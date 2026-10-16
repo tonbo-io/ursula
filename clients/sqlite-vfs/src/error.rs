@@ -48,7 +48,7 @@ pub(crate) enum ErrorKind {
     /// A write refused at admission (design §4.4).
     BacklogFull,
     /// A write the extension does not capture: EXCLUSIVE locking mode, a commit leaving WAL mode
-    /// or 4 KiB pages, a frame above the batch limit (M3 sends parts).
+    /// or 4 KiB pages, a commit frame above the 4 GiB a frame holds.
     Unsupported,
     Reset(ResetKind),
     InvalidArgument,

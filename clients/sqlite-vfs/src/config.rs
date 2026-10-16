@@ -80,6 +80,9 @@ pub(crate) enum Step {
     Forward,
     /// The commit confirmed by `SQLITE_FCNTL_COMMIT_PHASETWO`.
     PhaseTwo,
+    /// A PART run: before a part after the first goes out (each resend counts), so the run's
+    /// earlier parts may have landed and the rest never do.
+    PartSent,
     /// F1: a checkpoint starts, before the log fdatasync.
     CheckpointStart,
     /// F1: the log fdatasynced, before the first db page.
@@ -124,6 +127,7 @@ impl Step {
             Step::Logged => "logged",
             Step::Forward => "forward",
             Step::PhaseTwo => "phasetwo",
+            Step::PartSent => "part_sent",
             Step::CheckpointStart => "checkpoint_start",
             Step::CheckpointSynced => "checkpoint_synced",
             Step::CheckpointPage => "checkpoint_page",

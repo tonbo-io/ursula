@@ -39,6 +39,9 @@ pub(crate) enum HeadReason {
     Precondition,
     /// A `413` that names no limit: a layer outside #581 §6.4.
     TooLarge,
+    /// [`super::backoff::LOST_BEFORE_HEAD`] lost answers in a row for a large body: a layer in
+    /// front of the server may have refused it unread.
+    Unanswered,
     /// A `410` on a read: retention passed our tail, or the read went to another history (a `410`
     /// comes before a `412`). With our token unchanged the binding resets this kind: `fenced`
     /// for a `synced()` probe (another owner moved on), `stale` for a provisional pre-check.
@@ -62,8 +65,8 @@ pub(crate) enum Common {
     Redirect {
         location: Option<String>,
     },
-    /// A typed `413`: the named limit lowers `L`. With no re-cut in M1, blocked
-    /// `request_too_large`.
+    /// A typed `413`: the named limit lowers `L`. A body above it is sealed again, smaller, under
+    /// a new epoch; otherwise blocked `request_too_large`.
     LowerLimit {
         bytes: u64,
     },

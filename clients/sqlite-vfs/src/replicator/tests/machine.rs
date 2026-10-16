@@ -33,6 +33,7 @@ use crate::replicator::BoundaryReceipt;
 use crate::replicator::ClaimKind;
 use crate::replicator::Condition;
 use crate::replicator::Event;
+use crate::replicator::MIN_REQUEST_BYTES;
 use crate::replicator::Refusal;
 use crate::replicator::Replicator;
 use crate::replicator::RequestId;
@@ -281,7 +282,7 @@ fn redirects_are_resent_a_few_times_then_block() {
 }
 
 #[test]
-fn a_typed_413_lowers_the_limit_and_blocks() {
+fn a_typed_413_below_the_smallest_limit_lowers_it_and_blocks() {
     let mut h = streaming(1);
     let mut raw = RawAnswer::new(SizeLimit::STATUS);
     SizeLimit::Request(16).render(raw.emit());
@@ -290,7 +291,10 @@ fn a_typed_413_lowers_the_limit_and_blocks() {
         condition(&actions),
         Some(Some(Condition::Blocked(BlockedReason::RequestTooLarge)))
     );
-    assert_eq!(h.replicator.ctx().unwrap().limits.request(), 16);
+    let limits = h.replicator.ctx().unwrap().limits;
+    assert_eq!(limits.named, Some(16));
+    assert_eq!(limits.request(), MIN_REQUEST_BYTES);
+    assert!(matches!(h.replicator, Replicator::Streaming { .. }));
 }
 
 #[test]
@@ -552,26 +556,6 @@ fn a_probe_that_finds_our_own_batch_waits_for_its_answer() {
     let actions = h.answer(&read(&batch, 37 + len));
     assert_eq!(reset_of(&actions), None, "{actions:?}");
     assert!(!actions.contains(&Action::Synced { ticket: 4 }));
-}
-
-#[test]
-fn an_oversized_first_frame_blocks_without_sending() {
-    let pending = vec![commit(LINEAGE, 1, 1)];
-    let mut state = local(pending, 0);
-    state.configured_max_request_bytes = Some(4);
-    let (mut h, _) = Harness::activate(
-        ClaimKind::Takeover {
-            round: 1,
-            rekeyed: false,
-        },
-        state,
-    );
-    let actions = h.answer(&producer(&receipt(Delivery::Applied, 1, 0, 0, 37, None)));
-    assert!(sends(&actions).is_empty());
-    assert_eq!(
-        condition(&actions),
-        Some(Some(Condition::Blocked(BlockedReason::RequestTooLarge)))
-    );
 }
 
 #[test]

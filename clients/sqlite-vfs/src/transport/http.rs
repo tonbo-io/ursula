@@ -254,10 +254,16 @@ pub(crate) fn bulk_agent() -> &'static ureq::Agent {
 /// connection's starts when the host resolved).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Idle connections the pool keeps per host.
+const MAX_IDLE_PER_HOST: usize = 256;
+/// Idle connections the pool keeps in all.
+const MAX_IDLE: usize = 1024;
+
 /// An agent whose requests time out after `timeout` and that keeps a connection for
 /// `max_idle_age` after its last request. Resolving and connecting time out after
-/// `CONNECT_TIMEOUT` each. The pool keeps ureq's bounds: at most 3 idle connections per host and
-/// 10 in all. Hosts resolve through the shared cache of `net::Resolver`, and a failure to resolve
+/// `CONNECT_TIMEOUT` each. The pool keeps at most [`MAX_IDLE_PER_HOST`] idle connections per host
+/// and [`MAX_IDLE`] in all: every database has two request lanes, so a process with many databases
+/// on one host reuses its connections rather than handshaking under load. Hosts resolve through the shared cache of `net::Resolver`, and a failure to resolve
 /// or to connect proves the request never went out (`net`). ureq's proxy from the environment
 /// applies, as it always did (`ALL_PROXY`, `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`): a CONNECT
 /// proxy's host resolves through the same cache, and a failure to reach the proxy, or to have it
@@ -283,6 +289,8 @@ pub(crate) fn new_agent_with<R: ureq::unversioned::resolver::Resolver>(
         // would turn an append into a GET.
         .max_redirects(0)
         .max_idle_age(max_idle_age)
+        .max_idle_connections_per_host(MAX_IDLE_PER_HOST)
+        .max_idle_connections(MAX_IDLE)
         .tls_config(tls())
         .user_agent(USER_AGENT)
         .build();

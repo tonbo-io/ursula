@@ -72,6 +72,17 @@ export async function frames(path: string): Promise<{ claims: number; commits: n
 	return count;
 }
 
+/** The `USQ2` PART frames (kind 3) the stream at `path` holds. */
+export async function parts(path: string): Promise<number> {
+	const bytes = await streamBytes(path);
+	const view = new DataView(bytes.buffer);
+	let count = 0;
+	for (let at = 0; at < bytes.length; at += 13 + view.getUint32(at + 5, true)) {
+		if (bytes[at + 4] === 3) count += 1;
+	}
+	return count;
+}
+
 /** Where {@link fault} scripts a fault: the model's `/__model/faults`, or the gate's `/faults` (test/stack.ts). */
 export const faultsUrl = (): string => inject("ursulaFaults");
 

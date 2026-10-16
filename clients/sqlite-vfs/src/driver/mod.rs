@@ -153,8 +153,6 @@ pub(crate) struct BindingHandle {
     max_pending_bytes: u64,
     /// The last COMMIT record's position, as the commit path records it.
     last_commit: AtomicU64,
-    /// The largest commit frame the replicator can send in one batch.
-    max_frame_bytes: AtomicU64,
     /// The last acknowledged position.
     acked: AtomicU64,
     /// The reset, once one happened: [`ResetKind`] + 1, 0 for none. The first one stays.
@@ -357,7 +355,6 @@ impl BindingHandle {
             log: Mutex::new(bind.log),
             pending_bytes: AtomicU64::new(bind.pending_bytes),
             max_pending_bytes: bind.max_pending_bytes,
-            max_frame_bytes: AtomicU64::new(bind.max_frame_bytes),
             acked: AtomicU64::new(bind.acked.0),
             reset: AtomicU8::new(0),
             life: Mutex::new(Lifecycle {
@@ -481,10 +478,6 @@ impl BindingHandle {
                 Some(n.saturating_sub(len))
             })
             .unwrap_or_else(|unchanged| unchanged);
-    }
-
-    pub(crate) fn max_frame_bytes(&self) -> u64 {
-        self.max_frame_bytes.load(Ordering::Acquire)
     }
 
     pub(crate) fn acked(&self) -> Position {
@@ -736,14 +729,11 @@ impl BindingHandle {
             .clone()
     }
 
-    fn set_replication(&self, replication: Replication, max_frame_bytes: Option<u64>) {
+    fn set_replication(&self, replication: Replication) {
         *self
             .replication
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = replication;
-        if let Some(max) = max_frame_bytes {
-            self.max_frame_bytes.store(max, Ordering::Release);
-        }
     }
 
     fn set_acked(&self, acked: Position) {
@@ -761,7 +751,6 @@ pub(crate) struct Bind {
     pub(crate) log: Log,
     pub(crate) pending_bytes: u64,
     pub(crate) max_pending_bytes: u64,
-    pub(crate) max_frame_bytes: u64,
     pub(crate) acked: Position,
     pub(crate) attach: Attach,
     /// Bound before its claim: the stream was unreachable at the open (design §5.5).

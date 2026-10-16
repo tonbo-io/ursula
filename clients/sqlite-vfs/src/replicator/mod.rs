@@ -62,7 +62,22 @@
 //! commits the log held at the open. Those it logged while provisional were never sent, so a
 //! history that loses nothing re-keys them and they replicate, with no salvage.
 //!
-//! Left for later milestones: resume (M4), re-cut and PART sending (M3).
+//! A commit above the batch limit goes out as a run of PART frames, one per append
+//! ([`batch::Run`]). The acknowledged offset and the ACK stay at the commit boundary before the run
+//! until its last part's receipt: progress inside the run is [`Ctx::tail`], which the next part's
+//! receipt and a `synced()` probe check against, so a probe never reads our own parts as foreign
+//! bytes. Any claim drops the run, and the commit goes out again from part 0, cut for the limit of
+//! then: a CLAIM frame always separates a voided run from its resend, and readers apply only a
+//! complete run.
+//!
+//! A `413` naming a limit (or a HEAD advertising one) below the body in flight re-cuts: the body
+//! of a key never changes, so the replicator claims `own + 1`, and its reconcile cross-checks the
+//! closed epoch as after a re-key while bound. A limit below [`MIN_REQUEST_BYTES`] blocks
+//! `request_too_large` instead. Three lost answers in a row for a body above
+//! [`backoff::LOST_HEAD_BYTES`] send a HEAD before the next resend, since a layer that refuses a
+//! large body without reading it looks like a lost answer.
+//!
+//! Left for later milestones: resume (M4).
 //!
 //! Module map:
 //!
@@ -114,9 +129,11 @@ use self::answer::decide_head;
 use self::answer::decide_read;
 use self::answer::decide_status;
 use self::answer::takeover_may_rekey;
+use self::backoff::Halt;
 use self::backoff::HeadOutcome;
 use self::backoff::Hit;
 use self::backoff::Link;
+use self::batch::Run;
 use self::batch::SealError;
 use self::batch::Sealed;
 use self::reconcile::CatchUp;
@@ -148,6 +165,10 @@ use crate::wire::Typed;
 
 /// The largest batch, whatever the request limit (design §4.6).
 pub(crate) const MAX_BATCH_BYTES: u64 = 4 << 20;
+
+/// The smallest request limit the replicator cuts for: a limit below it blocks
+/// `request_too_large`, so a part always holds a useful slice.
+pub(crate) const MIN_REQUEST_BYTES: u64 = 4 << 10;
 
 /// The largest read answer the reconcile and the probe expect, which scales the time an answer
 /// body may take.
@@ -411,7 +432,8 @@ pub(crate) struct Limits {
 }
 
 impl Limits {
-    pub(crate) fn request(&self) -> u64 {
+    /// The lowest limit of the three.
+    fn lowest(&self) -> u64 {
         [Some(self.head), self.named, self.configured]
             .into_iter()
             .flatten()
@@ -419,8 +441,19 @@ impl Limits {
             .unwrap_or(self.head)
     }
 
+    /// `L`, at least [`MIN_REQUEST_BYTES`].
+    pub(crate) fn request(&self) -> u64 {
+        self.lowest().max(MIN_REQUEST_BYTES)
+    }
+
     pub(crate) fn batch(&self) -> u64 {
         self.request().min(MAX_BATCH_BYTES)
+    }
+
+    /// Whether a body of `len` bytes refused as too large is sealed again, smaller, under a new
+    /// epoch: the limit is below it and not below [`MIN_REQUEST_BYTES`]. Otherwise it blocks.
+    pub(crate) fn recuts(&self, len: u64) -> bool {
+        self.lowest() >= MIN_REQUEST_BYTES && len > self.batch()
     }
 }
 
@@ -452,6 +485,8 @@ pub(crate) struct Ctx {
     pub(crate) boundaries: BTreeSet<Position>,
     pub(crate) tickets: Tickets,
     pub(crate) sent: Vec<SentBatch>,
+    /// The PART run this epoch is sending, if any.
+    pub(crate) run: Option<Run>,
     pub(crate) condition: Option<Condition>,
     /// Boundaries acknowledged or passed, reported with the next ACK.
     reached: Vec<BoundaryReceipt>,
@@ -532,6 +567,7 @@ impl Ctx {
             boundaries: BTreeSet::new(),
             tickets: Tickets::default(),
             sent: Vec::new(),
+            run: None,
             condition: None,
             reached: Vec::new(),
             db_bytes: local.db_bytes,
@@ -662,6 +698,12 @@ impl Ctx {
     /// A read of the header of the snapshot at `offset`, under the precondition.
     pub(crate) fn snapshot_header_request(&self, offset: Offset) -> Request {
         Request::snapshot_read(offset, self.incarnation, SnapshotPart::Header)
+    }
+
+    /// Where the next write of this owner starts: the end of the last receipt of the run in
+    /// progress, else the acknowledged offset.
+    pub(crate) fn tail(&self) -> Offset {
+        self.run.map_or(self.acked_offset, |run| run.tail)
     }
 
     /// The first position not acknowledged: tickets at or above it wait.
@@ -822,8 +864,6 @@ pub(crate) enum Work {
         link: Box<Link>,
         probed: bool,
     },
-    /// The first pending frame is above the batch limit; checked again at `at_ms`.
-    Oversized { at_ms: u64 },
 }
 
 /// A leader read at the expected tail, for `synced()` (design §8.2). It goes out beside the
@@ -861,9 +901,6 @@ pub(crate) enum Replicator {
     Refused(Refusal),
     Stopped,
 }
-
-/// The time an oversized first frame is looked at again.
-const OVERSIZED_RETRY_MS: u64 = backoff::BLOCKED_RETRY_MS;
 
 impl Replicator {
     /// Starts claiming: the CLAIM record, then the claim. A takeover whose `local` names a token
@@ -1021,8 +1058,10 @@ fn claim_activation(ctx: &Ctx, epoch: Epoch) -> Activation {
         .map_or(ctx.activation, |(_, activation)| *activation)
 }
 
-/// Sends the claim of `epoch`, whose CLAIM record is logged.
+/// Sends the claim of `epoch`, whose CLAIM record is logged. A run in progress is dropped: after
+/// the claim the commit goes out again from part 0.
 fn send_claim(ctx: &mut Ctx, epoch: Epoch, actions: &mut Vec<Action>) -> Link {
+    ctx.run = None;
     let body: Arc<[u8]> = Arc::from(frame::encode_claim(epoch, claim_activation(ctx, epoch)));
     let request = ctx.write_request(epoch, Seq::ZERO, body);
     Link::send(request, ctx, actions)
@@ -1129,6 +1168,8 @@ fn activating_head(
     match outcome {
         HeadOutcome::Waiting => Replicator::Activating { kind, step, ctx },
         HeadOutcome::ReKey { to, from } => rekey(kind, holding, to, from, ctx, actions),
+        // Claims and reads have no body to cut.
+        HeadOutcome::Recut => reset(ResetKind::Internal, actions),
         HeadOutcome::Reset(kind) => reset(kind, actions),
     }
 }
@@ -1290,7 +1331,7 @@ fn activating(
                             Exchange::NoAnswer(_) => &[],
                         };
                         let fed = reconcile.feed(body, next, &mut ctx);
-                        reconciled(kind, reconcile, fed, ctx, now_ms, actions)
+                        reconciled(kind, reconcile, fed, ctx, actions)
                     }
                     ReadDecision::Gone => {
                         ctx.set_condition(None, actions);
@@ -1308,7 +1349,7 @@ fn activating(
                     ReadDecision::Common(common) => {
                         match link.common(common, retry_after(&exchange), now_ms, &mut ctx, actions)
                         {
-                            Err(kind) => reset(kind, actions),
+                            Err(halt) => reset(halt.reset_kind(), actions),
                             Ok(()) => Replicator::Activating {
                                 kind,
                                 step: Step::Reconcile { reconcile, link },
@@ -1344,7 +1385,7 @@ fn activating(
                 ctx.acknowledge(last, end);
                 ctx.log_bytes = log_bytes;
                 if reconcile.complete() {
-                    return finish(kind, *reconcile, ctx, now_ms, actions);
+                    return finish(kind, *reconcile, ctx, actions);
                 }
                 let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
                 Replicator::Activating {
@@ -1388,7 +1429,7 @@ fn activating(
                 let offset = ctx.acked_offset;
                 ctx.acknowledge(last, offset);
                 ctx.log_bytes = log_bytes;
-                bind(*done, ctx, now_ms, actions)
+                bind(*done, ctx, actions)
             }
             Event::Tick
             | Event::Answer { .. }
@@ -1424,6 +1465,7 @@ fn activating(
                             pre_check_rekey(kind, claim, to, from, ctx, actions)
                                 .unwrap_or_else(|terminal| terminal.into())
                         }
+                        HeadOutcome::Recut => reset(ResetKind::Internal, actions),
                         HeadOutcome::Reset(kind) => reset(kind, actions),
                     };
                 }
@@ -1582,7 +1624,7 @@ impl PreChecking {
             .link
             .common(common, retry_after(exchange), now_ms, &mut ctx, actions)
         {
-            Err(kind) => reset(kind, actions),
+            Err(halt) => reset(halt.reset_kind(), actions),
             Ok(()) => self.waiting(check, ctx),
         }
     }
@@ -1779,7 +1821,7 @@ impl Gone {
             .link
             .common(common, retry_after(exchange), now_ms, &mut ctx, actions)
         {
-            Err(kind) => reset(kind, actions),
+            Err(halt) => reset(halt.reset_kind(), actions),
             Ok(()) => self.waiting(ctx),
         }
     }
@@ -1811,7 +1853,7 @@ impl Gone {
                         _ => None,
                     };
                     match latest.filter(|s| s.offset >= self.reconcile.at()) {
-                        None => self.fails(ctx, now_ms, actions),
+                        None => self.fails(ctx, actions),
                         Some(latest) => {
                             let request = ctx.snapshot_header_request(latest.offset);
                             let link = Link::send(request, &mut ctx, actions);
@@ -1862,16 +1904,16 @@ impl Gone {
                         if header.fields.offset == snapshot.offset
                             && self.covers(&ctx, &header) =>
                     {
-                        self.continue_from(&header, ctx, now_ms, actions)
+                        self.continue_from(&header, ctx, actions)
                     }
                     // Not ours, or not at or below what this copy acknowledged.
-                    Ok(_) => self.fails(ctx, now_ms, actions),
+                    Ok(_) => self.fails(ctx, actions),
                     Err(e) => {
                         log::emit(Level::Warn, "snapshot_unreadable", &[
                             ("offset", &snapshot.offset),
                             ("error", &e),
                         ]);
-                        self.fails(ctx, now_ms, actions)
+                        self.fails(ctx, actions)
                     }
                 }
             }
@@ -1921,14 +1963,13 @@ impl Gone {
         mut self,
         header: &SnapshotHeader,
         mut ctx: Box<Ctx>,
-        now_ms: u64,
         actions: &mut Vec<Action>,
     ) -> Replicator {
         ctx.see_epoch(header.fields.epoch);
         ctx.acknowledge(header.fields.last.position, header.fields.offset);
         self.reconcile.restart(header.fields.offset);
         if self.reconcile.complete() {
-            return finish(self.kind, *self.reconcile, ctx, now_ms, actions);
+            return finish(self.kind, *self.reconcile, ctx, actions);
         }
         let link = Link::send(ctx.read_request(self.reconcile.at()), &mut ctx, actions);
         Replicator::Activating {
@@ -1943,9 +1984,9 @@ impl Gone {
 
     /// The snapshot does not cover the acknowledged records: a takeover diverges, a continuation
     /// resets `stale`.
-    fn fails(mut self, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
+    fn fails(mut self, mut ctx: Box<Ctx>, actions: &mut Vec<Action>) -> Replicator {
         let fed = self.reconcile.gone(&mut ctx);
-        reconciled(self.kind, self.reconcile, fed, ctx, now_ms, actions)
+        reconciled(self.kind, self.reconcile, fed, ctx, actions)
     }
 }
 
@@ -2032,7 +2073,7 @@ fn claim_answered(
                 ctx.acked_offset,
             ));
             if reconcile.complete() {
-                return finish(kind, *reconcile, ctx, now_ms, actions);
+                return finish(kind, *reconcile, ctx, actions);
             }
             let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
             Replicator::Activating {
@@ -2105,7 +2146,7 @@ fn claim_answered(
         }
         ClaimDecision::Common(common) => {
             match link.common(common, retry_after(exchange), now_ms, &mut ctx, actions) {
-                Err(kind) => reset(kind, actions),
+                Err(halt) => reset(halt.reset_kind(), actions),
                 Ok(()) => Replicator::Activating {
                     kind,
                     step: Step::Claim { epoch, link },
@@ -2195,7 +2236,6 @@ fn reconciled(
     mut reconcile: Box<Reconcile>,
     fed: Fed,
     mut ctx: Box<Ctx>,
-    now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
     if !matches!(fed, Fed::Reset(_))
@@ -2211,8 +2251,8 @@ fn reconciled(
     }
     match fed {
         Fed::Reset(kind) => reset(kind, actions),
-        Fed::Done => finish(kind, *reconcile, ctx, now_ms, actions),
-        Fed::More if reconcile.complete() => finish(kind, *reconcile, ctx, now_ms, actions),
+        Fed::Done => finish(kind, *reconcile, ctx, actions),
+        Fed::More if reconcile.complete() => finish(kind, *reconcile, ctx, actions),
         Fed::More => {
             let link = Link::send(ctx.read_request(reconcile.at()), &mut ctx, actions);
             Replicator::Activating {
@@ -2230,12 +2270,11 @@ fn finish(
     kind: ClaimKind,
     reconcile: Reconcile,
     mut ctx: Box<Ctx>,
-    now_ms: u64,
     actions: &mut Vec<Action>,
 ) -> Replicator {
     let done = reconcile.into_done();
     match &done.catch_up {
-        CatchUp::Nothing => bind(done, ctx, now_ms, actions),
+        CatchUp::Nothing => bind(done, ctx, actions),
         CatchUp::Rebuild { discard_from } => {
             if let Some(from) = *discard_from {
                 ctx.tickets.abandon_from(from, actions);
@@ -2260,7 +2299,7 @@ fn finish(
 }
 
 /// Streams under the claimed epoch: the ACK, the tickets, then the first batch.
-fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
+fn bind(done: Done, mut ctx: Box<Ctx>, actions: &mut Vec<Action>) -> Replicator {
     actions.push(Action::Bound { epoch: done.epoch });
     // A claim under the current token applied: the stream was written under it.
     ctx.rekey_from = None;
@@ -2276,15 +2315,14 @@ fn bind(done: Done, mut ctx: Box<Ctx>, now_ms: u64, actions: &mut Vec<Action>) -
         ctx.tickets.prove(claim);
     }
     ctx.settle(actions);
-    let mut stream = Stream {
+    let stream = Stream {
         epoch: done.epoch,
         seq: Seq::ZERO,
         work: Work::Idle,
         probe: None,
         ctx,
     };
-    stream.kick(now_ms, actions);
-    stream.into()
+    stream.kick(actions)
 }
 
 /// The renumbering negative control: a due resend seals the batch again with what is pending
@@ -2327,7 +2365,7 @@ impl From<Stream> for Replicator {
 impl Stream {
     /// Sends the next batch when the append slot is idle, and a probe for tickets that wait only
     /// for a round trip, unless an append in flight will be that round trip.
-    fn kick(&mut self, now_ms: u64, actions: &mut Vec<Action>) {
+    fn kick(mut self, actions: &mut Vec<Action>) -> Replicator {
         let ctx = &mut self.ctx;
         if matches!(self.work, Work::Idle)
             && !ctx.pending.is_empty()
@@ -2340,6 +2378,18 @@ impl Stream {
             // An exhausted epoch sends nothing: only a claim moves on.
             match batch::seal(self.epoch, next, ctx) {
                 Ok(sealed) => {
+                    if let Some(part) = sealed.part
+                        && ctx.run.is_none()
+                    {
+                        // A new run: cut once, its parts follow one per append.
+                        ctx.run = Some(Run {
+                            position: sealed.first,
+                            count: part.count,
+                            chunk: part.chunk,
+                            next: part.index,
+                            tail: ctx.acked_offset,
+                        });
+                    }
                     let request = ctx.write_request(self.epoch, next, Arc::clone(&sealed.body));
                     ctx.sent.push(SentBatch {
                         epoch: self.epoch,
@@ -2355,51 +2405,36 @@ impl Stream {
                     };
                 }
                 Err(SealError::Empty) => {}
-                Err(SealError::TooLarge { .. }) => {
-                    ctx.set_condition(
-                        Some(Condition::Blocked(BlockedReason::RequestTooLarge)),
-                        actions,
-                    );
-                    let at_ms = now_ms.saturating_add(OVERSIZED_RETRY_MS);
-                    actions.push(Action::Timer {
-                        at_ms,
-                        jitter_ms: 0,
-                    });
-                    self.work = Work::Oversized { at_ms };
+                Err(e) => {
+                    log::emit(Level::Error, "seal_failed", &[("error", &e)]);
+                    return reset(ResetKind::Internal, actions);
                 }
             }
         }
         let append_answers = match &self.work {
             Work::Append { link, probed, .. } => link.in_flight() || *probed,
-            Work::Idle | Work::Oversized { .. } => false,
+            Work::Idle => false,
         };
         if self.probe.is_none() && !append_answers && ctx.tickets.wants_probe(ctx.first_pending()) {
-            let from = ctx.acked_offset;
+            // From the tail: inside a run, past the parts that landed.
+            let from = ctx.tail();
             let link = Box::new(Link::send(ctx.read_request(from), ctx, actions));
             self.probe = Some(Probe { from, link });
         }
+        self.into()
     }
 
     fn on(mut self, event: Event, now_ms: u64, actions: &mut Vec<Action>) -> Replicator {
         match event {
             Event::Tick => {
-                match &mut self.work {
-                    Work::Append { sealed, link, .. } => {
-                        renumber(self.epoch, sealed, link, &self.ctx, now_ms);
-                        link.tick(now_ms, &mut self.ctx, actions);
-                    }
-                    Work::Oversized { at_ms } if now_ms >= *at_ms => self.work = Work::Idle,
-                    Work::Oversized { at_ms } => actions.push(Action::Timer {
-                        at_ms: *at_ms,
-                        jitter_ms: 0,
-                    }),
-                    Work::Idle => {}
+                if let Work::Append { sealed, link, .. } = &mut self.work {
+                    renumber(self.epoch, sealed, link, &self.ctx, now_ms);
+                    link.tick(now_ms, &mut self.ctx, actions);
                 }
                 if let Some(probe) = &mut self.probe {
                     probe.link.tick(now_ms, &mut self.ctx, actions);
                 }
-                self.kick(now_ms, actions);
-                self.into()
+                self.kick(actions)
             }
             Event::Answer { id, exchange } => {
                 if let Some(probe) = &self.probe
@@ -2419,10 +2454,7 @@ impl Stream {
             | Event::Snapshotted { .. }
             | Event::Sync { .. }
             | Event::CaughtUp { .. }
-            | Event::Stop => {
-                self.kick(now_ms, actions);
-                self.into()
-            }
+            | Event::Stop => self.kick(actions),
         }
     }
 
@@ -2446,6 +2478,7 @@ impl Stream {
             match link.head_answer(exchange, now_ms, ctx, actions) {
                 HeadOutcome::Waiting => {}
                 HeadOutcome::ReKey { to, from } => return self.rekey(to, from, actions),
+                HeadOutcome::Recut => return self.recut(actions),
                 HeadOutcome::Reset(kind) => return reset(kind, actions),
             }
             self.work = Work::Append {
@@ -2453,8 +2486,7 @@ impl Stream {
                 link,
                 probed,
             };
-            self.kick(now_ms, actions);
-            return self.into();
+            return self.kick(actions);
         }
         if let Exchange::Answered(answer) = exchange
             && let Ok(crate::wire::Typed::Producer(producer)) = &answer.typed
@@ -2464,8 +2496,26 @@ impl Stream {
         match decide_append(&sealed, exchange) {
             AppendDecision::Acknowledge { next, delivery } => {
                 ctx.set_condition(None, actions);
-                ctx.acknowledge(sealed.last, next);
-                ctx.ack_actions(actions);
+                match sealed.part {
+                    Some(part) if !part.last() => {
+                        // Inside a run: only the run's tail moves. The acknowledged offset and the
+                        // ACK stay at the commit boundary before it until its last part.
+                        let Some(run) = ctx
+                            .run
+                            .as_mut()
+                            .filter(|run| run.position == sealed.first && run.next == part.index)
+                        else {
+                            return reset(ResetKind::Internal, actions);
+                        };
+                        run.next = part.index.saturating_add(1);
+                        run.tail = next;
+                    }
+                    _ => {
+                        ctx.run = None;
+                        ctx.acknowledge(sealed.last, next);
+                        ctx.ack_actions(actions);
+                    }
+                }
                 // Only a write applied by an attempt that started after the call is at the
                 // tail: a repeat's bytes may have others after them.
                 if delivery == Delivery::Applied {
@@ -2477,43 +2527,58 @@ impl Stream {
                 if self
                     .probe
                     .as_ref()
-                    .is_some_and(|probe| probe.from != self.ctx.acked_offset)
+                    .is_some_and(|probe| probe.from != self.ctx.tail())
                 {
                     self.probe = None;
                 }
-                self.kick(now_ms, actions);
-                self.into()
+                self.kick(actions)
             }
-            AppendDecision::ContinuationClaim => {
-                ctx.set_condition(None, actions);
-                let Some(next) = next_epoch(self.epoch) else {
-                    return reset(ResetKind::Internal, actions);
-                };
-                let mut ctx = self.ctx;
-                let link = claim(&mut ctx, next, actions);
-                Replicator::Activating {
-                    kind: ClaimKind::Continuation {
-                        own: self.epoch,
-                        resent: false,
-                    },
-                    step: Step::Claim { epoch: next, link },
-                    ctx,
-                }
-            }
+            AppendDecision::ContinuationClaim => self.continuation_claim(actions),
             AppendDecision::Common(common) => {
-                if let Err(kind) = link.common(common, retry_after(exchange), now_ms, ctx, actions)
-                {
-                    return reset(kind, actions);
+                match link.common(common, retry_after(exchange), now_ms, ctx, actions) {
+                    Ok(()) => {}
+                    Err(Halt::Recut) => return self.recut(actions),
+                    Err(Halt::Reset(kind)) => return reset(kind, actions),
                 }
                 self.work = Work::Append {
                     sealed,
                     link,
                     probed,
                 };
-                self.kick(now_ms, actions);
-                self.into()
+                self.kick(actions)
             }
         }
+    }
+
+    /// Claims exactly `own + 1`: after `producer-expired`, or to re-cut. The batch in flight and
+    /// the probe go, and the claim's reconcile reads what landed.
+    fn continuation_claim(self, actions: &mut Vec<Action>) -> Replicator {
+        let mut ctx = self.ctx;
+        ctx.set_condition(None, actions);
+        let Some(next) = next_epoch(self.epoch) else {
+            return reset(ResetKind::Internal, actions);
+        };
+        let link = claim(&mut ctx, next, actions);
+        Replicator::Activating {
+            kind: ClaimKind::Continuation {
+                own: self.epoch,
+                resent: false,
+            },
+            step: Step::Claim { epoch: next, link },
+            ctx,
+        }
+    }
+
+    /// The limit fell below the body in flight: a key keeps its body until a definite answer, so
+    /// the commit is sealed again, smaller, only under a new epoch. The claim closes this epoch,
+    /// its reconcile cross-checks the closed seq against the batches sent in it, and a lost claim
+    /// resets `fenced`.
+    fn recut(self, actions: &mut Vec<Action>) -> Replicator {
+        log::emit(Level::Info, "recut", &[
+            ("epoch", &self.epoch),
+            ("limit", &self.ctx.limits.request()),
+        ]);
+        self.continuation_claim(actions)
     }
 
     /// A HEAD of the append or the probe named a history that inherits the generation: the
@@ -2548,10 +2613,9 @@ impl Stream {
         let Some(Probe { from, mut link }) = self.probe.take() else {
             return self.into();
         };
-        if from != self.ctx.acked_offset {
-            // Stale: our own acknowledged bytes now follow `from`.
-            self.kick(now_ms, actions);
-            return self.into();
+        if from != self.ctx.tail() {
+            // Stale: our own acknowledged bytes (or parts) now follow `from`.
+            return self.kick(actions);
         }
         // The condition is the append slot's while it is busy: the probe leaves it alone.
         let quiet = !matches!(self.work, Work::Idle);
@@ -2563,6 +2627,8 @@ impl Stream {
             match outcome {
                 HeadOutcome::Waiting => {}
                 HeadOutcome::ReKey { to, from } => return self.rekey(to, from, actions),
+                // A read has no body to cut.
+                HeadOutcome::Recut => return reset(ResetKind::Internal, actions),
                 HeadOutcome::Reset(kind) => return reset(kind, actions),
             }
             self.probe = Some(Probe { from, link });
@@ -2591,8 +2657,7 @@ impl Stream {
                 } else {
                     return reset(reconcile::past_tail(body), actions);
                 }
-                self.kick(now_ms, actions);
-                self.into()
+                self.kick(actions)
             }
             // Retention passed our acknowledged tail, or the read went to another history (its
             // `410` comes before the `412`): a HEAD decides. Our token still there: another owner
@@ -2602,8 +2667,8 @@ impl Stream {
                     let common = Common::Head(HeadReason::Gone(ResetKind::Fenced));
                     link.common(common, None, now_ms, ctx, actions)
                 });
-                if let Err(kind) = result {
-                    return reset(kind, actions);
+                if let Err(halt) = result {
+                    return reset(halt.reset_kind(), actions);
                 }
                 self.probe = Some(Probe { from, link });
                 self.into()
@@ -2612,8 +2677,8 @@ impl Stream {
                 let result = quietly(quiet, ctx, actions, |ctx, actions| {
                     link.common(common, retry_after(exchange), now_ms, ctx, actions)
                 });
-                if let Err(kind) = result {
-                    return reset(kind, actions);
+                if let Err(halt) = result {
+                    return reset(halt.reset_kind(), actions);
                 }
                 self.probe = Some(Probe { from, link });
                 self.into()
@@ -2653,8 +2718,7 @@ fn streaming(
         Err(terminal) => terminal.into(),
         Ok(None) => {
             stream.ctx.settle(actions);
-            stream.kick(now_ms, actions);
-            stream.into()
+            stream.kick(actions)
         }
         Ok(Some(event)) => stream.on(event, now_ms, actions),
     }

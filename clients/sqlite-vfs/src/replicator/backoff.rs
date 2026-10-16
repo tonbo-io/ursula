@@ -3,7 +3,11 @@
 //! from 25 ms to 5 s with full jitter (the driver's), never before `Retry-After` (capped at
 //! 60 s); retries a blocked request every 30 s; and parks the request while a HEAD checks the
 //! stream's token, cluster and limit. A HEAD naming a history that inherits the generation hands
-//! the re-key to the replicator ([`HeadOutcome::ReKey`]).
+//! the re-key to the replicator ([`HeadOutcome::ReKey`]), and a limit below the body in flight
+//! hands it the re-cut ([`Halt::Recut`], [`HeadOutcome::Recut`]). Three lost answers in a row for a
+//! body above [`LOST_HEAD_BYTES`] send a HEAD before the next resend: a layer in front of the
+//! server may answer a body above its limit without reading it and close, which looks like a lost
+//! answer, while a HEAD through it learns its limit.
 
 use std::time::Duration;
 
@@ -34,6 +38,11 @@ pub(crate) const RETRY_AFTER_CAP_MS: u64 = 60_000;
 pub(crate) const BLOCKED_RETRY_MS: u64 = 30_000;
 /// Redirects resent before the request is blocked `redirected`.
 pub(crate) const REDIRECTS: u8 = 3;
+/// A body above this many bytes whose answers are lost [`LOST_BEFORE_HEAD`] times in a row sends a
+/// HEAD before the next resend.
+pub(crate) const LOST_HEAD_BYTES: u64 = 64 << 10;
+/// Lost answers in a row before that HEAD.
+pub(crate) const LOST_BEFORE_HEAD: u8 = 3;
 
 /// The full-jitter span after `failures` consecutive failures.
 pub(crate) fn backoff_ms(failures: u32) -> u64 {
@@ -65,6 +74,8 @@ pub(crate) enum HeadOutcome {
         to: Incarnation,
         from: Incarnation,
     },
+    /// The advertised limit is below the body in flight: the replicator re-cuts.
+    Recut,
     Reset(ResetKind),
 }
 
@@ -73,6 +84,36 @@ impl From<Result<(), ResetKind>> for HeadOutcome {
         match result {
             Ok(()) => Self::Waiting,
             Err(kind) => Self::Reset(kind),
+        }
+    }
+}
+
+impl From<Result<(), Halt>> for HeadOutcome {
+    fn from(result: Result<(), Halt>) -> Self {
+        match result {
+            Ok(()) => Self::Waiting,
+            Err(Halt::Recut) => Self::Recut,
+            Err(Halt::Reset(kind)) => Self::Reset(kind),
+        }
+    }
+}
+
+/// What ends a request's retries short of a definite answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Halt {
+    /// A `413` named a limit below the body, at or above `MIN_REQUEST_BYTES`: the body is sealed
+    /// again, smaller, under a new epoch ([`super::Limits::recuts`]).
+    Recut,
+    Reset(ResetKind),
+}
+
+impl Halt {
+    /// The reset for a request with no body to cut (a claim or a read is below
+    /// `MIN_REQUEST_BYTES`, so it never re-cuts): `internal` for a re-cut.
+    pub(crate) fn reset_kind(self) -> ResetKind {
+        match self {
+            Self::Recut => ResetKind::Internal,
+            Self::Reset(kind) => kind,
         }
     }
 }
@@ -139,7 +180,7 @@ impl Policy {
     }
 
     /// What an answer without a producer outcome leads to. A typed `413` blocks
-    /// `request_too_large`: lowering the limit is the caller's.
+    /// `request_too_large`: lowering the limit, and the re-cut it may lead to, are the caller's.
     pub(crate) fn decide(
         &mut self,
         common: Common,
@@ -196,6 +237,8 @@ pub(crate) struct Link {
     request: Request,
     state: LinkState,
     policy: Policy,
+    /// Lost answers in a row.
+    lost: u8,
 }
 
 impl Link {
@@ -211,6 +254,7 @@ impl Link {
             request,
             state: LinkState::InFlight(id),
             policy: Policy::default(),
+            lost: 0,
         }
     }
 
@@ -282,7 +326,13 @@ impl Link {
         Ok(())
     }
 
-    /// Carries out what an answer without a producer outcome decided. `Err` is a reset.
+    /// The request's body length.
+    fn body_len(&self) -> u64 {
+        u64::try_from(self.request.body.len()).unwrap_or(u64::MAX)
+    }
+
+    /// Carries out what an answer without a producer outcome decided. `Err` is a reset, or a
+    /// re-cut when a `413` named a limit below the body.
     pub(crate) fn common(
         &mut self,
         common: Common,
@@ -290,12 +340,24 @@ impl Link {
         now_ms: u64,
         ctx: &mut Ctx,
         actions: &mut Vec<Action>,
-    ) -> Result<(), ResetKind> {
+    ) -> Result<(), Halt> {
+        let len = self.body_len();
         if let Common::LowerLimit { bytes } = common {
             ctx.limits.named = Some(ctx.limits.named.map_or(bytes, |named| named.min(bytes)));
+            if ctx.limits.recuts(len) {
+                return Err(Halt::Recut);
+            }
         }
-        let next = self.policy.decide(common, retry_after, now_ms);
-        self.carry(next, ctx, actions)
+        // A lost answer is the only `Resend` on a fresh connection.
+        let lost = matches!(common, Common::Resend { fresh: true, .. }) && len > LOST_HEAD_BYTES;
+        self.lost = if lost { self.lost.saturating_add(1) } else { 0 };
+        let next = if self.lost >= LOST_BEFORE_HEAD {
+            self.lost = 0;
+            Next::Head(HeadReason::Unanswered)
+        } else {
+            self.policy.decide(common, retry_after, now_ms)
+        };
+        self.carry(next, ctx, actions).map_err(Halt::Reset)
     }
 
     /// The answer to the HEAD this request waits on.
@@ -340,8 +402,24 @@ impl Link {
                     HeadReason::Precondition => {
                         self.policy.backoff(None, Attempt::default(), now_ms)
                     }
-                    // No re-cut in M1, whatever the advertised limit.
+                    // The advertised limit is below the body: sealed again, smaller.
+                    HeadReason::TooLarge | HeadReason::Unanswered
+                        if ctx.limits.recuts(self.body_len()) =>
+                    {
+                        return HeadOutcome::Recut;
+                    }
+                    // A limit at or above the body (or below the smallest one cut for) refused
+                    // it all the same: nothing the replicator can change.
                     HeadReason::TooLarge => Policy::block(BlockedReason::RequestTooLarge, now_ms),
+                    // The body fits: its answers were lost, sent again on a fresh connection.
+                    HeadReason::Unanswered => self.policy.backoff(
+                        None,
+                        Attempt {
+                            fresh_connection: true,
+                            refresh_token: false,
+                        },
+                        now_ms,
+                    ),
                     // Our token unchanged: retention passed our tail.
                     HeadReason::Gone(kind) => return HeadOutcome::Reset(kind),
                 };
