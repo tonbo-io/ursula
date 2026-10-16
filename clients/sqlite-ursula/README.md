@@ -62,7 +62,7 @@ import { openUrsulaPiStorage } from "@tonbo/sqlite-ursula/pi";
 const storage = await openUrsulaPiStorage("https://streams.example.com/acme/agent", { closeTimeoutMs: 10_000 });
 ```
 
-Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. `backlog_full` throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.2.0.
+Every transaction and statement resolves only after `synced()`, so a Pi commit resolves once the stream holds it. A commit refused with `backlog_full` commits nothing. From Pi 1.2 it waits for `synced()` and runs again, since Pi expects a storage to retry its own transient failures. On Pi 1.0 and 1.1 it throws Pi's `StorageRejected`, so the session continues. A reset throws the `UrsulaResetError` itself, so the session stops. `close` waits up to `closeTimeoutMs` for `synced()`. `@earendil-works/pi-durable` is an optional peer dependency, from 1.0.0 up to but not including 1.4.0.
 
 ## SQL functions
 

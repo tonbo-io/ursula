@@ -94,6 +94,21 @@ export interface UrsulaStatus {
 	 * is `salvaged`. A reader cache read up to the stream's tail at the open is `caught_up`.
 	 */
 	readonly attach: { readonly local: "resumed" | "rekeyed" | "caught_up" | "built" | "salvaged"; readonly snapshot_offset: number | null };
+	/** The snapshots this binding publishes into the stream, so a fresh cache builds from one and the tail after it. */
+	readonly snapshot: {
+		/** The stream offset of the latest snapshot this binding published, `null` before its first. */
+		readonly offset: number | null;
+		/** How long ago it published that snapshot, `null` before its first. */
+		readonly age_ms: number | null;
+		/** Failed attempts since the last that published. */
+		readonly failures: number;
+		/** Why the latest attempt failed, or why snapshots stopped for good, `null` when neither. */
+		readonly error: string | null;
+		/** Frame bytes acknowledged since the latest snapshot. */
+		readonly log_bytes: number;
+		/** The `log_bytes` past which a snapshot is due. */
+		readonly due_bytes: number;
+	};
 	/** The last write refused with nothing committed. */
 	readonly refused: { readonly kind: string; readonly action: string; readonly message: string } | null;
 	/**
