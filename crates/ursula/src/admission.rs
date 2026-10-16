@@ -3,20 +3,24 @@
 //! never says so: a client resolves an unknown outcome by repeating a keyed
 //! write (#581 section 2).
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
 use axum::body::Body;
 use axum::body::HttpBody;
-use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::http::HeaderValue;
 use axum::http::Method;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_LENGTH;
-use axum::middleware::Next;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use futures_util::future::BoxFuture;
+use tower::Layer;
+use tower::Service;
 use ursula_headers::ErrorCode;
 use ursula_headers::SizeLimit;
 
@@ -115,37 +119,75 @@ impl IntoResponse for AdmissionRefusal {
     }
 }
 
-pub(crate) async fn ingress_admission_middleware(
-    State(admission): State<IngressAdmission>,
-    mut request: Request<Body>,
-    next: Next,
-) -> Response {
-    let Some(body_bytes) = request_write_body_bytes(&request) else {
-        return next.run(request).await;
-    };
-    // Size first: the head alone decides it (#581 section 6.1). One limit
-    // for every request (section 3.1).
-    if body_bytes > limits::MAX_REQUEST_BYTES {
-        return AdmissionRefusal::BodyTooLarge(limits::REQUEST_LIMIT).into_response();
+/// Admission runs as a tower layer that calls the route it wraps directly:
+/// a `from_fn` middleware would clone the route, and every layer below it,
+/// for every request (#602).
+impl<S> Layer<S> for IngressAdmission {
+    type Service = Admitted<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Admitted {
+            inner,
+            admission: self.clone(),
+        }
     }
-    // A write routed before its body meets pressure after routing and its
-    // early answer: a follower redirects rather than refusing for its own
-    // pressure, and a repeat of an applied write adds nothing to any log.
-    if front_door::routed_before_body(
-        request.method(),
-        request.extensions().get::<axum::extract::MatchedPath>(),
-    ) {
-        request.extensions_mut().insert(DeferredAdmission {
-            admission,
-            body_bytes,
-        });
-        return next.run(request).await;
+}
+
+/// The service of the [`IngressAdmission`] layer.
+#[derive(Clone)]
+pub struct Admitted<S> {
+    inner: S,
+    admission: IngressAdmission,
+}
+
+impl<S> Service<Request<Body>> for Admitted<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible>,
+    S::Future: Send + 'static,
+{
+    type Error = Infallible;
+    type Future = BoxFuture<'static, Result<Response, Infallible>>;
+    type Response = Response;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
     }
-    let _permit = match admission.admit(body_bytes) {
-        Ok(permit) => permit,
-        Err(refusal) => return refusal.into_response(),
-    };
-    next.run(request).await
+
+    fn call(&mut self, mut request: Request<Body>) -> Self::Future {
+        let Some(body_bytes) = request_write_body_bytes(&request) else {
+            return Box::pin(self.inner.call(request));
+        };
+        // Size first: the head alone decides it (#581 section 6.1). One
+        // limit for every request (section 3.1).
+        if body_bytes > limits::MAX_REQUEST_BYTES {
+            let refusal = AdmissionRefusal::BodyTooLarge(limits::REQUEST_LIMIT).into_response();
+            return Box::pin(std::future::ready(Ok(refusal)));
+        }
+        // A write routed before its body meets pressure after routing and
+        // its early answer: a follower redirects rather than refusing for its
+        // own pressure, and a repeat of an applied write adds nothing to any
+        // log.
+        if front_door::routed_before_body(
+            request.method(),
+            request.extensions().get::<axum::extract::MatchedPath>(),
+        ) {
+            request.extensions_mut().insert(DeferredAdmission {
+                admission: self.admission.clone(),
+                body_bytes,
+            });
+            return Box::pin(self.inner.call(request));
+        }
+        let permit = match self.admission.admit(body_bytes) {
+            Ok(permit) => permit,
+            Err(refusal) => return Box::pin(std::future::ready(Ok(refusal.into_response()))),
+        };
+        let future = self.inner.call(request);
+        Box::pin(async move {
+            let response = future.await;
+            drop(permit);
+            response
+        })
+    }
 }
 
 impl IngressAdmission {
@@ -236,14 +278,14 @@ pub(crate) struct AdmissionPermit {
 
 /// The pressure checks of a write routed before its body, which its handler
 /// runs once routing and early answers have passed (#581 section 6.1). The
-/// middleware has checked its size already.
+/// layer has checked its size already.
 #[derive(Clone)]
 pub(crate) struct DeferredAdmission {
     admission: IngressAdmission,
     body_bytes: u64,
 }
 
-/// The [`DeferredAdmission`] the middleware left for a handler, taken out of
+/// The [`DeferredAdmission`] the layer left for a handler, taken out of
 /// the request rather than cloned. `None` when admission does not run.
 pub(crate) struct PendingAdmission(pub(crate) Option<DeferredAdmission>);
 

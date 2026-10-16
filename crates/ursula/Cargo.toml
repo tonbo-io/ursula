@@ -85,5 +85,9 @@ ursula-raft = { workspace = true, features = ["fault-injection"] }
 name = "json_text"
 harness = false
 
+[[bench]]
+name = "front_door"
+harness = false
+
 [lints]
 workspace = true
