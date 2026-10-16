@@ -8,6 +8,15 @@ use crate::error_body::ErrorCode;
 use crate::fields;
 use crate::names;
 
+/// The request limit of the protocol, `Ursula-Max-Request-Bytes` (32 MiB):
+/// the largest request body any request to any stream may carry. A node
+/// accepts exactly this much. An intermediary may lower it for its own
+/// clients and never raises it: a body the node refuses for its size must
+/// meet the intermediary's own `413` first, since the node answers it
+/// before reading the body and the intermediary, still sending it, may see
+/// a reset instead (extensions Section 10).
+pub const MAX_REQUEST_BYTES: u64 = 32 << 20;
+
 /// The limit a `413 Payload Too Large` applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeLimit {

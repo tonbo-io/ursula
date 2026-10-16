@@ -28,6 +28,9 @@
 //! - the JSON body of every error answer,
 //!   `{"error":{"code":"<code>","message":"<detail>"}}`, with its stable
 //!   code (Section 11);
+//! - what an answer says about a write: [`classify`] reads every write
+//!   answer of the node and the gateway as one [`WriteOutcome`], and
+//!   [`write_outcome::INVENTORY`] lists them;
 //! - immutable reads: the path of a chunk or a snapshot of one incarnation,
 //!   the headers of their answers with the `Stream-Immutable` marker, and the
 //!   deployment's `Stream-Read-Origin` hint (Section 4).
@@ -73,7 +76,8 @@
 //!   answers, and [`ReadOrigin`], the read-origin hint.
 //! - [`range`]: [`ByteRange`], the range a snapshot read honors, and
 //!   [`ContentRange`], its answer.
-//! - [`limit`]: [`SizeLimit`], the limit a `413` applied,
+//! - [`limit`]: [`MAX_REQUEST_BYTES`], the protocol's request limit,
+//!   [`SizeLimit`], the limit a `413` applied,
 //!   [`StagedPartsLimit`], the staged-parts limit a `429` applied, and
 //!   [`lowered_request_limit`], the request limit an intermediary forwards.
 //! - [`routing`]: [`RoutingAnswer`], the `307` or `503` of a node that does
@@ -82,6 +86,9 @@
 //!   [`StreamClosedConflict`] and [`StreamSeqConflict`] (`409`).
 //! - [`error_body`]: [`ErrorBody`], the body of every error answer, and its
 //!   [`ErrorCode`].
+//! - [`write_outcome`]: [`classify`] and [`WriteOutcome`], what an answer
+//!   says about a write, with the inventory of every write answer (as data
+//!   with the `test-support` feature).
 //! - [`error`]: the one error, [`HeaderError`].
 
 pub mod answer;
@@ -97,6 +104,7 @@ pub mod request;
 pub mod routing;
 pub mod snapshot;
 pub mod value;
+pub mod write_outcome;
 
 mod fields;
 
@@ -127,6 +135,7 @@ pub use immutable::ImmutableSnapshotRead;
 pub use immutable::OriginScheme;
 pub use immutable::ReadOrigin;
 pub use immutable::ResourceKind;
+pub use limit::MAX_REQUEST_BYTES;
 pub use limit::SizeLimit;
 pub use limit::StagedPartsLimit;
 pub use limit::lowered_request_limit;
@@ -168,3 +177,6 @@ pub use value::STREAM_SEQ_MAX_BYTES;
 pub use value::Seq;
 pub use value::SnapshotDigest;
 pub use value::StreamSeq;
+pub use write_outcome::Keying;
+pub use write_outcome::WriteOutcome;
+pub use write_outcome::classify;

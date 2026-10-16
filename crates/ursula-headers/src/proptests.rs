@@ -62,6 +62,10 @@ use crate::value::Offset;
 use crate::value::ProducerId;
 use crate::value::Seq;
 use crate::value::SnapshotDigest;
+use crate::write_outcome::Keying;
+use crate::write_outcome::WriteOutcome;
+use crate::write_outcome::classify;
+use crate::write_outcome::proves_refusal;
 
 type Pairs = Vec<(&'static str, String)>;
 
@@ -672,6 +676,62 @@ proptest! {
         if let Some(code) = code {
             let body = ErrorBody::new(code, message);
             prop_assert_eq!(ErrorBody::parse(body.render().as_bytes()), Ok(body));
+        }
+    }
+
+    /// `classify` reads any answer without panicking, and its reading
+    /// follows the status: a `2xx` holds, a `4xx` other than `408` is a
+    /// refusal, a `307` or `308` redirects, and anything else is a refusal
+    /// only when its code proves one.
+    #[test]
+    fn classify_follows_the_status(
+        status in fuzz_status(),
+        headers in fuzz_headers(),
+        code in option::of(0..crate::error_body::ErrorCode::ALL.len()),
+    ) {
+        let body = code
+            .and_then(|index| crate::error_body::ErrorCode::ALL.get(index).cloned())
+            .map(|code| ErrorBody::fixed(code).render().into_bytes())
+            .unwrap_or_default();
+        let outcome = classify(Keying::Keyless, status, fuzz_iter(&headers), &body);
+        match status {
+            200..=299 => prop_assert!(outcome.holds()),
+            307 | 308 => prop_assert_eq!(outcome, WriteOutcome::Redirected),
+            408 => prop_assert!(!outcome.holds()),
+            400..=499 => prop_assert!(matches!(outcome, WriteOutcome::Refused(_))),
+            _ => match &outcome {
+                WriteOutcome::Refused(code) => prop_assert!(proves_refusal(status, code)),
+                other => prop_assert_eq!(other, &WriteOutcome::Unknown),
+            },
+        }
+    }
+
+    /// A typed producer answer classifies by its kind: a receipt holds, a
+    /// refusal carries the answer's own code, whatever the body says.
+    #[test]
+    fn producer_answers_classify_by_their_kind(
+        answer in producer_answer(),
+        code in 0..crate::error_body::ErrorCode::ALL.len(),
+    ) {
+        let pairs = rendered(|emit| answer.render(emit));
+        let body = crate::error_body::ErrorCode::ALL
+            .get(code)
+            .cloned()
+            .map(|code| ErrorBody::fixed(code).render().into_bytes())
+            .unwrap_or_default();
+        let outcome = classify(Keying::Producer, answer.status(), iter(&pairs), &body);
+        match answer {
+            ProducerAnswer::Receipt { delivery: Delivery::Applied, .. } => {
+                prop_assert_eq!(outcome, WriteOutcome::Applied);
+            }
+            ProducerAnswer::Receipt { delivery: Delivery::Repeat, .. }
+            | ProducerAnswer::ReceiptEvicted { .. } => {
+                prop_assert_eq!(outcome, WriteOutcome::Repeat);
+            }
+            refusal => prop_assert_eq!(
+                Some(outcome),
+                refusal.error_code().map(WriteOutcome::Refused)
+            ),
         }
     }
 }
