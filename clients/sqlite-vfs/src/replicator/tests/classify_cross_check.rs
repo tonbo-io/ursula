@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use ursula_headers::Keying;
+use ursula_headers::WriteKind;
 use ursula_headers::WriteOutcome;
 use ursula_headers::classify;
 use ursula_headers::write_outcome::inventory::INVENTORY;
@@ -99,6 +99,10 @@ const KEYED_ONLY: &str =
 const NOT_URSULA: &str = "a keyed success without its receipt is no answer of Ursula's: the VFS \
                           blocks, which sends the identical request again every 30 s";
 
+const UNTYPED: &str = "a success without the typed answer Ursula sends for the write is no \
+                       answer of Ursula's: the VFS rejects it and blocks, which sends the \
+                       identical request again every 30 s";
+
 macro_rules! expected {
     ($($id:literal => $append:ident, $claim:tt, $snapshot:ident, $reason:expr;)+) => {
         &[$(Expected {
@@ -127,6 +131,7 @@ const EXPECTED: &[Expected] = expected! {
     "create-matching" => Blocked, -, Decides, ELSEWHERE;
     "snapshot-published" => Blocked, -, Decides, ELSEWHERE;
     "part-staged" => Blocked, -, Decides, ELSEWHERE;
+    "parts-discarded" => Blocked, -, Decides, ELSEWHERE;
     "parts-commit-published" => Blocked, -, Decides, ELSEWHERE;
     "redirect" => Redirect, Redirect, Decides, "";
     "producer-epoch-closed" => Reset, Lost, Decides, "";
@@ -145,6 +150,9 @@ const EXPECTED: &[Expected] = expected! {
     "incarnation-mismatch" => Head, Head, Decides, "";
     "too-large" => LowerLimit, -, Decides, "";
     "producer-limit" => Resend, Resend, Resend, SAFE_RESEND;
+    // Unlike every other `429`, the snapshotter decides on this one
+    // (`transient_part`): no repeat of the part lifts the stream's bound.
+    "staged-parts-limit" => Resend, -, Decides, SAFE_RESEND;
     "no-cold-store" => Resend, -, Decides, SAFE_RESEND;
     "no-leader-before-body" => Resend, Resend, Resend, SAFE_RESEND;
     "no-leader-before-proposal" => Resend, Resend, Resend, SAFE_RESEND;
@@ -186,6 +194,7 @@ const EXPECTED: &[Expected] = expected! {
     "foreign-408" => Resend, Resend, Resend, "";
     "foreign-5xx" => Resend, Resend, Resend, "";
     "keyed-2xx-without-receipt" => Blocked, Blocked, Decides, NOT_URSULA;
+    "keyless-2xx-untyped" => Blocked, -, Decides, UNTYPED;
     "transport-failure" => Resend, Resend, Resend, "";
 };
 
@@ -251,6 +260,7 @@ fn request_of(write: Write, keyed_seq: u64) -> Request {
             None,
             false,
         ),
+        Write::PartsDiscard => with(Method::Delete, Target::StagedParts, None, false),
     }
 }
 
@@ -366,14 +376,23 @@ fn the_vfs_and_classify_agree_on_every_inventory_row() {
                 "{id}: {vfs:?} is unsafe for {outcome:?}"
             );
         }
-        // The snapshotter's writes carry no producer key.
-        let keyless = row
-            .sample()
-            .expect("a sample")
-            .map_or(WriteOutcome::NO_ANSWER, |sample| {
-                classify(Keying::Keyless, sample.status, sample.pairs(), &sample.body)
-            });
-        if keyless == WriteOutcome::Unknown {
+        // The snapshotter sends again every answer that may have applied. A
+        // success it decides on (`decided`) counts as published only with the
+        // typed snapshot, so an untyped one never passes for a publish.
+        let as_snapshot =
+            row.sample()
+                .expect("a sample")
+                .map_or(WriteOutcome::NO_ANSWER, |sample| {
+                    let kind = match row.write {
+                        Write::PartStage => WriteKind::PartStage,
+                        _ => WriteKind::Publish,
+                    };
+                    if (200..300).contains(&sample.status) {
+                        return WriteOutcome::Applied;
+                    }
+                    classify(kind, sample.status, sample.pairs(), &sample.body)
+                });
+        if as_snapshot == WriteOutcome::Unknown {
             assert_eq!(
                 snapshot,
                 Snap::Resend,

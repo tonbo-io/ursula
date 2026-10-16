@@ -44,9 +44,9 @@ use axum::http::Version;
 use axum::http::header::LOCATION;
 use axum::http::header::RETRY_AFTER;
 use ursula_headers::Delivery;
-use ursula_headers::Keying;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::RoutingAnswer;
+use ursula_headers::WriteKind;
 use ursula_headers::WriteOutcome;
 use ursula_headers::classify;
 
@@ -428,7 +428,7 @@ impl Ledger {
     fn check_outcome(&mut self, trace: &mut SimTrace, write: Write, response: &Response<Bytes>) {
         let slot = (write.producer, write.seq);
         match classify(
-            Keying::Producer,
+            WriteKind::Producer,
             response.status().as_u16(),
             header_pairs(response),
             response.body(),

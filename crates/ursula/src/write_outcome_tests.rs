@@ -37,10 +37,10 @@ use ursula_gateway::refusal::EmbedderRefusal;
 use ursula_gateway::uploads::UploadLimits;
 use ursula_gateway::uploads::UploadLimitsSpec;
 use ursula_headers::ErrorBody;
-use ursula_headers::Keying;
 use ursula_headers::PartStaged;
 use ursula_headers::PartsCommit;
 use ursula_headers::PartsManifest;
+use ursula_headers::WriteKind;
 use ursula_headers::WriteOutcome;
 use ursula_headers::classify;
 use ursula_headers::names;
@@ -162,8 +162,8 @@ impl Answer {
             .map(|(name, value)| (name.as_str(), value.as_slice()))
     }
 
-    fn outcome(&self, keying: Keying) -> WriteOutcome {
-        classify(keying, self.status, self.pairs(), &self.body)
+    fn outcome(&self, kind: WriteKind) -> WriteOutcome {
+        classify(kind, self.status, self.pairs(), &self.body)
     }
 
     /// The names of the protocol's typed headers the answer carries.
@@ -661,7 +661,11 @@ impl Node {
             .with_wal_disk_monitor(wal_disk.clone());
         // Peer 2 is this node itself: a redirect to it is a redirect the
         // gateway can follow, and it answers each hop with a redirect again.
-        state.client_write_router = Some(ClientWriteLeaderRouter::new([(2, url.clone())]));
+        state.fields_mut().client_write_router =
+            Some(ClientWriteLeaderRouter::new([(2, url.clone())]));
+        // A stream holds two staged, unused parts at most, so the third is
+        // refused for the bound.
+        state.set_staged_parts(crate::staged_parts::StagedParts::for_test(2, u64::MAX));
         let admission = match budget {
             Some(bytes) => IngressAdmission::new(&ursula_config::ServerConfig {
                 http_inflight_body_size: ursula_config::HumanSize::bytes(bytes),
@@ -879,6 +883,23 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
         }
         "part-staged" => {
             node.create(path, OCTET, b"abc").await;
+            let target = format!("{path}/snapshot/3/parts");
+            node.send(via, request("POST", &target, &[], b"part")).await
+        }
+        "parts-discarded" => {
+            node.create(path, OCTET, b"abc").await;
+            node.stage(path, b"part").await;
+            node.send(
+                via,
+                request("DELETE", &format!("{path}/snapshot/parts"), &[], b""),
+            )
+            .await
+        }
+        "staged-parts-limit" => {
+            node.create(path, OCTET, b"abc").await;
+            for _ in 0..2 {
+                node.stage(path, b"part").await;
+            }
             let target = format!("{path}/snapshot/3/parts");
             node.send(via, request("POST", &target, &[], b"part")).await
         }
@@ -1369,7 +1390,7 @@ fn assert_row(row: &Row, answer: &Answer, via: Via) {
     let context = format!("{} via {via:?}: {answer:?}", row.id);
     assert_eq!(answer.status, row.status, "{context}");
     assert_eq!(answer.code(), row.code, "{context}");
-    assert_eq!(answer.outcome(row.write.keying()), row.outcome, "{context}");
+    assert_eq!(answer.outcome(row.write.kind()), row.outcome, "{context}");
     // The live answer carries every typed header its sample claims, so the
     // samples the clients' cross-checks read are the answers they get, and
     // a producer answer is one exactly when the sample is.
@@ -1517,7 +1538,7 @@ async fn only_a_write_answers_outcome_unknown_for_a_forward() {
         .with_leader_term(leader.map(|_| 7)),
     };
     let read = |leader| {
-        crate::runtime_error_or_leader_redirect_async(&node.state, forward(leader), "/wout/s")
+        crate::read_error_or_leader_redirect_async(&node.state, forward(leader), "/wout/s")
     };
     let write = |leader| {
         crate::write_error_or_leader_redirect_async(&node.state, forward(leader), "/wout/s")

@@ -39,11 +39,11 @@ use crate::SnapshotAnswer;
 use crate::SnapshotBody;
 use crate::SnapshotResource;
 use crate::read_at_token;
+use crate::read_error_or_leader_redirect_async;
 use crate::read_precondition_failed;
 use crate::render::chunk_response;
 use crate::render::error_response;
 use crate::request_target;
-use crate::runtime_error_or_leader_redirect_async;
 use crate::snapshot_answer;
 
 /// The route of a chunk.
@@ -152,9 +152,7 @@ pub(crate) async fn read_chunk(
             }
             chunk_response(response, max_len, &headers)
         }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
+        Err(err) => read_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await,
     }
 }
 

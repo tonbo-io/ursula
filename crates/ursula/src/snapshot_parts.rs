@@ -1076,8 +1076,7 @@ pub(crate) async fn discard_snapshot_parts(
             None => head.incarnation,
         },
         Err(err) => {
-            return crate::runtime_error_or_leader_redirect_async(&state, err, &request_target)
-                .await;
+            return crate::write_error_or_leader_redirect_async(&state, err, &request_target).await;
         }
     };
     let raft_group_id = state.runtime.locate(&stream_id).raft_group_id;

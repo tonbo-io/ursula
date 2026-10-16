@@ -2526,8 +2526,7 @@ pub(crate) async fn export_backup_group(
     let snapshot = match state.runtime.snapshot_group(raft_group_id).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            return runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri))
-                .await;
+            return read_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await;
         }
     };
     let body = match rmp_serde::to_vec_named(&snapshot.stream_snapshot) {
@@ -3851,7 +3850,7 @@ pub(crate) async fn head_stream_by_id(
             );
             (StatusCode::OK, headers).into_response()
         }
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => read_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -3936,7 +3935,7 @@ pub(crate) async fn read_stream_by_id(
         {
             Ok(owner) => owner,
             Err(err) => {
-                return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
+                return read_error_or_leader_redirect_async(&state, err, &request_target).await;
             }
         };
         let offset = start.unwrap_or(owner.head.tail_offset);
@@ -4024,7 +4023,7 @@ pub(crate) async fn read_stream_by_id(
                 read_response(response, &headers, None)
             }
         }
-        Err(err) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Err(err) => read_error_or_leader_redirect_async(&state, err, &request_target).await,
     }
 }
 
@@ -4573,7 +4572,7 @@ pub(crate) async fn snapshot_answer(
             response_headers.insert(CONTENT_LENGTH, HeaderValue::from(len));
             uncompressed((status, response_headers, body).into_response())
         }
-        Err(err) => runtime_error_or_leader_redirect_async(state, err, request_target).await,
+        Err(err) => read_error_or_leader_redirect_async(state, err, request_target).await,
     }
 }
 
@@ -4618,9 +4617,7 @@ pub(crate) async fn bootstrap_stream(
                 Some(object) => cold_snapshot::bootstrap_response(&state, response, object).await,
             }
         }
-        Err(err) => {
-            runtime_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await
-        }
+        Err(err) => read_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await,
     }
 }
 
@@ -4677,7 +4674,7 @@ pub(crate) async fn read_offset(
             Ok(head) => Ok(head.tail_offset),
             Err(err) => {
                 let response =
-                    runtime_error_or_leader_redirect_async(state, err, request_target).await;
+                    read_error_or_leader_redirect_async(state, err, request_target).await;
                 Err(Box::new(response))
             }
         },
@@ -4736,7 +4733,7 @@ pub(crate) async fn long_poll_stream(
                 }],
             ),
         };
-        return runtime_error_or_leader_redirect_async(&state, err, &request_target).await;
+        return read_error_or_leader_redirect_async(&state, err, &request_target).await;
     }
     let incarnation = if_incarnation.or((head.incarnation != 0).then_some(head.incarnation));
     let timeout_ms = long_poll_timeout_ms(query);
@@ -4767,7 +4764,7 @@ pub(crate) async fn long_poll_stream(
                 )
             }
         }
-        Ok(Err(err)) => runtime_error_or_leader_redirect_async(&state, err, &request_target).await,
+        Ok(Err(err)) => read_error_or_leader_redirect_async(&state, err, &request_target).await,
         // The requested offset (the 416 check above keeps it within the
         // owner's tail) and the incarnation the waiter is pinned to.
         // `Stream-Up-To-Date` and `Stream-Closed` hold as the owner read
@@ -5306,9 +5303,11 @@ pub(crate) enum Access {
     Write,
 }
 
-/// The answer to a failed read: a redirect to the leader its error names,
-/// else the runtime's answer.
-pub(crate) async fn runtime_error_or_leader_redirect_async(
+/// The answer to a failed read, which proposes nothing: a redirect to the
+/// leader its error names, else the runtime's answer. A write never uses it,
+/// since a write's forward after its proposal must answer
+/// `OUTCOME_UNKNOWN` ([`write_error_or_leader_redirect_async`]).
+pub(crate) async fn read_error_or_leader_redirect_async(
     state: &HttpState,
     err: RuntimeError,
     request_target: &str,
