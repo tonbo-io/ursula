@@ -16,6 +16,11 @@ ADMIN_PORT=${ADMIN_PORT:-4438}
 # Local end of each port-forward. Node ids are one-based and pod ordinals are
 # zero-based, so node N listens on BASE + N - 1.
 FORWARD_PORT_BASE=${FORWARD_PORT_BASE:-15438}
+# Peer host parts: global.clusterDomain and the chart's headless Service. They
+# must match the chart's [[raft.peers]] urls, because learner attachment
+# persists http_url in Raft membership.
+CLUSTER_DOMAIN=${CLUSTER_DOMAIN:-cluster.local}
+HEADLESS_SERVICE=${HEADLESS_SERVICE:-${STATEFULSET}-headless}
 
 CTL=${CTL:-/tools/ursulactl}
 STATE_CONFIGMAP="${STATEFULSET}-rollout-state"
@@ -42,8 +47,9 @@ write_manifest() {
       # membership, and peers dial it.
       printf '      "metrics_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
       printf '      "host": "%s-%s",\n' "${STATEFULSET}" "${ordinal}"
-      printf '      "http_url": "http://%s-%s.%s-headless.%s.svc.cluster.local:%s"\n' \
-        "${STATEFULSET}" "${ordinal}" "${STATEFULSET}" "${NAMESPACE}" "${CLUSTER_PORT}"
+      printf '      "http_url": "http://%s-%s.%s.%s.svc.%s:%s"\n' \
+        "${STATEFULSET}" "${ordinal}" "${HEADLESS_SERVICE}" "${NAMESPACE}" \
+        "${CLUSTER_DOMAIN}" "${CLUSTER_PORT}"
       printf '    }'
       ordinal=$((ordinal + 1))
     done

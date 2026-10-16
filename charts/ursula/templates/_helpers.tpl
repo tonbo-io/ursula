@@ -434,10 +434,6 @@ Validate gateway values before manifests are accepted.
 {{- end -}}
 
 {{/*
-The port peers dial for the cluster plane: server.ports.cluster when the
-cluster plane listens apart (server.clusterListen), else server.ports.client.
-*/}}
-{{/*
 Selector labels of the Helm test pod. Its name label differs from the server
 pods', so the release label does not put it behind the server Services.
 */}}
@@ -447,6 +443,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 app.kubernetes.io/component: helm-test
 {{- end -}}
 
+{{/*
+The port peers dial for the cluster plane: server.ports.cluster when the
+cluster plane listens apart (server.clusterListen), else server.ports.client.
+*/}}
 {{- define "ursula.clusterPort" -}}
 {{- if .Values.server.clusterListen -}}
 {{- .Values.server.ports.cluster | int -}}

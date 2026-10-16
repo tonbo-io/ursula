@@ -9,7 +9,7 @@ global:
     pullPolicy: IfNotPresent
   # Optional image pull secrets, rendered as `imagePullSecrets`.
   imagePullSecrets: []
-  # Kubernetes cluster DNS domain used for generated peer FQDNs and gateway upstreams.
+  # Kubernetes cluster DNS domain used for generated peer FQDNs, the cluster manifests and gateway upstreams. Set it before the first install: a voter whose peer URL changed refuses to start.
   clusterDomain: cluster.local
 
 # Override the chart name portion of generated resource names.
