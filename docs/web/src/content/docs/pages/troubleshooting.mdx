@@ -116,6 +116,20 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 
 `server.listen`, `server.cluster_listen` or `server.admin_listen` is taken. The client plane and inter-node gRPC share `server.listen` unless `server.cluster_listen` is set.
 
+### `raft group … records node … at …, but raft.peers configures …`
+
+The node exits at startup with:
+
+```text
+error: raft group 3 records node 2 at http://ursula-1.ursula-headless.ursula.svc.cluster.local:4437, but raft.peers configures http://ursula-1.ursula-headless.ursula.svc.cluster.local:4439: a node's Raft url (and server.cluster_listen) cannot change after its groups are initialized
+```
+
+This is `PeerAddressChanged`. Each group records every member's Raft address when it first initializes, and peers dial that recorded address from then on. The node's own `[[raft.peers]].url` no longer matches it. The host, the port or both changed, for example because `server.cluster_listen` moved the cluster plane to another port, or because the chart's `server.clusterListen`, `server.ports.cluster` or `global.clusterDomain` changed after the first install. A node serving at the new address would get no Raft traffic, so it refuses to start.
+
+Restore the recorded address the error names and roll the node again. With the Helm chart, set `server.clusterListen`, `server.ports.cluster` and `global.clusterDomain` back to the values of the first install. Outside the chart, restore the `url` and the `server.cluster_listen` port. Every node of the cluster needs the same peer list, so revert the change on all of them.
+
+Ursula 0.8 cannot change a recorded peer address in place. To move a cluster to a new address, install a fresh cluster at that address. [Issue #633](https://github.com/tonbo-io/ursula/issues/633) tracks migrating a recorded address without a fresh install.
+
 ### `raft WAL directory … holds data without a format marker`
 
 The data directory was written by Ursula 0.5.x or earlier (format epoch 1). This release reads format epoch 4 only and has no in-place upgrade. Start on an empty `raft.wal.path` and a new object-storage prefix, or run the release that wrote it.
