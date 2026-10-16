@@ -4526,6 +4526,7 @@ dependencies = [
  "toml",
  "tracing",
  "url",
+ "ursula-headers",
  "ursula-observability",
  "ursula-proto",
  "ursula-stream",
@@ -4564,6 +4565,7 @@ name = "ursula-headers"
 version = "0.7.5"
 dependencies = [
  "proptest",
+ "serde",
 ]
 
 [[package]]
@@ -4620,6 +4622,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 1.0.69",
+ "ursula-headers",
 ]
 
 [[package]]

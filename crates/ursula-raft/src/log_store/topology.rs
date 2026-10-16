@@ -99,6 +99,36 @@ impl TopologyDecision {
     }
 }
 
+/// The cluster id `root` holds, if it holds one. Reads only.
+fn stored_cluster_id(root: &Path) -> Result<Option<ClusterId>, RaftWalError> {
+    let path = root.join(TOPOLOGY_FILE);
+    state_file::read::<TopologyFile>(StateFileKind::Topology, &path)
+        .map_err(RaftWalError::ReadTopology)?
+        .map(|file| {
+            ClusterId::new(file.cluster_id.clone()).map_err(|_invalid| {
+                RaftWalError::InvalidStoredClusterId {
+                    root: root.to_owned(),
+                    stored: file.cluster_id,
+                }
+            })
+        })
+        .transpose()
+}
+
+/// Refuses `configured` when `root` already holds another cluster id, the
+/// check [`check_or_create`] makes, without taking the root's lock or writing
+/// anything. A root without a topology file passes.
+pub(super) fn check_cluster_id(root: &Path, configured: &ClusterId) -> Result<(), RaftWalError> {
+    match stored_cluster_id(root)? {
+        Some(stored) if stored != *configured => Err(RaftWalError::ClusterIdMismatch {
+            root: root.to_owned(),
+            stored,
+            configured: configured.clone(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 /// Called under the root lock, before recovery or run-state writes. Returns
 /// the root's cluster id.
 pub(super) fn check_or_create(

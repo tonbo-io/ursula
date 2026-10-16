@@ -128,7 +128,6 @@ use ursula_raft::RAFT_GRPC_APPEND_STREAM_PATH;
 use ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_READ_PATH;
 use ursula_raft::RAFT_GRPC_GROUP_WRITE_PATH;
-use ursula_raft::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use ursula_raft::RAFT_GRPC_REJOIN_BARRIER_PATH;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
@@ -373,6 +372,7 @@ impl HttpState {
     /// provider is installed.
     pub fn register_otel_metrics(&self) {
         otel_metrics::register(&self.runtime.metrics());
+        otel_metrics::register_cluster(self.cluster_id(), self.raft_registry.clone());
         if let Some(raft_wal) = &self.raft_wal {
             otel_metrics::register_wal_recovery(raft_wal.recovery_state());
         }
@@ -530,6 +530,28 @@ impl HttpState {
     /// The id this node sends as `Ursula-Cluster-Id`.
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
+    }
+
+    /// Peers refused on the Raft gRPC plane for another cluster id, in the
+    /// shape readiness and metrics report them.
+    fn peer_cluster_mismatches(&self) -> Vec<ursula_proto::admin::PeerClusterMismatch> {
+        self.raft_registry()
+            .map(|registry| registry.peer_cluster().mismatches())
+            .unwrap_or_default()
+    }
+
+    /// Raft RPCs refused for a cluster-id mismatch since start, both ways.
+    fn peer_cluster_refusals(&self) -> u64 {
+        self.raft_registry()
+            .map_or(0, |registry| registry.peer_cluster().refusals())
+    }
+
+    /// Inbound Raft RPCs refused since start because they named no cluster
+    /// id.
+    fn unidentified_peer_refusals(&self) -> u64 {
+        self.raft_registry().map_or(0, |registry| {
+            registry.peer_cluster().unidentified_refusals()
+        })
     }
 
     pub(crate) fn raft_wal(&self) -> Option<&ursula_raft::RaftWal> {
@@ -973,13 +995,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for HttpRaftGrpcSer
 fn raft_grpc_service(
     state: HttpState,
     registry: RaftGroupHandleRegistry,
-) -> raft_internal_proto::raft_internal_server::RaftInternalServer<HttpRaftGrpcService> {
-    raft_internal_proto::raft_internal_server::RaftInternalServer::new(HttpRaftGrpcService::new(
-        registry, state,
-    ))
-    .accept_compressed(tonic::codec::CompressionEncoding::Zstd)
-    .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-    .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+) -> ursula_raft::RaftGrpcServer<HttpRaftGrpcService> {
+    let peer_cluster = registry.peer_cluster().clone();
+    ursula_raft::raft_grpc_server(HttpRaftGrpcService::new(registry, state), &peer_cluster)
 }
 
 pub fn router(runtime: ShardRuntime) -> Router {
@@ -1300,7 +1318,27 @@ pub fn cluster_router_from_state(state: HttpState) -> Router {
         .route(LEADERSHIP_SHED_PATH, get(leadership_shed_status))
         .route(CLUSTER_PROBE_PATH, post(cluster_probe))
         .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES))
+        .layer(axum::middleware::map_request(with_peer_address))
         .with_state(state)
+}
+
+/// Hands a Raft RPC's peer address to tonic, whose cluster-id check logs
+/// the address of a refused sender (`tonic::Request::remote_addr`). Axum
+/// records it as `ConnectInfo`, where tonic does not look.
+async fn with_peer_address<B>(mut request: axum::http::Request<B>) -> axum::http::Request<B> {
+    if let Some(axum::extract::ConnectInfo(remote)) = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .copied()
+    {
+        request
+            .extensions_mut()
+            .insert(tonic::transport::server::TcpConnectInfo {
+                local_addr: None,
+                remote_addr: Some(remote),
+            });
+    }
+    request
 }
 
 /// Builds a `200`-style JSON response with the `application/json` content type.
@@ -1322,6 +1360,37 @@ pub(crate) const READINESS_PATH: &str = "/__ursula/ready";
 /// admission, so a node under write pressure still answers its peers.
 async fn cluster_probe(_body: Bytes) -> StatusCode {
     StatusCode::OK
+}
+
+/// What readiness decides on, besides the reports it carries.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReadinessFacts {
+    pub(crate) format_epoch_mismatch: bool,
+    pub(crate) wal_disk_pressure: bool,
+    pub(crate) recovery_stalled: bool,
+    pub(crate) recovery_ready: bool,
+    pub(crate) raft_ready: bool,
+}
+
+/// The reason readiness names: the first of the causes that apply, in this
+/// order. Peers of another cluster are never a reason.
+pub(crate) fn readiness_reason(
+    facts: ReadinessFacts,
+) -> Option<ursula_proto::admin::ServingReadinessReason> {
+    use ursula_proto::admin::ServingReadinessReason as Reason;
+    if facts.format_epoch_mismatch {
+        Some(Reason::FormatEpochMismatch)
+    } else if facts.wal_disk_pressure {
+        Some(Reason::WalDiskPressure)
+    } else if facts.recovery_stalled {
+        Some(Reason::RecoveryStalled)
+    } else if !facts.recovery_ready {
+        Some(Reason::RecoveryGateClosed)
+    } else if !facts.raft_ready {
+        Some(Reason::RaftReplicaUnready)
+    } else {
+        None
+    }
 }
 
 async fn readiness(State(state): State<HttpState>) -> Response {
@@ -1354,24 +1423,23 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    use ursula_proto::admin::ServingReadinessReason as Reason;
     (
         status,
         axum::Json(ursula_proto::admin::ServingReadiness {
             ready,
-            reason: if format_epoch_mismatch {
-                Some(Reason::FormatEpochMismatch)
-            } else if disk.pressure {
-                Some(Reason::WalDiskPressure)
-            } else if !stalled_groups.is_empty() {
-                Some(Reason::RecoveryStalled)
-            } else if !recovery_ready {
-                Some(Reason::RecoveryGateClosed)
-            } else if !raft_ready {
-                Some(Reason::RaftReplicaUnready)
-            } else {
-                None
-            },
+            reason: readiness_reason(ReadinessFacts {
+                format_epoch_mismatch,
+                wal_disk_pressure: disk.pressure,
+                recovery_stalled: !stalled_groups.is_empty(),
+                recovery_ready,
+                raft_ready,
+            }),
+            cluster_id: state.cluster_id().clone(),
+            // Configured peers refused for another cluster id. Reported
+            // beside the reason, never as one: one misconfigured node must
+            // not take its healthy peers out of service, nor hide why a node
+            // is unready.
+            peer_cluster_mismatches: state.peer_cluster_mismatches(),
             format_epoch_mismatch,
             recovery_barriers_ready: recovery_ready,
             raft_maintenance,
@@ -1392,7 +1460,7 @@ async fn leadership_shed_status(State(state): State<HttpState>) -> Response {
             .raft_registry()
             .cloned()
             .unwrap_or_default()
-            .participation_status(),
+            .participation_status(state.cluster_id().clone()),
     )
     .into_response()
 }
@@ -1828,6 +1896,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     let wal_disk = state.wal_disk.snapshot();
     axum::Json(render::MetricsResponse {
         node: ursula_proto::admin::NodeMetrics {
+            cluster_id: state.cluster_id().clone(),
             maintenance_fence: state.admin_fence.snapshot().await,
             maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
             process_incarnation: state.process_incarnation.clone(),
@@ -1863,6 +1932,9 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         wal_resume_available_bytes: wal_disk.resume_available_bytes,
         wal_disk_pressure: wal_disk.pressure,
         wal_disk_stat_errors: wal_disk.stat_errors,
+        raft_grpc_peer_cluster_refusals: state.peer_cluster_refusals(),
+        raft_grpc_unidentified_peer_refusals: state.unidentified_peer_refusals(),
+        peer_cluster_mismatches: state.peer_cluster_mismatches(),
     })
     .into_response()
 }

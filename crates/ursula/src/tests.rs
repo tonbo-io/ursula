@@ -603,6 +603,12 @@ struct StaticGrpcTestNodeStorage {
     snapshot_store: Option<ursula_runtime::SharedSnapshotStore>,
 }
 
+/// The cluster every static gRPC test node is in: peers refuse a node of
+/// another cluster.
+fn static_test_cluster_id() -> ursula_headers::ClusterId {
+    ursula_headers::ClusterId::new("static-grpc-test").expect("a valid cluster id")
+}
+
 async fn spawn_static_grpc_test_node(
     node_id: u64,
     listener: tokio::net::TcpListener,
@@ -621,10 +627,11 @@ async fn spawn_static_grpc_test_node(
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
     let (log_stores, wal_root) = match storage.raft_log_dir {
         Some(raft_log_dir) => (
-            ursula_raft::RaftWal::start(
+            ursula_raft::RaftWal::start_in_cluster(
                 raft_log_dir,
-                ursula_config::WalFsync::Always,
+                ursula_raft::JournalTuning::new(ursula_config::WalFsync::Always),
                 &ursula_shard::StaticShardMap::new(1, raft_group_count).expect("valid topology"),
+                Some(&static_test_cluster_id()),
             )
             .expect("start the Raft WAL"),
             None,
@@ -632,11 +639,12 @@ async fn spawn_static_grpc_test_node(
         None => {
             let wal_root = tempfile::tempdir().expect("WAL root");
             (
-                ursula_raft::RaftWal::start(
+                ursula_raft::RaftWal::start_in_cluster(
                     wal_root.path(),
-                    ursula_config::WalFsync::Never,
+                    ursula_raft::JournalTuning::new(ursula_config::WalFsync::Never),
                     &ursula_shard::StaticShardMap::new(1, raft_group_count)
                         .expect("valid topology"),
+                    Some(&static_test_cluster_id()),
                 )
                 .expect("start the Raft WAL"),
                 Some(wal_root),
@@ -665,12 +673,16 @@ async fn spawn_static_grpc_test_node(
     let runtime =
         ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, storage.cold_store)
             .expect("runtime");
-    let app = router_with_static_raft_cluster_topology(
-        runtime.clone(),
-        registry.clone(),
-        node_id,
-        router_peers,
-        storage.per_group_voters,
+    // Its answers name the cluster its WAL holds, as a server's do.
+    let app = router_with_http_state(
+        HttpState::with_static_raft_cluster_topology(
+            runtime.clone(),
+            registry.clone(),
+            Some(node_id),
+            router_peers,
+            storage.per_group_voters,
+        )
+        .with_configured_cluster_id(Some(static_test_cluster_id())),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let served = app.clone();
@@ -2084,6 +2096,18 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
 }
 
+/// A transport that sends as a node of `registry`'s cluster.
+fn peer_transport(registry: &RaftGroupHandleRegistry) -> Arc<ursula_raft::CoreRaftTransport> {
+    let identity = registry
+        .peer_cluster()
+        .identity()
+        .expect("the engine factory bound the registry's cluster");
+    Arc::new(ursula_raft::CoreRaftTransport::new(
+        identity,
+        ursula_raft::PeerCluster::default(),
+    ))
+}
+
 #[tokio::test]
 async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -2096,7 +2120,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .warm_group(RaftGroupId(0))
         .await
         .expect("warm raft group");
-    let app = router_with_raft_registry(runtime.clone(), registry);
+    let app = router_with_raft_registry(runtime.clone(), registry.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -2146,7 +2170,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     assert!(!observed.maintenance_fence_uncertain);
 
     let mut network = ursula_raft::GrpcRaftNetwork::new(
-        Arc::default(),
+        peer_transport(&registry),
         RaftGroupId(0),
         1,
         format!("http://{addr}"),
@@ -2159,7 +2183,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .expect("send vote over gRPC Raft network");
 
     let mut missing_group = ursula_raft::GrpcRaftNetwork::new(
-        Arc::default(),
+        peer_transport(&registry),
         RaftGroupId(1),
         1,
         format!("http://{addr}"),
@@ -4079,8 +4103,12 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .await
         .expect("build leader snapshot");
     let vote = ursula_raft::UrsulaVote::new(1, 1);
-    let mut snapshot_network =
-        ursula_raft::GrpcRaftNetwork::new(Arc::default(), RaftGroupId(0), 2, peers[1].1.clone());
+    let mut snapshot_network = ursula_raft::GrpcRaftNetwork::new(
+        peer_transport(&nodes[0].registry),
+        RaftGroupId(0),
+        2,
+        peers[1].1.clone(),
+    );
     let _: SnapshotResponse<UrsulaRaftTypeConfig> = snapshot_network
         .full_snapshot(
             vote,
@@ -9409,6 +9437,7 @@ mod leadership_shed {
                         }
                         let should_campaign = answer.load(Ordering::SeqCst);
                         Json(LeadershipShedStatus {
+                            cluster_id: crate::tests::static_test_cluster_id(),
                             bits: 0,
                             state: String::new(),
                             should_accept_transfer: should_campaign,
@@ -9649,7 +9678,7 @@ mod leadership_shed {
             "{leaders:?}"
         );
         // A cold-health shed keeps the node in elections.
-        assert!(node_1.registry.participation_status().should_campaign);
+        assert!(node_1.registry.should_campaign());
         cluster.shutdown().await;
     }
 }
@@ -12141,4 +12170,48 @@ async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejection
         assert_eq!(body.rejection, Some(reason));
         assert!(!body.transferred);
     }
+}
+
+/// Readiness names the first cause that applies, in a fixed order, and a
+/// peer of another cluster is none of them: it is reported beside the
+/// reason, so it neither hides a stall or a closed gate nor fails a healthy
+/// node.
+#[test]
+fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
+    use ursula_proto::admin::ServingReadinessReason as Reason;
+
+    use crate::ReadinessFacts;
+    use crate::readiness_reason;
+    let healthy = ReadinessFacts {
+        recovery_ready: true,
+        raft_ready: true,
+        ..ReadinessFacts::default()
+    };
+    assert_eq!(readiness_reason(healthy), None);
+    let mut facts = ReadinessFacts {
+        format_epoch_mismatch: true,
+        wal_disk_pressure: true,
+        recovery_stalled: true,
+        recovery_ready: false,
+        raft_ready: false,
+    };
+    let mut order = Vec::new();
+    while let Some(reason) = readiness_reason(facts) {
+        order.push(reason.clone());
+        match reason {
+            Reason::FormatEpochMismatch => facts.format_epoch_mismatch = false,
+            Reason::WalDiskPressure => facts.wal_disk_pressure = false,
+            Reason::RecoveryStalled => facts.recovery_stalled = false,
+            Reason::RecoveryGateClosed => facts.recovery_ready = true,
+            Reason::RaftReplicaUnready => facts.raft_ready = true,
+            Reason::Unknown => panic!("the server never names an unknown reason"),
+        }
+    }
+    assert_eq!(order, vec![
+        Reason::FormatEpochMismatch,
+        Reason::WalDiskPressure,
+        Reason::RecoveryStalled,
+        Reason::RecoveryGateClosed,
+        Reason::RaftReplicaUnready,
+    ]);
 }

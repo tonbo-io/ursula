@@ -254,6 +254,9 @@ pub struct RaftGroupHandleRegistry {
     snapshot_install: SnapshotInstallCoordinator,
     /// How this node's Raft WAL opened, when its logs are durable.
     wal_opening: Arc<Mutex<Option<WalOpening>>>,
+    /// This node's cluster identity on the Raft gRPC plane and the peers
+    /// refused for another cluster id.
+    peer_cluster: crate::peer_cluster::PeerCluster,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -270,6 +273,7 @@ impl Default for RaftGroupHandleRegistry {
             snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
             wal_opening: Arc::new(Mutex::new(None)),
+            peer_cluster: crate::peer_cluster::PeerCluster::default(),
         }
     }
 }
@@ -515,6 +519,12 @@ impl RaftGroupHandleRegistry {
             .wal_opening
             .lock()
             .unwrap_or_else(|poison| poison.into_inner()) = Some(opening);
+    }
+
+    /// This node's side of the cluster-id check between peers: its identity
+    /// once an engine factory binds its WAL's, and the peers it refused.
+    pub fn peer_cluster(&self) -> &crate::peer_cluster::PeerCluster {
+        &self.peer_cluster
     }
 
     /// How this node's Raft WAL opened; `None` until a WAL is attached.
@@ -908,17 +918,27 @@ impl RaftGroupHandleRegistry {
         self.leadership_shed_state().is_shed()
     }
 
-    /// A node cannot receive a planned leadership handoff until the recovery
-    /// gate of every registered group is open.
-    pub fn participation_status(&self) -> ursula_proto::admin::LeadershipShedStatus {
+    /// Whether this node's leadership-shed policy lets it campaign.
+    pub fn should_campaign(&self) -> bool {
+        self.election.may_campaign(None) && self.recovery_barriers_ready()
+    }
+
+    /// This node's leadership-shed state, as a node of `cluster_id` answers
+    /// it. A node cannot receive a planned leadership handoff until the
+    /// recovery gate of every registered group is open.
+    pub fn participation_status(
+        &self,
+        cluster_id: ursula_headers::ClusterId,
+    ) -> ursula_proto::admin::LeadershipShedStatus {
         let state = self.election.state();
-        let ready = self.recovery_barriers_ready();
+        let should_campaign = self.should_campaign();
         ursula_proto::admin::LeadershipShedStatus {
+            cluster_id,
             bits: state.bits(),
             state: state.to_string(),
-            should_accept_transfer: self.election.may_campaign(None) && ready,
-            should_campaign: self.election.may_campaign(None) && ready,
-            recovery_barriers_ready: ready,
+            should_accept_transfer: should_campaign,
+            should_campaign,
+            recovery_barriers_ready: self.recovery_barriers_ready(),
             should_shed_current_leaders: state.should_shed_current_leaders(),
         }
     }

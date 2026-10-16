@@ -228,8 +228,8 @@ async fn new_recovery_engine(
 async fn serve_fixture(service: RecoveryTestService) -> (String, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let wire = pb::raft_internal_server::RaftInternalServer::new(service)
-        .accept_compressed(tonic::codec::CompressionEncoding::Zstd);
+    // Production's server: the cluster-id check runs before the fixture.
+    let wire = crate::grpc::raft_grpc_server(service, &crate::peer_cluster::test_peer_cluster(0));
     let server = tokio::spawn(async move {
         ursula_observability::serve::serve_until_shutdown(
             listener,
@@ -728,7 +728,10 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         .connect()
         .await
         .unwrap();
-    let mut client = pb::raft_internal_client::RaftInternalClient::new(channel);
+    let mut client = pb::raft_internal_client::RaftInternalClient::with_interceptor(
+        channel,
+        crate::peer_cluster::test_identity(2),
+    );
     let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
             raft_group_id: placement().raft_group_id.0,

@@ -308,7 +308,9 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     // The stopped group closes only its own participation: planned handoffs
     // of the node's other groups stay open.
     assert!(restarted_registry.recovery_barriers_ready());
-    let participation = restarted_registry.participation_status();
+    let participation = restarted_registry.participation_status(
+        ursula_headers::ClusterId::new(crate::peer_cluster::TEST_CLUSTER_ID).unwrap(),
+    );
     assert!(participation.should_campaign);
     assert!(participation.should_accept_transfer);
     assert!(!restarted_registry.may_campaign(RaftGroupId(999)));

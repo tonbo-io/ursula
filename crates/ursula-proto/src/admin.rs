@@ -829,8 +829,12 @@ impl RecoveryGatesReport {
     }
 }
 
+/// Answer of `GET /__ursula/leadership-shed`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LeadershipShedStatus {
+    /// The answering node's `server.cluster_id`. A poller trusts only an
+    /// answer of its own cluster.
+    pub cluster_id: ursula_headers::ClusterId,
     pub bits: u8,
     pub state: String,
     pub should_accept_transfer: bool,
@@ -917,6 +921,9 @@ pub struct MembershipQuery {
 /// by readers, so new server diagnostics cannot break maintenance tooling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeMetrics {
+    /// The node's `server.cluster_id` (`Ursula-Cluster-Id`): every node of
+    /// one deployment reports the same.
+    pub cluster_id: ursula_headers::ClusterId,
     pub process_incarnation: ProcessIncarnation,
     #[serde(deserialize_with = "Option::deserialize")]
     pub process_node_id: Option<u64>,
@@ -1023,6 +1030,7 @@ mod metrics_contract_tests {
 
     fn complete() -> NodeMetrics {
         NodeMetrics {
+            cluster_id: ursula_headers::ClusterId::new("prod-eu-1").unwrap(),
             process_incarnation: ProcessIncarnation::from_bits(1),
             process_node_id: Some(1),
             maintenance_fence: MaintenanceFenceState::Unclaimed,
@@ -1180,6 +1188,13 @@ pub struct ServingReadiness {
     pub ready: bool,
     #[serde(deserialize_with = "Option::deserialize")]
     pub reason: Option<ServingReadinessReason>,
+    /// The node's `server.cluster_id`.
+    pub cluster_id: ursula_headers::ClusterId,
+    /// Configured peers whose Raft traffic was refused for another cluster
+    /// id within the last minute, either way. Never a `reason` and never a
+    /// cause of unreadiness: a misconfigured node must not take its healthy
+    /// peers out of service, nor hide why a node is unready.
+    pub peer_cluster_mismatches: Vec<PeerClusterMismatch>,
     pub format_epoch_mismatch: bool,
     pub recovery_barriers_ready: bool,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -1190,6 +1205,14 @@ pub struct ServingReadiness {
     pub wal_min_available_bytes: u64,
     pub wal_resume_available_bytes: u64,
     pub wal_disk_stat_errors: u64,
+}
+
+/// A configured peer seen with another cluster id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerClusterMismatch {
+    pub node_id: u64,
+    /// The cluster id the peer sent or answered with.
+    pub cluster_id: ursula_headers::ClusterId,
 }
 
 #[cfg(test)]

@@ -23,6 +23,8 @@ use std::time::Duration;
 
 use tonic::transport::Endpoint;
 
+use crate::peer_cluster::PeerIdentity;
+use crate::peer_cluster::refusing_cluster;
 use crate::raft_internal_proto;
 
 /// Text every protocol-version refusal carries, in 0.5.x, 0.6 and this binary.
@@ -89,6 +91,10 @@ pub enum PeerFormatEpoch {
     /// The peer refused this binary's protocol version (E8). Carries the
     /// peer's message.
     Refused(String),
+    /// The peer refused this node for another cluster id, which it named
+    /// (#581 section 6.5). Not a format-epoch answer: the node starts, and
+    /// readiness reports the peer once Raft traffic reaches it.
+    OtherCluster(ursula_headers::ClusterId),
     /// The peer could not be reached or answered something else. A fresh
     /// cluster starts its pods in parallel, so this is skipped; readiness
     /// covers a peer that turns out to differ later.
@@ -96,14 +102,26 @@ pub enum PeerFormatEpoch {
 }
 
 /// Probe one peer's Raft protocol version with a `Vote` for
-/// `FORMAT_EPOCH_PROBE_GROUP`. Both 0.5.x and this binary check the version
-/// before the group and the payload, so the probe has no side effect.
-pub async fn probe_peer_format_epoch(url: &str, timeout: Duration) -> PeerFormatEpoch {
-    probe_peer_with_protocol(url, crate::grpc::RAFT_GRPC_PROTOCOL_VERSION, timeout).await
+/// `FORMAT_EPOCH_PROBE_GROUP`, sent as `identity`. Both 0.5.x and this binary
+/// check the version before the group and the payload, so the probe has no
+/// side effect.
+pub async fn probe_peer_format_epoch(
+    url: &str,
+    identity: &PeerIdentity,
+    timeout: Duration,
+) -> PeerFormatEpoch {
+    probe_peer_with_protocol(
+        url,
+        identity,
+        crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+        timeout,
+    )
+    .await
 }
 
 pub(crate) async fn probe_peer_with_protocol(
     url: &str,
+    identity: &PeerIdentity,
     protocol_version: u32,
     timeout: Duration,
 ) -> PeerFormatEpoch {
@@ -122,24 +140,36 @@ pub(crate) async fn probe_peer_with_protocol(
         payload: Vec::new().into(),
     });
     request.set_timeout(timeout);
-    let result = raft_internal_proto::raft_internal_client::RaftInternalClient::new(channel)
-        .vote(request)
-        .await;
+    let result = raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
+        channel,
+        identity.clone(),
+    )
+    .vote(request)
+    .await;
     classify_probe_answer(result.map(|_| ()))
 }
 
-/// NOT_FOUND is a peer on this protocol; FAILED_PRECONDITION with the
+/// NOT_FOUND is a peer on this protocol; FAILED_PRECONDITION naming a
+/// cluster id is a peer of another cluster; FAILED_PRECONDITION with the
 /// mismatch text is E8; anything else is treated as unreachable.
 pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFormatEpoch {
-    match result {
-        Err(status) if status.code() == tonic::Code::NotFound => PeerFormatEpoch::Compatible,
-        Err(status) if is_protocol_mismatch(&status) => {
-            PeerFormatEpoch::Refused(status.message().to_owned())
-        }
-        Err(status) => PeerFormatEpoch::Unreachable(status.to_string()),
+    let status = match result {
+        Err(status) => status,
         // No node registers the probe group; a success is not a known answer.
-        Ok(()) => PeerFormatEpoch::Unreachable("unexpected success for the probe group".into()),
+        Ok(()) => {
+            return PeerFormatEpoch::Unreachable("unexpected success for the probe group".into());
+        }
+    };
+    if status.code() == tonic::Code::NotFound {
+        return PeerFormatEpoch::Compatible;
     }
+    if let Some(cluster_id) = refusing_cluster(&status) {
+        return PeerFormatEpoch::OtherCluster(cluster_id);
+    }
+    if is_protocol_mismatch(&status) {
+        return PeerFormatEpoch::Refused(status.message().to_owned());
+    }
+    PeerFormatEpoch::Unreachable(status.to_string())
 }
 
 #[cfg(test)]
@@ -148,15 +178,24 @@ mod tests {
 
     use super::*;
     use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
+    use crate::peer_cluster::test_identity;
     use crate::raft_internal_proto::raft_internal_client::RaftInternalClient;
     use crate::registry::RaftGroupHandleRegistry;
 
+    /// A node of the test cluster.
     async fn spawn_server() -> String {
+        spawn_server_in(test_identity(1)).await
+    }
+
+    async fn spawn_server_in(identity: PeerIdentity) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test raft grpc listener");
         let address = listener.local_addr().expect("listener address");
         let registry = RaftGroupHandleRegistry::default();
+        registry
+            .peer_cluster()
+            .bind(identity, std::collections::BTreeMap::new());
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(crate::grpc::raft_grpc_service(registry))
@@ -171,13 +210,16 @@ mod tests {
     async fn probe_treats_not_found_as_compatible_and_a_version_refusal_as_e8() {
         let url = spawn_server().await;
         let timeout = Duration::from_secs(2);
+        let identity = test_identity(2);
         assert_eq!(
-            probe_peer_format_epoch(&url, timeout).await,
+            probe_peer_format_epoch(&url, &identity, timeout).await,
             PeerFormatEpoch::Compatible
         );
         // A peer on another epoch answers the probe the way this server
         // answers a sender on another epoch.
-        match probe_peer_with_protocol(&url, RAFT_GRPC_PROTOCOL_VERSION - 1, timeout).await {
+        match probe_peer_with_protocol(&url, &identity, RAFT_GRPC_PROTOCOL_VERSION - 1, timeout)
+            .await
+        {
             PeerFormatEpoch::Refused(message) => {
                 assert!(message.contains(PROTOCOL_MISMATCH_TEXT), "{message}");
             }
@@ -185,15 +227,30 @@ mod tests {
         }
         assert!(FormatEpochMismatch::global().recorded());
         assert!(matches!(
-            probe_peer_format_epoch("http://127.0.0.1:1", timeout).await,
+            probe_peer_format_epoch("http://127.0.0.1:1", &identity, timeout).await,
             PeerFormatEpoch::Unreachable(_)
         ));
     }
 
     #[tokio::test]
+    async fn probe_reports_a_peer_of_another_cluster_by_its_id() {
+        let other = ursula_headers::ClusterId::new("other-cluster").unwrap();
+        let url = spawn_server_in(PeerIdentity::new(1, other.clone())).await;
+        assert_eq!(
+            probe_peer_format_epoch(&url, &test_identity(2), Duration::from_secs(2)).await,
+            PeerFormatEpoch::OtherCluster(other)
+        );
+    }
+
+    #[tokio::test]
     async fn group_write_and_group_read_without_a_protocol_version_fail_precondition() {
         let url = spawn_server().await;
-        let mut client = RaftInternalClient::connect(url).await.expect("connect");
+        let channel = tonic::transport::Endpoint::from_shared(url)
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let mut client = RaftInternalClient::with_interceptor(channel, test_identity(2));
         let write = client
             .group_write(raft_internal_proto::GroupWriteRequestV1 {
                 raft_group_id: 0,

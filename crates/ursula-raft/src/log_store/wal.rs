@@ -106,6 +106,13 @@ impl RaftWal {
         })
     }
 
+    /// Refuses `configured` when the WAL root at `root` already holds
+    /// another cluster id ([`RaftWalError::ClusterIdMismatch`]), reading
+    /// only, so a node checks it before it contacts any peer.
+    pub fn check_cluster_id(root: &Path, configured: &ClusterId) -> Result<(), RaftWalError> {
+        super::topology::check_cluster_id(root, configured)
+    }
+
     pub fn root(&self) -> &Path {
         self.node.root()
     }

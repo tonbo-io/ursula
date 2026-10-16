@@ -35,6 +35,8 @@ jq '{physical: .wal_physical_bytes, segments: .wal_segments, reclaims: .wal_recl
 jq '{opening: .wal_recovery, gates: .recovery_gates}' metrics.json
 # Local Raft issues that make the node unready or block maintenance
 jq '.raft_maintenance | {node_issues, group_issues}' metrics.json
+# This node's cluster id, and Raft traffic refused for another one
+jq '{cluster_id, refusals: .raft_grpc_peer_cluster_refusals, unidentified: .raft_grpc_unidentified_peer_refusals, peers: .peer_cluster_mismatches}' metrics.json
 ```
 
 `GET /__ursula/ready` is the process readiness probe. It answers `200` when the
@@ -156,7 +158,15 @@ A configured peer runs a release of another format epoch (Ursula 0.7 speaks prot
 
 ### `/__ursula/ready` answers `503` with `format_epoch_mismatch`
 
-The node exchanged a Raft RPC with a peer on another format epoch: a peer that was unreachable during the startup probe, or a node of another release that has this node in its peer list. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart.
+The node exchanged a Raft RPC with a peer on another format epoch: a configured peer that was unreachable during the startup probe, or a node of this cluster on another release that sent this node a Raft RPC. The node stays not ready until it restarts. Remove the mismatched node from the peer lists and restart. A sender that names no cluster id, such as a 0.7 node of another deployment, does not make this node unready (see [Peers of another cluster](/docs/operations#peers-of-another-cluster)).
+
+### `refusing Raft traffic with a peer of another cluster`
+
+The node and a peer have different `server.cluster_id` values: one of them is mistyped, or a peer URL points at a node of another deployment. Each refuses the other's Raft traffic. The log line names the peer's node id, cluster id and address. `/__ursula/ready` and `/__ursula/metrics` list a configured peer under `peer_cluster_mismatches` with the id it reported, and `raft_grpc_peer_cluster_refusals` counts the refusals. The refusals never change readiness: an unready node's `reason` is its own cause. Find the node whose id differs from the rest of the deployment and correct its `server.cluster_id` or the peer URL. A node whose WAL already holds the wrong id refuses to start with the corrected one, so restart it on an empty WAL and let it rejoin as a [wiped node](/docs/operations#rejoining-a-wiped-node). The healthy nodes stop listing the peer a minute after its last refusal. See [Peers of another cluster](/docs/operations#peers-of-another-cluster).
+
+### `refusing Raft traffic from a sender that names no cluster id`
+
+A node before format epoch 4, or a client that is not an Ursula node, sent a Raft RPC to this node, usually because a peer list of another deployment names this node's address. The sender is refused and gets a format-epoch refusal. This node stays ready and counts it in `raft_grpc_unidentified_peer_refusals`. Remove this node's address from the other deployment's peer list.
 
 ### `/__ursula/ready` answers `503` with `recovery_gate_closed`
 

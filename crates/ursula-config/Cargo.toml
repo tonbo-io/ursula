@@ -14,7 +14,7 @@ serde = { workspace = true, features = ["derive"] }
 toml = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
-ursula-headers = { workspace = true }
+ursula-headers = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

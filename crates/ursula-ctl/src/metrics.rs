@@ -675,6 +675,7 @@ pub(crate) fn test_metrics(
     identity: Option<ProcessIncarnation>,
 ) -> ursula_proto::admin::NodeMetrics {
     ursula_proto::admin::NodeMetrics {
+        cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
         process_incarnation: identity.expect("complete fixture identity"),
         process_node_id: Some(id),
         maintenance_fence: MaintenanceFenceState::Unclaimed,
@@ -763,6 +764,7 @@ pub(crate) fn test_view(node: NodeInfo, groups: Vec<RaftGroupView>) -> NodeMetri
     let raft_maintenance = Some(test_maintenance_report(node.id, &groups));
     let process_node_id = Some(node.id);
     NodeMetricsView::new(node, ursula_proto::admin::NodeMetrics {
+        cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
         process_incarnation: ProcessIncarnation::from_bits(1),
         process_node_id,
         maintenance_fence: MaintenanceFenceState::Unclaimed,

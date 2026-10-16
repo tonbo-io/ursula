@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use axum::serve::Listener;
 use axum::serve::ListenerExt;
+use axum::serve::TapIo;
 use tokio::net::TcpStream;
 
 /// Wait for a termination signal: SIGTERM or Ctrl-C (Ctrl-C only on
@@ -65,13 +66,15 @@ pub async fn shutdown_signal() {
 /// acknowledgement (at least 40 ms on Linux) until its next request. A Raft
 /// follower that writes two replies in a row then answers each ReadIndex
 /// round one round late (#521, #547).
-fn nodelay_listener<L>(listener: L) -> impl Listener<Io = TcpStream, Addr = L::Addr>
+fn nodelay_listener<L>(listener: L) -> TapIo<L, fn(&mut TcpStream)>
 where L: Listener<Io = TcpStream> {
-    listener.tap_io(|stream| {
-        if let Err(err) = stream.set_nodelay(true) {
-            tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
-        }
-    })
+    listener.tap_io(set_nodelay as fn(&mut TcpStream))
+}
+
+fn set_nodelay(stream: &mut TcpStream) {
+    if let Err(err) = stream.set_nodelay(true) {
+        tracing::warn!("set TCP_NODELAY on accepted socket: {err}");
+    }
 }
 
 /// Serve `listener` with `app` until `shutdown` completes, then stop accepting
@@ -79,7 +82,9 @@ where L: Listener<Io = TcpStream> {
 ///
 /// Every connection it accepts sets `TCP_NODELAY`: without it, Nagle's
 /// algorithm and the peer's delayed acknowledgement hold back a second reply
-/// on the same connection by 40 ms or more.
+/// on the same connection by 40 ms or more. Each request carries its
+/// connection's peer address as `axum::extract::ConnectInfo<L::Addr>`, a
+/// `SocketAddr` for a TCP listener.
 ///
 /// `drain_timeout` bounds the drain: with `Some(t)` the server returns `Ok`
 /// after `t` even if connections are still open; with `None` the drain is
@@ -93,9 +98,12 @@ pub async fn serve_until_shutdown<L>(
 ) -> io::Result<()>
 where
     L: Listener<Io = TcpStream>,
-    L::Addr: Debug,
+    L::Addr: Debug + Clone + Sync + 'static,
 {
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    // Handlers see each connection's peer address as
+    // `axum::extract::ConnectInfo<L::Addr>`.
+    let app = app.into_make_service_with_connect_info::<L::Addr>();
     let server = axum::serve(nodelay_listener(listener), app)
         .with_graceful_shutdown(async move {
             drop(shutdown_rx.await);

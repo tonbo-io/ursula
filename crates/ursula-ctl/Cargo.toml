@@ -34,6 +34,7 @@ ursula-observability = { workspace = true }
 ursula-proto = { workspace = true }
 
 [dev-dependencies]
+ursula-headers = { workspace = true }
 axum = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["net", "sync"] }

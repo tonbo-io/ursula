@@ -32,6 +32,9 @@
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
 //!   mismatch record readiness reads.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
+//! - [`peer_cluster`]: the cluster-id check between peers: the identity
+//!   every Raft gRPC request carries, the server interceptor that refuses a
+//!   peer of another cluster, and the record readiness and metrics read.
 //! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
 //!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
@@ -73,6 +76,7 @@ mod log_store;
 mod maintenance;
 mod meta;
 mod peer_channel;
+mod peer_cluster;
 mod read_index;
 mod recovery_transport;
 mod registry;
@@ -111,10 +115,12 @@ pub use grpc::RAFT_GRPC_REJOIN_BARRIER_PATH;
 pub use grpc::RAFT_GRPC_TRANSFER_LEADER_PATH;
 pub use grpc::RAFT_GRPC_VOTE_PATH;
 pub use grpc::RaftGrpcMetricsSnapshot;
+pub use grpc::RaftGrpcServer;
 pub use grpc::RaftGrpcService;
 #[cfg(all(test, not(madsim)))]
 pub(crate) use grpc::confirm_quorum_prefix;
 pub use grpc::raft_grpc_metrics_snapshot;
+pub use grpc::raft_grpc_server;
 pub use grpc::raft_grpc_service;
 pub use history::GroupHistory;
 #[cfg(any(test, madsim))]
@@ -158,6 +164,14 @@ pub use meta::MetaRaftSnapshotBuilder;
 pub use meta::MetaRaftStateMachine;
 pub use meta::MetaRaftTypeConfig;
 pub use meta::UnexpectedRegistrationResponse;
+pub use peer_cluster::CLUSTER_ID_METADATA;
+pub use peer_cluster::ClusterCheck;
+pub use peer_cluster::NODE_ID_METADATA;
+pub use peer_cluster::PEER_CLUSTER_MISMATCH_TTL;
+pub use peer_cluster::PeerCluster;
+pub use peer_cluster::PeerClusterError;
+pub use peer_cluster::PeerClusterMismatch;
+pub use peer_cluster::PeerIdentity;
 pub use registry::IncomingTransferError;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;
