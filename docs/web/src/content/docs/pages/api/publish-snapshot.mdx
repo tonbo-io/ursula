@@ -62,7 +62,7 @@ curl -X PUT 'http://127.0.0.1:4437/demo/hello/snapshot/00000000000000000042' \
 
 On a node with a cold backend, a snapshot above `Ursula-Max-Request-Bytes` goes up in parts, up to `Ursula-Max-Snapshot-Bytes` (**1 GiB**) in at most 4,096 parts. `HEAD` advertises both limits.
 
-1. Stage each part with `POST /{bucket}/{stream}/snapshot/{offset}/parts`. Its body is the part's bytes, at most `Ursula-Max-Request-Bytes`. The answer is `201` with the part's id in `Stream-Snapshot-Part`. Staging changes nothing a reader sees, and repeating it stages another part. The stream must exist (`404` otherwise), and the request may carry `Stream-Incarnation`. A part belongs to the stream's current incarnation, not to the offset in its path, which is checked and otherwise ignored. A part is charged against the node's in-flight body budget but is not refused for WAL or Raft-log pressure.
+1. Stage each part with `POST /{bucket}/{stream}/snapshot/{offset}/parts`. Its body is the part's bytes, at most `Ursula-Max-Request-Bytes`. The answer is `201` with the part's id in `Stream-Snapshot-Part`. Staging changes nothing a reader sees, and repeating it stages another part. The stream must exist (`404` otherwise), and the request may carry `Stream-Incarnation`. A part belongs to the stream's current incarnation, not to the offset in its path, which is checked and otherwise ignored. A part is charged against the node's in-flight body budget but is not refused for WAL or Raft-log pressure. A stream holds at most 8,192 staged parts that no commit used, and at most 2 GiB of them (see [staged parts](#staged-parts)).
 2. Commit with `PUT /{bucket}/{stream}/snapshot/{offset}`, `Stream-Snapshot-Parts: <count>` and `Stream-Snapshot-Digest: <digest of the whole snapshot>`. The body lists the part ids in order, each followed by a line feed, no id twice. `Content-Type` is the snapshot's.
 
 A commit checks its key first, before it reads its body. A repeat of a published snapshot answers `204` with its digest, and a commit whose offset holds another snapshot, or that a later snapshot supersedes, answers `409` naming the latest, both even after the parts are gone. Otherwise Ursula copies the parts into one snapshot, checks its digest, and publishes it like any other snapshot, with the same answers. It answers `400` when a part is unknown, belongs to another stream or to an earlier incarnation of this one, or is listed twice, when the manifest does not match `Stream-Snapshot-Parts`, or when the digest differs.
@@ -74,14 +74,34 @@ Whether Ursula deletes the parts depends on the answer:
 - After a `400` that copies nothing (an unknown part, another stream's part, a part listed twice, a malformed or oversized manifest), the parts stay, so a corrected commit can use them.
 - After a `503` or any other retryable answer, the parts stay. Repeat the same commit.
 
-The orphan sweep reclaims a part that no commit used once it is older than its grace, a day by default, whether its stream still exists or not, so commit within a day of staging the first part. Without a cold backend, parts and commits answer `501`.
+The orphan sweep reclaims a part that no commit used once it is older than its grace, a day by default, whether its stream still exists or not, so commit within a day of staging the first part. Without a cold backend, parts, commits and discards answer `501`.
+
+### Staged parts
+
+A stream holds at most 8,192 staged parts that no commit used, and at most 2 GiB of them. That is twice what one commit can use, so an abandoned upload and a full retry both fit. The parts of the stream's earlier incarnations count until they are deleted, so deleting and recreating a stream does not reset the bound. A part past either bound answers `429 Too Many Requests` before its body is read, with the error code `STAGED_PARTS_LIMIT`, the stream's `Stream-Incarnation` and the bound it hit: `Ursula-Max-Staged-Parts: 8192` or `Ursula-Max-Staged-Bytes: 2147483648`. The answer has no `Retry-After`, because a short wait does not free anything. A commit frees its parts once it has deleted them, a discard frees them at once, and the orphan sweep frees the parts it reclaims after its grace. Commit or discard the parts you staged before you stage another snapshot. A part counts its `Content-Length` while it uploads, and 32 MiB when it has none, so send `Content-Length` near the byte bound.
+
+Discard a stream's staged parts with `DELETE /{bucket}/{stream}/snapshot/parts`. It deletes every staged part of the stream's current incarnation, and the parts of its earlier incarnations staged more than a minute before it, and answers `204` with `Stream-Incarnation`. It may carry `Stream-Incarnation` (`412` when it does not match), answers `404` for a stream that does not exist, `501` without a cold backend and `502` with `COLD_STORE_FAILED` when the cold backend fails to list or delete the parts, and is answered by the stream's leader like a write. A part whose upload ends during a discard may or may not survive it. While a commit of the stream runs, a discard answers `503` with `Retry-After` and the error code `SNAPSHOT_COMMIT_IN_PROGRESS`. Through `ursulagw` a discard is authorized as a snapshot publish.
+
+Deleting a stream deletes its staged parts after the delete has answered, in a task the node owns: the parts of the incarnations the stream's leader knew of at any age, and the stream's other parts staged more than a minute before the delete. A recreated stream's next listing deletes the parts of its earlier incarnations staged more than a minute before it. These margins assume the nodes' clocks agree within a minute. When the delete of a commit's spent parts fails, they stay until a discard, a delete of the stream or the orphan sweep removes them.
+
+The stream's leader keeps the count in memory. It lists the stream's parts at the stream's first part after it starts to lead or after the orphan sweep reclaimed some of them, after every commit and discard, and at a refused part when its last listing is over a minute old. A new leader does not see the parts that were still uploading to the old one when it took over, so the stream can hold more than the bound by those parts until a commit, a discard, a delete or the sweep removes them.
+
+| Status | Meaning (part upload) |
+| ------ | --------------------- |
+| `201` | The part is staged. `Stream-Snapshot-Part` is its id. |
+| `404` | Stream not found or expired. |
+| `412` | `Stream-Incarnation` did not match. |
+| `413` | The part is above `Ursula-Max-Request-Bytes`, which the response names. |
+| `429` | The stream holds as many staged parts, or bytes of them, as it may. The response names the bound and the stream's `Stream-Incarnation`. |
+| `501` | The node has no cold backend. |
+| `502` | The cold backend failed while storing the part or listing the stream's parts. |
 
 A stream deleted and created again while its commit copies is not published to. A commit that sent `Stream-Incarnation` then answers `412`. One that did not answers `400` for an unknown part, as a commit sent after the new create does.
 
 A node copies at most two commits at once, and starts a copy only while a request of the full 32 MiB limit still fits in `server.http_inflight_body_size` beside it. Another commit answers `503` with `Retry-After` and the error code `SNAPSHOT_COMMITS_BUSY`. A copy is charged against the budget while it runs: 56 MiB at the default 256 MiB, 32 MiB on a node of 64 MiB, which reads fewer pieces ahead and so copies one commit at a time.
 
 <Note>
-The node owns a commit once it starts copying. A client that goes away, or a gateway that times out, cancels none of it: the copy, the publish and the deletion of the parts run to their end. A repeat while the commit runs answers `503` with `Retry-After` and the error code `SNAPSHOT_COMMIT_IN_PROGRESS`, and a repeat after it answers `204` from the key. A copy takes time in proportion to the snapshot's size and the number of parts. On S3, 256 MiB in eight 32 MiB parts took about 3 seconds. Through `ursulagw`, whose `--response-header-timeout` is 30 seconds by default, a commit of many small parts can outlast the timeout. Repeat it until it answers, or send larger parts.
+The node owns a commit once it starts copying. A client that goes away, or a gateway that times out, cancels none of it: the copy, the publish and the deletion of the parts run to their end. A repeat while the commit runs, and any other commit of the same stream incarnation, answers `503` with `Retry-After` and the error code `SNAPSHOT_COMMIT_IN_PROGRESS`, and a repeat after it answers `204` from the key. A copy takes time in proportion to the snapshot's size and the number of parts. On S3, 256 MiB in eight 32 MiB parts took about 3 seconds. Through `ursulagw`, whose `--response-header-timeout` is 30 seconds by default, a commit of many small parts can outlast the timeout. Repeat it until it answers, or send larger parts.
 </Note>
 
 ```bash Example

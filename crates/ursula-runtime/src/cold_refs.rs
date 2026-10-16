@@ -189,7 +189,8 @@ impl SharedRefCompactionReport {
 ///
 /// - exclusive chunks: `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`;
 /// - packs and staged external payloads: `{nanos:032x}-{seq:016x}.bin`;
-/// - staged snapshot parts: `{owner:016x}-{nanos:032x}-{seq:016x}.part`.
+/// - staged snapshot parts:
+///   `{stream:032x}-{incarnation:016x}-{nanos:032x}-{seq:016x}.part`.
 ///
 /// A zero timestamp (the simulator's clock) also yields `None`, so the
 /// orphan sweep never deletes an object whose age it cannot tell.
@@ -203,7 +204,7 @@ pub fn cold_object_written_unix_ms(file_name: &str) -> Option<u64> {
     let nanos_hex = match (part, widths.as_slice()) {
         (false, [16, 16, 32, 16]) => fields.get(2)?,
         (false, [32, 16]) => fields.first()?,
-        (true, [16, 32, 16]) => fields.get(1)?,
+        (true, [32, 16, 32, 16]) => fields.get(2)?,
         _ => return None,
     };
     if !fields
@@ -327,12 +328,12 @@ mod tests {
         let pack = format!("{nanos:032x}-{:016x}.bin", 9);
         assert_eq!(cold_object_written_unix_ms(&chunk), Some(1_700_000_000_123));
         assert_eq!(cold_object_written_unix_ms(&pack), Some(1_700_000_000_123));
-        let part = format!("{:016x}-{nanos:032x}-{:016x}.part", 3, 9);
+        let part = format!("{:032x}-{:016x}-{nanos:032x}-{:016x}.part", 3, 4, 9);
         assert_eq!(cold_object_written_unix_ms(&part), Some(1_700_000_000_123));
         assert_eq!(
             cold_object_written_unix_ms(&format!("{nanos:032x}-{:016x}.part", 9)),
             None,
-            "a part object names its owner"
+            "a part object names its stream and token"
         );
         assert_eq!(
             cold_object_written_unix_ms(&format!("{:032x}-{:016x}.bin", 0, 1)),

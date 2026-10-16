@@ -2131,6 +2131,12 @@ fn classify_request(method: &Method, uri: &Uri, headers: &HeaderMap) -> Option<C
             Action::PublishSnapshot
         }
         [suffix, _offset] if suffix == "snapshot" && *method == Method::GET => Action::ReadSnapshot,
+        // Discarding a stream's staged parts undoes part uploads (#622).
+        [suffix, parts]
+            if suffix == "snapshot" && parts == "parts" && *method == Method::DELETE =>
+        {
+            Action::PublishSnapshot
+        }
         // A snapshot part stores bytes for a later publish (#581 section 3.1).
         [suffix, _offset, parts]
             if suffix == "snapshot" && parts == "parts" && *method == Method::POST =>

@@ -1284,3 +1284,144 @@ mod serving_readiness_tests {
         assert!(!report.serving_ready());
     }
 }
+
+/// Answer of `GET /__ursula/usage`: per-bucket usage on the answering node,
+/// and the staged snapshot parts of the groups it leads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageReport {
+    pub version: SchemaVersion<1>,
+    /// The answering node's id, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<u64>,
+    /// The unit of `committed_write_units`, in bytes.
+    pub write_unit_bytes: u64,
+    /// From replicated state, summed across the node's Raft groups: every
+    /// replica reports the same values.
+    pub buckets: BTreeMap<String, BucketUsageReport>,
+    /// How many Raft groups the cluster has, numbered from 0.
+    pub raft_group_count: u32,
+    /// The staged, unused snapshot parts of each group the node leads, in
+    /// group order. Node-local, not replicated: a collector keeps, per
+    /// group, the report of the highest term, and treats as partial a group
+    /// whose counting has not finished or that no report names.
+    #[serde(default)]
+    pub staged_snapshot_parts: Vec<GroupStagedParts>,
+}
+
+/// One bucket's usage in a [`UsageReport`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketUsageReport {
+    pub committed_append_bytes: u64,
+    pub committed_records: u64,
+    pub committed_write_units: u64,
+    pub retained_bytes: u64,
+    pub stream_count: u64,
+}
+
+/// The staged snapshot parts of one group, as its leader counts them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStagedParts {
+    pub raft_group_id: u32,
+    /// The Raft term the answering node leads the group in.
+    pub term: u64,
+    /// The leader finished its listing of the group's parts. Until then
+    /// `bytes` holds only what it counted so far.
+    pub counting_finished: bool,
+    /// Bytes of staged, unused parts per bucket.
+    pub bytes: BTreeMap<String, u64>,
+}
+
+impl UsageReport {
+    /// The staged-part bytes per bucket across `reports`, one per node, as
+    /// a collector sums them: for each group the report of the highest term
+    /// counts, and `false` beside the sum when one of those has not finished
+    /// counting, or when no report names one of the cluster's groups.
+    pub fn staged_part_bytes(reports: &[Self]) -> (BTreeMap<String, u64>, bool) {
+        let mut newest = BTreeMap::<u32, &GroupStagedParts>::new();
+        for group in reports
+            .iter()
+            .flat_map(|report| &report.staged_snapshot_parts)
+        {
+            match newest.get(&group.raft_group_id) {
+                Some(seen) if seen.term >= group.term => {}
+                _ => {
+                    newest.insert(group.raft_group_id, group);
+                }
+            }
+        }
+        let mut buckets = BTreeMap::<String, u64>::new();
+        let group_count = reports
+            .iter()
+            .map(|report| report.raft_group_count)
+            .max()
+            .unwrap_or(0);
+        let mut complete = (0..group_count).all(|group| newest.contains_key(&group));
+        for group in newest.values() {
+            complete &= group.counting_finished;
+            for (bucket_id, bytes) in &group.bytes {
+                let total = buckets.entry(bucket_id.clone()).or_default();
+                *total = total.saturating_add(*bytes);
+            }
+        }
+        (buckets, complete)
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use std::collections::BTreeMap;
+
+    use super::GroupStagedParts;
+    use super::SchemaVersion;
+    use super::UsageReport;
+
+    fn report(node_id: u64, groups: Vec<GroupStagedParts>) -> UsageReport {
+        UsageReport {
+            version: SchemaVersion,
+            node_id: Some(node_id),
+            write_unit_bytes: 10_240,
+            buckets: BTreeMap::new(),
+            raft_group_count: 2,
+            staged_snapshot_parts: groups,
+        }
+    }
+
+    fn group(raft_group_id: u32, term: u64, finished: bool, bytes: u64) -> GroupStagedParts {
+        GroupStagedParts {
+            raft_group_id,
+            term,
+            counting_finished: finished,
+            bytes: BTreeMap::from([("tenant".to_owned(), bytes)]),
+        }
+    }
+
+    /// A deposed leader that has not seen the new term still reports its
+    /// group. The collector keeps the higher term per group, so nothing is
+    /// counted twice, and a group whose counting has not finished makes the
+    /// sum partial.
+    #[test]
+    fn a_collector_keeps_the_newest_term_per_group() {
+        let reports = [
+            report(1, vec![group(0, 7, true, 100), group(1, 3, true, 5)]),
+            report(2, vec![group(0, 8, true, 40)]),
+        ];
+        assert_eq!(
+            UsageReport::staged_part_bytes(&reports),
+            (BTreeMap::from([("tenant".to_owned(), 45)]), true)
+        );
+        let reports = [
+            report(1, vec![group(0, 7, true, 100), group(1, 3, true, 5)]),
+            report(2, vec![group(0, 8, false, 40)]),
+        ];
+        assert_eq!(
+            UsageReport::staged_part_bytes(&reports),
+            (BTreeMap::from([("tenant".to_owned(), 45)]), false)
+        );
+        // Group 1 has no leader any report names: the sum is partial.
+        let reports = [report(1, vec![group(0, 7, true, 100)])];
+        assert_eq!(
+            UsageReport::staged_part_bytes(&reports),
+            (BTreeMap::from([("tenant".to_owned(), 100)]), false)
+        );
+    }
+}

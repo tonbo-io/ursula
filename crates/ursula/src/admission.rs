@@ -290,16 +290,24 @@ fn request_write_body_bytes(request: &Request<Body>) -> Option<u64> {
     if !is_write_method(request.method()) {
         return None;
     }
-    if let Some(content_length) = request.headers().get(CONTENT_LENGTH)
+    Some(declared_body_bytes(request.headers(), request.body()))
+}
+
+/// The bytes a request's body declares: its `Content-Length`, else its
+/// body's size hint, else the request limit. The one reading of a body's
+/// declared size, for admission and for a snapshot part's reservation.
+pub(crate) fn declared_body_bytes(headers: &HeaderMap, body: &Body) -> u64 {
+    if let Some(content_length) = headers.get(CONTENT_LENGTH)
         && let Ok(content_length) = content_length.to_str()
         && let Ok(parsed) = content_length.parse::<u64>()
     {
-        return Some(parsed);
+        return parsed;
     }
-    let size_hint = request.body().size_hint();
-    size_hint.exact().or_else(|| size_hint.upper()).or(Some(
-        u64::try_from(MAX_HTTP_BODY_BYTES).expect("max body bytes fits u64"),
-    ))
+    let size_hint = body.size_hint();
+    size_hint
+        .exact()
+        .or_else(|| size_hint.upper())
+        .unwrap_or_else(|| u64::try_from(MAX_HTTP_BODY_BYTES).unwrap_or(u64::MAX))
 }
 
 fn is_write_method(method: &Method) -> bool {

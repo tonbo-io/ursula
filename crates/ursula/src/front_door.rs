@@ -12,7 +12,9 @@
 //!    `x-ursula-raft-term`, or `503` with `Retry-After` and
 //!    `x-ursula-raft-group` when it knows no leader ([`route_before_body`]);
 //! 4. early answers: the leader's answer to a repeat of an applied producer
-//!    write or a key conflict (section 2.5);
+//!    write or a key conflict (section 2.5), and the `429` of a snapshot
+//!    part whose stream holds as many staged parts as it may
+//!    ([`crate::staged_parts`]);
 //! 5. pressure (`503` with `Retry-After`), the admission checks deferred
 //!    until here.
 //!
@@ -35,6 +37,7 @@ use ursula_headers::RaftGroup;
 use ursula_headers::RaftTerm;
 use ursula_headers::RoutingAnswer;
 use ursula_raft::GroupLeadership;
+use ursula_raft::LeaderRole;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RoutedWrite;
@@ -55,6 +58,9 @@ use crate::render::insert_header_str;
 pub(crate) const STREAM_ROUTE: &str = "/{bucket}/{stream}";
 /// The route of a snapshot: publish or parts commit (`PUT`) and read.
 pub(crate) const SNAPSHOT_ROUTE: &str = "/{bucket}/{stream}/snapshot/{snapshot_offset}";
+/// The route that discards a stream's staged snapshot parts (`DELETE`,
+/// #622). It carries no body.
+pub(crate) const STAGED_PARTS_ROUTE: &str = "/{bucket}/{stream}/snapshot/parts";
 /// The route that stages one part of a snapshot (`POST`, #581 section 3.1).
 pub(crate) const SNAPSHOT_PARTS_ROUTE: &str = "/{bucket}/{stream}/snapshot/{snapshot_offset}/parts";
 
@@ -169,6 +175,46 @@ fn leadership_view(state: &HttpState, raft_group_id: RaftGroupId) -> Option<Writ
     registry
         .leadership(raft_group_id)
         .map(GroupLeadership::write_route)
+}
+
+/// The Raft term in which this node leads `raft_group_id` now, by its
+/// leadership view: `0` for a node without replication, which leads every
+/// group, and `None` while it does not lead the group, a candidate
+/// included. A leader's node-local state (the staged parts it counts) is
+/// valid for one term.
+pub(crate) fn leader_term(state: &HttpState, raft_group_id: RaftGroupId) -> Option<u64> {
+    registry_leader_term(state.raft_registry(), raft_group_id)
+}
+
+/// [`leader_term`] from a registry: `0` without one.
+pub(crate) fn registry_leader_term(
+    registry: Option<&ursula_raft::RaftGroupHandleRegistry>,
+    raft_group_id: RaftGroupId,
+) -> Option<u64> {
+    let Some(registry) = registry else {
+        return Some(0);
+    };
+    registry
+        .leadership(raft_group_id)
+        .filter(|leadership| leadership.role == LeaderRole::Leads)
+        .map(|leadership| leadership.term)
+}
+
+/// The answer to a write whose node stopped leading after it routed the
+/// write: the routing answer now, `307` to the new leader or `503` with
+/// `Retry-After`.
+pub(crate) async fn not_leading(
+    state: &HttpState,
+    stream_id: &BucketStreamId,
+    request_target: &str,
+) -> Response {
+    match route_before_body(state, stream_id, request_target, None, None).await {
+        HeadDecision::Answer(answer) => answer,
+        HeadDecision::Read(_) => {
+            let group = RaftGroup::from_u32(state.runtime.locate(stream_id).raft_group_id.0);
+            routing_response(RoutingAnswer::NoLeader { group }, None)
+        }
+    }
 }
 
 /// Runs the deferred pressure checks, if admission runs.

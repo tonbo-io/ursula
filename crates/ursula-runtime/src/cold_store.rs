@@ -270,6 +270,9 @@ pub enum ColdStoreOperation {
     DeleteChunk,
     RemoveAll,
     ReadObjectRange,
+    /// A prefix listing ([`ColdStore::list_file_sizes_with_prefix`]), once
+    /// it is read and before it returns.
+    ListPrefix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -918,6 +921,94 @@ impl ColdStore {
         Ok(names)
     }
 
+    /// The names and sizes of the files directly in `dir` whose names start
+    /// with `prefix`, at most `max` of them, in no particular order
+    /// ([`Self::fold_file_sizes_with_prefix`]).
+    pub async fn list_file_sizes_with_prefix(
+        &self,
+        dir: &str,
+        prefix: &str,
+        max: usize,
+    ) -> io::Result<Vec<(String, u64)>> {
+        let mut files = Vec::new();
+        self.fold_file_sizes_with_prefix(dir, prefix, |name, size| {
+            files.push((name.to_owned(), size));
+            files.len() < max
+        })
+        .await?;
+        Ok(files)
+    }
+
+    /// Hands `visit` the name and size of each file directly in `dir` whose
+    /// name starts with `prefix`, in no particular order, until it returns
+    /// `false`. It is a prefix listing (S3's `prefix=`), so it costs the
+    /// matching names, not the directory, on any store that honors a
+    /// prefix, and it holds no list of names. A backend whose listing
+    /// carries no size is asked for each. The fault policy sees the listing
+    /// as [`ColdStoreOperation::ListPrefix`] once it is read, before it
+    /// returns.
+    pub async fn fold_file_sizes_with_prefix(
+        &self,
+        dir: &str,
+        prefix: &str,
+        mut visit: impl FnMut(&str, u64) -> bool,
+    ) -> io::Result<()> {
+        self.count_list_request();
+        let path = format!("{dir}{prefix}");
+        let has_length = self
+            .operator
+            .info()
+            .full_capability()
+            .list_has_content_length;
+        let mut lister = self
+            .operator
+            .lister_with(&path)
+            .await
+            .map_err(|err| cold_store_io_error(&path, err))?;
+        while let Some(entry) = lister
+            .try_next()
+            .await
+            .map_err(|err| cold_store_io_error(&path, err))?
+        {
+            if entry.metadata().mode() != EntryMode::FILE {
+                continue;
+            }
+            let Some(name) = entry.path().strip_prefix(dir) else {
+                continue;
+            };
+            if name.contains('/') || !name.starts_with(prefix) {
+                continue;
+            }
+            let size = if has_length {
+                entry.metadata().content_length()
+            } else {
+                match self.object_size(entry.path()).await {
+                    Ok(size) => size,
+                    // Deleted since it was listed.
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => continue,
+                    Err(err) => return Err(err),
+                }
+            };
+            if !visit(name, size) {
+                break;
+            }
+        }
+        let _applied_fault = self
+            .maybe_apply_fault_effect(ColdStoreFaultContext {
+                operation: ColdStoreOperation::ListPrefix,
+                stream_id: None,
+                path,
+                payload_len: None,
+                read_start_offset: None,
+                len: None,
+                object_start: None,
+                object_end: None,
+                cached: None,
+            })
+            .await?;
+        Ok(())
+    }
+
     /// Deletes `paths` with the checks and events of
     /// [`Self::delete_chunk`] for each, in one batched call where the
     /// backend has one (S3's `DeleteObjects`). A path the checks refuse is
@@ -1422,6 +1513,7 @@ impl ColdStoreOperation {
             Self::DeleteChunk => "delete_chunk",
             Self::RemoveAll => "remove_all",
             Self::ReadObjectRange => "read_object_range",
+            Self::ListPrefix => "list_prefix",
         }
     }
 }
@@ -1844,37 +1936,67 @@ pub fn snapshot_part_dir(bucket_id: &str, raft_group_id: u32) -> String {
 }
 
 /// The object of part `id` staged for the incarnation `incarnation` of
-/// `stream_id`, in [`snapshot_part_dir`]: `{owner:016x}-{id}`, where `owner`
-/// is a hash of the stream and its token. A commit resolves an id only with
-/// its own stream's owner, so a manifest cannot name another stream's part,
-/// nor one staged for an earlier incarnation or history of its own stream.
+/// `stream_id`, in [`snapshot_part_dir`]:
+/// `{stream:032x}-{incarnation:016x}-{id}`, where `stream` is a hash of the
+/// stream ([`snapshot_part_stream_prefix`]). A commit resolves an id only
+/// with its own stream and token, so a manifest cannot name another
+/// stream's part, nor one staged for an earlier incarnation or history of
+/// its own stream.
 pub fn snapshot_part_path(
     stream_id: &BucketStreamId,
     raft_group_id: u32,
     incarnation: u64,
     id: &str,
 ) -> String {
+    format!(
+        "{}{}{id}",
+        snapshot_part_dir(&stream_id.bucket_id, raft_group_id),
+        snapshot_part_owner_prefix(stream_id, incarnation),
+    )
+}
+
+/// The file-name prefix, `{stream:032x}-`, of every part staged for any
+/// incarnation of `stream_id` in its [`snapshot_part_dir`], so one prefix
+/// listing ([`ColdStore::list_file_sizes_with_prefix`]) finds the parts of
+/// the stream's live and retired incarnations. `stream` is 128 bits of a
+/// hash of the stream id, so two streams of a directory never share it.
+pub fn snapshot_part_stream_prefix(stream_id: &BucketStreamId) -> String {
     let mut owner = blake3::Hasher::new();
     owner.update(b"ursula snapshot part owner\0");
     owner.update(stream_id.to_string().as_bytes());
-    owner.update(b"\0");
-    owner.update(&incarnation.to_le_bytes());
     let digest = owner.finalize();
     let owner = digest
         .as_bytes()
-        .first_chunk::<8>()
-        .map_or(0, |prefix| u64::from_be_bytes(*prefix));
+        .first_chunk::<16>()
+        .map_or(0, |prefix| u128::from_be_bytes(*prefix));
+    format!("{owner:032x}-")
+}
+
+/// The file-name prefix, `{stream:032x}-{incarnation:016x}-`, of every part
+/// staged for the incarnation `incarnation` of `stream_id`.
+pub fn snapshot_part_owner_prefix(stream_id: &BucketStreamId, incarnation: u64) -> String {
     format!(
-        "{}{owner:016x}-{id}",
-        snapshot_part_dir(&stream_id.bucket_id, raft_group_id),
+        "{}{incarnation:016x}-",
+        snapshot_part_stream_prefix(stream_id)
     )
 }
 
 /// Whether `name` (a file name in a [`snapshot_part_dir`]) has the form of
-/// a staged part object, `{owner:016x}-{nanos:032x}-{seq:016x}.part`. No
+/// a staged part object,
+/// `{stream:032x}-{incarnation:016x}-{nanos:032x}-{seq:016x}.part`. No
 /// replicated state ever references one.
 pub fn is_snapshot_part_object_name(name: &str) -> bool {
-    hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[16, 32, 16])
+    hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[32, 16, 32, 16])
+}
+
+/// The incarnation a staged part object named `name` was staged for, when
+/// `name` has the form [`is_snapshot_part_object_name`] checks.
+pub fn snapshot_part_object_incarnation(name: &str) -> Option<u64> {
+    if !is_snapshot_part_object_name(name) {
+        return None;
+    }
+    let incarnation = name.split('-').nth(1)?;
+    u64::from_str_radix(incarnation, 16).ok()
 }
 
 #[cfg(test)]
@@ -2076,6 +2198,37 @@ mod tests {
                 ))
                 .expect("response"))
         }
+    }
+
+    /// A prefix listing finds the files of one run of names directly in its
+    /// directory, with their sizes, and nothing that only shares a part of
+    /// the prefix or lies deeper.
+    #[tokio::test]
+    async fn a_prefix_listing_finds_one_run_of_names() {
+        let store = ColdStore::memory().expect("memory");
+        for (path, len) in [
+            ("b/_parts/00000000/aa-1", 1),
+            ("b/_parts/00000000/ab-1", 2),
+            ("b/_parts/00000000/ab-2", 3),
+            ("b/_parts/00000000/abc-1", 4),
+            ("b/_parts/00000000/ac-1", 5),
+            ("b/_parts/00000000/ab-/deeper", 6),
+        ] {
+            store.write_chunk(path, &vec![0; len]).await.expect("write");
+        }
+        let mut listed = store
+            .list_file_sizes_with_prefix("b/_parts/00000000/", "ab-", usize::MAX)
+            .await
+            .expect("list");
+        listed.sort();
+        assert_eq!(listed, [("ab-1".to_owned(), 2), ("ab-2".to_owned(), 3)]);
+        assert!(
+            store
+                .list_file_sizes_with_prefix("b/_parts/00000001/", "ab-", usize::MAX)
+                .await
+                .expect("list")
+                .is_empty()
+        );
     }
 
     /// Regression (AWS EKS run): with SSE on, opendal put

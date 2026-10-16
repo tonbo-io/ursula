@@ -856,6 +856,9 @@ pub(crate) struct MetricsResponse {
     /// The configured peers refused for another cluster id within the last
     /// minute.
     pub peer_cluster_mismatches: Vec<ursula_proto::admin::PeerClusterMismatch>,
+    /// Bytes of staged, unused snapshot parts in the streams this node
+    /// leads and counts.
+    pub staged_snapshot_part_bytes: u64,
 }
 
 #[derive(serde::Serialize)]

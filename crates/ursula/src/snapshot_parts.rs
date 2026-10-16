@@ -26,8 +26,13 @@
 //! A node copies at most [`SNAPSHOT_ASSEMBLIES`] commits at once, and each
 //! charges its copy buffers against the in-flight body budget. The server
 //! keeps no upload session: the orphan sweep reclaims every part older than
-//! its grace (a day by default), the parts of a deleted stream included.
-//! Without a cold store, a part or a commit answers `501`.
+//! its grace (a day by default), the parts of a deleted stream included. A
+//! stream holds a bounded number of unused parts, and a part past the bound
+//! answers `429` before its body ([`crate::staged_parts`]).
+//! `DELETE {stream}/snapshot/parts` discards them. A node runs one commit or
+//! discard per stream incarnation at a time, so two commits never spend the
+//! same parts. Without a cold store, a part, a commit or a discard answers
+//! `501`.
 
 use std::collections::HashSet;
 use std::io;
@@ -56,6 +61,7 @@ use ursula_headers::PartStaged;
 use ursula_headers::PartsCommit;
 use ursula_headers::PartsManifest;
 use ursula_headers::SnapshotPublishAnswer;
+use ursula_headers::StagedPartsLimit;
 use ursula_headers::names;
 use ursula_headers::value::SnapshotDigest as DigestValue;
 use ursula_runtime::COLD_OBJECT_WRITE_CONCURRENCY;
@@ -96,6 +102,7 @@ use crate::render::insert_header_str;
 use crate::render::insert_offset;
 use crate::render::snapshot_published_response;
 use crate::render::snapshot_ref;
+use crate::staged_parts::StagedOwner;
 
 /// Parts commits a node copies at once. A commit past them answers `503`
 /// with `Retry-After` and the code `SnapshotCommitsBusy`.
@@ -149,9 +156,10 @@ fn copy_plan(capacity: u64) -> (usize, u64) {
     (usize::try_from(pieces).unwrap_or(1), charge)
 }
 
-/// The commits a node runs: its copy slots, and the keys of the commits it
-/// runs now, so that a repeat of a running commit is answered instead of
-/// copied again.
+/// The commits a node runs: its copy slots, and the stream incarnations it
+/// runs a commit or a discard of now. One runs per stream incarnation at a
+/// time, so a repeat of a running commit is answered instead of copied
+/// again, and two commits never spend the same parts.
 #[derive(Clone)]
 pub(crate) struct SnapshotCommits {
     slots: Arc<tokio::sync::Semaphore>,
@@ -172,17 +180,18 @@ impl Default for SnapshotCommits {
     }
 }
 
-/// A commit's key: its stream, offset and digest.
+/// What a commit or a discard claims: the stream incarnation whose parts
+/// it uses.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct CommitKey {
-    stream_id: BucketStreamId,
-    snapshot_offset: u64,
-    digest: String,
+pub(crate) struct CommitKey {
+    pub(crate) stream_id: BucketStreamId,
+    pub(crate) incarnation: u64,
 }
 
 impl SnapshotCommits {
-    /// Marks the commit of `key` as running, or `None` when it runs already.
-    fn claim(&self, key: CommitKey) -> Option<RunningCommit> {
+    /// Marks a commit or a discard of `key` as running, or `None` when one
+    /// runs already.
+    pub(crate) fn claim(&self, key: CommitKey) -> Option<RunningCommit> {
         let mut running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
         running.insert(key.clone()).then(|| RunningCommit {
             running: Arc::clone(&self.running),
@@ -199,8 +208,8 @@ impl SnapshotCommits {
     }
 }
 
-/// A running commit, until it ends: its parts are deleted or kept.
-struct RunningCommit {
+/// A running commit or discard, until it ends.
+pub(crate) struct RunningCommit {
     running: Arc<Mutex<HashSet<CommitKey>>>,
     key: CommitKey,
     #[cfg(test)]
@@ -254,10 +263,19 @@ pub(crate) enum PartsRefusal {
     /// `SnapshotCommitsBusy`).
     #[error("this node copies as many snapshot commits as it may; retry")]
     Busy,
-    /// The node runs this commit already (`503`, `SnapshotCommitInProgress`):
-    /// its repeat answers once it ends.
-    #[error("this commit is running; repeat it")]
+    /// The node runs a commit or a discard of this stream incarnation
+    /// already (`503`, `SnapshotCommitInProgress`): a repeat answers once it
+    /// ends.
+    #[error("a commit or discard of this stream runs; repeat it")]
     InProgress,
+    /// The stream holds as many staged, unused parts, or bytes of them, as
+    /// it may (`429` naming the limit and the stream's `incarnation`,
+    /// `STAGED_PARTS_LIMIT`).
+    #[error("this stream holds as many staged snapshot parts as it may; commit or discard them")]
+    StagedLimit {
+        limit: StagedPartsLimit,
+        incarnation: u64,
+    },
     /// The cold store failed (`502`).
     #[error("snapshot parts in the cold store: {0}")]
     ColdStore(#[source] io::Error),
@@ -283,6 +301,9 @@ impl IntoResponse for PartsRefusal {
             Self::Body(_) => (StatusCode::BAD_REQUEST, ErrorCode::BodyUnreadable),
             Self::Busy => return retry_after_json(ErrorCode::SnapshotCommitsBusy),
             Self::InProgress => return retry_after_json(ErrorCode::SnapshotCommitInProgress),
+            Self::StagedLimit { limit, incarnation } => {
+                return staged_limit_response(*limit, *incarnation);
+            }
             Self::ColdStore(err) => {
                 tracing::warn!(error = %err, "snapshot parts in the cold store failed");
                 return fixed_error_response(StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed);
@@ -297,6 +318,25 @@ impl IntoResponse for PartsRefusal {
         };
         error_response(status, code, self.to_string())
     }
+}
+
+/// `429` naming the staged-parts limit a part passed and the stream's
+/// incarnation, with no `Retry-After`: a short wait does not release it, a
+/// commit, a discard or the sweep does.
+fn staged_limit_response(limit: StagedPartsLimit, incarnation: u64) -> Response {
+    let mut headers = HeaderMap::new();
+    crate::render::insert_incarnation(&mut headers, incarnation);
+    limit.render(|name, value| insert_header_str(&mut headers, name, value));
+    error_answer(
+        StatusCode::TOO_MANY_REQUESTS,
+        limit.error_code(),
+        format!(
+            "the stream holds as many staged snapshot parts as it may: {} {}",
+            limit.header_name(),
+            limit.value()
+        ),
+        headers,
+    )
 }
 
 impl From<StreamIntoObjectError> for PartsRefusal {
@@ -452,8 +492,9 @@ fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -
 /// publish and the deletion of the parts. The answer goes out as soon as
 /// the publish answers, before the parts are deleted. A client that goes
 /// away, or a gateway that times out, cancels none of it: the repeat finds
-/// the snapshot published and answers `204` from its key, and a repeat
-/// while the commit runs answers `503` with `SnapshotCommitInProgress`.
+/// the snapshot published and answers `204` from its key, and a repeat, or
+/// any other commit or discard of the stream incarnation, while the commit
+/// runs answers `503` with `SnapshotCommitInProgress`.
 ///
 /// The leader routed the commit and found its key open. `budget` is the
 /// node's in-flight body budget, which the copy is charged against once it
@@ -495,8 +536,7 @@ pub(crate) async fn commit(
     let commits = target.state.snapshot_commits.clone();
     let Some(running) = commits.claim(CommitKey {
         stream_id: target.stream_id.clone(),
-        snapshot_offset: target.snapshot_offset,
-        digest: commit.digest.to_string(),
+        incarnation,
     }) else {
         target
             .state
@@ -535,7 +575,22 @@ pub(crate) async fn commit(
             );
         }
         if let Some(parts) = spent {
-            delete_parts(&cold_store, &parts).await;
+            let paths = parts.into_iter().map(|part| part.path).collect();
+            target
+                .state
+                .staged_parts
+                .delete_spent(
+                    &cold_store,
+                    &target.stream_id,
+                    target
+                        .state
+                        .runtime
+                        .locate(&target.stream_id)
+                        .raft_group_id
+                        .0,
+                    paths,
+                )
+                .await;
         }
     });
     match answered.await {
@@ -798,21 +853,6 @@ async fn assemble(
     })
 }
 
-/// Deletes the parts a commit spent, a few at once, best effort: a part
-/// left behind is swept as an orphan.
-async fn delete_parts(cold_store: &ColdStoreHandle, parts: &[ResolvedPart]) {
-    let paths = parts
-        .iter()
-        .map(|part| part.path.clone())
-        .collect::<Vec<_>>();
-    if let Err(err) = cold_store.delete_objects(paths).await {
-        tracing::warn!(
-            error = %err,
-            "failed to delete the parts of a snapshot commit; the orphan sweep reclaims them"
-        );
-    }
-}
-
 async fn delete_object(cold_store: &ColdStoreHandle, path: &str) {
     if let Err(err) = cold_store.delete_chunk(path).await {
         tracing::warn!(
@@ -827,8 +867,10 @@ async fn delete_object(cold_store: &ColdStoreHandle, path: &str) {
 /// and answers `201` with its id. It is routed before its body like every
 /// write, and the stream must exist (and hold the token a
 /// `Stream-Incarnation` precondition names): the part is staged for that
-/// incarnation. It meets the in-flight body budget but no WAL or Raft-log
-/// pressure check, since it touches neither until it is committed. The
+/// incarnation. A stream that holds as many staged parts as it may answers
+/// `429` naming the limit ([`crate::staged_parts`]). It meets the in-flight
+/// body budget but no WAL or Raft-log pressure check, since it touches
+/// neither until it is committed. The
 /// offset in the path is checked and otherwise unused: a part is bound to
 /// its stream, not to an offset.
 #[tracing::instrument(
@@ -870,11 +912,14 @@ pub(crate) async fn stage_snapshot_part(
     if let HeadDecision::Answer(answer) = decision {
         return crate::answer_before_body(answer, version, &headers, body).await;
     }
+    // The anchor of the retirement rule: read before the HEAD that names
+    // the incarnation.
+    let anchor_ms = state.unix_time_ms();
     let head = state
         .runtime
         .head_stream(HeadStreamRequest {
             stream_id: stream_id.clone(),
-            now_ms: state.unix_time_ms(),
+            now_ms: anchor_ms,
             linearizable: true,
             read_index: None,
         })
@@ -892,6 +937,42 @@ pub(crate) async fn stage_snapshot_part(
             return crate::answer_before_body(refused, version, &headers, body).await;
         }
     };
+    let raft_group_id = state.runtime.locate(&stream_id).raft_group_id;
+    // The count is valid for the term this node leads in. A node that lost
+    // the lead since routing answers as the routing does now.
+    let Some(term) = front_door::leader_term(&state, raft_group_id) else {
+        let answer = front_door::not_leading(&state, &stream_id, &request_target).await;
+        return crate::answer_before_body(answer, version, &headers, body).await;
+    };
+    // The stream's staged parts are an answer of the leader's own state,
+    // decided before the pressure checks, so a listing holds no budget.
+    let reservation = match state
+        .staged_parts
+        .reserve(
+            &cold_store,
+            StagedOwner {
+                stream_id: &stream_id,
+                raft_group_id: raft_group_id.0,
+                incarnation,
+                term,
+            },
+            part_reservation(&headers, &body),
+            anchor_ms,
+        )
+        .await
+    {
+        Ok(reservation) => reservation,
+        Err(refusal) => {
+            if matches!(refusal, PartsRefusal::StagedLimit { .. }) {
+                state
+                    .http_metrics
+                    .snapshot_parts_staged_limit
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            return crate::answer_before_body(refusal.into_response(), version, &headers, body)
+                .await;
+        }
+    };
     let _permit = match admission
         .0
         .map(crate::admission::DeferredAdmission::admit_budget)
@@ -905,11 +986,12 @@ pub(crate) async fn stage_snapshot_part(
     };
     let owner = PartOwner {
         stream_id: &stream_id,
-        raft_group_id: state.runtime.locate(&stream_id).raft_group_id.0,
+        raft_group_id: raft_group_id.0,
         incarnation,
     };
     match stage(&cold_store, owner, body).await {
-        Ok(part) => {
+        Ok((part, size)) => {
+            reservation.staged(size);
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             PartStaged { part }.render(|name, value| insert_header_str(&mut headers, name, value));
@@ -919,15 +1001,22 @@ pub(crate) async fn stage_snapshot_part(
     }
 }
 
+/// What a part reserves of its stream's staged bytes before its body is
+/// read: its declared size, which ingress admission held to the request
+/// limit, or the request limit when it declares none.
+fn part_reservation(headers: &HeaderMap, body: &Body) -> u64 {
+    crate::admission::declared_body_bytes(headers, body).min(limits::MAX_REQUEST_BYTES)
+}
+
 /// Streams a part's body, at most the request limit, into a new part
-/// object for `owner`, and returns its id.
+/// object for `owner`, and returns its id and size.
 async fn stage(
     cold_store: &ColdStoreHandle,
     owner: PartOwner<'_>,
     body: Body,
-) -> Result<PartId, PartsRefusal> {
+) -> Result<(PartId, u64), PartsRefusal> {
     let id = PartId::new(new_snapshot_part_id()).map_err(PartsRefusal::Invariant)?;
-    stream_into_object(
+    let (_written, size) = stream_into_object(
         cold_store,
         &owner.path(id.as_str()),
         Bytes::new(),
@@ -936,7 +1025,96 @@ async fn stage(
         limits::MAX_REQUEST_BYTES,
     )
     .await?;
-    Ok(id)
+    Ok((id, size))
+}
+
+/// `DELETE {stream}/snapshot/parts`: discards every staged part of the
+/// stream's current incarnation, and the retired parts of earlier ones, and
+/// answers `204` with `Stream-Incarnation`. It honors a `Stream-Incarnation`
+/// precondition, is answered by the stream's leader (`307` elsewhere), and
+/// waits for no commit: one that runs answers `503` with
+/// `SnapshotCommitInProgress`. A part still uploading is not discarded.
+pub(crate) async fn discard_snapshot_parts(
+    State(state): State<HttpState>,
+    OriginalUri(uri): OriginalUri,
+    Path(path): Path<crate::StreamPath>,
+    headers: HeaderMap,
+) -> Response {
+    let stream_id = path.into_stream_id();
+    let if_incarnation = match crate::incarnation_precondition(&headers) {
+        Ok(if_incarnation) => if_incarnation,
+        Err(response) => return *response,
+    };
+    let Some(cold_store) = state.runtime.cold_store() else {
+        return PartsRefusal::NoColdStore.into_response();
+    };
+    let request_target = crate::request_target(&uri);
+    if let HeadDecision::Answer(answer) =
+        front_door::route_before_body(&state, &stream_id, &request_target, None, None).await
+    {
+        return answer;
+    }
+    let anchor_ms = state.unix_time_ms();
+    let incarnation = match state
+        .runtime
+        .head_stream(HeadStreamRequest {
+            stream_id: stream_id.clone(),
+            now_ms: anchor_ms,
+            linearizable: true,
+            read_index: None,
+        })
+        .await
+    {
+        Ok(head) => match crate::read_precondition_failed(if_incarnation, head.incarnation) {
+            Some(refused) => return refused,
+            None => head.incarnation,
+        },
+        Err(err) => {
+            return crate::runtime_error_or_leader_redirect_async(&state, err, &request_target)
+                .await;
+        }
+    };
+    let raft_group_id = state.runtime.locate(&stream_id).raft_group_id;
+    let Some(term) = front_door::leader_term(&state, raft_group_id) else {
+        return front_door::not_leading(&state, &stream_id, &request_target).await;
+    };
+    let Some(_running) = state.snapshot_commits.claim(CommitKey {
+        stream_id: stream_id.clone(),
+        incarnation,
+    }) else {
+        state
+            .http_metrics
+            .snapshot_commits_in_progress
+            .fetch_add(1, Ordering::Relaxed);
+        return PartsRefusal::InProgress.into_response();
+    };
+    let discarded = state
+        .staged_parts
+        .discard(
+            &cold_store,
+            StagedOwner {
+                stream_id: &stream_id,
+                raft_group_id: raft_group_id.0,
+                incarnation,
+                term,
+            },
+            anchor_ms,
+        )
+        .await;
+    match discarded {
+        Ok(listed) => {
+            tracing::debug!(
+                stream = %stream_id,
+                discarded = listed.deleted,
+                "discarded a stream's staged snapshot parts"
+            );
+            let mut headers = HeaderMap::new();
+            insert_default_response_headers(&mut headers);
+            crate::render::insert_incarnation(&mut headers, incarnation);
+            (StatusCode::NO_CONTENT, headers).into_response()
+        }
+        Err(refusal) => refusal.into_response(),
+    }
 }
 
 #[cfg(test)]

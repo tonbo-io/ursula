@@ -19,6 +19,8 @@
 //!   body, and streaming a read's body or byte range.
 //! - [`snapshot_parts`]: snapshots uploaded in parts: staging a part, and
 //!   the commit that assembles and publishes them.
+//! - [`staged_parts`]: the bound on a stream's staged, unused snapshot
+//!   parts, counted by the leader.
 //! - [`response_metadata`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on
 //!   every HEAD answer, and the request limit on a `413` that names none.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
@@ -45,6 +47,7 @@ mod removed_surface;
 mod render;
 mod response_metadata;
 mod snapshot_parts;
+mod staged_parts;
 mod wal_disk;
 
 use std::collections::BTreeMap;
@@ -272,7 +275,7 @@ pub(crate) struct StreamPath {
 }
 
 impl StreamPath {
-    fn into_stream_id(self) -> BucketStreamId {
+    pub(crate) fn into_stream_id(self) -> BucketStreamId {
         BucketStreamId::new(self.bucket, self.stream)
     }
 }
@@ -350,6 +353,8 @@ pub struct HttpState {
     cluster_id: Arc<ClusterId>,
     /// The parts commits this node runs (#581 section 3.1).
     snapshot_commits: snapshot_parts::SnapshotCommits,
+    /// The staged, unused snapshot parts of the streams this node leads.
+    staged_parts: staged_parts::StagedParts,
 }
 
 impl HttpState {
@@ -400,6 +405,116 @@ impl HttpState {
         if let Some(registry) = &self.raft_registry {
             otel_metrics::register_recovery_gates(registry.clone());
         }
+        otel_metrics::register_staged_snapshot_parts(self.clone());
+    }
+
+    /// Replaces the staged-parts tracker, which the orphan sweep then tells
+    /// of the parts it deletes.
+    #[cfg(test)]
+    pub(crate) fn set_staged_parts(&mut self, staged_parts: staged_parts::StagedParts) {
+        staged_parts.lead_by(self.raft_registry.clone());
+        self.runtime
+            .observe_swept_parts(Arc::new(staged_parts.clone()));
+        self.staged_parts = staged_parts;
+    }
+
+    /// This node's id, when it has one: configured, or named by its static
+    /// topology.
+    pub(crate) fn node_id(&self) -> Option<u64> {
+        self.configured_node_id
+            .or_else(|| {
+                self.client_write_router
+                    .as_ref()
+                    .and_then(|topology| topology.node_id)
+            })
+            .or_else(|| {
+                self.raft_registry().and_then(|registry| {
+                    registry
+                        .metrics_snapshot()
+                        .first()
+                        .map(|group| group.node_id)
+                })
+            })
+    }
+
+    /// The staged-part totals of the groups this node leads, in the term
+    /// it leads each in now.
+    pub(crate) fn staged_part_report(&self) -> Vec<staged_parts::GroupReport> {
+        self.staged_parts.report()
+    }
+
+    /// The bytes of staged parts in the groups this node leads.
+    pub(crate) fn staged_part_bytes_total(&self) -> u64 {
+        self.staged_part_report()
+            .iter()
+            .flat_map(|group| group.buckets.values())
+            .fold(0_u64, |total, bytes| total.saturating_add(*bytes))
+    }
+
+    /// Counts the staged parts of the groups this node leads, off the
+    /// request path: seeds a group's totals when the node starts to lead
+    /// it, woken by its Raft metrics. `None` without a cold store. Dropping
+    /// the guard ends the task.
+    pub(crate) fn spawn_staged_part_counting(&self) -> Option<AbortOnDrop> {
+        let cold_store = self.runtime.cold_store()?;
+        let state = self.clone();
+        Some(AbortOnDrop(tokio::spawn(async move {
+            loop {
+                state.count_staged_parts_once(&cold_store).await;
+                state.counting_wakeup().await;
+            }
+        })))
+    }
+
+    /// One round of the staged-part counting.
+    pub(crate) async fn count_staged_parts_once(
+        &self,
+        cold_store: &ursula_runtime::ColdStoreHandle,
+    ) {
+        self.staged_parts
+            .count_led_groups(&self.runtime, cold_store)
+            .await;
+    }
+
+    /// Waits until this node's leadership of a registered group changes
+    /// (its role or term, from the group's Raft metrics watch), an update
+    /// starts a group's staged-part totals, or [`STAGED_PART_COUNTING_RETRY`]
+    /// passes, after which a group registered meanwhile is watched and a
+    /// failed seed runs again.
+    async fn counting_wakeup(&self) {
+        use openraft::rt::WatchReceiver;
+
+        let mut changes = Vec::new();
+        if let Some(registry) = self.raft_registry() {
+            for group in 0..self.runtime.raft_group_count() {
+                let Some(raft) = registry.get(RaftGroupId(group)) else {
+                    continue;
+                };
+                let seen = raft.leadership();
+                let mut metrics = raft.metrics();
+                changes.push(Box::pin(async move {
+                    while metrics.changed().await.is_ok() {
+                        if ursula_raft::GroupLeadership::of(&metrics.borrow_watched()) != seen {
+                            return;
+                        }
+                    }
+                    std::future::pending::<()>().await;
+                }));
+            }
+        }
+        let leadership = async {
+            if changes.is_empty() {
+                std::future::pending::<()>().await;
+            } else {
+                futures_util::future::select_all(changes).await;
+            }
+        };
+        tokio::select! {
+            biased;
+            () = leadership => {}
+            () = self.staged_parts.count_started() => {}
+            () = tokio::time::sleep(STAGED_PART_COUNTING_RETRY) => {}
+        }
     }
 
     pub(crate) fn with_process_incarnation(mut self, boot: ProcessIncarnation) -> Self {
@@ -421,6 +536,7 @@ impl HttpState {
     }
 
     pub fn new(runtime: ShardRuntime) -> Self {
+        let staged_parts = staged_parts::StagedParts::observing(&runtime, None);
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
@@ -433,6 +549,7 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
             snapshot_commits: snapshot_parts::SnapshotCommits::default(),
+            staged_parts,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -444,6 +561,8 @@ impl HttpState {
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
     ) -> Self {
+        let staged_parts =
+            staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
         Self {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
             admin_fence: admin_fence::AdminMutationFence::default(),
@@ -456,6 +575,7 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
             snapshot_commits: snapshot_parts::SnapshotCommits::default(),
+            staged_parts,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -484,6 +604,8 @@ impl HttpState {
         peers: impl IntoIterator<Item = (u64, String)>,
         per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     ) -> Self {
+        let staged_parts =
+            staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
         Self {
             runtime,
             raft_registry: Some(raft_registry),
@@ -500,6 +622,7 @@ impl HttpState {
             node_memory: NodeMemoryMonitor::default(),
             external_payload_min_bytes: 1024 * 1024,
             snapshot_commits: snapshot_parts::SnapshotCommits::default(),
+            staged_parts,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
@@ -647,6 +770,9 @@ struct HttpMetrics {
     /// Repeats of a running parts commit, answered `503
     /// SnapshotCommitInProgress`.
     snapshot_commits_in_progress: AtomicU64,
+    /// Snapshot parts answered `429 STAGED_PARTS_LIMIT`: their stream held
+    /// as many staged parts as it may.
+    snapshot_parts_staged_limit: AtomicU64,
 }
 
 impl HttpMetrics {
@@ -660,6 +786,7 @@ impl HttpMetrics {
             producer_expired_answers: self.producer_expired_answers.load(Ordering::Relaxed),
             snapshot_commits_busy: self.snapshot_commits_busy.load(Ordering::Relaxed),
             snapshot_commits_in_progress: self.snapshot_commits_in_progress.load(Ordering::Relaxed),
+            snapshot_parts_staged_limit: self.snapshot_parts_staged_limit.load(Ordering::Relaxed),
         }
     }
 }
@@ -674,6 +801,20 @@ struct HttpMetricsSnapshot {
     producer_expired_answers: u64,
     snapshot_commits_busy: u64,
     snapshot_commits_in_progress: u64,
+    snapshot_parts_staged_limit: u64,
+}
+
+/// The longest the staged-part counting waits for a leadership change
+/// before it looks at every group again.
+const STAGED_PART_COUNTING_RETRY: Duration = Duration::from_secs(60);
+
+/// A task that ends when its guard drops.
+pub(crate) struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// Resolves the current leader of a raft group to a client-reachable base URL
@@ -1569,6 +1710,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
             get(immutable_reads::read_immutable_snapshot),
         )
         .route(
+            front_door::STAGED_PARTS_ROUTE,
+            axum::routing::delete(snapshot_parts::discard_snapshot_parts),
+        )
+        .route(
             "/{bucket}/{stream}/retention/{retained_offset}",
             put(advance_retention),
         )
@@ -1822,6 +1967,8 @@ pub(crate) async fn purge_bucket(
         Ok(report) => report,
         Err(err) => return purge_error_response(err),
     };
+    // The purge erased the bucket's staged parts with its prefix.
+    state.staged_parts.purged(&bucket);
     // Reclaim the just-enqueued cold prefixes now instead of waiting for the
     // background worker's next pass. Failures leave entries queued for the
     // worker; the purge itself is already durable.
@@ -1911,23 +2058,32 @@ pub(crate) async fn bucket_usage(State(state): State<HttpState>) -> Response {
             let buckets = report
                 .into_iter()
                 .map(|entry| {
-                    (
-                        entry.bucket_id,
-                        serde_json::json!({
-                            "committed_append_bytes": entry.usage.committed_append_bytes,
-                            "committed_records": entry.usage.committed_records,
-                            "committed_write_units": entry.usage.committed_write_units,
-                            "retained_bytes": entry.usage.retained_bytes,
-                            "stream_count": entry.usage.stream_count,
-                        }),
-                    )
+                    (entry.bucket_id, ursula_proto::admin::BucketUsageReport {
+                        committed_append_bytes: entry.usage.committed_append_bytes,
+                        committed_records: entry.usage.committed_records,
+                        committed_write_units: entry.usage.committed_write_units,
+                        retained_bytes: entry.usage.retained_bytes,
+                        stream_count: entry.usage.stream_count,
+                    })
                 })
-                .collect::<serde_json::Map<_, _>>();
-            axum::Json(serde_json::json!({
-                "version": 1,
-                "write_unit_bytes": ursula_runtime::COMMITTED_WRITE_UNIT_BYTES,
-                "buckets": buckets,
-            }))
+                .collect::<BTreeMap<_, _>>();
+            axum::Json(ursula_proto::admin::UsageReport {
+                version: ursula_proto::admin::SchemaVersion,
+                node_id: state.node_id(),
+                write_unit_bytes: ursula_runtime::COMMITTED_WRITE_UNIT_BYTES,
+                buckets,
+                raft_group_count: state.runtime.raft_group_count(),
+                staged_snapshot_parts: state
+                    .staged_part_report()
+                    .into_iter()
+                    .map(|group| ursula_proto::admin::GroupStagedParts {
+                        raft_group_id: group.raft_group_id,
+                        term: group.term,
+                        counting_finished: group.counting_finished,
+                        bytes: group.buckets,
+                    })
+                    .collect(),
+            })
             .into_response()
         }
         Err(err) => (
@@ -1967,13 +2123,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
             maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
             process_incarnation: state.process_incarnation.clone(),
             process_node_id: state
-                .configured_node_id
-                .or_else(|| {
-                    state
-                        .client_write_router
-                        .as_ref()
-                        .and_then(|topology| topology.node_id)
-                })
+                .node_id()
                 .or_else(|| raft_groups.first().map(|group| group.node_id)),
             groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
             raft_maintenance: state.raft_maintenance_report(),
@@ -2001,6 +2151,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         raft_grpc_peer_cluster_refusals: state.peer_cluster_refusals(),
         raft_grpc_unidentified_peer_refusals: state.unidentified_peer_refusals(),
         peer_cluster_mismatches: state.peer_cluster_mismatches(),
+        staged_snapshot_part_bytes: state.staged_part_bytes_total(),
     })
     .into_response()
 }
@@ -3518,15 +3669,32 @@ pub(crate) async fn delete_stream_by_id(
         Ok(if_incarnation) => if_incarnation,
         Err(response) => return *response,
     };
+    // Read before the delete: every incarnation known then is dead after it.
+    let started_ms = state.unix_time_ms();
+    let known_parts = state.staged_parts.before_delete(&stream_id);
     match state
         .runtime
         .delete_stream(DeleteStreamRequest {
-            stream_id,
+            stream_id: stream_id.clone(),
             if_incarnation,
         })
         .await
     {
         Ok(_) => {
+            // The stream's staged parts can no longer be committed. The
+            // cleanup runs after the answer, and only for a stream this
+            // node counts parts of.
+            if let (Some(known), Some(cold_store)) = (known_parts, state.runtime.cold_store()) {
+                let raft_group_id = state.runtime.locate(&stream_id).raft_group_id.0;
+                state.staged_parts.deleted(
+                    cold_store,
+                    stream_id,
+                    raft_group_id,
+                    known,
+                    if_incarnation,
+                    started_ms,
+                );
+            }
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);
             (StatusCode::NO_CONTENT, headers).into_response()

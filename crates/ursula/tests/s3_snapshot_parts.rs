@@ -2,8 +2,10 @@
 //! M4 of the step 4 review): 256 MiB in eight 32 MiB parts, staged and
 //! committed through the router, then read back by range. It logs how long
 //! the commit's copy took, the number a gateway's response timeout must
-//! cover. CI runs it in the Integration workflow's real-S3 job; it is
-//! skipped without `URSULA_COLD_S3_INTEGRATION=1`.
+//! cover. A second test lists one stream's staged parts on S3, as the
+//! staged-parts bound does (#622). CI runs both in the Integration
+//! workflow's real-S3 job; they are skipped without
+//! `URSULA_COLD_S3_INTEGRATION=1`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -160,6 +162,60 @@ async fn s3_commits_a_256_mib_snapshot_from_parts() {
         .collect::<Vec<_>>();
     assert_eq!(tail.as_ref(), expected.as_slice());
 
+    cold_store
+        .remove_all("")
+        .await
+        .expect("clean up the per-run S3 root");
+}
+
+/// #622: on S3 the leader counts a stream's staged parts from one prefix
+/// listing of its run of names, with the sizes S3 lists. The parts of the
+/// streams whose names sort before and after it are not listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s3_lists_one_streams_staged_parts() {
+    if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
+        tracing::warn!(
+            "skipping the S3 staged parts listing test; set URSULA_COLD_S3_INTEGRATION=1 and \
+             URSULA_COLD_S3_BUCKET"
+        );
+        return;
+    }
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    let cold_store = ColdStore::try_new(&cold_config(suffix)).expect("S3 cold store");
+    let dir = ursula_runtime::snapshot_part_dir("s3parts", 0);
+    let streams = ["a", "b", "c"].map(|name| ursula_shard::BucketStreamId::new("s3parts", name));
+    let sizes: [&[usize]; 3] = [&[1], &[2, 3, 4], &[5]];
+    for (stream_id, sizes) in streams.iter().zip(sizes) {
+        for (incarnation, size) in (7_u64..).zip(sizes) {
+            cold_store
+                .write_chunk(
+                    &ursula_runtime::snapshot_part_path(
+                        stream_id,
+                        0,
+                        incarnation,
+                        &ursula_runtime::new_snapshot_part_id(),
+                    ),
+                    &vec![7; *size],
+                )
+                .await
+                .expect("stage a part");
+        }
+    }
+    let prefix = ursula_runtime::snapshot_part_stream_prefix(&streams[1]);
+    let listed = cold_store
+        .list_file_sizes_with_prefix(&dir, &prefix, usize::MAX)
+        .await
+        .expect("list");
+    let mut sizes = listed.iter().map(|(_, size)| *size).collect::<Vec<_>>();
+    sizes.sort_unstable();
+    assert_eq!(sizes, [2, 3, 4], "{listed:?}");
+    assert!(listed.iter().all(|(name, _)| {
+        name.starts_with(&prefix)
+            && ursula_runtime::snapshot_part_object_incarnation(name).is_some()
+    }));
     cold_store
         .remove_all("")
         .await

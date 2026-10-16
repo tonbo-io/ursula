@@ -120,6 +120,13 @@
   },
   {
     "category": "tokio_watch",
+    "path": "crates/ursula/src/staged_parts.rs",
+    "snippet_contains": "watch",
+    "reason": "test-only",
+    "plan": "no action: the `cleaned` counter and its accessor are #[cfg(test)] pause points for the stream-delete cleanup tests and do not exist in a simulation build's library."
+  },
+  {
+    "category": "tokio_watch",
     "path": "crates/ursula/src/snapshot_parts.rs",
     "snippet_contains": "tokio::sync::watch",
     "reason": "test-only",

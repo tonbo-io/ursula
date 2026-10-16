@@ -473,6 +473,9 @@ async fn serve(
             .collect(),
     );
 
+    // Counts the staged snapshot parts of the groups this node leads, for
+    // usage. Its guard ends it on every way out of this function.
+    let staged_part_counting = state.spawn_staged_part_counting();
     let admin_app = crate::admin_router(state.clone());
     let admin_listener = tokio::net::TcpListener::bind(admin_listen).await?;
     let admin_task = tokio::spawn(serve_until_shutdown(
@@ -534,6 +537,7 @@ async fn serve(
         serve_res?;
         admin_res?;
     }
+    drop(staged_part_counting);
     tracing::info!("listeners closed; stopping the Raft groups");
     let wal_shutdown = shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
     tracing::info!("exiting");

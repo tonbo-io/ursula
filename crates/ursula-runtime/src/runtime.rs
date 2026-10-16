@@ -230,6 +230,23 @@ pub struct ShardRuntime {
     compaction_debt_chunk_bytes: Arc<AtomicU64>,
     /// Each started group's ReadIndex barrier, installed by its core worker.
     read_barriers: ReadIndexBarriers,
+    /// Told of the staged snapshot parts the orphan sweep deletes.
+    swept_parts: Arc<std::sync::RwLock<Option<Arc<dyn SweptPartsObserver>>>>,
+}
+
+/// One staged snapshot part the orphan sweep deleted: its object path and
+/// size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SweptPart {
+    pub path: String,
+    pub bytes: u64,
+}
+
+/// Told of the staged snapshot parts the orphan sweep deletes, so a node
+/// that counts staged parts gives them back (#639). Called on the sweep's
+/// task once per sweep step that deleted parts. It must not block.
+pub trait SweptPartsObserver: std::fmt::Debug + Send + Sync + 'static {
+    fn swept(&self, parts: &[SweptPart]);
 }
 
 /// Node-local position of one group's cold-index repair cursor.
@@ -322,7 +339,31 @@ impl ShardRuntime {
                 DEFAULT_COMPACTION_DEBT_CHUNK_BYTES,
             )),
             read_barriers,
+            swept_parts: Arc::default(),
         })
+    }
+
+    /// Installs the observer the orphan sweep tells of the staged parts it
+    /// deletes, in place of any earlier one.
+    pub fn observe_swept_parts(&self, observer: Arc<dyn SweptPartsObserver>) {
+        *self
+            .swept_parts
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
+    fn report_swept_parts(&self, parts: &[SweptPart]) {
+        if parts.is_empty() {
+            return;
+        }
+        let observer = self
+            .swept_parts
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(observer) = observer {
+            observer.swept(parts);
+        }
     }
 
     /// Sets the size below which exclusive chunks are compaction debt; the

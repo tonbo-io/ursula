@@ -300,6 +300,7 @@ pub(super) fn cold_store_operation_name(operation: ColdStoreOperation) -> &'stat
         ColdStoreOperation::DeleteChunk => "delete_chunk",
         ColdStoreOperation::RemoveAll => "remove_all",
         ColdStoreOperation::ReadObjectRange => "read_object_range",
+        ColdStoreOperation::ListPrefix => "list_prefix",
     }
 }
 
