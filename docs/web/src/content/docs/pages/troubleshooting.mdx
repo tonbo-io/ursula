@@ -426,8 +426,8 @@ These entries cover the `sqlite-ursula-vfs` extension and `@tonbo/sqlite-ursula`
 
 | `condition` | Cause | What to do |
 | ----------- | ----- | ---------- |
-| `retrying` | No definite answer yet: the stream is unreachable, answers `5xx`, `429` or `408`, or the connection dropped. The append is resent unchanged after backoff. A `429` marked `TenantUploads` or `TenantUploadBytes` means the bucket's large bodies under way reached its `max_concurrent_uploads` or `max_upload_bytes` in the gateway's `--quota-policy` | Check that the stream URL's host resolves and that the gateway or the server behind it is up. Nothing is lost while it retries. For the upload refusals, raise those keys or keep commits at or below the gateway's `--small-body-max-bytes` (1 MiB by default), which never count |
-| `unauthorized` | The same token was refused twice (`401`) | Fix the token passed to `open` or the file `URSULA_VFS_TOKEN_FILE` names. A changed file is read again at once |
+| `retrying` | No definite answer yet: the stream is unreachable, answers `5xx`, `429` or `408`, or the connection dropped. The append is resent unchanged after backoff. A `429` with the code `UPLOADS_EXHAUSTED` or `UPLOAD_BYTES_EXHAUSTED` means the bucket's large bodies under way reached its `max_concurrent_uploads` or `max_upload_bytes` in the gateway's `--quota-policy` | Check that the stream URL's host resolves and that the gateway or the server behind it is up. Nothing is lost while it retries. For the upload refusals, raise those keys, or set `URSULA_VFS_MAX_REQUEST_BYTES` at or below the gateway's `--small-body-max-bytes` (1 MiB by default), whose bodies never count. Small commits alone do not stay below it, since an append packs commits up to 4 MiB |
+| `unauthorized` | Two `401`s in a row, the second after reading the token again | Fix the token passed to `open` or the file `URSULA_VFS_TOKEN_FILE` names. A changed file is read again at once |
 | `forbidden` | An authorizer in front of the stream answered `403` | Allow the write in the authorizer |
 | `payment_required` | A layer in front of the stream answered `402` | Settle what the layer asks for |
 | `request_too_large` | A layer in front of the stream allows request bodies below 4 KiB | Raise the layer's limit |
@@ -462,7 +462,7 @@ The database was reset. Every statement throws an `UrsulaResetError` (`errcode` 
 
 | `kind` | Cause | What to do |
 | ------ | ----- | ---------- |
-| `server_too_old` | The stream's `HEAD` lacks `Ursula-Protocol: 2` or `Ursula-Cluster-Id`: a 0.7 server, or a layer that answers `HEAD` itself, such as a gateway whose authorizer conceals the stream | Run a 0.8 server, check the token, and send `HEAD` through to the server |
+| `server_too_old` | The stream's `HEAD` lacks `Ursula-Protocol: 2` or `Ursula-Cluster-Id`: a 0.7 server, or a layer that answers `HEAD` itself, such as a gateway whose authorizer conceals the stream, whose `404` carries neither header | Run a 0.8 server, check the token, and send `HEAD` through to the server |
 | `stream_format` | The stream holds 0.7 data, or another content type | Move the database with an import, see [Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07) |
 | `wrong_cluster` | The cache was built on another deployment than the one the URL reaches now | Fix the routing, or use another `dir` for the other deployment |
 | `not_found` | The stream is missing and the cache holds data | Open with `recreate: true`, or open another stream |

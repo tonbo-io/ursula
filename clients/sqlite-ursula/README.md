@@ -42,7 +42,7 @@ A commit is local. The extension appends it to a log it owns and replicates the 
 `importSqlite(url, file, { token, timeoutMs })` imports a plain SQLite database file into a new stream, as the stream's first snapshot, and returns `{ offset, digest, pages, bytes }`. Then `open(url)` it as any other stream.
 
 - The file must have 4096-byte pages, with no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
-- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published.
+- The stream must be missing, or empty. A stream of another content type fails with `stream_format`, anything else with `stream_state`, and nothing is published. A server before 0.8 fails with `server_too_old`.
 - While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until it is deleted or recreated. `UrsulaUnavailableError` from an import says `fix` for that reason.
 - A snapshot above the request limit goes up in parts, which needs a cold store on the server. Without one, a file whose compressed snapshot is above the limit fails with `invalid_argument`, naming the limit.
 - The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default).
@@ -56,7 +56,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (retry after `synced()`), `unsupported` (fix) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` when its signal fired first | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` when it met none yet |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_name`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a database that retired | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 After a reset, pending `synced()` calls reject first, then the `reset` listeners run once. Every statement of the database throws the reset, reads included, except reads in a read transaction it had open, which keep its snapshot. A write in it still fails. `open()` the stream again, or stop when the action is `stop`. The new open need not wait for the old database to close: it works on a copy of the local cache, which carries every commit the old one made. Close the old database once you no longer need it.
 

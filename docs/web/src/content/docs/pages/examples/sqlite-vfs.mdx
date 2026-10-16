@@ -87,7 +87,7 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 | `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed (`errcode` 7178) | `backlog_full`, `unsupported` |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` when its signal fires first, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` |
-| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a closed database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
+| `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 `unsupported` is a transaction the extension cannot capture: EXCLUSIVE locking mode, or a commit that leaves WAL mode or 4096-byte pages. Only that transaction fails.
 
@@ -190,7 +190,7 @@ const db = await open("https://ursula.example.com/acme/notes");
 ```
 
 - The file must have 4096-byte pages, no `-wal` beside it and no hot journal. `VACUUM INTO` writes such a copy (after `PRAGMA page_size = 4096` when the database has other pages). The file is only read.
-- The stream must be missing, or empty. Anything else fails with `stream_state` and nothing is published. While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until you delete or recreate it.
+- The stream must be missing, or empty. A stream of another content type fails with `stream_format`, anything else with `stream_state`, and nothing is published. A server before 0.8 fails with `server_too_old`. While the import runs, opens of the stream fail with `stream_state`. An import that fails after it claimed the stream leaves a stream that refuses opens and imports with `stream_state` until you delete or recreate it.
 - A file whose compressed snapshot is above the request limit goes up in parts, which needs a cold backend on the server. Without one it fails with `invalid_argument`, naming the limit.
 - The call blocks its thread until the import is done, for at most `timeoutMs` (10 minutes by default).
 
@@ -244,7 +244,7 @@ Operations changes:
 
 ## Layers in front of the stream
 
-Every write the extension sends carries a producer key and a digest of its body. A proxy or a gateway that sends a write again does no harm: the stream answers the repeat as a duplicate of the same write. The extension never needs to know that a write applied nothing: it sends the same bytes again until the stream answers them. 0.8 servers and gateways send no `x-ursula-not-applied` header.
+Every append the extension sends, a claim included, carries a producer key and a digest of its body. A proxy or a gateway that sends an append again does no harm: the stream answers the repeat as a duplicate of the same write. A snapshot publish or a parts commit sent again is answered from its offset and digest. The extension never needs to know that a write applied nothing: it sends the same bytes again until the stream answers them. 0.8 servers and gateways send no `x-ursula-not-applied` header.
 
 Other clients on a shared deployment may send writes without producer headers, which a replayed request applies twice. Keep proxy retries off for stream writes on such a deployment (`proxy-next-upstream: "off"` in the chart's TLS ingress example).
 

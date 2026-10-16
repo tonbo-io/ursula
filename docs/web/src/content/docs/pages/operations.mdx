@@ -498,15 +498,28 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 ## Upgrading to 0.8
 
-**0.8.0 is a breaking release.** It changes the storage and protocol format to format epoch 4. A 0.8 node refuses epoch-3 Raft WAL directories and object-storage prefixes at startup, refuses 0.7 peers, snapshots and backups, and `ursulactl restore` refuses 0.7 backups. There is no migration, no in-place upgrade, no rolling upgrade and no rollback.
+**0.8.0 is a breaking release.** It changes the storage and protocol format to format epoch 4. A 0.8 node refuses epoch-3 Raft WAL directories and object-storage prefixes at startup, refuses 0.7 peers, snapshots and backups, and `ursulactl restore` refuses 0.7 backups. There is no migration, no in-place upgrade, no rolling upgrade and no rollback. If you cannot move your data yet, stay on 0.7.6.
 
 1. **Install fresh.** Use empty PVCs and never-used prefixes for the cold store, S3 snapshots and the event-time indexer. Never reuse a prefix that 0.7, or a failed upgrade attempt, wrote to.
 2. **Set the cluster id.** Set `server.cluster_id` on every node of a multi-node cluster, the same on every node and different for every deployment a client can reach. The chart requires `server.clusterId` for every install, a single replica included.
 3. **Choose the network planes before the first install.** The chart serves Raft on `server.ports.cluster` (`4439`) by default. Do not change `server.clusterListen` or `server.ports.cluster` on an initialized cluster. Outside the chart, set `server.cluster_listen` and `client_url` together on every node.
-4. **Lower the gateway's request limit.** A gateway whose `--max-request-body-bytes` (`gateway.maxRequestBodyBytes`) is above 33554432 refuses to start. Larger snapshots go up in parts.
-5. **Move data by export and re-import.** The applications that own the data read it from 0.7 and write it into 0.8. For the SQLite VFS, export each database with 0.7 using `VACUUM INTO` and import the file with 0.8 ([Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07)).
-6. **Update clients and proxies.** Error answers have a JSON body, `x-ursula-not-applied` is gone, a leadership loss after a proposal answers `503` with `OUTCOME_UNKNOWN`, and `Stream-Incarnation` changes on a restore or an accepted loss. A proxy in front of Ursula follows the intermediary rules of [write outcomes](/docs/specs/extensions#111-write-outcomes).
-7. **Update recovery runbooks.** `accept-unsynced-loss` takes a recovery plan, and `ursulactl recover-group --accept-loss` computes it. A replica whose committed entries a plan dropped waits for its node to be rejoined as a wiped node. See [Recovering after a host crash](#recovering-after-a-host-crash) for the checks before a wipe.
+4. **Check the inflight body budget.** A node with a cold backend needs `server.http_inflight_body_size` of at least 64 MiB, or it refuses to start with `InflightBodyBudgetTooSmall`.
+5. **Lower the gateway's request limit.** A gateway whose `--max-request-body-bytes` (`gateway.maxRequestBodyBytes`) is above 33554432 refuses to start. Larger snapshots go up in parts.
+6. **Move data by export and re-import.** The applications that own the data read it from 0.7 and write it into 0.8. For the SQLite VFS, export each database with 0.7 using `VACUUM INTO` and import the file with 0.8 ([Moving from 0.7](/docs/examples/sqlite-vfs#moving-from-07)).
+7. **Update clients and proxies.** Error answers have a JSON body, `x-ursula-not-applied` is gone, a leadership loss after a proposal answers `503` with `OUTCOME_UNKNOWN`, and `Stream-Incarnation` changes on a restore or an accepted loss. A proxy in front of Ursula follows the intermediary rules of [write outcomes](/docs/specs/extensions#111-write-outcomes). Also check clients and tooling for these changes:
+   - A snapshot publish above 32 MiB sent straight to a node answers `413`. Send it in parts.
+   - A failed cold-tier read answers `502` `COLD_STORE_FAILED`, where 0.7 answered `500`, and a write that needs a cold backend the node lacks answers `501` `NO_COLD_STORE`, where 0.7 answered `503`.
+   - `Producer-Seq` on `200` and `204` is the epoch's highest applied seq, not the request's.
+   - A create with producer headers answers `400`. Create the stream, then claim an epoch.
+   - A producer close of a closed stream answers `409`. Only a close without producer headers is idempotent there.
+   - A retention request at or below the retained offset answers `204` and changes nothing, where 0.7 answered `409`.
+   - An SSE session ends on a delete and recreate, since it is pinned to the token its first response announced.
+   - Read and snapshot `ETag`s have a new form.
+   - `/__ursula/metrics` no longer reports `receipts`, `receipt_items` or `max_receipt_items_per_stream`.
+   - The gateway no longer uses a system proxy from `HTTP_PROXY` for its upstreams.
+   - The chart's Helm test pod's name label is now `<chart>-test`.
+   - `ursulactl` reads metrics at a manifest node's `client_url`, never at `http_url`. Add `client_url` to custom manifests.
+8. **Update recovery runbooks.** `accept-unsynced-loss` takes a recovery plan, and `ursulactl recover-group --accept-loss` computes it. A replica whose committed entries a plan dropped waits for its node to be rejoined as a wiped node. See [Recovering after a host crash](#recovering-after-a-host-crash) for the checks before a wipe.
 
 Every behavior change, with what to change for each area, is listed in the [0.8.0 release notes](/docs/release-notes#080).
 

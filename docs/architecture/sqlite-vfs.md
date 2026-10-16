@@ -318,8 +318,8 @@ implies our digest, since a key conflict is decided first.
   pending commits.
 - A HEAD follows three lost answers in a row for a body above 64 KiB, since a layer that refuses a
   large body without reading it looks like a lost answer.
-- A `synced()` probe or a pre-check answered `410` sends a HEAD before it fences: our token still
-  there fences, another token takes the history path.
+- A `synced()` probe or a pre-check answered `410` sends a HEAD first. With our token still there,
+  a probe resets `fenced` and a pre-check resets `stale`. Another token takes the history path.
 
 Tests: `replicator/tests/answer_rows.rs`, one test per row
 (`append_row_1_a_200_at_the_expected_tail_acknowledges` through
@@ -341,7 +341,7 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
 | --- | --- | --- |
 | made by | `open()` with the stream answering | the replicator: `producer-expired`, a re-cut, a re-key while bound, a provisional open after its pre-check |
 | epoch | above every epoch seen (own CLAIM records, the snapshot's epoch, a `403`'s `Producer-Epoch`), higher after any answer but its receipt, at most 16 rounds | exactly own + 1 |
-| loses | after 16 racing rounds (`claim_races`) | at the first answer but its receipt, or a foreign frame in its reconcile: reset `fenced` |
+| loses | after 16 lost claims (`claim_races`) | at the first answer but its receipt, or a foreign frame in its reconcile: reset `fenced` |
 
 - Before sending a claim the VFS appends a CLAIM record `(epoch, activation)` and fsyncs it, so a
   claim frame whose activation is in the log is ours whether or not its answer arrived.
