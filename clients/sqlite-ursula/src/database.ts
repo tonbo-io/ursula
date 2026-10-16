@@ -45,7 +45,7 @@ export interface UrsulaSalvage {
 }
 
 /**
- * `ursula_status` (design: Status, the part built so far): one snake_case JSON for every host.
+ * `ursula_status` (design: Status): one snake_case JSON for every host.
  */
 export interface UrsulaStatus {
 	/** The stream's path, such as `/acme/notes`. */

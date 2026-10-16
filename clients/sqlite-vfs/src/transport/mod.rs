@@ -1,8 +1,7 @@
 //! Transports: one attempt of a [`Request`], and what came of it ([`Exchange`]).
 //!
 //! A transport never retries, never follows a redirect and keeps no state about writes: the
-//! replicator decides what to send again and when. The 0.8 driver (M1) calls it from blocking
-//! workers; M3 swaps the runtime under it, not the callers.
+//! replicator decides what to send again and when. The driver calls it from blocking workers.
 //!
 //! Module map:
 //!

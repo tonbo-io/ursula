@@ -530,7 +530,7 @@ impl Threads {
     /// request no worker takes is answered as lost, so the core retries it.
     ///
     /// Lanes are not removed: two idle threads per stream URL the process opened, a bound set by
-    /// the streams an application opens. M3's async transport replaces them.
+    /// the streams an application opens.
     fn http(&mut self, io: HttpIo) {
         let mut io = io;
         for _ in 0..2 {
