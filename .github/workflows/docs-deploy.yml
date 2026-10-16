@@ -23,8 +23,10 @@ on:
 permissions:
   contents: read
 
+# Keyed on the Pages branch being deployed, so a preview never cancels a
+# production deploy and two deploys of one branch never race.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ inputs.branch || 'main' }}
   cancel-in-progress: true
 
 jobs:
@@ -62,4 +64,9 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_PAGES_PROJECT_NAME: ${{ secrets.CLOUDFLARE_PAGES_PROJECT_NAME }}
           DEPLOY_BRANCH: ${{ inputs.branch || 'main' }}
-        run: npx wrangler pages deploy dist --project-name "$CLOUDFLARE_PAGES_PROJECT_NAME" --branch "$DEPLOY_BRANCH"
+        run: |
+          if ! [[ "$DEPLOY_BRANCH" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+            echo "invalid Pages branch: $DEPLOY_BRANCH" >&2
+            exit 1
+          fi
+          npx wrangler pages deploy dist --project-name "$CLOUDFLARE_PAGES_PROJECT_NAME" --branch="$DEPLOY_BRANCH"

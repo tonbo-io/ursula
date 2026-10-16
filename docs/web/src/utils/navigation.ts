@@ -9,6 +9,8 @@ export const DOCS_VERSIONS = __DOCS_VERSIONS__;
 // stay "/docs/..." and buildAppHref maps them to this root.
 export const DOCS_ROOT = DOCS_VERSION ? `${DOCS_PATH}/${DOCS_VERSION}` : DOCS_PATH;
 export const DOCS_TITLE_SUFFIX = DOCS_VERSION ? `Ursula ${DOCS_VERSION}` : "Ursula";
+// Where this version's llms.txt and llms-full.txt live.
+export const LLMS_ROOT = DOCS_VERSION ? DOCS_ROOT : "";
 export const PAGEFIND_BASE = DOCS_VERSION ? `${DOCS_ROOT}/pagefind` : "/pagefind";
 export const BENCHMARK_PATH = "/benchmark";
 export const CHAOS_TEST_PATH = "/chaos-test";

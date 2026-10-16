@@ -1,4 +1,4 @@
-import { buildAppHref, isInternalAppPath, navigateTo } from "../utils/navigation";
+import { LLMS_ROOT, buildAppHref, isInternalAppPath, navigateTo } from "../utils/navigation";
 
 type HeaderNavItem = {
   label: string;
@@ -122,7 +122,7 @@ const CATALOG: CatalogGroup[] = [
     sub: [
       { label: "blog", href: "/blog" },
       { label: "github", href: "__github__" },
-      { label: "llms.txt", href: "/llms.txt" },
+      { label: "llms.txt", href: `${LLMS_ROOT}/llms.txt` },
     ],
   },
 ];

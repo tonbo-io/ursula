@@ -20,6 +20,10 @@ const DIST = join(ROOT, "dist");
 const ORIGIN = "https://ursula.tonbo.io";
 const PAGES_PATH = "docs/web/src/content/docs/pages";
 const VERSIONS = JSON.parse(readFileSync(join(ROOT, "docs-versions.json"), "utf8")).archived;
+for (const version of VERSIONS) {
+  // The id becomes a path that fetch and build delete, so keep it to "<major>.<minor>".
+  if (!/^\d+\.\d+$/.test(version.id)) throw new Error(`bad docs version id: ${version.id}`);
+}
 
 const archivedDir = (version) => join(ROOT, "archived-docs", version.id);
 
@@ -46,7 +50,11 @@ function fetchVersions() {
     try {
       run("git", ["rev-parse", "-q", "--verify", `${tagRef}^{commit}`], { stdio: "ignore" });
     } catch {
-      run("git", ["fetch", "--no-tags", "--depth=1", "origin", `${tagRef}:${tagRef}`]);
+      // --depth=1 only keeps a CI checkout shallow. On a full clone it would make it shallow.
+      const shallow =
+        execFileSync("git", ["rev-parse", "--is-shallow-repository"], { cwd: ROOT, encoding: "utf8" }).trim() ===
+        "true";
+      run("git", ["fetch", "--no-tags", ...(shallow ? ["--depth=1"] : []), "origin", `${tagRef}:${tagRef}`]);
     }
     const pagesDir = join(archivedDir(version), "pages");
     rmSync(pagesDir, { recursive: true, force: true });
@@ -90,7 +98,24 @@ function buildVersions() {
     // Covers the .md, llms and search files, which carry no robots meta.
     headers.push(`/docs/${version.id}/*`, "  X-Robots-Tag: noindex", "");
   }
-  appendFileSync(join(DIST, "_headers"), `${headers.join("\n")}`);
+  appendFileSync(join(DIST, "_headers"), `\n${headers.join("\n")}`);
+}
+
+// Site links in generated text (llms files and .md pages): absolute
+// https://ursula.tonbo.io/docs/... URLs, markdown "](/docs/...)" and href="/docs/...".
+function siteDocsLinks(text) {
+  const pattern = new RegExp(`(?:${ORIGIN.replace(/\./g, "\\.")}|\\]\\(|href=")(/docs(?:[/#?][^\\s)"'<>\\]]*)?)`, "g");
+  // A sentence can end right after a URL.
+  return [...text.matchAll(pattern)].map((match) => match[1].replace(/[.,;:]+$/, ""));
+}
+
+// "/docs/0.7/api/read.md#x" with root "/docs/0.7" -> "api/read".
+function slugOf(path, root) {
+  return path
+    .split(/[?#]/)[0]
+    .slice(root.length)
+    .replace(/^\/|\/$/g, "")
+    .replace(/\.md$/, "");
 }
 
 function verifyVersions() {
@@ -99,25 +124,73 @@ function verifyVersions() {
     if (!ok) failures.push(message);
   };
   const read = (path) => readFileSync(path, "utf8");
-  const pageCount = (entry) =>
-    Object.values(JSON.parse(read(entry)).languages).reduce((sum, lang) => sum + lang.page_count, 0);
-  const archivedPrefixes = VERSIONS.map((version) => `${version.id}/`);
+  const pageCount = (entry) => {
+    if (!existsSync(entry)) return null;
+    return Object.values(JSON.parse(read(entry)).languages).reduce((sum, lang) => sum + lang.page_count, 0);
+  };
+  const checkIndex = (entry, expected, label) => {
+    const count = pageCount(entry);
+    check(count !== null, `${label}: no search index at ${entry}`);
+    check(count === null || count === expected, `${label}: search index has ${count} pages, expected ${expected}`);
+  };
+  const archivedRoots = VERSIONS.map((version) => `/docs/${version.id}`);
+  const underRoot = (path, root) => path === root || (path.startsWith(root) && /^[/#?]/.test(path.slice(root.length)));
+  const canonicalOf = (html) => html.match(/<link rel="canonical" href="([^"]*)"/)?.[1];
+  // "install/index.html" -> ".../install/", the trailing-slash form Pages serves.
+  const pageUrl = (root, file) => `${ORIGIN}${root}/${file.replace(/index\.html$/, "")}`;
 
+  // Latest docs.
+  const latestSlugs = new Set(listFiles(join(ROOT, "src/content/docs/pages"), ".mdx").map((file) =>
+    file.replace(/\.mdx$/, "").replace(/\/index$/, ""),
+  ));
   const latestPages = listFiles(join(DIST, "docs"), "index.html").filter(
-    (file) => !archivedPrefixes.some((prefix) => file.startsWith(prefix)),
+    (file) => !archivedRoots.some((root) => underRoot(`/docs/${file}`, root)),
   );
   for (const file of latestPages) {
     const html = read(join(DIST, "docs", file));
     check(!html.includes('name="robots"'), `latest docs/${file} has a robots meta`);
     check(!html.includes("docs-version-banner"), `latest docs/${file} has the version banner`);
+    const expected = pageUrl("/docs", file);
+    check(canonicalOf(html) === expected, `latest docs/${file}: canonical ${canonicalOf(html)}, expected ${expected}`);
   }
-  check(
-    pageCount(join(DIST, "pagefind", "pagefind-entry.json")) === latestPages.length,
-    `latest search index does not match the ${latestPages.length} latest pages`,
-  );
-  const llmsFull = read(join(DIST, "llms-full.txt"));
+  checkIndex(join(DIST, "pagefind", "pagefind-entry.json"), latestPages.length, "latest");
+  const latestText = [
+    "llms.txt",
+    "llms-full.txt",
+    ...listFiles(join(DIST, "docs"), ".md")
+      .filter((file) => !archivedRoots.some((root) => underRoot(`/docs/${file}`, root)))
+      .map((file) => `docs/${file}`),
+  ];
+  for (const file of latestText) {
+    for (const path of siteDocsLinks(read(join(DIST, file)))) {
+      const archived = archivedRoots.find((root) => underRoot(path, root));
+      if (archived) {
+        // Only llms.txt points readers at an older version's llms.txt.
+        check(file === "llms.txt" && path === `${archived}/llms.txt`, `${file}: link ${path} leaves the latest docs`);
+        continue;
+      }
+      const slug = slugOf(path, "/docs");
+      check(slug === "" || latestSlugs.has(slug), `${file}: link ${path} has no latest page`);
+    }
+  }
 
-  const headers = existsSync(join(DIST, "_headers")) ? read(join(DIST, "_headers")) : "";
+  // _headers: the only noindex rules are the archived /docs/<id>/* prefixes.
+  const headersPath = join(DIST, "_headers");
+  const rules = [];
+  for (const line of (existsSync(headersPath) ? read(headersPath) : "").split("\n")) {
+    if (!line.trim() || line.trim().startsWith("#")) continue;
+    if (/^\s/.test(line)) rules.at(-1)?.headers.push(line.trim());
+    else rules.push({ path: line.trim(), headers: [] });
+  }
+  const robotsRules = rules.filter((rule) => rule.headers.some((header) => /^x-robots-tag\s*:/i.test(header)));
+  for (const rule of robotsRules) {
+    check(
+      archivedRoots.some((root) => rule.path === `${root}/*`),
+      `_headers: X-Robots-Tag rule for ${rule.path} is not an archived /docs/<id>/* prefix`,
+    );
+  }
+
+  // Archived versions.
   for (const version of VERSIONS) {
     const root = `/docs/${version.id}`;
     const dir = join(DIST, "docs", version.id);
@@ -130,10 +203,8 @@ function verifyVersions() {
       const where = `${root}/${file}`;
       const html = read(join(dir, file));
       check(html.includes('<meta name="robots" content="noindex, follow"'), `${where}: no noindex meta`);
-      check(
-        new RegExp(`<link rel="canonical" href="${ORIGIN}${root.replace(/\./g, "\\.")}/`).test(html),
-        `${where}: canonical is not under ${root}/`,
-      );
+      const expected = pageUrl(root, file);
+      check(canonicalOf(html) === expected, `${where}: canonical ${canonicalOf(html)}, expected ${expected}`);
       check(html.includes("docs-version-banner"), `${where}: no version banner`);
       for (const [, asset] of html.matchAll(/(?:src|href)="(\/[^"]*\.(?:js|css))"/g)) {
         check(asset.startsWith(`${root}/assets/`), `${where}: asset ${asset} outside ${root}/assets/`);
@@ -142,24 +213,40 @@ function verifyVersions() {
       for (const [tag] of article.matchAll(/<a\s[^>]*>/g)) {
         if (tag.includes("data-docs-version-exit")) continue;
         const href = tag.match(/href="([^"]*)"/)?.[1] ?? "";
-        const path = href.split(/[?#]/)[0];
-        if (!/^\/docs(\/|$)/.test(path)) continue;
-        if (path !== root && !path.startsWith(`${root}/`)) {
+        if (!/^\/docs([/#?]|$)/.test(href)) continue;
+        if (!underRoot(href, root)) {
           check(false, `${where}: link ${href} leaves ${root}`);
           continue;
         }
-        const slug = path.slice(root.length).replace(/^\/|\/$/g, "");
+        const slug = slugOf(href, root);
         check(slug === "" || slugs.has(slug), `${where}: link ${href} has no page`);
       }
     }
 
+    checkIndex(join(dir, "pagefind", "pagefind-entry.json"), pages.length, version.id);
+    for (const name of ["llms.txt", "llms-full.txt"]) {
+      check(existsSync(join(dir, name)), `${version.id}: no ${root}/${name}`);
+    }
+    for (const file of listFiles(dir, ".md").concat(["llms.txt", "llms-full.txt"])) {
+      if (!existsSync(join(dir, file))) continue;
+      for (const path of siteDocsLinks(read(join(dir, file)))) {
+        if (!underRoot(path, root)) {
+          check(false, `${root}/${file}: link ${path} leaves ${root}`);
+          continue;
+        }
+        const slug = slugOf(path, root);
+        check(
+          slug === "" || slug === "llms.txt" || slug === "llms-full.txt" || slugs.has(slug),
+          `${root}/${file}: link ${path} has no page`,
+        );
+      }
+    }
     check(
-      pageCount(join(dir, "pagefind", "pagefind-entry.json")) === pages.length,
-      `${version.id}: search index does not match its ${pages.length} pages`,
+      robotsRules.some(
+        (rule) => rule.path === `${root}/*` && rule.headers.some((header) => /^x-robots-tag\s*:\s*noindex$/i.test(header)),
+      ),
+      `${version.id}: no _headers noindex rule for ${root}/*`,
     );
-    check(existsSync(join(dir, "llms.txt")), `${version.id}: no ${root}/llms.txt`);
-    check(!llmsFull.includes(`${root}/`), `llms-full.txt links ${root}`);
-    check(headers.includes(`${root}/*\n  X-Robots-Tag: noindex`), `${version.id}: no _headers noindex rule`);
   }
 
   if (failures.length > 0) {
