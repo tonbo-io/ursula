@@ -931,14 +931,14 @@ impl RaftGroupHandleRegistry {
         cluster_id: ursula_headers::ClusterId,
     ) -> ursula_proto::admin::LeadershipShedStatus {
         let state = self.election.state();
-        let ready = self.recovery_barriers_ready();
+        let should_campaign = self.should_campaign();
         ursula_proto::admin::LeadershipShedStatus {
             cluster_id,
             bits: state.bits(),
             state: state.to_string(),
-            should_accept_transfer: self.election.may_campaign(None) && ready,
-            should_campaign: self.election.may_campaign(None) && ready,
-            recovery_barriers_ready: ready,
+            should_accept_transfer: should_campaign,
+            should_campaign,
+            recovery_barriers_ready: self.recovery_barriers_ready(),
             should_shed_current_leaders: state.should_shed_current_leaders(),
         }
     }

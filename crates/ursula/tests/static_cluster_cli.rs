@@ -670,6 +670,8 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
             "node {} sheds: {status:?}",
             plane.node_id
         );
+        // The cluster port names its cluster, which its peers' polls check.
+        assert_eq!(status.cluster_id.as_str(), "static-cluster-cli");
         let probe = client
             .post(format!("{}/__ursula/cluster-probe", plane.cluster_url()))
             .body(vec![0_u8; 1024])
