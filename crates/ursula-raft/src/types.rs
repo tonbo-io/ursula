@@ -72,6 +72,9 @@ pub enum RaftGroupResponse {
 pub struct RaftLogProgressSnapshot {
     pub term: u64,
     pub index: u64,
+    /// The node that led the entry's term (#613): the entry's full id with
+    /// the two above.
+    pub node_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,6 +93,13 @@ pub struct RaftGroupMetricsSnapshot {
     pub purged: Option<RaftLogProgressSnapshot>,
     pub voter_ids: Vec<u64>,
     pub voter_configurations: Vec<std::collections::BTreeSet<u64>>,
+    /// The voter configurations of the membership the replica keeps when a
+    /// recovery plan cuts its log back to its committed entry (#613). A
+    /// record from before #613 has none, so the planner finds no replica it
+    /// may elect with a cut: only versions of one minor read each other's
+    /// records.
+    #[serde(default)]
+    pub committed_voter_configurations: Vec<std::collections::BTreeSet<u64>>,
     pub learner_ids: Vec<u64>,
     /// Process-local participation and effective-membership status. Missing
     /// fields deserialize closed; an old metrics record is not a health proof.

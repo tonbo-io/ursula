@@ -208,6 +208,26 @@ impl GroupHistory {
         metrics.state == ServerState::Leader && self.pending()
     }
 
+    /// Refuses a client read at once while this replica holds a recovery
+    /// plan whose history event it has not applied (#613). A member inside
+    /// the plan's membership applies the event right after the plan's leader
+    /// is elected. One outside it never does, and would otherwise keep
+    /// serving the history the plan replaces. Only client reads call this:
+    /// usage, gauges and every internal access of the state machine stay
+    /// unfenced. A leader is left to [`Self::admit`], which waits a moment
+    /// for the event it proposes.
+    pub(crate) fn refuse_planned_read(
+        &self,
+        metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
+    ) -> Result<(), GroupEngineError> {
+        if metrics.state != ServerState::Leader && self.plan().is_some() && self.pending() {
+            return Err(GroupEngineError::Infra(GroupInfraError::RecoveryPending {
+                raft_group_id: self.raft_group_id,
+            }));
+        }
+        Ok(())
+    }
+
     /// The fence of a leader whose history is pending: waits up to
     /// [`HISTORY_PENDING_WAIT`] for the history event or a lost leadership,
     /// then refuses. Never fences a follower.
@@ -323,11 +343,44 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
             .filter(|debt| proposed != Some(*debt));
         if let Some((term, debt)) = owed {
             proposed = Some((term, debt));
+            // The driver looks only once the leader applied its whole log,
+            // so its applied history is the one this event replaces, and at
+            // the genesis every entry it applied stays.
             let command = GroupWriteCommand::Stream(StreamCommand::NewHistory {
                 history: ursula_runtime::draw_history_id(),
                 now_ms: ursula_runtime::unix_time_ms(),
+                previous: history.applied().map_or(0, |event| event.id.get()),
+                kept: match debt {
+                    Owed::Plan { point, .. } => point,
+                    Owed::Genesis => metrics
+                        .borrow_watched()
+                        .last_applied
+                        .map_or(0, |applied| applied.index),
+                },
+                leader: ursula_stream::HistoryLeader {
+                    term,
+                    node_id: metrics.borrow_watched().id,
+                },
             });
-            match raft.client_write(command).await {
+            let answer = raft
+                .client_write(command)
+                .await
+                .map(|response| response.data);
+            match answer {
+                Ok(crate::types::RaftGroupResponse::Write(Err(refusal))) => {
+                    // N1 of the fifth #613 review: the event named another
+                    // predecessor than the group's history and applied
+                    // nothing. Propose again from the applied history.
+                    tracing::warn!(
+                        raft_group_id = history.raft_group_id.0,
+                        term,
+                        ?debt,
+                        %refusal,
+                        "the history event this leader proposed was refused; it proposes again"
+                    );
+                    proposed = None;
+                    crate::rt::time::sleep(PROPOSAL_RETRY).await;
+                }
                 Ok(_) => tracing::info!(
                     raft_group_id = history.raft_group_id.0,
                     term,

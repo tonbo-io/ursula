@@ -582,10 +582,12 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         let prev_log_id = rpc.prev_log_id;
         let sent_last_log_id = rpc.entries.last().map(|entry| entry.log_id);
         let response = target.append_entries(group, rpc).await.map_err(|err| {
-            RPCError::Network(NetworkError::from_string(format!(
-                "remote AppendEntries on node {}: {err}",
-                self.target
-            )))
+            let message = format!("remote AppendEntries on node {}: {err}", self.target);
+            if refuses_overwrite(&err) {
+                RPCError::Unreachable(Unreachable::from_string(message))
+            } else {
+                RPCError::Network(NetworkError::from_string(message))
+            }
         })?;
         if let Some(rejoin) = &self.rejoin
             && rejoin.follower_lost_log(
@@ -668,10 +670,15 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             .install_full_snapshot(group, vote, snapshot)
             .await
             .map_err(|err| {
-                StreamingError::Network(NetworkError::from_string(format!(
-                    "remote full snapshot on node {}: {err}",
-                    self.target
-                )))
+                let message = format!("remote full snapshot on node {}: {err}", self.target);
+                match &err {
+                    crate::registry::SnapshotInstallError::Group(group)
+                        if refuses_overwrite(group) =>
+                    {
+                        StreamingError::Unreachable(Unreachable::from_string(message))
+                    }
+                    _ => StreamingError::Network(NetworkError::from_string(message)),
+                }
             })
     }
 
@@ -727,4 +734,18 @@ async fn sleep_in_process_raft_network(delay: Duration) {
 #[cfg(not(madsim))]
 async fn sleep_in_process_raft_network(delay: Duration) {
     std::thread::sleep(delay);
+}
+
+/// Whether a replica refused the request because it would replace entries
+/// it knows are committed (#613). The gRPC network answers it `Unavailable`,
+/// which the client reports as unreachable, so OpenRaft backs off instead of
+/// resending at once; this network classifies it the same.
+fn refuses_overwrite(error: &ursula_runtime::GroupEngineError) -> bool {
+    matches!(
+        error.infra(),
+        Some(
+            ursula_runtime::GroupInfraError::CommittedOverwrite { .. }
+                | ursula_runtime::GroupInfraError::UnrelatedHistory { .. }
+        )
+    )
 }

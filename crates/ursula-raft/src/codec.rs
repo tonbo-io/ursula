@@ -137,8 +137,36 @@ mod tests {
         assert!(matches!(
             history.payload,
             openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::NewHistory { history, now_ms: 1_700_000_000_000 }
+                ursula_stream::StreamCommand::NewHistory {
+                    history,
+                    now_ms: 1_700_000_000_000,
+                    previous: 0,
+                    kept: 18,
+                    leader: ursula_stream::HistoryLeader {
+                        term: 7,
+                        node_id: 2,
+                    },
+                }
             )) if history.get() == 0x0123_4567_89ab_cdef
+        ));
+        // A recovery plan's history event (#613): it names the history it
+        // replaced and the plan's point, up to which it kept that history.
+        let recovery: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "recovery_history_entry");
+        assert_eq!(recovery.log_id, log);
+        assert!(matches!(
+            recovery.payload,
+            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::NewHistory {
+                    history,
+                    now_ms: 1_700_000_000_000,
+                    previous: 0x0123_4567_89ab_cdef,
+                    kept: 12,
+                    leader: ursula_stream::HistoryLeader {
+                        term: 7,
+                        node_id: 2,
+                    },
+                }
+            )) if history.get() == 0x0fed_cba9_8765_4321
         ));
         // An import is a history event keyed by its backup (#581 section
         // 4.4): the history id and the backup's digest are in the entry.
@@ -156,6 +184,23 @@ mod tests {
             )) if history.get() == 0x0123_4567_89ab_cdef
                 && backup_digest == [0xab; 32]
                 && snapshot.buckets == ["tenant"]
+        ));
+        // S4 of the fifth #613 review: a history event inside an imported
+        // snapshot, as a backup taken after a recovery carries it.
+        let import: EntryOf<UrsulaRaftTypeConfig> =
+            check(&fixtures, "import_snapshot_history_entry");
+        assert!(matches!(
+            import.payload,
+            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::ImportSnapshot { ref snapshot, .. }
+            )) if snapshot.history == Some(ursula_stream::HistoryEvent {
+                id: std::num::NonZeroU64::new(0x0fed_cba9_8765_4321).expect("non-zero"),
+                event_index: 14,
+                previous: 0x0123_4567_89ab_cdef,
+                kept: 12,
+                leader: ursula_stream::HistoryLeader { term: 7, node_id: 2 },
+                imported: Some([0xcd; 32]),
+            })
         ));
     }
 }

@@ -43,6 +43,12 @@ fn group(genesis: u64) -> StreamStateMachine {
         machine.apply_entry(1, StreamCommand::NewHistory {
             history: id(genesis),
             now_ms: 0,
+            previous: 0,
+            kept: 0,
+            leader: crate::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
         }),
         StreamResponse::HistoryStarted { .. }
     ));
@@ -126,10 +132,17 @@ fn tokened(token: u64, command: StreamCommand) -> StreamCommand {
 }
 
 fn new_history(machine: &mut StreamStateMachine, index: u64, history: u64, now_ms: u64) {
+    let previous = machine.history_id();
     assert_eq!(
         machine.apply_entry(index, StreamCommand::NewHistory {
             history: id(history),
             now_ms,
+            previous,
+            kept: index.saturating_sub(1),
+            leader: crate::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
         }),
         StreamResponse::HistoryStarted {
             history: id(history)
@@ -1068,4 +1081,42 @@ fn history_ids_drawn_for_events_differ() {
     for id in ids {
         assert!(seen.insert(id, ()).is_none(), "a repeated history id");
     }
+}
+
+/// #613: a history event records the history it replaced and the index it
+/// kept, and one that names another history than the group's current one
+/// applies nothing.
+#[test]
+fn a_history_event_records_what_it_replaced_and_refuses_a_stale_predecessor() {
+    let mut machine = group(7);
+    let raced = machine.apply_entry(5, StreamCommand::NewHistory {
+        history: id(9),
+        now_ms: 0,
+        previous: 8,
+        kept: 3,
+        leader: crate::HistoryLeader {
+            term: 0,
+            node_id: 0,
+        },
+    });
+    assert!(matches!(raced, StreamResponse::Error {
+        code: crate::StreamErrorCode::HistoryMismatch,
+        ..
+    }));
+    assert_eq!(machine.history_id(), 7);
+    assert!(matches!(
+        machine.apply_entry(6, StreamCommand::NewHistory {
+            history: id(9),
+            now_ms: 0,
+            previous: 7,
+            kept: 3,
+            leader: crate::HistoryLeader {
+                term: 0,
+                node_id: 0,
+            },
+        }),
+        StreamResponse::HistoryStarted { .. }
+    ));
+    let event = machine.history().expect("an event");
+    assert_eq!((event.previous, event.kept, event.event_index), (7, 3, 6));
 }

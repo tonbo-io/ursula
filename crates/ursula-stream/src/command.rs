@@ -174,6 +174,18 @@ pub enum StreamCommand {
         /// The new history's id, drawn by the proposer.
         history: NonZeroU64,
         now_ms: u64,
+        /// The id of the history this one replaces, as the proposer applied
+        /// it; 0 at the genesis, which replaces none (#613). An event whose
+        /// `previous` is not the group's current history applies nothing.
+        previous: u64,
+        /// The last log index the new history keeps from the one it
+        /// replaces: a recovery plan's point, below which every entry stays
+        /// and above which the plan's leader replaced them, or at the
+        /// genesis the last entry the proposer applied (#613).
+        kept: u64,
+        /// The proposer's term and node id: the leader id of the entry that
+        /// carries the event (#613).
+        leader: crate::HistoryLeader,
     },
     /// Bounded normalization of one stream's replicated state (bounded-state
     /// F0): expires idle producers and evicts producers over the cap (F3).

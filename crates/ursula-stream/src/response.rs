@@ -186,6 +186,10 @@ pub enum StreamErrorCode {
     /// section 4.3). Every command but the history event is refused at
     /// apply, so a write that raced the genesis applies nothing. Retryable.
     HistoryPending,
+    /// A history event named another history as the one it replaces than
+    /// the group's current one (#613): two proposers raced. Nothing was
+    /// applied.
+    HistoryMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

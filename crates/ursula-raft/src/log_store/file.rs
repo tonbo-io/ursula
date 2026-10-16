@@ -453,6 +453,65 @@ impl RaftGroupFileLogStore {
         lock(&self.log).log_id_at(index)
     }
 
+    /// The index of the first of `log_ids` at or below `marker` that differs
+    /// from this store's entry there (#613): taking it would overwrite a
+    /// committed entry. At or below the last purged entry, an id is compared
+    /// with that entry, unless `skip_purged`, the sim's negative control.
+    pub(crate) fn committed_conflict(
+        &self,
+        marker: u64,
+        log_ids: impl IntoIterator<Item = LogIdOf<UrsulaRaftTypeConfig>>,
+        skip_purged: bool,
+    ) -> Option<u64> {
+        let log = lock(&self.log);
+        let purged = log.last_purged();
+        log_ids
+            .into_iter()
+            .filter(|log_id| log_id.index() <= marker)
+            .find(|log_id| match purged {
+                // B1 of the fifth #613 review: a purged entry is still a
+                // committed one. Every entry below the last purged one has a
+                // leader id at most its own, so a greater one differs.
+                Some(purged) if log_id.index() <= purged.index() && skip_purged => false,
+                Some(purged) if log_id.index() < purged.index() => {
+                    (log_id.leader_id.term, log_id.leader_id.node_id)
+                        > (purged.leader_id.term, purged.leader_id.node_id)
+                }
+                Some(purged) if log_id.index() == purged.index() => *log_id != purged,
+                Some(_) | None => log.log_id_at(log_id.index()) != Some(*log_id),
+            })
+            .map(|log_id| log_id.index())
+    }
+
+    /// The index of the last entry this store holds, purged or not.
+    pub(crate) fn last_held_index(&self) -> Option<u64> {
+        lock(&self.log).last_log_id().map(|last| last.index())
+    }
+
+    /// The id of the entry this store holds at `index`, also when it is the
+    /// last purged one.
+    pub(crate) fn log_id_or_purged_at(&self, index: u64) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+        let log = lock(&self.log);
+        log.log_id_at(index)
+            .or_else(|| log.last_purged().filter(|purged| purged.index() == index))
+    }
+
+    /// The index of this store's commit marker, if any.
+    pub(crate) fn committed_index(&self) -> Option<u64> {
+        lock(&self.log)
+            .committed()
+            .map(|committed| committed.index())
+    }
+
+    /// The newest membership entry this store's log holds at or below
+    /// `index` (#613).
+    pub(crate) fn membership_at_or_below(
+        &self,
+        index: u64,
+    ) -> Option<openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig>> {
+        lock(&self.log).membership_at_or_below(index)
+    }
+
     /// Runs the cut of the replica's recovery plan, before its Raft core
     /// starts: the log keeps only entries the replica knew were committed.
     /// It checks that the log still holds the committed entry the plan

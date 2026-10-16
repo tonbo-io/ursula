@@ -12,11 +12,13 @@
 //! ([`plan_wedged`]). The deterministic simulation runs the same planner and
 //! sender over its own [`PlanTransport`].
 
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::time::Duration;
 
 use reqwest::Method;
 use tokio::time::Instant;
+use ursula_proto::admin::EntryId;
 use ursula_proto::admin::PlanStep;
 use ursula_proto::admin::RaftGroupMetrics;
 use ursula_proto::admin::RaftGroupRecovery;
@@ -36,6 +38,11 @@ pub struct PlanMember {
     pub node_id: u64,
     pub log: ReplicaLogView,
     pub committed: Option<u64>,
+    /// The id of the committed entry, with `committed` as its index.
+    pub committed_entry: Option<EntryId>,
+    /// The last index the replica applied: committed, also on a replica
+    /// whose group stopped and reports no committed index.
+    pub last_applied: Option<u64>,
     pub gate: RecoveryGateStatus,
     /// The recovery plan this replica holds, if any.
     pub plan: Option<RaftGroupRecovery>,
@@ -44,7 +51,16 @@ pub struct PlanMember {
     /// The log index of the history event it applied last.
     pub history_event_index: Option<u64>,
     pub current_leader: Option<u64>,
-    pub voter_ids: Vec<u64>,
+    /// The voter configs of the replica's effective membership: one, or
+    /// two while a change is joint.
+    pub voter_configs: Vec<BTreeSet<u64>>,
+    /// The voter configs of the membership the replica keeps when a plan
+    /// cuts its log back to its committed entry.
+    pub committed_voter_configs: Vec<BTreeSet<u64>>,
+    pub learner_ids: Vec<u64>,
+    /// The replica's group runs. One whose apply stopped reports no
+    /// membership and votes for no one: it never counts toward a majority.
+    pub running: bool,
 }
 
 impl PlanMember {
@@ -58,13 +74,44 @@ impl PlanMember {
                 current_term: group.current_term,
             },
             committed: group.committed_index,
+            committed_entry: group
+                .committed_term
+                .zip(group.committed_node)
+                .map(|(term, node_id)| EntryId { term, node_id }),
+            last_applied: group.last_applied_index,
             gate: group.recovery_gate,
             plan: group.recovery,
             leads_live: group.leads_live,
             history_event_index: group.history.as_ref().map(|history| history.event_index),
             current_leader: group.current_leader,
-            voter_ids: group.voter_ids.clone(),
+            voter_configs: group.voter_configs.clone(),
+            committed_voter_configs: group.committed_voter_configs.clone(),
+            learner_ids: group.learner_ids.clone(),
+            running: group.maintenance.running,
         }
+    }
+
+    /// Whether the replica's own membership makes it a voter: without a
+    /// cut its effective membership, with a cut the one it keeps. OpenRaft
+    /// lets only a voter campaign.
+    fn votes_in_own_membership(&self, cut: bool) -> bool {
+        let configs = if cut {
+            &self.committed_voter_configs
+        } else {
+            &self.voter_configs
+        };
+        configs.iter().any(|config| config.contains(&self.node_id))
+    }
+
+    /// Every node the replica's effective membership names, learners
+    /// included: the replicas its leadership replicates to.
+    fn membership(&self) -> BTreeSet<u64> {
+        self.voter_configs
+            .iter()
+            .flatten()
+            .chain(self.learner_ids.iter())
+            .copied()
+            .collect()
     }
 
     /// The leader of the plan this replica holds, if any.
@@ -104,6 +151,10 @@ pub struct GroupPlan {
     /// The highest vote term among the restricted replicas: when the
     /// longest voter log's last term is below it, the plan cuts.
     pub floor: u64,
+    /// With a cut whose point is a later committed entry another replica
+    /// reported than the leader's own commit marker: that entry's id, which
+    /// the leader must hold (F3 of the third #613 review).
+    pub point_entry: Option<EntryId>,
 }
 
 /// Why the tool does not plan a group now.
@@ -112,9 +163,27 @@ pub enum PlanError {
     #[error("no replica of the group answered")]
     NoReplica,
     #[error(
-        "only {answered} of the group's {voters} voters answered; a plan needs a majority of them"
+        "only {answered} of the voters {voters:?} answered; a plan needs a majority of every \
+         voter set a replica reports"
     )]
-    NoMajority { answered: usize, voters: usize },
+    NoMajority {
+        answered: usize,
+        voters: BTreeSet<u64>,
+    },
+    #[error("no replica the plan may elect is a voter of the membership it would campaign under")]
+    NoEligibleLeader,
+    /// The plan would continue below an entry a reached replica knows is
+    /// committed, and that replica's committed entries would be overwritten
+    /// (M-A of the #613 review). No replica the plan may elect knows as much.
+    #[error(
+        "node {node_id} knows entry {committed} is committed, but the plan would continue from \
+         {point}: no replica the plan may elect knows as much"
+    )]
+    BelowCommitted {
+        node_id: u64,
+        committed: u64,
+        point: u64,
+    },
     #[error(
         "node {node_id}'s gate is {status:?}: it may still open through a leader's barrier \
          without losing anything, or it is running a plan's cut; wait and observe again"
@@ -128,30 +197,70 @@ pub enum PlanError {
 }
 
 /// Computes the plan from the replicas that answered (operations guide,
-/// "Recovering after a host crash"):
-///
-/// - `floor` is the highest vote term among the restricted replicas.
-/// - The leader is the replica with the greatest last log id, and the
-///   plan's point is its last log index, without a cut.
-/// - When that leader's last log term is below `floor`, its log may hold a
-///   stale entry: every member cuts its log to its committed entry, and the
-///   leader is the replica with the greatest committed index.
+/// "Recovering after a host crash"), as [`plan_group_excluding`] with no
+/// replica left out.
 pub fn plan_group(members: &[PlanMember]) -> Result<GroupPlan, PlanError> {
-    let voters = voters_of(members);
-    let answered = members
+    plan_group_excluding(members, &BTreeSet::new())
+}
+
+/// Computes the plan from the replicas that answered, leaving `excluded`
+/// out of it (#613):
+///
+/// - Every voter set any replica reports, `excluded` ones included, needs a
+///   majority among the planned replicas. Each may be the newest committed
+///   membership, whose quorums the floor must meet, and the plan's leader
+///   must win one. A replica whose group stopped is never planned.
+/// - `floor` is the highest vote term among the restricted replicas.
+/// - The leader is the voter with the greatest last log id, and the plan's
+///   point is its last log index, without a cut.
+/// - When that log's last term is below `floor`, its log may hold a stale
+///   entry. When the replica holding it is no voter of its own membership,
+///   it cannot lead. Either way every member cuts its log to its committed
+///   entry, and the leader is the replica with the greatest committed index
+///   among those the membership they keep makes a voter.
+/// - When a replica reports a later committed entry than that leader's
+///   marker, a learner's say, the leader is instead a voter whose log
+///   reaches it, and keeps its log up to that entry, which it must hold
+///   exactly ([`GroupPlan::point_entry`]).
+/// - The point is never below a committed or applied index any reached
+///   replica reports, planned or not, stopped and excluded ones included:
+///   otherwise the plan is refused as [`PlanError::BelowCommitted`].
+///
+/// Why a majority of each reported voter set is enough. A replica syncs a
+/// membership entry before it acknowledges it, so every replica that
+/// acknowledged a change still reports it after a power loss. OpenRaft
+/// proposes one change at a time: a joint configuration `C` commits under
+/// the configuration `L` before it, and `C`'s last configuration is `L`'s
+/// successor only once `C` commits. Whatever the loss rolled back, the
+/// newest committed membership is either the last one some replica reports
+/// or the one before it, `L`, which every replica holding `C` also reports
+/// as `C`'s old half. A plan with a majority of every reported set holds a
+/// majority of `L` and of any newer committed membership, so its leader is
+/// elected by the same quorums Raft would require, and the floor reaches
+/// every vote a quorum of them granted. This assumes no earlier plan's cut
+/// dropped a committed membership entry: plans are serialized by their
+/// terms, and each one checks the same rule.
+pub fn plan_group_excluding(
+    members: &[PlanMember],
+    excluded: &BTreeSet<u64>,
+) -> Result<GroupPlan, PlanError> {
+    let planned = members
         .iter()
-        .filter(|member| voters.contains(&member.node_id))
-        .count();
-    if members.is_empty() {
+        .filter(|member| member.running && !excluded.contains(&member.node_id))
+        .collect::<Vec<_>>();
+    if planned.is_empty() {
         return Err(PlanError::NoReplica);
     }
-    if answered.saturating_mul(2) <= voters.len() {
-        return Err(PlanError::NoMajority {
-            answered,
-            voters: voters.len(),
-        });
+    for voters in voter_sets(members) {
+        let answered = planned
+            .iter()
+            .filter(|member| voters.contains(&member.node_id))
+            .count();
+        if answered.saturating_mul(2) <= voters.len() {
+            return Err(PlanError::NoMajority { answered, voters });
+        }
     }
-    if let Some(member) = members.iter().find(|member| {
+    if let Some(member) = planned.iter().find(|member| {
         matches!(
             member.gate,
             RecoveryGateStatus::AwaitingBarrier
@@ -164,56 +273,171 @@ pub fn plan_group(members: &[PlanMember]) -> Result<GroupPlan, PlanError> {
             status: member.gate,
         });
     }
-    let floor = members
+    let floor = planned
         .iter()
         .filter(|member| member.restricted())
         .map(|member| member.log.current_term)
         .max()
         .unwrap_or(0);
-    let highest_term = members
+    let highest_term = planned
         .iter()
         .map(|member| member.log.current_term)
         .max()
         .unwrap_or(0);
+    let voters = voters_of(members);
     // Only a voter leads: a learner is refused as the plan's leader.
     let candidates = || {
-        members
+        planned
             .iter()
+            .copied()
             .filter(|member| voters.contains(&member.node_id))
     };
     let longest = candidates()
-        .max_by_key(|member| (member.last_log_id(), member.node_id))
+        .max_by_key(|member| {
+            (
+                member.last_log_id(),
+                member.votes_in_own_membership(false),
+                member.node_id,
+            )
+        })
         .ok_or(PlanError::NoReplica)?;
     // A single voter never cuts: no other voter could have overwritten an
-    // entry it holds (#581 section 4.5).
-    if voters.len() > 1 && longest.log.last_log_term.unwrap_or(0) < floor {
-        let leader = candidates()
+    // entry it holds (#581 section 4.5). The server decides it the same way.
+    let single = ursula_proto::admin::single_voter(
+        longest
+            .voter_configs
+            .iter()
+            .chain(longest.committed_voter_configs.iter()),
+    );
+    let stale_possible = longest.log.last_log_term.unwrap_or(0) < floor;
+    // R7 (#613): the newest committed index any reached replica reports,
+    // planned or not, learners and stopped replicas included. A stopped
+    // replica reports what it applied, which was committed.
+    let reported = members
+        .iter()
+        .flat_map(|member| {
+            [
+                member
+                    .committed
+                    .map(|index| (index, member.committed_entry, member.node_id)),
+                member
+                    .last_applied
+                    .map(|index| (index, None, member.node_id)),
+            ]
+        })
+        .flatten()
+        .max_by_key(|(index, entry, node_id)| (*index, entry.is_some(), *node_id));
+    let plan = if !single && (stale_possible || !longest.votes_in_own_membership(false)) {
+        let eligible = || candidates().filter(|member| member.votes_in_own_membership(true));
+        let leader = eligible()
             .max_by_key(|member| (member.committed, member.node_id))
-            .ok_or(PlanError::NoReplica)?;
-        Ok(GroupPlan {
+            .ok_or(PlanError::NoEligibleLeader)?;
+        // A replica knows a later entry is committed than the leader's
+        // marker: lead from a replica whose log may hold it, keeping up to
+        // it. The leader verifies it holds exactly that entry. With no such
+        // log, the ordinary cut below is refused as `BelowCommitted`.
+        let raised = reported.and_then(|(index, entry, _)| {
+            let entry = entry?;
+            if leader.committed.is_some_and(|committed| committed >= index) {
+                return None;
+            }
+            // The server checks the leader against its membership at the
+            // point, which lies between the one it keeps at its marker and
+            // its effective one: a voter of both is a voter there (N4 of the
+            // fifth #613 review).
+            let leader = eligible()
+                .filter(|member| member.votes_in_own_membership(false))
+                .filter(|member| member.log.last_log_index.is_some_and(|last| last >= index))
+                .max_by_key(|member| (member.committed, member.node_id))?;
+            Some(GroupPlan {
+                leader: leader.node_id,
+                point: index,
+                cut: true,
+                highest_term,
+                floor,
+                point_entry: Some(entry),
+            })
+        });
+        raised.unwrap_or(GroupPlan {
             leader: leader.node_id,
             point: leader.committed.unwrap_or(0),
             cut: true,
             highest_term,
             floor,
+            point_entry: None,
         })
     } else {
-        Ok(GroupPlan {
+        GroupPlan {
             leader: longest.node_id,
             point: longest.log.last_log_index.unwrap_or(0),
             cut: false,
             highest_term,
             floor,
-        })
+            point_entry: None,
+        }
+    };
+    // M-A of the second #613 review: a plan never continues below an entry
+    // any reached replica knows is committed, or that replica's committed
+    // entries would be overwritten.
+    if let Some((index, _, node_id)) = reported
+        && index > plan.point
+    {
+        return Err(PlanError::BelowCommitted {
+            node_id,
+            committed: index,
+            point: plan.point,
+        });
     }
+    Ok(plan)
 }
 
-/// The voters the replicas report: the union of their memberships.
-fn voters_of(members: &[PlanMember]) -> std::collections::BTreeSet<u64> {
+/// Every voter set the replicas report: each config of each replica's
+/// effective membership and of the membership it keeps after a cut.
+fn voter_sets(members: &[PlanMember]) -> BTreeSet<BTreeSet<u64>> {
     members
         .iter()
-        .flat_map(|member| member.voter_ids.iter().copied())
+        .flat_map(|member| {
+            member
+                .voter_configs
+                .iter()
+                .chain(member.committed_voter_configs.iter())
+        })
+        .filter(|voters| !voters.is_empty())
+        .cloned()
         .collect()
+}
+
+/// The voters the replicas report: the union of their voter sets.
+fn voters_of(members: &[PlanMember]) -> BTreeSet<u64> {
+    voter_sets(members).into_iter().flatten().collect()
+}
+
+/// The voter sets `plan`'s leader campaigns under, as the tool read it: a
+/// majority of each must take the plan to elect it. A cut to a later entry
+/// than the leader's marker keeps the membership at the point, which the
+/// leader reports neither as kept (at its marker) nor as effective (at its
+/// last entry). It is one of the two or a change between them, so both
+/// count (D of the fourth #613 review).
+pub fn electorate(plan: &GroupPlan, members: &[PlanMember]) -> Vec<BTreeSet<u64>> {
+    members
+        .iter()
+        .find(|member| member.node_id == plan.leader)
+        .map(|leader| {
+            if plan.point_entry.is_some() {
+                let mut sets = leader.committed_voter_configs.clone();
+                for voters in &leader.voter_configs {
+                    if !sets.contains(voters) {
+                        sets.push(voters.clone());
+                    }
+                }
+                sets
+            } else if plan.cut {
+                leader.committed_voter_configs.clone()
+            } else {
+                leader.voter_configs.clone()
+            }
+        })
+        .unwrap_or_default()
 }
 
 /// What a dry run shows before an operator accepts the loss.
@@ -235,7 +459,13 @@ pub fn explain_plan(plan: GroupPlan, members: &[PlanMember]) -> PlanExplanation 
     let longest = members
         .iter()
         .filter(|member| voters.contains(&member.node_id))
-        .max_by_key(|member| (member.last_log_id(), member.node_id));
+        .max_by_key(|member| {
+            (
+                member.last_log_id(),
+                member.votes_in_own_membership(false),
+                member.node_id,
+            )
+        });
     PlanExplanation {
         plan,
         longest_last_log_term: longest.and_then(|member| member.log.last_log_term),
@@ -291,17 +521,41 @@ pub fn plan_wedged(leader: u64, members: &[PlanMember]) -> Option<Wedge> {
 }
 
 /// Whether the plan with `point` is satisfied on every replica the tool
-/// reached: each applied a history event above the point and holds no plan,
-/// and the group has a leader.
+/// reached in the leader's membership: each applied a history event above
+/// the point and holds no plan, and the group has a leader. A replica
+/// outside the membership of a leader the tool reached never receives the
+/// event ([`outside_leaders_membership`]).
 pub fn plan_satisfied(point: u64, members: &[PlanMember]) -> bool {
-    !members.is_empty()
+    let outside = outside_leaders_membership(members);
+    // m8: a replica whose group stopped applies nothing: never waited for.
+    let within = members
+        .iter()
+        .filter(|member| member.running && !outside.contains(&member.node_id))
+        .collect::<Vec<_>>();
+    !within.is_empty()
         && members.iter().any(|member| member.current_leader.is_some())
-        && members.iter().all(|member| {
+        && within.iter().all(|member| {
             member.plan.is_none()
                 && member
                     .history_event_index
                     .is_some_and(|index| index > point)
         })
+}
+
+/// The reached replicas outside the membership of the leader the tool
+/// reached, if it reached one. The leader replicates nothing to them, so
+/// they keep the history the plan replaced, and answer reads with `503`
+/// while they hold the plan.
+pub fn outside_leaders_membership(members: &[PlanMember]) -> Vec<u64> {
+    let Some(leader) = members.iter().find(|member| member.reports_leading()) else {
+        return Vec::new();
+    };
+    let membership = leader.membership();
+    members
+        .iter()
+        .map(|member| member.node_id)
+        .filter(|node_id| !membership.contains(node_id))
+        .collect()
 }
 
 /// Why one replica did not take its part of a plan.
@@ -450,6 +704,7 @@ pub async fn send_plan<T: PlanTransport>(
         })?;
     let report = transport
         .send(plan.leader, &RecoveryPlanRequest {
+            point_entry: plan.point_entry,
             leader: plan.leader,
             point: plan.point,
             cut: plan.cut,
@@ -481,6 +736,7 @@ pub async fn send_follows<T: PlanTransport>(
         .filter(|member| member.node_id != plan.leader)
     {
         let request = RecoveryPlanRequest {
+            point_entry: plan.point_entry,
             leader: plan.leader,
             point: plan.point,
             cut: plan.cut,
@@ -537,8 +793,16 @@ pub enum RecoverOutcome {
     Healthy,
     /// The plan the tool would send, explained, without `accept_loss`.
     DryRun(PlanExplanation),
-    /// The last plan sent was satisfied everywhere the tool reached.
-    Satisfied { plan: GroupPlan, plans_sent: usize },
+    /// The last plan sent was satisfied everywhere the tool reached in the
+    /// leader's membership. `outside` are the reached replicas outside it,
+    /// which keep the replaced history.
+    Satisfied {
+        plan: GroupPlan,
+        plans_sent: usize,
+        outside: Vec<u64>,
+        /// Reached replicas whose group stopped: not waited for.
+        stopped: Vec<u64>,
+    },
 }
 
 /// Why [`recover_group`] stopped without a satisfied plan.
@@ -611,6 +875,12 @@ pub fn next_step(
         return Ok(Step::Done(RecoverOutcome::Satisfied {
             plan: sent.plan,
             plans_sent: state.plans_sent,
+            outside: outside_leaders_membership(members),
+            stopped: members
+                .iter()
+                .filter(|member| !member.running)
+                .map(|member| member.node_id)
+                .collect(),
         }));
     }
     // The answer to `lead` was lost: the leader's record is the answer.
@@ -712,13 +982,9 @@ pub fn next_step(
         return Ok(Step::Wait);
     }
     // m2(c): the intent to plan again holds through a wait for a gate
-    // that may still open. Replicas that refused for good are left out.
-    let candidates = members
-        .iter()
-        .filter(|member| !state.excluded.contains(&member.node_id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let plan = match plan_group(&candidates) {
+    // that may still open. Replicas that refused for good are left out,
+    // but the voter sets they report still count (#613).
+    let plan = match plan_group_excluding(members, &state.excluded) {
         Ok(plan) => plan,
         Err(PlanError::NotStalled { .. }) => return Ok(Step::Wait),
         Err(error) => return Err(error.into()),
@@ -736,12 +1002,16 @@ pub fn next_step(
 /// Records what sending `plan` did in `state`: the plan term and the
 /// members that took the plan, or the leader's error. Only the leader's
 /// refusal that no plan fixes stops the tool; a member that refuses so is
-/// left out of the next plan, and a plan its members can elect stands.
+/// left out of the next plan, and a plan its members can elect stands:
+/// they hold a majority of every voter set in `electorate`, the sets the
+/// leader campaigns under ([`electorate`]). A `leader_not_voter` refusal of
+/// the leader changed nothing: the membership moved since the tool read
+/// it, so the tool reads it again and plans again (#613).
 pub fn plan_sent(
     state: &mut LoopState,
     plan: GroupPlan,
     sent: Result<PlanSent, SendError>,
-    voters: usize,
+    electorate: &[BTreeSet<u64>],
 ) -> Result<(), RecoverError> {
     match sent {
         Ok(sent) => {
@@ -749,10 +1019,17 @@ pub fn plan_sent(
                 plan,
                 leader_term: Some(sent.leader_term),
             });
+            let mut replan_now = false;
             for error in &sent.refused {
                 match error.refusal() {
                     Some(RecoveryPlanRefusal::FollowsLeader { leader }) => {
                         state.follows_leader = Some(leader);
+                    }
+                    // M-A of the #613 review: the member knows more is
+                    // committed than the point. The plan picked the wrong
+                    // leader: plan again from a new read.
+                    Some(RecoveryPlanRefusal::RecoveryPointBehind) => {
+                        replan_now = true;
                     }
                     Some(refusal) if refusal.no_plan_fixes() => {
                         if let Some(node_id) = error.node_id() {
@@ -765,7 +1042,16 @@ pub fn plan_sent(
             // m2(b): members that took the plan and form a majority with its
             // leader elect it; only a plan that cannot win is planned again,
             // and not while a replica follows another live leader.
-            if sent.taken.len().saturating_mul(2) <= voters && state.follows_leader.is_none() {
+            let elects = !electorate.is_empty()
+                && electorate.iter().all(|voters| {
+                    sent.taken
+                        .iter()
+                        .filter(|node_id| voters.contains(node_id))
+                        .count()
+                        .saturating_mul(2)
+                        > voters.len()
+                });
+            if (replan_now || !elects) && state.follows_leader.is_none() {
                 state.replan = true;
             }
             Ok(())
@@ -922,11 +1208,6 @@ pub async fn recover_group(
     let mut deadline = settle(Instant::now());
     loop {
         let members = observe(client, nodes, raft_group_id).await;
-        let voters = members
-            .iter()
-            .flat_map(|member| member.voter_ids.iter().copied())
-            .collect::<std::collections::BTreeSet<_>>()
-            .len();
         match next_step(&mut state, &members, options.max_plans)? {
             Step::Done(outcome) => return Ok(outcome),
             Step::Wait => {}
@@ -951,7 +1232,7 @@ pub async fn recover_group(
                         tracing::warn!(raft_group_id, %error, "recovery: a member refused the plan");
                     }
                 }
-                plan_sent(&mut state, plan, sent, voters)?;
+                plan_sent(&mut state, plan, sent, &electorate(&plan, &members))?;
             }
             Step::Resume { plan, leader_term } => {
                 tracing::info!(
@@ -960,7 +1241,7 @@ pub async fn recover_group(
                     "recovery: the plan's leader recorded the plan; sending it to the members"
                 );
                 let sent = send_follows(&mut transport, plan, leader_term, &members).await;
-                plan_sent(&mut state, plan, Ok(sent), voters)?;
+                plan_sent(&mut state, plan, Ok(sent), &electorate(&plan, &members))?;
             }
         }
         if Instant::now() >= deadline {
@@ -1000,13 +1281,26 @@ mod tests {
                 current_term,
             },
             committed,
+            committed_entry: committed.map(|_| ursula_proto::admin::EntryId {
+                term: 3,
+                node_id: 1,
+            }),
+            last_applied: committed,
             gate,
             plan: None,
             leads_live: false,
             history_event_index: Some(1),
             current_leader: None,
-            voter_ids: vec![1, 2, 3],
+            voter_configs: vec![[1, 2, 3].into()],
+            committed_voter_configs: vec![[1, 2, 3].into()],
+            learner_ids: vec![],
+            running: true,
         }
+    }
+
+    /// The voter set of a three-voter group, as the leader campaigns.
+    fn three() -> Vec<std::collections::BTreeSet<u64>> {
+        vec![[1, 2, 3].into()]
     }
 
     /// A plan for leader `leader` at point 12, plan term 9.
@@ -1035,7 +1329,8 @@ mod tests {
                 point: 12,
                 cut: false,
                 highest_term: 9,
-                floor: 3
+                floor: 3,
+                point_entry: None
             })
         );
     }
@@ -1054,7 +1349,8 @@ mod tests {
                 point: 12,
                 cut: true,
                 highest_term: 5,
-                floor: 5
+                floor: 5,
+                point_entry: None
             })
         );
     }
@@ -1072,7 +1368,7 @@ mod tests {
             plan_group(&one),
             Err(PlanError::NoMajority {
                 answered: 1,
-                voters: 3
+                voters: [1, 2, 3].into()
             })
         );
         let catching_up = [
@@ -1121,7 +1417,8 @@ mod tests {
                 point: 12,
                 cut: true,
                 highest_term: 8,
-                floor: 8
+                floor: 8,
+                point_entry: None
             })
         );
     }
@@ -1336,11 +1633,23 @@ mod tests {
             super::plan_sent(
                 &mut state,
                 plan,
-                Err(refused(1, RecoveryPlanRefusal::LeaderNotVoter)),
-                3
+                Err(refused(1, RecoveryPlanRefusal::MissingVoteFloor)),
+                &three()
             ),
             Err(super::RecoverError::Unfixable { .. })
         ));
+        // #613: the leader's `leader_not_voter` changed nothing: read the
+        // membership again and plan again, leaving no replica out.
+        let mut state = super::LoopState::default();
+        super::plan_sent(
+            &mut state,
+            plan,
+            Err(refused(1, RecoveryPlanRefusal::LeaderNotVoter)),
+            &three(),
+        )
+        .expect("planned again");
+        assert!(state.replan);
+        assert!(state.excluded.is_empty());
         // Leader and one member are a majority of three: wait for it.
         let mut state = super::LoopState::default();
         super::plan_sent(
@@ -1351,7 +1660,7 @@ mod tests {
                 taken: vec![1, 2],
                 refused: vec![refused(3, RecoveryPlanRefusal::ReplicaChanged)],
             }),
-            3,
+            &three(),
         )
         .expect("recorded");
         assert!(!state.replan);
@@ -1368,7 +1677,7 @@ mod tests {
                     refused(3, RecoveryPlanRefusal::ReplicaChanged),
                 ],
             }),
-            3,
+            &three(),
         )
         .expect("recorded");
         assert!(state.replan);
@@ -1408,7 +1717,7 @@ mod tests {
             status: 504,
             body: String::new(),
         };
-        super::plan_sent(&mut state, plan, Err(timeout), 3).expect("recorded");
+        super::plan_sent(&mut state, plan, Err(timeout), &three()).expect("recorded");
         let mut members = stalled();
         members[0].gate = RecoveryGateStatus::Cutting;
         assert_eq!(
@@ -1439,7 +1748,7 @@ mod tests {
                 status: 503,
                 body: String::new(),
             }),
-            3,
+            &three(),
         )
         .expect("recorded");
         assert!(matches!(
@@ -1452,8 +1761,8 @@ mod tests {
     /// longest log, and a group with one voter never cuts.
     #[test]
     fn a_learner_never_leads_and_one_voter_never_cuts() {
-        let mut learner = member(4, Some((20, 9)), 9, Some(20), RecoveryGateStatus::Open);
-        learner.voter_ids = vec![1, 2, 3];
+        let mut learner = member(4, Some((20, 9)), 9, Some(12), RecoveryGateStatus::Open);
+        learner.learner_ids = vec![4];
         let mut members = stalled();
         members.push(learner);
         assert_eq!(plan_group(&members).expect("a plan").leader, 1);
@@ -1461,9 +1770,13 @@ mod tests {
         // One voter, gated, whose log ends below the floor a learner's vote
         // term sets: no cut.
         let mut voter = member(1, Some((12, 3)), 3, Some(10), RecoveryGateStatus::Stalled);
-        voter.voter_ids = vec![1];
+        voter.voter_configs = vec![[1].into()];
+        voter.committed_voter_configs = vec![[1].into()];
+        voter.learner_ids = vec![2];
         let mut learner = member(2, Some((12, 3)), 7, Some(12), RecoveryGateStatus::Stalled);
-        learner.voter_ids = vec![1];
+        learner.voter_configs = vec![[1].into()];
+        learner.committed_voter_configs = vec![[1].into()];
+        learner.learner_ids = vec![2];
         let plan = plan_group(&[voter, learner]).expect("a plan");
         assert_eq!(plan.leader, 1);
         assert!(!plan.cut, "{plan:?}");
@@ -1499,7 +1812,7 @@ mod tests {
                 taken: vec![1, 2],
                 refused: vec![refused(3, RecoveryPlanRefusal::MissingVoteFloor)],
             }),
-            3,
+            &three(),
         )
         .expect("the plan stands");
         assert!(!state.replan);
@@ -1533,7 +1846,7 @@ mod tests {
                 taken: vec![1],
                 refused: vec![refused(2, RecoveryPlanRefusal::FollowsLeader { leader: 5 })],
             }),
-            3,
+            &three(),
         )
         .expect("recorded");
         assert!(!state.replan);
@@ -1583,10 +1896,319 @@ mod tests {
             &mut state,
             plan,
             Err(refused(1, RecoveryPlanRefusal::PlanInFlight)),
-            3,
+            &three(),
         )
         .expect("recorded");
         assert_eq!(state.plans_sent, 0);
         assert!(state.replan);
+    }
+
+    /// A rolled-back promotion of node 4 (#613): the leader `1` and node 4
+    /// hold the joint change, voters 2 and 3 never appended it.
+    fn promoted(cut_off: bool) -> Vec<PlanMember> {
+        let joint = vec![[1, 2, 3].into(), [1, 2, 3, 4].into()];
+        let gate = if cut_off {
+            RecoveryGateStatus::Open
+        } else {
+            RecoveryGateStatus::Stalled
+        };
+        let mut leader = member(1, Some((13, 3)), 3, Some(11), gate);
+        leader.voter_configs = joint.clone();
+        leader.learner_ids = vec![];
+        let mut added = member(4, Some((13, 3)), 3, Some(11), RecoveryGateStatus::Open);
+        added.voter_configs = joint;
+        // With a cut it keeps the learner it was before the promotion.
+        added.committed_voter_configs = vec![[1, 2, 3].into()];
+        added.learner_ids = vec![];
+        let term = if cut_off { 5 } else { 3 };
+        let mut members = vec![
+            leader,
+            member(
+                2,
+                Some((11, 3)),
+                term,
+                Some(11),
+                RecoveryGateStatus::Stalled,
+            ),
+            member(
+                3,
+                Some((11, 3)),
+                term,
+                Some(11),
+                RecoveryGateStatus::Stalled,
+            ),
+            added,
+        ];
+        for member in members.iter_mut().skip(1).take(2) {
+            member.learner_ids = vec![4];
+        }
+        members[0].committed_voter_configs = vec![[1, 2, 3].into()];
+        members
+    }
+
+    /// #613: without a cut the added voter may lead under the joint
+    /// change; with a cut it keeps no vote, so a voter of the membership
+    /// it keeps leads instead, and the plan needs a majority of both
+    /// halves of the joint change.
+    #[test]
+    fn a_rolled_back_promotion_is_planned_under_the_membership_each_leader_campaigns_under() {
+        let plan = plan_group(&promoted(false)).expect("a plan");
+        assert_eq!((plan.leader, plan.cut, plan.point), (4, false, 13));
+        assert_eq!(super::electorate(&plan, &promoted(false)), vec![
+            [1, 2, 3].into(),
+            [1, 2, 3, 4].into()
+        ]);
+        let plan = plan_group(&promoted(true)).expect("a plan");
+        assert!(plan.cut, "{plan:?}");
+        assert_eq!(
+            plan.leader, 3,
+            "the greatest committed voter that keeps its vote"
+        );
+        assert_eq!(super::electorate(&plan, &promoted(true)), three());
+        let members = promoted(false);
+        assert_eq!(
+            plan_group(&[members[0].clone(), members[3].clone(), members[1].clone()])
+                .map(|plan| (plan.leader, plan.cut)),
+            Ok((4, false))
+        );
+        // One of three voters of the joint change's first half: no plan.
+        assert!(matches!(
+            super::plan_group_excluding(&members, &[2, 3].into()),
+            Err(PlanError::NoMajority { .. })
+        ));
+    }
+
+    /// #613: the replicas outside the leader's membership never receive the
+    /// event: the plan is satisfied without them, and they are named.
+    #[test]
+    fn a_replica_outside_the_leaders_membership_is_not_waited_for() {
+        let mut members = stalled();
+        for member in &mut members {
+            member.history_event_index = Some(13);
+            member.current_leader = Some(1);
+        }
+        let mut removed = member(4, Some((12, 3)), 3, Some(12), RecoveryGateStatus::Planned);
+        removed.plan = Some(planned(1));
+        removed.voter_configs = vec![[1, 2, 3, 4].into()];
+        members.push(removed);
+        assert!(plan_satisfied(12, &members));
+        assert_eq!(super::outside_leaders_membership(&members), vec![4]);
+        members[0].learner_ids = vec![4];
+        assert!(
+            !plan_satisfied(12, &members),
+            "a learner of the leader waits"
+        );
+    }
+
+    /// m1 of the #613 review: R1 against the union rule. Five voters shrank
+    /// to `{1,2,3}`, committed. The tool reaches 3, which holds the shrink,
+    /// and 4 and 5, which hold only its joint step. The union counts 3 of 5;
+    /// R1 sees that only one of `{1,2,3}` answered, and the quorum `{1,2}`
+    /// that may have committed every later entry is out of reach.
+    #[test]
+    fn every_reported_voter_set_needs_half_its_voters_not_the_union() {
+        let joint = vec![[1, 2, 3, 4, 5].into(), [1, 2, 3].into()];
+        let mut shrunk = member(3, Some((20, 4)), 4, Some(20), RecoveryGateStatus::Stalled);
+        shrunk.voter_configs = vec![[1, 2, 3].into()];
+        shrunk.committed_voter_configs = vec![[1, 2, 3].into()];
+        let mut members = vec![shrunk];
+        for node_id in [4, 5] {
+            let mut removed = member(
+                node_id,
+                Some((18, 4)),
+                4,
+                Some(17),
+                RecoveryGateStatus::Stalled,
+            );
+            removed.voter_configs = joint.clone();
+            removed.committed_voter_configs = vec![[1, 2, 3, 4, 5].into()];
+            members.push(removed);
+        }
+        assert!(matches!(
+            plan_group(&members),
+            Err(PlanError::NoMajority { answered: 1, ref voters }) if *voters == [1, 2, 3].into()
+        ));
+        // The union rule would have planned: 3 of 5 answered.
+        let union = members
+            .iter()
+            .flat_map(|member| member.voter_configs.iter().flatten())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(members.len().saturating_mul(2) > union.len());
+        // With node 2 reached too, two of `{1,2,3}` meet every quorum of it.
+        let mut two = member(2, Some((20, 4)), 4, Some(20), RecoveryGateStatus::Stalled);
+        two.voter_configs = vec![[1, 2, 3].into()];
+        members.push(two);
+        plan_group(&members).expect("two of {1,2,3} meet every quorum");
+    }
+
+    /// m6 reverted: an even voter set needs a strict majority too. A
+    /// promotion of node 4 with nodes 3 and 4 down: 1 and 2 are not planned,
+    /// since such a plan could not win.
+    #[test]
+    fn an_even_voter_set_still_needs_a_majority() {
+        let joint = vec![[1, 2, 3].into(), [1, 2, 3, 4].into()];
+        let members = [1, 2].map(|node_id| {
+            let mut kept = member(
+                node_id,
+                Some((12, 3)),
+                5,
+                Some(10),
+                RecoveryGateStatus::Stalled,
+            );
+            kept.voter_configs = joint.clone();
+            kept
+        });
+        assert!(matches!(
+            plan_group(&members),
+            Err(PlanError::NoMajority { answered: 2, ref voters }) if voters.len() == 4
+        ));
+    }
+
+    /// M-A of the #613 review: a replica that knows a later committed entry
+    /// than the replica the plan would elect, here a promoted voter that a
+    /// cut makes a learner again, refuses the plan, typed, instead of having
+    /// its committed entries overwritten.
+    #[test]
+    fn a_plan_never_continues_below_a_reached_committed_index() {
+        let mut members = promoted(true);
+        // Node 4 knows entry 12 is committed; the voters only 11. Node 1's
+        // log reaches 13, so the cut keeps up to 12 from it, and node 1
+        // must hold exactly node 4's committed entry (F3 of the third #613
+        // review).
+        members[3].committed = Some(12);
+        assert_eq!(
+            plan_group(&members).map(|plan| (plan.leader, plan.point, plan.point_entry)),
+            Ok((
+                1,
+                12,
+                Some(ursula_proto::admin::EntryId {
+                    term: 3,
+                    node_id: 1
+                })
+            ))
+        );
+        // No eligible log reaches it: refused, typed.
+        members[0].log.last_log_index = Some(11);
+        members[0].log.last_log_term = Some(3);
+        assert_eq!(
+            plan_group(&members),
+            Err(PlanError::BelowCommitted {
+                node_id: 4,
+                committed: 12,
+                point: 11
+            })
+        );
+        // Without that knowledge, the cut leads from the voters.
+        members[3].committed = Some(11);
+        members[3].last_applied = Some(11);
+        assert_eq!(plan_group(&members).map(|plan| plan.point), Ok(11));
+    }
+
+    /// D of the fourth #613 review: a cut to a later entry than the
+    /// leader's marker counts both the membership it keeps at the marker and
+    /// its effective one.
+    #[test]
+    fn a_raised_cut_counts_the_kept_and_the_effective_voter_sets() {
+        let mut members = promoted(true);
+        members[3].committed = Some(12);
+        let plan = plan_group(&members).expect("a raised cut");
+        assert!(plan.point_entry.is_some());
+        let leader = &members[0];
+        let sets = super::electorate(&plan, &members);
+        for voters in leader
+            .committed_voter_configs
+            .iter()
+            .chain(leader.voter_configs.iter())
+        {
+            assert!(sets.contains(voters), "{sets:?} lacks {voters:?}");
+        }
+    }
+
+    /// F2 of the third #613 review: a replica whose group stopped reports
+    /// no committed index but what it applied, which was committed: the
+    /// plan never continues below it, though the replica is not planned.
+    #[test]
+    fn a_stopped_replicas_applied_index_bounds_the_point() {
+        let mut members = stalled();
+        let mut stopped = member(4, Some((20, 3)), 3, None, RecoveryGateStatus::Open);
+        stopped.running = false;
+        stopped.last_applied = Some(15);
+        stopped.voter_configs = vec![];
+        stopped.committed_voter_configs = vec![];
+        members.push(stopped);
+        assert!(matches!(
+            plan_group(&members),
+            Err(PlanError::BelowCommitted {
+                node_id: 4,
+                committed: 15,
+                ..
+            })
+        ));
+    }
+
+    /// M-A: a member's `recovery_point_behind` plans again, even when the
+    /// members that took the plan could elect its leader.
+    #[test]
+    fn a_member_behind_the_point_plans_again() {
+        use ursula_proto::admin::RecoveryPlanRefusal;
+        let plan = plan_group(&stalled()).expect("a plan");
+        let mut state = super::LoopState::default();
+        super::plan_sent(
+            &mut state,
+            plan,
+            Ok(super::PlanSent {
+                leader_term: 9,
+                taken: vec![1, 2],
+                refused: vec![refused(3, RecoveryPlanRefusal::RecoveryPointBehind)],
+            }),
+            &three(),
+        )
+        .expect("recorded");
+        assert!(state.replan);
+    }
+
+    /// m8: a replica whose apply stopped never counts.
+    #[test]
+    fn a_stopped_replica_never_counts_toward_a_voter_set() {
+        let mut members = stalled();
+        members.pop();
+        members[1].running = false;
+        assert!(matches!(
+            plan_group(&members),
+            Err(PlanError::NoMajority { answered: 1, .. })
+        ));
+    }
+
+    /// m4: a single voter's own sets decide, as on the server: a shrink to
+    /// node 1 whose holder still reports the joint step is cut, and node 1
+    /// alone is not.
+    #[test]
+    fn the_single_voter_rule_reads_the_leaders_own_voter_sets() {
+        let mut alone = member(1, Some((12, 3)), 3, Some(10), RecoveryGateStatus::Stalled);
+        alone.voter_configs = vec![[1].into()];
+        alone.committed_voter_configs = vec![[1].into()];
+        let mut floor = member(2, Some((11, 3)), 7, Some(10), RecoveryGateStatus::Stalled);
+        floor.voter_configs = vec![[1].into()];
+        floor.committed_voter_configs = vec![[1].into()];
+        let plan = plan_group(&[alone.clone(), floor.clone()]).expect("a plan");
+        assert!(!plan.cut, "{plan:?}");
+        alone.committed_voter_configs = vec![[1, 2].into(), [1].into()];
+        let plan = plan_group(&[alone, floor]).expect("a plan");
+        assert!(plan.cut, "{plan:?}");
+    }
+
+    /// m8: a replica whose group stopped is not waited for.
+    #[test]
+    fn a_stopped_replica_is_not_waited_for() {
+        let mut members = stalled();
+        for member in &mut members {
+            member.history_event_index = Some(13);
+            member.current_leader = Some(1);
+        }
+        members[2].history_event_index = None;
+        assert!(!plan_satisfied(12, &members));
+        members[2].running = false;
+        assert!(plan_satisfied(12, &members));
     }
 }

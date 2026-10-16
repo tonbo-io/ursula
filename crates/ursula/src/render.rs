@@ -142,6 +142,8 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::WalOpen { .. }
         | GroupInfraError::RecoveryVoteFloor { .. }
         | GroupInfraError::RecoveryCutting { .. }
+        | GroupInfraError::CommittedOverwrite { .. }
+        | GroupInfraError::UnrelatedHistory { .. }
         | GroupInfraError::RecoveryPlanFenced { .. }
         | GroupInfraError::OwnerStopped
         | GroupInfraError::Internal { .. }
@@ -197,6 +199,8 @@ pub(crate) fn stream_error_answer(code: StreamErrorCode) -> (StatusCode, ErrorCo
         }
         StreamErrorCode::ImportConflict => (S::CONFLICT, ErrorCode::ImportConflict),
         StreamErrorCode::ImportInvalid => (S::BAD_REQUEST, ErrorCode::ImportInvalid),
+        // Only the history driver proposes the event: a server fault.
+        StreamErrorCode::HistoryMismatch => (S::INTERNAL_SERVER_ERROR, ErrorCode::HistoryMismatch),
         // F3 producer cap.
         StreamErrorCode::ProducerLimit => (S::TOO_MANY_REQUESTS, ErrorCode::ProducerLimit),
         // The proposer's clock is about 140,000 years ahead: a server fault
@@ -987,11 +991,14 @@ pub(crate) fn raft_group_metrics(
         committed_index: value.committed.map(|progress| progress.index),
         last_applied_index: value.last_applied.map(|progress| progress.index),
         voter_ids: value.voter_ids.clone(),
+        voter_configs: value.voter_configurations.clone(),
+        committed_voter_configs: value.committed_voter_configurations.clone(),
         learner_ids: value.learner_ids.clone(),
         maintenance: value.maintenance.clone(),
         last_log_index: value.last_log.map(|progress| progress.index),
         last_log_term: value.last_log.map(|progress| progress.term),
         committed_term: value.committed.map(|progress| progress.term),
+        committed_node: value.committed.map(|progress| progress.node_id),
         last_applied_term: value.last_applied.map(|progress| progress.term),
         snapshot_term: value.snapshot.map(|progress| progress.term),
         snapshot_index: value.snapshot.map(|progress| progress.index),
@@ -1579,6 +1586,7 @@ mod tests {
             StreamErrorCode::JsonBoundaryUnverified,
             StreamErrorCode::ImportConflict,
             StreamErrorCode::ImportInvalid,
+            StreamErrorCode::HistoryMismatch,
             StreamErrorCode::ProducerLimit,
             StreamErrorCode::CreatedAtOutOfRange,
             StreamErrorCode::IncarnationMismatch,

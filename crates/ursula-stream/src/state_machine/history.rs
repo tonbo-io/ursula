@@ -51,11 +51,30 @@ impl StreamStateMachine {
         &mut self,
         index: u64,
         history: NonZeroU64,
+        previous: u64,
+        kept: u64,
+        leader: crate::HistoryLeader,
         now_ms: u64,
     ) -> StreamResponse {
+        // The proposer applied the whole log before it proposed, so another
+        // event in between means two proposers raced: this one replaces a
+        // history it never saw, and its `previous` would misname it.
+        if previous != self.history_id() {
+            return StreamResponse::error(
+                crate::StreamErrorCode::HistoryMismatch,
+                format!(
+                    "history event names {previous:#x} as the history it replaces, but the \
+                     group's history is {:#x}",
+                    self.history_id()
+                ),
+            );
+        }
         self.history = Some(HistoryEvent {
             id: history,
             event_index: index,
+            previous,
+            kept,
+            leader,
             imported: self.history.and_then(|previous| previous.imported),
         });
         // A lost suffix also lost the C7 counter: without this a create

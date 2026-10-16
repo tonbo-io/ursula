@@ -432,6 +432,11 @@ pub struct SnapshotPlan {
 /// snapshot builds still counts toward the next one.
 #[derive(Debug, Default)]
 pub struct GroupLogGauge {
+    /// The membership the state machine applied last (#613): what a replica
+    /// keeps after a recovery plan's cut when its log holds no membership
+    /// entry at or below its committed index.
+    applied_membership:
+        std::sync::Mutex<openraft::alias::StoredMembershipOf<crate::types::UrsulaRaftTypeConfig>>,
     apply_stopped: AtomicBool,
     applied_bytes: AtomicU64,
     applied_entries: AtomicU64,
@@ -456,6 +461,27 @@ impl GroupLogMark {
 }
 
 impl GroupLogGauge {
+    /// Records the membership the state machine applied last.
+    pub(crate) fn record_membership(
+        &self,
+        membership: &openraft::alias::StoredMembershipOf<crate::types::UrsulaRaftTypeConfig>,
+    ) {
+        *self
+            .applied_membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = membership.clone();
+    }
+
+    /// The membership the state machine applied last.
+    pub(crate) fn applied_membership(
+        &self,
+    ) -> openraft::alias::StoredMembershipOf<crate::types::UrsulaRaftTypeConfig> {
+        self.applied_membership
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub(crate) fn stop_apply(&self) {
         self.apply_stopped.store(true, AtomicOrdering::Release);
     }

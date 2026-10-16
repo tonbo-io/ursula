@@ -173,6 +173,10 @@ pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
 /// A group's shared cold-index page cache.
 pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>;
 
+/// How long a recovery plan's accept waits for a restarted replica to
+/// publish the membership it rebuilt from its cut log (#613).
+const RESTARTED_MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Resources published atomically with a live owner handle. Only cache and
 /// recovery are optional capabilities; every registered group has a barrier.
 #[derive(Debug, Clone)]
@@ -185,6 +189,8 @@ pub(crate) struct ActiveGroup {
     /// The group's history on this replica (#581 section 4.5): a leader
     /// whose history is pending proposes, serves and confirms nothing.
     pub(crate) history: Arc<crate::history::GroupHistory>,
+    /// The state machine's log gauge and applied membership (#613).
+    pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
 }
 impl ActiveGroup {
     pub(crate) fn raft(&self) -> &OwnerRaftHandle {
@@ -308,6 +314,9 @@ impl From<SnapshotInstallError> for tonic::Status {
 struct PrefetchedInstallSnapshot {
     snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
     guard: Option<PrefetchedSnapshotGuard>,
+    /// The history event the snapshot's state holds, for the commit screen
+    /// (#613); `None` when it is the snapshot this replica already holds.
+    history: Option<Option<ursula_runtime::HistoryEvent>>,
 }
 
 #[derive(Debug)]
@@ -615,6 +624,7 @@ impl RaftGroupHandleRegistry {
             cache: engine.cold_index_cache.clone(),
             barrier: engine.read_barrier.clone(),
             history: engine.history.clone(),
+            log_gauge: engine.log_gauge.clone(),
             recovery: engine
                 .rejoin
                 .lock()
@@ -696,6 +706,7 @@ impl RaftGroupHandleRegistry {
         let plan = *plan;
         let job = rejoin.clone();
         let history = entry.history.clone();
+        let applied = entry.log_gauge.applied_membership();
         // m1 (#581 review): the job, with its rollback, runs in a task of
         // its own, so a caller that stops waiting never cancels it half
         // way. The restart that follows a cut runs in the caller's future:
@@ -707,7 +718,8 @@ impl RaftGroupHandleRegistry {
                         raft: &raft,
                         raft_group_id,
                     };
-                    job.accept_recovery_plan(&plan, &core, &history).await
+                    job.accept_recovery_plan(&plan, &core, &history, applied)
+                        .await
                 })
                 .await
                 .map_err(|source| RecoveryGateError::OwnerStopped {
@@ -746,6 +758,57 @@ impl RaftGroupHandleRegistry {
                         committed,
                         held,
                     });
+                }
+                // #613: the restart rebuilt the membership from the cut log.
+                // A plan's leader that it leaves no voter can never
+                // campaign: drop the plan rather than wedge its members.
+                // The restarted core publishes the membership it rebuilt
+                // once it runs; until then its metrics hold none.
+                // Off under the R2 negative control, as before #613.
+                let checks_kept = !ursula_stream::sim_controls::off(
+                    ursula_stream::sim_controls::Defence::PlanKeptMembership,
+                );
+                if checks_kept && plan.cut && plan.leader == report.node_id {
+                    let entry = self
+                        .groups
+                        .load()
+                        .get(&raft_group_id.0)
+                        .and_then(|entry| entry.active().cloned())
+                        .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+                    let published = entry
+                        .raft()
+                        .wait(Some(RESTARTED_MEMBERSHIP_WAIT))
+                        .metrics(
+                            |metrics| metrics.membership_config.log_id().is_some(),
+                            "the restarted replica publishes its membership",
+                        )
+                        .await;
+                    // A restart whose membership never shows cannot be
+                    // shown to campaign: fail closed, as for no vote.
+                    let refusal = match published {
+                        Ok(metrics)
+                            if metrics
+                                .membership_config
+                                .membership()
+                                .voter_ids()
+                                .any(|voter| voter == plan.leader) =>
+                        {
+                            None
+                        }
+                        Ok(_left_without_vote) => {
+                            Some(RecoveryGateError::CutLeftNoVote { raft_group_id })
+                        }
+                        Err(_timed_out) => {
+                            Some(RecoveryGateError::CutMembershipUnknown { raft_group_id })
+                        }
+                    };
+                    if let Some(refusal) = refusal {
+                        restarted
+                            .drop_plan_left_without_vote(&entry.history)
+                            .await?;
+                        self.refresh_group_elections(raft_group_id);
+                        return Err(refusal);
+                    }
                 }
                 report
             }
@@ -984,6 +1047,7 @@ impl RaftGroupHandleRegistry {
                         purged: None,
                         voter_ids: Vec::new(),
                         voter_configurations: Vec::new(),
+                        committed_voter_configurations: Vec::new(),
                         learner_ids: Vec::new(),
                         maintenance: crate::types::RaftGroupMaintenanceState {
                             running: false,
@@ -1030,6 +1094,14 @@ impl RaftGroupHandleRegistry {
                 purged: metrics.purged.map(log_progress_snapshot),
                 voter_ids: membership.voter_ids().collect(),
                 voter_configurations: membership.get_joint_config().clone(),
+                committed_voter_configurations: crate::rejoin::kept_membership_of(
+                    entry.recovery.as_deref(),
+                    metrics.local_committed.map(|id| id.index),
+                    entry.log_gauge.applied_membership(),
+                )
+                .membership()
+                .get_joint_config()
+                .clone(),
                 learner_ids: membership.learner_ids().collect(),
                 maintenance: crate::types::RaftGroupMaintenanceState {
                     running,
@@ -1121,6 +1193,15 @@ impl RaftGroupHandleRegistry {
                 if let Some(refusal) = rejoin.replication_refusal(&request.vote) {
                     return Err(refusal);
                 }
+                let marker = rejoin.effective_marker(
+                    &openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()),
+                );
+                if let Some(refusal) =
+                    rejoin.committed_overwrite(crate::rejoin::Incoming::Append(&request), marker)
+                {
+                    tracing::error!(%refusal, "recovery: refused an append below the commit marker");
+                    return Err(refusal);
+                }
                 rejoin.observe_inbound_append(&request);
             }
             Ok(raft.append_entries(request).await)
@@ -1164,6 +1245,15 @@ impl RaftGroupHandleRegistry {
         if let Some(floor) = entry.check_recovery_vote(raft_group_id, vote)? {
             return Ok(SnapshotResponse::new(floor));
         }
+        if let Some(refusal) = entry
+            .recovery
+            .as_ref()
+            .and_then(|rejoin| rejoin.refused_snapshot(&snapshot.meta.snapshot_id))
+        {
+            return Err(SnapshotInstallError::Group(GroupEngineError::Infra(
+                refusal,
+            )));
+        }
         // Wait in the RPC future, so canceled queued requests retain neither
         // an owned task nor shutdown-drain admission. Admit the captured engine
         // only after both resources are available; shutdown rejects stale waiters.
@@ -1172,6 +1262,7 @@ impl RaftGroupHandleRegistry {
         let permit = self.snapshot_install.acquire().await?;
         let raft = entry.raft().clone();
         let rejoin = entry.recovery.clone();
+        let history = entry.history.clone();
         let lifetime =
             entry
                 .snapshot_installs
@@ -1198,6 +1289,7 @@ impl RaftGroupHandleRegistry {
                 PrefetchedInstallSnapshot {
                     snapshot,
                     guard: None,
+                    history: None,
                 }
             } else {
                 registry
@@ -1206,6 +1298,7 @@ impl RaftGroupHandleRegistry {
             };
             let _prefetch_guard = prefetched.guard;
             let snapshot = prefetched.snapshot;
+            let incoming_history = prefetched.history;
             let result = raft
                 .call(move |raft| async move {
                     // A recovery plan may have closed the replica while the
@@ -1215,6 +1308,41 @@ impl RaftGroupHandleRegistry {
                         .and_then(|rejoin| rejoin.replication_refusal(&vote))
                     {
                         return Err(refusal);
+                    }
+                    // #613: like an append, a snapshot never replaces entries
+                    // this replica knows are committed.
+                    if let Some(incoming) = incoming_history
+                        && let Some(rejoin) = rejoin.as_ref()
+                    {
+                        // The marker and the applied index, read once: the
+                        // history at the marker is read against them.
+                        let (marker, applied_index) = {
+                            let watched = raft.metrics();
+                            let metrics = openraft::rt::WatchReceiver::borrow_watched(&watched);
+                            (
+                                rejoin.effective_marker(&metrics),
+                                metrics.last_applied.map(|applied| applied.index),
+                            )
+                        };
+                        let local = rejoin
+                            .history_at_marker(history.applied(), applied_index, marker)
+                            .await;
+                        if let Some(refusal) = rejoin.committed_overwrite(
+                            crate::rejoin::Incoming::Snapshot {
+                                last: snapshot.meta.last_log_id,
+                                history: incoming,
+                                local,
+                            },
+                            marker,
+                        ) {
+                            tracing::error!(
+                                %refusal,
+                                "recovery: refused a snapshot install that would replace \
+                                 committed entries"
+                            );
+                            rejoin.record_refused_snapshot(&snapshot.meta.snapshot_id, &refusal);
+                            return Err(refusal);
+                        }
                     }
                     Ok(raft.install_full_snapshot(vote, snapshot).await)
                 })
@@ -1256,13 +1384,22 @@ impl RaftGroupHandleRegistry {
             snapshot_id,
             location,
         } = pointer;
-        if matches!(location, SnapshotLocation::Inline { .. }) {
+        if let SnapshotLocation::Inline { bytes } = &location {
+            let history = decode_group_snapshot(bytes)
+                .map_err(|err| {
+                    GroupEngineError::new(format!(
+                        "decode inline OpenRaft snapshot {snapshot_id}: {err}"
+                    ))
+                })?
+                .stream_snapshot
+                .history;
             return Ok(PrefetchedInstallSnapshot {
                 snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
                     meta: snapshot.meta,
                     snapshot: Cursor::new(pointer_bytes),
                 },
                 guard: None,
+                history: Some(history),
             });
         }
 
@@ -1286,6 +1423,7 @@ impl RaftGroupHandleRegistry {
             ))
         })?;
         drop(snapshot_bytes);
+        let history = group_snapshot.stream_snapshot.history;
         // Keep fallible object-store I/O outside OpenRaft's state-machine
         // worker: a write-snapshot error there is fatal to RaftCore. Keep the
         // original external pointer so large snapshots are not duplicated in
@@ -1312,6 +1450,7 @@ impl RaftGroupHandleRegistry {
                 snapshot: Cursor::new(pointer_bytes),
             },
             guard: Some(guard),
+            history: Some(history),
         })
     }
 
@@ -1417,6 +1556,7 @@ pub(crate) fn log_progress_snapshot(
     RaftLogProgressSnapshot {
         term: log_id.leader_id.term,
         index: log_id.index,
+        node_id: log_id.leader_id.node_id,
     }
 }
 

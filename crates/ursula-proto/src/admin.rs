@@ -271,8 +271,24 @@ pub struct RecoveryPlanRequest {
     pub cut: bool,
     /// Whether this replica leads the plan or follows it.
     pub step: PlanStep,
+    /// With a cut whose `point` is above the plan leader's own commit
+    /// marker: the id of the entry at `point`, which another replica reported
+    /// committed (#613). The leader keeps its log up to `point` only if it
+    /// holds exactly that entry; every other member cuts to its own commit
+    /// marker as always.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub point_entry: Option<EntryId>,
     /// This replica's log as the tool read it.
     pub expected: ReplicaLogView,
+}
+
+/// The id of one log entry: its leader's term and node, and its index is
+/// given with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntryId {
+    pub term: u64,
+    pub node_id: u64,
 }
 
 /// Which part of a recovery plan a request carries.
@@ -318,7 +334,10 @@ pub enum RecoveryPlanRefusal {
     FollowsLeader { leader: u64 },
     /// The request's `step` is not this replica's.
     StepMismatch,
-    /// The plan's leader is not a voter of the group.
+    /// The plan's leader is not a voter of the membership it would campaign
+    /// under: its effective membership, or with a cut the one it keeps.
+    /// Only the plan's leader answers it, and it changed nothing. The tool
+    /// reads the replicas again and plans again.
     LeaderNotVoter,
     /// The replica's gate may still open without a plan, or runs a cut.
     NotStalled { status: RecoveryGateStatus },
@@ -336,28 +355,49 @@ pub enum RecoveryPlanRefusal {
     /// dropped, the log recorded recovering and the gate stays closed. The
     /// one refusal that changed the replica: it took the plan first.
     CutRefused,
+    /// The plan's cut left its leader, this replica, no voter of the
+    /// membership it keeps: it could never campaign. Like `cut_refused`, the
+    /// plan was dropped, the log recorded recovering and the gate stays
+    /// closed. Read the replicas again and plan again.
+    CutLeftNoVote,
+    /// The plan's cut restarted its leader, this replica, and the restarted
+    /// core never showed the membership it keeps in time. Like
+    /// `cut_left_no_vote`, the plan was dropped. Read the replicas again and
+    /// plan again.
+    CutMembershipUnknown,
     /// The replica's log store closed.
     StoreClosed,
     /// The replica is taking another recovery plan.
     PlanInFlight,
-    /// The plan cuts a group with one voter: no other voter could have
-    /// overwritten an entry it holds, so its log is kept whole.
+    /// The plan cuts a replica whose voter sets name only itself
+    /// ([`single_voter`]): no other voter could have overwritten an entry it
+    /// holds, so its log is kept whole.
     SingleVoterCut,
     /// A `follow` names a plan term below the vote term the tool read on
     /// this replica: the term did not come from the plan's leader.
     PlanTermBelowVote,
 }
 
+/// Whether a replica's voter sets, of its effective membership and of the
+/// one it keeps after a cut, name a single voter (#581 section 4.5, #613).
+/// Every entry above its commit marker was then written while it was the
+/// only voter, so no other voter could have overwritten one, and a recovery
+/// plan never cuts its log. The planner and the server both decide with it.
+pub fn single_voter<'a>(sets: impl IntoIterator<Item = &'a BTreeSet<u64>>) -> bool {
+    let mut voters = sets.into_iter().flatten();
+    match voters.next() {
+        Some(first) => voters.all(|voter| voter == first),
+        None => false,
+    }
+}
+
 impl RecoveryPlanRefusal {
     /// Whether no plan can fix the refusal: a replica that lost its vote
-    /// needs a quorum's proof first, a plan naming a node outside the
-    /// membership the replica holds stays refused, and a step that is not
-    /// the replica's is a bug in the tool.
+    /// needs a quorum's proof first, and a step that is not the replica's
+    /// is a bug in the tool. `leader_not_voter` is not one: a plan read
+    /// from the current membership names another leader (#613).
     pub fn no_plan_fixes(&self) -> bool {
-        matches!(
-            self,
-            Self::MissingVoteFloor | Self::LeaderNotVoter | Self::StepMismatch
-        )
+        matches!(self, Self::MissingVoteFloor | Self::StepMismatch)
     }
 }
 
@@ -489,6 +529,7 @@ mod tests {
         use super::RecoveryPlanRequest;
         use super::ReplicaLogView;
         let plan = RecoveryPlanRequest {
+            point_entry: None,
             leader: 2,
             point: 12,
             cut: true,
@@ -504,6 +545,7 @@ mod tests {
             r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
         );
         let lead = RecoveryPlanRequest {
+            point_entry: None,
             step: PlanStep::Lead { highest_term: 8 },
             ..plan
         };
@@ -568,6 +610,7 @@ mod tests {
             )
             .unwrap(),
             RecoveryPlanRequest {
+                point_entry: None,
                 leader: 2,
                 point: 12,
                 cut: false,
@@ -947,6 +990,13 @@ pub struct RaftGroupMetrics {
     #[serde(deserialize_with = "Option::deserialize")]
     pub last_applied_index: Option<u64>,
     pub voter_ids: Vec<u64>,
+    /// The voter configs of the effective membership: one, or two while a
+    /// change is joint. A recovery plan needs a majority of each (#613).
+    pub voter_configs: Vec<BTreeSet<u64>>,
+    /// The voter configs of the membership the replica keeps when a
+    /// recovery plan cuts its log back to its committed entry: the
+    /// effective one once it is committed, else the one before it.
+    pub committed_voter_configs: Vec<BTreeSet<u64>>,
     pub learner_ids: Vec<u64>,
     pub maintenance: RaftGroupMaintenanceState,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -957,6 +1007,10 @@ pub struct RaftGroupMetrics {
     pub last_log_term: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub committed_term: Option<u64>,
+    /// The node that led the term of the committed entry: with
+    /// `committed_term` and `committed_index`, the entry's id.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub committed_node: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub last_applied_term: Option<u64>,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -1051,6 +1105,8 @@ mod metrics_contract_tests {
                 committed_index: Some(5),
                 last_applied_index: Some(5),
                 voter_ids: vec![1],
+                voter_configs: vec![BTreeSet::from([1])],
+                committed_voter_configs: vec![BTreeSet::from([1])],
                 learner_ids: vec![],
                 maintenance: RaftGroupMaintenanceState {
                     running: true,
@@ -1063,6 +1119,7 @@ mod metrics_contract_tests {
                 last_log_index: Some(5),
                 last_log_term: Some(1),
                 committed_term: Some(1),
+                committed_node: Some(1),
                 last_applied_term: Some(1),
                 snapshot_term: None,
                 snapshot_index: None,
@@ -1115,6 +1172,8 @@ mod metrics_contract_tests {
             "/raft_groups/0/current_term",
             "/raft_groups/0/maintenance",
             "/raft_groups/0/voter_ids",
+            "/raft_groups/0/voter_configs",
+            "/raft_groups/0/committed_voter_configs",
             "/raft_groups/0/has_snapshot",
             "/raft_groups/0/log_bytes_since_snapshot",
             "/raft_groups/0/log_entries_since_snapshot",

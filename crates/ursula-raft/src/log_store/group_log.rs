@@ -27,6 +27,7 @@ use std::ops::RangeBounds;
 
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
+use openraft::alias::StoredMembershipOf;
 
 use super::RaftGroupLogRecord;
 use super::journal::FrameLoc;
@@ -36,6 +37,7 @@ use crate::types::entry_log_bytes;
 
 type Entry = EntryOf<UrsulaRaftTypeConfig>;
 type LogId = LogIdOf<UrsulaRaftTypeConfig>;
+type StoredMembership = StoredMembershipOf<UrsulaRaftTypeConfig>;
 
 /// Bytes a committed or purge marker counts in its segment.
 pub(crate) const MARKER_BYTES: u64 = 64;
@@ -169,6 +171,9 @@ pub(crate) struct GroupLog {
     /// Live entry bytes per segment.
     live: BTreeMap<SegmentId, u64>,
     cache: EntryCache,
+    /// The membership entries the log holds, by index (#613). A recovery
+    /// plan's cut keeps the newest one at or below the committed index.
+    memberships: BTreeMap<u64, StoredMembership>,
 }
 
 impl GroupLog {
@@ -182,6 +187,7 @@ impl GroupLog {
             index: EntryIndex::default(),
             live: BTreeMap::new(),
             cache: EntryCache::new(cache_budget),
+            memberships: BTreeMap::new(),
         }
     }
 
@@ -196,6 +202,30 @@ impl GroupLog {
 
     pub(crate) fn last_purged(&self) -> Option<LogId> {
         self.last_purged
+    }
+
+    /// The newest membership entry the log holds at or below `index`.
+    pub(crate) fn membership_at_or_below(&self, index: u64) -> Option<StoredMembership> {
+        self.memberships
+            .range(..=index)
+            .next_back()
+            .map(|(_, membership)| membership.clone())
+    }
+
+    /// Records whether the entry at its index is a membership entry.
+    fn index_membership(&mut self, entry: &Entry) {
+        let index = entry.log_id.index;
+        match &entry.payload {
+            openraft::EntryPayload::Membership(membership) => {
+                self.memberships.insert(
+                    index,
+                    StoredMembership::new(Some(entry.log_id), membership.clone()),
+                );
+            }
+            openraft::EntryPayload::Blank | openraft::EntryPayload::Normal(_) => {
+                self.memberships.remove(&index);
+            }
+        }
     }
 
     pub(crate) fn committed(&self) -> Option<LogId> {
@@ -346,6 +376,7 @@ impl GroupLog {
             if let Some(replaced) = self.index.insert(indexed)? {
                 self.unlive(replaced);
             }
+            self.index_membership(&entry);
             live = live.saturating_add(u64::from(bytes));
             if self.last_index() == Some(index) {
                 self.cache.push_newest(entry, u64::from(bytes));
@@ -383,6 +414,7 @@ impl GroupLog {
             if let Some(replaced) = self.index.insert(indexed)? {
                 self.unlive(replaced);
             }
+            self.index_membership(entry);
             self.add_live(at.segment, u64::from(storage_bytes));
         }
         Ok(())
@@ -393,6 +425,10 @@ impl GroupLog {
         self.index
             .remove_after(last, |entry| remove_live(live, entry));
         self.cache.truncate_after(last);
+        match last {
+            Some(last) => drop(self.memberships.split_off(&last.saturating_add(1))),
+            None => self.memberships.clear(),
+        }
     }
 
     fn purge_through(&mut self, index: u64) {
@@ -400,6 +436,7 @@ impl GroupLog {
         self.index
             .remove_through(index, |entry| remove_live(live, entry));
         self.cache.purge_through(index);
+        self.memberships = self.memberships.split_off(&index.saturating_add(1));
     }
 
     fn add_live(&mut self, segment: SegmentId, bytes: u64) {
@@ -1363,5 +1400,93 @@ mod tests {
             log_id(4, 6)
         ]);
         assert_eq!(log.key_log_ids(2, 4), [log_id(1, 3), log_id(2, 4)]);
+    }
+
+    fn membership(term: u64, index: u64, voters: &[u64]) -> Entry {
+        let voters = voters
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        Entry::new(
+            log_id(term, index),
+            EntryPayload::Membership(openraft::Membership::new_with_defaults(vec![voters], [])),
+        )
+    }
+
+    fn voters_at(log: &GroupLog, index: u64) -> Option<Vec<u64>> {
+        log.membership_at_or_below(index)
+            .map(|membership| membership.membership().voter_ids().collect())
+    }
+
+    /// #613: the log tracks the membership entries it holds, through a live
+    /// append, an overwrite by a later leader, a truncation and a purge.
+    #[test]
+    fn the_log_tracks_its_membership_entries() {
+        let mut log = GroupLog::new(1 << 20);
+        append(
+            &mut log,
+            vec![
+                membership(1, 1, &[1, 2, 3]),
+                entry(1, 2, 8),
+                membership(1, 3, &[1, 2, 3, 4]),
+                entry(1, 4, 8),
+            ],
+            at(1, 0),
+            ApplyMode::Live,
+        );
+        assert_eq!(voters_at(&log, 2), Some(vec![1, 2, 3]));
+        assert_eq!(voters_at(&log, 4), Some(vec![1, 2, 3, 4]));
+        // A later leader overwrites the membership entry at 3 with data.
+        log.apply(
+            RaftGroupLogRecord::TruncateAfter(Some(log_id(1, 2))),
+            at(1, 100),
+            ApplyMode::Live,
+        )
+        .expect("truncate");
+        assert_eq!(voters_at(&log, 4), Some(vec![1, 2, 3]));
+        append(&mut log, vec![entry(2, 3, 8)], at(1, 200), ApplyMode::Live);
+        assert_eq!(voters_at(&log, 3), Some(vec![1, 2, 3]));
+        // A purge drops what the state machine's membership covers.
+        log.apply(
+            RaftGroupLogRecord::Purge(log_id(1, 2)),
+            at(1, 300),
+            ApplyMode::Live,
+        )
+        .expect("purge");
+        assert_eq!(voters_at(&log, 3), None);
+        // Truncating everything drops every membership entry.
+        append(
+            &mut log,
+            vec![membership(2, 4, &[1, 2])],
+            at(1, 400),
+            ApplyMode::Live,
+        );
+        assert_eq!(voters_at(&log, 4), Some(vec![1, 2]));
+        log.apply(
+            RaftGroupLogRecord::TruncateAfter(Some(log_id(2, 3))),
+            at(1, 500),
+            ApplyMode::Live,
+        )
+        .expect("truncate");
+        assert_eq!(voters_at(&log, 9), None);
+    }
+
+    /// #613: replay rebuilds the same membership entries, a rewritten entry
+    /// replacing the one before it at its index.
+    #[test]
+    fn replay_rebuilds_the_membership_entries() {
+        let mut log = GroupLog::replaying(1 << 20);
+        append(
+            &mut log,
+            vec![
+                membership(1, 1, &[1, 2, 3]),
+                membership(1, 2, &[1, 2, 3, 4]),
+            ],
+            at(1, 0),
+            ApplyMode::Replay,
+        );
+        append(&mut log, vec![entry(2, 2, 8)], at(2, 0), ApplyMode::Replay);
+        log.finish_replay().expect("a consecutive log");
+        assert_eq!(voters_at(&log, 2), Some(vec![1, 2, 3]));
     }
 }

@@ -173,6 +173,9 @@ pub struct RaftGroupEngine {
     pub(crate) read_barrier: Arc<ReadIndexBarrier>,
     /// See [`RaftGroupEngineOptions::peer_cluster`].
     pub(crate) peer_cluster: Option<crate::PeerCluster>,
+    /// The state machine's log gauge, which also holds its applied
+    /// membership (#613).
+    pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
 }
 
 /// Whether a read's error may hold only for a replica's lagging state: a
@@ -421,6 +424,7 @@ impl RaftGroupEngine {
         } = options;
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
+        let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         let snapshot_install = snapshot_install.unwrap_or_default();
         let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
@@ -490,7 +494,29 @@ impl RaftGroupEngine {
             cold_store,
             cold_index_cache,
             peer_cluster,
+            log_gauge,
         })
+    }
+
+    /// The voter configs of the membership this replica keeps when a
+    /// recovery plan cuts its log back to its committed entry (#613).
+    pub fn kept_voter_configs(&self) -> Vec<std::collections::BTreeSet<u64>> {
+        let committed = openraft::rt::WatchReceiver::borrow_watched(&self.raft.metrics())
+            .local_committed
+            .map(|id| id.index);
+        let rejoin = self
+            .rejoin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        crate::rejoin::kept_membership_of(
+            rejoin.as_deref(),
+            committed,
+            self.log_gauge.applied_membership(),
+        )
+        .membership()
+        .get_joint_config()
+        .clone()
     }
 
     pub async fn initialize_membership(
@@ -614,6 +640,8 @@ impl RaftGroupEngine {
         .await?
     }
 
+    /// What this replica's applied state holds for a stream, read past every
+    /// fence: simulation introspection only, never a client answer.
     #[cfg(madsim)]
     pub async fn sim_read_local_stream(
         &self,
@@ -623,7 +651,7 @@ impl RaftGroupEngine {
         let stream_id = request.stream_id.clone();
         let read_request = request.clone();
         let plan = self
-            .with_state_machine(move |state_machine| {
+            .with_applied_state(move |state_machine| {
                 Box::pin(async move {
                     state_machine
                         .engine
@@ -1053,6 +1081,9 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupRouteHeadStreamFuture<'a> {
         Box::pin(async move {
+            // #613: a replica holding an unsatisfied plan serves no client read.
+            self.history
+                .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
             if !self.raft.is_leader()
                 && let Some(route) = self.leader_route().await
             {
@@ -1135,6 +1166,9 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupRouteReadStreamFuture<'a> {
         Box::pin(async move {
+            // #613: a replica holding an unsatisfied plan serves no client read.
+            self.history
+                .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
             let original_request = request.clone();
             // A live read pinned to its owner's confirmed read index is
             // served only here, while this replica leads and has applied
@@ -1306,6 +1340,9 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> ursula_runtime::GroupOpenLiveReadFuture<'a> {
         Box::pin(async move {
+            // #613: a replica holding an unsatisfied plan serves no client read.
+            self.history
+                .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
             let read_index = self
                 .linearizable_read_index("live_read", request.read_index)
                 .await?;
@@ -1543,6 +1580,9 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupReadSnapshotFuture<'a> {
         Box::pin(async move {
+            // #613: a replica holding an unsatisfied plan serves no client read.
+            self.history
+                .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
             self.require_linearizable_leader_read("read_snapshot", request.read_index)
                 .await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
@@ -1560,6 +1600,9 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupBootstrapStreamFuture<'a> {
         Box::pin(async move {
+            // #613: a replica holding an unsatisfied plan serves no client read.
+            self.history
+                .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
             self.require_linearizable_leader_read("bootstrap_stream", request.read_index)
                 .await?;
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, true)

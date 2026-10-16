@@ -94,6 +94,7 @@ use std::time::Duration;
 use openraft::Instant as _;
 use openraft::RaftMetrics;
 use openraft::alias::LogIdOf;
+use openraft::alias::VoteOf;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
 use openraft::type_config::TypeConfigExt;
@@ -143,6 +144,62 @@ pub fn leads_live(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
             .last_quorum_acked
             .as_ref()
             .is_some_and(|acked| acked.elapsed() < LIVE_LEADER_QUORUM_ACK)
+}
+
+/// The membership a replica keeps when a recovery plan cuts its log back to
+/// its committed entry (#613): the newest membership entry at or below its
+/// committed index. A restart rebuilds the membership from the log that is
+/// left and the state machine. `log` is the newest such entry the log still
+/// holds; `applied` is the state machine's membership, which covers every
+/// purged entry. OpenRaft's own committed membership is only the
+/// second-to-last membership entry in the log, which can be above this
+/// replica's commit marker: the marker is never synced on its own.
+pub(crate) fn kept_of(
+    log: Option<openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig>>,
+    applied: openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig>,
+) -> openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig> {
+    match log {
+        Some(log) if log.log_id() > applied.log_id() => log,
+        Some(_) | None => applied,
+    }
+}
+
+/// The membership a replica keeps after a cut back to `committed`: through
+/// its recovery gate's log store ([`GroupRejoin::kept_membership`]), or the
+/// state machine's `applied` membership alone when it has no gate. The one
+/// computation both the metrics and the simulation read.
+pub(crate) fn kept_membership_of(
+    rejoin: Option<&GroupRejoin>,
+    committed: Option<u64>,
+    applied: openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig>,
+) -> openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig> {
+    match rejoin {
+        Some(rejoin) => rejoin.kept_membership(committed, applied),
+        None => applied,
+    }
+}
+
+/// The log id a cutting plan's leader keeps when the plan names the entry
+/// at its point ([`RecoveryPlanRequest::point_entry`]).
+fn point_log_id(plan: &RecoveryPlanRequest) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
+    plan.point_entry.map(|entry| openraft::LogId {
+        leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(entry.term, entry.node_id),
+        index: plan.point,
+    })
+}
+
+/// What reaches the commit screen ([`GroupRejoin::committed_overwrite`]).
+pub(crate) enum Incoming<'a> {
+    Append(&'a openraft::raft::AppendEntriesRequest<UrsulaRaftTypeConfig>),
+    Snapshot {
+        last: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+        /// The history event the snapshot's state holds.
+        history: Option<ursula_runtime::HistoryEvent>,
+        /// The id of the history this replica's commit marker lies in
+        /// ([`GroupRejoin::history_at_marker`]), 0 before the genesis;
+        /// `None` when its log could not be read.
+        local: Option<u64>,
+    },
 }
 
 /// How long one membership step of the heal driver may take.
@@ -678,6 +735,29 @@ pub enum RecoveryGateError {
         held: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     },
     #[error(
+        "raft group {}'s recovery plan elects this replica, but after its cut the membership it \
+         keeps does not make it a voter: the plan was dropped and the replica waits for a new plan",
+        .raft_group_id.0
+    )]
+    CutLeftNoVote { raft_group_id: RaftGroupId },
+    #[error(
+        "raft group {}'s recovery plan elects this replica, but after its cut its restarted core \
+         never showed the membership it keeps: the plan was dropped and the replica waits for a \
+         new plan",
+        .raft_group_id.0
+    )]
+    CutMembershipUnknown { raft_group_id: RaftGroupId },
+    #[error(
+        "raft group {}: record the plan term as the vote of the plan's leader before its Raft \
+         core starts",
+        .raft_group_id.0
+    )]
+    RaisePlanVote {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
+    },
+    #[error(
         "raft group {}'s recovery gate on this replica is {status:?}, not stalled: a leader's \
          barrier may still open it without losing anything; plan only a group whose gated \
          replicas report it stalled",
@@ -724,7 +804,8 @@ pub enum RecoveryGateError {
         held: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     },
     #[error(
-        "raft group {}'s recovery plan elects node {leader}, which is not one of its voters",
+        "raft group {}'s recovery plan elects node {leader}, which is no voter of the membership \
+         it would campaign under",
         .raft_group_id.0
     )]
     LeaderNotVoter {
@@ -814,6 +895,8 @@ impl RecoveryGateError {
             Self::NothingCommitted { .. } => RecoveryPlanRefusal::NothingCommitted,
             Self::CommittedEntryMissing { .. } => RecoveryPlanRefusal::CommittedEntryMissing,
             Self::CutRefused { .. } => RecoveryPlanRefusal::CutRefused,
+            Self::CutLeftNoVote { .. } => RecoveryPlanRefusal::CutLeftNoVote,
+            Self::CutMembershipUnknown { .. } => RecoveryPlanRefusal::CutMembershipUnknown,
             Self::StoreClosed { .. } => RecoveryPlanRefusal::StoreClosed,
             Self::PlanInFlight { .. } => RecoveryPlanRefusal::PlanInFlight,
             Self::SingleVoterCut { .. } => RecoveryPlanRefusal::SingleVoterCut,
@@ -822,7 +905,8 @@ impl RecoveryGateError {
             Self::Record { .. }
             | Self::Cut { .. }
             | Self::Restart { .. }
-            | Self::StartAsFollower { .. } => return PlanAnswer::Failed,
+            | Self::StartAsFollower { .. }
+            | Self::RaisePlanVote { .. } => return PlanAnswer::Failed,
             Self::OwnerStopped { .. } | Self::NotStarted { .. } | Self::JobAborted { .. } => {
                 return PlanAnswer::Unavailable;
             }
@@ -965,6 +1049,11 @@ pub struct GroupRejoin {
     /// while its gate is still registered.
     store: Weak<RaftGroupFileLogStore>,
     changes: WatchSenderOf<UrsulaRaftTypeConfig, ()>,
+    /// The last snapshot the commit screen refused, by its id, and why (S2
+    /// of the fifth #613 review): a resend of it is refused before the
+    /// install queues for the group's lock, the node's permit or a download.
+    /// A refusal for a snapshot only grows firmer as the marker rises.
+    refused_snapshot: Mutex<Option<(String, ursula_runtime::GroupInfraError)>>,
     /// The committed leader whose AppendEntries reached this replica last,
     /// and when.
     last_leader_append: Mutex<
@@ -1107,6 +1196,29 @@ impl GroupRejoin {
                         source,
                     }
                 })?;
+                // #613: the plan's leader starts with the plan term as its
+                // uncommitted vote, if that is higher, so its first campaign
+                // is above the plan term. Before the Raft core starts, like
+                // the demotion above. OpenRaft then also refuses appends from
+                // a leader whose vote is below `(plan term, this node)`. A
+                // leader at the plan term with a higher node id passes it:
+                // the replication fence is what refuses that one.
+                if record.leader == node_id
+                    && !ursula_stream::sim_controls::off(
+                        ursula_stream::sim_controls::Defence::PlanTermVote,
+                    )
+                {
+                    store
+                        .persist_recovery_vote(VoteOf::<UrsulaRaftTypeConfig>::new(
+                            record.leader_term,
+                            node_id,
+                        ))
+                        .await
+                        .map_err(|source| RecoveryGateError::RaisePlanVote {
+                            raft_group_id,
+                            source,
+                        })?;
+                }
                 VoteGate::planned(&record, node_id)
             }
             (None, _) if cut_refused.is_some() => VoteGate::closed(GroupEvidence::Initialized),
@@ -1151,6 +1263,7 @@ impl GroupRejoin {
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
             last_leader_append: Mutex::new(None),
+            refused_snapshot: Mutex::new(None),
             cut_refused,
             stall_after: OnceLock::new(),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -1414,6 +1527,41 @@ impl GroupRejoin {
         })
     }
 
+    /// Drops the plan this replica leads because the cut left it no vote
+    /// in the membership it keeps, or its restart never showed that
+    /// membership (#613): a leader that cannot campaign would wedge every
+    /// member restricted to it. Like a cut that cannot run, the plan goes in
+    /// the same write that records the log recovering, and the gate stays
+    /// closed until a new plan.
+    pub(crate) async fn drop_plan_left_without_vote(
+        &self,
+        history: &crate::history::GroupHistory,
+    ) -> Result<(), RecoveryGateError> {
+        let raft_group_id = self.raft_group_id;
+        let store = self
+            .store
+            .upgrade()
+            .ok_or(RecoveryGateError::StoreClosed { raft_group_id })?;
+        store
+            .drop_unrunnable_plan()
+            .await
+            .map_err(|source| RecoveryGateError::Record {
+                raft_group_id,
+                source,
+            })?;
+        drop(store);
+        *self.gate() = VoteGate::closed(GroupEvidence::Initialized);
+        history.set_plan(None);
+        self.changes.send_if_modified(|()| true);
+        tracing::error!(
+            node_id = self.node_id,
+            raft_group_id = raft_group_id.0,
+            "recovery plan: after its cut this replica, the plan's leader, is no voter of the \
+             membership it keeps; the plan is dropped and the replica waits for a new plan"
+        );
+        Ok(())
+    }
+
     /// The cut of the plan this replica took could not run at its start
     /// (m3, #581 review): the entry the cut keeps, and what the log held.
     pub(crate) fn cut_refused(
@@ -1440,10 +1588,248 @@ impl GroupRejoin {
             .then_some(leader)
     }
 
+    /// This replica's commit marker as the commit screen reads it (B1 of
+    /// the fifth #613 review): the greatest of the store's marker, OpenRaft's
+    /// committed index and its applied one. OpenRaft raises its committed
+    /// index past the store's marker after a snapshot install without saving
+    /// it, and under `fsync = never` the stored marker falls behind after a
+    /// power loss. Read once per request, in the owner job. `None` when
+    /// nothing is committed.
+    pub(crate) fn effective_marker(
+        &self,
+        metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>,
+    ) -> Option<u64> {
+        let store = self.store.upgrade();
+        let stored = store.as_ref().and_then(|store| store.committed_index());
+        if ursula_stream::sim_controls::off(
+            ursula_stream::sim_controls::Defence::CommitScreenPurged,
+        ) {
+            return stored;
+        }
+        // OpenRaft's indexes never pass the log it keeps in this store; a
+        // gate built over another store, as tests do, reads its own.
+        let held = store.as_ref().and_then(|store| store.last_held_index());
+        let raft = [
+            metrics.local_committed.map(|id| id.index),
+            metrics.last_applied.map(|id| id.index),
+        ]
+        .into_iter()
+        .flatten()
+        .max()
+        .zip(held)
+        .map(|(index, held)| index.min(held));
+        stored.max(raft)
+    }
+
+    /// The commit screen (#613): refuses an append, or a snapshot install,
+    /// that would replace entries this replica knows are committed, so the
+    /// replica stays stalled instead of diverging. Checked before OpenRaft
+    /// sees the request, which assumes a committed entry is always held.
+    /// `marker` is [`Self::effective_marker`]; with none, nothing is
+    /// committed and nothing is refused. Without its store, the replica is
+    /// stopping and refuses everything.
+    ///
+    /// - An append whose entries, or the entry it continues from, differ
+    ///   from this replica's log at or below the marker, compared with the
+    ///   last purged entry below it.
+    /// - A snapshot whose last entry differs so.
+    /// - A snapshot of another history than the one the marker lies in,
+    ///   unless that history directly replaced this one and either kept
+    ///   every entry up to the marker ([`ursula_runtime::HistoryEvent::kept`])
+    ///   or was proposed by the leader of this replica's entry at the marker
+    ///   ([`ursula_runtime::HistoryEvent::leader`]), whose log this replica
+    ///   then holds up to there. A snapshot carries only its latest history
+    ///   event, so a history two or more steps ahead, or on another branch,
+    ///   cannot show that it kept this replica's committed entries: it is
+    ///   refused as `UnrelatedHistory`, and the replica rejoins as a wiped
+    ///   node. OpenRaft compares log ids term first, so a later leader's
+    ///   snapshot always looks newer, even at a lower index.
+    pub(crate) fn committed_overwrite(
+        &self,
+        incoming: Incoming<'_>,
+        marker: Option<u64>,
+    ) -> Option<ursula_runtime::GroupInfraError> {
+        use ursula_stream::sim_controls::Defence;
+        let (switch, ids, history) = match incoming {
+            Incoming::Append(request) => (
+                Defence::CommitScreen,
+                request
+                    .prev_log_id
+                    .into_iter()
+                    .chain(request.entries.iter().map(|entry| entry.log_id))
+                    .collect::<Vec<_>>(),
+                None,
+            ),
+            Incoming::Snapshot {
+                last,
+                history,
+                local,
+            } => (
+                Defence::CommitScreenInstall,
+                last.into_iter().collect(),
+                Some((history, local)),
+            ),
+        };
+        if ursula_stream::sim_controls::off(switch) {
+            return None;
+        }
+        let Some(store) = self.store.upgrade() else {
+            return Some(ursula_runtime::GroupInfraError::OwnerStopped);
+        };
+        let committed = marker?;
+        let skip_purged = ursula_stream::sim_controls::off(Defence::CommitScreenPurged);
+        let refusal = store
+            .committed_conflict(committed, ids, skip_purged)
+            .map(
+                |index| ursula_runtime::GroupInfraError::CommittedOverwrite {
+                    raft_group_id: self.raft_group_id,
+                    committed,
+                    index,
+                },
+            )
+            .or_else(|| {
+                let (incoming, local) = history?;
+                let id = incoming.map_or(0, |event| event.id.get());
+                if local == Some(id) {
+                    return None;
+                }
+                let replaced = incoming.map_or(0, |event| event.previous);
+                let chained = local == Some(replaced)
+                    || (local.is_some()
+                        && ursula_stream::sim_controls::off(Defence::CommitScreenChain));
+                if !chained {
+                    return Some(ursula_runtime::GroupInfraError::UnrelatedHistory {
+                        raft_group_id: self.raft_group_id,
+                        history: id,
+                        replaced,
+                        local,
+                    });
+                }
+                let kept = incoming.map_or(0, |event| event.kept);
+                // S1 of the fifth #613 review: the new history's leader may
+                // have appended its blank entry, which this replica saw
+                // committed, before the event.
+                let same_leader = incoming.is_some_and(|event| {
+                    event.leader.term > 0
+                        && store.log_id_or_purged_at(committed).is_some_and(|held| {
+                            (held.leader_id.term, held.leader_id.node_id)
+                                == (event.leader.term, event.leader.node_id)
+                        })
+                });
+                (kept < committed && !same_leader).then_some(
+                    ursula_runtime::GroupInfraError::CommittedOverwrite {
+                        raft_group_id: self.raft_group_id,
+                        committed,
+                        index: kept.saturating_add(1),
+                    },
+                )
+            })?;
+        ursula_stream::sim_controls::note_fired(switch);
+        Some(refusal)
+    }
+
+    /// The refusal of the snapshot `snapshot_id`, when the commit screen
+    /// refused it before.
+    pub(crate) fn refused_snapshot(
+        &self,
+        snapshot_id: &str,
+    ) -> Option<ursula_runtime::GroupInfraError> {
+        self.refused_snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(refused, _)| refused == snapshot_id)
+            .map(|(_, refusal)| refusal.clone())
+    }
+
+    /// Records that the commit screen refused the snapshot `snapshot_id`.
+    /// A refusal for a log it could not read may pass later: not recorded.
+    pub(crate) fn record_refused_snapshot(
+        &self,
+        snapshot_id: &str,
+        refusal: &ursula_runtime::GroupInfraError,
+    ) {
+        if matches!(
+            refusal,
+            ursula_runtime::GroupInfraError::UnrelatedHistory { local: None, .. }
+                | ursula_runtime::GroupInfraError::OwnerStopped
+        ) {
+            return;
+        }
+        *self
+            .refused_snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((snapshot_id.to_owned(), refusal.clone()));
+    }
+
+    /// The id of the history this replica's commit marker lies in (#613):
+    /// that of the newest history event at or below `marker`, 0 before the
+    /// genesis. `applied` is the newest event it applied, through
+    /// `applied_index`; committed entries above that are read from its log.
+    /// An event counts as apply would count it: only when it names the
+    /// history before it. `None` when the log could not be read, or holds
+    /// an import there, whose outcome only its apply knows.
+    pub(crate) async fn history_at_marker(
+        &self,
+        applied: Option<ursula_runtime::HistoryEvent>,
+        applied_index: Option<u64>,
+        marker: Option<u64>,
+    ) -> Option<u64> {
+        let mut current = applied.map_or(0, |event| event.id.get());
+        let Some(committed) = marker else {
+            return Some(current);
+        };
+        let from = applied_index.map_or(0, |index| index.saturating_add(1));
+        if from > committed {
+            return Some(current);
+        }
+        let mut reader = self.store.upgrade()?;
+        let entries =
+            openraft::storage::RaftLogReader::try_get_log_entries(&mut reader, from..=committed)
+                .await
+                .ok()?;
+        for entry in entries {
+            match entry.payload {
+                openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                    ursula_stream::StreamCommand::NewHistory {
+                        history, previous, ..
+                    },
+                )) => {
+                    if previous == current {
+                        current = history.get();
+                    }
+                }
+                openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                    ursula_stream::StreamCommand::ImportSnapshot { .. },
+                )) => return None,
+                _ => {}
+            }
+        }
+        Some(current)
+    }
+
+    /// The membership this replica keeps when a recovery plan cuts its log
+    /// back to `committed` ([`kept_of`]), given the state machine's
+    /// `applied` membership.
+    pub(crate) fn kept_membership(
+        &self,
+        committed: Option<u64>,
+        applied: openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig>,
+    ) -> openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig> {
+        let log = committed.and_then(|index| {
+            self.store
+                .upgrade()
+                .and_then(|store| store.membership_at_or_below(index))
+        });
+        kept_of(log, applied)
+    }
+
     /// Takes a recovery plan (#581 section 4.5), as one owner job of its
     /// group on `core`. Refused, with nothing changed, when the replica leads
     /// or follows a live leader, the request's step is not this replica's
-    /// role, the plan's leader is not a voter, the replica no longer holds
+    /// role, it is the plan's leader and no voter of the membership it would
+    /// campaign under (#613), the replica no longer holds
     /// the log the tool read, it committed or applied above the plan's
     /// point, or it is the plan's leader and its log does not continue from
     /// the point.
@@ -1463,6 +1849,7 @@ impl GroupRejoin {
         plan: &RecoveryPlanRequest,
         core: &dyn PlanCore,
         history: &crate::history::GroupHistory,
+        applied: openraft::alias::StoredMembershipOf<UrsulaRaftTypeConfig>,
     ) -> Result<PlanTaken, RecoveryGateError> {
         let raft_group_id = self.raft_group_id;
         // m4 (#581 review): one accept job at a time. A second one would
@@ -1513,19 +1900,59 @@ impl GroupRejoin {
                 leader,
             });
         }
-        if !metrics
-            .membership_config
-            .membership()
-            .voter_ids()
-            .any(|voter| voter == plan.leader)
+        // #613: only the plan's leader checks membership, against the one
+        // it campaigns under. A member's vote counts under the leader's
+        // membership whatever its own says, so a member whose membership
+        // is older or newer than the leader's is one the leader needs.
+        // A cut that knows no committed entry is refused once the gate has
+        // changed (`NothingCommitted`), so it keeps the effective one here.
+        // A cut to a later committed entry another replica reported keeps
+        // the leader's log up to the point, so its membership there.
+        let keeps_to = if leads && plan.cut && plan.point_entry.is_some() {
+            Some(plan.point)
+        } else {
+            metrics.local_committed.as_ref().map(|id| id.index())
+        };
+        let kept = self.kept_membership(keeps_to, applied);
+        let effective_only = ursula_stream::sim_controls::off(
+            ursula_stream::sim_controls::Defence::PlanKeptMembership,
+        );
+        let campaigns_under = if plan.cut && metrics.local_committed.is_some() && !effective_only {
+            kept.membership()
+        } else {
+            metrics.membership_config.membership()
+        };
+        let member_checks = !leads
+            && ursula_stream::sim_controls::off(
+                ursula_stream::sim_controls::Defence::PlanMemberCheck,
+            );
+        let checked = if leads {
+            Some(campaigns_under)
+        } else if member_checks {
+            Some(metrics.membership_config.membership())
+        } else {
+            None
+        };
+        if checked
+            .is_some_and(|membership| !membership.voter_ids().any(|voter| voter == plan.leader))
         {
             return Err(RecoveryGateError::LeaderNotVoter {
                 raft_group_id,
                 leader: plan.leader,
             });
         }
-        // #581 section 4.5: a group with one voter never cuts.
-        if plan.cut && metrics.membership_config.membership().voter_ids().count() == 1 {
+        // #581 section 4.5: a group with one voter never cuts, as the
+        // planner decides it (m4 of the #613 review).
+        if plan.cut
+            && ursula_proto::admin::single_voter(
+                metrics
+                    .membership_config
+                    .membership()
+                    .get_joint_config()
+                    .iter()
+                    .chain(kept.membership().get_joint_config().iter()),
+            )
+        {
             return Err(RecoveryGateError::SingleVoterCut { raft_group_id });
         }
         let status = self.status();
@@ -1573,8 +2000,21 @@ impl GroupRejoin {
             });
         }
         // The plan's leader continues from the point: its last entry, or
-        // with a cut its committed one.
-        if leads {
+        // with a cut its committed one, or with a cut to a later entry
+        // another replica reported committed (#613), exactly that entry.
+        if leads
+            && plan.cut
+            && let Some(keep) = point_log_id(plan)
+        {
+            let held = store.log_id_at(plan.point);
+            if held != Some(keep) || committed.is_some_and(|index| index > plan.point) {
+                return Err(RecoveryGateError::CommittedEntryMissing {
+                    raft_group_id,
+                    committed: keep,
+                    held,
+                });
+            }
+        } else if leads {
             let (expected, basis) = if plan.cut {
                 (committed.unwrap_or(0), PointBasis::CommittedIndex)
             } else {
@@ -1688,7 +2128,12 @@ impl GroupRejoin {
                 applied: None,
             });
         }
-        if leads && plan.cut && committed.unwrap_or(0) != plan.point {
+        let raised = if leads && plan.cut {
+            point_log_id(plan)
+        } else {
+            None
+        };
+        if leads && plan.cut && raised.is_none() && committed.unwrap_or(0) != plan.point {
             return Err(RecoveryGateError::PointMismatch {
                 raft_group_id,
                 point: plan.point,
@@ -1697,9 +2142,15 @@ impl GroupRejoin {
             });
         }
         let cut = if plan.cut {
-            let keep = state
-                .committed
-                .ok_or(RecoveryGateError::NothingCommitted { raft_group_id })?;
+            // The plan's leader keeps up to a later entry another replica
+            // reported committed, when it holds exactly that entry (#613):
+            // the cut then never lands below a reached replica's commit.
+            let keep = match raised {
+                Some(keep) => keep,
+                None => state
+                    .committed
+                    .ok_or(RecoveryGateError::NothingCommitted { raft_group_id })?,
+            };
             let held = store.log_id_at(keep.index());
             if held != Some(keep) {
                 return Err(RecoveryGateError::CommittedEntryMissing {
@@ -1730,8 +2181,16 @@ impl GroupRejoin {
         // starts again as a follower under the plan.
         // A negative control that defers the cut to the next start skips
         // every in-process restart, as before the #581 review.
+        // #613 (n2 of the fourth #581 review): the plan's leader whose vote
+        // term is below the plan term restarts too, and starts with the plan
+        // term as its vote (`GroupRejoin::durable`), so its first campaign
+        // is above it. Climbing one term per election timeout could outlast
+        // the stall timeout when an open replica's campaigns raised the
+        // plan term far above its own.
         let demote = (matches!(state.server_state, openraft::ServerState::Leader)
-            || (leads && matches!(state.server_state, openraft::ServerState::Candidate)))
+            || (leads
+                && (matches!(state.server_state, openraft::ServerState::Candidate)
+                    || state.vote_term < leader_term)))
             && !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::RecoveryCut);
         let restart = cut_restart || demote;
         if demote {
@@ -2115,6 +2574,46 @@ impl GroupRejoin {
 
 #[cfg(test)]
 mod tests {
+
+    /// #613: the kept membership is the newer of the log's newest entry at
+    /// or below the committed index and the state machine's membership. With
+    /// a snapshot only, the log holds none, and the applied one is kept.
+    #[test]
+    fn the_kept_membership_is_the_newer_of_the_log_and_the_applied_state() {
+        use openraft::alias::StoredMembershipOf;
+        let stored = |index: u64, voters: &[u64]| {
+            StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                Some(openraft::LogId {
+                    leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+                    index,
+                }),
+                openraft::Membership::new_with_defaults(vec![voters.iter().copied().collect()], []),
+            )
+        };
+        let voters = |kept: StoredMembershipOf<UrsulaRaftTypeConfig>| {
+            kept.membership().voter_ids().collect::<Vec<_>>()
+        };
+        // A snapshot install, or a purge: the log holds no membership entry.
+        assert_eq!(voters(super::kept_of(None, stored(4, &[1, 2, 3]))), vec![
+            1, 2, 3
+        ]);
+        // The log's entry at or below the committed index is newer.
+        assert_eq!(
+            voters(super::kept_of(
+                Some(stored(7, &[1, 2, 3, 4])),
+                stored(4, &[1, 2, 3])
+            )),
+            vec![1, 2, 3, 4]
+        );
+        // The applied state is never older than what the log still holds.
+        assert_eq!(
+            voters(super::kept_of(
+                Some(stored(3, &[1, 2])),
+                stored(4, &[1, 2, 3])
+            )),
+            vec![1, 2, 3]
+        );
+    }
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
@@ -2665,6 +3164,7 @@ mod tests {
         assert!(gate.stall());
         let plan =
             |leader, point, cut, last_log_index, last_log_term, current_term| RecoveryPlanRequest {
+                point_entry: None,
                 leader,
                 point,
                 cut,
@@ -2695,7 +3195,12 @@ mod tests {
             ursula_runtime::HistoryPublisher::default().subscribe(),
         );
         let missing_floor = gate
-            .accept_recovery_plan(&plan(1, 0, false, None, None, 0), &NoCore, &history)
+            .accept_recovery_plan(
+                &plan(1, 0, false, None, None, 0),
+                &NoCore,
+                &history,
+                Default::default(),
+            )
             .await
             .expect_err("accepting lost entries cannot replace a lost vote history");
         assert!(matches!(

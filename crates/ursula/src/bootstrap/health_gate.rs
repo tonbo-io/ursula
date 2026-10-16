@@ -805,6 +805,7 @@ mod tests {
             purged: None,
             voter_ids: vec![1, 2, 3],
             voter_configurations: vec![[1, 2, 3].into()],
+            committed_voter_configurations: vec![[1, 2, 3].into()],
             learner_ids: Vec::new(),
             maintenance: ursula_raft::RaftGroupMaintenanceState::default(),
             log: Default::default(),

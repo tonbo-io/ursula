@@ -2275,3 +2275,263 @@ async fn an_exhausted_recorded_epoch_refuses_a_new_poisoned_recovery() {
         assert_eq!(fs::read(&path).unwrap(), before);
     }
 }
+
+/// #613: the store reports an append that would overwrite an entry at or
+/// below a commit marker, which the replica refuses before OpenRaft sees
+/// it, and nothing above the marker or matching the log. B1 of the fifth
+/// review: at or below the last purged entry it compares with that entry.
+#[tokio::test]
+async fn an_overwrite_below_the_commit_marker_is_reported() {
+    let core = Core::new(JournalTuning::new(WalFsync::Never));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [
+        blank_entry(1),
+        blank_entry(2),
+        blank_entry(3),
+        blank_entry(4),
+    ])
+    .await;
+    let other_term = |index: u64| openraft::LogId {
+        leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(9, 1),
+        index,
+    };
+    assert_eq!(store.committed_conflict(2, [other_term(2)], false), Some(2));
+    assert_eq!(
+        store.committed_conflict(2, [log_id(1), other_term(2)], false),
+        Some(2)
+    );
+    assert_eq!(
+        store.committed_conflict(2, [log_id(2), other_term(3)], false),
+        None
+    );
+    assert_eq!(
+        store.committed_conflict(2, [log_id(1), log_id(2)], false),
+        None
+    );
+    // Purged up to 3, as after a snapshot install: a later leader's id at or
+    // below it differs, and our own ids do not.
+    store.purge(log_id(3)).await.expect("purge");
+    assert_eq!(store.committed_conflict(4, [other_term(2)], false), Some(2));
+    assert_eq!(store.committed_conflict(4, [other_term(3)], false), Some(3));
+    assert_eq!(
+        store.committed_conflict(4, [log_id(2), log_id(3)], false),
+        None
+    );
+    // The negative control skips them, as before the review.
+    assert_eq!(store.committed_conflict(4, [other_term(2)], true), None);
+}
+
+/// F1 of the third #613 review, and A of the fourth: a snapshot never
+/// installs over this replica's committed entries. Its last entry must
+/// agree with the log at or below the marker, and a snapshot of another
+/// history must have directly replaced the history the marker lies in and
+/// kept every entry up to the marker. A chain of two recoveries, or a fork,
+/// is refused even when the latest history kept more than the marker.
+#[tokio::test]
+async fn the_commit_screen_refuses_a_snapshot_that_replaced_committed_entries() {
+    use ursula_runtime::GroupInfraError;
+    let core = Core::new(JournalTuning::new(WalFsync::Never));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    append(&mut store, [
+        blank_entry(1),
+        blank_entry(2),
+        blank_entry(3),
+        blank_entry(4),
+    ])
+    .await;
+    store
+        .save_committed(Some(log_id(4)))
+        .await
+        .expect("save the committed entry");
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("a gate");
+    let later = |index: u64| openraft::LogId {
+        leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(9, 2),
+        index,
+    };
+    let event = |id: u64, previous: u64, kept: u64| ursula_runtime::HistoryEvent {
+        id: std::num::NonZeroU64::new(id).expect("non-zero"),
+        event_index: kept.saturating_add(2),
+        previous,
+        kept,
+        leader: ursula_stream::HistoryLeader {
+            term: 0,
+            node_id: 0,
+        },
+        imported: None,
+    };
+    // The marker lies in history 1 (H0); history 7 (H1) replaced it, and
+    // history 8 (H2) replaced H1.
+    let screen = |last: u64, history, local| {
+        gate.committed_overwrite(
+            crate::rejoin::Incoming::Snapshot {
+                last: Some(later(last)),
+                history,
+                local,
+            },
+            Some(4),
+        )
+    };
+    let h0 = Some(event(1, 0, 0));
+    // A higher term at a lower index than the marker.
+    assert!(matches!(
+        screen(3, h0, Some(1)),
+        Some(GroupInfraError::CommittedOverwrite {
+            committed: 4,
+            index: 3,
+            ..
+        })
+    ));
+    // Our own history, above the marker.
+    assert_eq!(screen(9, h0, Some(1)), None);
+    // H1 replaced ours but kept only up to entry 2: it replaced 3 and 4.
+    assert!(matches!(
+        screen(9, Some(event(7, 1, 2)), Some(1)),
+        Some(GroupInfraError::CommittedOverwrite {
+            committed: 4,
+            index: 3,
+            ..
+        })
+    ));
+    // H1 replaced ours and kept every committed entry.
+    assert_eq!(screen(9, Some(event(7, 1, 4)), Some(1)), None);
+    // S1 of the fifth review: H1 kept only up to 2, but its leader is the
+    // one of our entry at the marker, its blank entry say, which we saw
+    // committed before its event: we hold its log up to there.
+    let by_our_leader = ursula_runtime::HistoryEvent {
+        leader: ursula_stream::HistoryLeader {
+            term: 5,
+            node_id: 1,
+        },
+        ..event(7, 1, 2)
+    };
+    assert_eq!(screen(9, Some(by_our_leader), Some(1)), None);
+    // The same at the genesis: a replica before it saw that leader's
+    // entries committed, a raced write say, but not its event.
+    let genesis = ursula_runtime::HistoryEvent {
+        leader: ursula_stream::HistoryLeader {
+            term: 5,
+            node_id: 1,
+        },
+        ..event(7, 0, 2)
+    };
+    assert_eq!(screen(9, Some(genesis), Some(0)), None);
+    assert!(matches!(
+        screen(9, Some(event(7, 0, 2)), Some(0)),
+        Some(GroupInfraError::CommittedOverwrite { .. })
+    ));
+    // Another node of that term did not lead our entry.
+    let by_another = ursula_runtime::HistoryEvent {
+        leader: ursula_stream::HistoryLeader {
+            term: 5,
+            node_id: 2,
+        },
+        ..event(7, 1, 2)
+    };
+    assert!(matches!(
+        screen(9, Some(by_another), Some(1)),
+        Some(GroupInfraError::CommittedOverwrite { .. })
+    ));
+    // A chain: H2 kept up to 15 of H1, but H1 kept only 2 of ours.
+    assert!(matches!(
+        screen(20, Some(event(8, 7, 15)), Some(1)),
+        Some(GroupInfraError::UnrelatedHistory {
+            history: 8,
+            replaced: 7,
+            local: Some(1),
+            ..
+        })
+    ));
+    // A fork: our marker lies in H1, which was lost; H2 replaced H0.
+    assert!(matches!(
+        screen(20, Some(event(8, 1, 9)), Some(7)),
+        Some(GroupInfraError::UnrelatedHistory {
+            history: 8,
+            replaced: 1,
+            local: Some(7),
+            ..
+        })
+    ));
+    // A log that could not be read shows nothing: refused.
+    assert!(matches!(
+        screen(9, Some(event(7, 1, 4)), None),
+        Some(GroupInfraError::UnrelatedHistory { local: None, .. })
+    ));
+}
+
+/// N2 of the fifth #613 review: the history a replica's commit marker lies
+/// in, read from its log above what it applied. An event counts only when
+/// it names the history before it, as its apply does, and an import makes
+/// the answer unknown.
+#[tokio::test]
+async fn the_history_at_the_marker_follows_the_events_apply_would_take() {
+    let core = Core::new(JournalTuning::new(WalFsync::Never));
+    let writer = core.writer();
+    let mut store = core.store(&writer, 1);
+    let new_history = |index: u64, history: u64, previous: u64| {
+        Entry::new(
+            log_id(index),
+            EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::NewHistory {
+                history: std::num::NonZeroU64::new(history).expect("non-zero"),
+                now_ms: 0,
+                previous,
+                kept: index.saturating_sub(1),
+                leader: ursula_stream::HistoryLeader {
+                    term: 5,
+                    node_id: 1,
+                },
+            })),
+        )
+    };
+    append(&mut store, [
+        blank_entry(1),
+        new_history(2, 7, 1),
+        // Names a history the group never had: its apply refuses it.
+        new_history(3, 9, 5),
+        blank_entry(4),
+    ])
+    .await;
+    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
+        .await
+        .expect("a gate");
+    let applied = ursula_runtime::HistoryEvent {
+        id: std::num::NonZeroU64::new(1).expect("non-zero"),
+        event_index: 1,
+        previous: 0,
+        kept: 0,
+        leader: ursula_stream::HistoryLeader {
+            term: 5,
+            node_id: 1,
+        },
+        imported: None,
+    };
+    assert_eq!(
+        gate.history_at_marker(Some(applied), Some(1), Some(4))
+            .await,
+        Some(7)
+    );
+    assert_eq!(
+        gate.history_at_marker(Some(applied), Some(1), Some(1))
+            .await,
+        Some(1)
+    );
+    assert_eq!(gate.history_at_marker(None, None, None).await, Some(0));
+    append(&mut store, [Entry::new(
+        log_id(5),
+        EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::ImportSnapshot {
+            snapshot: Box::default(),
+            history: std::num::NonZeroU64::new(11).expect("non-zero"),
+            backup_digest: [1; 32],
+            now_ms: 0,
+        })),
+    )])
+    .await;
+    assert_eq!(
+        gate.history_at_marker(Some(applied), Some(1), Some(5))
+            .await,
+        None
+    );
+}

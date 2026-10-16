@@ -41,6 +41,7 @@ pub use format::FORMAT_EPOCH;
 pub use format::format_epoch_refusal;
 pub use history::BackupDigest;
 pub use history::HistoryEvent;
+pub use history::HistoryLeader;
 pub use history::INCARNATION_TAG;
 pub use history::InheritedHistory;
 pub use history::InheritedReport;

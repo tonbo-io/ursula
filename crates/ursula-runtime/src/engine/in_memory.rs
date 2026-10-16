@@ -253,6 +253,13 @@ impl InMemoryGroupEngine {
                 StreamCommand::NewHistory {
                     history: ursula_stream::draw_history_id(),
                     now_ms,
+                    // No replicas: nothing to keep from a history before.
+                    previous: 0,
+                    kept: 0,
+                    leader: ursula_stream::HistoryLeader {
+                        term: 0,
+                        node_id: 0,
+                    },
                 },
                 placement,
             );

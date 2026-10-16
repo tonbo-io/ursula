@@ -501,6 +501,8 @@ mod tests {
             committed_index: Some(100),
             last_applied_index: Some(100),
             voter_ids: vec![1, 2, 3],
+            voter_configs: vec![[1, 2, 3].into()],
+            committed_voter_configs: vec![[1, 2, 3].into()],
             learner_ids: vec![],
             maintenance: ursula_proto::admin::RaftGroupMaintenanceState {
                 running: true,
@@ -513,6 +515,7 @@ mod tests {
             last_log_index: Some(100),
             last_log_term: Some(1),
             committed_term: Some(1),
+            committed_node: Some(1),
             last_applied_term: Some(1),
             snapshot_term: None,
             snapshot_index: None,
