@@ -625,8 +625,9 @@ fn tickets_resolve_in_order_through_one_watermark() {
     );
 }
 
-// Admission (design §4.4) counts a commit from its log write: back-to-back commits that the driver
-// thread has not heard of yet are refused at the bound, and admitted again once acknowledged.
+// Admission (design: Backpressure) counts a commit from its log write: back-to-back commits that
+// the driver thread has not heard of yet are refused at the bound, and admitted again once
+// acknowledged.
 #[test]
 fn admission_counts_commits_the_driver_thread_has_not_seen() {
     let dir = TempDir::new("driver-admission");
@@ -2298,7 +2299,7 @@ fn reset_after(change: impl FnOnce(&mut ModelServer)) -> Vec<ResetKind> {
 }
 
 /// A history event that loses nothing while bound: the append meets the new token, the HEAD
-/// shows the history inherits the generation, and it re-keys (design §6.2). The log rolls to a
+/// shows the history inherits the generation, and it re-keys (design: History). The log rolls to a
 /// segment naming the new token with the claim of `own + 1`, the binding takes the token, the
 /// pending commit is resent under the new epoch, and `synced()` resolves with no reset.
 #[test]
@@ -2335,7 +2336,7 @@ fn an_inheriting_history_re_keys_without_a_reset() {
 
 /// A restore that lost an acknowledged commit resets the binding `rewound` once its HEAD shows
 /// the history does not inherit the generation, and its latest ACK names the exact acknowledged
-/// offset, fsynced, so the next open's test fails the same way (design §6.2, D5): the reopen
+/// offset, fsynced, so the next open's test fails the same way (design: History, Log): the reopen
 /// salvages the generation (`history_changed`), whose db holds the lost commit, and builds anew.
 #[test]
 fn a_lossy_restore_resets_rewound_and_the_reopen_salvages() {
@@ -2387,7 +2388,7 @@ fn a_lossy_restore_resets_rewound_and_the_reopen_salvages() {
 
 /// A misrouted request meets another deployment: the HEAD names another cluster, the binding
 /// blocks `wrong_cluster` with no reset, nothing applies there, and the binding resumes once the
-/// route is fixed (design §6.3).
+/// route is fixed (design: Identity).
 #[test]
 fn a_misroute_blocks_and_then_resumes() {
     let dir = TempDir::new("driver-misroute");
@@ -2420,7 +2421,7 @@ fn a_misroute_blocks_and_then_resumes() {
 
 /// After a re-key the binding's token is the new one, and a snapshot publish under it succeeds;
 /// one under the old token, or answered as another deployment, fails without stopping snapshots
-/// (design §6.2, G9).
+/// (design: History).
 #[test]
 fn snapshots_publish_under_the_new_token_and_a_stale_token_is_transient() {
     let (server, old) = published_world();
@@ -2953,8 +2954,8 @@ fn a_reopen_after_an_inheriting_history_salvages_while_commits_are_pending() {
 
 /// A crash leaves a commit pending, and a history event that loses nothing lands right after the
 /// reopen's HEAD: the takeover's claim meets the new token with a commit pending, so the open fails
-/// `rewound` before the log rolls (its ACK fsynced, D5), and the next open salvages the generation
-/// with the pending commit in it.
+/// `rewound` before the log rolls (its ACK fsynced, design: Log), and the next open salvages the
+/// generation with the pending commit in it.
 #[test]
 fn a_takeover_meeting_an_inheriting_history_with_commits_pending_fails_before_the_roll() {
     let dir = TempDir::new("driver-takeover-rekey-pending");
@@ -4458,7 +4459,7 @@ fn an_emptied_db_of_a_snapshot_built_generation_is_salvaged() {
 }
 
 /// A history event lands while a fresh open builds (after the open's HEAD, before the build's):
-/// the build starts over under the new token (design D8) and the open takes over with it.
+/// the build starts over under the new token (design: Materialize) and the open takes over with it.
 #[test]
 fn a_history_change_during_a_fresh_build_starts_it_over() {
     let dir_a = TempDir::new("driver-d8-a");
@@ -4779,7 +4780,7 @@ fn claimed(w: &World, c: usize) -> Vec<Epoch> {
     claims
 }
 
-/// The stream is unreachable at the reopen (design §5.5): the trusted generation opens at once,
+/// The stream is unreachable at the reopen (design: Open): the trusted generation opens at once,
 /// provisional, and nothing is logged. Commits log and stay pending, `synced()` waits with the
 /// condition `retrying`. Once the stream answers, the pre-check (a HEAD, then the reads from the
 /// log's acknowledged offset) finds nothing foreign, the log's claim `own` goes out again, its
@@ -4929,10 +4930,10 @@ fn a_provisional_claim_meeting_an_inheriting_history_re_keys() {
 }
 
 /// The same history event with a commit the provisional binding logged during the outage:
-/// that commit was never sent, so the B2 gate counts only what the log held at the open, and
-/// nothing. The binding re-keys, its commit replicates, and nothing is salvaged. On a single
-/// voter with `fsync=never` every unclean restart is such an event, and offline work must survive
-/// it.
+/// that commit was never sent, so the history gate (design: History) counts only what the log held
+/// at the open, and nothing. The binding re-keys, its commit replicates, and nothing is salvaged.
+/// On a single voter with `fsync=never` every unclean restart is such an event, and offline work
+/// must survive it.
 #[test]
 fn an_offline_commit_survives_a_history_that_keeps_everything() {
     let dir = TempDir::new("driver-provisional-rekey-offline");
@@ -4960,10 +4961,10 @@ fn an_offline_commit_survives_a_history_that_keeps_everything() {
 }
 
 /// The opposite case: a commit logged before this open, after the log's latest ACK, may have been
-/// sent and acknowledged, so the B2 gate holds. The binding resets `rewound` before its log rolls
-/// and sends nothing (its connections are live, it cannot salvage under them), and the next open,
-/// which reaches the stream, salvages the generation (`history_changed`). The manifest counts that
-/// commit and the provisional one as unacknowledged.
+/// sent and acknowledged, so the history gate (design: History) holds. The binding resets `rewound`
+/// before its log rolls and sends nothing (its connections are live, it cannot salvage under them),
+/// and the next open, which reaches the stream, salvages the generation (`history_changed`). The
+/// manifest counts that commit and the provisional one as unacknowledged.
 #[test]
 fn a_commit_before_the_open_after_the_ack_resets_rewound_at_a_history_and_the_next_open_salvages() {
     let dir = TempDir::new("driver-provisional-rekey-pending");
@@ -5057,8 +5058,8 @@ fn a_provisional_claim_meeting_a_lossy_restore_resets_rewound() {
     );
 }
 
-/// A power loss dropped a commit the stream acknowledged, with its ACK, from the log (design
-/// §8.3): the generation is as it was before that commit. The provisional binding commits other
+/// A power loss dropped a commit the stream acknowledged, with its ACK, from the log (design:
+/// Resets): the generation is as it was before that commit. The provisional binding commits other
 /// bytes at the same position, and once the stream answers, its pre-check finds the lost commit
 /// in the stream with no pending record to match it: the binding resets `stale` with nothing sent,
 /// and its provisional commit never reaches the stream.
@@ -5249,11 +5250,12 @@ fn log_bytes(dir: &Path) -> Vec<u8> {
 
 /// A provisional binding resets (`fenced`, `stale`, `rewound`) while its connection still holds
 /// its generation. Its connection's commits are refused under the log's lock from the reset on
-/// (G8), so the log stays as the reset left it. A reopen in the same core runs beside it from a
-/// copy of that generation (design §5.6), and the original is trashed. After `rewound`, the
-/// reopen's salvage (`history_changed`) takes the copy, whose log holds the original's, and its
-/// manifest counts the provisional commits as unacknowledged. After `fenced` or `stale` the
-/// reopen takes over and rebuilds from the stream, which never held the provisional commits.
+/// (design: Materialize), so the log stays as the reset left it. A reopen in the same core runs
+/// beside it from a copy of that generation (design: Materialize), and the original is trashed.
+/// After `rewound`, the reopen's salvage (`history_changed`) takes the copy, whose log holds the
+/// original's, and its manifest counts the provisional commits as unacknowledged. After `fenced` or
+/// `stale` the reopen takes over and rebuilds from the stream, which never held the provisional
+/// commits.
 #[test]
 fn a_reset_provisional_binding_is_reopened_beside_its_connection_from_a_copy() {
     for kind in [ResetKind::Fenced, ResetKind::Stale, ResetKind::Rewound] {
@@ -5391,7 +5393,7 @@ fn a_hand_out_given_back_by_a_failed_open_waits_again() {
     assert!(!bound.handle.holds_root());
 }
 
-/// A read-only open's spec: the reader of design D6.
+/// A read-only open's spec: the reader (design: Readers).
 fn reader_spec(dir: &Path) -> OpenSpec {
     OpenSpec {
         access: Access::Reader,
@@ -5419,7 +5421,7 @@ fn owner_with_a_commit(w: &mut World, dir: &Path, c: usize, salt: u8) -> Bound {
     bound
 }
 
-/// A reader in another process (design D6) builds its generation in `reader-0/`, beside the
+/// A reader in another process (design: Readers) builds its generation in `reader-0/`, beside the
 /// owner's lock, from HEADs and reads alone: it claims nothing, so the owner goes on committing
 /// unfenced. Its `synced()` resolves at once, and it shows the stream as of its open. A second
 /// reader takes `reader-1/`.

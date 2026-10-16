@@ -1,6 +1,6 @@
-// PART runs (design §4.6): a commit above the batch limit, min(request limit, 4 MiB), goes out as a
-// run of PART frames, one per append, and readers apply only a complete run. Against the e2e server
-// (test/stack.ts):
+// PART runs (design: Appends): a commit above the batch limit, min(request limit, 4 MiB), goes out
+// as a run of PART frames, one per append, and readers apply only a complete run. Against the e2e
+// server (test/stack.ts):
 // - Under a lowered limit (URSULA_VFS_MAX_REQUEST_BYTES=65536) a 1 MiB transaction commits, synced()
 //   resolves, and a fresh build equals it. A 9 MiB transaction at the default limit goes out in
 //   parts of 4 MiB.

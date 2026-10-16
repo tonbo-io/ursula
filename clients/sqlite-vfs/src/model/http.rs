@@ -5,7 +5,8 @@
 //! carry `Content-Length` (`411` otherwise, chunked bodies are refused with `501`), as the
 //! client's transport always sends it. A stream request whose `Content-Length` exceeds the
 //! model's request limit (`/__model/limits`) gets the typed `413` (or a scripted fault) decided
-//! before its body is read, which is then read and dropped, as the server does on HTTP/1.1 (A3),
+//! before its body is read, which is then read and dropped, as the server does on HTTP/1.1
+//! (extensions: Answers Before the Body),
 //! before the answer goes out and the connection closes; a client that sent
 //! `Expect: 100-continue` sends no body. Otherwise `Expect: 100-continue` gets `100 Continue`,
 //! then the body is read: the model
@@ -222,13 +223,13 @@ fn read_request(
         None if matches!(method, "PUT" | "POST") => return Ok(Err(answer(RawAnswer::new(411)))),
         None => 0,
         Some(Ok(length)) if length <= limit => length,
-        // Decided from `Content-Length`, before the body (#581 §6.4), through the same faults
-        // as in process.
+        // Decided from `Content-Length`, before the body (extensions: Server Metadata), through the
+        // same faults as in process.
         Some(Ok(length)) => {
-            // As the server's early answers on HTTP/1.1 (A3): the body is read and dropped first,
-            // within the drain bound, so a client still writing it never meets a closed socket
-            // (which macOS reports as `EINVAL` rather than the answer). A client that sent
-            // `Expect: 100-continue` gets no `100 Continue` and sends no body.
+            // As the server's early answers on HTTP/1.1 (extensions: Answers Before the Body): the
+            // body is read and dropped first, within the drain bound, so a client still writing it
+            // never meets a closed socket (which macOS reports as `EINVAL` rather than the answer).
+            // A client that sent `Expect: 100-continue` gets no `100 Continue` and sends no body.
             let expects_continue =
                 header("expect").is_some_and(|v| v.eq_ignore_ascii_case("100-continue"));
             if !expects_continue && length <= MAX_DRAIN_BYTES {

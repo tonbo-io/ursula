@@ -1,5 +1,6 @@
-//! A reader's open after its HEAD (design D6): the reader rows ([`table::decide_reader`]) carried
-//! out, a catch-up in place of a trusted reader generation, and the row of an unreachable stream.
+//! A reader's open after its HEAD (design: Readers): the reader rows ([`table::decide_reader`])
+//! carried out, a catch-up in place of a trusted reader generation, and the row of an unreachable
+//! stream.
 //!
 //! A reader holds no commit of its own, so its generation is the stream as of its open and nothing
 //! else. A trusted one of the stream's token is caught up in place: the stream is read from the

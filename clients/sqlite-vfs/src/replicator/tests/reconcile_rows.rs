@@ -1,6 +1,6 @@
-//! One test per row of the reconcile table of design §4.9, each through both columns: a takeover
-//! and a continuation claim, driven through the replicator with the claim's answer and the read
-//! as they travel.
+//! One test per row of the reconcile table (design: Reconcile), each through both columns: a
+//! takeover and a continuation claim, driven through the replicator with the claim's answer and the
+//! read as they travel.
 
 use ursula_headers::Delivery;
 
@@ -340,8 +340,8 @@ fn gone_with_snapshot(kind: ClaimKind, last: CommitId) -> (Harness, Vec<Action>,
 // A snapshot of our lineage at or below the acknowledged position: the stream holds that state
 // under our lineage and this copy acknowledged it, so a takeover goes on from its offset (here the
 // claim's start, other claims having come between), and nothing is rebuilt. A continuation never
-// skips bytes it did not read: it goes on only from a snapshot where its reads are (N2), and
-// resets `stale` for one past them, whatever the bytes it would skip hold.
+// skips bytes it did not read: it goes on only from a snapshot where its reads are (design:
+// Reconcile), and resets `stale` for one past them, whatever the bytes it would skip hold.
 #[test]
 fn row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked() {
     // The continuation's snapshot sits at its acknowledged offset, and two claims of its own follow.

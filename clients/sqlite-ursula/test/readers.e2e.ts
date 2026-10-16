@@ -1,10 +1,10 @@
-// Read-only opens (design D6), against the e2e server (test/stack.ts). A reader in a process with no
-// binding of the stream builds a reader cache of its own in `reader-<n>` beside the owner's lock and
-// reads the stream as of its open: it claims nothing, so the owner is never fenced and no claim
-// frame appears, its writes fail with SQLITE_READONLY and `synced()` resolves at once. A reader in
-// the owner's process reads the owner's binding instead, and sees its latest writes. A missing
-// stream is `not_found`, an unreachable one opens an earlier reader cache as it is (or waits until
-// the signal fires without one), and `recreate` cannot go with `readOnly`.
+// Read-only opens (design: Readers), against the e2e server (test/stack.ts). A reader in a process
+// with no binding of the stream builds a reader cache of its own in `reader-<n>` beside the owner's
+// lock and reads the stream as of its open: it claims nothing, so the owner is never fenced and no
+// claim frame appears, its writes fail with SQLITE_READONLY and `synced()` resolves at once. A
+// reader in the owner's process reads the owner's binding instead, and sees its latest writes. A
+// missing stream is `not_found`, an unreachable one opens an earlier reader cache as it is (or
+// waits until the signal fires without one), and `recreate` cannot go with `readOnly`.
 import { sep } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";

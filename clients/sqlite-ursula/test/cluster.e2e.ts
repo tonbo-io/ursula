@@ -1,4 +1,4 @@
-// Another deployment (design §6.3), against two model servers of their own (`--cluster-id
+// Another deployment (design: Identity), against two model servers of their own (`--cluster-id
 // cluster-a` and `cluster-b`, with distinct seeds, so their tokens differ) behind test/gate.mjs,
 // which misroutes on `PUT /target`. A bound owner whose requests reach the other deployment blocks
 // with `condition: wrong_cluster`, never resets, and goes on once the route is fixed. An open whose
@@ -142,7 +142,7 @@ describe.skipIf(!onModel())("another deployment", () => {
 		expect(error).toBeInstanceOf(UrsulaSetupError);
 		expect(error).toMatchObject({ kind: "wrong_cluster", action: "fix" });
 		// No directory moved and nothing sent. The open materializes the generation before its HEAD
-		// (design §5.5), which folds the WAL into the db, so a second refusal finds every byte as the
+		// (design: Open), which folds the WAL into the db, so a second refusal finds every byte as the
 		// first left it.
 		expect(directories()).toEqual(before);
 		const refused = hashes(dir);

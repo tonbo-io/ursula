@@ -692,9 +692,9 @@ fn a_reset_refuses_new_reads_and_every_write() {
     drop(unsafe { Box::from_raw(wal.ext) });
 }
 
-// The commit point checks the reset under the log's lock (G8): a commit waiting for the lock while
-// the binding resets is refused once it takes it, and appends nothing, so no commit lands in a log
-// an open may be copying. A live binding's commit gets the log.
+// The commit point checks the reset under the log's lock (design: Materialize): a commit waiting
+// for the lock while the binding resets is refused once it takes it, and appends nothing, so no
+// commit lands in a log an open may be copying. A live binding's commit gets the log.
 #[test]
 fn a_commit_after_a_reset_is_refused_under_the_log_lock() {
     let dir = TempDir::new("vfs-commit-reset");

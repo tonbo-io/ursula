@@ -1,5 +1,5 @@
-//! What callers outside the extension see of a failure (design §8.3, §8.4): a stable kind token
-//! ([`ErrorKind`]) with what to do about it ([`Action`]), in every SQL function's error
+//! What callers outside the extension see of a failure (design: Resets, Errors): a stable kind
+//! token ([`ErrorKind`]) with what to do about it ([`Action`]), in every SQL function's error
 //! (`<function>: <kind>: <message>`) and in `ursula_status`.
 //!
 //! A refused write ([`WriteRefusal`]) fails its transaction alone with `SQLITE_IOERR_AUTH`, nothing
@@ -47,7 +47,7 @@ impl Action {
 /// The stable kind of a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ErrorKind {
-    /// A write refused at admission (design §4.4).
+    /// A write refused at admission (design: Backpressure).
     BacklogFull,
     /// A write the extension does not capture: EXCLUSIVE locking mode, a commit leaving WAL mode
     /// or 4 KiB pages, a commit frame above the 4 GiB a frame holds.
@@ -137,7 +137,7 @@ impl ErrorKind {
     }
 }
 
-/// The action of a reset (design §8.3).
+/// The action of a reset (design: Resets).
 pub(crate) fn reset_action(kind: ResetKind) -> Action {
     match kind {
         ResetKind::Fenced => Action::Stop,
@@ -149,7 +149,7 @@ pub(crate) fn reset_action(kind: ResetKind) -> Action {
 }
 
 impl OpenError {
-    /// The kind callers see (design §8.4).
+    /// The kind callers see (design: Errors).
     pub(crate) fn error_kind(&self) -> ErrorKind {
         use crate::open::Unavailable;
         match self {
@@ -322,7 +322,7 @@ mod tests {
     use super::reset_action;
     use crate::replicator::ResetKind;
 
-    // Every reset kind has the action of design §8.3, and its token is the reset's.
+    // Every reset kind has the action of its reset (design: Resets), and its token is the reset's.
     #[test]
     fn resets_say_what_to_do() {
         let cases = [
@@ -341,7 +341,7 @@ mod tests {
         }
     }
 
-    // The write refusals of design §8.4: `backlog_full` is retried after `synced()`, an
+    // The write refusals (design: Errors): `backlog_full` is retried after `synced()`, an
     // unsupported write is fixed.
     #[test]
     fn write_refusals_say_what_to_do() {

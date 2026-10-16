@@ -37,7 +37,7 @@ use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
 use ursula_headers::names;
 
-/// `Producer-Id` of every keyed write: constant for the `USQ2` format (design §4.6).
+/// `Producer-Id` of every keyed write: constant for the `USQ2` format (design: Appends).
 pub(crate) const PRODUCER_ID: &str = "sqlite-ursula-vfs/2";
 
 /// `Content-Type` header name.
@@ -121,7 +121,7 @@ pub(crate) enum Target {
     SnapshotParts { offset: Offset },
     /// Every part staged under the stream's current token, discarded (`DELETE`).
     StagedParts,
-    /// The retention boundary (`PUT`), monotonic (#581 §3).
+    /// The retention boundary (`PUT`), monotonic (extensions: Publish Snapshot).
     Retention { offset: Offset },
 }
 
@@ -248,7 +248,7 @@ pub(crate) struct Request {
 /// Which part of a snapshot a read asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SnapshotPart {
-    /// The `USS3` header alone, which verifies without the body (design §4.11).
+    /// The `USS3` header alone, which verifies without the body (design: Snapshots).
     Header,
     /// The bytes `first..=last` of the body (`first <= last`). A server that ignores `Range`
     /// answers the whole body instead, in the time these bytes take.
@@ -392,17 +392,19 @@ impl Request {
 pub(crate) enum Typed {
     /// No typed header applies: the status alone speaks.
     Untyped,
-    /// An answer to a keyed write (#581 §2.3.1, §2.4).
+    /// An answer to a keyed write (extensions: Producer Write Answers).
     Producer(ProducerAnswer),
     /// `409 Stream-Closed`: the stream is closed and the append did not apply.
     StreamClosed(StreamClosedConflict),
     /// `412`: the `Stream-Incarnation` precondition failed.
     IncarnationMismatch(IncarnationMismatch),
-    /// `413`, with the limit it applied when a layer of #581 §6.4 sent it.
+    /// `413`, with the limit it applied when a layer that implements the size refusals
+    /// (extensions: Server Metadata) sent it.
     TooLarge(Option<SizeLimit>),
     /// `307` or `503` of a node that does not lead the stream's group.
     Routing(RoutingAnswer),
-    /// A `HEAD`: the server's identity on every answer (A1), and the stream's metadata on a `200`.
+    /// A `HEAD`: the server's identity on every answer (extensions: Server Metadata), and the
+    /// stream's metadata on a `200`.
     /// A server that sends no identity speaks protocol 1, whose metadata is not read.
     Head {
         identity: Option<ServerIdentity>,
@@ -583,7 +585,8 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
             };
             match producer {
                 Some(answer) => Typed::Producer(answer),
-                // A success to a keyed write is always a typed producer answer (#581 §2.4).
+                // A success to a keyed write is always a typed producer answer (extensions:
+                // Producer Write Answers).
                 None if request.keys.producer.is_some() && (200..300).contains(&status) => {
                     return Err(HeaderError::Missing {
                         name: names::PRODUCER_EPOCH,

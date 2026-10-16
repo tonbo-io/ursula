@@ -1,4 +1,4 @@
-//! One test per row of the two answer tables of design §4.7, through [`decide_append`] and
+//! One test per row of the two answer tables (design: Answers), through [`decide_append`] and
 //! [`decide_claim`], with answers rendered and parsed as they travel.
 
 use std::sync::Arc;

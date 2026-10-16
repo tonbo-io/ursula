@@ -1,5 +1,5 @@
-//! Capture at the commit point (design §4.1): the WAL file's layout, the shape of every WAL write
-//! a write transaction makes, and the transaction's final page images.
+//! Capture at the commit point (design: Capture): the WAL file's layout, the shape of every WAL
+//! write a write transaction makes, and the transaction's final page images.
 //!
 //! [`classify`] names a write by its offset and length. [`WriteTxn`] follows one write transaction
 //! from its WRITE lock: it records each frame's page number and the crc32c of the page this

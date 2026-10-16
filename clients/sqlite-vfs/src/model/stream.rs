@@ -1,5 +1,6 @@
 //! One stream of the model: its bytes, configuration, snapshot, retention, producer records, epoch
-//! floor and what its current history inherited (#581 §2.3, §3, §4.8).
+//! floor and what its current history inherited (extensions: Producer Write Answers, Epoch
+//! Floor, Publish Snapshot, Snapshot Metadata on HEAD and Stream Incarnation).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -13,7 +14,8 @@ use ursula_headers::SnapshotRef;
 use super::producer::IDLE_RETIREMENT_MS;
 use super::producer::ProducerRecord;
 
-/// What the stream's current history began from, in history ids (#581 §4.8).
+/// What the stream's current history began from, in history ids
+/// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct InheritedFrom {
     pub(crate) history: u64,
@@ -67,12 +69,14 @@ impl Stream {
         Offset::from_u64(u64::try_from(self.bytes.len()).unwrap_or(u64::MAX))
     }
 
-    /// The stream's token in history `history` (#581 §4.2).
+    /// The stream's token in history `history`
+    /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
     pub(crate) fn token_in(&self, history: u64) -> Incarnation {
         super::incarnation_token(self.created_at_ms, history)
     }
 
-    /// What HEAD reports about the history the current one began from (#581 §4.8).
+    /// What HEAD reports about the history the current one began from
+    /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
     pub(crate) fn inherited(&self, group_history: u64) -> Option<Inherited> {
         if self.history != group_history {
             return Some(Inherited {

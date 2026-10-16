@@ -1,4 +1,4 @@
-//! The commit log (design §5.2): a generation's `log/` directory of `USL1` segments, named by
+//! The commit log (design: Log): a generation's `log/` directory of `USL1` segments, named by
 //! their first position (`<20 digits>.usl`) and rolled at 16 MiB.
 //!
 //! The valid log is the longest prefix whose chains verify and whose positions grow by one across
@@ -20,13 +20,13 @@
 //! record goes there, so no record of a later segment outlives an earlier one's. [`Log::trim`]
 //! deletes the segments whose records are all at or below `min(base, acked)` (F3), after an fsync
 //! that makes those records durable, and does nothing (no fsync) when no segment would go.
-//! [`Log::rekey`] re-keys the generation to a new stream token (design §5.2, §6.2): the log rolls to
-//! a segment whose header names the token, and the CLAIM record of the claim that follows goes
-//! there, fsynced. A crash before the CLAIM leaves a latest segment that names the new token, which
-//! the next open reads as the generation's token. A clean close or a reset after the roll and
+//! [`Log::rekey`] re-keys the generation to a new stream token (design: Log, History): the log
+//! rolls to a segment whose header names the token, and the CLAIM record of the claim that follows
+//! goes there, fsynced. A crash before the CLAIM leaves a latest segment that names the new token,
+//! which the next open reads as the generation's token. A clean close or a reset after the roll and
 //! before the claim lands leaves the same, not only a crash: two history events with no write
 //! between them then name a token from before the roll, and the next open salvages a generation
-//! that lost nothing (G18, accepted). A current segment with no record has its header
+//! that lost nothing (accepted, design: History). A current segment with no record has its header
 //! replaced instead (a temp file renamed over it), since a roll would start at the same position.
 //! [`copy`] copies a log for a copy of its generation: every segment written again to name the
 //! generation it supersedes.
@@ -710,9 +710,9 @@ impl Log {
         Ok(())
     }
 
-    /// Re-keys the generation to `incarnation` (design §6.2): a new segment naming it, holding the
-    /// CLAIM record of `(epoch, activation)`, fsynced before this returns. A current segment with
-    /// no record has its header replaced instead, atomically. Returns the CLAIM's position.
+    /// Re-keys the generation to `incarnation` (design: History): a new segment naming it, holding
+    /// the CLAIM record of `(epoch, activation)`, fsynced before this returns. A current segment
+    /// with no record has its header replaced instead, atomically. Returns the CLAIM's position.
     pub(crate) fn rekey(
         &mut self,
         incarnation: Incarnation,
@@ -898,10 +898,10 @@ fn write_segment(path: &Path, h: &SegmentHeader) -> Result<(File, u64, u32), Log
     Ok((file, u64::try_from(bytes.len()).unwrap_or(u64::MAX), seed))
 }
 
-/// Copies the log in `from` into `to`, created, for a copy of its generation (design §5.6): every
-/// segment written again, its header naming the generation directory `supersedes` and its records
-/// chained anew from that header, so every segment of the copy names what it supersedes, as a
-/// roll keeps them. Each segment and the directory are fsynced. A segment that ends in a torn
+/// Copies the log in `from` into `to`, created, for a copy of its generation (design: Materialize):
+/// every segment written again, its header naming the generation directory `supersedes` and its
+/// records chained anew from that header, so every segment of the copy names what it supersedes, as
+/// a roll keeps them. Each segment and the directory are fsynced. A segment that ends in a torn
 /// record is copied up to it, and the segments after it are left out, as [`Log::open`] would cut
 /// them.
 pub(crate) fn copy(from: &Path, to: &Path, supersedes: GenId) -> Result<(), LogError> {

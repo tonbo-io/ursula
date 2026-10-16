@@ -1,11 +1,11 @@
-// A long outage (design §4.6, §5.7, M1 exit criterion), against the e2e server (test/stack.ts)
-// behind test/gate.mjs: the stream is cut off for OUTAGE_MS (60 s by default, 600 s in the soak
-// workflow), as a blackhole (requests read and never answered) and as refused connections. Meanwhile
-// commits go on, nothing resets, `synced()` waits, status says `retrying`, and a database with a
-// small `maxPendingBytes` refuses writes with `backlog_full` and stays usable. After the heal both
-// catch up in full: acknowledged equals logged, a snapshot that came due during the outage is published
-// after it (URSULA_VFS_SNAPSHOT_DUE_BYTES), and the stream (snapshot and tail) equals the local
-// database.
+// A long outage (design: Appends, Crashes, M1 exit criterion), against the e2e server
+// (test/stack.ts) behind test/gate.mjs: the stream is cut off for OUTAGE_MS (60 s by default, 600 s
+// in the soak workflow), as a blackhole (requests read and never answered) and as refused
+// connections. Meanwhile commits go on, nothing resets, `synced()` waits, status says `retrying`,
+// and a database with a small `maxPendingBytes` refuses writes with `backlog_full` and stays
+// usable. After the heal both catch up in full: acknowledged equals logged, a snapshot that came
+// due during the outage is published after it (URSULA_VFS_SNAPSHOT_DUE_BYTES), and the stream
+// (snapshot and tail) equals the local database.
 import { spawn } from "node:child_process";
 import { appendFileSync } from "node:fs";
 import { createInterface } from "node:readline";

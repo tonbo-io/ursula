@@ -4,13 +4,14 @@
 //! own reading of the contract.
 //!
 //! It models one Raft group: one history id, one clock, any number of streams. In scope: the
-//! producer rows of §2.3.1 with the epoch floor and idle retirement, write identity by
-//! `Producer-Digest`, contiguous receipts, tokens in [2^52, 2^53) that change on history events,
-//! what a stream inherited after one (W5, §4.8), HEAD metadata on every answer (A1), the typed and
+//! producer rules (extensions: Producer Write Answers) with the epoch floor and idle retirement,
+//! write identity by `Producer-Digest`, contiguous receipts, tokens in [2^52, 2^53) that change on
+//! history events, what a stream inherited after one (extensions: Snapshot Metadata on HEAD and
+//! Stream Incarnation), HEAD metadata on every answer (extensions: Server Metadata), the typed and
 //! untyped `413`, create keyed by configuration, reads with the incarnation precondition (`412`,
 //! `410`), snapshots keyed by offset and digest, snapshot reads in one byte range (`206`, `416`),
-//! snapshots uploaded in parts (#618: minted part ids, the commit's key checked first, the parts
-//! a final answer consumes, the one-day sweep on the model's clock), monotonic retention, and
+//! snapshots uploaded in parts (#618: minted part ids, the commit's key checked first, the parts a
+//! final answer consumes, the one-day sweep on the model's clock), monotonic retention, and
 //! scripted faults. Out of scope: immutable reads, the timing of answers before the body, the
 //! producer cap, SSE and JSON streams.
 //!
@@ -88,10 +89,10 @@ use crate::wire::RawAnswer;
 use crate::wire::Request;
 use crate::wire::Target;
 
-/// A node's one request limit (#581 §3.1).
+/// A node's one request limit (extensions: Server Metadata).
 pub(crate) const MAX_REQUEST_BYTES: u64 = 32 << 20;
 
-/// The largest snapshot accepted in parts, with a cold store (#581 §6.3).
+/// The largest snapshot accepted in parts, with a cold store (extensions: Server Metadata).
 pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
 
 /// How long a staged part waits for a commit before the sweep reclaims it (extensions §2.2).
@@ -110,7 +111,8 @@ const START_MS: u64 = 1_760_000_000_000;
 const TOKEN_TAG: u64 = 1 << 52;
 const TOKEN_MASK: u64 = (1 << 52) - 1;
 
-/// The key a history id mixes into every token of its history (#581 §4.2).
+/// The key a history id mixes into every token of its history
+/// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
 fn history_key(history: u64) -> u64 {
     let digest = blake3::Hasher::new()
         .update(b"ursula incarnation key v1")
@@ -122,7 +124,8 @@ fn history_key(history: u64) -> u64 {
 }
 
 /// The `Stream-Incarnation` token of a stream created at `created_at_ms`, in history `history`
-/// (#581 §4.2): never 0, below 2^53, a bijection of `created_at_ms` within one history.
+/// (extensions: Snapshot Metadata on HEAD and Stream Incarnation): never 0, below 2^53, a bijection
+/// of `created_at_ms` within one history.
 pub(crate) fn incarnation_token(created_at_ms: u64, history: u64) -> Incarnation {
     Incarnation::try_from(TOKEN_TAG | ((created_at_ms ^ history_key(history)) & TOKEN_MASK))
         .expect("a token is non-zero and below 2^53")
@@ -164,8 +167,8 @@ struct Checkpoint {
     streams: BTreeMap<String, Stream>,
 }
 
-/// A history event (#581 §4.3): every token of the group changes and every producer record is
-/// history-fenced.
+/// A history event (extensions: Snapshot Metadata on HEAD and Stream Incarnation): every token of
+/// the group changes and every producer record is history-fenced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HistoryEvent {
     /// No byte changes: an accepted loss that lost nothing.
@@ -373,11 +376,13 @@ impl ModelServer {
         CheckpointId(self.checkpoints.len().saturating_sub(1))
     }
 
-    /// Applies a history event (#581 §4.3): a fresh history id, `last_created_at_ms` kept at least
-    /// the clock, and nothing else. Tokens, fences and inheritance all derive from the id. A
-    /// restore puts every stream back as the source held it, in the history it was last written
-    /// in, so HEAD reports the token under which the stream was last written with the restored
-    /// tail (§4.8): after events with no write between them, the token before all of them.
+    /// Applies a history event (extensions: Snapshot Metadata on HEAD and Stream Incarnation): a
+    /// fresh history id, `last_created_at_ms` kept at least the clock, and nothing else. Tokens,
+    /// fences and inheritance all derive from the id. A restore puts every stream back as the
+    /// source held it, in the history it was last written in, so HEAD reports the token under which
+    /// the stream was last written with the restored tail (extensions: Snapshot Metadata on HEAD
+    /// and Stream Incarnation): after events with no write between them, the token before all of
+    /// them.
     pub(crate) fn history_event(&mut self, event: HistoryEvent) -> Result<(), ModelError> {
         if let HistoryEvent::Restore(CheckpointId(id)) = event {
             let source = self
@@ -472,7 +477,7 @@ impl ModelServer {
         self.deliver(method, |server, _ranges| server.too_large())
     }
 
-    /// The typed `413` of the request limit (#581 §6.4).
+    /// The typed `413` of the request limit (extensions: Server Metadata).
     fn too_large(&mut self) -> RawAnswer {
         let mut answer = RawAnswer::new(SizeLimit::STATUS);
         SizeLimit::Request(self.limits.max_request_bytes).render(answer.emit());
@@ -522,8 +527,8 @@ impl ModelServer {
         }
     }
 
-    /// The server's answer to `request` for the stream at `path`, decided in #581 §6.1's order:
-    /// size, then the route.
+    /// The server's answer to `request` for the stream at `path`, decided in one order
+    /// (extensions: Answers Before the Body): size, then the route.
     pub(crate) fn handle(&mut self, path: &str, request: &Request) -> RawAnswer {
         self.answer(path, request, Ranges::Honored)
     }
@@ -565,8 +570,9 @@ impl ModelServer {
         Ok(stream)
     }
 
-    /// `HEAD`: the server's identity on every answer, `404` included (A1), and the stream's
-    /// metadata (#581 §6.3, §4.8).
+    /// `HEAD`: the server's identity on every answer, `404` included
+    /// (extensions: Server Metadata), and the stream's metadata
+    /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
     fn head(&mut self, path: &str) -> RawAnswer {
         let mut answer = RawAnswer::new(404);
         self.identity.render(answer.emit());
@@ -592,9 +598,9 @@ impl ModelServer {
         answer
     }
 
-    /// `PUT {stream}`, keyed by its configuration, content type and closure (#581 §3): `201` when
-    /// this request created the stream, `200` when one with this configuration exists, `409`
-    /// otherwise, `400` with producer headers.
+    /// `PUT {stream}`, keyed by its configuration, content type and closure (extensions: Keys):
+    /// `201` when this request created the stream, `200` when one with this configuration exists,
+    /// `409` otherwise, `400` with producer headers.
     fn create(&mut self, path: &str, request: &Request) -> RawAnswer {
         if request.keys.producer.is_some() {
             return RawAnswer::new(400);
@@ -628,8 +634,8 @@ impl ModelServer {
     ///
     /// 1. Header shape (`400`): [`Request`] is typed, so a malformed header never reaches here.
     /// 2. The stream (`404`), the precondition (`412`), then idle retirement of the producer.
-    /// 3. The rows of §2.3.1, keyed by the `Producer-Digest` header, never by the body. Every
-    ///    refusal and every repeat is answered here.
+    /// 3. The producer rules (extensions: Producer Write Answers), keyed by the `Producer-Digest`
+    ///    header, never by the body. Every refusal and every repeat is answered here.
     /// 4. Only a write that would apply meets the closed stream (`409 Stream-Closed`).
     /// 5. Only a write that would apply meets the content checks: a body unless the write closes
     ///    the stream (`400`), `Content-Type` present (`400`) and the stream's (`409`), and the body
@@ -761,8 +767,8 @@ impl ModelServer {
         answer
     }
 
-    /// `PUT {stream}/snapshot/{offset}`, keyed by `(offset, digest)` (#581 §3): `204` with the
-    /// digest while it is the latest, `409` naming the latest otherwise.
+    /// `PUT {stream}/snapshot/{offset}`, keyed by `(offset, digest)` (extensions: Publish
+    /// Snapshot): `204` with the digest while it is the latest, `409` naming the latest otherwise.
     fn publish(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
         let history = self.history;
         let stream = match self.stream(path, request) {
@@ -1036,8 +1042,8 @@ impl ModelServer {
         answer
     }
 
-    /// `PUT {stream}/retention/{offset}`, monotonic (#581 §3): `204` with the retained offset, at
-    /// or above `offset`, and `409` for a boundary past the latest snapshot.
+    /// `PUT {stream}/retention/{offset}`, monotonic (extensions: Publish Snapshot): `204` with the
+    /// retained offset, at or above `offset`, and `409` for a boundary past the latest snapshot.
     fn retain(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
         let history = self.history;
         let stream = match self.stream(path, request) {

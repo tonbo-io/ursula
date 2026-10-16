@@ -1,14 +1,15 @@
-// The crash matrix (design §5.7 and §12, M1 exit criterion), against the e2e server
+// The crash matrix (design: Crashes and Verification, M1 exit criterion), against the e2e server
 // (test/stack.ts): a process committing transactions of several rows each (test/crash-child.mjs) is
 // killed with SIGKILL by URSULA_VFS_ABORT_AT (config::Step) at every step of the commit path
-// (§4.1), of F1 (a checkpoint, §4.3) and of F2 (a new WAL generation, and the WAL truncated to
-// nothing, §4.3). After each crash the next open of the same cache root must need no manual step,
-// resume the same generation (no salvage, no rebuild, no reset), hold every transaction up to the
-// last one the application saw commit, or that one plus the one the crash interrupted once it was
-// logged, whole, catch the stream up, and equal a fresh build from the stream.
+// (design: Capture), of F1 (a checkpoint, design: Fsyncs) and of F2 (a new WAL generation, and
+// the WAL truncated to nothing, design: Fsyncs). After each crash the next open of the same cache
+// root must need no manual step, resume the same generation (no salvage, no rebuild, no reset),
+// hold every transaction up to the last one the application saw commit, or that one plus the one
+// the crash interrupted once it was logged, whole, catch the stream up, and equal a fresh build
+// from the stream.
 //
-// The second matrix kills at the steps of M2's durability paths (design §5.2, §5.6, §6.2, F3): a
-// re-key while bound and at open (`rekey_rolled`, `rekey_claimed`), a publish that salvages
+// The second matrix kills at the steps of M2's durability paths (design: Log, Materialize, History,
+// F3): a re-key while bound and at open (`rekey_rolled`, `rekey_claimed`), a publish that salvages
 // (`salvage_marked`, `publish_renamed`, `salvage_moved`), the first publish of a fresh open
 // (`publish_renamed`), a trim (`trim_unlinked`) and an open's cut of a torn log tail
 // (`cut_removed`). test/reopen.e2e.ts kills a copy at `copy_db` and `copy_log`. After each crash

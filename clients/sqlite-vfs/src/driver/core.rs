@@ -8,7 +8,7 @@
 //!
 //! - A CLAIM record is appended and fsynced before anything after it, its send among them. A
 //!   re-key rolls the log to a segment naming the new token first, and the binding's token
-//!   follows it (design §6.2).
+//!   follows it (design: History).
 //! - ACK records are written lazily, at most once a second ([`ACK_INTERVAL_MS`]), and whenever a
 //!   binding resets or retires; during an open they are written at once. A `rewound` reset also
 //!   fsyncs its ACK, so the next open tests inheritance against the exact acknowledged offset, and
@@ -21,14 +21,15 @@
 //!   replicator reads on.
 //! - A failed log write or fsync resets the binding `local_damage`, and a panic inside a
 //!   binding's step resets it `internal`.
-//! - A reset takes the log's lock once it is marked, so no commit lands in the log after it (G8).
-//!   An open of a stream first carries out a reset its connections marked that the core has not
-//!   heard of yet, then shares the stream's root while a reset binding's connections hold it, and
-//!   its first disk job copies the generation they hold (design §5.6).
-//! - A provisional open (design §5.5: the stream unreachable, a trusted generation with a CLAIM
+//! - A reset takes the log's lock once it is marked, so no commit lands in the log after it
+//!   (design: Materialize). An open of a stream first carries out a reset its connections marked
+//!   that the core has not heard of yet, then shares the stream's root while a reset binding's
+//!   connections hold it, and its first disk job copies the generation they hold (design:
+//!   Materialize).
+//! - A provisional open (design: Open; the stream unreachable, a trusted generation with a CLAIM
 //!   record) binds at once and resolves before any answer. Its replicator claims only once the
-//!   stream answered and a pre-check found nothing foreign (design §7). Commits log and wait,
-//!   and so does `synced()`. The binding is live once its claim applies and its reconcile
+//!   stream answered and a pre-check found nothing foreign (design: Pre-check). Commits log and
+//!   wait, and so does `synced()`. The binding is live once its claim applies and its reconcile
 //!   completes ([`Action::Bound`]), and resets `fenced` or `stale` when another owner moved the
 //!   stream meanwhile.
 //!
@@ -36,8 +37,8 @@
 //! path recorded on the handle; a target the core has not been told is logged yet waits for that
 //! `Logged` before the replicator sees it.
 //!
-//! A reader binding (design D6) has no claim and no replicator: it binds as soon as its open is
-//! done, its `synced()` resolves at once, and it retires as soon as its last connection closes.
+//! A reader binding (design: Readers) has no claim and no replicator: it binds as soon as its open
+//! is done, its `synced()` resolves at once, and it retires as soon as its last connection closes.
 //! Randomness (backoff jitter, lineages) comes from a seeded [`Rng`], so a run is reproducible.
 //!
 //! [`Action::Bound`]: crate::replicator::Action::Bound
@@ -348,7 +349,7 @@ impl Binding {
     }
 }
 
-/// A reader binding (design D6): its files, and the hand-out it waits on a connection for. No
+/// A reader binding (design: Readers): its files, and the hand-out it waits on a connection for. No
 /// claim, no replicator, no commit.
 #[derive(Debug)]
 struct Reader {
@@ -564,19 +565,19 @@ impl Core {
         }
     }
 
-    /// Starts open `open` (design §5.5). Its outcome comes as [`DriverEvent::Opened`].
+    /// Starts open `open` (design: Open). Its outcome comes as [`DriverEvent::Opened`].
     ///
     /// While a binding of the stream given up for an open under another cache root drains, the
     /// open waits for it to retire ([`Core::defer`]), so no two bindings of a stream ever run in
     /// the process, whichever open of it comes first.
     ///
     /// A binding of the stream that its connections reset, and whose reset has not reached the
-    /// core yet, resets first, so its log takes no append once the open may copy it (G8). Then the
-    /// open shares the stream's root when only reset bindings' connections still hold it: with
-    /// any other binding or open of the stream left in the core (one still draining, or a
-    /// tombstone whose disk job is out), it locks the root anew and is refused `in_use`, so it
-    /// never runs beside a replicator or a job that writes the stream's files. A reader's open
-    /// locks a reader directory of its own and shares nothing.
+    /// core yet, resets first, so its log takes no append once the open may copy it (design:
+    /// Materialize). Then the open shares the stream's root when only reset bindings' connections
+    /// still hold it: with any other binding or open of the stream left in the core (one still
+    /// draining, or a tombstone whose disk job is out), it locks the root anew and is refused
+    /// `in_use`, so it never runs beside a replicator or a job that writes the stream's files. A
+    /// reader's open locks a reader directory of its own and shares nothing.
     pub(crate) fn open(&mut self, open: OpenId, spec: OpenSpec, now_ms: u64) -> Vec<Io> {
         if let Some(given_up) = self.given_up(&spec.url) {
             return self.defer(open, spec, given_up, now_ms);
@@ -768,10 +769,10 @@ impl Core {
         });
     }
 
-    /// A provisional open (design §5.5): the binding binds now and the open resolves with it,
+    /// A provisional open (design: Open): the binding binds now and the open resolves with it,
     /// before any answer. Its replicator's pre-check (a HEAD, then reads up to the tail) goes out,
     /// and nothing is logged until the stream answered: its claim, the log's latest `claim` sent
-    /// again, follows only a pre-check that found nothing foreign (design §7).
+    /// again, follows only a pre-check that found nothing foreign (design: Pre-check).
     fn provisional(
         &mut self,
         open: OpenId,
@@ -1027,8 +1028,8 @@ impl Core {
         }
     }
 
-    /// One read of a takeover's catch-up in place, with nothing pending (design §5.6): a disk job
-    /// logs the frames, writes an ACK covering them and fsyncs before it applies them, and
+    /// One read of a takeover's catch-up in place, with nothing pending (design: Materialize): a
+    /// disk job logs the frames, writes an ACK covering them and fsyncs before it applies them, and
     /// [`Event::CaughtUp`] lets the replicator send the next read.
     fn apply(
         &mut self,
@@ -1061,7 +1062,7 @@ impl Core {
     /// A takeover's divergence (the pending tail from `discard_from` on dropped), a `410`, or a
     /// catch-up in place that grew past the database: a new generation is built from the stream in
     /// `gen-<id32>.tmp` and published by one rename once complete, and [`Event::CaughtUp`]
-    /// follows (design §5.6).
+    /// follows (design: Materialize).
     ///
     /// The old generation stays whole until that rename. A rebuild begins only once it is decided:
     /// the replicator found the pending tail diverged from the stream (it is discarded whatever
@@ -1207,8 +1208,8 @@ impl Core {
     /// unlocks once the last handle drops. During an open, the open fails.
     ///
     /// A `rewound` reset also fsyncs the log, so the next open tests inheritance against the exact
-    /// acknowledged offset (design §6.2, D5): an ACK lost to a power loss would let it re-key a
-    /// generation that lost data. When that fsync fails the reset is `local_damage` instead.
+    /// acknowledged offset (design: History, Log): an ACK lost to a power loss would let it re-key
+    /// a generation that lost data. When that fsync fails the reset is `local_damage` instead.
     fn reset(&mut self, binding: BindingId, kind: ResetKind, now_ms: u64) {
         let Some(b) = self.bindings.get_mut(&binding) else {
             return;
@@ -1268,7 +1269,7 @@ impl Core {
         // A barrier for the connections, which check the reset under the log's lock
         // (`Binding::log_unless_reset`): a COMMIT, ACK or BASE record whose append took the lock
         // before the mark is written, and every later one is refused. The core itself appends
-        // nothing more, so the log is final once an open may copy it (G8).
+        // nothing more, so the log is final once an open may copy it (design: Materialize).
         drop(handle.log());
         // Its connections hold its generation, and the root, until the last one closes.
         handle.reset_retired();
@@ -1734,7 +1735,7 @@ impl Core {
         ios
     }
 
-    /// `synced()` with ticket `ticket` (design §8.2): it waits for every commit at or below
+    /// `synced()` with ticket `ticket` (design: Synced): it waits for every commit at or below
     /// `target`, taken at most as the last COMMIT position the commit path recorded on the handle
     /// ([`BindingHandle::last_commit`], also the default). A target past the last commit this core
     /// was told of waits for its `Logged`. The outcome comes as the binding's watermark
@@ -1791,7 +1792,7 @@ impl Core {
         ios
     }
 
-    /// A batch must end exactly at `position` (a snapshot's `k`, design §4.11).
+    /// A batch must end exactly at `position` (a snapshot's `k`, design: Snapshots).
     pub(crate) fn boundary(
         &mut self,
         binding: BindingId,
