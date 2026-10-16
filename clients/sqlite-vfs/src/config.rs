@@ -63,8 +63,8 @@ pub(crate) fn set_panic_in_for_tests(entry: Option<&'static str>) {
     PANIC_IN_FOR_TESTS.set(entry);
 }
 
-/// A step of the commit path, of a checkpoint, of a re-key, of a generation's copy or of its
-/// publish that `URSULA_VFS_ABORT_AT` can stop the process at (design §4.1, §4.3, §5.1, §5.6,
+/// A step of the commit path, of a checkpoint, of a re-key, of a trim or cut of the log, of a
+/// generation's copy or of its publish that `URSULA_VFS_ABORT_AT` can stop the process at (design §4.1, §4.3, §5.1, §5.6,
 /// §6.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -108,6 +108,11 @@ pub(crate) enum Step {
     CopyDb,
     /// A copy of a held generation: its log copied, before the copy is published.
     CopyLog,
+    /// F3: a trim unlinked a segment and fsynced the directory, before the next one goes.
+    TrimUnlinked,
+    /// An open cutting the log after its valid prefix: the later segments removed and the
+    /// directory fsynced, before the current segment is truncated.
+    CutRemoved,
 }
 
 impl Step {
@@ -132,6 +137,8 @@ impl Step {
             Step::SalvageMoved => "salvage_moved",
             Step::CopyDb => "copy_db",
             Step::CopyLog => "copy_log",
+            Step::TrimUnlinked => "trim_unlinked",
+            Step::CutRemoved => "cut_removed",
         }
     }
 }

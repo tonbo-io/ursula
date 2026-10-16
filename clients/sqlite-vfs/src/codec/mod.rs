@@ -19,6 +19,8 @@ pub mod marker;
 pub mod segment;
 pub mod snapshot;
 pub mod stream;
+#[cfg(test)]
+mod vectors;
 
 /// A SQLite page: the VFS requires 4 KiB pages.
 pub const PAGE: usize = 4096;

@@ -5,8 +5,8 @@
 //   noted, behind test/gate.mjs, a transparent proxy that scripts the answer delays the suites ask
 //   for (`fault` in test/kit.ts), as the model does. The per-group hot admission limit always stays
 //   at its default.
-//   - Default: one `ursula server` node with its Raft WAL in its temporary directory and an
-//     in-memory cold store (URSULA_COLD=none for none).
+//   - Default: one `ursula server` node (`server.cluster_id` set) with its Raft WAL in its
+//     temporary directory and an in-memory cold store (URSULA_COLD=none for none).
 //   - E2E_NODES=3: three nodes (each with its own Raft WAL directory, `server.cluster_id` set)
 //     behind an `ursula gateway`, with S3 as the cold store (see `resolveS3`: an endpoint (MinIO)
 //     with static keys, or AWS S3 with the ambient AWS_* credentials), or with no cold tier when
@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { TestProject } from "vitest/node";
 
-function freePort(): Promise<number> {
+export function freePort(): Promise<number> {
 	return new Promise((res, rej) => {
 		const server = createServer();
 		server.once("error", rej);
@@ -39,7 +39,7 @@ function freePort(): Promise<number> {
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
-function ursulaBin(): string {
+export function ursulaBin(): string {
 	const bin = process.env.URSULA_BIN;
 	if (bin === undefined || bin.length === 0) throw new Error("set URSULA_BIN to an ursula binary");
 	return resolve(bin);
@@ -50,7 +50,7 @@ function ursulaBin(): string {
  * this process's end of the watchdog's stdin closes: a vitest process that dies before its
  * teardown leaves no server behind.
  */
-class Proc {
+export class Proc {
 	private readonly child: ChildProcess;
 	private tail = "";
 	private serverPid = 0;
@@ -118,7 +118,7 @@ class Proc {
 	}
 }
 
-async function waitReady(url: string, proc: Proc, timeoutMs = 120_000): Promise<void> {
+export async function waitReady(url: string, proc: Proc, timeoutMs = 120_000): Promise<void> {
 	const deadline = Date.now() + timeoutMs;
 	let last = "";
 	while (Date.now() < deadline) {
@@ -136,7 +136,7 @@ async function waitReady(url: string, proc: Proc, timeoutMs = 120_000): Promise<
 }
 
 /** Ready once the bucket and a stream in every group can be created through `url`. */
-async function waitWritable(url: string, logs: () => string): Promise<void> {
+export async function waitWritable(url: string, logs: () => string): Promise<void> {
 	const deadline = Date.now() + 120_000;
 	let last = "";
 	while (Date.now() < deadline) {
@@ -222,32 +222,42 @@ async function startModel(): Promise<Stack> {
 	return { url: `http://127.0.0.1:${port}`, nodes: [], stop };
 }
 
+/** The deployment id every server of the suites runs under (`server.cluster_id`). */
+export const CLUSTER_ID = "sqlite-ursula-test";
+
+/**
+ * The TOML of one `ursula server` node bootstrapping alone: its Raft WAL in `dir`, `server.cluster_id`
+ * set, so a node whose WAL was wiped and restored (test/history-real.e2e.ts) stays the same
+ * deployment, and the cold store `cold` (`none` for none).
+ */
+export function singleNodeToml(o: { port: number; adminPort: number; dir: string; cores: number; groups: number; cold: string }): string {
+	return [
+		"[server]",
+		`listen = "127.0.0.1:${o.port}"`,
+		`admin_listen = "127.0.0.1:${o.adminPort}"`,
+		`cluster_id = "${CLUSTER_ID}"`,
+		"",
+		"[runtime]",
+		`core_count = ${o.cores}`,
+		"",
+		"[raft]",
+		"node_id = 1",
+		`group_count = ${o.groups}`,
+		"",
+		"[raft.wal]",
+		`path = "${join(o.dir, "wal")}"`,
+		"",
+		...(o.cold === "none" ? [] : ["[storage.cold]", `backend = "${o.cold}"`, ""]),
+	].join("\n");
+}
+
 async function startSingle(): Promise<Stack> {
 	const cold = process.env.URSULA_COLD ?? "memory";
 	const dir = mkdtempSync(join(tmpdir(), "sqlite-ursula-node-"));
 	const port = await freePort();
 	const adminPort = await freePort();
 	const config = join(dir, "ursula.toml");
-	writeFileSync(
-		config,
-		[
-			"[server]",
-			`listen = "127.0.0.1:${port}"`,
-			`admin_listen = "127.0.0.1:${adminPort}"`,
-			"",
-			"[runtime]",
-			"core_count = 2",
-			"",
-			"[raft]",
-			"node_id = 1",
-			"group_count = 4",
-			"",
-			"[raft.wal]",
-			`path = "${join(dir, "wal")}"`,
-			"",
-			...(cold === "none" ? [] : ["[storage.cold]", `backend = "${cold}"`, ""]),
-		].join("\n"),
-	);
+	writeFileSync(config, singleNodeToml({ port, adminPort, dir, cores: 2, groups: 4, cold }));
 	const node = new Proc(ursulaBin(), ["server", "--config", config], dir, {}, "node1");
 	const url = `http://127.0.0.1:${port}`;
 	const stop = async (): Promise<void> => {
@@ -387,7 +397,7 @@ async function startCluster(): Promise<Stack> {
 				"[server]",
 				`listen = "127.0.0.1:${node.port}"`,
 				`admin_listen = "${node.admin.replace("http://", "")}"`,
-				'cluster_id = "sqlite-ursula-test"',
+				`cluster_id = "${CLUSTER_ID}"`,
 				"",
 				"[runtime]",
 				`core_count = ${cores}`,

@@ -1957,6 +1957,48 @@ fn a_reopen_after_an_inheriting_history_re_keys_a_generation_with_nothing_pendin
     assert_eq!(tokens.last(), Some(&token));
 }
 
+/// A clean close right after `synced()`, inside the ACK interval: the retire writes an ACK at the
+/// exact acknowledged position, so the log holds no commit after its latest ACK. A history event
+/// that loses nothing then re-keys the generation at the next open instead of salvaging it.
+#[test]
+fn a_clean_close_writes_an_exact_ack_so_an_inheriting_history_re_keys() {
+    let dir = TempDir::new("driver-exact-ack");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, spec(dir.path(), 1));
+    let first = w.commit(c, &bound, 1).unwrap();
+    w.run_for(1_000);
+    // The second commit's ACK is due a second after the first one's: unwritten at the close.
+    let second = w.commit(c, &bound, 2).unwrap();
+    let ticket = w.sync(c, bound.binding);
+    while w.outcome(c, ticket).is_none() {
+        w.run_for(1);
+    }
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    let generation = bound.handle.generation.dir.clone();
+    let ack_after_commit = |records: &[RecordBody]| {
+        let ack = records
+            .iter()
+            .rposition(|r| matches!(r, RecordBody::Ack { .. }));
+        let commit = records
+            .iter()
+            .rposition(|r| matches!(r, RecordBody::Commit { .. }));
+        ack > commit
+    };
+    assert!(!ack_after_commit(&log_records(&generation)));
+    w.retire(c, &bound);
+    drop(bound);
+    let records = log_records(&generation);
+    assert!(ack_after_commit(&records), "{records:?}");
+    w.server.history_event(HistoryEvent::NewHistory).unwrap();
+    let c2 = w.core();
+    let bound = w.open(c2, spec(dir.path(), 2));
+    assert_eq!(bound.handle.generation.dir, generation);
+    assert_eq!(bound.handle.attach, super::Attach::ReKeyed);
+    assert!(salvages(&generation).is_empty());
+    assert_eq!(w.stream_commits(), vec![first, second]);
+}
+
 /// A crash leaves a commit pending; the stream then changes history and loses nothing. The log's
 /// ACK may trail what the stream acknowledged, so the reopen never re-keys: it salvages the
 /// generation, whose db and log hold the pending commit, and builds from the new history. No
