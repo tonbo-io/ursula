@@ -93,6 +93,9 @@ pub(super) struct Controls {
     /// A replica holding a plan takes replication from any leader, as
     /// before the third #581 review.
     replication_fence_off: bool,
+    /// The plan's leader restarts without the plan term as its vote, as
+    /// before #613.
+    plan_term_vote_off: bool,
     /// The tool sends the plan to the members first, without a plan term,
     /// and to the leader last, as before the second #581 review.
     leader_last: bool,
@@ -104,6 +107,7 @@ impl Controls {
         deferred_cut: false,
         log_guard_off: false,
         replication_fence_off: false,
+        plan_term_vote_off: false,
         leader_last: false,
     };
     pub(super) const DEFERRED_CUT: Self = Self {
@@ -121,15 +125,32 @@ impl Controls {
         log_guard_off: true,
         ..Self::NONE
     };
-    pub(super) const NO_REPLICATION_FENCE: Self = Self {
+    /// Of the three defences against a pre-plan leader's entry after the
+    /// cut (M1 of the third review, and #613's plan term vote), only the
+    /// replication fence.
+    pub(super) const FENCE_ONLY: Self = Self {
+        log_guard_off: true,
+        plan_term_vote_off: true,
+        ..Self::NONE
+    };
+    /// Only the members' log guard.
+    pub(super) const GUARD_ONLY: Self = Self {
+        replication_fence_off: true,
+        plan_term_vote_off: true,
+        ..Self::NONE
+    };
+    /// Only the plan's leader starting at the plan term.
+    pub(super) const TERM_VOTE_ONLY: Self = Self {
+        log_guard_off: true,
         replication_fence_off: true,
         ..Self::NONE
     };
-    /// Both defences against a pre-plan leader's entry after the cut:
-    /// either alone keeps it from being applied (M1 of the third review).
+    /// All three defences against a pre-plan leader's entry after the cut:
+    /// each alone keeps it from being applied.
     pub(super) const FOREIGN_ENTRY: Self = Self {
         log_guard_off: true,
         replication_fence_off: true,
+        plan_term_vote_off: true,
         ..Self::NONE
     };
     /// Both defences against an unplanned leader: the leader-first order
@@ -179,6 +200,7 @@ fn set_defences(controls: Controls) {
         Defence::PlanReplicationFence,
         controls.replication_fence_off,
     );
+    set_off(Defence::PlanTermVote, controls.plan_term_vote_off);
 }
 
 fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: String) -> ! {
@@ -381,6 +403,7 @@ async fn recover_group_slowly(
         });
     }
     let request = |member: &PlanMember, step: PlanStep| RecoveryPlanRequest {
+        point_entry: None,
         leader: plan.leader,
         point: plan.point,
         cut: plan.cut,
@@ -482,7 +505,9 @@ pub(super) async fn try_append(
     )
 }
 
-/// What `node_id`'s replica of `group` serves locally.
+/// What `node_id`'s replica of `group` holds in its applied state, read past
+/// every fence: a refused read fails loudly, never as empty bytes. A node
+/// that does not run holds nothing to read.
 pub(super) async fn read_local(cluster: &JournalCluster, group: u32, node_id: u64) -> Vec<u8> {
     let Some(engine) = cluster.engines.get(&(group, node_id)) else {
         return Vec::new();
@@ -502,7 +527,9 @@ pub(super) async fn read_local(cluster: &JournalCluster, group: u32, node_id: u6
         )
         .await
         .map(|read| read.payload.to_vec())
-        .unwrap_or_default()
+        .unwrap_or_else(|error| {
+            panic!("node {node_id} group {group}: read the applied state: {error}")
+        })
 }
 
 /// Fails the invariant when any replica of any group serves the cut-off

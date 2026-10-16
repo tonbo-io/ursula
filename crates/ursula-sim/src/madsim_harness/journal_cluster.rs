@@ -164,6 +164,9 @@ pub(super) struct JournalCluster {
     pub(super) plan_leaders: std::collections::BTreeSet<u64>,
     /// The voters, nodes `1..=voters`.
     pub(super) voters: u64,
+    /// Nodes `voters + 1..=voters + spares`: provisioned, outside the
+    /// bootstrap membership, started only when a scenario starts them.
+    pub(super) spares: u64,
 }
 
 impl JournalCluster {
@@ -183,7 +186,19 @@ impl JournalCluster {
 
     /// `voters` nodes, `1..=voters`, whose WALs run with `tuning`.
     pub(super) async fn start_voters(name: &str, tuning: JournalTuning, voters: u64) -> Self {
-        let mut cluster = Self::unstarted_voters(name, tuning, voters);
+        Self::start_with_spares(name, tuning, voters, 0).await
+    }
+
+    /// `voters` nodes, `1..=voters`, whose WALs run with `tuning`, and
+    /// `spares` more nodes provisioned but not started: they join a group
+    /// only as a scenario adds them.
+    pub(super) async fn start_with_spares(
+        name: &str,
+        tuning: JournalTuning,
+        voters: u64,
+        spares: u64,
+    ) -> Self {
+        let mut cluster = Self::unstarted_voters(name, tuning, voters, spares);
         for node_id in 1..=voters {
             cluster.start_node(node_id).await;
         }
@@ -216,10 +231,11 @@ impl JournalCluster {
 
     #[cfg(test)]
     fn unstarted_with_tuning(name: &str, tuning: JournalTuning) -> Self {
-        Self::unstarted_voters(name, tuning, 3)
+        Self::unstarted_voters(name, tuning, 3, 0)
     }
 
-    fn unstarted_voters(name: &str, tuning: JournalTuning, voters: u64) -> Self {
+    fn unstarted_voters(name: &str, tuning: JournalTuning, voters: u64, spares: u64) -> Self {
+        let nodes = voters.saturating_add(spares);
         let config = Arc::new(
             Config {
                 cluster_name: name.to_owned(),
@@ -236,7 +252,7 @@ impl JournalCluster {
             config,
             policy,
             votes,
-            wals: (1..=voters)
+            wals: (1..=nodes)
                 .map(|node_id| {
                     (
                         node_id,
@@ -251,7 +267,7 @@ impl JournalCluster {
                 .collect(),
             engines: BTreeMap::new(),
             rejoins: BTreeMap::new(),
-            metrics: (1..=voters)
+            metrics: (1..=nodes)
                 .map(|node_id| (node_id, RuntimeMetrics::new(1, JOURNAL_GROUPS.len())))
                 .collect(),
             acknowledged: BTreeMap::new(),
@@ -259,7 +275,13 @@ impl JournalCluster {
             replay_stopped: BTreeMap::new(),
             plan_leaders: std::collections::BTreeSet::new(),
             voters,
+            spares,
         }
+    }
+
+    /// Every node, the spares included.
+    pub(super) fn nodes(&self) -> std::ops::RangeInclusive<u64> {
+        1..=self.voters.saturating_add(self.spares)
     }
 
     pub(super) async fn start_node(&mut self, node_id: u64) {
@@ -500,49 +522,89 @@ impl JournalCluster {
     /// but the last `keep` entries the snapshot covers, as the snapshot
     /// driver's snapshots do.
     pub(super) async fn snapshot_and_purge(&self, group: u32, keep: u64, skip: u64) {
-        for ((engine_group, node_id), engine) in &self.engines {
+        for ((engine_group, node_id), _engine) in &self.engines {
             if *engine_group != group
                 || *node_id == skip
                 || self.stopped_by_storage_error(group, *node_id)
             {
                 continue;
             }
-            let raft = engine.raft_handle();
-            let applied = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
-                .last_applied
-                .map_or(0, |log_id| log_id.index);
-            raft.trigger().snapshot().await.expect("trigger a snapshot");
-            let snapshot = raft
-                .wait(Some(Duration::from_secs(5)))
-                .metrics(
-                    |metrics| {
-                        metrics
-                            .snapshot
-                            .is_some_and(|snapshot| snapshot.index >= applied)
-                    },
-                    "snapshot built",
-                )
-                .await
-                .expect("wait for the snapshot")
-                .snapshot
-                .expect("snapshot log id");
-            let purge_upto = snapshot.index.saturating_sub(keep);
-            raft.trigger()
-                .purge_log(purge_upto)
-                .await
-                .expect("trigger a purge");
-            raft.wait(Some(Duration::from_secs(5)))
-                .metrics(
-                    |metrics| {
-                        metrics
-                            .purged
-                            .is_some_and(|purged| purged.index >= purge_upto)
-                    },
-                    "log purged",
-                )
-                .await
-                .expect("wait for the purge");
+            self.snapshot_and_purge_node(group, *node_id, keep).await;
         }
+    }
+
+    /// Snapshots `node_id`'s replica of `group` and purges all but the last
+    /// `keep` entries the snapshot covers.
+    pub(super) async fn snapshot_and_purge_node(&self, group: u32, node_id: u64, keep: u64) {
+        self.try_snapshot_and_purge_node(group, node_id, keep, Duration::from_secs(5))
+            .await
+            .unwrap_or_else(|stage| panic!("group {group}: node {node_id}: {stage}"));
+    }
+
+    /// [`Self::snapshot_and_purge_node`], answering which stage did not
+    /// finish within `wait` instead of panicking.
+    pub(super) async fn try_snapshot_and_purge_node(
+        &self,
+        group: u32,
+        node_id: u64,
+        keep: u64,
+        wait: Duration,
+    ) -> Result<u64, &'static str> {
+        let raft = self.engines[&(group, node_id)].raft_handle();
+        let applied = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
+            .last_applied
+            .map_or(0, |log_id| log_id.index);
+        raft.trigger()
+            .snapshot()
+            .await
+            .map_err(|_fatal| "trigger a snapshot")?;
+        let snapshot = raft
+            .wait(Some(wait))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .is_some_and(|snapshot| snapshot.index >= applied)
+                },
+                "snapshot built",
+            )
+            .await
+            .map_err(|_timeout| "wait for the snapshot")?
+            .snapshot
+            .ok_or("snapshot log id")?;
+        let purge_upto = snapshot.index.saturating_sub(keep);
+        raft.trigger()
+            .purge_log(purge_upto)
+            .await
+            .map_err(|_fatal| "trigger a purge")?;
+        raft.wait(Some(wait))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .purged
+                        .is_some_and(|purged| purged.index >= purge_upto)
+                },
+                "log purged",
+            )
+            .await
+            .map_err(|_timeout| "wait for the purge")?;
+        Ok(purge_upto)
+    }
+
+    /// Stops `node_id` and gives it an empty WAL named `name`, as a lost
+    /// disk would: it rejoins as a wiped node when it starts again.
+    pub(super) async fn wipe_node(&mut self, node_id: u64, name: &str, tuning: JournalTuning) {
+        self.stop_node(node_id).await;
+        self.wals.insert(
+            node_id,
+            SimNodeWal::provision_with_tuning(name, tuning).with_group_count(JOURNAL_GROUPS.len()),
+        );
+    }
+
+    /// How many full snapshots the network delivered to `node_id`'s replica
+    /// of `group`.
+    pub(super) fn full_snapshots(&self, group: u32, node_id: u64) -> usize {
+        self.registries[&group].full_snapshot_count(node_id)
     }
 
     /// Every acknowledged write is readable from every replica.
@@ -605,7 +667,7 @@ pub(super) fn metrics(
 
 /// The replica of `group` that currently is in the leader state, if any.
 pub(super) fn leader_by_state(cluster: &JournalCluster, group: u32) -> Option<u64> {
-    (1..=cluster.voters).find(|node_id| {
+    cluster.nodes().find(|node_id| {
         cluster.engines.contains_key(&(group, *node_id))
             && metrics(cluster, group, *node_id).state == openraft::ServerState::Leader
     })
@@ -655,6 +717,13 @@ pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u
             current_term: vote.map_or(0, |vote| vote.leader_id().term()),
         },
         committed: replica.local_committed.map(|committed| committed.index),
+        committed_entry: replica
+            .local_committed
+            .map(|committed| ursula_proto::admin::EntryId {
+                term: committed.leader_id.term,
+                node_id: committed.leader_id.node_id,
+            }),
+        last_applied: replica.last_applied.map(|applied| applied.index),
         gate: gate(cluster, group, node_id),
         plan: history
             .plan()
@@ -667,7 +736,18 @@ pub(super) async fn member_view(cluster: &JournalCluster, group: u32, node_id: u
         leads_live: ursula_raft::leads_live(&replica),
         history_event_index: history.applied().map(|event| event.event_index),
         current_leader: replica.current_leader,
-        voter_ids: replica.membership_config.membership().voter_ids().collect(),
+        voter_configs: replica
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .clone(),
+        committed_voter_configs: cluster.engines[&(group, node_id)].kept_voter_configs(),
+        running: true,
+        learner_ids: replica
+            .membership_config
+            .membership()
+            .learner_ids()
+            .collect(),
     }
 }
 

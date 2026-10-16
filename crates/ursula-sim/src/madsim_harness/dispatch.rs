@@ -16,12 +16,6 @@ use super::ThreeNodeRaftSimOutcome;
 use super::accepted_loss::Controls as RecoveryPlanControls;
 use super::accepted_loss::Shape as RecoveryPlanShape;
 use super::accepted_loss::run_recovery_plan_inner;
-use super::cold_read_delay_ms_from_fault_plan;
-use super::cold_read_truncate_len_from_fault_plan;
-use super::cold_write_delay_ms_from_fault_plan;
-use super::corrupt_cold_live_read_node_from_fault_plan;
-use super::has_cold_delete_fault_in_fault_plan;
-use super::has_cold_read_fault_in_fault_plan;
 use super::has_cold_write_fault_in_fault_plan;
 use super::has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan;
 use super::has_corrupt_http_live_sse_next_offset_expectation_in_fault_plan;
@@ -43,7 +37,15 @@ use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
 use super::immutable_reads::Controls as ImmutableReadControls;
 use super::immutable_reads::run_marked_chunks_never_contradict_inner;
+use super::introspect::cold_read_delay_ms_from_fault_plan;
+use super::introspect::cold_read_truncate_len_from_fault_plan;
+use super::introspect::cold_write_delay_ms_from_fault_plan;
+use super::introspect::corrupt_cold_live_read_node_from_fault_plan;
+use super::introspect::has_cold_delete_fault_in_fault_plan;
+use super::introspect::has_cold_read_fault_in_fault_plan;
 use super::leader_reads::run_leader_read_linearizability_inner;
+use super::membership_rollback::Controls as MembershipRollbackControls;
+use super::membership_rollback::run_membership_rollback_inner;
 use super::routing::Controls as RoutingControls;
 use super::routing::run_routing_before_body_inner;
 use super::run_cold_delete_fault_inner;
@@ -286,6 +288,12 @@ impl ThreeNodeRaftSim {
                     ImmutableReadControls::default(),
                 )
             }
+            SimScenario::RecoveryPlanMembershipRollback => {
+                Self::run_membership_rollback_with_controls_report(
+                    config,
+                    MembershipRollbackControls::default(),
+                )
+            }
         }
     }
 
@@ -312,6 +320,20 @@ impl ThreeNodeRaftSim {
             SimScenario::MarkedChunksNeverContradict,
             seed,
             run_marked_chunks_never_contradict_inner(config, controls),
+        )
+    }
+
+    /// Runs the recovery plan across a rolled-back membership change (#613)
+    /// with `controls`.
+    pub(super) fn run_membership_rollback_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: MembershipRollbackControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::RecoveryPlanMembershipRollback,
+            seed,
+            run_membership_rollback_inner(config, controls),
         )
     }
 

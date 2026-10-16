@@ -162,6 +162,7 @@ pub enum SimScenario {
     RecoveryPlanSurvivorCampaigns,
     RoutingBeforeBodyUnderLeaderChurn,
     MarkedChunksNeverContradict,
+    RecoveryPlanMembershipRollback,
 }
 
 #[derive(Clone)]
@@ -211,6 +212,7 @@ impl SimScenario {
             Self::RecoveryPlanSurvivorCampaigns => "recovery-plan-survivor-campaigns",
             Self::RoutingBeforeBodyUnderLeaderChurn => "routing-before-body-under-leader-churn",
             Self::MarkedChunksNeverContradict => "marked-chunks-never-contradict",
+            Self::RecoveryPlanMembershipRollback => "recovery-plan-membership-rollback",
         }
     }
 }
@@ -231,6 +233,9 @@ pub struct SimSchedule {
 
 impl SimSchedule {
     pub fn generate(seed: u64) -> Self {
+        if seed == 505 {
+            return Self::for_scenario(seed, SimScenario::RecoveryPlanMembershipRollback);
+        }
         if seed == 54 {
             return Self::for_scenario(seed, SimScenario::HttpProducerProtocolSurface);
         }
@@ -556,6 +561,7 @@ mod immutable_reads;
 mod immutable_reads_loss;
 mod journal_cluster;
 mod leader_reads;
+mod membership_rollback;
 mod recovery_wiring;
 mod routing;
 mod runtime_network;
@@ -586,12 +592,6 @@ mod faults_inner;
 pub use faults_inner::*;
 mod dispatch;
 mod introspect;
-use introspect::cold_read_delay_ms_from_fault_plan;
-use introspect::cold_read_truncate_len_from_fault_plan;
-use introspect::cold_write_delay_ms_from_fault_plan;
-use introspect::corrupt_cold_live_read_node_from_fault_plan;
-use introspect::has_cold_delete_fault_in_fault_plan;
-use introspect::has_cold_read_fault_in_fault_plan;
 use introspect::has_cold_write_fault_in_fault_plan;
 use introspect::has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan;
 use introspect::has_corrupt_http_live_sse_next_offset_expectation_in_fault_plan;

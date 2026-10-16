@@ -1674,6 +1674,7 @@ fn assert_schedule_corpus_covers_expected_scenarios_and_seeds() {
         (285, SimScenario::HttpProtocolSurfaceRandomized),
         (317, SimScenario::RuntimeRaftNetwork),
         (500, SimScenario::RoutingBeforeBodyUnderLeaderChurn),
+        (505, SimScenario::RecoveryPlanMembershipRollback),
     ];
     assert_eq!(actual, expected);
 
@@ -1808,7 +1809,7 @@ fn smoke_corpus_replays() {
     let schedule_corpus = include_str!("../../corpus/schedule-smoke.json");
     let schedule_records = serde_json::from_str::<Vec<SimScheduledRecord>>(schedule_corpus)
         .expect("deserialize schedule corpus");
-    assert_eq!(schedule_records.len(), 28);
+    assert_eq!(schedule_records.len(), 29);
     for record in schedule_records {
         assert_eq!(record.schedule, SimSchedule::generate(record.schedule.seed));
         record.assert_replays();

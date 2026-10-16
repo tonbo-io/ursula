@@ -330,6 +330,10 @@ fn generate_marked_chunks_never_contradict(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::MarkedChunksNeverContradict)
 }
 
+fn generate_recovery_plan_membership_rollback(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanMembershipRollback)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -413,6 +417,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 919,
         kind: "recovery-plan-survivor-campaigns",
         generate: generate_recovery_plan_survivor_campaigns,
+    },
+    SeedFamily {
+        name: "recovery-plan-membership-rollback",
+        start: 505,
+        end: 513,
+        kind: "recovery-plan-membership-rollback",
+        generate: generate_recovery_plan_membership_rollback,
+    },
+    SeedFamily {
+        name: "recovery-plan-membership-rollback-extended",
+        start: 980,
+        end: 999,
+        kind: "recovery-plan-membership-rollback",
+        generate: generate_recovery_plan_membership_rollback,
     },
     SeedFamily {
         name: "history-rewind-under-leader-churn-extended",
