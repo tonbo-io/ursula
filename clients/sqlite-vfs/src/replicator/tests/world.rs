@@ -4,19 +4,23 @@
 //! `5xx`/`429`/`408`/`307`/`401`/`402`/`403` and untyped `413` answers, a lowered request limit
 //! (typed `413`), the clock moved past idle expiry, history events (a new history that loses
 //! nothing, and restores of checkpoints), requests misrouted to another deployment, foreign
-//! appends and claims, retention (and with it `410`s), clones, restarts (through the open table
-//! (design: Open): a restart whose history does not inherit the log, or may have lost commits it
-//! holds after its latest ACK, salvages it and continues as a fresh takeover), provisional
-//! restarts (the open's first HEAD unanswered: a continuation of the log's latest claim, bound
-//! before it applies), owners cut off from the network, power losses that drop a log's unsynced
-//! trailing commits, takeovers by new owners and `synced()` calls, then a `Heal` phase with a
-//! perfect network and the route restored.
+//! appends and claims, retention (and with it `410`s), clones (a memory snapshot restored with its
+//! own disk: one activation, one epoch), copies of an owner's cache opened on another host (a new
+//! activation over the copied log, durable or as it was, opening as a takeover or provisionally),
+//! restarts (through the open table (design: Open): a restart whose history does not inherit the
+//! log, or may have lost commits it holds after its latest ACK, salvages it and continues as a
+//! fresh takeover), reopens that keep the activation (after a clone, two takeovers of one epoch),
+//! provisional restarts (the open's first HEAD unanswered: a continuation of the log's latest
+//! claim, bound before it applies), owners cut off from the network, power losses that drop a
+//! log's unsynced trailing commits, takeovers by new owners and `synced()` calls, then a `Heal`
+//! phase with a perfect network and the route restored. One seed in eight runs every instance
+//! under one activation, as a platform passing a constant `activation` would.
 //!
 //! The monitors check, as the run goes:
 //!
 //! 1. acknowledged never regresses, per replicator;
 //! 2. acknowledged records form a log prefix and appear in the stream in log order (L5);
-//! 3. one lineage never sends two bodies under one key (per owner, clones aside);
+//! 3. one lineage never sends two bodies under one key (per owner, clones aside: property 22);
 //! 4. a new continuation claim is exactly one above the latest claim of its instance the server
 //!    applied, the baseline of a provisional instance being the latest claim of its log the server
 //!    applied (a claim sent again with the body of one its log held is not new);
@@ -26,10 +30,12 @@
 //! 8. of two divergent clone commits, at most one is acknowledged (commits at one commit id with
 //!    other bytes diverge unless the later one was made after catching the earlier one up);
 //! 9. `Synced` never fires while a pre-call foreign frame sits past the acknowledged offset, nor
-//!    for a target later discarded;
-//! 10. the bytes between an owner's consecutive acknowledged offsets are its own frames, frames
-//!     it caught up, or foreign claims in a takeover's reconcile or followed by a claim of its own
-//!     before the one it binds with, unless it rebuilt;
+//!    for a target later discarded (a claim is the owner's own only when its log holds that epoch
+//!    and activation, so another copy's claim under a shared activation is foreign);
+//! 10. the bytes between an owner's consecutive acknowledged offsets are its own frames (a claim
+//!     as in 9), frames it caught up, or foreign claims in a takeover's reconcile or followed by a
+//!     claim of its own before the one it binds with, unless it rebuilt (with one activation for
+//!     every instance, any claim);
 //! 11. after `Heal`, every ticket of an owner that ends acknowledged resolved or was abandoned;
 //! 12. no append carries a frame the owner caught up;
 //! 13. an owner resets `fenced` or `stale` only when another writer, owner or clone was on the
@@ -48,15 +54,18 @@
 //!     across restarts) carries `salvage: true`, records a provisional open logged after its open
 //!     apart (never sent under the old token);
 //! 19. after `Heal`, every commit an owner was told is acknowledged is in the stream, in a log,
-//!     or in a salvage: none is lost, whatever history changes came (clones apart, whose copies
-//!     commit at one commit id, and commits a power loss dropped from a log before an fsync);
+//!     or in a salvage: none is lost, whatever history changes, clones and copies came (commits a
+//!     power loss dropped from a log before an fsync apart);
 //! 20. a background claim (a continuation's, a provisional open's) never applies above a claim an
 //!     explicit open of another owner made past the background owner's acknowledged offset and its
 //!     own latest claim (design: Claims, its last paragraph), unless that claim landed after a
 //!     provisional instance's pre-check read the tail (the round trip the pre-check accepts,
-//!     design: Pre-check);
+//!     design: Pre-check), or every instance runs under one activation (whose claims are all its
+//!     own, design: Claims);
 //! 21. an owner resets `stream_state` only when another writer, owner or clone was on the stream
-//!     (the gate of property 13).
+//!     (the gate of property 13);
+//! 22. within one history, every producer key the server acknowledged (a receipt, applied or a
+//!     repeat) carries one body, whichever owner, clone or copy sent it.
 //!
 //! Snapshots carry real `USS3` headers (the owner's lineage, an acknowledged position and its
 //! offset): the `410` rule reads them.
@@ -67,8 +76,11 @@
 //! re-key, one that takes another cluster's HEAD for a deleted stream, one that re-keys a log
 //! holding commits after its latest ACK (the #611 history gate undone, design: History), one that
 //! settles `synced()` tickets while activating (as before #604), one that resets `stream_state` on a
-//! repeat receipt for a claim sent again that ends at or below the acknowledged offset, and a
-//! provisional open that claims at once, above its log's highest CLAIM record, with no pre-check.
+//! repeat receipt for a claim sent again that ends at or below the acknowledged offset, a
+//! provisional open that claims at once, above its log's highest CLAIM record, with no pre-check,
+//! one that trusts a clone's snapshot of our lineage above the acknowledged position, one that
+//! matches a reconcile's commits by commit id alone, and a `synced()` probe that skips claims of an
+//! activation in its log.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -202,7 +214,14 @@ enum Op {
     ForeignAppend(u8),
     ForeignClaim(bool),
     Clone(u8),
+    /// Another host opens a copy of the owner's cache: a new owner with the log as copied (with
+    /// `durable`, only what an fsync made durable), a fresh activation and commits of its own
+    /// bytes, opening as a takeover, or provisionally when `offline`. The original keeps running.
+    CopyCache(u8, bool, bool),
     Restart(u8, u8),
+    /// The owner reopens in its process with the activation it had, as a platform passing one
+    /// `activation` does: after a clone, both copies take over at one epoch.
+    Reopen(u8),
     /// The owner restarts and its open's first HEAD gets no answer with nothing sent: the open
     /// table's unreachable rows decide (design: Open), with the ACK it reads lagging by `lag`.
     ProvisionalRestart(u8, u8),
@@ -253,6 +272,9 @@ fn op() -> impl Strategy<Value = Op> {
         2 => (0u8..3).prop_map(Op::ForeignAppend),
         1 => proptest::bool::ANY.prop_map(Op::ForeignClaim),
         1 => (0u8..8).prop_map(Op::Clone),
+        1 => ((0u8..8), proptest::bool::ANY, proptest::bool::ANY)
+            .prop_map(|(o, durable, offline)| Op::CopyCache(o, durable, offline)),
+        1 => (0u8..8).prop_map(Op::Reopen),
         2 => ((0u8..8), (0u8..3)).prop_map(|(o, lag)| Op::Restart(o, lag)),
         2 => ((0u8..8), (0u8..3)).prop_map(|(o, lag)| Op::ProvisionalRestart(o, lag)),
         2 => ((0u8..8), proptest::bool::ANY).prop_map(|(o, on)| Op::Partition(o, on)),
@@ -271,6 +293,9 @@ struct Knobs {
     /// A provisional open claims one above its log's highest CLAIM record at once, with no
     /// pre-check (this PR's first revision).
     claim_without_pre_check: bool,
+    /// Every instance runs under one activation, as a platform passing a constant `activation`
+    /// would: not a negative control but a configuration, drawn from the seed in [`check`].
+    shared_activation: bool,
     /// The replicators' own.
     replicator: ReplicatorKnobs,
 }
@@ -314,6 +339,36 @@ impl LogModel {
     fn sync(&mut self) {
         self.durable_acks = self.acks.len();
         self.durable_through = self.last_logged().0;
+    }
+
+    /// Drops up to `k` of the unsynced trailing commits, with the ACK records after them, as a
+    /// power loss does: the frames dropped. The next commits at those positions carry other bytes.
+    fn drop_unsynced(&mut self, k: usize) -> Vec<Arc<[u8]>> {
+        let lost: Vec<u64> = self
+            .commits
+            .range(self.durable_through + 1..)
+            .map(|(p, _)| *p)
+            .rev()
+            .take(k)
+            .collect();
+        let Some(&first) = lost.last() else {
+            return Vec::new();
+        };
+        let dropped: Vec<Arc<[u8]>> = lost
+            .iter()
+            .filter_map(|position| self.commits.remove(position))
+            .map(|record| record.frame)
+            .collect();
+        let durable = self.durable_acks;
+        let mut at = 0;
+        self.acks.retain(|(acked, _, _)| {
+            let keep = at < durable || acked.0 < first;
+            at += 1;
+            keep
+        });
+        let last = self.commits.keys().last().copied().unwrap_or(0);
+        self.next_position = last.max(self.durable_through).max(self.rebuilt_through) + 1;
+        dropped
     }
 }
 
@@ -378,6 +433,8 @@ struct Instance {
     /// The stream as the last HEAD of a pre-check saw it: a re-key it decided rolls the log only
     /// with the claim, after the reads (property 15).
     pre_check_head: Option<Vec<u8>>,
+    /// The open of a copy of another owner's cache, until its first bind (coverage).
+    copied: bool,
 }
 
 /// What the scripts of one [`check`] run reached, beyond the properties.
@@ -406,6 +463,45 @@ struct Coverage {
     provisional_fenced: AtomicU64,
     /// Provisional opens reset `stale`.
     provisional_stale: AtomicU64,
+    /// Owners sharing a lineage with another, fenced by `key-conflict`.
+    clones_fenced_key_conflict: AtomicU64,
+    /// Owners sharing a lineage with another, fenced by `receipt-evicted`.
+    clones_fenced_receipt_evicted: AtomicU64,
+    /// Continuation claims won by a repeat on their first attempt (another copy's identical claim).
+    repeats_won_continuation: AtomicU64,
+    /// Takeover claims won by a repeat on their first attempt (another copy's identical claim).
+    repeats_won_takeover: AtomicU64,
+    /// Copies of a cache that took over.
+    copies_took_over: AtomicU64,
+    /// Copies of a cache opened offline that went live.
+    offline_copies_live: AtomicU64,
+    /// Copies of a cache opened offline reset `stale`.
+    offline_copies_stale: AtomicU64,
+    /// Copies of a cache opened offline reset `fenced`.
+    offline_copies_fenced: AtomicU64,
+    /// Snapshots of another copy of our lineage, above our acknowledged position, that the `410`
+    /// rule read (and never trusts).
+    clone_snapshots_rejected: AtomicU64,
+    /// Restores while two owners share a lineage.
+    restores_shared_lineage: AtomicU64,
+}
+
+/// A refusal that fences an owner sharing its lineage with another (coverage).
+#[derive(Debug, Clone, Copy)]
+enum Fence {
+    KeyConflict,
+    ReceiptEvicted,
+}
+
+/// What an answer may reach for the coverage counters, seen before the replicator takes it.
+#[derive(Debug, Clone, Copy)]
+struct Watch {
+    /// A refusal that may fence an owner sharing its lineage.
+    fence: Option<Fence>,
+    /// A repeat for the first attempt of a claim: `true` for a continuation's.
+    won: Option<bool>,
+    /// A snapshot read of the `410` rule, the snapshot another copy's of the lineage.
+    rejected: bool,
 }
 
 /// What the replicator was doing when an event came, and where its answer came from.
@@ -430,6 +526,8 @@ struct Owner {
     /// A power loss dropped commits from its log: the stream may hold them, so a reconcile may find
     /// them with no record to match (property 13's exemption).
     power_lost: bool,
+    /// The activation of its latest open: a reopen keeps it.
+    activation: Activation,
 }
 
 #[derive(Debug, Clone)]
@@ -526,10 +624,14 @@ struct World {
     power_lost: Vec<Arc<[u8]>>,
     /// Every commit frame an owner was told its stream acknowledged (property 19).
     acknowledged: Vec<Arc<[u8]>>,
-    /// The lineage of every log cloned, and its last position then: after it the copies commit at
-    /// one commit id, and a takeover of one may discard what the other had acknowledged, so
-    /// those commits are outside property 19.
-    cloned: Vec<(Lineage, Position)>,
+    /// The body digest of every producer key the server acknowledged, by history (property 22).
+    bodies: HashMap<(Incarnation, Epoch, Seq), BodyDigest>,
+    /// The first attempt of every claim an instance sent, by instance and attempt, and whether it
+    /// was a continuation's (coverage).
+    first_claims: HashMap<(u64, RequestId), bool>,
+    /// The last commit each published snapshot names, and the family of the owner that published
+    /// it (coverage).
+    snapshots: Vec<(CommitId, u64)>,
     /// The families whose requests fail before connecting.
     partitioned: BTreeSet<u64>,
     /// The family of every instance that sent a request, so a dead instance's requests of a
@@ -616,7 +718,9 @@ impl World {
             salvaged: Vec::new(),
             power_lost: Vec::new(),
             acknowledged: Vec::new(),
-            cloned: Vec::new(),
+            bodies: HashMap::new(),
+            first_claims: HashMap::new(),
+            snapshots: Vec::new(),
             partitioned: BTreeSet::new(),
             families: HashMap::new(),
             applied_claims: BTreeSet::new(),
@@ -640,7 +744,11 @@ impl World {
         self.server.frames(PATH).unwrap_or_default().to_vec()
     }
 
+    /// The activation of a new open: its own, or the one every instance shares.
     fn activation(&mut self) -> Activation {
+        if self.knobs.shared_activation {
+            return Activation([0xa5; 16]);
+        }
         self.next_activation = self.next_activation.wrapping_add(1);
         Activation([self.next_activation; 16])
     }
@@ -712,6 +820,7 @@ impl World {
             checked_tail: None,
             expired: false,
             pre_check_head: None,
+            copied: false,
         }
     }
 
@@ -733,7 +842,8 @@ impl World {
         if self.owners.len() >= MAX_OWNERS {
             return;
         }
-        let (owner, actions) = self.fresh_owner(lagging);
+        let activation = self.activation();
+        let (owner, actions) = self.fresh_owner(lagging, activation);
         self.owners.push(owner);
         let index = self.owners.len() - 1;
         let before = Before {
@@ -744,9 +854,8 @@ impl World {
     }
 
     /// An owner of a new family whose generation was built from the stream up to its tail (from
-    /// offset 0 when `lagging`), and the actions of its takeover.
-    fn fresh_owner(&mut self, lagging: bool) -> (Owner, Vec<Action>) {
-        let activation = self.activation();
+    /// offset 0 when `lagging`), and the actions of its takeover under `activation`.
+    fn fresh_owner(&mut self, lagging: bool, activation: Activation) -> (Owner, Vec<Action>) {
         let family = self.next_family;
         self.next_family += 1;
         let lineage = Lineage([u8::try_from(family % 250).unwrap() + 1; 16]);
@@ -795,6 +904,7 @@ impl World {
             log,
             inst,
             power_lost: false,
+            activation,
         };
         (owner, actions)
     }
@@ -850,12 +960,13 @@ impl World {
     /// open's HEAD goes through the open table: the same token resumes, an inheriting history
     /// re-keys a log with nothing pending, any other history salvages the log and the owner
     /// continues as a fresh takeover, and a refusal runs no replicator. An owner cut off from the
-    /// network gets no answer to that HEAD, and reopens provisionally.
-    fn restart(&mut self, index: usize, lag: u8) {
+    /// network gets no answer to that HEAD, and reopens provisionally. With `keep` the open runs
+    /// under the activation the owner had.
+    fn restart(&mut self, index: usize, lag: u8, keep: bool) {
         if self.partitioned.contains(&self.owners[index].family) {
-            return self.provisional_restart(index, lag);
+            return self.provisional_restart(index, lag, keep);
         }
-        let activation = self.activation();
+        let activation = self.open_activation(index, keep);
         let family = self.owners[index].family;
         let (reopened, summary) = self.reopened(index, lag);
         let head = Request::new(Method::Head, Target::Stream);
@@ -910,7 +1021,7 @@ impl World {
                     self.salvaged.extend(log.applied.iter().cloned());
                     self.salvaged.push(Arc::clone(&log.rebuilt));
                 }
-                let (owner, actions) = self.fresh_owner(false);
+                let (owner, actions) = self.fresh_owner(false, activation);
                 self.owners[index] = owner;
                 let before = Before {
                     takeover: true,
@@ -927,6 +1038,7 @@ impl World {
         let local = reopened.local(activation, incarnation, limit, family, rekey_from);
         let (inst, actions) = self.instance(local);
         self.owners[index].inst = inst;
+        self.owners[index].activation = activation;
         let before = Before {
             takeover: true,
             head_saw: Some(self.routed().frames(PATH).unwrap_or_default().to_vec()),
@@ -938,9 +1050,10 @@ impl World {
     /// The owner's process restarts and its open's first HEAD gets no answer with nothing sent
     /// (design: Open): a log with a CLAIM record binds at once under the log's token, and once the
     /// stream answers its pre-check (design: Pre-check) decides whether that claim goes out again.
-    /// A log without one waits, and the open's signal fires: no replicator runs.
-    fn provisional_restart(&mut self, index: usize, lag: u8) {
-        let activation = self.activation();
+    /// A log without one waits, and the open's signal fires: no replicator runs. With `keep` the
+    /// open runs under the activation the owner had.
+    fn provisional_restart(&mut self, index: usize, lag: u8, keep: bool) {
+        let activation = self.open_activation(index, keep);
         let family = self.owners[index].family;
         let (reopened, summary) = self.reopened(index, lag);
         let claim = match decide_unreachable(Local::<(), ()>::Trusted(summary, ())) {
@@ -980,7 +1093,17 @@ impl World {
             opened_through,
             ..inst
         };
+        self.owners[index].activation = activation;
         self.process(index, actions, Before::default());
+    }
+
+    /// The activation of owner `index`'s next open: the one it had with `keep`, else a new one.
+    fn open_activation(&mut self, index: usize, keep: bool) -> Activation {
+        if keep {
+            self.owners[index].activation
+        } else {
+            self.activation()
+        }
     }
 
     fn clone_owner(&mut self, index: usize) {
@@ -989,7 +1112,6 @@ impl World {
         }
         let mut copy = self.owners[index].clone();
         let original = copy.inst.uid;
-        self.cloned.push((copy.log.lineage, copy.log.last_logged()));
         copy.family = self.next_family;
         self.next_family += 1;
         copy.salt = u8::try_from(copy.family % 250).unwrap();
@@ -1024,11 +1146,42 @@ impl World {
         self.owners.push(copy);
     }
 
-    /// Whether a clone of the log of `id`'s lineage may have committed at `id` too.
-    fn after_a_clone(&self, id: CommitId) -> bool {
-        self.cloned
+    /// Another host opens a copy of owner `index`'s cache (design: Clones, its host contract
+    /// broken): a new owner of a new family, so its commits carry its own bytes, with the log as
+    /// copied (with `durable`, only what an fsync made durable, as after a power loss). It opens
+    /// through the open table under a fresh activation, as a takeover, or provisionally when
+    /// `offline`. The original keeps running.
+    fn copy_cache(&mut self, index: usize, durable: bool, offline: bool) {
+        if self.owners.len() >= MAX_OWNERS {
+            return;
+        }
+        let mut copy = self.owners[index].clone();
+        copy.family = self.next_family;
+        self.next_family += 1;
+        copy.salt = u8::try_from(copy.family % 250).unwrap();
+        copy.inst = self.stopped(copy.inst.acked, copy.inst.acked_offset);
+        // The commits the copy lost may be in the stream (property 13's exemption); the original
+        // still holds them.
+        if durable && !copy.log.drop_unsynced(usize::MAX).is_empty() {
+            copy.power_lost = true;
+        }
+        self.owners.push(copy);
+        let index = self.owners.len() - 1;
+        if offline {
+            self.provisional_restart(index, 0, false);
+        } else {
+            self.restart(index, 0, false);
+        }
+        self.owners[index].inst.copied = true;
+    }
+
+    /// Whether another owner's log is of owner `index`'s lineage: a clone or a copy.
+    fn shares_lineage(&self, index: usize) -> bool {
+        let lineage = self.owners[index].log.lineage;
+        self.owners
             .iter()
-            .any(|(lineage, at)| *lineage == id.lineage && id.position > *at)
+            .enumerate()
+            .any(|(i, o)| i != index && o.log.lineage == lineage)
     }
 
     fn live(&self, index: usize) -> bool {
@@ -1301,6 +1454,7 @@ impl World {
                             .any(|c| self.applied_claims.contains(c));
                     let alone = self.alone(index);
                     let provisional = owner.inst.provisional;
+                    let copied = owner.inst.copied;
                     if alone && !lost && !expired && !never_held {
                         self.violation(format!(
                             "property 13: a {kind:?} reset with no other writer on the stream"
@@ -1310,6 +1464,13 @@ impl World {
                         let counter = match kind {
                             ResetKind::Fenced => &self.coverage.provisional_fenced,
                             _ => &self.coverage.provisional_stale,
+                        };
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                    if provisional && copied {
+                        let counter = match kind {
+                            ResetKind::Fenced => &self.coverage.offline_copies_fenced,
+                            _ => &self.coverage.offline_copies_stale,
                         };
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
@@ -1331,10 +1492,20 @@ impl World {
                     self.owners[index].power_lost = false;
                     let inst = &mut self.owners[index].inst;
                     inst.expired = false;
-                    if std::mem::take(&mut inst.provisional) {
+                    let provisional = std::mem::take(&mut inst.provisional);
+                    let copied = std::mem::take(&mut inst.copied);
+                    if provisional {
                         self.coverage
                             .provisional_live
                             .fetch_add(1, Ordering::Relaxed);
+                    }
+                    let counter = match (copied, provisional) {
+                        (false, _) => None,
+                        (true, false) => Some(&self.coverage.copies_took_over),
+                        (true, true) => Some(&self.coverage.offline_copies_live),
+                    };
+                    if let Some(counter) = counter {
+                        counter.fetch_add(1, Ordering::Relaxed);
                     }
                 }
                 Action::Reset(_) | Action::Refuse(_) => {}
@@ -1464,6 +1635,12 @@ impl World {
             }
             let inst = &mut self.owners[index].inst;
             let resent = claimed.is_some_and(|c| inst.inherited.contains(&c));
+            let first = claimed.is_some() && !resent && !inst.claims_sent.contains(&write.epoch);
+            if first {
+                let uid = inst.uid;
+                self.first_claims.insert((uid, id), continuation);
+            }
+            let inst = &mut self.owners[index].inst;
             if write.seq == Seq::ZERO && !inst.claims_sent.contains(&write.epoch) {
                 inst.claims_sent.push(write.epoch);
                 // A new continuation claim, not one sent again: one above the latest claim of
@@ -1506,12 +1683,11 @@ impl World {
             .take_while(|(p, _)| **p <= acked.0)
             .map(|(_, p)| p.clone())
             .collect();
-        // Property 19: the owner's own commits it was told are acknowledged, those a clone may
-        // also have committed at aside.
+        // Property 19: the owner's own commits it was told are acknowledged.
         let lineage = self.owners[index].log.lineage;
         let acknowledged: Vec<Arc<[u8]>> = records
             .iter()
-            .filter(|p| p.id.lineage == lineage && !self.after_a_clone(p.id))
+            .filter(|p| p.id.lineage == lineage)
             .map(|p| Arc::clone(&p.frame))
             .collect();
         self.acknowledged.extend(acknowledged);
@@ -1567,9 +1743,10 @@ impl World {
         inst.acked_offset = offset;
     }
 
-    /// Publishes a snapshot at `offset` whose `USS3` header names `last`, as a snapshot thread
-    /// would (the image is a stand-in: only the header is ever read here).
-    fn publish_snapshot(&mut self, offset: Offset, last: CommitId) {
+    /// Publishes a snapshot at `offset` whose `USS3` header names `last`, as the snapshot thread
+    /// of an owner of family `by` would (the image is a stand-in: only the header is ever read
+    /// here).
+    fn publish_snapshot(&mut self, offset: Offset, last: CommitId, by: u64) {
         let fields = SnapshotFields {
             offset,
             epoch: Epoch::try_from(1).unwrap(),
@@ -1590,7 +1767,9 @@ impl World {
             body: Arc::from(body),
             ..Request::new(Method::Put, Target::Snapshot { offset })
         };
-        drop(self.server.handle(PATH, &publish));
+        if self.server.handle(PATH, &publish).status < 300 {
+            self.snapshots.push((last, by));
+        }
     }
 
     /// Property 14: a boundary's receipt names the end of record `k`'s frame in the stream with
@@ -1637,10 +1816,11 @@ impl World {
         }
         // The snapshot thread fsyncs ACK(k, W) before it publishes: no restart reads an older ACK.
         self.owners[index].log.sync();
-        self.publish_snapshot(offset, CommitId {
+        let last = CommitId {
             lineage: owner.log.lineage,
             position: receipt.position,
-        });
+        };
+        self.publish_snapshot(offset, last, owner.family);
         self.event(index, Event::Snapshotted {
             log_bytes: receipt.log_bytes,
         });
@@ -1664,10 +1844,13 @@ impl World {
             .unwrap_or_default();
         let own_frames: Vec<&[u8]> = owner.log.commits.values().map(|p| &p.frame[..]).collect();
         let frames = decode_all(range);
+        // Its own: a claim whose epoch and activation its log holds. Under one activation for every
+        // instance, any claim is its own to the replicator (design: Claims).
         let own_claim = |frame: &Option<Frame>| {
-            matches!(frame, Some(Frame::Claim { activation, .. })
-                if owner.log.claims.iter().any(|(_, a)| a == activation))
+            matches!(frame, Some(Frame::Claim { epoch, activation })
+                if owner.log.claims.contains(&(*epoch, *activation)))
         };
+        let shared = self.knobs.shared_activation;
         // A claim of its own after a foreign one, other than the claim it binds with at the end,
         // applied after it (design: Reconcile, superseded).
         let superseder = frames
@@ -1679,7 +1862,7 @@ impl World {
             let bytes = range.get(start..start + len).unwrap_or_default();
             let fine = match frame {
                 Some(Frame::Claim { .. }) => {
-                    takeover || own_claim(frame) || superseder.is_some_and(|s| s > i)
+                    shared || takeover || own_claim(frame) || superseder.is_some_and(|s| s > i)
                 }
                 Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
                 _ => false,
@@ -1721,8 +1904,8 @@ impl World {
             for (start, len, frame) in decode_all(past) {
                 let bytes = past.get(start..start + len).unwrap_or_default();
                 let own = match frame {
-                    Some(Frame::Claim { activation, .. }) => {
-                        owner.log.claims.iter().any(|(_, a)| *a == activation)
+                    Some(Frame::Claim { epoch, activation }) => {
+                        owner.log.claims.contains(&(epoch, activation))
                     }
                     Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
                     _ => false,
@@ -1855,6 +2038,11 @@ impl World {
         if let Some(epoch) = crate::replicator::answer::answer_epoch(answer) {
             self.max_epoch = self.max_epoch.max(epoch.get());
         }
+        if let (ProducerAnswer::Receipt { incarnation, .. }, Some(write), Some(_)) =
+            (answer, &request.keys.producer, id)
+        {
+            self.one_body(*incarnation, write.epoch, write.seq, &request.body);
+        }
         let (
             ProducerAnswer::Receipt {
                 delivery: Delivery::Applied,
@@ -1881,11 +2069,29 @@ impl World {
         }
     }
 
+    /// Property 22: the server acknowledged `body` under `(epoch, seq)` in the history of
+    /// `incarnation`, and no other body under that key.
+    fn one_body(&mut self, incarnation: Incarnation, epoch: Epoch, seq: Seq, body: &[u8]) {
+        let digest = producer_digest(body);
+        let previous = self.bodies.insert((incarnation, epoch, seq), digest);
+        if previous.is_some_and(|p| p != digest) {
+            self.violation(format!(
+                "property 22: two bodies acknowledged under ({epoch}, {seq}) in history \
+                 {incarnation}"
+            ));
+        }
+    }
+
     /// Property 20: instance `uid`'s background claim of `epoch` applied at `start`: no
     /// claim an explicit open of another owner made past both the instance's
     /// acknowledged offset and its own latest claim in the stream lies below it, unless it landed
     /// after the instance's pre-check read the tail.
     fn background_claim_applied(&mut self, uid: u64, epoch: Epoch, start: Offset) {
+        // Under one activation every claim is the replicator's own (design: Claims): a background
+        // claim reads an explicit owner's claim as its own and may go above it.
+        if self.knobs.shared_activation {
+            return;
+        }
         let Some(owner) = self.owners.iter().find(|o| o.inst.uid == uid) else {
             return;
         };
@@ -1969,7 +2175,9 @@ impl World {
 
     fn deliver_answer(&mut self, to: u64, id: RequestId, exchange: Exchange, misrouted: bool) {
         let head_saw = self.heads.remove(&(to, id));
+        let first_claim = self.first_claims.remove(&(to, id));
         if let Some(index) = self.owners.iter().position(|o| o.inst.uid == to) {
+            let watch = self.watch(index, &exchange, first_claim);
             let inst = &mut self.owners[index].inst;
             // Only an expiry naming the claim a provisional instance sent again after its
             // pre-check (property 13).
@@ -2002,6 +2210,73 @@ impl World {
                 ..Before::default()
             };
             self.event_from(index, Event::Answer { id, exchange }, before);
+            self.watched(index, watch);
+        }
+    }
+
+    /// What an answer to owner `index` may reach for the coverage counters, seen before the
+    /// replicator takes it.
+    fn watch(&self, index: usize, exchange: &Exchange, first_claim: Option<bool>) -> Watch {
+        let owner = &self.owners[index];
+        let producer = match exchange {
+            Exchange::Answered(answer) => match &answer.typed {
+                Ok(Typed::Producer(producer)) => Some(producer),
+                _ => None,
+            },
+            Exchange::NoAnswer(_) => None,
+        };
+        let fence = match producer {
+            Some(ProducerAnswer::KeyConflict { .. }) => Some(Fence::KeyConflict),
+            Some(ProducerAnswer::ReceiptEvicted { .. }) => Some(Fence::ReceiptEvicted),
+            _ => None,
+        }
+        .filter(|_| self.shares_lineage(index));
+        let repeat = matches!(
+            producer,
+            Some(ProducerAnswer::Receipt {
+                delivery: Delivery::Repeat,
+                ..
+            })
+        );
+        // A snapshot read of the `410` rule, the latest snapshot another copy's of our lineage
+        // above our acknowledged position.
+        let rejected = match &owner.inst.replicator {
+            Replicator::Activating {
+                step: Step::Gone {
+                    snapshot: Some(_), ..
+                },
+                ctx,
+                ..
+            } => self.snapshots.last().is_some_and(|(last, family)| {
+                last.lineage == ctx.lineage && last.position > ctx.acked && *family != owner.family
+            }),
+            _ => false,
+        };
+        Watch {
+            fence,
+            won: first_claim.filter(|_| repeat),
+            rejected,
+        }
+    }
+
+    /// Counts what the answer `watch` saw reached, now that owner `index`'s replicator took it.
+    fn watched(&self, index: usize, watch: Watch) {
+        let replicator = &self.owners[index].inst.replicator;
+        let coverage = &self.coverage;
+        let fenced = matches!(replicator, Replicator::Reset(ResetKind::Fenced));
+        let fence = match watch.fence {
+            Some(Fence::KeyConflict) if fenced => Some(&coverage.clones_fenced_key_conflict),
+            Some(Fence::ReceiptEvicted) if fenced => Some(&coverage.clones_fenced_receipt_evicted),
+            _ => None,
+        };
+        let won = match watch.won.filter(|_| replicator.ctx().is_some()) {
+            Some(true) => Some(&coverage.repeats_won_continuation),
+            Some(false) => Some(&coverage.repeats_won_takeover),
+            None => None,
+        };
+        let rejected = watch.rejected.then_some(&coverage.clone_snapshots_rejected);
+        for counter in [fence, won, rejected].into_iter().flatten() {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -2133,29 +2408,8 @@ impl World {
     /// bytes. Its process stops; requests it had out may still land.
     fn power_loss(&mut self, index: usize, k: u8) {
         let owner = &mut self.owners[index];
-        let log = &mut owner.log;
-        let lost: Vec<u64> = log
-            .commits
-            .range(log.durable_through + 1..)
-            .map(|(p, _)| *p)
-            .rev()
-            .take(usize::from(k))
-            .collect();
-        if let Some(&first) = lost.last() {
-            let dropped: Vec<Arc<[u8]>> = lost
-                .iter()
-                .filter_map(|position| log.commits.remove(position))
-                .map(|record| record.frame)
-                .collect();
-            let durable = log.durable_acks;
-            let mut at = 0;
-            log.acks.retain(|(acked, _, _)| {
-                let keep = at < durable || acked.0 < first;
-                at += 1;
-                keep
-            });
-            let last = log.commits.keys().last().copied().unwrap_or(0);
-            log.next_position = last.max(log.durable_through).max(log.rebuilt_through) + 1;
+        let dropped = owner.log.drop_unsynced(usize::from(k));
+        if !dropped.is_empty() {
             owner.power_lost = true;
             owner.salt = owner.salt.wrapping_add(128);
             self.power_lost.extend(dropped);
@@ -2269,6 +2523,11 @@ impl World {
             }
             Op::NewHistory => self.server.history_event(HistoryEvent::NewHistory).unwrap(),
             Op::Restore(n) => {
+                if (0..self.owners.len()).any(|i| self.shares_lineage(i)) {
+                    self.coverage
+                        .restores_shared_lineage
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 let latest = self.checkpoints.len() - 1;
                 let (checkpoint, max) = self.checkpoints[latest - usize::from(n) % (latest + 1)];
                 self.max_claimed = max;
@@ -2307,7 +2566,8 @@ impl World {
                 // The snapshot thread fsyncs ACK(k, W) before it publishes: no restart reads an
                 // older ACK.
                 self.owners[i].log.sync();
-                self.publish_snapshot(offset, last);
+                let by = self.owners[i].family;
+                self.publish_snapshot(offset, last, by);
                 let request = Request::new(Method::Put, Target::Retention { offset });
                 drop(self.server.handle(PATH, &request));
             }
@@ -2375,11 +2635,19 @@ impl World {
             }
             Op::Restart(o, lag) => {
                 let i = self.owner(o);
-                self.restart(i, lag);
+                self.restart(i, lag, false);
+            }
+            Op::Reopen(o) => {
+                let i = self.owner(o);
+                self.restart(i, 0, true);
+            }
+            Op::CopyCache(o, durable, offline) => {
+                let i = self.owner(o);
+                self.copy_cache(i, durable, offline);
             }
             Op::ProvisionalRestart(o, lag) => {
                 let i = self.owner(o);
-                self.provisional_restart(i, lag);
+                self.provisional_restart(i, lag, false);
             }
             Op::Partition(o, on) => {
                 let family = self.owners[self.owner(o)].family;
@@ -2466,17 +2734,7 @@ impl World {
             }
         }
         let stream = self.stream();
-        let cloned = |frame: &[u8]| match frame::decode(frame, u64::MAX) {
-            Ok(Decoded::Frame {
-                frame: Frame::Commit { id, .. },
-                ..
-            }) => self.after_a_clone(id),
-            _ => false,
-        };
         let lost = self.acknowledged.iter().find(|frame| {
-            if cloned(frame) {
-                return false;
-            }
             let within = |bytes: &[u8]| bytes.windows(frame.len()).any(|w| w == &frame[..]);
             let held = self.owners.iter().any(|o| {
                 o.log.commits.values().any(|p| p.frame == **frame)
@@ -2576,6 +2834,11 @@ fn check(
         proptest::collection::vec(op(), 20..160),
     );
     runner.run(&strategy, |(seed, ops)| {
+        // One seed in eight runs every instance under one activation, inside the same cases.
+        let knobs = Knobs {
+            shared_activation: knobs.shared_activation || seed % 8 == 0,
+            ..knobs
+        };
         let violations = run_counted(knobs, seed, &ops, Arc::clone(&coverage));
         if violations.is_empty() {
             Ok(())
@@ -2595,8 +2858,11 @@ fn the_replicator_keeps_its_properties_against_the_model() {
 
 /// The scripts reach a catch-up in place read by read, one that rebuilds midway, re-keys while
 /// streaming, while a continuation claim is out and at open, `rewound` resets, owners blocked
-/// `wrong_cluster` that resumed, and provisional opens that went live, were fenced and went
-/// stale: checked on a fixed seed, so the coverage is reproducible.
+/// `wrong_cluster` that resumed, provisional opens that went live, were fenced and went stale,
+/// clones and copies fenced by `key-conflict` and by `receipt-evicted`, claims of either kind won
+/// by a repeat on their first attempt, copies of a cache that took over, offline copies that went
+/// live, stale or fenced, clone snapshots the `410` rule rejected, and restores while two owners
+/// share a lineage: checked on a fixed seed, so the coverage is reproducible.
 #[test]
 fn the_world_catches_up_in_place_read_by_read() {
     let coverage = match check(Knobs::default(), COVERAGE_CASES, true) {
@@ -2618,11 +2884,42 @@ fn the_world_catches_up_in_place_read_by_read() {
         ),
         ("provisional opens fenced", &coverage.provisional_fenced),
         ("provisional opens gone stale", &coverage.provisional_stale),
+        (
+            "clones fenced by key-conflict",
+            &coverage.clones_fenced_key_conflict,
+        ),
+        (
+            "clones fenced by receipt-evicted",
+            &coverage.clones_fenced_receipt_evicted,
+        ),
+        (
+            "continuations won by a repeat",
+            &coverage.repeats_won_continuation,
+        ),
+        ("takeovers won by a repeat", &coverage.repeats_won_takeover),
+        ("copies that took over", &coverage.copies_took_over),
+        (
+            "offline copies that went live",
+            &coverage.offline_copies_live,
+        ),
+        ("offline copies gone stale", &coverage.offline_copies_stale),
+        ("offline copies fenced", &coverage.offline_copies_fenced),
+        (
+            "clone snapshots rejected",
+            &coverage.clone_snapshots_rejected,
+        ),
+        (
+            "restores of a shared lineage",
+            &coverage.restores_shared_lineage,
+        ),
     ];
+    let mut missing = Vec::new();
     for (what, count) in counts {
-        let count = count.load(Ordering::Relaxed);
-        assert!(count > 0, "no {what}");
+        if count.load(Ordering::Relaxed) == 0 {
+            missing.push(what);
+        }
     }
+    assert!(missing.is_empty(), "none of: {missing:?}");
 }
 
 /// The world with the replicators' negative controls `knobs`.
@@ -3002,6 +3299,32 @@ fn negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage
     );
 }
 
+/// [`crash_after_a_rekey_at_open`] with owner 0 cloned first: the commit the negative control
+/// loses is one the clone's copy could have committed at too. Property 19 once left every commit
+/// after a clone out, so only property 18 tripped here; it now checks them all.
+#[test]
+fn negative_control_re_keying_with_commits_pending_loses_a_commit_after_a_clone() {
+    let mut ops = crash_after_a_rekey_at_open();
+    ops.insert(1, Op::Clone(0));
+    assert_eq!(run(Knobs::default(), 1, &ops), Vec::<String>::new());
+    let violations = run(
+        replicator_knobs(ReplicatorKnobs {
+            rekey_with_pending: true,
+            ..ReplicatorKnobs::default()
+        }),
+        1,
+        &ops,
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 18")),
+        "{violations:?}"
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 19")),
+        "{violations:?}"
+    );
+}
+
 /// Streaming owner 0 acknowledges a commit, is cloned, and both copies commit different bytes at
 /// the same position.
 fn divergent_clones() -> Vec<Op> {
@@ -3049,6 +3372,10 @@ fn negative_control_the_model_without_digests_breaks_clone_safety() {
         violations.iter().any(|v| v.starts_with("property 8")),
         "{violations:?}"
     );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 22")),
+        "{violations:?}"
+    );
 }
 
 #[test]
@@ -3073,6 +3400,7 @@ fn negative_control_a_renumbering_replicator_sends_two_bodies_under_one_key() {
 
 #[test]
 fn negative_controls_fail_the_proptest_too() {
+    let mut passed = Vec::new();
     for knobs in [
         Knobs {
             strip_digests: true,
@@ -3108,11 +3436,26 @@ fn negative_controls_fail_the_proptest_too() {
         // `settle_while_activating` is left to its fixed script too: its early `Synced` needs a
         // proof from before a continuation claim and a `synced()` call between two reads of
         // that claim's reconcile.
+        replicator_knobs(ReplicatorKnobs {
+            trust_clone_snapshot: true,
+            ..ReplicatorKnobs::default()
+        }),
+        replicator_knobs(ReplicatorKnobs {
+            match_commits_by_id: true,
+            ..ReplicatorKnobs::default()
+        }),
+        replicator_knobs(ReplicatorKnobs {
+            probe_skips_own_claims: true,
+            ..ReplicatorKnobs::default()
+        }),
     ] {
         // A fixed seed: the fixed scripts above always trip, and this search is a bonus that
         // must not flake.
-        assert!(check(knobs, 512, true).is_err(), "{knobs:?} passed");
+        if check(knobs, 512, true).is_ok() {
+            passed.push(knobs);
+        }
     }
+    assert!(passed.is_empty(), "{passed:?} passed");
 }
 
 /// A clone commits at the next position with its own bytes, its snapshot of our shared lineage
@@ -3120,9 +3463,8 @@ fn negative_controls_fail_the_proptest_too() {
 /// position meets the `410`. The rule must not take the clone's snapshot as covering the
 /// original's own record above its acknowledged position: that would acknowledge a commit the
 /// stream never held (property 8) and append after another copy's state.
-#[test]
-fn a_clones_snapshot_never_covers_the_originals_commit() {
-    let ops = vec![
+fn a_clone_snapshot_past_the_original() -> Vec<Op> {
+    vec![
         Op::Flush,
         Op::Commit(0),
         Op::Flush,
@@ -3134,13 +3476,36 @@ fn a_clones_snapshot_never_covers_the_originals_commit() {
         Op::Flush,
         Op::Restart(0, 0),
         Op::Flush,
-    ];
+    ]
+}
+
+#[test]
+fn a_clones_snapshot_never_covers_the_originals_commit() {
     let mut world = World::new(Knobs::default(), 1, Arc::default());
-    for op in &ops {
+    for op in &a_clone_snapshot_past_the_original() {
         world.step(op);
     }
     world.heal();
     assert_eq!(world.violations, Vec::<String>::new());
+    assert_eq!(
+        world
+            .coverage
+            .clone_snapshots_rejected
+            .load(Ordering::Relaxed),
+        1
+    );
+    let violations = run(
+        replicator_knobs(ReplicatorKnobs {
+            trust_clone_snapshot: true,
+            ..ReplicatorKnobs::default()
+        }),
+        1,
+        &a_clone_snapshot_past_the_original(),
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 8")),
+        "{violations:?}"
+    );
 }
 
 /// A host whose build lags reconciles from below retention: the `410` rebuilds, never skips the
@@ -3762,8 +4127,7 @@ fn an_unapplied_claim_in_the_log_never_fences_an_explicit_owner() {
 
 /// Probe B of #615's review: clones, a provisional restart and a foreign claim, with the
 /// provisional owner cut off. Once healed it resets, and the owner that bound goes on.
-#[test]
-fn a_provisional_clone_never_fences_the_owner_that_bound() {
+fn a_provisional_clone_beside_the_owner_that_bound() -> Vec<Op> {
     use Op::Clone;
     use Op::Commit;
     use Op::Deliver;
@@ -3775,7 +4139,7 @@ fn a_provisional_clone_never_fences_the_owner_that_bound() {
     use Op::Partition;
     use Op::ProvisionalRestart;
     use Op::Restart;
-    let ops = vec![
+    vec![
         Clone(0),
         Restart(2, 0),
         Op::Fault(FaultKind::Status(503, Some(1)), false, 2),
@@ -3801,9 +4165,13 @@ fn a_provisional_clone_never_fences_the_owner_that_bound() {
         Flush,
         Commit(1),
         Flush,
-    ];
+    ]
+}
+
+#[test]
+fn a_provisional_clone_never_fences_the_owner_that_bound() {
     let mut world = World::new(Knobs::default(), 0, Arc::default());
-    for op in &ops {
+    for op in &a_provisional_clone_beside_the_owner_that_bound() {
         world.step(op);
     }
     assert!(matches!(
@@ -3816,6 +4184,20 @@ fn a_provisional_clone_never_fences_the_owner_that_bound() {
     ));
     world.heal();
     assert_eq!(world.violations, Vec::<String>::new());
+    let violations = run(
+        Knobs {
+            claim_without_pre_check: true,
+            ..Knobs::default()
+        },
+        0,
+        &a_provisional_clone_beside_the_owner_that_bound(),
+    );
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.starts_with("property 20") || v.starts_with("property 4")),
+        "{violations:?}"
+    );
 }
 
 /// Probe F of #615's review (design: Claims): a takeover's claim applied after a foreign one, and
@@ -3892,4 +4274,277 @@ fn a_re_key_while_reconciling_never_fences_an_explicit_owner() {
         Commit(0),
     ];
     assert_eq!(run(Knobs::default(), 0, &ops), Vec::<String>::new());
+}
+
+/// Owner 0 is cloned while it streams idle, idle expiry passes, and owner 0's commit meets
+/// `producer-expired`: its continuation claim of the next epoch applies under the activation both
+/// copies share. The clone's `synced()` probe then reads that claim past its tail. The claim's
+/// epoch is in no CLAIM record of the clone's log, so it is another copy's: the probe fences.
+fn a_clone_probes_past_a_continuation_claim() -> Vec<Op> {
+    vec![
+        Op::Flush,
+        Op::Clone(0),
+        Op::ExpireIdle,
+        Op::Commit(0),
+        // The append meets `producer-expired`, the continuation claim goes out and applies.
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::Sync(1),
+        // The clone's probe reaches the server, and its answer the clone.
+        Op::Deliver(1),
+        Op::Deliver(1),
+    ]
+}
+
+#[test]
+fn negative_control_a_probe_skipping_claims_of_its_activation_syncs_past_a_copys_claim() {
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &a_clone_probes_past_a_continuation_claim() {
+        world.step(op);
+    }
+    assert!(
+        matches!(
+            world.owners[1].inst.replicator,
+            Replicator::Reset(ResetKind::Fenced)
+        ),
+        "{:?}",
+        world.owners[1].inst.replicator
+    );
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+    let violations = run(
+        replicator_knobs(ReplicatorKnobs {
+            probe_skips_own_claims: true,
+            ..ReplicatorKnobs::default()
+        }),
+        1,
+        &a_clone_probes_past_a_continuation_claim(),
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 9")),
+        "{violations:?}"
+    );
+}
+
+/// Owner 0 acknowledges a commit and another host opens a copy of its cache offline; owner 0
+/// commits the next position and the copy commits its own bytes there. The copy's claim lands
+/// after owner 0's commit, which its reconcile meets at the commit id of its pending record with
+/// other bytes: another copy's state, never its own record.
+fn an_offline_copy_behind_the_original() -> Vec<Op> {
+    vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::CopyCache(0, false, true),
+        Op::Commit(0),
+        Op::Commit(1),
+        Op::Flush,
+    ]
+}
+
+#[test]
+fn negative_control_matching_commits_by_id_acknowledges_a_copys_commit() {
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &an_offline_copy_behind_the_original() {
+        world.step(op);
+    }
+    assert!(
+        matches!(world.owners[1].inst.replicator, Replicator::Reset(_)),
+        "{:?}",
+        world.owners[1].inst.replicator
+    );
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+    let violations = run(
+        replicator_knobs(ReplicatorKnobs {
+            match_commits_by_id: true,
+            ..ReplicatorKnobs::default()
+        }),
+        1,
+        &an_offline_copy_behind_the_original(),
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 2")
+            || v.starts_with("property 8")
+            || v.starts_with("property 19")),
+        "{violations:?}"
+    );
+}
+
+/// Owner 0 is cloned while it streams idle, and both copies reopen under the activation they
+/// share: their takeovers compute one epoch and send byte-identical claims, the second answered by
+/// a repeat, and both bind. At the first commit where they differ, the second copy's append meets
+/// `key-conflict`: exactly one copy is fenced, and nothing either acknowledged is lost.
+#[test]
+fn a_shared_epoch_takeover_fences_exactly_one_copy() {
+    let ops = vec![
+        Op::Flush,
+        Op::Clone(0),
+        Op::Reopen(0),
+        Op::Reopen(1),
+        Op::Flush,
+        Op::Commit(0),
+        Op::Commit(1),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    let fenced = |i: usize| {
+        matches!(
+            world.owners[i].inst.replicator,
+            Replicator::Reset(ResetKind::Fenced)
+        )
+    };
+    let streaming = |i: usize| {
+        matches!(
+            world.owners[i].inst.replicator,
+            Replicator::Streaming { .. }
+        )
+    };
+    assert!(
+        (fenced(0) && streaming(1)) || (fenced(1) && streaming(0)),
+        "{:?} / {:?}",
+        world.owners[0].inst.replicator,
+        world.owners[1].inst.replicator
+    );
+    let counted = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
+    assert_eq!(counted(&world.coverage.repeats_won_takeover), 1);
+    assert_eq!(counted(&world.coverage.clones_fenced_key_conflict), 1);
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+}
+
+/// Another host opens a copy of owner 0's cache and takes over, while owner 0 commits: owner 0's
+/// append meets the copy's claim and it resets `fenced`, its commit kept in its log, and the copy
+/// streams.
+#[test]
+fn a_copy_taken_over_while_the_original_writes_fences_the_original() {
+    let ops = vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::CopyCache(0, false, false),
+        Op::Commit(0),
+        Op::Flush,
+        Op::Commit(1),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    assert!(
+        matches!(
+            world.owners[0].inst.replicator,
+            Replicator::Reset(ResetKind::Fenced)
+        ),
+        "{:?}",
+        world.owners[0].inst.replicator
+    );
+    assert!(
+        matches!(
+            world.owners[1].inst.replicator,
+            Replicator::Streaming { .. }
+        ),
+        "{:?}",
+        world.owners[1].inst.replicator
+    );
+    assert_eq!(world.owners[0].log.commits.len(), 2);
+    assert_eq!(world.coverage.copies_took_over.load(Ordering::Relaxed), 1);
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+}
+
+/// Another host opens a copy of idle owner 0's cache offline (the residual case of the design for
+/// a copy of a live cache): the pre-check finds nothing past the acknowledged offset, the log's
+/// claim sent again meets its repeat, and the copy's claim of the next epoch binds. Owner 0's next
+/// append meets it: `fenced`.
+#[test]
+fn an_offline_copy_of_an_idle_cache_fences_the_original() {
+    let ops = vec![
+        Op::Flush,
+        Op::CopyCache(0, false, true),
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    assert!(
+        matches!(
+            world.owners[0].inst.replicator,
+            Replicator::Reset(ResetKind::Fenced)
+        ),
+        "{:?}",
+        world.owners[0].inst.replicator
+    );
+    assert!(
+        matches!(
+            world.owners[1].inst.replicator,
+            Replicator::Streaming { .. }
+        ),
+        "{:?}",
+        world.owners[1].inst.replicator
+    );
+    assert_eq!(
+        world.coverage.offline_copies_live.load(Ordering::Relaxed),
+        1
+    );
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+}
+
+/// Another host opens a copy of owner 0's cache offline; its pre-check finds nothing past the
+/// acknowledged offset and sends the log's claim again, and owner 0's commit applies before that
+/// claim lands. The repeat brings the copy's claim of the next epoch, applied after owner 0's
+/// commit: its reconcile meets that commit, `stale`, and owner 0's next append meets the copy's
+/// claim, `fenced`. Both reset, and owner 0's acknowledged commits stay in the stream.
+#[test]
+fn an_offline_copy_and_the_original_both_reset() {
+    let ops = vec![
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+        Op::CopyCache(0, false, true),
+        // The copy's HEAD, then its claim sent again.
+        Op::Deliver(0),
+        Op::Deliver(0),
+        Op::Commit(0),
+        // Owner 0's append applies first.
+        Op::Deliver(1),
+        Op::Flush,
+        Op::Commit(0),
+        Op::Flush,
+    ];
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &ops {
+        world.step(op);
+    }
+    assert!(
+        matches!(
+            world.owners[0].inst.replicator,
+            Replicator::Reset(ResetKind::Fenced)
+        ),
+        "{:?}",
+        world.owners[0].inst.replicator
+    );
+    assert!(
+        matches!(
+            world.owners[1].inst.replicator,
+            Replicator::Reset(ResetKind::Stale)
+        ),
+        "{:?}",
+        world.owners[1].inst.replicator
+    );
+    assert_eq!(
+        world.coverage.offline_copies_stale.load(Ordering::Relaxed),
+        1
+    );
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
 }

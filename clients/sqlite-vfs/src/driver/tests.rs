@@ -6020,3 +6020,226 @@ fn a_reader_open_in_progress_does_not_keep_an_owner_reopen_from_the_root() {
     let reader = w.c(o).take_opened(open).unwrap().unwrap();
     assert_eq!(reader.handle.role, Role::Reader);
 }
+
+/// Copies every file under `from` to the same path under `to`, as a host copying a cache directory
+/// does (design: Clones, a copy that breaks the host contract): the generations, their logs and
+/// db files, and the root's lock file, which locks nothing once copied.
+fn copy_root(from: &Path, to: &Path) {
+    for (path, bytes) in files(from) {
+        let target = to.join(path.strip_prefix(from).unwrap());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, bytes).unwrap();
+    }
+}
+
+/// Another host opens a copy of a live owner's cache: the copy's generation (same lineage, its
+/// log as copied) takes over above the original's claim. The original's next append meets that
+/// claim and resets `fenced`, keeping its commit in its log, and every commit it acknowledged stays
+/// in the stream under the copy's.
+#[test]
+fn a_copy_of_a_live_cache_takes_over_and_the_original_is_fenced_losing_nothing() {
+    let (dir_a, dir_b) = (TempDir::new("driver-copy-a"), TempDir::new("driver-copy-b"));
+    let mut w = World::new();
+    let a = w.core();
+    let bound_a = w.open(a, spec(dir_a.path(), 1));
+    let c1 = w.commit(a, &bound_a, 1).unwrap();
+    w.run_for(2_000);
+    assert_eq!(bound_a.handle.pending_bytes(), 0);
+    copy_root(dir_a.path(), dir_b.path());
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    assert_eq!(bound_b.handle.attach, Attach::Resumed);
+    assert_eq!(
+        bound_b.handle.generation.lineage,
+        bound_a.handle.generation.lineage
+    );
+    let c2 = w.commit(a, &bound_a, 2).unwrap();
+    w.run_for(10_000);
+    assert_eq!(w.resets(a), vec![ResetKind::Fenced]);
+    assert!(
+        log_records(&bound_a.handle.generation.dir)
+            .contains(&RecordBody::Commit { frame: c2.clone() })
+    );
+    let d1 = w.commit(b, &bound_b, 3).unwrap();
+    let ticket = w.sync(b, bound_b.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(b, ticket), Some(Ok(())));
+    assert!(w.resets(b).is_empty());
+    assert_eq!(w.stream_commits(), vec![c1, d1]);
+}
+
+/// A copy taken while the original's commit was still pending carries that commit in its log; the
+/// original acknowledges it after the copy. The copy's takeover finds it in the stream at its
+/// commit id with its bytes, acknowledges it, and sends it no second time.
+#[test]
+fn a_copy_carrying_a_commit_the_original_acknowledged_since_matches_it_and_resends_nothing() {
+    let (dir_a, dir_b) = (
+        TempDir::new("driver-copy-pending-a"),
+        TempDir::new("driver-copy-pending-b"),
+    );
+    let mut w = World::new();
+    let a = w.core();
+    let bound_a = w.open(a, spec(dir_a.path(), 1));
+    w.down[a] = true;
+    let c1 = w.commit(a, &bound_a, 1).unwrap();
+    copy_root(dir_a.path(), dir_b.path());
+    w.down[a] = false;
+    w.run_for(10_000);
+    assert_eq!(bound_a.handle.pending_bytes(), 0);
+    assert_eq!(w.stream_commits(), vec![c1.clone()]);
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    assert_eq!(
+        bound_b.handle.generation.lineage,
+        bound_a.handle.generation.lineage
+    );
+    let ticket = w.sync(b, bound_b.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(b, ticket), Some(Ok(())));
+    assert!(w.resets(b).is_empty(), "{:?}", w.resets(b));
+    assert_eq!(bound_b.handle.pending_bytes(), 0);
+    assert!(
+        w.appends(b)
+            .iter()
+            .all(|(_, seq, body)| *seq == 0 || *body != c1),
+        "the copy resent the commit"
+    );
+    assert_eq!(w.stream_commits(), vec![c1]);
+}
+
+/// Two copies of one cache open on one activation (`spec(dir, 1)` on both): their takeovers claim
+/// one epoch with byte-identical claims, so the second wins by a repeat and both bind, and both
+/// `synced()` calls resolve on the same state. At the first commit where they differ, the second
+/// copy's append meets `key-conflict`: exactly one copy is fenced, its commit never acknowledged.
+#[test]
+fn two_copies_on_one_activation_share_an_epoch_until_a_divergent_commit_fences_one() {
+    let (dir_a, dir_b) = (
+        TempDir::new("driver-shared-epoch-a"),
+        TempDir::new("driver-shared-epoch-b"),
+    );
+    let mut w = World::new();
+    let (_, own, c1) = crashed_owner(&mut w, dir_a.path(), 1);
+    copy_root(dir_a.path(), dir_b.path());
+    let a = w.core();
+    let bound_a = w.open(a, spec(dir_a.path(), 1));
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 1));
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, a), vec![next]);
+    assert_eq!(claimed(&w, b), vec![next]);
+    let (ticket_a, ticket_b) = (w.sync(a, bound_a.binding), w.sync(b, bound_b.binding));
+    w.run_for(1_000);
+    assert_eq!(w.outcome(a, ticket_a), Some(Ok(())));
+    assert_eq!(w.outcome(b, ticket_b), Some(Ok(())));
+    let x = w.commit(a, &bound_a, 2).unwrap();
+    w.commit(b, &bound_b, 3).unwrap();
+    w.run_for(10_000);
+    assert!(w.resets(a).is_empty(), "{:?}", w.resets(a));
+    assert_eq!(w.resets(b), vec![ResetKind::Fenced]);
+    assert_eq!(w.stream_commits(), vec![c1, x]);
+}
+
+/// A copy taken before the original wrote on, opened after the original's snapshot of their shared
+/// lineage moved retention past the copy's acknowledged offset: the snapshot names a commit above
+/// the copy's acknowledged position, which the copy cannot know the stream holds as its own, so it
+/// never trusts it and builds anew from the stream.
+#[test]
+fn a_stale_copy_below_retention_rebuilds_and_never_trusts_the_originals_snapshot() {
+    let (dir_a, dir_b) = (
+        TempDir::new("driver-copy-gone-a"),
+        TempDir::new("driver-copy-gone-b"),
+    );
+    let mut w = World::new();
+    let a = w.core();
+    let bound_a = w.open(a, spec(dir_a.path(), 1));
+    w.commit(a, &bound_a, 1).unwrap();
+    w.run_for(2_000);
+    copy_root(dir_a.path(), dir_b.path());
+    let lineage = bound_a.handle.generation.lineage;
+    let c2 = w.commit(a, &bound_a, 2).unwrap();
+    w.run_for(2_000);
+    assert_eq!(bound_a.handle.pending_bytes(), 0);
+    snapshot_as(&mut w.server, CommitId {
+        lineage,
+        position: bound_a.handle.last_commit(),
+    });
+    let b = w.core();
+    let bound_b = w.open(b, spec(dir_b.path(), 2));
+    assert_ne!(bound_b.handle.generation.lineage, lineage, "rebuilt");
+    assert_eq!(bound_b.handle.pending_bytes(), 0);
+    assert_eq!(
+        std::fs::read(bound_b.handle.generation.db()).unwrap(),
+        page_on_disk(bound_b.handle.generation.lineage, 2)
+    );
+    assert!(w.resets(b).is_empty());
+    assert_eq!(w.stream_commits().last(), Some(&c2));
+}
+
+/// A copy opened offline while the original writes on: once the stream answers, its pre-check reads
+/// the original's commit past the copy's acknowledged offset, which no record of the copy matches,
+/// and it resets `stale` with nothing sent.
+#[test]
+fn an_offline_copy_behind_the_original_goes_stale_with_nothing_sent() {
+    let (dir_a, dir_b) = (
+        TempDir::new("driver-copy-offline-a"),
+        TempDir::new("driver-copy-offline-b"),
+    );
+    let mut w = World::new();
+    let a = w.core();
+    let bound_a = w.open(a, spec(dir_a.path(), 1));
+    w.commit(a, &bound_a, 1).unwrap();
+    w.run_for(2_000);
+    copy_root(dir_a.path(), dir_b.path());
+    w.commit(a, &bound_a, 2).unwrap();
+    w.run_for(2_000);
+    let b = w.core();
+    let bound_b = open_provisionally(&mut w, b, dir_b.path());
+    w.down[b] = false;
+    w.run_for(10_000);
+    assert_eq!(w.resets(b), vec![ResetKind::Stale]);
+    assert_eq!(bound_b.handle.reset(), Some(ResetKind::Stale));
+    assert!(w.appends(b).is_empty(), "{:?}", w.appends(b));
+    assert!(w.resets(a).is_empty());
+}
+
+/// The stream is deleted under a bound owner holding an acknowledged commit and a pending one,
+/// then created again, or created and imported: the binding resets, and the reopen salvages the
+/// generation (`history_changed`) with both commits in its log.
+#[test]
+fn a_delete_then_recreate_or_import_under_a_bound_owner_salvages_every_commit() {
+    for import in [false, true] {
+        let dir = TempDir::new("driver-delete-bound");
+        let mut w = World::new();
+        let c = w.core();
+        let bound = w.open(c, spec(dir.path(), 1));
+        let acked = w.commit(c, &bound, 1).unwrap();
+        w.run_for(2_000);
+        assert_eq!(bound.handle.pending_bytes(), 0);
+        w.down[c] = true;
+        let pending = w.commit(c, &bound, 2).unwrap();
+        w.server.delete(PATH).unwrap();
+        create(&mut w.server);
+        if import {
+            import_page(&mut w.server, 0x33);
+        }
+        w.down[c] = false;
+        w.run_for(10_000);
+        assert_eq!(w.resets(c).len(), 1, "import {import}: {:?}", w.resets(c));
+        let generation = bound.handle.generation.dir.clone();
+        drop(bound);
+        w.crash(c);
+        let c2 = w.core();
+        let reopened = w.open(c2, spec(dir.path(), 2));
+        assert!(
+            matches!(reopened.handle.attach, Attach::Built {
+                salvaged: Some(Reason::HistoryChanged),
+                ..
+            }),
+            "import {import}: {:?}",
+            reopened.handle.attach
+        );
+        let s = only_salvage(&generation, Reason::HistoryChanged);
+        assert!(holds_commit(&s, &acked), "import {import}");
+        assert!(holds_commit(&s, &pending), "import {import}");
+    }
+}

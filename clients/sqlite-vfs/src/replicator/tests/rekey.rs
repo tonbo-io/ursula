@@ -971,6 +971,65 @@ fn a_provisional_claim_repeated_across_the_acknowledged_offset_resets_stream_sta
     assert!(claim_of(&actions).is_none(), "{actions:?}");
 }
 
+/// The rule over a record this generation acknowledged holds only for a repeat of a claim sent
+/// again. A claim sent again that applies afresh below the acknowledged offset, and a new
+/// continuation claim (not sent again) whose repeat receipt lies below it, name bytes the stream
+/// holds where this generation acknowledged its own: `stream_state`, with no claim after them.
+#[test]
+fn a_receipt_below_the_acknowledged_offset_resets_stream_state_unless_a_resent_claims_repeat() {
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), CLAIM, None));
+    let actions = h.answer(&producer(&receipt(Delivery::Applied, 3, 0, 0, CLAIM, None)));
+    assert_eq!(
+        reset_of(&actions),
+        Some(ResetKind::StreamState),
+        "{actions:?}"
+    );
+    assert!(claim_of(&actions).is_none(), "{actions:?}");
+    let mut state = local(Vec::new(), 2 * CLAIM);
+    state.claims = vec![(epoch(1), ACTIVATION)];
+    let kind = ClaimKind::Continuation {
+        own: epoch(1),
+        resent: false,
+    };
+    let (mut h, actions) = Harness::activate(kind, state);
+    assert_eq!(claim_of(&actions), Some((2, ACTIVATION)), "{actions:?}");
+    let actions = h.answer(&producer(&receipt(Delivery::Repeat, 2, 0, 0, CLAIM, None)));
+    assert_eq!(
+        reset_of(&actions),
+        Some(ResetKind::StreamState),
+        "{actions:?}"
+    );
+    assert!(claim_of(&actions).is_none(), "{actions:?}");
+}
+
+/// The log holds `(3, PRIOR)` and this open runs under another activation. A CLAIM frame of PRIOR
+/// is ours at any epoch (design: Claims, a claim frame whose activation is in the log is ours), so
+/// a later PRIOR claim after a foreign one supersedes it and the claim goes out again; after a
+/// foreign claim and a commit of its writer, the later PRIOR claim does not make that commit ours:
+/// `stale`, with nothing sent.
+#[test]
+fn a_later_claim_of_an_activation_in_the_log_supersedes_a_foreign_claim_but_not_its_commits() {
+    let foreign = frame::encode_claim(epoch(4), FOREIGN);
+    let later = frame::encode_claim(epoch(5), PRIOR);
+    let commit_frame = commit(crate::ids::Lineage([0x22; 16]), 1, 9).frame;
+    let cases: [(Vec<u8>, Option<ResetKind>); 2] = [
+        ([foreign.clone(), later.clone()].concat(), None),
+        (
+            [foreign, commit_frame.to_vec(), later].concat(),
+            Some(ResetKind::Stale),
+        ),
+    ];
+    for (body, reset) in cases {
+        let mut h = provisional(Vec::new());
+        let tail = CLAIM + u64::try_from(body.len()).unwrap();
+        h.answer(&head(token(), tail, None));
+        let actions = h.answer(&read(&body, tail));
+        assert_eq!(reset_of(&actions), reset, "{actions:?}");
+        assert_eq!(claim_of(&actions).is_some(), reset.is_none(), "{actions:?}");
+    }
+}
+
 /// `receipt-evicted` for the claim sent again: its digest is ours, and later writes under it
 /// evicted its receipt, so it applied before and the next epoch follows. `producer-expired` naming
 /// its epoch, the pre-check without its frame, proves nothing about whose record retired: the
