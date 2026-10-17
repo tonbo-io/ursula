@@ -647,7 +647,13 @@ async fn power_loss_mid_rewrite(cut: RewriteCut, fsync: WalFsync) {
             }
         }
     }
-    journal.maintain_until_clean(&writer, Instant::now()).await;
+    // A purge made again here is new: its frames free their segments once
+    // they are old.
+    let now = Instant::now();
+    writer.maintain(now, MAX_AGE).await.expect("a pass");
+    journal
+        .maintain_until_clean(&writer, later(now, MAX_AGE))
+        .await;
     assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{context}");
     assert_eq!(log_ids(&removed).await, Vec::<u64>::new(), "{context}");
 }
