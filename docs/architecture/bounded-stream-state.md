@@ -164,7 +164,7 @@ A snapshot body above the staging threshold (the smaller of `external_payload_mi
 
 ### F17: hardening
 
-- **WAL reclaim.** The segmented journal deletes sealed segments no group needs, and once it holds more than twice its live bytes it frees the oldest segment by rewriting small remainders forward and reporting groups with large ones as lagging (`ursula-raft/src/log_store/reclaim.rs`, [`raft-wal.md`](raft-wal.md)). F12e snapshots lagging groups first, and their purge frees the segment.
+- **WAL reclaim.** The segmented journal deletes sealed segments no group needs, and once it holds more than twice its live bytes it frees the oldest segment by rewriting small remainders forward and reporting groups with large ones as lagging (`ursula-raft/src/log_store/reclaim.rs`, [`raft-wal.md`](raft-wal.md)). F12e snapshots lagging groups first, and their purge frees the segment. A segment that held dead entries for a quarter of `raft.deleted_data_max_age` is freed the same way though the journal is within its budget (#669), driven by the snapshot driver's tick at most an eighth segment per core per tick. A lagging group that applied nothing since its snapshot is purged through it.
 - **Admin copies.** Group snapshot export takes one transient copy of the group per call, bounded by call rate.
 
 ### F18: cold coverage derived from the hot buffer

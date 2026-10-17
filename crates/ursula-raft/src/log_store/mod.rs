@@ -8,8 +8,9 @@
 //!   each live entry's frame is, and a bounded cache of recent entries.
 //! - `segment`: the segment files of a core journal: naming, recovery across
 //!   segments, rotation and deletion.
-//! - `reclaim`: which segments a reclaim pass deletes or rewrites, and which
-//!   groups it reports lagging.
+//! - `reclaim`: which segments a reclaim pass deletes or rewrites, for the
+//!   journal's size or for how long they held dead frames, and which groups
+//!   it reports lagging.
 //! - `journal`: the framed, checksummed format of one segment.
 //! - `frozen`: immutable payload archives and validated journal references for stopped groups.
 //! - `core_meta`: each core's metadata file: every group's vote and log
@@ -25,6 +26,8 @@
 //!   only (`cfg(test)`).
 
 mod core_meta;
+#[cfg(test)]
+mod dirty_tests;
 pub(crate) mod disk;
 mod file;
 mod frozen;

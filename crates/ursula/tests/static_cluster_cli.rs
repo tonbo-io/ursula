@@ -2041,18 +2041,30 @@ async fn group_zero_progress(
 /// Every node-local snapshot file under `wal_dir` that holds
 /// [`DELETED_MARKER`].
 fn snapshot_files_with_marker(wal_dir: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+    files_with_marker(wal_dir, |name| name.contains(".snapshot.json"))
+}
+
+/// Every file under `wal_dir`, the journal segments among them, that holds
+/// [`DELETED_MARKER`].
+fn wal_files_with_marker(wal_dir: &Path) -> Vec<PathBuf> {
+    files_with_marker(wal_dir, |_| true)
+}
+
+/// Every file under `dir` whose name `chosen` picks and that holds
+/// [`DELETED_MARKER`].
+fn files_with_marker(dir: &Path, chosen: fn(&str) -> bool) -> Vec<PathBuf> {
+    fn walk(dir: &Path, chosen: fn(&str) -> bool, found: &mut Vec<PathBuf>) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             return;
         };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                walk(&path, found);
+                walk(&path, chosen, found);
             } else if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.contains(".snapshot.json"))
+                .is_some_and(chosen)
                 && std::fs::read(&path).is_ok_and(|bytes| {
                     bytes
                         .windows(DELETED_MARKER.len())
@@ -2064,15 +2076,16 @@ fn snapshot_files_with_marker(wal_dir: &Path) -> Vec<PathBuf> {
         }
     }
     let mut found = Vec::new();
-    walk(wal_dir, &mut found);
+    walk(dir, chosen, &mut found);
     found
 }
 
 /// #669: within `raft.deleted_data_max_age` of a stream's deletion, each
-/// replica's current snapshot no longer holds it and its Raft log is purged
-/// through that snapshot. Inline snapshots: the snapshot file in each
-/// node's Raft log directory is the whole snapshot. The WAL's segment files
-/// are bounded by a later change.
+/// replica's current snapshot no longer holds it, its Raft log is purged
+/// through that snapshot, and no file in its Raft log directory holds the
+/// stream's records: neither the snapshot file, which is the whole snapshot
+/// with inline snapshots, nor a journal segment. Small segments, so the
+/// records sit in sealed segments that quiet groups still pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -2113,7 +2126,8 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
                 "init_membership_per_group = false\n",
                 "init_membership_per_group = false\ndeleted_data_max_age = \"90s\"\n\
                  install_snapshot_timeout = \"10s\"\n",
-            ),
+            )
+            .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n"),
         )
         .expect("write node config");
         admins.push(format!("http://127.0.0.1:{admin_port}"));
@@ -2205,7 +2219,7 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
             let scrubbed = applied >= Some(removal_index)
                 && snapshot >= Some(removal_index)
                 && purged >= snapshot
-                && snapshot_files_with_marker(&wal_dirs[index]).is_empty()
+                && wal_files_with_marker(&wal_dirs[index]).is_empty()
                 && metrics["raft_deleted_data_oldest_age_ms"] == 0;
             if !scrubbed {
                 still.push(index);

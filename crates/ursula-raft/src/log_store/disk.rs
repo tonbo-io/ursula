@@ -23,6 +23,7 @@ use std::io::Seek;
 use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 #[cfg(not(madsim))]
 use fs4::fs_std::FileExt;
@@ -66,6 +67,10 @@ pub trait JournalDisk {
     fn remove_file(path: &Path) -> io::Result<()>;
     /// `fsync`s the directory at `path`, making its entries durable.
     fn sync_dir(path: &Path) -> io::Result<()>;
+    /// When the file at `path` was last written, on [`JournalDisk::wall_clock`].
+    fn modified(path: &Path) -> io::Result<SystemTime>;
+    /// The wall clock [`JournalDisk::modified`] reads.
+    fn wall_clock() -> SystemTime;
     /// Tries to take the exclusive lock at `path` without blocking.
     fn try_lock(path: &Path) -> io::Result<LockAttempt<Self::Lock>>;
     /// The id of the current boot of the host that holds `path`, or `None`
@@ -194,6 +199,14 @@ impl JournalDisk for OsDisk {
 
     fn sync_dir(path: &Path) -> io::Result<()> {
         File::open(path)?.sync_all()
+    }
+
+    fn modified(path: &Path) -> io::Result<SystemTime> {
+        fs::metadata(path)?.modified()
+    }
+
+    fn wall_clock() -> SystemTime {
+        SystemTime::now()
     }
 
     fn try_lock(path: &Path) -> io::Result<LockAttempt<OsJournalLock>> {

@@ -407,6 +407,7 @@ runtime_metrics! {
     sum wal_segments: core per_core_wal_segments;
     sum wal_pinned_segments: core per_core_wal_pinned_segments;
     sum wal_lagging_groups: core per_core_wal_lagging_groups;
+    sum wal_dirty_segments: core per_core_wal_dirty_segments;
     sum wal_cache_hits: core per_core_wal_cache_hits, group per_group_wal_cache_hits;
     sum wal_cache_misses: core per_core_wal_cache_misses, group per_group_wal_cache_misses;
     sum wal_disk_reads: core per_core_wal_disk_reads, group per_group_wal_disk_reads;
@@ -717,6 +718,8 @@ impl RuntimeMetricsInner {
             .store_at(core_index, sample.pinned_segments);
         self.per_core_wal_lagging_groups
             .store_at(core_index, sample.lagging_groups);
+        self.per_core_wal_dirty_segments
+            .store_at(core_index, sample.dirty_segments);
     }
 
     pub(crate) fn record_wal_read(
@@ -1200,6 +1203,8 @@ mod metric_manifest_tests {
         "per_core_wal_pinned_segments",
         "wal_lagging_groups",
         "per_core_wal_lagging_groups",
+        "wal_dirty_segments",
+        "per_core_wal_dirty_segments",
         "wal_cache_hits",
         "per_core_wal_cache_hits",
         "per_group_wal_cache_hits",
@@ -1466,6 +1471,9 @@ pub struct WalJournalSample {
     pub pinned_segments: u64,
     /// Gauge: groups reported lagging to the snapshot driver.
     pub lagging_groups: u64,
+    /// Gauge: segments that hold dead frames, of entries purged, truncated,
+    /// written again or copied away (#669).
+    pub dirty_segments: u64,
 }
 
 /// What a read of a group's log cost.

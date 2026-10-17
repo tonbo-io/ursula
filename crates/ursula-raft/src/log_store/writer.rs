@@ -34,6 +34,16 @@
 //! and reports the groups that keep it alive with more to [`LaggingGroups`],
 //! which the snapshot driver reads.
 //!
+//! The writer also tracks which segments hold dead frames, those of entries
+//! purged, truncated, written again or copied away by a rewrite (#669). The
+//! snapshot driver's tick sends each writer a [`CoreWriteOp::Maintain`]: the
+//! writer stamps the deaths it learned of since the last one with the tick's
+//! time, seals its active segment once that segment has held dead frames for
+//! the tick's maximum age, and frees segments that held them that long,
+//! copying at most a pass's budget per tick. The writer has no timer of its
+//! own. At open, replay finds the dead frames again, a segment's age comes
+//! from its modification time, and a dirty newest segment is sealed.
+//!
 //! Errors are fail-stop. A failed write or `fsync` of the journal, a
 //! rotation, a rewrite or a directory, or a frame that fails verification,
 //! poisons the writer: the request that hit it and every later one fail. A
@@ -103,9 +113,13 @@ use super::journal::JournalWriter;
 use super::journal::RecordTooLarge;
 use super::journal::WRITE_BUFFER_BYTES;
 use super::reclaim;
+use super::reclaim::AgeRule;
+use super::reclaim::DirtySince;
+use super::reclaim::FreeCause;
 use super::reclaim::GroupPin;
 use super::reclaim::JournalShape;
 use super::reclaim::ReclaimLimits;
+use super::reclaim::Rewrite;
 use super::run_state::RecoveryState;
 use super::run_state::RunStateFile;
 use super::run_state::RunStatus;
@@ -173,12 +187,6 @@ impl JournalTuning {
     /// Target encoded size of the entries in one rewritten Append frame.
     fn rewrite_chunk_bytes(&self) -> u64 {
         (self.segment_bytes() / 16).clamp(256, 1024 * 1024)
-    }
-
-    /// Live bytes one reclaim pass rewrites at most, so a pass never holds
-    /// the writer for long.
-    fn rewrite_pass_bytes(&self) -> u64 {
-        (self.segment_bytes() / 8).max(1024)
     }
 }
 
@@ -516,6 +524,13 @@ pub(crate) enum CoreWriteOp {
     /// gate stays closed across restarts until a leader's barrier or a new
     /// plan (m2, #581 review).
     DropPlan { group_id: u32 },
+    /// The snapshot driver's tick (#669): a maintenance pass as of `now` on
+    /// the driver's clock, which frees segments that have held dead frames
+    /// for `max_dirty_age`. It is answered once the pass ran.
+    Maintain {
+        now: Instant,
+        max_dirty_age: Duration,
+    },
 }
 
 /// What one request's write cost, as reported to its group's metrics.
@@ -607,6 +622,7 @@ impl CoreFileLogWriter {
             return Err(error.into());
         }
         let recovered = recovered?;
+        let mut died = BTreeSet::new();
         for (group_id, log) in &mut logs {
             log.finish_replay()
                 .map_err(|source| CoreJournalError::InconsistentLog {
@@ -614,6 +630,7 @@ impl CoreFileLogWriter {
                     raft_group_id: RaftGroupId(*group_id),
                     source: Arc::new(source),
                 })?;
+            died.extend(log.take_died());
         }
         let recovery_ns = elapsed_ns(recovery_started_at);
         let recovery_bytes = recovered
@@ -715,6 +732,18 @@ impl CoreFileLogWriter {
             }
         };
         let (active, _fsyncs) = segment::open_segment(&dir, active_id)?;
+        // Replay found the dead frames again. How long they have been dead
+        // is unknown, but no longer than since their segment last changed.
+        let wall_clock = Disk::wall_clock();
+        let dirty = died
+            .into_iter()
+            .filter(|id| *id == active_id || sealed.iter().any(|(kept, _)| kept == id))
+            .map(|id| {
+                (id, DirtySince::Unstamped {
+                    age: segment_age(&dir, id, wall_clock),
+                })
+            })
+            .collect();
         let groups = Arc::new(Mutex::new(CoreGroups {
             logs: logs
                 .into_iter()
@@ -756,6 +785,9 @@ impl CoreFileLogWriter {
             reclaim_due: true,
             pinned_segments: 0,
             lagging_groups: 0,
+            dirty,
+            age: AgeRule::Off,
+            maintenance: Vec::new(),
         };
         let (exited_tx, exited) = crate::rt::sync::watch::channel(());
         let worker = spawn_core_file_log_writer(Box::new(journal), rx, exited_tx)?;
@@ -889,6 +921,18 @@ impl CoreFileLogWriter {
                 }
             }
         }
+    }
+
+    /// Runs a maintenance pass as of `now` on the snapshot driver's clock
+    /// ([`CoreWriteOp::Maintain`]), after everything sent before.
+    pub(crate) async fn maintain(
+        &self,
+        now: Instant,
+        max_dirty_age: Duration,
+    ) -> Result<(), CoreJournalError> {
+        self.write(CoreWriteOp::Maintain { now, max_dirty_age })
+            .await
+            .map(drop)
     }
 
     /// Writes and `fsync`s everything sent before, then stops the writer.
@@ -1027,6 +1071,45 @@ struct CoreJournal {
     /// lagging groups, and those groups.
     pinned_segments: u64,
     lagging_groups: u64,
+    /// The segments that hold dead frames, and since when (#669).
+    dirty: BTreeMap<SegmentId, DirtySince>,
+    /// The age rule of the last maintenance pass, which every pass plans
+    /// with until the next one.
+    age: AgeRule,
+    /// Callers of the maintenance passes the current batch asked for,
+    /// answered once the pass ran.
+    maintenance: Vec<WriteReply>,
+}
+
+/// Which pass [`maintain`] runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// The writer starts: a dirty newest segment is sealed, so a restart
+    /// never keeps dead frames in a segment that only grows.
+    Start,
+    /// After a batch: only the journal's budget rewrites.
+    AfterBatch,
+    /// The snapshot driver's tick: the age rule rotates and rewrites too.
+    Maintenance,
+}
+
+/// How old the frames of segment `id` in `dir` are at most: the time since
+/// the segment last changed on the disk's `wall_clock`. A segment whose
+/// modification time cannot be read counts as just changed.
+fn segment_age(dir: &Path, id: SegmentId, wall_clock: std::time::SystemTime) -> Duration {
+    let path = segment_path(dir, id);
+    match Disk::modified(&path) {
+        Ok(modified) => wall_clock.duration_since(modified).unwrap_or_default(),
+        Err(error) => {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "read the modification time of an OpenRaft journal segment; its dead frames \
+                 count as new"
+            );
+            Duration::ZERO
+        }
+    }
 }
 
 /// The state of a core journal's writer.
@@ -1048,7 +1131,7 @@ async fn run_core_file_log_writer(
     mut rx: mpsc::UnboundedReceiver<CoreWriterRequest>,
 ) {
     // Startup reclaim: segments the recovered groups no longer need go now.
-    let mut state = maintain(journal);
+    let mut state = maintain(journal, Pass::Start);
     while let Some(first) = rx.recv().await {
         let fsync = match &state {
             WriterState::Open(journal) => journal.context.tuning.fsync,
@@ -1065,7 +1148,7 @@ async fn run_core_file_log_writer(
         }
         state = match state {
             WriterState::Open(journal) => match write_core_log_batch(journal, batch.writes) {
-                WriterState::Open(journal) => maintain(journal),
+                WriterState::Open(journal) => maintain(journal, Pass::AfterBatch),
                 poisoned @ WriterState::Poisoned { .. } => poisoned,
             },
             WriterState::Poisoned { dir, cause } => {
@@ -1260,7 +1343,7 @@ impl CoreJournal {
     /// Applies a written record to its group's log, and reports what the
     /// log then holds in memory.
     fn apply(
-        &self,
+        &mut self,
         log: &Mutex<GroupLog>,
         record: RaftGroupLogRecord,
         at: FramePos,
@@ -1272,10 +1355,44 @@ impl CoreJournal {
                 offset: at.loc.offset,
                 source,
             })?;
-        Ok(WalMemorySample {
+        let memory = WalMemorySample {
             cache_bytes: log.cache_bytes(),
             indexed_entries: log.indexed_entries(),
-        })
+        };
+        let died = log.take_died();
+        drop(log);
+        self.note_died(died);
+        Ok(memory)
+    }
+
+    /// Records that `segments` hold dead frames, from now if they held none:
+    /// the next maintenance pass stamps them.
+    fn note_died(&mut self, segments: BTreeSet<SegmentId>) {
+        for segment in segments {
+            self.dirty.entry(segment).or_insert(DirtySince::Unstamped {
+                age: Duration::ZERO,
+            });
+        }
+    }
+
+    /// The snapshot driver's tick at `now`: stamps the deaths learned of
+    /// since the last one, and plans with `max_dirty_age` from now on.
+    fn tick(&mut self, now: Instant, max_dirty_age: Duration) {
+        for since in self.dirty.values_mut() {
+            *since = since.stamped(now, max_dirty_age);
+        }
+        self.age = if ursula_stream::sim_controls::off(
+            ursula_stream::sim_controls::Defence::WalDirtyAge,
+        ) {
+            AgeRule::Off
+        } else {
+            AgeRule::At { now, max_dirty_age }
+        };
+    }
+
+    /// The segments that hold dead frames.
+    fn dirty_segments(&self) -> u64 {
+        u64::try_from(self.dirty.len()).unwrap_or(u64::MAX)
     }
 
     /// Seals the active segment and starts the next one. Returns the number
@@ -1305,10 +1422,40 @@ impl CoreJournal {
         Ok(())
     }
 
+    /// Rotates once the active segment reached its target size, and in
+    /// `pass` once it holds dead frames: at the writer's start, or in a
+    /// maintenance pass once they are as old as the age rule frees (#669).
+    fn rotate_if_due(
+        &mut self,
+        pass: Pass,
+        sample: &mut WalJournalSample,
+    ) -> Result<(), JournalError> {
+        let since = self.dirty.get(&self.active_id()).copied();
+        let dirty = match pass {
+            Pass::Start => since.is_some(),
+            Pass::AfterBatch => false,
+            Pass::Maintenance => reclaim::rotates_active(self.age, since),
+        };
+        if !dirty {
+            return self.rotate_if_full(sample);
+        }
+        if pass == Pass::Maintenance {
+            ursula_stream::sim_controls::note_fired(
+                ursula_stream::sim_controls::Defence::WalDirtyAge,
+            );
+        }
+        let fsyncs = self.rotate()?;
+        sample.rotations = sample.rotations.saturating_add(1);
+        sample.fsyncs = sample.fsyncs.saturating_add(fsyncs);
+        self.reclaim_due = true;
+        Ok(())
+    }
+
     /// One reclaim pass: delete segments no group needs, then rewrite the
     /// small remainders out of the oldest segment when the journal is over
-    /// its budget, and report the lagging groups.
-    fn reclaim(&mut self, sample: &mut WalJournalSample) -> Reclaim {
+    /// its budget or, in a maintenance pass, when a kept segment held dead
+    /// frames too long, and report the lagging groups.
+    fn reclaim(&mut self, pass: Pass, sample: &mut WalJournalSample) -> Reclaim {
         let started_at = Instant::now();
         let active = self.active_id();
         let mut pins = Vec::new();
@@ -1333,13 +1480,22 @@ impl CoreJournal {
                 active_bytes: self.active.len(),
                 live_bytes,
                 pins: &pins,
+                dirty: &self.dirty,
+                age: self.age,
             },
             ReclaimLimits::for_segment_bytes(self.context.tuning.segment_bytes()),
         );
         self.context.lagging.set(self.context.core, &plan.lagging);
         self.lagging_groups = u64::try_from(plan.lagging.len()).unwrap_or(u64::MAX);
         self.pinned_segments = plan.pinned_segments;
-        self.reclaim_due = plan.rewrite.is_some();
+        // Rewrites for the age of dead frames run only on the driver's tick,
+        // so they copy at most a pass's budget per tick however busy the
+        // core is.
+        let rewrite = plan.rewrite.filter(|rewrite| match rewrite.cause {
+            FreeCause::OverBudget => true,
+            FreeCause::DirtyAge => pass == Pass::Maintenance,
+        });
+        self.reclaim_due = rewrite.is_some();
         let mut outcome = Reclaim::Done;
         if !plan.delete.is_empty() {
             // A segment's deletion becomes durable only after the records
@@ -1360,6 +1516,9 @@ impl CoreJournal {
                 .drain(..removed.min(self.sealed.len()))
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>();
+            for id in &removed_ids {
+                self.dirty.remove(id);
+            }
             sample.reclaims = sample.reclaims.saturating_add(deleted.segments);
             sample.reclaimed_bytes = sample.reclaimed_bytes.saturating_add(deleted.bytes);
             if deleted.segments != 0 {
@@ -1407,8 +1566,13 @@ impl CoreJournal {
                 }
             }
         }
-        if let (Reclaim::Done, Some((target, groups))) = (&outcome, plan.rewrite) {
-            outcome = self.rewrite(target, &groups, sample);
+        if let (Reclaim::Done, Some(rewrite)) = (&outcome, rewrite) {
+            if rewrite.cause == FreeCause::DirtyAge {
+                ursula_stream::sim_controls::note_fired(
+                    ursula_stream::sim_controls::Defence::WalDirtyAge,
+                );
+            }
+            outcome = self.rewrite(&rewrite, sample);
         }
         if matches!(outcome, Reclaim::Done)
             && let Some(error) = garbage_error
@@ -1424,12 +1588,9 @@ impl CoreJournal {
     /// durable and points each group's log at them. A group's entries are
     /// copied in chunks from its newest down, so whatever a pass copied
     /// replays next to entries already present.
-    fn rewrite(
-        &mut self,
-        target: SegmentId,
-        groups: &[u32],
-        sample: &mut WalJournalSample,
-    ) -> Reclaim {
+    fn rewrite(&mut self, rewrite: &Rewrite, sample: &mut WalJournalSample) -> Reclaim {
+        let target = rewrite.target;
+        let groups = rewrite.groups.as_slice();
         let path = segment_path(&self.context.dir, target);
         let mut file = match Disk::open_read(&path) {
             Ok(file) => file,
@@ -1438,7 +1599,7 @@ impl CoreJournal {
                 return Reclaim::Abandoned(JournalError::io(&path, JournalOp::Open, source));
             }
         };
-        let budget = self.context.tuning.rewrite_pass_bytes();
+        let budget = rewrite.budget;
         let chunk_bytes = self.context.tuning.rewrite_chunk_bytes();
         let mut moves = Vec::<Moved>::new();
         let mut copied = 0_u64;
@@ -1660,6 +1821,10 @@ impl CoreJournal {
                 Moved::Committed { from, to, .. } => log.relocate_committed(from, to),
                 Moved::Purged { from, to, .. } => log.relocate_purged(from, to),
             }
+            // The originals are dead now: copied away.
+            let died = log.take_died();
+            drop(log);
+            self.note_died(died);
         }
         sample.rewritten_bytes = sample.rewritten_bytes.saturating_add(copied);
         sample.frozen_reference_rewritten_bytes = sample
@@ -1861,7 +2026,19 @@ fn write_core_log_batch(
     let mut metadata_changed = false;
     let mut batch = batch.into_iter();
     while let Some(request) = batch.next() {
+        let request = match request {
+            CoreFileLogWrite {
+                op: CoreWriteOp::Maintain { now, max_dirty_age },
+                reply,
+            } => {
+                journal.tick(now, max_dirty_age);
+                journal.maintenance.push(reply);
+                continue;
+            }
+            request => request,
+        };
         let position = match &request.op {
+            CoreWriteOp::Maintain { .. } => None,
             CoreWriteOp::Vote { group_id, vote } => {
                 metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= journal.metadata.set_vote(*group_id, *vote);
@@ -2052,15 +2229,23 @@ fn write_core_log_batch(
 }
 
 /// Rotates a full segment and runs a reclaim pass when one is due, after
-/// the batch was acknowledged, and records what they did.
-fn maintain(mut journal: Box<CoreJournal>) -> WriterState {
+/// the batch was acknowledged, and records what they did. A batch that
+/// carried a [`CoreWriteOp::Maintain`] makes it a maintenance pass, which
+/// always reclaims, and whose callers it answers once it ran.
+fn maintain(mut journal: Box<CoreJournal>, pass: Pass) -> WriterState {
+    let pass = if journal.maintenance.is_empty() {
+        pass
+    } else {
+        Pass::Maintenance
+    };
+    let waiting = std::mem::take(&mut journal.maintenance);
     let mut sample = WalJournalSample::default();
-    let mut outcome = match journal.rotate_if_full(&mut sample) {
+    let mut outcome = match journal.rotate_if_due(pass, &mut sample) {
         Ok(()) => Reclaim::Done,
         Err(error) => Reclaim::Poisoned(error),
     };
-    if matches!(outcome, Reclaim::Done) && journal.reclaim_due {
-        outcome = journal.reclaim(&mut sample);
+    if matches!(outcome, Reclaim::Done) && (journal.reclaim_due || pass == Pass::Maintenance) {
+        outcome = journal.reclaim(pass, &mut sample);
     }
     sample.physical_bytes = journal.physical_bytes();
     sample.segments = u64::try_from(journal.sealed.len())
@@ -2068,6 +2253,7 @@ fn maintain(mut journal: Box<CoreJournal>) -> WriterState {
         .saturating_add(1);
     sample.pinned_segments = journal.pinned_segments;
     sample.lagging_groups = journal.lagging_groups;
+    sample.dirty_segments = journal.dirty_segments();
     match outcome {
         Reclaim::Done => {}
         Reclaim::Abandoned(error) => {
@@ -2086,6 +2272,15 @@ fn maintain(mut journal: Box<CoreJournal>) -> WriterState {
             }
             let cause = Arc::new(error);
             on_journal_poisoned(&journal.context, &cause);
+            for reply in waiting {
+                send_reply(
+                    reply,
+                    Err(CoreJournalError::WriterPoisoned {
+                        journal: journal.context.dir.clone(),
+                        cause: cause.clone(),
+                    }),
+                );
+            }
             return WriterState::Poisoned {
                 dir: journal.context.dir.clone(),
                 cause,
@@ -2094,6 +2289,20 @@ fn maintain(mut journal: Box<CoreJournal>) -> WriterState {
     }
     if let Some(metrics) = &journal.context.metrics {
         metrics.record_wal_journal(journal.context.core, sample);
+    }
+    for reply in waiting {
+        send_reply(
+            reply,
+            Ok(CoreFileLogWriteTiming {
+                write_ns: 0,
+                sync_ns: 0,
+                storage: WalStorageSample {
+                    physical_bytes: journal.physical_bytes(),
+                    ..WalStorageSample::default()
+                },
+                memory: None,
+            }),
+        );
     }
     WriterState::Open(journal)
 }

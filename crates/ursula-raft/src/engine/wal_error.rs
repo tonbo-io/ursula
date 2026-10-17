@@ -30,7 +30,8 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
     match error {
         RaftWalError::OpenCore { source, .. }
         | RaftWalError::OpenGroup { source, .. }
-        | RaftWalError::CloseJournal { source, .. } => core_failure(source),
+        | RaftWalError::CloseJournal { source, .. }
+        | RaftWalError::MaintainJournal { source, .. } => core_failure(source),
         RaftWalError::TopologyMismatch { .. }
         | RaftWalError::MissingTopology { .. }
         | RaftWalError::ClusterIdMismatch { .. } => WalOpenFailureKind::InvalidConfiguration,

@@ -420,6 +420,14 @@ pub enum RaftWalError {
         #[source]
         source: super::CoreJournalError,
     },
+    /// A maintenance pass of a core's journal could not be asked for: its
+    /// writer stopped or is poisoned.
+    #[error("maintain the journal of core {core}: {source}")]
+    MaintainJournal {
+        core: u16,
+        #[source]
+        source: super::CoreJournalError,
+    },
     #[error("Raft WAL state mutex poisoned")]
     LockPoisoned,
 }

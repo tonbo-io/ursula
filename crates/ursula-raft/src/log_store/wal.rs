@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::time::Duration;
 
 use futures_util::future::join_all;
 use ursula_config::WalFsync;
@@ -25,6 +26,7 @@ use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
 use crate::log_store::WriterExited;
 use crate::log_store::core_dir;
+use crate::rt::time::Instant;
 
 /// The open writer of one core's journal, if any, and the signal that its
 /// worker stopped, which outlives the writer's last handle.
@@ -217,6 +219,47 @@ impl RaftWal {
         let core_writer = self.core_writer(placement, metrics.clone())?;
         RaftGroupFileLogStore::open(placement, metrics, core_writer)
             .map_err(|source| RaftWalError::OpenGroup { placement, source })
+    }
+
+    /// Runs one maintenance pass of every open core journal, as of `now` on
+    /// the snapshot driver's clock (#669): each writer stamps the dead
+    /// frames it learned of since its last pass with `now`, seals its active
+    /// segment once that segment has held dead frames for `max_dirty_age`,
+    /// and frees the oldest kept segment while a kept segment has, copying
+    /// at most its pass budget. The writers have no timer of their own: the
+    /// snapshot driver's tick calls this. Returns once every pass ran, with
+    /// the first writer that could not take one. A WAL that shut down has
+    /// nothing to maintain.
+    pub async fn maintain(
+        &self,
+        now: Instant,
+        max_dirty_age: Duration,
+    ) -> Result<(), RaftWalError> {
+        let slots = match &*self
+            .core_writers
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+        {
+            CoreWriterSlots::Running(slots) => slots.clone(),
+            CoreWriterSlots::ShutDown => return Ok(()),
+        };
+        let mut writers = Vec::with_capacity(slots.len());
+        for (core, slot) in slots {
+            let slot = slot
+                .lock()
+                .map_err(|_poisoned| RaftWalError::LockPoisoned)?;
+            writers.extend(slot.writer.upgrade().map(|writer| (core, writer)));
+        }
+        let passes = join_all(writers.iter().map(|(core, writer)| async move {
+            writer.maintain(now, max_dirty_age).await.map_err(|source| {
+                RaftWalError::MaintainJournal {
+                    core: *core,
+                    source,
+                }
+            })
+        }))
+        .await;
+        passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
     }
 
     /// Ends this run cleanly: closes every core writer, each of which

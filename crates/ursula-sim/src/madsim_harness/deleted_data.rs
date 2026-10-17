@@ -8,10 +8,13 @@
 //! purged. On each replica, from when it applied the removal, within the
 //! bound: its current snapshot holds neither the stream nor the marker, no
 //! entry its log retains holds the marker, and a read of the stream answers
-//! not found. Seeds stop a follower across the removal, stop the leader
-//! right after it, or cut a replica's power right after the snapshot that
-//! covers the removal. A replica's time counts from when it applies the
-//! removal, again after it restarts.
+//! not found. From the last time it applied the removal, again as it replays
+//! its log after a restart, within the bound: (a) no file under its WAL
+//! root, a journal segment or another, holds the marker. Seeds stop a
+//! follower across the removal, stop the leader right after it, or cut a
+//! replica's power right after the snapshot that covers the removal. A
+//! replica's time counts from when it applies the removal, again after it
+//! restarts.
 //!
 //! A second scenario interleaves an operator's snapshot with a purge
 //! through a covering snapshot that the leader defers while a slow
@@ -32,6 +35,9 @@
 //!   snapshot that dropped the stream and the purge through it does not
 //!   purge through the snapshot it restores, so its log keeps the records.
 //!   With the purge on ([`Controls::CRASH_BEFORE_PURGE`]) the bound holds.
+//! - [`Controls::WAL_AGE_OFF`]: the log drops the records, but a journal
+//!   segment that held their dead frames is freed only once the journal
+//!   outgrows its budget, so a small journal keeps them in its files (a).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -39,6 +45,8 @@ use std::time::Duration;
 
 use openraft::storage::RaftLogReader;
 use ursula_config::WalFsync;
+use ursula_raft::wal::diagnostics::JournalDisk;
+use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -124,6 +132,9 @@ pub(super) struct Controls {
     /// so it crashes between the snapshot that dropped the stream and the
     /// purge through it.
     purge_after_restart: bool,
+    /// A journal segment that held dead frames is never sealed or freed for
+    /// their age.
+    wal_age_off: bool,
 }
 
 #[cfg(test)]
@@ -134,6 +145,7 @@ impl Controls {
         hold_off: false,
         restore_off: false,
         purge_after_restart: false,
+        wal_age_off: false,
     };
     pub(super) const FLOOR_OFF: Self = Self {
         floor_off: true,
@@ -157,6 +169,10 @@ impl Controls {
     pub(super) const RESTORE_OFF: Self = Self {
         restore_off: true,
         purge_after_restart: true,
+        ..Self::NONE
+    };
+    pub(super) const WAL_AGE_OFF: Self = Self {
+        wal_age_off: true,
         ..Self::NONE
     };
 }
@@ -188,6 +204,7 @@ fn set_defences(controls: Controls) {
     set_off(Defence::ScrubPurge, controls.purge_off);
     set_off(Defence::ScrubPurgeHold, controls.hold_off);
     set_off(Defence::RestorePurge, controls.restore_off);
+    set_off(Defence::WalDirtyAge, controls.wal_age_off);
     if controls.purge_after_restart {
         set_off(Defence::ScrubPurge, true);
     }
@@ -416,6 +433,27 @@ async fn log_holds_marker(cluster: &JournalCluster, node_id: u64) -> Option<Stri
     })
 }
 
+/// The first file under `node_id`'s WAL root that holds the marker: a
+/// journal segment, a snapshot file or any other.
+fn wal_file_holds_marker(cluster: &JournalCluster, node_id: u64) -> Option<String> {
+    let mut dirs = vec![cluster.wals[&node_id].root().to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = SimDisk::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("node {node_id}: list {}: {error}", dir.display()));
+        for path in entries {
+            match SimDisk::read(&path) {
+                Ok(bytes) if holds_marker(&bytes) => {
+                    return Some(format!("file {} holds the marker", path.display()));
+                }
+                Ok(_) => {}
+                // A directory.
+                Err(_not_a_file) => dirs.push(path),
+            }
+        }
+    }
+    None
+}
+
 /// What `node_id`'s replica shows of its snapshot work, for a failure.
 fn replica_state(cluster: &JournalCluster, node_id: u64) -> String {
     let raft = metrics(cluster, GROUP, node_id);
@@ -509,10 +547,12 @@ async fn check_replica(
     }
 }
 
-/// When each running replica applied the removal at `index`, as observed.
+/// When each running replica applied the removal at `index`, as observed:
+/// first, and last, which a restart resets as the replica applies it again.
 #[derive(Debug, Default)]
 struct Applied {
     at: BTreeMap<u64, madsim::time::Instant>,
+    last: BTreeMap<u64, madsim::time::Instant>,
 }
 
 impl Applied {
@@ -522,8 +562,16 @@ impl Applied {
         for node_id in NODES {
             if applied(cluster, node_id) >= Some(index) {
                 self.at.entry(node_id).or_insert(now);
+                self.last.entry(node_id).or_insert(now);
+            } else {
+                self.last.remove(&node_id);
             }
         }
+    }
+
+    /// `node_id` restarted: it applies the removal again as it replays.
+    fn restarted(&mut self, node_id: u64) {
+        self.last.remove(&node_id);
     }
 
     /// Waits `duration`, observing all along.
@@ -624,6 +672,7 @@ pub(super) async fn run_deleted_data_inner(
             });
             seen.wait(&cluster, removal_index, LEADER_DOWN).await;
             cluster.start_node(remover).await;
+            seen.restarted(remover);
         }
         Fault::PowerLossAfterSnapshot => {
             // The first replica whose snapshot covers the removal.
@@ -660,6 +709,7 @@ pub(super) async fn run_deleted_data_inner(
                 phase: "power_lost_after_covering_snapshot".to_owned(),
             });
             cluster.start_node(covered).await;
+            seen.restarted(covered);
             if controls.purge_after_restart {
                 // OpenRaft publishes the restored state from its core task,
                 // after the engine started.
@@ -696,10 +746,11 @@ pub(super) async fn run_deleted_data_inner(
     }
 
     // Every replica is checked once the bound passed since it applied the
-    // removal.
+    // removal, and its files once the bound passed since it last did.
     let mut checked = BTreeSet::new();
+    let mut files_checked = BTreeSet::new();
     let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age.saturating_mul(2);
-    while checked.len() < NODES.len() {
+    while checked.len() < NODES.len() || files_checked.len() < NODES.len() {
         seen.observe(&cluster, removal_index);
         let now = madsim::time::Instant::now();
         let due = seen
@@ -723,6 +774,28 @@ pub(super) async fn run_deleted_data_inner(
             }
             check_replica(&cluster, node_id, &mut trace, &context).await;
             checked.insert(node_id);
+        }
+        let files_due = seen
+            .last
+            .iter()
+            .filter(|(node_id, at)| {
+                !files_checked.contains(*node_id) && now >= **at + BOUND_DRIVERS.max_age
+            })
+            .map(|(node_id, _)| *node_id)
+            .collect::<Vec<_>>();
+        for node_id in files_due {
+            if let Some(held) = wal_file_holds_marker(&cluster, node_id) {
+                fail(
+                    &mut trace,
+                    BOUND_INVARIANT,
+                    "deleted_data_bound_passed",
+                    format!(
+                        "{context}: node {node_id}: {held} ({})",
+                        replica_state(&cluster, node_id)
+                    ),
+                );
+            }
+            files_checked.insert(node_id);
         }
         assert!(
             now < deadline,
@@ -974,6 +1047,19 @@ mod tests {
         let _guard = sim_test_guard();
         let message = assert_fails(520, Controls::PURGE_OFF, BOUND_INVARIANT);
         assert!(message.contains("holds the marker"), "{message}");
+    }
+
+    /// Without the age rule of the journal's dead frames, the log drops the
+    /// marked records, but the segment files that hold them stay: the small
+    /// journal never outgrows its budget (invariant (a)).
+    #[test]
+    fn negative_control_a_journal_without_its_age_rule_keeps_the_records_in_its_files() {
+        let _guard = sim_test_guard();
+        let message = assert_fails(520, Controls::WAL_AGE_OFF, BOUND_INVARIANT);
+        assert!(
+            message.contains("file") && message.contains("holds the marker"),
+            "{message}"
+        );
     }
 
     /// A replica that restarts between the snapshot that dropped the stream

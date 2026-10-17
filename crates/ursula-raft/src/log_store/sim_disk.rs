@@ -35,6 +35,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::SystemTime;
 
 use madsim::net::NetSim;
 
@@ -180,7 +181,6 @@ struct DiskState {
     power_losses: Vec<PathBuf>,
 }
 
-#[derive(Default)]
 struct Inode {
     /// Contents as the running process reads them.
     data: Vec<u8>,
@@ -188,6 +188,24 @@ struct Inode {
     durable: Vec<u8>,
     /// Pages written since the last `fsync`.
     dirty: BTreeSet<usize>,
+    /// When the contents last changed, on the simulation's wall clock.
+    modified: SystemTime,
+}
+
+impl Default for Inode {
+    fn default() -> Self {
+        Self {
+            data: Vec::new(),
+            durable: Vec::new(),
+            dirty: BTreeSet::new(),
+            modified: sim_wall_clock(),
+        }
+    }
+}
+
+/// The simulation's wall clock, which madsim advances with virtual time.
+fn sim_wall_clock() -> SystemTime {
+    madsim::time::TimeHandle::try_current().map_or(SystemTime::UNIX_EPOCH, |time| time.now_time())
 }
 
 fn current_runtime() -> Option<Weak<NetSim>> {
@@ -235,6 +253,7 @@ impl Inode {
         if start < end {
             self.dirty.extend(page_range(start, end));
         }
+        self.modified = sim_wall_clock();
     }
 
     fn append(&mut self, buf: &[u8]) {
@@ -652,6 +671,19 @@ impl JournalDisk for SimDisk {
 
     fn sync_dir(path: &Path) -> io::Result<()> {
         io_with_disk(|state| state.sync_dir(path))
+    }
+
+    fn modified(path: &Path) -> io::Result<SystemTime> {
+        io_with_disk(|state| {
+            let inode = state.resolve_file(path)?;
+            Ok(state
+                .inode(inode)
+                .map_or(SystemTime::UNIX_EPOCH, |inode| inode.modified))
+        })
+    }
+
+    fn wall_clock() -> SystemTime {
+        sim_wall_clock()
     }
 
     fn try_lock(path: &Path) -> io::Result<LockAttempt<SimJournalLock>> {
