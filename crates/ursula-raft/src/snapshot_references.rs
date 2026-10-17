@@ -5,11 +5,12 @@
 //! so installation cannot deadlock a concurrent snapshot builder.
 //!
 //! Snapshot GC (#669): the external object a replica replaces stays pinned
-//! for the GC grace G (`min(raft.deleted_data_max_age / 4, 1h)`), which covers
-//! a send of its pointer that started before the switch. Once the pin
-//! expires, the snapshot driver runs a GC pass of the group
-//! ([`SnapshotReferences::collect_garbage`]): the reference publication drops
-//! the pin, and the store prunes every object nothing names any more.
+//! for the GC grace G (`RaftConfig::snapshot_gc_grace`), which covers a send
+//! of its pointer that started before the switch. Once the pin expires, the
+//! next reference publication drops it, and the snapshot driver runs a GC
+//! pass of the group ([`SnapshotReferences::collect_garbage`]) that prunes
+//! every object nothing names any more. A node without a driver prunes after
+//! each build instead.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -27,13 +28,17 @@ use crate::rt::time::Instant;
 
 /// How long after a failed GC pass of a group the next one runs.
 const SNAPSHOT_GC_RETRY: Duration = Duration::from_secs(30);
+/// The longest G a group uses. A server's G is at most a few hours
+/// (`RaftConfig::snapshot_gc_grace`), and this clamp keeps every deadline G
+/// after an instant representable.
+const MAX_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
 #[derive(Debug)]
 pub(crate) struct SnapshotReferences {
     serial: AsyncMutex<PublicationRetry>,
     state: Mutex<ReferenceState>,
     /// G: how long a replaced current object stays pinned, and how long
-    /// after a restore the group's GC pass runs.
+    /// after an upload or a restore the group's GC pass runs.
     gc_grace: Duration,
 }
 
@@ -51,51 +56,119 @@ struct ReferenceState {
     // A terminal metadata failure may have published this candidate before
     // returning an error. Keep it beyond the failed engine's lease lifetime.
     failed_candidate: Option<SnapshotLocation>,
-    /// The objects this node replaced, pinned until they expire, and the GC
-    /// passes the group owes.
-    retiring: Vec<Retirement>,
+    /// The objects this node replaced, pinned until they expire (#669).
+    retiring: Vec<RetiringObject>,
+    /// The GC passes the group owes (#669).
+    passes: GcPasses,
 }
 
-/// What the group's snapshot GC still owes (#669).
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Retirement {
-    /// The external object that was this node's current snapshot until
-    /// another replaced it. It stays pinned until `until`, then a GC pass
-    /// drops the pin and deletes it unless another replica names it.
-    Object {
-        location: SnapshotLocation,
-        until: Instant,
-    },
-    /// A GC pass owed at `at` that pins nothing: G after a restore, whose
-    /// reconcile dropped the pins of objects retiring before the restart,
-    /// right after an install, or the retry of a failed pass.
-    Pass { at: Instant },
+/// An external object that was this node's current snapshot until another
+/// replaced it (#669). It stays pinned until it expires, then a GC pass
+/// deletes it unless another replica names or pins it.
+#[derive(Debug, Clone)]
+struct RetiringObject {
+    location: SnapshotLocation,
+    expiry: Expiry,
 }
 
-impl Retirement {
-    fn due(&self) -> Instant {
+/// When a retiring object's pin expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Expiry {
+    At(Instant),
+    /// The deadline is not representable: the pin never expires, so the
+    /// object is never deleted for it (fail closed).
+    Never,
+}
+
+impl Expiry {
+    fn by(self, now: Instant) -> bool {
         match self {
-            Self::Object { until, .. } => *until,
-            Self::Pass { at } => *at,
+            Self::At(until) => until <= now,
+            Self::Never => false,
         }
     }
 }
 
+/// The GC passes a group owes (#669): the earliest and the latest only. A
+/// pass deletes every object old enough at its time, so the latest pass
+/// covers every reason to run one before it, and the earliest keeps the
+/// next pass prompt. The list stays bounded with or without a driver.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum GcPasses {
+    #[default]
+    None,
+    One(Instant),
+    Two {
+        earliest: Instant,
+        latest: Instant,
+    },
+}
+
+impl GcPasses {
+    fn add(&mut self, at: Instant) {
+        *self = match *self {
+            Self::None => Self::One(at),
+            Self::One(owed) if owed == at => Self::One(at),
+            Self::One(owed) => Self::Two {
+                earliest: owed.min(at),
+                latest: owed.max(at),
+            },
+            Self::Two { earliest, latest } => Self::Two {
+                earliest: earliest.min(at),
+                latest: latest.max(at),
+            },
+        };
+    }
+
+    fn earliest(self) -> Option<Instant> {
+        match self {
+            Self::None => None,
+            Self::One(at) | Self::Two { earliest: at, .. } => Some(at),
+        }
+    }
+
+    /// Drops the passes due by `now`. Returns whether any was.
+    fn take_due(&mut self, now: Instant) -> bool {
+        let (next, due) = match *self {
+            Self::None => (Self::None, false),
+            Self::One(at) if at <= now => (Self::None, true),
+            Self::One(at) => (Self::One(at), false),
+            Self::Two { latest, .. } if latest <= now => (Self::None, true),
+            Self::Two { earliest, latest } if earliest <= now => (Self::One(latest), true),
+            two @ Self::Two { .. } => (two, false),
+        };
+        *self = next;
+        due
+    }
+}
+
 impl ReferenceState {
-    fn retained(&self) -> Vec<SnapshotLocation> {
+    /// Turns the retiring objects whose pin expired by `now` into a GC pass
+    /// owed when they expired, so that their pins drop at the next
+    /// reconcile, with or without a snapshot driver.
+    fn settle(&mut self, now: Instant) {
+        let mut expired = Vec::new();
+        self.retiring.retain(|object| match object.expiry {
+            Expiry::At(until) if until <= now => {
+                expired.push(until);
+                false
+            }
+            Expiry::At(_) | Expiry::Never => true,
+        });
+        for until in expired {
+            self.passes.add(until);
+        }
+    }
+
+    /// The external locations this node pins at `now`.
+    fn retained(&mut self, now: Instant) -> Vec<SnapshotLocation> {
+        self.settle(now);
         self.current
             .iter()
             .cloned()
             .chain(self.failed_candidate.iter().cloned())
             .chain(self.active.values().map(|(location, _)| location.clone()))
-            .chain(
-                self.retiring
-                    .iter()
-                    .filter_map(|retirement| match retirement {
-                        Retirement::Object { location, .. } => Some(location.clone()),
-                        Retirement::Pass { .. } => None,
-                    }),
-            )
+            .chain(self.retiring.iter().map(|object| object.location.clone()))
             .collect()
     }
 }
@@ -143,12 +216,13 @@ impl Default for SnapshotReferences {
 }
 
 impl SnapshotReferences {
-    /// References whose replaced objects stay pinned for `gc_grace` (G).
+    /// References whose replaced objects stay pinned for `gc_grace` (G),
+    /// at most [`MAX_GC_GRACE`].
     pub(crate) fn new(gc_grace: Duration) -> Self {
         Self {
             serial: AsyncMutex::new(PublicationRetry::default()),
             state: Mutex::new(ReferenceState::default()),
-            gc_grace,
+            gc_grace: gc_grace.min(MAX_GC_GRACE),
         }
     }
 
@@ -166,7 +240,7 @@ impl SnapshotReferences {
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retained();
+            .retained(Instant::now());
         retained.push(location.clone());
         // Reconcile abandoned pins before creating more. On durable startup,
         // the incoming location is the restored pointer and must be retained.
@@ -210,50 +284,67 @@ impl SnapshotReferences {
             SnapshotLocation::Inline { .. } | SnapshotLocation::Local { .. } => None,
         };
         // An object that is current again is pinned as current.
-        state.retiring.retain(|retirement| {
-            !matches!(retirement, Retirement::Object { location, .. } if Some(location) == next.as_ref())
-        });
+        state
+            .retiring
+            .retain(|object| Some(&object.location) != next.as_ref());
         if let Some(previous) = std::mem::replace(&mut state.current, next)
             && state.current.as_ref() != Some(&previous)
         {
-            // G is at most an hour (`RaftConfig::snapshot_gc_grace`), so the
-            // deadline does not overflow.
-            let until = now.checked_add(self.gc_grace).unwrap_or(now);
-            state.retiring.push(Retirement::Object {
+            let expiry = now
+                .checked_add(self.gc_grace)
+                .map_or(Expiry::Never, Expiry::At);
+            state.retiring.push(RetiringObject {
                 location: previous,
-                until,
+                expiry,
             });
         }
+        state.settle(now);
     }
 
-    /// Owes a GC pass of the group at `at`, unless one is owed by then.
+    /// Owes a GC pass of the group at `at`.
     pub(crate) fn schedule_pass(&self, at: Instant) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        if !state
-            .retiring
-            .iter()
-            .any(|retirement| matches!(retirement, Retirement::Pass { at: owed } if *owed <= at))
-        {
-            state.retiring.push(Retirement::Pass { at });
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .passes
+            .add(at);
+    }
+
+    /// Owes a GC pass `delay` from now. A deadline that is not
+    /// representable owes none, which deletes nothing.
+    fn schedule_pass_in(&self, delay: Duration) {
+        if let Some(at) = Instant::now().checked_add(delay) {
+            self.schedule_pass(at);
         }
     }
 
-    /// A restore owes a GC pass G later: its reconcile dropped the pins of
-    /// the objects that were retiring before the restart, and once they are
-    /// G old the pass deletes them.
-    pub(crate) fn schedule_pass_after_restore(&self) {
-        let now = Instant::now();
-        self.schedule_pass(now.checked_add(self.gc_grace).unwrap_or(now));
+    /// An external upload owes a GC pass G later (#669). If the upload never
+    /// becomes current, as when a newer install overtook its build or its
+    /// pin failed and the build fell back inline, no retirement covers it,
+    /// and that pass deletes it once it is G old.
+    pub(crate) fn schedule_pass_after_upload(&self) {
+        self.schedule_pass_in(self.gc_grace);
+    }
+
+    /// A restore owes a GC pass about G later: its reconcile dropped the
+    /// pins of the objects that were retiring before the restart, and once
+    /// they are G old the pass deletes them. The passes of a node's groups
+    /// spread over a further quarter of G by group, so that a restart does
+    /// not bring every group's pass due at once.
+    pub(crate) fn schedule_pass_after_restore(&self, group: u32) {
+        let spread = self
+            .gc_grace
+            .checked_div(64)
+            .unwrap_or_default()
+            .saturating_mul(group % 16);
+        self.schedule_pass_in(self.gc_grace.saturating_add(spread));
     }
 
     /// Whether a pin expired or a GC pass is owed by `now`.
     pub(crate) fn gc_due(&self, now: Instant) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retiring
-            .iter()
-            .any(|retirement| retirement.due() <= now)
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.retiring.iter().any(|object| object.expiry.by(now))
+            || state.passes.earliest().is_some_and(|at| at <= now)
     }
 
     /// Drops the retirements due by `now`: the pins that expired, which the
@@ -261,9 +352,8 @@ impl SnapshotReferences {
     /// owed. Returns whether any was due.
     pub(crate) fn expire_retiring(&self, now: Instant) -> bool {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let owed = state.retiring.len();
-        state.retiring.retain(|retirement| retirement.due() > now);
-        state.retiring.len() < owed
+        state.settle(now);
+        state.passes.take_due(now)
     }
 
     /// This node's current snapshot location, inline when it has none in
@@ -306,7 +396,7 @@ impl SnapshotReferences {
             Err(error) => Err(SnapshotGcError::Publish(error)),
         };
         if pass.is_err() {
-            self.schedule_pass(now.checked_add(SNAPSHOT_GC_RETRY).unwrap_or(now));
+            self.schedule_pass_in(SNAPSHOT_GC_RETRY);
         }
         pass
     }
@@ -336,11 +426,13 @@ impl SnapshotReferences {
         } else {
             Ok(())
         };
+        // An expired pin drops here, also on a node that runs no snapshot
+        // driver.
         let retained = self
             .state
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .retained();
+            .retained(Instant::now());
         let cleanup = store.reconcile_reference_pins(group, &retained).await;
         let result = publication.and(cleanup);
         if result.is_err() {
@@ -399,7 +491,7 @@ mod tests {
     }
 
     fn retained(references: &SnapshotReferences) -> Vec<SnapshotLocation> {
-        references.state.lock().unwrap().retained()
+        references.state.lock().unwrap().retained(Instant::now())
     }
 
     /// #669: the object a new current replaces stays retained, so its pin
@@ -449,7 +541,7 @@ mod tests {
         let references = SnapshotReferences::new(GRACE);
         let start = Instant::now();
         references.commit_current(&s3("restored"));
-        references.schedule_pass_after_restore();
+        references.schedule_pass_after_restore(0);
         assert_eq!(retained(&references), vec![s3("restored")]);
         assert!(!references.gc_due(start));
         let due = later(Instant::now(), GRACE);
@@ -529,6 +621,71 @@ mod tests {
         assert!(!references.gc_due(later(now, GRACE.saturating_mul(10))));
     }
 
+    /// An upload owes a pass G later, so an upload that never becomes
+    /// current is deleted too.
+    #[tokio::test]
+    async fn an_upload_owes_a_pass_after_the_grace() {
+        let references = SnapshotReferences::new(GRACE);
+        let start = Instant::now();
+        references.schedule_pass_after_upload();
+        assert!(!references.gc_due(start));
+        assert!(references.gc_due(later(Instant::now(), GRACE)));
+    }
+
+    /// The owed passes stay two, the earliest and the latest, however many
+    /// are owed, and the latest stays owed once the earliest ran.
+    #[tokio::test]
+    async fn owed_passes_stay_bounded() {
+        let references = SnapshotReferences::new(GRACE);
+        let start = Instant::now();
+        for seconds in [30, 10, 50, 20, 40] {
+            references.schedule_pass(later(start, Duration::from_secs(seconds)));
+        }
+        assert_eq!(
+            references.state.lock().unwrap().passes,
+            super::GcPasses::Two {
+                earliest: later(start, Duration::from_secs(10)),
+                latest: later(start, Duration::from_secs(50)),
+            }
+        );
+        assert!(references.expire_retiring(later(start, Duration::from_secs(10))));
+        assert!(!references.gc_due(later(start, Duration::from_secs(49))));
+        assert!(references.gc_due(later(start, Duration::from_secs(50))));
+    }
+
+    /// B1 of the review: without a snapshot driver, an expired pin drops at
+    /// the next reference publication, so a build's prune deletes the object
+    /// it pinned, and the retiring list stays bounded.
+    #[tokio::test(start_paused = true)]
+    async fn an_expired_pin_drops_without_a_driver() {
+        let store = store();
+        let references = Arc::new(SnapshotReferences::new(GRACE));
+        let old = upload(&store, b"old").await;
+        let new = upload(&store, b"new").await;
+        switch_to(&references, &store, &old).await;
+        switch_to(&references, &store, &new).await;
+        assert_eq!(
+            references.prune(&store, 7).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 0 }
+        );
+        assert_eq!(store.download(&old).await.unwrap(), b"old");
+        tokio::time::advance(GRACE.saturating_add(Duration::from_secs(1))).await;
+        let newer = upload(&store, b"newer").await;
+        // A build: a new current and its prune, with no GC pass in between.
+        switch_to(&references, &store, &newer).await;
+        assert_eq!(
+            references.prune(&store, 7).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(matches!(
+            store.download(&old).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        assert_eq!(store.download(&new).await.unwrap(), b"new");
+        assert_eq!(store.download(&newer).await.unwrap(), b"newer");
+        assert_eq!(references.state.lock().unwrap().retiring.len(), 1);
+    }
+
     /// A store whose reference publication fails.
     #[derive(Debug)]
     struct UnpublishableStore;
@@ -575,7 +732,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, SnapshotGcError::Publish(_)), "{error}");
-        assert!(!references.gc_due(expired));
-        assert!(references.gc_due(later(expired, SNAPSHOT_GC_RETRY)));
+        assert!(!references.gc_due(Instant::now()));
+        assert!(references.gc_due(later(Instant::now(), SNAPSHOT_GC_RETRY)));
     }
 }

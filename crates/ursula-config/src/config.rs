@@ -262,10 +262,12 @@ impl RaftConfig {
     pub const MAX_SNAPSHOT_BUILD_CONCURRENCY: usize = 16;
     /// `deleted_data_max_age` is at least this many `install_snapshot_timeout`s
     /// (#669). A replica keeps the snapshot object it replaced pinned for a
-    /// quarter of the age ([`RaftConfig::snapshot_gc_grace`]), which must
-    /// outlast two installs of that object.
+    /// quarter of the age, capped at the longer of an hour and two installs
+    /// ([`RaftConfig::snapshot_gc_grace`]), which must outlast two installs
+    /// of that object.
     pub const DELETED_DATA_MAX_AGE_INSTALLS: u32 = 8;
-    /// The longest snapshot GC grace ([`RaftConfig::snapshot_gc_grace`]).
+    /// The snapshot GC grace is at most this ([`RaftConfig::snapshot_gc_grace`]),
+    /// unless two installs take longer.
     pub const MAX_SNAPSHOT_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     /// `deleted_data_max_age` when it is unset and the install timeout
     /// allows it.
@@ -291,14 +293,20 @@ impl RaftConfig {
     }
 
     /// Snapshot GC grace G (#669): a quarter of
-    /// [`RaftConfig::effective_deleted_data_max_age`], at most an hour. A
-    /// replica keeps the snapshot object it replaced pinned for G, and the
-    /// snapshot store deletes an object nothing names once it is G old.
+    /// [`RaftConfig::effective_deleted_data_max_age`], at most an hour or two
+    /// `install_snapshot_timeout`s, whichever is longer. A replica keeps the
+    /// snapshot object it replaced pinned for G, and the snapshot store
+    /// deletes an object nothing names once it is G old. The floor on the
+    /// max age and the cap both keep G at two installs or more.
     pub fn snapshot_gc_grace(&self) -> std::time::Duration {
+        let two_installs = self
+            .install_snapshot_timeout
+            .as_duration()
+            .saturating_mul(2);
         self.effective_deleted_data_max_age()
             .checked_div(4)
             .unwrap_or_default()
-            .min(Self::MAX_SNAPSHOT_GC_GRACE)
+            .min(Self::MAX_SNAPSHOT_GC_GRACE.max(two_installs))
     }
 }
 

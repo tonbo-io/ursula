@@ -625,7 +625,7 @@ async fn spawn_static_grpc_test_node(
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
     let registry = match storage.snapshot_gc_grace {
-        Some(gc_grace) => RaftGroupHandleRegistry::default().with_snapshot_gc_grace(gc_grace),
+        Some(gc_grace) => RaftGroupHandleRegistry::default().with_snapshot_install(1, gc_grace),
         None => RaftGroupHandleRegistry::default(),
     };
     if storage.start_maintenance_drained {
@@ -8678,7 +8678,13 @@ mod snapshot_driver {
         for slots in [1, 3] {
             let trigger = tokio::time::timeout(
                 Duration::from_secs(1),
-                trigger_snapshot_build(&node.registry, &coordinator, 0, || Some(slots)),
+                trigger_snapshot_build(
+                    &node.registry,
+                    &coordinator,
+                    0,
+                    &mut coordinator.subscribe_builds(),
+                    || Some(slots),
+                ),
             )
             .await;
             assert!(matches!(trigger, Ok(Trigger::Busy)), "{slots}: {trigger:?}");
@@ -8702,7 +8708,13 @@ mod snapshot_driver {
         hand_off.await.expect("the hand-off is pending");
         let trigger = tokio::time::timeout(
             Duration::from_secs(1),
-            trigger_snapshot_build(&node.registry, &coordinator, 1, || Some(3)),
+            trigger_snapshot_build(
+                &node.registry,
+                &coordinator,
+                1,
+                &mut coordinator.subscribe_builds(),
+                || Some(3),
+            ),
         )
         .await;
         assert!(matches!(trigger, Ok(Trigger::Busy)), "{trigger:?}");
@@ -8736,7 +8748,13 @@ mod snapshot_driver {
         };
         let trigger = tokio::time::timeout(
             Duration::from_secs(5),
-            trigger_snapshot_build(&node.registry, &coordinator, 2, pace),
+            trigger_snapshot_build(
+                &node.registry,
+                &coordinator,
+                2,
+                &mut coordinator.subscribe_builds(),
+                pace,
+            ),
         )
         .await;
         assert!(matches!(trigger, Ok(Trigger::Busy)), "{trigger:?}");

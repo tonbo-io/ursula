@@ -568,9 +568,23 @@ impl SnapshotBuildCoordinator {
     pub async fn acquire_below(
         &self,
         poll: Duration,
+        limit: impl FnMut() -> Option<usize>,
+    ) -> Result<Option<OwnedSemaphorePermit>, SnapshotPermitError> {
+        self.acquire_below_watching(&mut self.subscribe_builds(), poll, limit)
+            .await
+    }
+
+    /// [`Self::acquire_below`] on the caller's subscription to the builds.
+    /// When the caller stops waiting, the subscription is marked seen at
+    /// the wait's last check, so it ends a later wait only on a build that
+    /// starts or ends after that check.
+    pub async fn acquire_below_watching(
+        &self,
+        watching: &mut BuildsChanged,
+        poll: Duration,
         mut limit: impl FnMut() -> Option<usize>,
     ) -> Result<Option<OwnedSemaphorePermit>, SnapshotPermitError> {
-        let mut builds = self.inner.builds.subscribe();
+        let builds = &mut watching.0;
         loop {
             let Some(slots) = limit() else {
                 return Ok(None);
@@ -1310,16 +1324,15 @@ impl Default for SnapshotInstallCoordinator {
 
 impl SnapshotInstallCoordinator {
     pub fn new(max_concurrency: usize) -> Self {
-        Self::with_semaphore(
-            Arc::new(Semaphore::new(max_concurrency.max(1))),
-            DEFAULT_SNAPSHOT_GC_GRACE,
-        )
+        Self::with_gc_grace(max_concurrency, DEFAULT_SNAPSHOT_GC_GRACE)
     }
 
-    fn with_semaphore(semaphore: Arc<Semaphore>, gc_grace: Duration) -> Self {
+    /// A coordinator whose groups keep the snapshot object they replaced
+    /// pinned for `gc_grace`, G (#669).
+    pub fn with_gc_grace(max_concurrency: usize, gc_grace: Duration) -> Self {
         Self {
             inner: Arc::new(SnapshotInstallCoordinatorInner {
-                semaphore,
+                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
                 next_install: AtomicU64::new(0),
                 prefetched: Mutex::new(BTreeMap::new()),
                 references: Mutex::new(BTreeMap::new()),
@@ -1327,13 +1340,6 @@ impl SnapshotInstallCoordinator {
                 gc_grace,
             }),
         }
-    }
-
-    /// The coordinator with snapshot GC grace G (#669): how long a group's
-    /// replaced snapshot object stays pinned. Set it before any group
-    /// starts: the groups' references are created with the grace.
-    pub fn with_gc_grace(self, gc_grace: Duration) -> Self {
-        Self::with_semaphore(self.inner.semaphore.clone(), gc_grace)
     }
 
     /// The snapshot GC grace G.
@@ -1650,7 +1656,7 @@ impl RaftGroupStateMachine {
         // The reconcile above dropped the pins of the objects that were
         // retiring before the restart. The snapshot driver deletes them once
         // they are the GC grace old (#669).
-        references.schedule_pass_after_restore();
+        references.schedule_pass_after_restore(self.placement.raft_group_id.0);
         Ok(())
     }
 
@@ -2138,6 +2144,10 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             .await
         {
             Ok(location) => {
+                // An upload that never becomes current, because a newer
+                // install overtakes this build or its pin fails, has no
+                // retirement to delete it: a GC pass G later does (#669).
+                self.references.schedule_pass_after_upload();
                 // Re-stat immediately so a silent partial-success (multipart
                 // Complete failing after the parts uploaded, opendal retry
                 // caching, etc.) is caught HERE rather than 10 minutes later
@@ -2712,13 +2722,14 @@ mod tests {
         let metadata = directory.path().join("group-7.snapshot.json");
         let store: SharedSnapshotStore =
             Arc::new(ursula_runtime::S3SnapshotStore::memory_for_tests("stale-build").unwrap());
+        let coordinator = SnapshotInstallCoordinator::default();
         let mut state = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
             None,
             None,
             store.clone(),
             SnapshotBuildCoordinator::default(),
-            SnapshotInstallCoordinator::default(),
+            coordinator.clone(),
             Some(metadata.clone()),
         );
         state
@@ -2750,6 +2761,17 @@ mod tests {
         assert_eq!(returned.meta.last_log_id, Some(test_log_id(2)));
         let pointer = SnapshotPointer::decode(returned.snapshot.get_ref()).unwrap();
         assert_eq!(pointer.snapshot_id, "newer-install");
+        // The overtaken build's upload never became current: a GC pass G
+        // later deletes it (#669).
+        let references = coordinator.references(7);
+        assert!(!references.gc_due(Instant::now()));
+        assert!(
+            references.gc_due(
+                Instant::now()
+                    .checked_add(DEFAULT_SNAPSHOT_GC_GRACE)
+                    .unwrap()
+            )
+        );
         let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
             None,

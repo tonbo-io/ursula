@@ -297,7 +297,7 @@ pub struct SnapshotGcPass {
     pub skipped_unreferenced_voter: u64,
     /// The passes that failed, which run again later.
     pub failed: usize,
-    /// The groups whose pass is due but past `max_groups`.
+    /// The groups whose pass is due but past `max_groups` or the budget.
     pub left: usize,
 }
 
@@ -905,34 +905,43 @@ impl RaftGroupHandleRegistry {
         self.len() == 0
     }
 
-    pub fn with_snapshot_install_max_concurrency(mut self, max_concurrency: usize) -> Self {
-        let gc_grace = self.snapshot_install.gc_grace();
+    /// Snapshot installs: at most `max_concurrency` at once, and the
+    /// snapshot GC grace G (#669), how long each group keeps the snapshot
+    /// object it replaced pinned (`RaftConfig::snapshot_gc_grace` on a
+    /// server).
+    pub fn with_snapshot_install(
+        mut self,
+        max_concurrency: usize,
+        gc_grace: std::time::Duration,
+    ) -> Self {
         self.snapshot_install =
-            SnapshotInstallCoordinator::new(max_concurrency).with_gc_grace(gc_grace);
-        self
-    }
-
-    /// Snapshot GC grace G (#669): how long each group keeps the snapshot
-    /// object it replaced pinned, `RaftConfig::snapshot_gc_grace` on a
-    /// server. Set it before any group starts.
-    pub fn with_snapshot_gc_grace(mut self, gc_grace: std::time::Duration) -> Self {
-        self.snapshot_install = self.snapshot_install.with_gc_grace(gc_grace);
+            SnapshotInstallCoordinator::with_gc_grace(max_concurrency, gc_grace);
         self
     }
 
     /// Runs the snapshot GC passes due now (#669), for at most `max_groups`
-    /// groups in group order: each drops the pins that expired, publishes
-    /// the group's current reference and prunes the objects nothing names
-    /// any more. A failed pass runs again later.
-    pub async fn collect_snapshot_garbage(&self, max_groups: usize) -> SnapshotGcPass {
-        let now = crate::rt::time::Instant::now();
-        let due = self.snapshot_install.gc_due(now);
+    /// groups in group order, and starts none once `budget` has passed:
+    /// each drops the pins that expired, publishes the group's current
+    /// reference and prunes the objects nothing names any more. A failed
+    /// pass runs again later, and a pass left out stays due.
+    pub async fn collect_snapshot_garbage(
+        &self,
+        max_groups: usize,
+        budget: std::time::Duration,
+    ) -> SnapshotGcPass {
+        let started = crate::rt::time::Instant::now();
+        let due = self.snapshot_install.gc_due(started);
         let store = self.snapshot_store();
         let mut pass = SnapshotGcPass {
-            left: due.len().saturating_sub(max_groups),
+            left: due.len(),
             ..SnapshotGcPass::default()
         };
         for (group, references) in due.into_iter().take(max_groups) {
+            if started.elapsed() >= budget {
+                break;
+            }
+            let now = crate::rt::time::Instant::now();
+            pass.left = pass.left.saturating_sub(1);
             pass.groups = pass.groups.saturating_add(1);
             match references.collect_garbage(&store, group, now).await {
                 Ok(prune) => {

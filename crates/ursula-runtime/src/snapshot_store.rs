@@ -516,6 +516,11 @@ mod s3 {
         /// a replica keeps the object it replaced pinned. An object nobody
         /// pins, such as the upload of a build a newer install overtook, is
         /// then deleted once it is that old.
+        ///
+        /// An object's age is its store modification time against this
+        /// node's clock, and a build pins its upload only after the PUT
+        /// returns. Both assume that the nodes' clocks agree with the
+        /// store's, and that an upload completes, well within the grace.
         pub fn with_gc_grace(mut self, gc_grace: Duration) -> Self {
             self.gc_grace = gc_grace;
             self
