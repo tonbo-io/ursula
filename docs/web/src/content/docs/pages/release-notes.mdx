@@ -3,6 +3,17 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.8.1
+
+0.8.1 is a drop-in patch for 0.8.0: format epoch 4 and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged, so 0.8.0 and 0.8.1 owners and readers of one stream work side by side and owners upgrade one at a time.
+
+### SQLite VFS
+
+- **A commit above the commit limit fails as `too_large`.** A commit whose pages take more than `URSULA_VFS_MAX_COMMIT_BYTES` (128 MiB by default, from 4096 bytes to 1 GiB) fails at its COMMIT with `SQLITE_IOERR_AUTH` (7178), action `fix`. SQLite rolls the whole transaction back, nothing of it is logged or sent, and the database stays usable. 0.8.0 bounded a commit only by memory. Readers apply every commit a frame holds, whatever their own limit, and a run of parts too long for any commit frame now fails at its first part instead of after it is joined.
+- **`WriteRefusedKind` and the error kinds gain `too_large`.** `UrsulaWriteRefusedError` carries it, and `status().refused` names it until the next commit is logged. A `switch` over `WriteRefusedKind` needs a case for it.
+- **Writing a commit takes less memory.** The commit frame is built in one buffer and the pages are dropped once it is encoded, so the writer holds about the pages plus twice the compressed record. The bytes logged and sent are unchanged.
+- **Upgrading:** check your largest transactions, such as a `VACUUM` or a rewrite of a large table. Split them, or set `URSULA_VFS_MAX_COMMIT_BYTES` (at most 1 GiB) on every host that may own the database, with memory for about three times the limit. Commits that 0.8.0 logged above the limit still replicate and are still read. Rolling back to 0.8.0 is safe.
+
 ## 0.8.0
 
 **0.8.0 is a breaking release.** It changes the storage and protocol format to format epoch 4. A 0.8 node refuses epoch-3 Raft WAL directories and object-storage prefixes at startup, refuses 0.7 peers, snapshots and backups, and `ursulactl restore` refuses 0.7 backups. There is no migration, no in-place upgrade, no rolling upgrade and no rollback.
@@ -160,7 +171,7 @@ The SQLite VFS is redesigned for 0.8. A commit is local: the extension appends i
 
 Known limits of 0.8.0:
 
-- **Commit size is bounded by memory.** Capture holds the whole transaction, and a build holds a joined commit of parts twice.
+- **Commit size is bounded by memory.** Capture holds the whole transaction, and a build holds a joined commit of parts twice. Bounded by the commit limit in 0.8.1.
 - **Two history events with no write between them**, plus a crash, a clean close or a reset between a re-key's log roll and its claim, move aside a cache that lost nothing.
 - **Offline commits after a history event.** Commits logged before an open and after its latest acknowledgement are moved aside after any history event, since they may have been sent. A clean close records an exact acknowledgement, and commits made while provisional still replicate.
 - **Idle expiry.** An owner idle past producer expiry whose own claim the extension cannot find on the stream resets `stale`. Reopen it.

@@ -9,19 +9,9 @@
 // - Model only: a commit logged as one COMMIT while the stream is cut off, then a limit lowered
 //   below it, re-cuts after the heal: the replicator claims the next epoch and sends it in parts.
 import { afterEach, describe, expect, it } from "vitest";
-import { Child, directUrl, fromStream, freshDir, gate, killChildren, onModel, parts, stream } from "./kit.ts";
+import { Child, directUrl, fromStream, freshDir, gate, insert, killChildren, onModel, parts, ROWS_SQL, stream } from "./kit.ts";
 
 afterEach(killChildren);
-
-/** Rows of 64 KiB of random bytes: samples of each, so equal rows are equal bytes but for chance. */
-const ROWS_SQL = "SELECT i, length(b) AS n, hex(substr(b, 1, 64)) AS head, hex(substr(b, 30000, 64)) AS mid, hex(substr(b, -64)) AS tail FROM t ORDER BY i";
-const BLOB = 64 << 10;
-
-/** One transaction inserting `rows` rows of 64 KiB of random bytes, `from` on. */
-function insert(from: number, rows: number): string {
-	const values = Array.from({ length: rows }, (_, k) => `(${from + k}, randomblob(${BLOB}))`).join(", ");
-	return `BEGIN; INSERT INTO t VALUES ${values}; COMMIT`;
-}
 
 async function synced(c: Child, ms = 60_000): Promise<void> {
 	expect((await c.send({ synced: ms })).synced).toMatchObject({ synced: true });

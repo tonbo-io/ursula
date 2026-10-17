@@ -8,7 +8,8 @@
 //! from the commit frame's page in the buffer and the earlier frames read back from the WAL file,
 //! each checked against the crc of what was written. Writes after the commit point (checksum
 //! rewrites, sector padding) are the rest of a captured transaction and are not captured. Every
-//! other write shape fails the write alone as unsupported.
+//! other write shape fails the write alone as unsupported. [`WriteTxn::check_size`] refuses a
+//! commit of more page bytes than the commit limit before anything is read back.
 //!
 //! Pure: reading the WAL back is the caller's closure.
 
@@ -30,6 +31,16 @@ pub(crate) const PAGE_BYTES: i64 = PAGE as i64;
 pub(crate) const WAL_HDR_LEN: usize = 32;
 pub(crate) const FRAME_HDR_LEN: usize = 24;
 pub(crate) const FRAME_LEN: usize = FRAME_HDR_LEN + PAGE;
+
+/// The commit limit by default, in bytes of pages (`URSULA_VFS_MAX_COMMIT_BYTES`, design: Capture).
+pub(crate) const DEFAULT_MAX_COMMIT_BYTES: u64 = 128 << 20;
+/// The smallest commit limit: one page.
+pub(crate) const MIN_COMMIT_BYTES: u64 = PAGE as u64;
+/// The largest commit limit. Its compressed record stays well under the u32 a frame body's length
+/// holds (zstd grows incompressible input by less than 1%).
+pub(crate) const MAX_COMMIT_BYTES: u64 = 1 << 30;
+const _: () = assert!(MAX_COMMIT_BYTES <= u32::MAX as u64 / 2);
+const _: () = assert!(DEFAULT_MAX_COMMIT_BYTES <= MAX_COMMIT_BYTES);
 
 /// Whether `off` is where a frame's page starts in the WAL file.
 pub(crate) fn page_at(off: i64) -> bool {
@@ -136,6 +147,14 @@ pub(crate) enum CaptureError {
     },
     #[error("a commit frame page of {len} bytes")]
     CommitPage { len: usize },
+}
+
+/// A commit of more page bytes than the commit limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a commit of {bytes} bytes of pages, at most {max}")]
+pub(crate) struct TooLarge {
+    pub(crate) bytes: u64,
+    pub(crate) max: u64,
 }
 
 /// A frame the transaction wrote.
@@ -279,6 +298,27 @@ impl WriteTxn {
             .filter(|&(&pgno, _)| pgno != commit_pgno)
             .map(|(&pgno, &(off, crc))| (pgno, off, crc))
             .collect()
+    }
+
+    /// How many pages the commit's record holds: exactly the length of the record
+    /// [`WriteTxn::capture`] builds, with nothing read back.
+    pub(crate) fn pages(&self, point: CommitPoint) -> usize {
+        let earlier = self.final_frames(point.db_pages_after, point.pgno).len();
+        if point.pgno <= point.db_pages_after {
+            earlier.saturating_add(1)
+        } else {
+            earlier
+        }
+    }
+
+    /// Refuses a commit whose pages take more than `max` bytes (design: Capture).
+    pub(crate) fn check_size(&self, point: CommitPoint, max: u64) -> Result<(), TooLarge> {
+        let pages = u64::try_from(self.pages(point)).unwrap_or(u64::MAX);
+        let bytes = pages.saturating_mul(PAGE as u64);
+        if bytes > max {
+            return Err(TooLarge { bytes, max });
+        }
+        Ok(())
     }
 
     /// The commit's record: the final image of every page the transaction wrote up to the

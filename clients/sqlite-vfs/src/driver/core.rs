@@ -253,6 +253,7 @@ struct Binding {
     /// `synced()` calls whose target is past `last_commit`, waiting for its `Logged`.
     held: Vec<(Ticket, Position)>,
     max_pending_bytes: u64,
+    max_commit_bytes: u64,
     /// The hand-out it waits on a connection for.
     unconnected: Unconnected,
     /// The open failed while a disk job held the generation: the binding stays, its root locked
@@ -701,6 +702,8 @@ impl Core {
             log,
             pending_bytes: 0,
             max_pending_bytes: 0,
+            // A reader logs no commit.
+            max_commit_bytes: 0,
             acked: last,
             attach,
             role: Role::Reader,
@@ -844,6 +847,7 @@ impl Core {
             resolved_max: Ticket(0),
             held: Vec::new(),
             max_pending_bytes: spec.max_pending_bytes,
+            max_commit_bytes: spec.max_commit_bytes,
             unconnected: Unconnected::default(),
             failing: None,
             attach,
@@ -1389,6 +1393,7 @@ impl Core {
             log,
             pending_bytes: pending,
             max_pending_bytes: b.max_pending_bytes,
+            max_commit_bytes: b.max_commit_bytes,
             acked: ctx.map_or(Position(0), |c| c.acked),
             attach: b.attach,
             provisional,

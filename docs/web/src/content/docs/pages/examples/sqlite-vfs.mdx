@@ -84,12 +84,14 @@ Every error the package throws for a failure of the extension has a `kind`, an `
 
 | class | thrown by | kinds |
 | --- | --- | --- |
-| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed (`errcode` 7178) | `backlog_full`, `unsupported` |
+| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed (`errcode` 7178) | `backlog_full`, `unsupported`, `too_large` |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | `fenced`, `stale`, `rewound`, `deleted`, `local_damage`, `stream_state`, `internal` |
 | `UrsulaUnavailableError` | `open()` when its signal fires first, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition (`unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`), or `cancelled` |
 | `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
 
 `unsupported` is a transaction the extension cannot capture: EXCLUSIVE locking mode, or a commit that leaves WAL mode or 4096-byte pages. Only that transaction fails.
+
+`too_large` is a commit whose pages take more than the commit limit, `URSULA_VFS_MAX_COMMIT_BYTES` (128 MiB by default). SQLite rolls the whole transaction back, nothing of it is logged or sent, and the database stays usable. Split the transaction, or raise the limit on every host that may own the database. A `VACUUM` or a rewrite of a large table writes most of the database in one transaction: raise the limit for it, run `PRAGMA incremental_vacuum(N)` in steps on a database created with `auto_vacuum = INCREMENTAL`, or `VACUUM INTO` a plain file and import that into a new stream with `importSqlite()`.
 
 ## Resets
 
@@ -229,7 +231,7 @@ Code changes:
 
 Operations changes:
 
-- `URSULA_VFS_RETRY_MS` is gone: appends are resent until a definite answer. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`. Commits of any size go out, in parts above the request limit. `URSULA_VFS_SNAPSHOT_MIN_BYTES` is gone: a snapshot is due past the database's size or 8 MiB, whichever is larger.
+- `URSULA_VFS_RETRY_MS` is gone: appends are resent until a definite answer. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`. Commits up to the commit limit (`URSULA_VFS_MAX_COMMIT_BYTES`) go out, in parts above the request limit. `URSULA_VFS_SNAPSHOT_MIN_BYTES` is gone: a snapshot is due past the database's size or 8 MiB, whichever is larger.
 - The default cache root is `<user cache>/sqlite-ursula/0.8`, and the `sqlite3` shell cannot open a cache.
 - The extension sends `User-Agent: sqlite-ursula-vfs/0.8.0`. Update any proxy, WAF or log rule keyed on it.
 - Multi-node clusters need `server.cluster_id`, and snapshots above 32 MiB compressed need a cold backend (see [What the cluster needs](#what-the-cluster-needs)).
@@ -273,6 +275,7 @@ The extension reads these environment variables once per process:
 | `URSULA_VFS_TOKEN_FILE` | none | A file holding the bearer token, read again when it changes |
 | `URSULA_VFS_CA_FILE` | the bundled CAs | A PEM bundle of the certificate authorities to trust |
 | `URSULA_VFS_MAX_REQUEST_BYTES` | the server's | A request limit below the one `HEAD` advertises, for a layer in front of the stream that does not advertise its own |
+| `URSULA_VFS_MAX_COMMIT_BYTES` | 134217728 (128 MiB) | The most bytes of pages one commit may hold, from 4096 to 1 GiB. A larger commit fails as `too_large`. Writing a commit takes about three times the limit in memory for pages that do not compress, and readers need memory for the largest commit any owner logs |
 | `URSULA_VFS_IDLE_MS` | 90000 | How long a connection is kept after its last request. Keep it below the idle timeout of any NAT, load balancer or firewall on the path |
 | `URSULA_VFS_MIN_UPLOAD_KBPS` | 256 | The slowest upload, in KiB/s, an attempt's time limit allows: a request body may take 5 s plus its size at this rate |
 

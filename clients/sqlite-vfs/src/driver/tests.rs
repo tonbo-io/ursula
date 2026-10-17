@@ -91,6 +91,7 @@ fn spec(dir: &Path, activation: u8) -> OpenSpec {
         activation: Activation([activation; 16]),
         max_pending_bytes: 1 << 20,
         max_request_bytes: None,
+        max_commit_bytes: crate::capture::DEFAULT_MAX_COMMIT_BYTES,
         timeout_ms: 30_000,
         access: Access::Owner { recreate: false },
     }
@@ -413,18 +414,23 @@ impl World {
         Some(frame)
     }
 
-    /// The commit path's log append, recorded on the handle; `Logged` is the caller's.
+    /// The commit path's log append of a one-page commit, recorded on the handle; `Logged` is the
+    /// caller's.
     fn append(bound: &Bound, page: Box<[u8; 4096]>) -> Option<Pending> {
+        Self::append_record(bound, CommitRecord {
+            db_pages_after: 1,
+            pages: vec![(1, sqlite(page))],
+        })
+    }
+
+    /// The commit path's log append of `record`, recorded on the handle; `Logged` is the caller's.
+    fn append_record(bound: &Bound, record: CommitRecord) -> Option<Pending> {
         let handle = &bound.handle;
         let mut log = handle.log().unwrap();
         let position = log.next_position();
         let id = CommitId {
             lineage: handle.generation.lineage,
             position,
-        };
-        let record = CommitRecord {
-            db_pages_after: 1,
-            pages: vec![(1, sqlite(page))],
         };
         let frame = frame::encode_commit(id, &record).unwrap();
         if handle.admit(frame.len() as u64).is_err() {
@@ -658,6 +664,37 @@ fn admission_counts_commits_the_driver_thread_has_not_seen() {
     w.run_for(1_000);
     assert_eq!(bound.handle.pending_bytes(), 0);
     assert!(World::append(&bound, page(4)).is_some());
+}
+
+// The commit limit applies at the commit point only (design: Capture): a commit logged above it (by
+// an earlier release, or before the limit was lowered) replicates and is acknowledged as any other.
+#[test]
+fn a_logged_commit_above_the_limit_still_replicates() {
+    let dir = TempDir::new("driver-above-limit");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, OpenSpec {
+        max_commit_bytes: 4096,
+        ..spec(dir.path(), 1)
+    });
+    assert_eq!(bound.handle.max_commit_bytes, 4096);
+    let pending = World::append_record(&bound, CommitRecord {
+        db_pages_after: 3,
+        pages: vec![
+            (1, sqlite(Box::new([1; 4096]))),
+            (2, Box::new([2; 4096])),
+            (3, Box::new([3; 4096])),
+        ],
+    })
+    .unwrap();
+    let frame = pending.frame.to_vec();
+    w.logged(c, &bound, pending);
+    let ticket = w.sync(c, bound.binding);
+    w.run_for(1_000);
+    assert_eq!(w.outcome(c, ticket), Some(Ok(())));
+    assert_eq!(w.stream_commits(), vec![frame]);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    assert!(w.resets(c).is_empty());
 }
 
 #[test]

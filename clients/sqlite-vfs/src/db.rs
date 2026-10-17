@@ -399,6 +399,7 @@ pub(crate) fn open(
                         activation: options.activation.unwrap_or_else(process_activation),
                         max_pending_bytes: options.max_pending_bytes,
                         max_request_bytes: crate::config::max_request_bytes(),
+                        max_commit_bytes: crate::config::max_commit_bytes(),
                         access: options.access,
                         timeout_ms: open_ms,
                     };
@@ -699,6 +700,12 @@ fn process_activation() -> Activation {
 /// registry, and the driver never heard of it: a reset only marks it.
 #[cfg(test)]
 pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
+    for_tests_with_limit(dir, crate::capture::DEFAULT_MAX_COMMIT_BYTES)
+}
+
+/// [`for_tests`] with a commit limit of `max_commit_bytes`.
+#[cfg(test)]
+pub(crate) fn for_tests_with_limit(dir: &std::path::Path, max_commit_bytes: u64) -> Arc<Binding> {
     use ursula_headers::Incarnation;
     use ursula_headers::Offset;
 
@@ -739,6 +746,7 @@ pub(crate) fn for_tests(dir: &std::path::Path) -> Arc<Binding> {
             log,
             pending_bytes: 0,
             max_pending_bytes: 1 << 20,
+            max_commit_bytes,
             acked: Position(0),
             attach: crate::driver::Attach::Resumed,
             provisional: false,

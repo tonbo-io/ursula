@@ -8,6 +8,9 @@ use std::sync::PoisonError;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::capture::DEFAULT_MAX_COMMIT_BYTES;
+use crate::capture::MAX_COMMIT_BYTES;
+use crate::capture::MIN_COMMIT_BYTES;
 use crate::log;
 use crate::log::Level;
 
@@ -205,6 +208,35 @@ pub(crate) fn max_request_bytes() -> Option<u64> {
     })
 }
 
+/// `URSULA_VFS_MAX_COMMIT_BYTES`: the most bytes of pages one commit may hold, 128 MiB by default
+/// (design: Capture). A value outside 4096 ..= 1 GiB is clamped to the nearest bound, and 0 or a
+/// value that is not a number of bytes keeps the default, each logged once (`setting_adjusted`).
+pub(crate) fn max_commit_bytes() -> u64 {
+    static V: OnceLock<u64> = OnceLock::new();
+    *V.get_or_init(|| {
+        let Ok(value) = std::env::var("URSULA_VFS_MAX_COMMIT_BYTES") else {
+            return DEFAULT_MAX_COMMIT_BYTES;
+        };
+        let (bytes, changed) = commit_limit(&value);
+        if changed {
+            adjusted("URSULA_VFS_MAX_COMMIT_BYTES", &value, &bytes);
+        }
+        bytes
+    })
+}
+
+/// The commit limit `value` sets, and whether it differs from what `value` says.
+fn commit_limit(value: &str) -> (u64, bool) {
+    match value.trim().parse::<u64>() {
+        Ok(0) => (DEFAULT_MAX_COMMIT_BYTES, true),
+        Err(_not_a_number) => (DEFAULT_MAX_COMMIT_BYTES, true),
+        Ok(bytes) => {
+            let used = bytes.clamp(MIN_COMMIT_BYTES, MAX_COMMIT_BYTES);
+            (used, used != bytes)
+        }
+    }
+}
+
 /// Test hook `URSULA_VFS_SNAPSHOT_DUE_BYTES`: a snapshot is due once more frame bytes than this
 /// are acknowledged since the latest one, instead of past the db file's size or 8 MiB (design:
 /// Snapshots). Unset, or not a number of bytes: the design's threshold.
@@ -302,5 +334,26 @@ fn hook_file(path: &Path) {
             ("path", &path.display()),
             ("error", &e),
         ]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::commit_limit;
+    use crate::capture::DEFAULT_MAX_COMMIT_BYTES;
+
+    // A commit limit in range is used as is. One outside 4096 ..= 1 GiB is clamped to the nearest
+    // bound, and 0 or a value that is not a number keeps the default, each reported as adjusted.
+    #[test]
+    fn the_commit_limit_is_clamped_to_one_page_through_one_gib() {
+        assert_eq!(commit_limit("1048576"), (1 << 20, false));
+        assert_eq!(commit_limit(" 4096 "), (4096, false));
+        assert_eq!(commit_limit("1073741824"), (1 << 30, false));
+        assert_eq!(commit_limit("100"), (4096, true));
+        assert_eq!(commit_limit("1073741825"), (1 << 30, true));
+        assert_eq!(commit_limit("18446744073709551615"), (1 << 30, true));
+        assert_eq!(commit_limit("0"), (DEFAULT_MAX_COMMIT_BYTES, true));
+        assert_eq!(commit_limit("64MiB"), (DEFAULT_MAX_COMMIT_BYTES, true));
+        assert_eq!(commit_limit("-1"), (DEFAULT_MAX_COMMIT_BYTES, true));
     }
 }

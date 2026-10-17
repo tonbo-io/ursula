@@ -445,6 +445,7 @@ A blocked condition is retried every 30 s, and commits continue until `commits.p
 
 - `backlog_full`: compressed commits waiting for the stream reached `maxPendingBytes` (64 MiB by default). Await `db.synced()` and run the transaction again. If it stays full, see [`synced()` does not resolve](#synced-does-not-resolve).
 - `unsupported`: the transaction ran in EXCLUSIVE locking mode, or its commit leaves WAL mode or 4096-byte pages. Change the transaction. Other transactions go on.
+- `too_large`: the commit's pages take more than `URSULA_VFS_MAX_COMMIT_BYTES` (128 MiB by default). The message names the commit's size and the limit. Split the transaction, or raise the limit (at most 1 GiB) on every host that may own the database, with memory for about three times the limit. A `VACUUM` of a large database hits it: see [Errors](/docs/examples/sqlite-vfs#errors) for the ways around it.
 
 ### Statements fail with error code 266 or 778
 

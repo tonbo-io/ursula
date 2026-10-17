@@ -154,6 +154,19 @@ proptest! {
         prop_assert_eq!(decompress(&compressed).unwrap(), record);
     }
 
+    // `encode_commit` builds in one buffer the bytes `encode` gives the same COMMIT: the frame
+    // carries `id` and the record, and encoding its compressed record again gives every byte back.
+    #[test]
+    fn a_commit_encoded_in_one_buffer_is_the_commit_frame(id in id(), record in record()) {
+        let bytes = encode_commit(id, &record).unwrap();
+        let Frame::Commit { id: found, compressed } = decoded(&bytes) else {
+            panic!("a commit")
+        };
+        prop_assert_eq!(found, id);
+        prop_assert_eq!(&decompress(&compressed).unwrap(), &record);
+        prop_assert_eq!(encode(&Frame::Commit { id, compressed }).unwrap(), bytes);
+    }
+
     // Reads cut frames anywhere: every strict prefix is Partial, also with a frame following.
     #[test]
     fn every_strict_prefix_is_partial(frame in any_frame(), next in any_frame()) {
@@ -554,4 +567,38 @@ fn part_frames_cut_a_commit_and_join_back_to_it() {
     ));
     assert_eq!(super::part_index(&commit), None);
     assert_eq!(super::part_index(&claim), None);
+}
+
+// A run whose parts before the last are as long as part 0 cannot fit a COMMIT frame (a body of at
+// most 2^32 - 1 bytes) once `(count - 1) x len(part 0) + 1` passes it: refused at part 0, before
+// anything is joined. A run that fits starts as usual.
+#[test]
+fn a_run_no_commit_frame_holds_is_refused_at_its_first_part() {
+    let id = CommitId {
+        lineage: Lineage([5; 16]),
+        position: Position(3),
+    };
+    let chunk = vec![7u8; 4 << 20];
+    let part = |count| Frame::Part {
+        id,
+        index: 0,
+        count,
+        chunk: chunk.clone(),
+    };
+    let mut run = PartRun::default();
+    // 1023 x 4 MiB + 1 fits under 2^32 - 25.
+    assert_eq!(run.push(part(1024)).unwrap(), None);
+    // 1024 x 4 MiB + 1 does not.
+    assert!(matches!(
+        run.push(part(1025)),
+        Err(FrameError::RunTooLong { count: 1025, len, .. }) if len == (1024u64 << 22) + 1
+    ));
+    // A short part 0 of a long run fits.
+    let short = Frame::Part {
+        id,
+        index: 0,
+        count: 1 << 20,
+        chunk: vec![1],
+    };
+    assert_eq!(run.push(short).unwrap(), None);
 }

@@ -56,6 +56,16 @@ async function streamBytes(path: string): Promise<Uint8Array> {
 	return new Uint8Array(Buffer.concat(chunks));
 }
 
+/** Rows of 64 KiB of random bytes (table `t(i, b)`): samples of each, so equal rows are equal bytes but for chance. */
+export const ROWS_SQL = "SELECT i, length(b) AS n, hex(substr(b, 1, 64)) AS head, hex(substr(b, 30000, 64)) AS mid, hex(substr(b, -64)) AS tail FROM t ORDER BY i";
+const BLOB = 64 << 10;
+
+/** One transaction inserting `rows` rows of 64 KiB of random bytes into `t(i, b)`, `from` on. */
+export function insert(from: number, rows: number): string {
+	const values = Array.from({ length: rows }, (_, k) => `(${from + k}, randomblob(${BLOB}))`).join(", ");
+	return `BEGIN; INSERT INTO t VALUES ${values}; COMMIT`;
+}
+
 /** The `USQ2` frames the stream at `path` holds, by kind (1 claim, 2 commit). */
 export async function frames(path: string): Promise<{ claims: number; commits: number }> {
 	const bytes = await streamBytes(path);

@@ -151,6 +151,8 @@ pub(crate) struct BindingHandle {
     log: Mutex<Log>,
     pending_bytes: AtomicU64,
     max_pending_bytes: u64,
+    /// The most bytes of pages one commit may hold (design: Capture).
+    pub(crate) max_commit_bytes: u64,
     /// The last COMMIT record's position, as the commit path records it.
     last_commit: AtomicU64,
     /// The last acknowledged position.
@@ -355,6 +357,7 @@ impl BindingHandle {
             log: Mutex::new(bind.log),
             pending_bytes: AtomicU64::new(bind.pending_bytes),
             max_pending_bytes: bind.max_pending_bytes,
+            max_commit_bytes: bind.max_commit_bytes,
             acked: AtomicU64::new(bind.acked.0),
             reset: AtomicU8::new(0),
             life: Mutex::new(Lifecycle {
@@ -751,6 +754,8 @@ pub(crate) struct Bind {
     pub(crate) log: Log,
     pub(crate) pending_bytes: u64,
     pub(crate) max_pending_bytes: u64,
+    /// The most bytes of pages one commit may hold.
+    pub(crate) max_commit_bytes: u64,
     pub(crate) acked: Position,
     pub(crate) attach: Attach,
     /// Bound before its claim: the stream was unreachable at the open (design: Open).

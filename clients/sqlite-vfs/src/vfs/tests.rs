@@ -29,12 +29,14 @@ use super::x_access;
 use super::x_delete;
 use crate::capture::FIRST_PAGE;
 use crate::capture::FRAME;
+use crate::capture::WAL_HDR;
 use crate::codec::PAGE;
 use crate::codec::marker::SQLITE_MAGIC;
 use crate::codec::marker::mark;
 use crate::config::set_panic_in_for_tests;
 use crate::db::Binding;
 use crate::db::for_tests;
+use crate::db::for_tests_with_limit;
 use crate::db::registered_for_tests;
 use crate::driver::Holder;
 use crate::publication::HandleState;
@@ -744,6 +746,60 @@ fn a_wal_write_without_the_write_lock_is_unsupported() {
         Some(ResetKind::LocalDamage),
         "a failed F2 fsync resets"
     );
+    // SAFETY: the `Box`es `file_of` made, which nothing freed.
+    drop(unsafe { Box::from_raw(main.ext) });
+    // SAFETY: as above.
+    drop(unsafe { Box::from_raw(wal.ext) });
+}
+
+// A commit of more bytes of pages than the commit limit fails alone as `too_large` at the commit
+// point, before anything is read back (the stand-in has no `xRead`) or logged: no position is
+// taken, nothing is pending and the binding stays live.
+#[test]
+fn a_commit_above_the_limit_fails_alone_with_nothing_logged() {
+    let dir = TempDir::new("vfs-too-large");
+    // Two pages.
+    let b = for_tests_with_limit(dir.path(), 8192);
+    let mut main = file_of(&b, true, &raw const STAND_IN);
+    let mut wal = file_of(&b, false, &raw const STAND_IN);
+    let (m, w) = (
+        (&raw mut main).cast::<ffi::sqlite3_file>(),
+        (&raw mut wal).cast::<ffi::sqlite3_file>(),
+    );
+    let next = commit_log(&b).map(|log| log.next_position()).unwrap();
+    let write_lock = ffi::SQLITE_SHM_LOCK | ffi::SQLITE_SHM_EXCLUSIVE;
+    assert_eq!(shm_lock(m, 0, write_lock), ffi::SQLITE_OK);
+    // Frames of pages 1, 2 and 3, the last the commit frame of a 3-page database, written after
+    // the WAL header (whose F2 fsync the stand-in cannot do).
+    let frame = |pgno: u32, commit_size: u32| {
+        let mut h = [0u8; 24];
+        h[0..4].copy_from_slice(&pgno.to_be_bytes());
+        h[4..8].copy_from_slice(&commit_size.to_be_bytes());
+        h
+    };
+    // Frame `n`'s header and page offsets.
+    let at = |n: i64| {
+        let header = FRAME
+            .checked_mul(n)
+            .and_then(|f| f.checked_add(WAL_HDR))
+            .unwrap();
+        (header, header.checked_add(24).unwrap())
+    };
+    for (n, pgno) in [(0, 1), (1, 2)] {
+        let (header, page) = at(n);
+        assert_eq!(write(w, &frame(pgno, 0), header), ffi::SQLITE_OK);
+        assert_eq!(write(w, &[1u8; PAGE], page), ffi::SQLITE_OK);
+    }
+    let (header, page) = at(2);
+    assert_eq!(write(w, &frame(3, 3), header), ffi::SQLITE_OK);
+    assert_eq!(write(w, &[3u8; PAGE], page), ffi::SQLITE_IOERR_AUTH);
+    assert!(b.reset_kind().is_none());
+    assert_eq!(
+        b.lock().refused.as_ref().map(|r| r.kind().as_str()),
+        Some("too_large")
+    );
+    assert_eq!(b.handle.pending_bytes(), 0);
+    assert_eq!(b.handle.log().unwrap().next_position(), next);
     // SAFETY: the `Box`es `file_of` made, which nothing freed.
     drop(unsafe { Box::from_raw(main.ext) });
     // SAFETY: as above.
