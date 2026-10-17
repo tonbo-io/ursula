@@ -119,6 +119,8 @@ struct SnapshotBuildCoordinatorInner {
     /// (#669), each holding its group's builds until it lands. Shared like
     /// the log gauges. Locked after `handoffs` when both are.
     purges: Arc<Mutex<BTreeMap<u32, PurgeHold>>>,
+    /// Numbers the holds in `purges`.
+    next_purge: AtomicU64,
 }
 
 /// A group's Raft metrics, which show when a purge landed.
@@ -171,9 +173,39 @@ pub struct PurgeBusy {
     pub work: GroupSnapshotWork,
 }
 
+/// A hold of a group's builds for a purge
+/// ([`SnapshotBuildCoordinator::hold_for_purge`]). Dropped before
+/// [`PurgeHoldGuard::keep`], it lifts the hold, so a caller that stops before
+/// it triggered the purge never leaves the group held.
+#[derive(Debug)]
+#[must_use = "dropping the guard lifts the hold"]
+pub struct PurgeHoldGuard {
+    coordinator: SnapshotBuildCoordinator,
+    raft_group_id: u32,
+    /// The hold, `None` once kept or when no hold was taken.
+    id: Option<u64>,
+}
+
+impl PurgeHoldGuard {
+    /// The purge was triggered: the hold stays until it lands.
+    pub fn keep(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for PurgeHoldGuard {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            self.coordinator.release_hold(self.raft_group_id, id);
+        }
+    }
+}
+
 /// A purge through a covering snapshot that holds its group's builds until
 /// it lands ([`GroupSnapshotWork::Purging`]).
 struct PurgeHold {
+    /// Numbers the holds, so that a wait or a release names its own.
+    id: u64,
     through: u64,
     /// Entries the group's OpenRaft keeps below a snapshot it built
     /// (`max_in_snapshot_log_to_keep`), `None` when its engine has not
@@ -185,6 +217,7 @@ struct PurgeHold {
 impl std::fmt::Debug for PurgeHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PurgeHold")
+            .field("id", &self.id)
             .field("through", &self.through)
             .field("keep", &self.keep)
             .finish_non_exhaustive()
@@ -432,6 +465,7 @@ impl SnapshotBuildCoordinator {
                 log_pressure,
                 built: Mutex::default(),
                 purges,
+                next_purge: AtomicU64::new(0),
             }),
         }
     }
@@ -758,13 +792,28 @@ impl SnapshotBuildCoordinator {
     /// The index a purge that has not landed goes through, forgetting a
     /// hold whose purge landed.
     fn purging(&self, raft_group_id: u32) -> Option<u64> {
+        self.current_hold(raft_group_id)
+            .map(|(through, _id)| through)
+    }
+
+    /// The index the hold of `raft_group_id` that has not landed goes
+    /// through, and its number, forgetting a hold whose purge landed.
+    fn current_hold(&self, raft_group_id: u32) -> Option<(u64, u64)> {
         let mut purges = self.purges();
         let hold = purges.get(&raft_group_id)?;
         if hold.landed() {
             purges.remove(&raft_group_id);
             return None;
         }
-        Some(hold.through)
+        Some((hold.through, hold.id))
+    }
+
+    /// Forgets the hold `id` of `raft_group_id`, leaving any other.
+    fn release_hold(&self, raft_group_id: u32, id: u64) {
+        let mut purges = self.purges();
+        if purges.get(&raft_group_id).is_some_and(|hold| hold.id == id) {
+            purges.remove(&raft_group_id);
+        }
     }
 
     /// Holds `raft_group_id`'s builds for a purge of its log through
@@ -780,28 +829,41 @@ impl SnapshotBuildCoordinator {
         published_index: Option<u64>,
         through: u64,
         metrics: RaftMetricsWatch,
-    ) -> Result<(), PurgeBusy> {
+    ) -> Result<PurgeHoldGuard, PurgeBusy> {
         if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::ScrubPurgeHold) {
-            return Ok(());
+            return Ok(PurgeHoldGuard {
+                coordinator: self.clone(),
+                raft_group_id,
+                id: None,
+            });
         }
         let keep = self.log_gauge(raft_group_id).log_keep();
         let handoffs = self.handoffs();
         match self.work_with(&handoffs, raft_group_id, published_index) {
             GroupSnapshotWork::Idle => {}
             work => {
+                ursula_stream::sim_controls::note_fired(
+                    ursula_stream::sim_controls::Defence::ScrubPurgeHold,
+                );
                 return Err(PurgeBusy {
                     raft_group_id,
                     work,
                 });
             }
         }
+        let id = self.inner.next_purge.fetch_add(1, Ordering::Relaxed);
         self.purges().insert(raft_group_id, PurgeHold {
+            id,
             through,
             keep,
             metrics,
         });
         drop(handoffs);
-        Ok(())
+        Ok(PurgeHoldGuard {
+            coordinator: self.clone(),
+            raft_group_id,
+            id: Some(id),
+        })
     }
 
     /// Lifts the hold of `raft_group_id`'s builds for a purge: its trigger
@@ -824,21 +886,34 @@ impl SnapshotBuildCoordinator {
     }
 
     /// Waits until no purge through a snapshot holds `raft_group_id`'s
-    /// builds.
+    /// builds: each hold in turn, on the metrics of the Raft it is for.
     pub async fn purge_landed(&self, raft_group_id: u32) {
-        let Some(mut metrics) = self
-            .purges()
-            .get(&raft_group_id)
-            .map(|hold| hold.metrics.clone())
-        else {
-            return;
-        };
-        while self.purging(raft_group_id).is_some() {
-            if metrics.changed().await.is_err() {
-                // The group's Raft stopped: no purge of it lands.
-                self.release_purge(raft_group_id);
+        loop {
+            let Some((id, mut metrics)) = self
+                .purges()
+                .get(&raft_group_id)
+                .map(|hold| (hold.id, hold.metrics.clone()))
+            else {
                 return;
+            };
+            while self
+                .current_hold(raft_group_id)
+                .is_some_and(|(_through, current)| current == id)
+            {
+                if metrics.changed().await.is_err() {
+                    // That Raft stopped: no purge of it lands.
+                    self.release_hold(raft_group_id, id);
+                }
             }
+        }
+    }
+
+    /// Waits until a build starts or ends, or a hand-off is taken back.
+    pub async fn builds_changed(&self) {
+        let mut builds = self.inner.builds.subscribe();
+        // A closed registry never changes again.
+        if builds.changed().await.is_err() {
+            std::future::pending::<()>().await;
         }
     }
 
@@ -949,6 +1024,9 @@ impl SnapshotBuildCoordinator {
     ) -> Result<SnapshotBuildLease, BuildDeferred> {
         let mut handoffs = self.handoffs();
         if let Some(through) = self.purging(raft_group_id) {
+            ursula_stream::sim_controls::note_fired(
+                ursula_stream::sim_controls::Defence::ScrubPurgeHold,
+            );
             return Err(BuildDeferred::PurgePending { through });
         }
         let permit = match handoffs.remove(&raft_group_id) {
@@ -3549,39 +3627,40 @@ mod tests {
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Idle);
         // Busy groups take no purge.
         let running = build.try_lease(8, 0).expect("a free permit");
-        assert_eq!(
+        assert!(matches!(
             build.hold_for_purge(8, Some(10), 10, metrics.clone()),
             Err(PurgeBusy {
                 raft_group_id: 8,
                 work: GroupSnapshotWork::Building
             })
-        );
+        ));
         drop(running);
         let token = build
             .hand_off(8, build.acquire().await.expect("a permit"))
             .expect("not busy");
-        assert_eq!(
+        assert!(matches!(
             build.hold_for_purge(8, Some(10), 10, metrics.clone()),
             Err(PurgeBusy {
                 raft_group_id: 8,
                 work: GroupSnapshotWork::HandedOff
             })
-        );
+        ));
         assert!(build.reclaim_handoff(8, token));
 
         build
             .hold_for_purge(7, Some(10), 10, metrics.clone())
-            .expect("an idle group");
+            .expect("an idle group")
+            .keep();
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Purging {
             through: 10
         });
-        assert_eq!(
+        assert!(matches!(
             build.hold_for_purge(7, Some(10), 12, metrics.clone()),
             Err(PurgeBusy {
                 raft_group_id: 7,
                 work: GroupSnapshotWork::Purging { through: 10 }
             })
-        );
+        ));
         // No build of the group starts meanwhile: OpenRaft's defers, and a
         // hand-off answers busy.
         assert!(build.busy(7));
@@ -3597,6 +3676,15 @@ mod tests {
         assert_eq!(building, BTreeMap::from([(7, 0)]));
         // Other groups build.
         drop(build.lease_for_build(9, 0).expect("another group builds"));
+        // A hold dropped before its purge was triggered lifts.
+        let dropped = build
+            .hold_for_purge(9, Some(5), 5, metrics.clone())
+            .expect("an idle group");
+        assert_eq!(build.work(9, Some(5)), GroupSnapshotWork::Purging {
+            through: 5
+        });
+        drop(dropped);
+        assert_eq!(build.work(9, Some(5)), GroupSnapshotWork::Idle);
 
         // Three entries past the purge are not enough to cover it...
         sender.send(purge_metrics(13, None)).expect("a receiver");
@@ -3613,7 +3701,8 @@ mod tests {
         // A purged log lands it too.
         build
             .hold_for_purge(7, Some(20), 20, metrics.clone())
-            .expect("an idle group");
+            .expect("an idle group")
+            .keep();
         assert!(build.busy(7));
         sender
             .send(purge_metrics(20, Some(20)))
@@ -3637,19 +3726,20 @@ mod tests {
         lease.record_built(Some(test_log_id(12)));
         drop(lease);
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Unpublished);
-        assert_eq!(
+        assert!(matches!(
             build.hold_for_purge(7, Some(10), 10, metrics.clone()),
             Err(PurgeBusy {
                 raft_group_id: 7,
                 work: GroupSnapshotWork::Unpublished
             })
-        );
+        ));
         // A hand-off is not refused for it: OpenRaft drops the trigger.
         assert!(!build.busy(7));
         assert_eq!(build.work(7, Some(12)), GroupSnapshotWork::Idle);
         build
             .hold_for_purge(7, Some(12), 12, metrics)
-            .expect("published");
+            .expect("published")
+            .keep();
     }
 
     /// #669: an operator's snapshot start waits while a purge through a
@@ -3665,7 +3755,8 @@ mod tests {
         let (sender, metrics) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
         build
             .hold_for_purge(7, Some(10), 10, metrics)
-            .expect("an idle group");
+            .expect("an idle group")
+            .keep();
         let triggers = AtomicU64::new(0);
         let start = build.start_snapshot(
             7,
@@ -3707,7 +3798,8 @@ mod tests {
         let (sender, metrics) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
         build
             .hold_for_purge(7, Some(10), 10, metrics)
-            .expect("an idle group");
+            .expect("an idle group")
+            .keep();
         let landed = build.purge_landed(7);
         tokio::pin!(landed);
         assert!(futures_util::poll!(&mut landed).is_pending());
@@ -3715,6 +3807,43 @@ mod tests {
         assert!(futures_util::poll!(&mut landed).is_ready());
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Idle);
         build.release_purge(7);
+    }
+
+    /// #669 review: a wait on a hold whose Raft stopped lifts only that
+    /// hold, never the hold the group's next incarnation took, and goes on
+    /// to wait for that one.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_stale_purge_wait_leaves_the_next_hold() {
+        use openraft::rt::WatchSender;
+        use openraft::type_config::TypeConfigExt;
+
+        let build = SnapshotBuildCoordinator::new(1);
+        let (old_sender, old) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
+        build
+            .hold_for_purge(7, Some(10), 10, old)
+            .expect("an idle group")
+            .keep();
+        let landed = build.purge_landed(7);
+        tokio::pin!(landed);
+        assert!(futures_util::poll!(&mut landed).is_pending());
+        // The group's Raft restarts and its new incarnation holds again.
+        build.release_purge(7);
+        let (sender, metrics) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
+        build
+            .hold_for_purge(7, Some(10), 10, metrics)
+            .expect("an idle group")
+            .keep();
+        drop(old_sender);
+        assert!(futures_util::poll!(&mut landed).is_pending());
+        assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Purging {
+            through: 10
+        });
+        sender
+            .send(purge_metrics(10, Some(10)))
+            .expect("a receiver");
+        assert!(futures_util::poll!(&mut landed).is_ready());
+        assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Idle);
     }
 
     /// #561: a triggered build takes the permit handed to its group before a

@@ -2206,7 +2206,7 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
                 && snapshot >= Some(removal_index)
                 && purged >= snapshot
                 && snapshot_files_with_marker(&wal_dirs[index]).is_empty()
-                && metrics["raft_deleted_data_oldest_ms"] == 0;
+                && metrics["raft_deleted_data_oldest_age_ms"] == 0;
             if !scrubbed {
                 still.push(index);
             }

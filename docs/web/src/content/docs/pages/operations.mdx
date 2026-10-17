@@ -76,8 +76,10 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST ht
 # Trigger a Raft snapshot for one group
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/snapshot
 
-# Purge log entries below the last snapshot index for one group
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/purge
+# Purge log entries through index 1000 for one group, at most through its
+# last snapshot. Answers 503 with Retry-After while a snapshot of the group
+# builds or a purge of it has not landed. Send it again then.
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/purge?upto=1000"
 
 # Add a learner (non-voting replica) to one group without blocking on catch-up.
 # addr is the address peers dial: the learner's cluster listener (its
@@ -407,7 +409,7 @@ Semantics:
 
 ## Deleted data
 
-Deleting a stream, purging a bucket and a stream's expiry remove the stream from its group's state at once. Copies of its records can stay for a while in each replica's Raft snapshot and Raft log, which are cleaned up in the background. `raft.deleted_data_max_age` (1 hour by default) bounds how long they stay.
+Deleting a stream and purging a bucket remove the stream from its group's state at once. Copies of its records can stay for a while in each replica's Raft snapshot and Raft log, which are cleaned up in the background. `raft.deleted_data_max_age` (1 hour by default) bounds how long they stay.
 
 Within that time after a replica applies the removal:
 
@@ -420,7 +422,9 @@ The time counts per replica, from when that replica first applies the removal. A
 
 The bound and its gauges need the snapshot driver, which runs on every node of a cluster by default. With `storage.snapshot.drive_interval = "0s"` nothing enforces the bound, the gauges below stay at 0, and the server logs a warning at startup. A single node runs no snapshot driver yet, so the bound does not hold there.
 
-While the driver purges a group's log through a snapshot, the group takes no new snapshot until that purge lands, which is usually at once. An operator's `POST /__ursula/raft/{group}/snapshot` waits for it, and answers `503` with `Retry-After` when the wait passes 10 seconds. An operator's `POST /__ursula/raft/{group}/purge` follows the same rule: while a snapshot of the group builds, or OpenRaft has not published the one it built, it answers `503` with `Retry-After`. The driver also purges the log of a group that holds old WAL segments and applied nothing since its last snapshot, so the WAL can free those segments.
+While the driver purges a group's log through a snapshot, the group takes no new snapshot until that purge lands, which is usually at once. An operator's `POST /__ursula/raft/{group}/snapshot` waits for it, and answers `503` with `Retry-After` when the wait passes 10 seconds. An operator's `POST /__ursula/raft/{group}/purge?upto=<index>` follows the same rule: while a snapshot of the group builds, OpenRaft has not published the one it built, or an earlier purge of the group has not landed, it answers `503` with `Retry-After`. Send it again then.
+
+Under write pressure the driver first snapshots the groups that free the most log, and groups that owe a removal wait their turn among the due groups. Removals catch up once the node's log is back under its target.
 
 Later releases bound two more places, which this one leaves as they were:
 
@@ -429,14 +433,17 @@ Later releases bound two more places, which this one leaves as they were:
 
 The bound does not cover:
 
-- Retention advances. Records a stream's retention trims are not a removal and leave the snapshots and the log on the group's usual cadence. A stream's expiry is covered.
+- Stream expiry, for now. An expired stream reads as gone at once, but its group removes it only when a write or a touch reaches the stream, and the time starts then. A stream that expires in a quiet group keeps its records in the snapshot and the log until that happens. A later release removes expired streams in the background so that the bound covers them.
+- Retention advances. Records a stream's retention trims are not a removal and leave the snapshots and the log on the group's usual cadence.
+- A leader whose follower lags. A leader purges no log entry a follower still needs, so a slow or unreachable follower holds the leader's log through the removal until it catches up or the leader sends it a snapshot.
+- A group whose Raft is not running on the replica, for example while the replica restarts or after it stopped on a storage error. The time keeps counting, and the driver cleans the group up once its Raft runs again.
 - A replica that is down for longer than `raft.deleted_data_max_age`. It catches up when it is back, and its time counts from when it applies the removal.
 - A snapshot object another replica still uses. It stays until that replica's own snapshot moves past it.
 - Backups taken before the removal. Delete them to complete an erasure.
 - Freed disk blocks and memory. Ursula deletes and replaces files but does not overwrite the blocks they used, and read caches keep blocks of a deleted stream until they are evicted. Use encrypted volumes and buckets where that matters.
 - A group whose committed application failed. It keeps its whole log for replay until it is repaired.
 
-`raft_deleted_data_oldest_ms` in `/__ursula/metrics` reports how long ago the oldest removal on the node applied whose stream its current snapshot or its Raft log still holds, and `raft_deleted_data_overdue_groups` counts the groups whose snapshot still holds one past a quarter of `raft.deleted_data_max_age`. `deleted_data` lists each such group with what it still holds: `owed` or `replayed` while its snapshot holds the stream, with the bytes and age, and `purging` while only its log does, with the age and the index the log is purged through. Alert when `raft_deleted_data_oldest_ms` nears half of `raft.deleted_data_max_age`.
+`raft_deleted_data_oldest_age_ms` in `/__ursula/metrics` reports how long ago the oldest removal on the node applied whose stream its current snapshot or its Raft log still holds, and `raft_deleted_data_overdue_groups` counts the groups whose snapshot still holds one past a quarter of `raft.deleted_data_max_age`. `deleted_data` lists each such group with what it still holds: `owed` or `replayed` while its snapshot holds the stream, with the bytes and age, and `purging` while only its log does, with the age and the index the log is purged through. Alert when `raft_deleted_data_oldest_age_ms` nears half of `raft.deleted_data_max_age`.
 
 ## Cleaning S3
 

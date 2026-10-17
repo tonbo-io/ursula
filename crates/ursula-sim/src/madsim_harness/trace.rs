@@ -755,6 +755,9 @@ pub enum SimEvent {
         purge: bool,
         fault: String,
         replicas: u64,
+        /// How often a restored snapshot raised a replica's purge
+        /// watermark (`Defence::RestorePurge`).
+        restore_purges: u64,
     },
     /// An operator's snapshot of a group whose leader deferred a purge
     /// through a covering snapshot started only once that purge landed

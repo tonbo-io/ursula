@@ -596,6 +596,9 @@ pub(super) async fn run_deleted_data_inner(
         })
     };
     let removal_index = removal_applied(&cluster, remover, before, &context).await;
+    // The replica restarted after its covering snapshot, and the full
+    // snapshots sent to it by then.
+    let mut restart = None;
     let mut seen = Applied::default();
     seen.observe(&cluster, removal_index);
 
@@ -648,22 +651,31 @@ pub(super) async fn run_deleted_data_inner(
                 }
                 madsim::time::sleep(POLL).await;
             };
+            let before_stop = metrics(&cluster, GROUP, covered);
             cluster.stop_node(covered).await;
-            if controls.purge_after_restart {
-                // A process restart: the replica restores its snapshot and
-                // keeps its log as it was, which a power loss's recovery
-                // gate may replace with the leader's snapshot.
-                trace.push(SimEvent::FaultApplied {
-                    phase: "process_restarted_after_covering_snapshot".to_owned(),
-                });
-            } else {
-                cluster.wals[&covered].power_loss_losing_unsynced().await;
-                trace.push(SimEvent::FaultApplied {
-                    phase: "power_lost_after_covering_snapshot".to_owned(),
-                });
-            }
+            cluster.wals[&covered].power_loss_losing_unsynced().await;
+            trace.push(SimEvent::FaultApplied {
+                phase: "power_lost_after_covering_snapshot".to_owned(),
+            });
             cluster.start_node(covered).await;
+            let restarted = metrics(&cluster, GROUP, covered);
             if controls.purge_after_restart {
+                // What the restore purge is for: the replica restored the
+                // snapshot that dropped the stream, and OpenRaft's startup
+                // purged none of its log (it purges only a log that ends
+                // below the snapshot).
+                let restored = restarted.snapshot.map(|snapshot| snapshot.index);
+                assert!(
+                    restored >= Some(removal_index),
+                    "{context}: node {covered} restored snapshot {restored:?}, below the \
+                     removal at {removal_index}"
+                );
+                assert_eq!(
+                    restarted.purged.map(|log_id| log_id.index),
+                    before_stop.purged.map(|log_id| log_id.index),
+                    "{context}: node {covered} purged its log at startup"
+                );
+                restart = Some((covered, cluster.full_snapshots_to(GROUP, covered)));
                 ursula_stream::sim_controls::set_off(
                     ursula_stream::sim_controls::Defence::ScrubPurge,
                     false,
@@ -688,6 +700,16 @@ pub(super) async fn run_deleted_data_inner(
             .map(|(node_id, _)| *node_id)
             .collect::<Vec<_>>();
         for node_id in due {
+            if let Some((restarted, sent)) = restart
+                && restarted == node_id
+            {
+                // No leader's snapshot replaced the restored one.
+                assert_eq!(
+                    cluster.full_snapshots_to(GROUP, node_id),
+                    sent,
+                    "{context}: node {node_id} installed a snapshot after its restart"
+                );
+            }
             check_replica(&cluster, node_id, &mut trace, &context).await;
             checked.insert(node_id);
         }
@@ -706,6 +728,9 @@ pub(super) async fn run_deleted_data_inner(
         purge: plan.purge,
         fault: plan.fault.name().to_owned(),
         replicas: u64::try_from(checked.len()).expect("replica count fits u64"),
+        restore_purges: ursula_stream::sim_controls::fired(
+            ursula_stream::sim_controls::Defence::RestorePurge,
+        ),
     });
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
@@ -895,10 +920,21 @@ mod tests {
                 .filter(|event| matches!(event, SimEvent::FaultApplied { .. }))
                 .collect::<Vec<_>>()
         );
+        let panic = result.err().map(|payload| {
+            payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| {
+                    payload
+                        .downcast_ref::<&str>()
+                        .map(|text| (*text).to_owned())
+                })
+                .unwrap_or_default()
+        });
         let trace = SimTrace::last_recorded();
         assert!(
             invariant_failed(&trace, invariant),
-            "{controls:?} did not fail `{invariant}` on seed {seed}: {:?}",
+            "{controls:?} did not fail `{invariant}` on seed {seed}: {panic:?}, {:?}",
             trace.events.last()
         );
         trace
@@ -940,13 +976,16 @@ mod tests {
             config(CRASH_SEED),
             Controls::CRASH_BEFORE_PURGE,
         );
+        // The bound held, and the restore purge is what held it.
         assert!(
-            report
-                .outcome
-                .trace
-                .events
-                .iter()
-                .any(|event| matches!(event, SimEvent::DeletedDataLeft { replicas: 3, .. })),
+            report.outcome.trace.events.iter().any(|event| matches!(
+                event,
+                SimEvent::DeletedDataLeft {
+                    replicas: 3,
+                    restore_purges: 1..,
+                    ..
+                }
+            )),
             "{:?}",
             report.outcome.trace.events.last()
         );
@@ -964,6 +1003,38 @@ mod tests {
     /// A seed whose run cuts a replica's power after its covering
     /// snapshot.
     const CRASH_SEED: u64 = 523;
+
+    /// Nightly seeds of the same fault (`seed % 4 == 3`).
+    const NIGHTLY_CRASH_SEEDS: [u64; 3] = [603, 615, 627];
+
+    /// The same crash and its negative control on nightly seeds.
+    #[test]
+    fn scrub_restore_purge_holds_on_nightly_seeds() {
+        let _guard = sim_test_guard();
+        for seed in NIGHTLY_CRASH_SEEDS {
+            let report = ThreeNodeRaftSim::run_deleted_data_with_controls_report(
+                config(seed),
+                Controls::CRASH_BEFORE_PURGE,
+            );
+            assert!(
+                report.outcome.trace.events.iter().any(|event| matches!(
+                    event,
+                    SimEvent::DeletedDataLeft {
+                        replicas: 3,
+                        restore_purges: 1..,
+                        ..
+                    }
+                )),
+                "seed {seed}: {:?}",
+                report.outcome.trace.events.last()
+            );
+            let message = assert_fails(seed, Controls::RESTORE_OFF, BOUND_INVARIANT);
+            assert!(
+                message.contains("holds the marker"),
+                "seed {seed}: {message}"
+            );
+        }
+    }
 
     /// #669 review: an operator's snapshot that interleaves with a purge
     /// through a covering snapshot the leader defers starts only once that

@@ -448,7 +448,7 @@ runtime_metrics! {
     // age of the oldest removal a snapshot or log still holds, and the
     // groups whose snapshot holds one past a quarter of
     // `raft.deleted_data_max_age`.
-    counter raft_deleted_data_oldest_ms;
+    counter raft_deleted_data_oldest_age_ms;
     counter raft_deleted_data_overdue_groups;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
@@ -787,8 +787,8 @@ impl RuntimeMetricsInner {
     }
 
     fn record_raft_deleted_data(&self, sample: RaftDeletedDataSample) {
-        self.raft_deleted_data_oldest_ms
-            .store_relaxed(sample.oldest_ms);
+        self.raft_deleted_data_oldest_age_ms
+            .store_relaxed(sample.oldest_age_ms);
         self.raft_deleted_data_overdue_groups
             .store_relaxed(sample.overdue_groups);
     }
@@ -1230,7 +1230,7 @@ mod metric_manifest_tests {
         "raft_snapshot_builds_in_flight_max",
         "raft_log_bytes",
         "raft_log_bytes_high_watermark",
-        "raft_deleted_data_oldest_ms",
+        "raft_deleted_data_oldest_age_ms",
         "raft_deleted_data_overdue_groups",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
@@ -1305,17 +1305,17 @@ mod metric_manifest_tests {
     fn raft_deleted_data_gauges_follow_the_latest_poll() {
         let metrics = metrics_for_test();
         metrics.record_raft_deleted_data(RaftDeletedDataSample {
-            oldest_ms: 90_000,
+            oldest_age_ms: 90_000,
             overdue_groups: 3,
         });
         metrics.record_raft_deleted_data(RaftDeletedDataSample {
-            oldest_ms: 1_000,
+            oldest_age_ms: 1_000,
             overdue_groups: 0,
         });
         let snapshot = metrics.snapshot();
         assert_eq!(
             (
-                snapshot.raft_deleted_data_oldest_ms,
+                snapshot.raft_deleted_data_oldest_age_ms,
                 snapshot.raft_deleted_data_overdue_groups,
             ),
             (1_000, 0)
@@ -1370,7 +1370,7 @@ mod metric_manifest_tests {
 pub struct RaftDeletedDataSample {
     /// How long ago the oldest removal applied whose stream a snapshot or a
     /// Raft log on the node still holds, 0 for none.
-    pub oldest_ms: u64,
+    pub oldest_age_ms: u64,
     /// Groups that hold a removal past a quarter of
     /// `raft.deleted_data_max_age`, or one replayed at startup, which no
     /// snapshot covers yet.

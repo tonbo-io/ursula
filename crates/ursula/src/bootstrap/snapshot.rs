@@ -307,7 +307,7 @@ pub(crate) fn deleted_data_sample<'a>(
                 .age()
                 .map_or(0, |age| u64::try_from(age.as_millis()).unwrap_or(u64::MAX));
             RaftDeletedDataSample {
-                oldest_ms: sample.oldest_ms.max(age_ms),
+                oldest_age_ms: sample.oldest_age_ms.max(age_ms),
                 overdue_groups: sample
                     .overdue_groups
                     .saturating_add(u64::from(cadence.removal_overdue(progress))),
@@ -454,36 +454,29 @@ pub(crate) struct ScrubPurge {
 /// would stay until a later snapshot moved past them. A group whose latest
 /// snapshot covering a removal, or the snapshot it restored at startup, is
 /// past its purged log is purged through it once OpenRaft's metrics show that
-/// snapshot. So is a group the Raft WAL reports keeping old journal segments
-/// that applied nothing since its last snapshot, through that snapshot: no
-/// build of it can start, and its only live entries are the kept window.
-pub(crate) fn plan_scrub_purges(
-    snapshots: &[RaftGroupMetricsSnapshot],
-    lagging: &BTreeSet<RaftGroupId>,
-) -> Vec<ScrubPurge> {
+/// snapshot. A group whose Raft is not running is left alone.
+pub(crate) fn plan_scrub_purges(snapshots: &[RaftGroupMetricsSnapshot]) -> Vec<ScrubPurge> {
     if ursula_stream::sim_controls::off(Defence::ScrubPurge) {
         return Vec::new();
     }
-    snapshots
+    let purges = snapshots
         .iter()
-        .filter(|snapshot| snapshot.apply_failure.is_none())
+        .filter(|snapshot| snapshot.apply_failure.is_none() && snapshot.maintenance.running)
         .filter_map(|snapshot| {
             let published = snapshot.snapshot?.index;
             let purged = snapshot.purged.map(|purged| purged.index);
-            let lagging_idle = lagging.contains(&RaftGroupId(snapshot.raft_group_id))
-                && snapshot.log.log_entries == 0;
-            let through = if lagging_idle {
-                snapshot.log.scrub_purge_through.max(published)
-            } else {
-                snapshot.log.scrub_purge_through
-            };
+            let through = snapshot.log.scrub_purge_through;
             (through > 0 && Some(through) > purged && through <= published).then_some(ScrubPurge {
                 raft_group_id: snapshot.raft_group_id,
                 through,
                 published,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if !purges.is_empty() {
+        ursula_stream::sim_controls::note_fired(Defence::ScrubPurge);
+    }
+    purges
 }
 
 /// What the snapshot driver works with besides its registry.
@@ -522,6 +515,9 @@ pub struct SnapshotDriver {
     /// The groups held out of the last pass, so that passes that only carry
     /// the same holds are neither logged nor counted.
     last_held: BTreeSet<u32>,
+    /// Whether the last pass ended without a build slot for an overdue
+    /// group (#669): the pause then ends once a build starts or ends.
+    wait_for_slot: bool,
 }
 
 impl SnapshotDriver {
@@ -546,6 +542,7 @@ impl SnapshotDriver {
             metrics,
             held_groups: HeldGroups::default(),
             last_held: BTreeSet::new(),
+            wait_for_slot: false,
         }
     }
 
@@ -561,16 +558,28 @@ impl SnapshotDriver {
 
     /// Waits `pause`, or until the WAL's lagging groups change, so that they
     /// are snapshotted and purged sooner.
-    pub async fn pause(&self, pause: Duration) {
-        match &self.wal_lagging {
-            Some(lagging) => {
-                tokio::select! {
-                    biased;
-                    () = clock::sleep(pause) => {}
-                    () = lagging.changed() => {}
-                }
+    /// A pass that left an overdue group without a build slot ends its
+    /// pause once a build starts or ends instead (#669).
+    pub async fn pause(&mut self, pause: Duration) {
+        let slot = std::mem::take(&mut self.wait_for_slot);
+        let builds = async {
+            if slot {
+                self.coordinator.builds_changed().await;
+            } else {
+                std::future::pending::<()>().await;
             }
-            None => clock::sleep(pause).await,
+        };
+        let lagging = async {
+            match &self.wal_lagging {
+                Some(lagging) => lagging.changed().await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            biased;
+            () = clock::sleep(pause) => {}
+            () = lagging => {}
+            () = builds => {}
         }
     }
 
@@ -587,10 +596,6 @@ impl SnapshotDriver {
             .as_ref()
             .map(|lagging| lagging.groups())
             .unwrap_or_default();
-        // The purges through covering snapshots first (#669): they are
-        // cheap, and a pass may wait long for build slots and hand-offs.
-        self.purge_through_covering_snapshots(&self.registry.metrics_snapshot(), &lagging)
-            .await;
         // The builds first: a group whose build ends after this read still
         // counts as in flight, and one whose build ended before it shows, in
         // the metrics read next, the log after the build freed it, never the
@@ -606,6 +611,10 @@ impl SnapshotDriver {
         let mut building = coordinator.builds_in_flight();
         let held = self.held_groups.held(Instant::now());
         let snaps = self.registry.metrics_snapshot();
+        // The purges through covering snapshots before the pass (#669): they
+        // are cheap, and a pass may wait long for build slots and hand-offs.
+        // A group they hold counts as building below.
+        self.purge_through_covering_snapshots(&snaps).await;
         coordinator.add_publishing(
             &mut building,
             snaps.iter().map(|snapshot| {
@@ -629,7 +638,7 @@ impl SnapshotDriver {
         // build or are held wait for that.
         let overdue_total = snaps
             .iter()
-            .filter(|snapshot| snapshot.apply_failure.is_none())
+            .filter(|snapshot| snapshot.apply_failure.is_none() && snapshot.maintenance.running)
             .filter(|snapshot| {
                 !building.contains_key(&snapshot.raft_group_id)
                     && !held.contains(&snapshot.raft_group_id)
@@ -639,7 +648,9 @@ impl SnapshotDriver {
                 progress.log_entries > 0 && cadence.removal_overdue(&progress)
             })
             .count();
-        let mut overdue_left = overdue_total > plan.overdue;
+        // Under pressure overdue groups plan as due groups, paced by the
+        // pressure pass.
+        let mut overdue_left = !plan.pressure.is_pressure() && overdue_total > plan.overdue;
         // Measured the way the pass measures it below, so only a rise
         // during the pass ends it.
         let planned_pressure = cadence.pressure(coordinator.node_log_bytes(), limits.max_builds);
@@ -681,9 +692,15 @@ impl SnapshotDriver {
                     Trigger::NotStarted => not_started = not_started.saturating_add(1),
                     Trigger::Busy => busy = busy.saturating_add(1),
                     Trigger::Unclaimed => unclaimed = unclaimed.saturating_add(1),
-                    Trigger::NoSlot | Trigger::Outgrown => {
+                    Trigger::NoSlot => {
+                        // An overdue group left without a slot waits for one
+                        // on the builds, not on a timer.
+                        self.wait_for_slot = position < plan.overdue;
+                        break;
+                    }
+                    Trigger::Outgrown => {
                         overdue_left |= position < plan.overdue;
-                        outgrown = trigger == Trigger::Outgrown;
+                        outgrown = true;
                         break;
                     }
                 }
@@ -744,30 +761,30 @@ impl SnapshotDriver {
     /// removals ([`plan_scrub_purges`]), holding the group's builds until
     /// the purge lands. A group whose snapshot work is not idle
     /// ([`ursula_raft::GroupSnapshotWork`]) is purged on a later tick.
-    async fn purge_through_covering_snapshots(
-        &self,
-        snaps: &[RaftGroupMetricsSnapshot],
-        lagging: &BTreeSet<RaftGroupId>,
-    ) {
-        for purge in plan_scrub_purges(snaps, lagging) {
+    async fn purge_through_covering_snapshots(&self, snaps: &[RaftGroupMetricsSnapshot]) {
+        for purge in plan_scrub_purges(snaps) {
             let Some(raft) = self.registry.get(RaftGroupId(purge.raft_group_id)) else {
                 continue;
             };
-            if let Err(busy) = self.coordinator.hold_for_purge(
+            let guard = match self.coordinator.hold_for_purge(
                 purge.raft_group_id,
                 Some(purge.published),
                 purge.through,
                 raft.metrics(),
             ) {
-                tracing::debug!(
-                    through = purge.through,
-                    %busy,
-                    "snapshot driver: purging through the covering snapshot later"
-                );
-                continue;
-            }
+                Ok(guard) => guard,
+                Err(busy) => {
+                    tracing::debug!(
+                        through = purge.through,
+                        %busy,
+                        "snapshot driver: purging through the covering snapshot later"
+                    );
+                    continue;
+                }
+            };
             if let Err(err) = raft.trigger().purge_log(purge.through).await {
-                self.coordinator.release_purge(purge.raft_group_id);
+                // Dropping the guard lifts the hold.
+                drop(guard);
                 tracing::error!(
                     raft_group_id = purge.raft_group_id,
                     through = purge.through,
@@ -775,6 +792,7 @@ impl SnapshotDriver {
                     "snapshot driver: purge through the covering snapshot failed"
                 );
             } else {
+                guard.keep();
                 tracing::info!(
                     raft_group_id = purge.raft_group_id,
                     through = purge.through,

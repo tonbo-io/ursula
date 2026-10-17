@@ -357,6 +357,11 @@ impl JournalCluster {
         }
     }
 
+    /// How many full snapshots `group`'s leaders sent `node_id`.
+    pub(super) fn full_snapshots_to(&self, group: u32, node_id: u64) -> usize {
+        self.registries[&group].full_snapshot_count(node_id)
+    }
+
     /// Whether `node_id`'s snapshot driver task runs.
     pub(super) fn driver_running(&self, node_id: u64) -> bool {
         self.driver_tasks
@@ -653,26 +658,34 @@ impl JournalCluster {
         let raft = self.engines[&(group, node_id)].raft_handle();
         let snapshot = self.operator_snapshot(group, node_id, wait).await?;
         let purge_upto = snapshot.saturating_sub(keep);
+        // Under the hold rule every purge of the drivers' nodes keeps
+        // (#669): while a build of the group runs or OpenRaft has not
+        // published one, a purge could stop the group's Raft core.
+        let mut held = None;
         if self.drivers.is_some() {
-            // Under the hold rule every purge of the drivers' nodes keeps
-            // (#669): while a build of the group runs or OpenRaft has not
-            // published one, a purge could stop the group's Raft core.
             let coordinator = self.coordinator(node_id);
             let deadline = madsim::time::Instant::now() + wait;
-            while coordinator
-                .hold_for_purge(group, Some(snapshot), purge_upto, raft.metrics())
-                .is_err()
-            {
-                if madsim::time::Instant::now() >= deadline {
-                    return Err("hold the group's builds for the purge");
+            loop {
+                match coordinator.hold_for_purge(group, Some(snapshot), purge_upto, raft.metrics())
+                {
+                    Ok(guard) => {
+                        held = Some(guard);
+                        break;
+                    }
+                    Err(_busy) if madsim::time::Instant::now() >= deadline => {
+                        return Err("hold the group's builds for the purge");
+                    }
+                    Err(_busy) => madsim::time::sleep(Duration::from_millis(10)).await,
                 }
-                madsim::time::sleep(Duration::from_millis(10)).await;
             }
         }
         raft.trigger()
             .purge_log(purge_upto)
             .await
             .map_err(|_fatal| "trigger a purge")?;
+        if let Some(guard) = held {
+            guard.keep();
+        }
         raft.wait(Some(wait))
             .metrics(
                 |metrics| {

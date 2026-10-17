@@ -7360,59 +7360,47 @@ mod snapshot_driver {
     }
 
     /// #669: the driver purges a group's log through the snapshot that
-    /// covers its removals once OpenRaft shows that snapshot, and a lagging
-    /// group that applied nothing since its snapshot through that snapshot.
+    /// covers its removals once OpenRaft shows that snapshot, and leaves a
+    /// group whose Raft stopped alone.
     #[test]
     fn snapshot_driver_purges_through_the_covering_snapshot() {
         let covering = |through| GroupLogProgress {
             scrub_purge_through: through,
             ..log(MIB, MIB)
         };
-        let mut purged = snap(3, Some(40), Some(30), covering(30));
+        let running = |mut snapshot: RaftGroupMetricsSnapshot| {
+            snapshot.maintenance.running = true;
+            snapshot
+        };
+        let mut purged = running(snap(3, Some(40), Some(30), covering(30)));
         purged.purged = Some(super::RaftLogProgressSnapshot {
             term: 1,
             index: 30,
             node_id: 1,
         });
-        let mut stopped = snap(4, Some(40), Some(30), covering(30));
+        let mut stopped = running(snap(4, Some(40), Some(30), covering(30)));
         stopped.apply_failure = Some(ursula_proto::admin::ApplyFailure {
             term: 1,
             index: 41,
             kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
             message: "diagnostic".to_owned(),
         });
-        let idle = GroupLogProgress {
-            log_bytes: 0,
-            log_entries: 0,
-            ..covering(0)
-        };
         let snapshots = vec![
-            snap(0, Some(40), Some(30), covering(30)),
+            running(snap(0, Some(40), Some(30), covering(30))),
             // OpenRaft does not show the covering snapshot yet.
-            snap(1, Some(40), Some(20), covering(30)),
+            running(snap(1, Some(40), Some(20), covering(30))),
             // No snapshot covered a removal.
-            snap(2, Some(40), Some(30), covering(0)),
+            running(snap(2, Some(40), Some(30), covering(0))),
             purged,
             stopped,
-            // Lagging and idle: through its snapshot.
-            snap(5, Some(36), Some(36), idle),
-            // Lagging, but it applied log since its snapshot: a build of it
-            // comes first.
-            snap(6, Some(40), Some(36), covering(0)),
+            // Its Raft does not run.
+            snap(5, Some(40), Some(30), covering(30)),
         ];
-        let lagging = BTreeSet::from([RaftGroupId(5), RaftGroupId(6)]);
-        assert_eq!(plan_scrub_purges(&snapshots, &lagging), vec![
-            ScrubPurge {
-                raft_group_id: 0,
-                through: 30,
-                published: 30,
-            },
-            ScrubPurge {
-                raft_group_id: 5,
-                through: 36,
-                published: 36,
-            },
-        ]);
+        assert_eq!(plan_scrub_purges(&snapshots), vec![ScrubPurge {
+            raft_group_id: 0,
+            through: 30,
+            published: 30,
+        }]);
     }
 
     /// #669: a group with an overdue removal leads the pass, and while the
@@ -7474,7 +7462,7 @@ mod snapshot_driver {
         assert_eq!(
             deleted_data_sample(&cadence, &groups),
             ursula_runtime::RaftDeletedDataSample {
-                oldest_ms: 20_000,
+                oldest_age_ms: 20_000,
                 overdue_groups: 2,
             }
         );
@@ -8127,7 +8115,7 @@ mod snapshot_driver {
             .runtime
             .metrics()
             .snapshot()
-            .raft_deleted_data_oldest_ms
+            .raft_deleted_data_oldest_age_ms
             == 0
         {
             assert!(Instant::now() < deadline, "the removal is never reported");
@@ -8155,7 +8143,7 @@ mod snapshot_driver {
             .expect("deadline");
         loop {
             let metrics = node.runtime.metrics().snapshot();
-            if metrics.raft_deleted_data_oldest_ms == 0
+            if metrics.raft_deleted_data_oldest_age_ms == 0
                 && metrics.raft_deleted_data_overdue_groups == 0
             {
                 break;

@@ -50,6 +50,7 @@
 //! simulated groups.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering as AtomicOrdering;
@@ -66,8 +67,6 @@ pub const MAX_SNAPSHOT_FLOOR_BYTES: u64 = 16 << 20;
 pub const MIN_SNAPSHOT_FLOOR_BYTES: u64 = 64 << 10;
 /// Default far backstop in applied entries.
 pub const DEFAULT_SNAPSHOT_BACKSTOP_ENTRIES: u64 = 100_000;
-/// Default `raft.deleted_data_max_age` (#669).
-pub const DEFAULT_DELETED_DATA_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Log a group applied since its last snapshot, and that snapshot's size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -280,7 +279,9 @@ impl SnapshotCadence {
             floor_bytes,
             node_budget_bytes: node_budget_bytes.max(1),
             backstop_entries: backstop_entries.max(1),
-            removal_floor: removal_floor_of(DEFAULT_DELETED_DATA_MAX_AGE),
+            removal_floor: removal_floor_of(
+                ursula_config::RaftConfig::DEFAULT_DELETED_DATA_MAX_AGE,
+            ),
         }
     }
 
@@ -302,7 +303,13 @@ impl SnapshotCadence {
         match progress.removal {
             RemovalProgress::Clear | RemovalProgress::Purging { .. } => false,
             RemovalProgress::Owed { age_ms, .. } => {
-                Duration::from_millis(age_ms) >= self.removal_floor
+                let overdue = Duration::from_millis(age_ms) >= self.removal_floor;
+                if overdue {
+                    ursula_stream::sim_controls::note_fired(
+                        ursula_stream::sim_controls::Defence::RemovalFloor,
+                    );
+                }
+                overdue
             }
             RemovalProgress::Replayed { .. } => true,
         }
@@ -430,9 +437,10 @@ impl SnapshotCadence {
     /// One pass of the snapshot driver: the groups to snapshot, by index
     /// into `groups`, in the order to start them.
     ///
-    /// Groups with an overdue removal ([`Self::removal_overdue`], #669) go
-    /// first, the oldest removal first, then lagging groups that hold log,
-    /// most log first. Below the
+    /// Below the pressure watermark, groups with an overdue removal
+    /// ([`Self::removal_overdue`], #669) go first, replayed ones and then
+    /// the oldest removal first. Under pressure they plan as due groups.
+    /// Lagging groups that hold log come next, most log first. Below the
     /// pressure watermark the rest are the groups due on their own cadence,
     /// the most log freed per snapshot byte first. At or above it they are
     /// any group that holds log, the most reclaimable log first, until the
@@ -449,22 +457,36 @@ impl SnapshotCadence {
         let pressure = self.pressure(node_log_bytes, limits.max_builds);
         let max_groups = limits.max_groups.max(1).saturating_mul(pressure.builds());
         let at = |index: &usize| groups.get(*index);
-        let overdue_age = |index: &usize| {
+        // Overdue removals lead a calm pass, replayed ones first, then the
+        // oldest. Under pressure the log comes first: overdue groups are due
+        // groups like any other, after the groups that free the most log, so
+        // removal debt never holds back the relief the 503 gate waits for.
+        let overdue_rank = |index: &usize| {
             at(index)
-                .filter(|group| group.startable() && self.removal_overdue(&group.progress))
-                .and_then(|group| group.progress.removal.age())
+                .filter(|group| {
+                    !pressure.is_pressure()
+                        && group.startable()
+                        && self.removal_overdue(&group.progress)
+                })
+                .map(|group| {
+                    (
+                        matches!(group.progress.removal, RemovalProgress::Replayed { .. }),
+                        group.progress.removal.age(),
+                    )
+                })
         };
         let mut selected = (0..groups.len())
-            .filter(|index| overdue_age(index).is_some())
+            .filter(|index| overdue_rank(index).is_some())
             .collect::<Vec<_>>();
         selected.sort_by(|left, right| {
-            overdue_age(right)
-                .cmp(&overdue_age(left))
+            overdue_rank(right)
+                .cmp(&overdue_rank(left))
                 .then_with(|| left.cmp(right))
         });
         let overdue = selected.len().min(max_groups);
+        let mut chosen = selected.iter().copied().collect::<BTreeSet<_>>();
         let mut lagging = (0..groups.len())
-            .filter(|index| !selected.contains(index))
+            .filter(|index| !chosen.contains(index))
             .filter(|index| at(index).is_some_and(|group| group.lagging && group.startable()))
             .collect::<Vec<_>>();
         lagging.sort_by(|left, right| {
@@ -473,6 +495,7 @@ impl SnapshotCadence {
         });
         selected.extend(lagging);
         selected.truncate(max_groups);
+        chosen = selected.iter().copied().collect();
         // The log left once the builds in flight and the planned ones
         // complete.
         let in_flight = groups
@@ -488,7 +511,7 @@ impl SnapshotCadence {
             .saturating_sub(in_flight)
             .saturating_sub(planned);
         let mut order = (0..groups.len())
-            .filter(|index| !selected.contains(index))
+            .filter(|index| !chosen.contains(index))
             .filter(|index| {
                 at(index).is_some_and(|group| {
                     group.startable() && (pressure.is_pressure() || self.is_due(&group.progress))
@@ -650,6 +673,10 @@ struct RemovalLedger {
     /// Entries the group's OpenRaft keeps below a snapshot it built
     /// (`max_in_snapshot_log_to_keep`), once its engine started.
     log_keep: Option<u64>,
+    /// `removals` when the latest mark was taken, and when the first
+    /// removal after it applied: what a snapshot of that mark leaves owed.
+    marked_removals: u64,
+    first_after_mark: Option<Instant>,
 }
 
 /// Counter values a snapshot covers; see [`GroupLogGauge::mark`].
@@ -709,6 +736,9 @@ impl GroupLogGauge {
     /// when the oldest of them applied.
     pub fn record_removal(&self, bytes: u64) {
         let mut ledger = self.ledger();
+        if ledger.removals == ledger.marked_removals && ledger.first_after_mark.is_none() {
+            ledger.first_after_mark = Some(Instant::now());
+        }
         ledger.removals = ledger.removals.saturating_add(1);
         ledger.removed_bytes = ledger.removed_bytes.saturating_add(bytes);
         ledger.debt = match ledger.debt {
@@ -757,7 +787,11 @@ impl GroupLogGauge {
 
     /// What a snapshot of the state applied so far covers.
     pub fn mark(&self) -> GroupLogMark {
-        let ledger = self.ledger();
+        let mut ledger = self.ledger();
+        if ledger.marked_removals != ledger.removals {
+            ledger.marked_removals = ledger.removals;
+            ledger.first_after_mark = None;
+        }
         GroupLogMark {
             bytes: self.applied_bytes.load(AtomicOrdering::Relaxed),
             entries: self.applied_entries.load(AtomicOrdering::Relaxed),
@@ -774,10 +808,9 @@ impl GroupLogGauge {
     /// scrub purge watermark to `index`. Once it covers every removal
     /// applied so far, the replica owes a purge of its log through the
     /// watermark ([`RemovalDebt::Purging`]). A removal that applied while
-    /// the snapshot was built makes it owe the next snapshot from now, at
-    /// most one build late, so a group whose streams keep expiring
-    /// snapshots once per [`SnapshotCadence::removal_floor`], not back to
-    /// back.
+    /// the snapshot was built makes it owe the next snapshot from when that
+    /// removal applied, so a group whose streams keep expiring snapshots
+    /// once per [`SnapshotCadence::removal_floor`], not back to back.
     pub fn record_snapshot(&self, mark: GroupLogMark, snapshot_bytes: u64, index: u64) {
         self.snapshot_bytes_mark
             .fetch_max(mark.bytes, AtomicOrdering::Relaxed);
@@ -801,9 +834,14 @@ impl GroupLogGauge {
                 };
             }
         } else if covers_new {
-            ledger.debt = RemovalDebt::Owed {
-                since: Instant::now(),
-            };
+            // The removals the snapshot left owed applied after its mark:
+            // the oldest of them when this was the latest mark, else no
+            // earlier than the snapshot's record.
+            let since = (ledger.marked_removals == mark.removals)
+                .then_some(ledger.first_after_mark)
+                .flatten()
+                .unwrap_or_else(Instant::now);
+            ledger.debt = RemovalDebt::Owed { since };
         }
     }
 
@@ -818,7 +856,12 @@ impl GroupLogGauge {
             return;
         }
         let mut ledger = self.ledger();
-        ledger.purge_through = ledger.purge_through.max(index);
+        if index > ledger.purge_through {
+            ursula_stream::sim_controls::note_fired(
+                ursula_stream::sim_controls::Defence::RestorePurge,
+            );
+            ledger.purge_through = index;
+        }
     }
 
     /// Applied log bytes the latest snapshot covers.
@@ -1296,7 +1339,8 @@ mod tests {
         let plan = cadence.plan_pass(&groups, limits(16, 1));
         assert_eq!(plan.pressure, LogPressure::Calm);
         assert_eq!(plan.overdue, 3);
-        assert_eq!(&plan.groups[..4], &[3, 2, 4, 0]);
+        // The replayed removal first, then the oldest.
+        assert_eq!(&plan.groups[..4], &[4, 3, 2, 0]);
         assert_eq!(plan.groups.len(), 6);
         assert_eq!(
             plan.node_log_bytes,
@@ -1304,12 +1348,36 @@ mod tests {
             "removed bytes are not log"
         );
         let capped = cadence.plan_pass(&groups, limits(2, 1));
-        assert_eq!((capped.groups, capped.overdue), (vec![3, 2], 2));
+        assert_eq!((capped.groups, capped.overdue), (vec![4, 3], 2));
         // A group whose build is in flight is not planned, overdue or not.
         groups[3].building = Some(0);
         let plan = cadence.plan_pass(&groups, limits(16, 1));
         assert_eq!(plan.overdue, 2);
-        assert_eq!(&plan.groups[..3], &[2, 4, 0]);
+        assert_eq!(&plan.groups[..3], &[4, 2, 0]);
+    }
+
+    /// #669 review: under pressure removal debt never runs ahead of log
+    /// relief. An overdue group with little log plans after the groups
+    /// that free the most.
+    #[test]
+    fn under_pressure_overdue_groups_wait_for_the_log() {
+        let cadence = SnapshotCadence::new(64 * MIB, 4, 100_000)
+            .with_deleted_data_max_age(Duration::from_secs(60));
+        let groups = drive(&[
+            GroupLogProgress {
+                removal: owed(1, 60_000),
+                ..progress(1_024, MIB)
+            },
+            progress(30 * MIB, 30 * MIB),
+            progress(20 * MIB, 20 * MIB),
+        ]);
+        let plan = cadence.plan_pass(&groups, limits(16, 1));
+        assert!(plan.pressure.is_pressure());
+        assert_eq!(plan.overdue, 0);
+        // The largest group brings the log under the target, then the due
+        // group with the overdue removal. The 20 MiB group is not due.
+        assert_eq!(plan.groups, vec![1, 0]);
+        assert_eq!(cadence.plan_pass(&groups, limits(1, 1)).groups, vec![1]);
     }
 }
 
@@ -1318,6 +1386,7 @@ mod tests {
 #[cfg(all(test, not(madsim)))]
 mod removal_ledger_tests {
     use super::GroupLogGauge;
+    use super::Instant;
     use super::RemovalDebt;
     use super::RemovalProgress;
 
@@ -1378,15 +1447,17 @@ mod removal_ledger_tests {
         };
         let mark = gauge.mark();
         // Applied while the build runs.
+        let applying = Instant::now();
         gauge.record_removal(50);
+        let applied = Instant::now();
         assert_eq!(gauge.removal_debt(), RemovalDebt::Owed { since: first });
         gauge.record_snapshot(mark, 1_000, 5);
         // The build covered the first removal: the watermark moves, and the
-        // second one is owed from when the build recorded its snapshot.
+        // second one is owed from when it applied, not from the snapshot.
         assert_eq!(gauge.progress().scrub_purge_through, 5);
         assert!(matches!(
             gauge.removal_debt(),
-            RemovalDebt::Owed { since } if since >= first
+            RemovalDebt::Owed { since } if since >= applying && since <= applied
         ));
         assert_eq!(gauge.progress().removal.bytes(), 50);
         gauge.record_snapshot(gauge.mark(), 1_000, 6);
@@ -1631,6 +1702,41 @@ mod proptests {
             }
         }
 
+        /// #669 review: under pressure removal debt never starves log relief.
+        /// Until the log would fall to the target, a pass starts the same
+        /// groups, in the same order, as it would with no removal at all.
+        #[test]
+        fn prop_removal_debt_never_starves_log_relief((cadence, groups, limits) in node()) {
+            let cleared = groups
+                .iter()
+                .map(|group| GroupDriveState {
+                    progress: GroupLogProgress {
+                        removal: RemovalProgress::Clear,
+                        ..group.progress
+                    },
+                    ..*group
+                })
+                .collect::<Vec<_>>();
+            let plan = cadence.plan_pass(&groups, limits);
+            prop_assume!(plan.pressure.is_pressure());
+            let without = cadence.plan_pass(&cleared, limits);
+            let mut left = plan.node_log_bytes.saturating_sub(sum(groups.iter().filter_map(|group| group.building)));
+            let mut relief = Vec::new();
+            for index in &without.groups {
+                if left <= cadence.pressure_target_bytes() && !groups[*index].lagging {
+                    break;
+                }
+                relief.push(*index);
+                left = left.saturating_sub(groups[*index].progress.log_bytes);
+            }
+            prop_assert!(
+                plan.groups.starts_with(&relief),
+                "relief {:?} not leading {:?}",
+                relief,
+                plan.groups
+            );
+        }
+
         /// A pass never plans a group that cannot build, a group twice, or
         /// more groups than its cap. Groups with an overdue removal lead,
         /// the oldest first, then lagging groups (#669). A pass under
@@ -1657,14 +1763,26 @@ mod proptests {
                     prop_assert!(cadence.is_due(&group.progress));
                 }
             }
-            let overdue = |group: &GroupDriveState| cadence.removal_overdue(&group.progress);
+            // Overdue groups lead only a calm pass.
+            let calm = !plan.pressure.is_pressure();
+            let overdue =
+                |group: &GroupDriveState| calm && cadence.removal_overdue(&group.progress);
             let owing = groups.iter().filter(|group| startable(group) && overdue(group)).count();
             prop_assert_eq!(plan.overdue, owing.min(cap));
             let (first, rest) = plan.groups.split_at(plan.overdue);
             prop_assert!(first.iter().all(|index| overdue(&groups[*index])));
             prop_assert!(rest.iter().all(|index| !overdue(&groups[*index])));
-            let age = |index: usize| (Reverse(groups[index].progress.removal.age()), index);
-            prop_assert!(first.windows(2).all(|pair| age(pair[0]) < age(pair[1])));
+            let rank = |index: usize| {
+                let removal = groups[index].progress.removal;
+                (
+                    Reverse((
+                        matches!(removal, RemovalProgress::Replayed { .. }),
+                        removal.age(),
+                    )),
+                    index,
+                )
+            };
+            prop_assert!(first.windows(2).all(|pair| rank(pair[0]) < rank(pair[1])));
             let led = rest
                 .iter()
                 .take_while(|index| groups[**index].lagging)

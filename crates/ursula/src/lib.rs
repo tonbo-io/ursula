@@ -2857,28 +2857,37 @@ pub(crate) async fn trigger_raft_purge(
         .borrow_watched()
         .snapshot
         .map(|log_id| log_id.index);
-    if let Some(published) = published
-        && let Err(busy) = coordinator.hold_for_purge(
+    // A request dropped before its purge was triggered drops the guard,
+    // which lifts the hold.
+    let guard = match published.map(|published| {
+        coordinator.hold_for_purge(
             raft_group_id.0,
             Some(published),
             upto.min(published),
             raft.metrics(),
         )
-    {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, "1")],
-            format!("{busy}; retry"),
-        )
-            .into_response();
-    }
+    }) {
+        None => None,
+        Some(Ok(guard)) => Some(guard),
+        Some(Err(busy)) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(axum::http::header::RETRY_AFTER, "1")],
+                format!("{busy}; retry"),
+            )
+                .into_response();
+        }
+    };
+    // A failed trigger drops the guard here, which lifts the hold.
     if let Err(err) = raft.trigger().purge_log(upto).await {
-        coordinator.release_purge(raft_group_id.0);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("trigger raft purge: {err}"),
         )
             .into_response();
+    }
+    if let Some(guard) = guard {
+        guard.keep();
     }
     if let Err(err) = raft
         .wait(Some(Duration::from_secs(10)))
