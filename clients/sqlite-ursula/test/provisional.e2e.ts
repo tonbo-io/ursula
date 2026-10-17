@@ -6,8 +6,8 @@
 // (design: Pre-check), the claim applies, `synced()` resolves and the database is `live`. If
 // another owner took the stream over meanwhile, the database resets `fenced` with nothing sent,
 // none of its provisional commits reaches the stream, and that owner goes on, however many offline
-// opens came before. Without a cache the open waits for the stream and fails `unreachable` when its
-// signal fires.
+// opens came before. An owner that claimed and never wrote goes live the same way. Without a
+// cache the open waits for the stream and fails `unreachable` when its signal fires.
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open, type UrsulaDatabase, type UrsulaResetError, UrsulaUnavailableError } from "../src/index.ts";
 import { Child, directUrl, ext, freshDir, fromStream, gate, killChildren, rejection, stream } from "./kit.ts";
@@ -116,6 +116,26 @@ describe("provisional opens", () => {
 		expect(resets).toEqual([]);
 		db.close();
 		expect(await fromStream(s.url, "SELECT x FROM t ORDER BY x")).toEqual([{ x: 1 }, { x: 2 }]);
+	});
+
+	it("goes live over an owner that never wrote", async () => {
+		const s = stream("provisional-idle");
+		const dir = freshDir();
+		// The owner claims the stream and closes without a commit: its ACK sits at its claim's end.
+		const first = await open(`${front.url}${s.path}`, { dir });
+		await first.synced();
+		first.close();
+		const { db, resets } = await openProvisionally(s.path, dir);
+		const gated = db.synced();
+		await mode("forward");
+		await gated;
+		expect(db.status()).toMatchObject({ state: "live", reset: null });
+		db.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+		await db.synced();
+		expect(db.status()).toMatchObject({ state: "live", reset: null });
+		expect(resets).toEqual([]);
+		db.close();
+		expect(await fromStream(s.url, "SELECT x FROM t")).toEqual([{ x: 1 }]);
 	});
 
 	it("resets `fenced` when another owner took the stream over during the outage, and its commits never reach the stream", async () => {

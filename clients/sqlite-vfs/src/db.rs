@@ -396,7 +396,7 @@ pub(crate) fn open(
                     let spec = OpenSpec {
                         url: url.to_owned(),
                         dir: requested.path.clone(),
-                        activation: options.activation.unwrap_or_else(process_activation),
+                        activation: options.activation.unwrap_or_else(Activation::draw),
                         max_pending_bytes: options.max_pending_bytes,
                         max_request_bytes: crate::config::max_request_bytes(),
                         max_commit_bytes: crate::config::max_commit_bytes(),
@@ -680,20 +680,6 @@ fn default_dir() -> PathBuf {
         })
         .unwrap_or_else(std::env::temp_dir);
     cache.join("sqlite-ursula").join("0.8")
-}
-
-/// This process's activation when the open names none: random, once per process.
-fn process_activation() -> Activation {
-    static A: OnceLock<Activation> = OnceLock::new();
-    *A.get_or_init(|| {
-        let bytes = crate::ids::random16().unwrap_or_else(|_unavailable| {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos());
-            (nanos ^ u128::from(std::process::id())).to_le_bytes()
-        });
-        Activation(bytes)
-    })
 }
 
 /// A binding of a fresh generation under `dir`, for tests of the file methods. It is in no

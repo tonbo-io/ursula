@@ -542,6 +542,10 @@ pub(crate) struct Knobs {
     /// Settle `synced()` tickets while activating too, as before #604: a claim's reconcile
     /// acknowledges records before it announces them.
     pub(crate) settle_while_activating: bool,
+    /// Reset `stream_state` on a repeat receipt for a claim sent again whenever it starts below
+    /// the acknowledged offset, before the follow-up claim: a provisional open of an owner that
+    /// never wrote under its claim resets.
+    pub(crate) guard_repeat_start: bool,
 }
 
 impl Ctx {
@@ -2029,16 +2033,26 @@ fn claim_answered(
             delivery,
         } => {
             ctx.set_condition(None, actions);
-            if receipt.start() < ctx.acked_offset {
-                return reset(ResetKind::StreamState, actions);
-            }
             let follow_up = match delivery {
                 Delivery::Repeat => !repeat_binds(&ctx),
                 // A provisional open never writes under the claim it sent again: writes of ours
                 // may have gone out under that epoch in a history before.
                 Delivery::Applied => ctx.log_claim == Some(epoch),
             };
-            if follow_up && matches!(kind, ClaimKind::Continuation { resent: true, .. }) {
+            let resent = matches!(kind, ClaimKind::Continuation { resent: true, .. });
+            // A claim sent again whose repeat ends at or below the acknowledged offset is the
+            // record this generation acknowledged when it bound (a provisional open of an owner
+            // that never wrote under it): the follow-up claim goes over it. A receipt that starts
+            // below the acknowledged offset and ends past it is no record of ours.
+            let acknowledged_repeat = resent
+                && follow_up
+                && delivery == Delivery::Repeat
+                && receipt.next() <= ctx.acked_offset
+                && !guard_repeat_start(&ctx);
+            if receipt.start() < ctx.acked_offset && !acknowledged_repeat {
+                return reset(ResetKind::StreamState, actions);
+            }
+            if follow_up && resent {
                 // The claim applied before the history event, so the record stays
                 // history-fenced: one more claim over it (design: History). So does a provisional
                 // open's claim, whatever its receipt.
@@ -2237,6 +2251,19 @@ fn repeat_binds(ctx: &Ctx) -> bool {
 
 #[cfg(not(test))]
 fn repeat_binds(_ctx: &Ctx) -> bool {
+    false
+}
+
+/// Whether a repeat receipt that starts below the acknowledged offset resets `stream_state` even
+/// when it ends at or below it: never, but under the negative control that restores the check
+/// order from before the provisional follow-up claim.
+#[cfg(test)]
+fn guard_repeat_start(ctx: &Ctx) -> bool {
+    ctx.knobs.guard_repeat_start
+}
+
+#[cfg(not(test))]
+fn guard_repeat_start(_ctx: &Ctx) -> bool {
     false
 }
 

@@ -54,7 +54,9 @@
 //!     explicit open of another owner made past the background owner's acknowledged offset and its
 //!     own latest claim (design: Claims, its last paragraph), unless that claim landed after a
 //!     provisional instance's pre-check read the tail (the round trip the pre-check accepts,
-//!     design: Pre-check).
+//!     design: Pre-check);
+//! 21. an owner resets `stream_state` only when another writer, owner or clone was on the stream
+//!     (the gate of property 13).
 //!
 //! Snapshots carry real `USS3` headers (the owner's lineage, an acknowledged position and its
 //! offset): the `410` rule reads them.
@@ -64,8 +66,9 @@
 //! re-keys on any other token, one that binds on a repeat receipt for a claim sent again after a
 //! re-key, one that takes another cluster's HEAD for a deleted stream, one that re-keys a log
 //! holding commits after its latest ACK (the #611 history gate undone, design: History), one that
-//! settles `synced()` tickets while activating (as before #604), and a provisional open that claims
-//! at once, above its log's highest CLAIM record, with no pre-check.
+//! settles `synced()` tickets while activating (as before #604), one that resets `stream_state` on a
+//! repeat receipt for a claim sent again that ends at or below the acknowledged offset, and a
+//! provisional open that claims at once, above its log's highest CLAIM record, with no pre-check.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1115,6 +1118,12 @@ impl World {
         self.violations.push(what);
     }
 
+    /// Owner `index` is the only writer on the stream: no foreign append or claim, no other owner
+    /// or clone, and its continuation claim did not lose to idle expiry (properties 13 and 21).
+    fn alone(&self, index: usize) -> bool {
+        !self.others && self.owners.len() == 1 && !self.owners[index].inst.claim_expired
+    }
+
     /// Carries out an owner's actions and checks them.
     fn process(&mut self, index: usize, actions: Vec<Action>, before: Before) {
         self.process_in(index, actions, before);
@@ -1290,7 +1299,7 @@ impl World {
                             .claims
                             .iter()
                             .any(|c| self.applied_claims.contains(c));
-                    let alone = !self.others && self.owners.len() == 1 && !owner.inst.claim_expired;
+                    let alone = self.alone(index);
                     let provisional = owner.inst.provisional;
                     if alone && !lost && !expired && !never_held {
                         self.violation(format!(
@@ -1304,6 +1313,12 @@ impl World {
                         };
                         counter.fetch_add(1, Ordering::Relaxed);
                     }
+                }
+                Action::Reset(ResetKind::StreamState) if self.alone(index) => {
+                    self.violation(format!(
+                        "property 21: owner {index} reset stream_state with no other writer on the \
+                         stream"
+                    ));
                 }
                 // The retiring binding fsyncs its ACK (design: History, Log).
                 Action::Reset(ResetKind::Rewound) => {
@@ -2711,6 +2726,55 @@ fn negative_control_binding_on_a_repeat_after_a_rekey_fences_falsely() {
     );
 }
 
+/// Owner 0 binds and never writes under its claim, then restarts offline: the open goes
+/// provisional, the pre-check has nothing to read, and the claim sent again meets a repeat whose
+/// receipt ends at the acknowledged offset.
+fn provisional_over_an_idle_claim() -> Vec<Op> {
+    vec![Op::Flush, Op::ProvisionalRestart(0, 0), Op::Flush]
+}
+
+#[test]
+fn negative_control_guarding_the_repeat_start_resets_an_idle_owners_provisional_open() {
+    let mut world = World::new(Knobs::default(), 1, Arc::default());
+    for op in &provisional_over_an_idle_claim() {
+        world.step(op);
+    }
+    assert!(
+        matches!(
+            world.owners[0].inst.replicator,
+            Replicator::Streaming { .. }
+        ),
+        "{:?}",
+        world.owners[0].inst.replicator
+    );
+    // The provisional open went live with one continuation claim over its own: [own, own + 1].
+    let epochs: Vec<u64> = world.owners[0]
+        .log
+        .claims
+        .iter()
+        .map(|(epoch, _)| epoch.get())
+        .collect();
+    assert!(
+        matches!(epochs.as_slice(), [.., own, next] if own.checked_add(1) == Some(*next)),
+        "{epochs:?}"
+    );
+    assert!(world.coverage.provisional_live.load(Ordering::Relaxed) > 0);
+    world.heal();
+    assert_eq!(world.violations, Vec::<String>::new());
+    let violations = run(
+        replicator_knobs(ReplicatorKnobs {
+            guard_repeat_start: true,
+            ..ReplicatorKnobs::default()
+        }),
+        1,
+        &provisional_over_an_idle_claim(),
+    );
+    assert!(
+        violations.iter().any(|v| v.starts_with("property 21")),
+        "{violations:?}"
+    );
+}
+
 /// Owner 0's requests go to another deployment, with and without a stream at the path, and
 /// come back.
 fn misrouted_and_back(exists: bool) -> Vec<Op> {
@@ -3037,6 +3101,10 @@ fn negative_controls_fail_the_proptest_too() {
             claim_without_pre_check: true,
             ..Knobs::default()
         },
+        replicator_knobs(ReplicatorKnobs {
+            guard_repeat_start: true,
+            ..ReplicatorKnobs::default()
+        }),
         // `settle_while_activating` is left to its fixed script too: its early `Synced` needs a
         // proof from before a continuation claim and a `synced()` call between two reads of
         // that claim's reconcile.

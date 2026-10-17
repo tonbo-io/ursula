@@ -405,7 +405,9 @@ its acknowledged offset do not claim at once. They first:
    token still there resets `stale`, another token takes the history path.
 3. Only then send the log's latest claim again, same epoch and body. Nothing is logged before. A
    repeat receipt, or `receipt-evicted`, means that claim applied before, and one continuation
-   claim of the next epoch follows.
+   claim of the next epoch follows. That holds for a repeat whose receipt ends at or below the
+   acknowledged offset too, as when the owner bound and never wrote under the claim. A receipt
+   that starts below the acknowledged offset and ends past it resets `stream_state`.
 
 A provisional open thus claims at most one above the latest claim of its own the stream applied,
 and never above an owner an explicit open installed before the pre-check read the tail. A
@@ -420,8 +422,9 @@ Tests:
   `a_batch_found_above_the_closed_seq_resets_stream_state`, `driver/tests.rs`
   `idle_expiry_claims_own_plus_one_and_carries_on`,
   `a_continuation_after_another_owners_claim_loses_and_fences`,
-  `a_failed_claim_write_sends_no_claim`, model `model/tests.rs`
-  `a_second_claimant_of_an_epoch_gets_key_conflict_and_a_clone_too`, `idle_expiry_raises_the_floor`.
+  `a_failed_claim_write_sends_no_claim`,
+  `each_open_draws_an_activation_and_a_reopen_continues_the_claims_before_it`, model
+  `model/tests.rs` `a_second_claimant_of_an_epoch_gets_key_conflict_and_a_clone_too`, `idle_expiry_raises_the_floor`.
 - Background claims never fence an explicit owner: the world's properties 4 and 20, and
   `replicator/tests/world.rs` `offline_restarts_never_fence_an_owner_an_explicit_open_installed`,
   `an_unapplied_claim_in_the_log_never_fences_an_explicit_owner`,
@@ -430,10 +433,14 @@ Tests:
 - Pre-check: `replicator/tests/rekey.rs`
   `a_provisional_open_sends_its_logs_claim_again_after_the_pre_check`,
   `a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent`,
-  `a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry`, `driver/tests.rs`
-  `a_provisional_open_after_another_owners_takeover_is_fenced`, `test/provisional.e2e.ts` "resets
-  `fenced` when another owner took the stream over during the outage, and its commits never reach
-  the stream".
+  `a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry`,
+  `a_provisional_claim_repeated_at_the_acknowledged_offset_claims_the_next_epoch`,
+  `a_provisional_claim_repeated_across_the_acknowledged_offset_resets_stream_state`,
+  `driver/tests.rs` `a_provisional_open_after_another_owners_takeover_is_fenced`,
+  `a_provisional_open_of_an_owner_that_never_wrote_goes_live`, `replicator/tests/world.rs`
+  `negative_control_guarding_the_repeat_start_resets_an_idle_owners_provisional_open`,
+  `test/provisional.e2e.ts` "resets `fenced` when another owner took the stream over during the
+  outage, and its commits never reach the stream" and "goes live over an owner that never wrote".
 
 ### Reconcile
 
@@ -494,15 +501,16 @@ makes `PersistClaim` and `ReKey` durable before it carries out the actions that 
 A proptest world (`replicator/tests/world.rs`) runs owners against the model server over a network
 that delays, reorders, loses and duplicates requests and answers, with scripted faults, idle
 expiry, history events, misrouting, foreign writers, retention, clones, restarts, provisional
-restarts and power losses, then heals. Its monitors check twenty properties, among them:
+restarts and power losses, then heals. Its monitors check twenty-one properties, among them:
 acknowledged never regresses (1), acknowledged records are a log prefix in stream order (2), one
 lineage never sends two bodies under one key (3), a continuation lands exactly one above the
 latest applied claim (4), no older key applies after a claim (5), a typed fence keeps pending
 records (6), every run ends acknowledged, retrying, blocked or reset (7), of two divergent clone
 commits at most one is acknowledged (8), `Synced` never fires past a foreign frame (9), a re-key
 happens only when the history inherits the generation (15), nothing applies on another deployment
-(16), no acknowledged commit is lost (19), and a background claim never applies above an explicit
-owner's (20). Negative controls must fail them.
+(16), no acknowledged commit is lost (19), a background claim never applies above an explicit
+owner's (20), and an owner alone on the stream never resets `stream_state` (21). Negative controls
+must fail them.
 
 Tests: `replicator/tests/world.rs` `the_replicator_keeps_its_properties_against_the_model`,
 `negative_controls_fail_the_proptest_too`, `the_proptests_shrunk_counterexamples_pass`, and each
