@@ -24,6 +24,7 @@ use super::ForeignFrame;
 use super::MAX_BATCH_BYTES;
 use super::RequestId;
 use super::ResetKind;
+use super::matches_commits_by_id;
 use crate::codec::frame;
 use crate::codec::frame::Decoded;
 use crate::codec::frame::Frame;
@@ -327,10 +328,9 @@ impl Reconcile {
             }
             Frame::Claim { .. } => self.row(FrameClass::ForeignClaim, None, ctx),
             Frame::Commit { id, .. } => {
-                let next = ctx
-                    .pending
-                    .front()
-                    .is_some_and(|p| p.id == id && p.frame == bytes);
+                let next = ctx.pending.front().is_some_and(|p| {
+                    p.id == id && (p.frame == bytes || matches_commits_by_id(ctx))
+                });
                 let class = match (next, self.foreign) {
                     // Another owner's write after its claim: decided by whether a claim of our
                     // own follows them.

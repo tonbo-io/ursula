@@ -393,8 +393,8 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
   floor from `Producer-Epoch` and goes above it.
 
 A claim nobody timed never takes a stream over: a process back from a partition cannot fence the
-owner an explicit open installed, unless it opens a copy of that owner's own cache
-([Limits](#limits)).
+owner an explicit open installed, unless it opens a copy of that owner's own cache or shares its
+activation, as a memory clone or a constant `activation` does ([Limits](#limits)).
 
 #### Pre-check
 
@@ -427,7 +427,8 @@ Tests:
   `idle_expiry_claims_own_plus_one_and_carries_on`,
   `a_continuation_after_another_owners_claim_loses_and_fences`,
   `a_failed_claim_write_sends_no_claim`,
-  `each_open_draws_an_activation_and_a_reopen_continues_the_claims_before_it`, model
+  `each_open_draws_an_activation_and_a_reopen_continues_the_claims_before_it`, `db.rs`
+  `each_open_draws_its_own_activation`, model
   `model/tests.rs` `a_second_claimant_of_an_epoch_gets_key_conflict_and_a_clone_too`, `idle_expiry_raises_the_floor`.
 - Background claims never fence an explicit owner: the world's properties 4 and 20, and
   `replicator/tests/world.rs` `offline_restarts_never_fence_an_owner_an_explicit_open_installed`,
@@ -440,6 +441,7 @@ Tests:
   `a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry`,
   `a_provisional_claim_repeated_at_the_acknowledged_offset_claims_the_next_epoch`,
   `a_provisional_claim_repeated_across_the_acknowledged_offset_resets_stream_state`,
+  `a_receipt_below_the_acknowledged_offset_resets_stream_state_unless_a_resent_claims_repeat`,
   `driver/tests.rs` `a_provisional_open_after_another_owners_takeover_is_fenced`,
   `a_provisional_open_of_an_owner_that_never_wrote_goes_live`, `replicator/tests/world.rs`
   `negative_control_guarding_the_repeat_start_resets_an_idle_owners_provisional_open`,
@@ -454,7 +456,7 @@ activation and by commit id plus bytes, never by `(epoch, seq)` (`replicator/rec
 
 | frame | takeover | continuation |
 | --- | --- | --- |
-| a CLAIM with an activation in the log | skip | skip |
+| a CLAIM with our activation or one in the log | skip | skip |
 | a COMMIT or complete PART run with the next pending record's commit id and bytes | acknowledged | acknowledged |
 | a foreign CLAIM | skip | reset `fenced`, unless a CLAIM of our own follows it in the range, which supersedes it |
 | a foreign COMMIT, or our commit id with other bytes | divergence: the pending tail is discarded, the generation caught up or rebuilt ([Materialize](#materialize)) | reset `stale` |
@@ -475,7 +477,9 @@ Tests: `replicator/tests/reconcile_rows.rs`, one test per row:
 `row_6_a_410_continues_from_our_lineages_snapshot_at_or_below_acked`,
 `row_6_a_410_with_a_snapshot_that_does_not_cover_us_diverges`. Superseded claims:
 `replicator/tests/world.rs`
-`a_crash_before_the_bind_supersedes_a_foreign_claim_and_goes_stale_on_a_foreign_commit`. Clones:
+`a_crash_before_the_bind_supersedes_a_foreign_claim_and_goes_stale_on_a_foreign_commit`,
+`replicator/tests/rekey.rs`
+`a_later_claim_of_an_activation_in_the_log_supersedes_a_foreign_claim_but_not_its_commits`. Clones:
 `replicator/tests/world.rs` `a_clones_snapshot_never_covers_the_originals_commit`. Takeovers:
 `driver/tests.rs` `a_takeover_fences_the_owner_which_keeps_its_tail_then_discards_it_and_rebuilds`,
 `a_410_at_a_takeover_with_a_pending_commit_rebuilds_from_the_snapshot`.
@@ -504,17 +508,20 @@ makes `PersistClaim` and `ReKey` durable before it carries out the actions that 
 
 A proptest world (`replicator/tests/world.rs`) runs owners against the model server over a network
 that delays, reorders, loses and duplicates requests and answers, with scripted faults, idle
-expiry, history events, misrouting, foreign writers, retention, clones, restarts, provisional
-restarts and power losses, then heals. Its monitors check twenty-one properties, among them:
+expiry, history events, misrouting, foreign writers, retention, clones, copies of a cache opened
+on another host, restarts, reopens that keep the activation, provisional restarts and power
+losses, then heals. One seed in eight runs every open under one activation. Its monitors check
+twenty-two properties, among them:
 acknowledged never regresses (1), acknowledged records are a log prefix in stream order (2), one
 lineage never sends two bodies under one key (3), a continuation lands exactly one above the
 latest applied claim (4), no older key applies after a claim (5), a typed fence keeps pending
 records (6), every run ends acknowledged, retrying, blocked or reset (7), of two divergent clone
 commits at most one is acknowledged (8), `Synced` never fires past a foreign frame (9), a re-key
 happens only when the history inherits the generation (15), nothing applies on another deployment
-(16), no acknowledged commit is lost (19), a background claim never applies above an explicit
-owner's (20), and an owner alone on the stream never resets `stream_state` (21). Negative controls
-must fail them.
+(16), no acknowledged commit is lost, across clones and copies too (19), a background claim never
+applies above an explicit owner's (20), an owner alone on the stream never resets `stream_state`
+(21), and every producer key the server acknowledged carries one body within a history, whoever
+sent it (22). Negative controls must fail them.
 
 Tests: `replicator/tests/world.rs` `the_replicator_keeps_its_properties_against_the_model`,
 `negative_controls_fail_the_proptest_too`, `the_proptests_shrunk_counterexamples_pass`, and each
@@ -993,14 +1000,16 @@ Tests:
   `a_repeat_after_a_rekey_claims_once_more`,
   `a_takeover_with_commits_pending_resets_before_it_re_keys`,
   `a_rebuild_that_discards_after_a_rekey_at_open_salvages`, the world's properties 15, 18 and 19
-  with `negative_control_re_keying_on_any_token_drops_acknowledged_records` and
-  `negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage`.
+  with `negative_control_re_keying_on_any_token_drops_acknowledged_records`,
+  `negative_control_re_keying_with_commits_pending_discards_them_with_no_salvage` and
+  `negative_control_re_keying_with_commits_pending_loses_a_commit_after_a_clone`.
 - The driver: `driver/tests.rs` `an_inheriting_history_re_keys_without_a_reset`,
   `a_lossy_restore_resets_rewound_and_the_reopen_salvages`,
   `a_reopen_after_an_inheriting_history_salvages_while_commits_are_pending`,
   `an_acknowledged_commit_behind_a_lagging_ack_is_salvaged`,
   `an_offline_commit_survives_a_history_that_keeps_everything`,
-  `a_provisional_claim_meeting_an_inheriting_history_re_keys`.
+  `a_provisional_claim_meeting_an_inheriting_history_re_keys`,
+  `a_delete_then_recreate_or_import_under_a_bound_owner_salvages_every_commit`.
 - Salvage: `salvage/tests.rs` `a_salvage_moves_the_whole_generation_and_restores_the_magic`,
   `a_replaced_db_is_left_as_it_was_found`, `the_manifest_renders_as_its_golden_json`, and
   `codec/vectors/mod.rs` `the_salvage_manifest_is_frozen`.
@@ -1071,10 +1080,29 @@ answers, a copy behind retention does not take the original's snapshot as coveri
 commits ([Reconcile](#reconcile)), and rebuilds from it into a new generation. Offline, its
 pre-check's `410` resets it `stale`.
 
-Tests: the world's properties 3 and 8 (`replicator/tests/world.rs`
-`the_replicator_keeps_its_properties_against_the_model`) with
-`negative_control_the_model_without_digests_breaks_clone_safety`, and
-`a_provisional_clone_never_fences_the_owner_that_bound`. End to end, `test/clone.e2e.ts` "takes
+Tests:
+
+- The world's properties 3, 8, 19 and 22 (`replicator/tests/world.rs`
+  `the_replicator_keeps_its_properties_against_the_model`) with
+  `negative_control_the_model_without_digests_breaks_clone_safety`,
+  `negative_control_a_probe_skipping_claims_of_its_activation_syncs_past_a_copys_claim`,
+  `negative_control_matching_commits_by_id_acknowledges_a_copys_commit`, the
+  `trust_clone_snapshot` control in `a_clones_snapshot_never_covers_the_originals_commit`, and
+  `a_provisional_clone_never_fences_the_owner_that_bound`,
+  `a_shared_epoch_takeover_fences_exactly_one_copy`,
+  `a_copy_taken_over_while_the_original_writes_fences_the_original`,
+  `an_offline_copy_of_an_idle_cache_fences_the_original`,
+  `an_offline_copy_and_the_original_both_reset`.
+- The machine: `replicator/tests/machine.rs`
+  `a_takeover_won_by_a_repeat_binds_and_its_first_refused_append_fences`.
+- The driver, over copied directories: `driver/tests.rs`
+  `a_copy_of_a_live_cache_takes_over_and_the_original_is_fenced_losing_nothing`,
+  `a_copy_carrying_a_commit_the_original_acknowledged_since_matches_it_and_resends_nothing`,
+  `two_copies_on_one_activation_share_an_epoch_until_a_divergent_commit_fences_one`,
+  `a_stale_copy_below_retention_rebuilds_and_never_trusts_the_originals_snapshot`,
+  `an_offline_copy_behind_the_original_goes_stale_with_nothing_sent`,
+  `a_delete_then_recreate_or_import_under_a_bound_owner_salvages_every_commit`.
+- End to end, `test/clone.e2e.ts` "takes
 over from the original when opened by another process, and the original is fenced at its next
 commit", "shares one epoch between two copies opened with one activation, and their first
 divergent commit fences exactly one", "resets `stale` with nothing sent when its original kept
@@ -1438,10 +1466,13 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   in the stream, and its next commit or `synced()` resets it `fenced`. A host that copies a live
   cache stops the original first, or opens the copy while the stream answers, so its takeover is
   explicit.
-- **A constant `activation`.** Two opens that pass one `activation` and compute one epoch both
+- **A shared activation.** Two opens under one activation, a constant `activation` or a memory
+  clone and its original, take each other's claims for their own. Two that compute one epoch both
   bind on one claim. Until their first divergent commit both are live, and only the server's
   digest per producer key tells them apart: the second append under that key gets
-  `key-conflict` and that open resets `fenced`.
+  `key-conflict` and that open resets `fenced`. After a restore starts the epochs again, a
+  background claim of one can also apply above the claim an explicit open of the other installed,
+  and the explicit owner resets `fenced` at its next commit.
 - **Transport.** HTTP/1.1 only, so a retry resends the whole body. ureq tries addresses in turn, so
   an IPv6 path that connects and then stalls fails every attempt (an IPv4-only hostname works
   around it). Each database uses two HTTP worker threads and a snapshot thread.

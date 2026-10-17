@@ -396,7 +396,7 @@ pub(crate) fn open(
                     let spec = OpenSpec {
                         url: url.to_owned(),
                         dir: requested.path.clone(),
-                        activation: options.activation.unwrap_or_else(Activation::draw),
+                        activation: activation_of(&options),
                         max_pending_bytes: options.max_pending_bytes,
                         max_request_bytes: crate::config::max_request_bytes(),
                         max_commit_bytes: crate::config::max_commit_bytes(),
@@ -420,6 +420,12 @@ pub(crate) fn open(
         }
         // Another caller took the open's result: its registration, or a new open, is next.
     }
+}
+
+/// The activation of an open (design: Claims): the `activation` option, else 16 random bytes drawn
+/// for this open alone, never one shared by the opens of a process.
+fn activation_of(options: &OpenOptions) -> Activation {
+    options.activation.unwrap_or_else(Activation::draw)
 }
 
 /// Where `ursula_open` of a stream goes.
@@ -789,6 +795,7 @@ mod tests {
     use super::Commit;
     use super::OpenEntry;
     use super::Registry;
+    use super::activation_of;
     use super::claim;
     use super::default_dir;
     use super::for_tests;
@@ -800,7 +807,9 @@ mod tests {
     use crate::error::Action;
     use crate::error::Error;
     use crate::error::ErrorKind;
+    use crate::ids::Activation;
     use crate::open::OpenError;
+    use crate::options::OpenOptions;
     use crate::testdir::TempDir;
 
     // A cache root has one form: two spellings of one directory, through a symlink, `.` or
@@ -931,6 +940,25 @@ mod tests {
             kept(&e),
             (Kept::Opening, ErrorKind::BoundElsewhere, Action::Fix)
         );
+    }
+
+    // An open that names no activation draws its own (design: Claims, 16 random bytes per open):
+    // two opens of one process never share one, as a draw once per process would. A named one is
+    // the platform's, used as given.
+    #[test]
+    fn each_open_draws_its_own_activation() {
+        let defaults = OpenOptions::default();
+        let drawn: Vec<Activation> = (0..4).map(|_| activation_of(&defaults)).collect();
+        for (i, a) in drawn.iter().enumerate() {
+            for (j, b) in drawn.iter().enumerate() {
+                assert!(i == j || a != b, "{drawn:?}");
+            }
+        }
+        let named = OpenOptions {
+            activation: Some(Activation([7; 16])),
+            ..OpenOptions::default()
+        };
+        assert_eq!(activation_of(&named), Activation([7; 16]));
     }
 
     // The cache root ends in `sqlite-ursula/0.8`, so 0.7's caches are never read.

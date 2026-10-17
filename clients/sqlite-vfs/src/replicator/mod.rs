@@ -546,6 +546,16 @@ pub(crate) struct Knobs {
     /// the acknowledged offset, before the follow-up claim: a provisional open of an owner that
     /// never wrote under its claim resets.
     pub(crate) guard_repeat_start: bool,
+    /// Take a snapshot of our lineage for covering the acknowledged records whatever its position:
+    /// a clone's snapshot above our acknowledged position is trusted, though the clone committed
+    /// other bytes there.
+    pub(crate) trust_clone_snapshot: bool,
+    /// Match a reconcile's commit frame with the next pending record by commit id alone: a copy's
+    /// commit at one commit id with other bytes is taken for ours.
+    pub(crate) match_commits_by_id: bool,
+    /// A `synced()` probe that finds only claims of an activation in the log past the tail proves
+    /// the tail: another copy's claim under our activation goes unseen.
+    pub(crate) probe_skips_own_claims: bool,
 }
 
 impl Ctx {
@@ -1966,7 +1976,7 @@ impl Gone {
             Mode::Continuation => self.reconcile.at() == offset,
         };
         last.lineage == ctx.lineage
-            && last.position <= ctx.acked
+            && (last.position <= ctx.acked || trusts_clone_snapshot(ctx))
             && unread
             && offset <= self.reconcile.end()
     }
@@ -2040,8 +2050,8 @@ fn claim_answered(
                 Delivery::Applied => ctx.log_claim == Some(epoch),
             };
             let resent = matches!(kind, ClaimKind::Continuation { resent: true, .. });
-            // A claim sent again whose repeat ends at or below the acknowledged offset is the
-            // record this generation acknowledged when it bound (a provisional open of an owner
+            // A claim sent again whose repeat ends at or below the acknowledged offset is a
+            // record inside what this generation acknowledged (a provisional open of an owner
             // that never wrote under it): the follow-up claim goes over it. A receipt that starts
             // below the acknowledged offset and ends past it is no record of ours.
             let acknowledged_repeat = resent
@@ -2264,6 +2274,57 @@ fn guard_repeat_start(ctx: &Ctx) -> bool {
 
 #[cfg(not(test))]
 fn guard_repeat_start(_ctx: &Ctx) -> bool {
+    false
+}
+
+/// Whether a snapshot of our lineage above the acknowledged position covers the acknowledged
+/// records: never, but under the negative control that trusts a clone's snapshot.
+#[cfg(test)]
+fn trusts_clone_snapshot(ctx: &Ctx) -> bool {
+    ctx.knobs.trust_clone_snapshot
+}
+
+#[cfg(not(test))]
+fn trusts_clone_snapshot(_ctx: &Ctx) -> bool {
+    false
+}
+
+/// Whether a reconcile matches a commit frame with the next pending record by commit id alone:
+/// never, but under the negative control that ignores the bytes.
+#[cfg(test)]
+pub(crate) fn matches_commits_by_id(ctx: &Ctx) -> bool {
+    ctx.knobs.match_commits_by_id
+}
+
+#[cfg(not(test))]
+pub(crate) fn matches_commits_by_id(_ctx: &Ctx) -> bool {
+    false
+}
+
+/// Whether a probe's `body` past the tail proves it anyway: never, but under the negative control
+/// that skips claims of an activation in the log.
+#[cfg(test)]
+fn probe_skips(body: &[u8], ctx: &Ctx) -> bool {
+    if !ctx.knobs.probe_skips_own_claims {
+        return false;
+    }
+    let mut rest = body;
+    while !rest.is_empty() {
+        match frame::decode(rest, MAX_BATCH_BYTES) {
+            Ok(frame::Decoded::Frame {
+                frame: frame::Frame::Claim { activation, .. },
+                len,
+            }) if ctx.owns_activation(activation) => {
+                rest = rest.get(len..).unwrap_or_default();
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+#[cfg(not(test))]
+fn probe_skips(_body: &[u8], _ctx: &Ctx) -> bool {
     false
 }
 
@@ -2678,7 +2739,7 @@ impl Stream {
                     Exchange::Answered(answer) => answer.body.as_slice(),
                     Exchange::NoAnswer(_) => &[],
                 };
-                if body.is_empty() && next == from {
+                if (body.is_empty() && next == from) || probe_skips(body, ctx) {
                     // The append slot keeps its own condition (a blocked append stays blocked).
                     if matches!(self.work, Work::Idle) {
                         ctx.set_condition(None, actions);

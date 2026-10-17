@@ -2,6 +2,7 @@
 //! conditions, batching, the closed-seq cross-check and `synced()`.
 
 use ursula_headers::ClusterId;
+use ursula_headers::CurrentEpoch;
 use ursula_headers::Delivery;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
@@ -910,4 +911,51 @@ fn a_ticket_waits_for_the_continuation_reconcile_to_finish() {
         matches!((wake, synced), (Some(w), Some(s)) if w < s),
         "{actions:?}"
     );
+}
+
+/// Two copies on one activation take over at one epoch (design: Clones): the second copy's claim is
+/// byte-identical to the first's, so it wins by a `204` repeat and binds. Its first append, which
+/// the other copy's writes under the same key refuse (`key-conflict` for another body,
+/// `receipt-evicted` once later writes evicted the key's receipt), resets `fenced` and keeps the
+/// pending commits for the next open's reconcile.
+#[test]
+fn a_takeover_won_by_a_repeat_binds_and_its_first_refused_append_fences() {
+    let refusals = [
+        ProducerAnswer::KeyConflict { epoch: epoch(1) },
+        ProducerAnswer::ReceiptEvicted {
+            epoch: CurrentEpoch::new(epoch(1)),
+            seq: super::seq(3),
+            incarnation: token(),
+        },
+    ];
+    for refusal in refusals {
+        let pending = vec![commit(LINEAGE, 1, 1), commit(LINEAGE, 2, 1)];
+        let (mut h, _) = Harness::activate(
+            ClaimKind::Takeover {
+                round: 1,
+                rekeyed: false,
+            },
+            local(pending, 0),
+        );
+        let actions = h.answer(&producer(&receipt(Delivery::Repeat, 1, 0, 0, 37, None)));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Bound { .. })),
+            "{actions:?}"
+        );
+        assert!(matches!(h.replicator, Replicator::Streaming { .. }));
+        let keys = h.last_request().keys.producer.clone().unwrap();
+        assert_eq!((keys.epoch, keys.seq), (epoch(1), super::seq(1)));
+        let actions = h.answer(&producer(&refusal));
+        assert_eq!(
+            reset_of(&actions),
+            Some(ResetKind::Fenced),
+            "{refusal:?}: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Rebuild { .. } | Action::Wake { .. })),
+            "{refusal:?}: {actions:?}"
+        );
+    }
 }
