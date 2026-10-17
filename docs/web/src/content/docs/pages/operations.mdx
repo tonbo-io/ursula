@@ -572,6 +572,8 @@ Every behavior change, with what to change for each area, is listed in the [0.8.
 
 0.8.1 upgrades 0.8.0 in place with an ordinary rolling restart (`helm upgrade`), with no fresh install. See the [0.8.1 release notes](/docs/release-notes#081).
 
+0.8.2 upgrades 0.8.0 and 0.8.1 in place the same way, once your Helm values no longer set the indexer it removes. See the [0.8.2 release notes](/docs/release-notes#082).
+
 ## Upgrading to 0.7
 
 **0.7.0 is a breaking release.** It changes the Raft WAL format (format epoch 3) and removes the memory WAL, so the per-core disk journal is the only Raft WAL. 0.7 cannot read 0.6 data: a node refuses 0.6 Raft WAL directories and object-storage prefixes at startup, `ursulactl restore` refuses 0.6 backups, and a node will not join a cluster with 0.6 nodes. There is no in-place upgrade, no automatic migration and no rollback.
