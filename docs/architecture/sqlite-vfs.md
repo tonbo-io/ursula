@@ -123,7 +123,8 @@ Tests:
   `a_commit_above_the_limit_fails_alone_with_nothing_logged`, `config.rs`
   `the_commit_limit_is_clamped_to_one_page_through_one_gib`, `driver/tests.rs`
   `a_logged_commit_above_the_limit_still_replicates`, and `test/limits.e2e.ts` "refuses a
-  transaction above the commit limit alone, as too_large, and commits the next".
+  transaction above the commit limit alone, as too_large, and commits the next", "rolls a refused
+  transaction that spilled back whole, and the next commit writes over its frames".
 - Read-backs: `capture/tests.rs` `a_read_back_that_differs_is_a_lost_write`, `vfs/tests.rs`
   `pages_read_back_are_checked_against_what_was_written`.
 - A failed log write: `replog/tests.rs` `an_injected_write_failure_cuts_the_segment_back`.
@@ -192,9 +193,9 @@ and `trim_unlinked` (F3). Claims: `driver/tests.rs` `a_failed_claim_write_sends_
 (64 MiB by default) a write transaction fails at its first WAL write with `backlog_full`
 (`SQLITE_IOERR_AUTH`, action `retry` after `synced()`), nothing written, the database usable. A
 transaction is admitted while nothing is pending, and its commit is at most the commit limit
-([Capture](#capture)). This is the only admission rule: a
-`402`, an authorizer's `403` or a refused token is a replication condition in status, and commits
-continue until the backlog fills. The bound also caps what a reset discards.
+([Capture](#capture)). This is the only admission rule: a `402`, an authorizer's `403` or a
+refused token is a replication condition in status, and commits continue until the backlog fills.
+The bound also caps what a reset discards.
 
 Tests: `driver/tests.rs` `admission_counts_commits_the_driver_thread_has_not_seen`,
 `test/open.e2e.ts` "refuses a write past maxPendingBytes with nothing committed, and keeps the

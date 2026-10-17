@@ -154,11 +154,17 @@ proptest! {
         prop_assert_eq!(decompress(&compressed).unwrap(), record);
     }
 
-    // `encode_commit` builds in one buffer the bytes `encode` gives the same COMMIT.
+    // `encode_commit` builds in one buffer the bytes `encode` gives the same COMMIT: the frame
+    // carries `id` and the record, and encoding its compressed record again gives every byte back.
     #[test]
     fn a_commit_encoded_in_one_buffer_is_the_commit_frame(id in id(), record in record()) {
         let bytes = encode_commit(id, &record).unwrap();
-        prop_assert_eq!(encode(&decoded(&bytes)).unwrap(), bytes);
+        let Frame::Commit { id: found, compressed } = decoded(&bytes) else {
+            panic!("a commit")
+        };
+        prop_assert_eq!(found, id);
+        prop_assert_eq!(&decompress(&compressed).unwrap(), &record);
+        prop_assert_eq!(encode(&Frame::Commit { id, compressed }).unwrap(), bytes);
     }
 
     // Reads cut frames anywhere: every strict prefix is Partial, also with a frame following.
