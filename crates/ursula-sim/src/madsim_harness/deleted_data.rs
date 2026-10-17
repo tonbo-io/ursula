@@ -616,6 +616,11 @@ pub(super) async fn run_deleted_data_inner(
                 }
                 madsim::time::sleep(POLL).await;
             };
+            if controls.purge_after_restart {
+                trace.push(SimEvent::FaultApplied {
+                    phase: format!("node {covered} stops: {}", replica_state(&cluster, covered)),
+                });
+            }
             cluster.stop_node(covered).await;
             if controls.purge_after_restart {
                 // A process restart: the replica restores its snapshot and
@@ -636,6 +641,8 @@ pub(super) async fn run_deleted_data_inner(
                     ursula_stream::sim_controls::Defence::ScrubPurge,
                     false,
                 );
+                seen.wait(&cluster, removal_index, Duration::from_millis(500))
+                    .await;
                 trace.push(SimEvent::FaultApplied {
                     phase: format!(
                         "node {covered} restarted: {}",
