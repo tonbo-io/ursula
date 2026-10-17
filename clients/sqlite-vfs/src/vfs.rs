@@ -939,6 +939,8 @@ unsafe fn commit(
             return ffi::SQLITE_IOERR_WRITE;
         }
     };
+    // The pages are in the frame now: free them before the log write copies it.
+    drop(record);
     let bytes = frame.len();
     abort_at(Step::Encode);
     let logging = Instant::now();

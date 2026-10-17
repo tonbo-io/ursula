@@ -350,14 +350,21 @@ fn record_len(pages: u32) -> u64 {
 }
 
 /// The COMMIT frame of `record`. Pages must ascend and lie within the database. The zstd frame
-/// declares its content size and carries a content checksum.
+/// declares its content size and carries a content checksum. The frame is built in one buffer:
+/// the header and the commit id, then zstd writes the record after them, and the body length and
+/// checksum are filled in last. The bytes are those of [`encode`] of the same COMMIT.
 pub fn encode_commit(id: CommitId, record: &CommitRecord) -> Result<Vec<u8>, FrameError> {
     let n = record.pages.len();
     let count =
         u32::try_from(n).map_err(|_too_many| FrameError::TooManyPages { pages: n as u64 })?;
     let size = record_len(count);
-    let mut z =
-        zstd::stream::write::Encoder::new(Vec::new(), ZSTD_LEVEL).map_err(FrameError::Compress)?;
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.push(COMMIT);
+    // The body length and the checksum, filled in once the record is compressed.
+    out.extend_from_slice(&[0; 8]);
+    put_id(&mut out, id);
+    let mut z = zstd::stream::write::Encoder::new(out, ZSTD_LEVEL).map_err(FrameError::Compress)?;
     z.include_checksum(true).map_err(FrameError::Compress)?;
     z.include_contentsize(true).map_err(FrameError::Compress)?;
     z.set_pledged_src_size(Some(size))
@@ -372,8 +379,32 @@ pub fn encode_commit(id: CommitId, record: &CommitRecord) -> Result<Vec<u8>, Fra
         write(&pgno.to_le_bytes())?;
         write(image.as_slice())?;
     }
-    let compressed = z.finish().map_err(FrameError::Compress)?;
-    encode(&Frame::Commit { id, compressed })
+    let mut out = z.finish().map_err(FrameError::Compress)?;
+    let (head, body) = out
+        .split_at_mut_checked(HEADER)
+        .ok_or(FrameError::BodyLength {
+            kind: COMMIT,
+            len: 0,
+        })?;
+    if body.len() <= ID {
+        return Err(FrameError::BodyLength {
+            kind: COMMIT,
+            len: body.len() as u64,
+        });
+    }
+    let len = u32::try_from(body.len()).map_err(|_too_long| FrameError::TooLarge {
+        len: body.len() as u64,
+    })?;
+    let crc = checksum(COMMIT, body);
+    let fields = len.to_le_bytes().into_iter().chain(crc.to_le_bytes());
+    for (slot, byte) in head
+        .iter_mut()
+        .skip(MAGIC.len().saturating_add(1))
+        .zip(fields)
+    {
+        *slot = byte;
+    }
+    Ok(out)
 }
 
 /// Page `pgno` follows page `previous` (0 for none) in a database of `db_pages_after` pages.

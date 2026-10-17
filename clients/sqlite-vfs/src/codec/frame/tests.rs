@@ -154,6 +154,13 @@ proptest! {
         prop_assert_eq!(decompress(&compressed).unwrap(), record);
     }
 
+    // `encode_commit` builds in one buffer the bytes `encode` gives the same COMMIT.
+    #[test]
+    fn a_commit_encoded_in_one_buffer_is_the_commit_frame(id in id(), record in record()) {
+        let bytes = encode_commit(id, &record).unwrap();
+        prop_assert_eq!(encode(&decoded(&bytes)).unwrap(), bytes);
+    }
+
     // Reads cut frames anywhere: every strict prefix is Partial, also with a frame following.
     #[test]
     fn every_strict_prefix_is_partial(frame in any_frame(), next in any_frame()) {
