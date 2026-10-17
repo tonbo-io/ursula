@@ -38,12 +38,12 @@ export const freshDir = (): string => mkdtempSync(join(tmpdir(), "sqlite-ursula-
 
 /**
  * Every byte of the stream at `path`: the model's `/__model/frames`, or a read of the stream from
- * its start to its tail.
+ * `from` (its start by default, otherwise a frame boundary such as its retained offset) to its tail.
  */
-async function streamBytes(path: string): Promise<Uint8Array> {
+export async function streamBytes(path: string, from = "-1"): Promise<Uint8Array> {
 	if (onModel()) return new Uint8Array(await (await fetch(`${directUrl()}/__model/frames?path=${path}`)).arrayBuffer());
 	const chunks: Uint8Array[] = [];
-	for (let offset = "-1"; ; ) {
+	for (let offset = from; ; ) {
 		const r = await fetch(`${directUrl()}${path}?offset=${offset}`);
 		expect(r.status, `read ${path} from ${offset}`).toBe(200);
 		const chunk = new Uint8Array(await r.arrayBuffer());

@@ -383,15 +383,18 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
   `Producer-Closed-Seq`. When that is the epoch the binding streamed in, the reconcile cross-checks
   it: a batch the binding sent above `Producer-Closed-Seq` found in the stream resets
   `stream_state`.
-- The activation id is 16 random bytes per open, or the `activation` option of `ursula_open`, and
-  the CLAIM frame carries it. Claims of one epoch from different activations have different
-  digests.
+- The activation id is 16 random bytes drawn by each open that starts a binding, or the
+  `activation` option of `ursula_open`, and the CLAIM frame carries it. An open that joins a
+  binding, or takes back one still draining, draws nothing. Claims of one epoch from different
+  activations have different digests. Two opens with one `activation` that compute one epoch send
+  identical claims, and the second binds on the repeat ([Clones](#clones)).
 - The epoch floor refuses every tokened claim at or below the highest retired epoch. A
   continuation at own + 1 after idle expiry applies when own is the floor. A takeover learns the
   floor from `Producer-Epoch` and goes above it.
 
 A claim nobody timed never takes a stream over: a process back from a partition cannot fence the
-owner an explicit open installed.
+owner an explicit open installed, unless it opens a copy of that owner's own cache
+([Limits](#limits)).
 
 #### Pre-check
 
@@ -410,7 +413,8 @@ its acknowledged offset do not claim at once. They first:
    that starts below the acknowledged offset and ends past it resets `stream_state`.
 
 A provisional open thus claims at most one above the latest claim of its own the stream applied,
-and never above an owner an explicit open installed before the pre-check read the tail. A
+and never above an owner an explicit open installed before the pre-check read the tail, unless
+the open is of a copy of that owner's own cache, whose claims are its own ([Limits](#limits)). A
 generation whose log holds no CLAIM record has nothing to continue and does not open
 provisionally.
 
@@ -1058,10 +1062,25 @@ host. Copies share the epoch, next seq, in-flight batch, lineage and activation.
 - Host contract: each restored copy gets its own copy-on-write disk, since `flock` in a guest does
   not exclude another VM on a shared directory.
 
+A copy of a cache directory carries the log, so the original's CLAIM records and commits are
+its own to it. Opened while the stream answers, it takes the stream over like any open, and the
+original resets `fenced` at its next commit or `synced()`. Opened offline, its pre-check decides:
+commits the original made since the copy reset it `stale` with nothing sent, and an idle
+original's claim is continued at own + 1, which fences the original. Opened while the stream
+answers, a copy behind retention does not take the original's snapshot as covering its own
+commits ([Reconcile](#reconcile)), and rebuilds from it into a new generation. Offline, its
+pre-check's `410` resets it `stale`.
+
 Tests: the world's properties 3 and 8 (`replicator/tests/world.rs`
 `the_replicator_keeps_its_properties_against_the_model`) with
 `negative_control_the_model_without_digests_breaks_clone_safety`, and
-`a_provisional_clone_never_fences_the_owner_that_bound`.
+`a_provisional_clone_never_fences_the_owner_that_bound`. End to end, `test/clone.e2e.ts` "takes
+over from the original when opened by another process, and the original is fenced at its next
+commit", "shares one epoch between two copies opened with one activation, and their first
+divergent commit fences exactly one", "resets `stale` with nothing sent when its original kept
+writing", "goes live over an idle original and fences it", "goes live over an idle original that
+never wrote and fences it", and "rebuilds a copy that fell behind retention, never trusting the
+original's snapshot".
 
 ## API
 
@@ -1133,8 +1152,8 @@ calls through one watermark while the stream holds its answer back".
 
 | kind | trigger | action | unacknowledged commits | next open |
 | --- | --- | --- | --- | --- |
-| `fenced` | `key-conflict`, `epoch-closed` or another producer `403` to an append, `receipt-evicted` for the in-flight seq, a lost continuation claim, a foreign frame in a pre-check | `stop` | kept for the next reconcile | takeover |
-| `stale` | a continuation found the stream moved on, an idle `producer-expired` without the owner's claim frame, a provisional open whose log lost acknowledged commits to a power loss | `reopen` | discarded | takeover, catch-up or rebuild |
+| `fenced` | `key-conflict`, `epoch-closed` or another producer `403` to an append, `receipt-evicted` for the in-flight seq, a lost continuation claim, a foreign claim in a pre-check | `stop` | kept for the next reconcile | takeover |
+| `stale` | a continuation found the stream moved on, a foreign commit in a pre-check (our commit id with other bytes included), an idle `producer-expired` without the owner's claim frame, a provisional open whose log lost acknowledged commits to a power loss | `reopen` | discarded | takeover, catch-up or rebuild |
 | `rewound` | a `412` confirmed by HEAD when the generation does not inherit | `reopen` | salvaged at the reopen | salvage, rebuild |
 | `deleted` | a `404` confirmed by HEAD with the generation's cluster id | `fix` | kept | `not_found` unless `recreate` |
 | `local_damage` | a failed fsync, a lost WAL page, an uncuttable log write, an unconfirmed commit, a foreign page 1 | `reopen` | kept | materialize |
@@ -1413,6 +1432,16 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   see resets `stale`.
 - **No resume after a memory restore.** A mismatch between memory and disk goes unseen, and each
   restored copy needs its own disk ([Clones](#clones)).
+- **Copies of a live cache.** A copy of a cache directory opened offline while its original is
+  bound and idle continues the original's claim once the stream answers, goes live and fences the
+  original, though the copy's open was provisional. Every commit the original acknowledged stays
+  in the stream, and its next commit or `synced()` resets it `fenced`. A host that copies a live
+  cache stops the original first, or opens the copy while the stream answers, so its takeover is
+  explicit.
+- **A constant `activation`.** Two opens that pass one `activation` and compute one epoch both
+  bind on one claim. Until their first divergent commit both are live, and only the server's
+  digest per producer key tells them apart: the second append under that key gets
+  `key-conflict` and that open resets `fenced`.
 - **Transport.** HTTP/1.1 only, so a retry resends the whole body. ureq tries addresses in turn, so
   an IPv6 path that connects and then stalls fails every attempt (an IPv4-only hostname works
   around it). Each database uses two HTTP worker threads and a snapshot thread.
