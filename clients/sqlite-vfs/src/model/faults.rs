@@ -3,6 +3,8 @@
 
 use std::collections::VecDeque;
 
+use ursula_headers::ErrorCode;
+
 use crate::wire::Method;
 
 /// What happens to a request instead of, or around, the server's answer.
@@ -29,26 +31,28 @@ pub(crate) enum Fault {
     Delay { ms: u64 },
     /// A layer strips `Range`: a snapshot read gets the whole body, `200`.
     IgnoreRange,
-    /// The node answers a parts commit `503` with `Retry-After: 1` and this JSON `error` code,
-    /// nothing applied.
+    /// The node answers a parts commit or discard `503` with `Retry-After: 1` and this error
+    /// body code, nothing applied.
     CommitRefused(CommitRefusal),
 }
 
 /// Why a node refuses a parts commit for now (extensions §2.2): the client repeats it as is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitRefusal {
-    /// Every copy slot is taken: `SnapshotCommitsBusy`.
+    /// Every copy slot is taken: `SNAPSHOT_COMMITS_BUSY`.
     Busy,
-    /// The node runs this commit now: `SnapshotCommitInProgress`.
+    /// The node runs a commit or a discard of this stream incarnation now (#622): one at a time,
+    /// `SNAPSHOT_COMMIT_IN_PROGRESS`. Scripted on a `PUT` for a commit, on a `DELETE` for a
+    /// discard.
     InProgress,
 }
 
 impl CommitRefusal {
-    /// The JSON `error` code of the `503`.
-    pub(crate) fn code(self) -> &'static str {
+    /// The code of the `503`'s error body.
+    pub(crate) fn code(self) -> ErrorCode {
         match self {
-            Self::Busy => "SnapshotCommitsBusy",
-            Self::InProgress => "SnapshotCommitInProgress",
+            Self::Busy => ErrorCode::SnapshotCommitsBusy,
+            Self::InProgress => ErrorCode::SnapshotCommitInProgress,
         }
     }
 }
