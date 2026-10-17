@@ -383,9 +383,11 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
   `Producer-Closed-Seq`. When that is the epoch the binding streamed in, the reconcile cross-checks
   it: a batch the binding sent above `Producer-Closed-Seq` found in the stream resets
   `stream_state`.
-- The activation id is 16 random bytes per open, or the `activation` option of `ursula_open`, and
-  the CLAIM frame carries it. Claims of one epoch from different activations have different
-  digests.
+- The activation id is 16 random bytes drawn at each open, a reopen in the same process
+  included, or the `activation` option of `ursula_open`, and the CLAIM frame carries it. Claims
+  of one epoch from different activations have different digests. Two opens with one
+  `activation` that compute one epoch send identical claims, and the second binds on the repeat
+  ([Clones](#clones)).
 - The epoch floor refuses every tokened claim at or below the highest retired epoch. A
   continuation at own + 1 after idle expiry applies when own is the floor. A takeover learns the
   floor from `Producer-Epoch` and goes above it.
@@ -1058,10 +1060,22 @@ host. Copies share the epoch, next seq, in-flight batch, lineage and activation.
 - Host contract: each restored copy gets its own copy-on-write disk, since `flock` in a guest does
   not exclude another VM on a shared directory.
 
+A copy of a cache directory carries the log, so the original's CLAIM records and commits are
+its own to it. Opened while the stream answers, it takes the stream over like any open, and the
+original resets `fenced` at its next commit. Opened offline, its pre-check decides: commits the
+original made since the copy reset it `stale` with nothing sent, and an idle original's claim is
+continued at own + 1, which fences the original. A copy behind retention never trusts the
+original's snapshot ([Reconcile](#reconcile)) and rebuilds from it.
+
 Tests: the world's properties 3 and 8 (`replicator/tests/world.rs`
 `the_replicator_keeps_its_properties_against_the_model`) with
 `negative_control_the_model_without_digests_breaks_clone_safety`, and
-`a_provisional_clone_never_fences_the_owner_that_bound`.
+`a_provisional_clone_never_fences_the_owner_that_bound`. End to end, `test/clone.e2e.ts` "takes
+over from the original when opened by another process, and the original is fenced at its next
+commit", "shares one epoch between two copies opened with one activation, and their first
+divergent commit fences exactly one", "resets `stale` with nothing sent when its original kept
+writing", "goes live over an idle original and fences it" (and "that never wrote"), and "rebuilds
+a copy that fell behind retention, never trusting the original's snapshot".
 
 ## API
 
@@ -1413,6 +1427,14 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
   see resets `stale`.
 - **No resume after a memory restore.** A mismatch between memory and disk goes unseen, and each
   restored copy needs its own disk ([Clones](#clones)).
+- **Copies of a live cache.** A copy of a cache directory opened offline while its original is
+  bound and idle continues the original's claim once the stream answers, goes live and fences the
+  original, though no explicit open of the copy took the stream over. Every commit the original
+  acknowledged stays in the stream, and its commits after that reset `fenced`.
+- **A constant `activation`.** Two copies that pass one `activation` and compute one epoch both
+  bind on one claim. Until their first divergent commit both are live, and only the server's
+  digest per producer key tells them apart: the second append under that key gets
+  `key-conflict` and its copy resets `fenced`.
 - **Transport.** HTTP/1.1 only, so a retry resends the whole body. ureq tries addresses in turn, so
   an IPv6 path that connects and then stalls fails every attempt (an IPv4-only hostname works
   around it). Each database uses two HTTP worker threads and a snapshot thread.
