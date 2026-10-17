@@ -218,6 +218,35 @@ impl SnapshotStoreError {
     }
 }
 
+/// What one [`SnapshotStore::prune_retired`] pass did (#669).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPrune {
+    /// The store keeps no external objects of the group under reference
+    /// control: it is inline, or it has no voters to check.
+    Unmanaged,
+    /// A configured voter of the group has published no reference, so the
+    /// pass deleted nothing. Pruning fails closed: that voter may hold any
+    /// of the group's objects as its current snapshot.
+    VoterWithoutReference { node_id: u64 },
+    /// The pass deleted `deleted` objects.
+    Pruned { deleted: u64 },
+}
+
+impl SnapshotPrune {
+    /// The objects the pass deleted.
+    pub fn deleted(self) -> u64 {
+        match self {
+            Self::Pruned { deleted } => deleted,
+            Self::Unmanaged | Self::VoterWithoutReference { .. } => 0,
+        }
+    }
+
+    /// Whether a voter without a reference held the pass back.
+    pub fn skipped_unreferenced_voter(self) -> bool {
+        matches!(self, Self::VoterWithoutReference { .. })
+    }
+}
+
 pub type SnapshotStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SnapshotStoreError>> + Send + 'a>>;
 pub type SnapshotBytesIterator = Box<dyn Iterator<Item = Result<Bytes, SnapshotStoreError>> + Send>;
@@ -252,17 +281,18 @@ pub trait SnapshotStore: Send + Sync + Debug {
     /// Best-effort delete; missing is not an error.
     fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()>;
 
-    /// Best-effort prune of retired snapshots for one Raft group. Backends may
-    /// only delete objects that cannot still be referenced by an OpenRaft
-    /// snapshot pointer. Inline snapshots have no external lifecycle, so the
-    /// default is a no-op.
+    /// Deletes the retired snapshot objects of one Raft group: every object
+    /// older than the store's GC grace that `current`, no node's reference
+    /// and no node's pin names (#669). Backends may only delete objects that
+    /// cannot still be referenced by an OpenRaft snapshot pointer. It runs
+    /// whatever `current` is, an inline current included. Inline snapshots
+    /// have no external lifecycle, so the default deletes nothing.
     fn prune_retired<'a>(
         &'a self,
         _raft_group_id: u32,
         _current: &'a SnapshotLocation,
-        _retain_latest: usize,
-    ) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
+    ) -> SnapshotStoreFuture<'a, SnapshotPrune> {
+        Box::pin(async move { Ok(SnapshotPrune::Unmanaged) })
     }
 
     /// Publish this node's current durable pointer. External stores use these
@@ -425,12 +455,14 @@ mod s3 {
     use super::SnapshotCompression;
     use super::SnapshotKey;
     use super::SnapshotLocation;
+    use super::SnapshotPrune;
     use super::SnapshotReferenceConfig;
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
+    /// The GC grace of a store built without one ([`S3SnapshotStore::with_gc_grace`]).
     const S3_SNAPSHOT_GC_GRACE: Duration = Duration::from_secs(60 * 60);
     const SNAPSHOT_REFERENCE_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 
@@ -479,8 +511,12 @@ mod s3 {
             self
         }
 
-        #[cfg(test)]
-        pub(crate) fn with_gc_grace_for_tests(mut self, gc_grace: Duration) -> Self {
+        /// How old an object must be before pruning may delete it (#669).
+        /// A server passes `min(raft.deleted_data_max_age / 4, 1h)`, the time
+        /// a replica keeps the object it replaced pinned. An object nobody
+        /// pins, such as the upload of a build a newer install overtook, is
+        /// then deleted once it is that old.
+        pub fn with_gc_grace(mut self, gc_grace: Duration) -> Self {
             self.gc_grace = gc_grace;
             self
         }
@@ -909,28 +945,35 @@ mod s3 {
             })
         }
 
+        /// Deletes every `.snap` object of the group older than the GC grace
+        /// that `current`, no reference record and no pin names (#669). No
+        /// count of retired objects is kept: a replica pins the object it
+        /// replaced for the grace, which covers a send of its pointer that
+        /// started before the switch. It runs with an inline `current` too.
+        ///
+        /// Fails closed: while a configured voter of the group has published
+        /// no reference, nothing is deleted, since that voter may hold any of
+        /// the group's objects. Every reference record found is honoured,
+        /// including one a node that left the cluster wrote, whose object
+        /// stays until an operator deletes that record.
         fn prune_retired<'a>(
             &'a self,
             raft_group_id: u32,
             current: &'a SnapshotLocation,
-            retain_latest: usize,
-        ) -> SnapshotStoreFuture<'a, ()> {
+        ) -> SnapshotStoreFuture<'a, SnapshotPrune> {
             Box::pin(async move {
-                let SnapshotLocation::S3 {
-                    key: current_key, ..
-                } = current
-                else {
-                    return Ok(());
-                };
                 let Some(references) = &self.references else {
-                    return Ok(());
+                    return Ok(SnapshotPrune::Unmanaged);
                 };
                 let expected_voters = references.voters_for(raft_group_id);
                 if expected_voters.is_empty() {
-                    return Ok(());
+                    return Ok(SnapshotPrune::Unmanaged);
                 }
                 let group_prefix = self.group_prefix(raft_group_id);
-                let mut retained = HashSet::from([current_key.clone()]);
+                let mut retained = HashSet::new();
+                if let SnapshotLocation::S3 { key, .. } = current {
+                    retained.insert(key.clone());
+                }
                 for node_id in expected_voters {
                     let reference_key = self.reference_key(raft_group_id, *node_id);
                     let reference_bytes = match self.operator.read(&reference_key).await {
@@ -941,7 +984,7 @@ mod s3 {
                                 node_id,
                                 "deferring S3 snapshot pruning until every voter publishes a reference"
                             );
-                            return Ok(());
+                            return Ok(SnapshotPrune::VoterWithoutReference { node_id: *node_id });
                         }
                         Err(error) => {
                             return Err(SnapshotStoreError::Backend(error.to_string()));
@@ -976,20 +1019,23 @@ mod s3 {
                     .recursive(true)
                     .await
                     .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+                let references_prefix = format!("{group_prefix}references/");
                 for entry in &entries {
                     if !entry.metadata().mode().is_file()
-                        || !entry
-                            .path()
-                            .starts_with(&format!("{group_prefix}references/"))
+                        || !entry.path().starts_with(&references_prefix)
                         || !entry.path().ends_with(".json")
                     {
                         continue;
                     }
-                    let bytes = self
-                        .operator
-                        .read(entry.path())
-                        .await
-                        .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+                    let bytes = match self.operator.read(entry.path()).await {
+                        Ok(bytes) => bytes,
+                        // A pin its node released after the listing (#490):
+                        // it protects nothing any more.
+                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
+                            continue;
+                        }
+                        Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
+                    };
                     let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
                         .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
                     if reference.version != SNAPSHOT_REFERENCE_VERSION
@@ -1010,7 +1056,7 @@ mod s3 {
                         retained.insert(key);
                     }
                 }
-                let mut retired = Vec::new();
+                let mut deleted = 0_u64;
                 for entry in entries {
                     if !entry.metadata().mode().is_file()
                         || !entry.path().ends_with(".snap")
@@ -1029,19 +1075,17 @@ mod s3 {
                             .map(Into::into)
                             .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
                     };
-                    if let Some(modified) = modified
-                        && modified <= cutoff
-                    {
-                        retired.push((modified, entry.path().to_owned()));
+                    if !modified.is_some_and(|modified: SystemTime| modified <= cutoff) {
+                        continue;
                     }
-                }
-                retired.sort_unstable_by(|left, right| right.cmp(left));
-                let mut deleted = 0_usize;
-                for (_modified, key) in retired.into_iter().skip(retain_latest) {
-                    self.operator
-                        .delete(&key)
-                        .await
-                        .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+                    match self.operator.delete(entry.path()).await {
+                        Ok(()) => {}
+                        // Another replica's pass deleted it first.
+                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
+                            continue;
+                        }
+                        Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
+                    }
                     deleted = deleted.saturating_add(1);
                 }
                 if deleted > 0 {
@@ -1052,7 +1096,7 @@ mod s3 {
                         "pruned unreachable S3 snapshot objects"
                     );
                 }
-                Ok(())
+                Ok(SnapshotPrune::Pruned { deleted })
             })
         }
 
@@ -1144,11 +1188,14 @@ pub use s3::S3SnapshotStore;
 
 /// Pick a snapshot store from a typed `ursula_config::RaftSnapshotConfig`. Returns `None`
 /// when the backend is "inline" (the default) so callers can fall back to
-/// [`default_snapshot_store`] without instantiating anything.
+/// [`default_snapshot_store`] without instantiating anything. `gc_grace` is
+/// how old an external object must be before pruning may delete it
+/// ([`S3SnapshotStore::with_gc_grace`]).
 pub fn snapshot_store_from_config(
     cfg: &ursula_config::RaftSnapshotConfig,
     cold_cfg: &crate::ColdConfig,
     references: SnapshotReferenceConfig,
+    gc_grace: std::time::Duration,
 ) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
     match resolved_snapshot_backend(cfg.backend, cold_cfg.backend) {
         ursula_config::RaftSnapshotBackend::Auto | ursula_config::RaftSnapshotBackend::Inline => {
@@ -1160,14 +1207,20 @@ pub fn snapshot_store_from_config(
             // this namespace must stay relative to that root.
             let prefix = snapshot_namespace(cfg);
             Ok(Some(Arc::new(
-                S3SnapshotStore::try_new(cold_cfg, &prefix)?.with_references(references),
+                S3SnapshotStore::try_new(cold_cfg, &prefix)?
+                    .with_references(references)
+                    .with_gc_grace(gc_grace),
             )))
         }
         #[cfg(madsim)]
-        ursula_config::RaftSnapshotBackend::S3 => Err(SnapshotStoreError::Backend(format!(
-            "snapshot backend {:?} has no I/O under madsim; use 'inline'",
-            cfg.backend
-        ))),
+        ursula_config::RaftSnapshotBackend::S3 => {
+            // No S3 store under madsim, so no grace to apply.
+            let _no_store = gc_grace;
+            Err(SnapshotStoreError::Backend(format!(
+                "snapshot backend {:?} has no I/O under madsim; use 'inline'",
+                cfg.backend
+            )))
+        }
     }
 }
 
@@ -1445,7 +1498,7 @@ mod tests {
                 default_voters: BTreeSet::from([1]),
                 per_group_voters: BTreeMap::new(),
             })
-            .with_gc_grace_for_tests(std::time::Duration::ZERO);
+            .with_gc_grace(std::time::Duration::ZERO);
         let other = S3SnapshotStore::new(operator, "snapshot-pin-gc").with_references(
             SnapshotReferenceConfig {
                 node_id: 2,
@@ -1476,7 +1529,7 @@ mod tests {
         // The unchanged GC reader understands these version-two records,
         // while the primary still names the old pointer during installation
         // or after a failed primary PUT. Zero grace makes protection explicit.
-        store.prune_retired(7, &old, 0).await.unwrap();
+        store.prune_retired(7, &old).await.unwrap();
         assert_eq!(store.download(&old).await.unwrap(), b"old");
         assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
         assert_eq!(store.download(&abandoned).await.unwrap(), b"abandoned");
@@ -1485,7 +1538,7 @@ mod tests {
             .reconcile_reference_pins(7, std::slice::from_ref(&incoming))
             .await
             .unwrap();
-        store.prune_retired(7, &old, 0).await.unwrap();
+        store.prune_retired(7, &old).await.unwrap();
         assert!(matches!(
             store.download(&abandoned).await,
             Err(SnapshotStoreError::NotFound(_))
@@ -1493,7 +1546,7 @@ mod tests {
         assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
         assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
         store.publish_reference(7, &incoming).await.unwrap();
-        store.prune_retired(7, &incoming, 0).await.unwrap();
+        store.prune_retired(7, &incoming).await.unwrap();
         assert!(matches!(
             store.download(&old).await,
             Err(SnapshotStoreError::NotFound(_))
@@ -1592,7 +1645,7 @@ mod tests {
         let store = S3SnapshotStore::memory_for_tests("snapshots")
             .unwrap()
             .with_references(references)
-            .with_gc_grace_for_tests(Duration::ZERO);
+            .with_gc_grace(Duration::ZERO);
         let retired = store
             .upload(test_key(7, "retired"), b"retired".to_vec().into())
             .await
@@ -1611,7 +1664,10 @@ mod tests {
             .unwrap();
         store.publish_reference(7, &current).await.unwrap();
 
-        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::VoterWithoutReference { node_id: 2 }
+        );
         assert_eq!(store.download(&retired).await.unwrap(), b"retired");
 
         for (node_id, location) in [(2, &node_two), (3, &node_three)] {
@@ -1633,7 +1689,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        store.prune_retired(7, &current, 0).await.unwrap();
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
         assert!(matches!(
             store.download(&retired).await,
             Err(SnapshotStoreError::NotFound(_))
@@ -1641,5 +1700,254 @@ mod tests {
         assert_eq!(store.download(&node_two).await.unwrap(), b"node-two");
         assert_eq!(store.download(&node_three).await.unwrap(), b"node-three");
         assert_eq!(store.download(&current).await.unwrap(), b"current");
+    }
+
+    #[cfg(not(madsim))]
+    fn gc_store(voters: &[u64], gc_grace: std::time::Duration) -> S3SnapshotStore {
+        S3SnapshotStore::memory_for_tests("snapshots")
+            .unwrap()
+            .with_references(SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: voters.iter().copied().collect(),
+                per_group_voters: BTreeMap::new(),
+            })
+            .with_gc_grace(gc_grace)
+    }
+
+    #[cfg(not(madsim))]
+    async fn write_reference(store: &S3SnapshotStore, path: &str, node_id: u64, key: Option<&str>) {
+        store
+            .write_raw_for_tests(
+                path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": ursula_stream::FORMAT_EPOCH,
+                    "node_id": node_id,
+                    "raft_group_id": 7,
+                    "snapshot_key": key,
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[cfg(not(madsim))]
+    fn s3_key(location: &SnapshotLocation) -> &str {
+        let SnapshotLocation::S3 { key, .. } = location else {
+            panic!("expected S3 location")
+        };
+        key
+    }
+
+    #[cfg(not(madsim))]
+    fn is_gone(result: Result<Vec<u8>, SnapshotStoreError>) -> bool {
+        matches!(result, Err(SnapshotStoreError::NotFound(_)))
+    }
+
+    /// #669: no count of retired objects is kept. Every object past the
+    /// grace that nothing names goes, the newest of them too.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pruning_keeps_no_retired_object_nothing_names() {
+        let store = gc_store(&[1], std::time::Duration::ZERO);
+        let mut retired = Vec::new();
+        for id in ["first", "second", "newest-retired"] {
+            retired.push(
+                store
+                    .upload(test_key(7, id), id.as_bytes().to_vec().into())
+                    .await
+                    .unwrap(),
+            );
+        }
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 3 }
+        );
+        for location in &retired {
+            assert!(is_gone(store.download(location).await));
+        }
+        assert_eq!(store.download(&current).await.unwrap(), b"current");
+        // A second pass finds nothing left to delete.
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 0 }
+        );
+    }
+
+    /// #669: a replica whose current snapshot is inline, after an inline
+    /// fallback, still deletes the objects it no longer uses.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pruning_runs_while_the_current_snapshot_is_inline() {
+        let store = gc_store(&[1], std::time::Duration::ZERO);
+        let old = store
+            .upload(test_key(7, "old"), b"old".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &old).await.unwrap();
+        let inline = SnapshotLocation::Inline {
+            bytes: b"inline".to_vec(),
+        };
+        store.publish_reference(7, &inline).await.unwrap();
+
+        assert_eq!(
+            store.prune_retired(7, &inline).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(is_gone(store.download(&old).await));
+    }
+
+    /// #669: a pin keeps its object past the grace until its node drops it.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pruning_spares_a_pinned_object_until_the_pin_goes() {
+        let store = gc_store(&[1], std::time::Duration::ZERO);
+        let retiring = store
+            .upload(test_key(7, "retiring"), b"retiring".to_vec().into())
+            .await
+            .unwrap();
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.pin_reference(7, &retiring).await.unwrap();
+        store.pin_reference(7, &current).await.unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 0 }
+        );
+        assert_eq!(store.download(&retiring).await.unwrap(), b"retiring");
+        store
+            .reconcile_reference_pins(7, std::slice::from_ref(&current))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(is_gone(store.download(&retiring).await));
+        assert_eq!(store.download(&current).await.unwrap(), b"current");
+    }
+
+    /// #669: the object a voter that is down still names stays, and so does
+    /// the one a node that left the cluster names in the reference it left.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pruning_keeps_what_a_down_voter_or_a_departed_node_names() {
+        let store = gc_store(&[1, 2], std::time::Duration::ZERO);
+        let down = store
+            .upload(test_key(7, "down"), b"down".to_vec().into())
+            .await
+            .unwrap();
+        let departed = store
+            .upload(test_key(7, "departed"), b"departed".to_vec().into())
+            .await
+            .unwrap();
+        let retired = store
+            .upload(test_key(7, "retired"), b"retired".to_vec().into())
+            .await
+            .unwrap();
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+        write_reference(
+            &store,
+            "snapshots/group-7/references/node-2.json",
+            2,
+            Some(s3_key(&down)),
+        )
+        .await;
+        write_reference(
+            &store,
+            "snapshots/group-7/references/node-9.json",
+            9,
+            Some(s3_key(&departed)),
+        )
+        .await;
+
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(is_gone(store.download(&retired).await));
+        assert_eq!(store.download(&down).await.unwrap(), b"down");
+        assert_eq!(store.download(&departed).await.unwrap(), b"departed");
+        assert_eq!(store.download(&current).await.unwrap(), b"current");
+    }
+
+    /// #669: pruning fails closed while a configured voter has published no
+    /// reference, inline current or not.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pruning_deletes_nothing_while_a_voter_has_no_reference() {
+        let store = gc_store(&[1, 2, 3], std::time::Duration::ZERO);
+        let retired = store
+            .upload(test_key(7, "retired"), b"retired".to_vec().into())
+            .await
+            .unwrap();
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+        write_reference(&store, "snapshots/group-7/references/node-3.json", 3, None).await;
+
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::VoterWithoutReference { node_id: 2 }
+        );
+        let inline = SnapshotLocation::Inline { bytes: Vec::new() };
+        assert_eq!(
+            store.prune_retired(7, &inline).await.unwrap(),
+            SnapshotPrune::VoterWithoutReference { node_id: 2 }
+        );
+        assert_eq!(store.download(&retired).await.unwrap(), b"retired");
+    }
+
+    /// #669: an object younger than the grace stays even when nothing names
+    /// it, such as the upload of a build that a newer install overtook. The
+    /// in-memory operator records no modification time, so this runs on a
+    /// local directory.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_pruning_spares_an_object_younger_than_the_grace() {
+        let root = tempfile::tempdir().unwrap();
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(root.path().to_str().unwrap()),
+        )
+        .unwrap()
+        .finish();
+        let store = S3SnapshotStore::new(operator, "snapshots")
+            .with_references(SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: BTreeSet::from([1]),
+                per_group_voters: BTreeMap::new(),
+            })
+            .with_gc_grace(std::time::Duration::from_secs(60 * 60));
+        let young = store
+            .upload(test_key(7, "young"), b"young".to_vec().into())
+            .await
+            .unwrap();
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 0 }
+        );
+        assert_eq!(store.download(&young).await.unwrap(), b"young");
     }
 }

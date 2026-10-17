@@ -409,12 +409,13 @@ Semantics:
 
 ## Deleted data
 
-Deleting a stream and purging a bucket remove the stream from its group's state at once. Copies of its records can stay for a while in each replica's Raft snapshot and Raft log, which are cleaned up in the background. `raft.deleted_data_max_age` (1 hour by default) bounds how long they stay.
+Deleting a stream and purging a bucket remove the stream from its group's state at once. Copies of its records can stay for a while in each replica's Raft snapshot and Raft log, and in older snapshot objects of an S3 snapshot store. They are cleaned up in the background. `raft.deleted_data_max_age` (1 hour by default) bounds how long they stay.
 
 Within that time after a replica applies the removal:
 
 - The replica's current snapshot no longer holds the stream. That covers the snapshot in memory, the snapshot file in the Raft log directory and, with an S3 snapshot store, the snapshot object that file names.
 - The replica's Raft log holds no entry with the stream's records.
+- The snapshot store no longer holds the snapshot objects the replica used before, unless another replica still uses them.
 
 Removed bytes count toward a group's next snapshot, so a large removal is cleaned up within minutes. A small removal makes its group take a snapshot a quarter of `raft.deleted_data_max_age` after the replica applied it, and the replica then purges its Raft log through that snapshot. Cold chunks, cold indexes and external payloads are deleted by cold GC, usually within seconds, and a bucket purge reports when they are gone.
 
@@ -424,12 +425,11 @@ The bound and its gauges need the snapshot driver, which runs on every node of a
 
 While the driver purges a group's log through a snapshot, the group takes no new snapshot until that purge lands, which is usually at once. An operator's `POST /__ursula/raft/{group}/snapshot` waits for it, and answers `503` with `Retry-After` when the wait passes 10 seconds. An operator's `POST /__ursula/raft/{group}/purge?upto=<index>` follows the same rule: while a snapshot of the group builds, OpenRaft has not published the one it built, or an earlier purge of the group has not landed, it answers `503` with `Retry-After`. Send it again then.
 
-Under write pressure the driver first snapshots the groups that free the most log, and groups that owe a removal wait their turn among the due groups. Removals catch up once the node's log is back under its target.
+Under write pressure the driver first snapshots the groups that free the most log, and groups that owe a removal wait their turn among the due groups. They lead the driver's passes again once the node's log is below three quarters of its budget.
 
-Later releases bound two more places, which this one leaves as they were:
+With an S3 snapshot store, the object a replica used before its current snapshot stays for a quarter of `raft.deleted_data_max_age`, at most an hour. That covers a peer that started to install it before the replica moved on. The driver then deletes it, unless another replica still names it as its current snapshot, and also deletes every older object of the group that no replica names. Such an object stays until that replica's own snapshot moves past it, and is deleted within the same time after that. Snapshot GC deletes nothing while a configured voter of the group has never stored a snapshot reference, since that voter may use any of the group's objects. `snapshot_gc_deleted_objects` in `/__ursula/metrics` counts the objects it deleted, and `snapshot_gc_skipped_unreferenced_voter` counts the passes such a voter held back.
 
-- The Raft log's files on disk. A purged entry's bytes stay in its journal segment until the segment is reclaimed, which waits until every group on the core has moved past it.
-- Older snapshot objects in an S3 snapshot store. The object a replica used before stays until snapshot GC deletes it.
+A later release bounds one more place, which this one leaves as it was: the Raft log's files on disk. A purged entry's bytes stay in its journal segment until the segment is reclaimed, which waits until every group on the core has moved past it.
 
 The bound does not cover:
 
@@ -438,7 +438,11 @@ The bound does not cover:
 - A leader whose follower lags. A leader purges no log entry a follower still needs, so a slow or unreachable follower holds the leader's log through the removal until it catches up or the leader sends it a snapshot.
 - A group whose Raft is not running on the replica, for example while the replica restarts or after it stopped on a storage error. The time keeps counting, and the driver cleans the group up once its Raft runs again.
 - A replica that is down for longer than `raft.deleted_data_max_age`. It catches up when it is back, and its time counts from when it applies the removal.
+- Sustained write pressure. While the node's log stays above three quarters of its budget, the driver snapshots the groups that free the most log first, and the time can run past the bound.
 - A snapshot object another replica still uses. It stays until that replica's own snapshot moves past it.
+- A configured voter that has never stored a snapshot reference. Its group's old snapshot objects stay until it stores one.
+- A node that left the cluster. It keeps its `references/node-<id>.json` under the group's snapshot prefix, and with it the snapshot object that file names. Delete that file when you remove the node.
+- Object versioning. On a bucket with versioning, a deleted snapshot object stays as a noncurrent version until a lifecycle rule expires it.
 - Backups taken before the removal. Delete them to complete an erasure.
 - Freed disk blocks and memory. Ursula deletes and replaces files but does not overwrite the blocks they used, and read caches keep blocks of a deleted stream until they are evicted. Use encrypted volumes and buckets where that matters.
 - A group whose committed application failed. It keeps its whole log for replay until it is repaired.

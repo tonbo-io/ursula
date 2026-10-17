@@ -786,6 +786,12 @@ impl GroupLogGauge {
     }
 
     /// What a snapshot of the state applied so far covers.
+    ///
+    /// Taking a mark changes the gauge: it becomes the latest mark, and the
+    /// first removal applied after it dates what a snapshot of it leaves
+    /// owed ([`Self::record_snapshot`]). A snapshot of an earlier mark,
+    /// recorded after a newer mark was taken, leaves its removals owed from
+    /// when it is recorded instead.
     pub fn mark(&self) -> GroupLogMark {
         let mut ledger = self.ledger();
         if ledger.marked_removals != ledger.removals {

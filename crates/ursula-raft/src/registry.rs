@@ -284,6 +284,23 @@ impl Default for RaftGroupHandleRegistry {
     }
 }
 
+/// What one round of snapshot GC passes did
+/// ([`RaftGroupHandleRegistry::collect_snapshot_garbage`], #669).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotGcPass {
+    /// The groups whose pass ran.
+    pub groups: usize,
+    /// The snapshot objects the passes deleted.
+    pub deleted: u64,
+    /// The passes that deleted nothing because a configured voter of the
+    /// group had published no reference.
+    pub skipped_unreferenced_voter: u64,
+    /// The passes that failed, which run again later.
+    pub failed: usize,
+    /// The groups whose pass is due but past `max_groups`.
+    pub left: usize,
+}
+
 /// Failure of snapshot admission, owned installation, or reference publication.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotInstallError {
@@ -889,8 +906,52 @@ impl RaftGroupHandleRegistry {
     }
 
     pub fn with_snapshot_install_max_concurrency(mut self, max_concurrency: usize) -> Self {
-        self.snapshot_install = SnapshotInstallCoordinator::new(max_concurrency);
+        let gc_grace = self.snapshot_install.gc_grace();
+        self.snapshot_install =
+            SnapshotInstallCoordinator::new(max_concurrency).with_gc_grace(gc_grace);
         self
+    }
+
+    /// Snapshot GC grace G (#669): how long each group keeps the snapshot
+    /// object it replaced pinned, `RaftConfig::snapshot_gc_grace` on a
+    /// server. Set it before any group starts.
+    pub fn with_snapshot_gc_grace(mut self, gc_grace: std::time::Duration) -> Self {
+        self.snapshot_install = self.snapshot_install.with_gc_grace(gc_grace);
+        self
+    }
+
+    /// Runs the snapshot GC passes due now (#669), for at most `max_groups`
+    /// groups in group order: each drops the pins that expired, publishes
+    /// the group's current reference and prunes the objects nothing names
+    /// any more. A failed pass runs again later.
+    pub async fn collect_snapshot_garbage(&self, max_groups: usize) -> SnapshotGcPass {
+        let now = crate::rt::time::Instant::now();
+        let due = self.snapshot_install.gc_due(now);
+        let store = self.snapshot_store();
+        let mut pass = SnapshotGcPass {
+            left: due.len().saturating_sub(max_groups),
+            ..SnapshotGcPass::default()
+        };
+        for (group, references) in due.into_iter().take(max_groups) {
+            pass.groups = pass.groups.saturating_add(1);
+            match references.collect_garbage(&store, group, now).await {
+                Ok(prune) => {
+                    pass.deleted = pass.deleted.saturating_add(prune.deleted());
+                    pass.skipped_unreferenced_voter = pass
+                        .skipped_unreferenced_voter
+                        .saturating_add(u64::from(prune.skipped_unreferenced_voter()));
+                }
+                Err(err) => {
+                    pass.failed = pass.failed.saturating_add(1);
+                    tracing::warn!(
+                        raft_group_id = group,
+                        %err,
+                        "snapshot GC pass failed; retrying later"
+                    );
+                }
+            }
+        }
+        pass
     }
 
     pub fn set_snapshot_build_max_concurrency(&self, max_concurrency: usize) {
@@ -1375,9 +1436,12 @@ impl RaftGroupHandleRegistry {
             // the node-wide download/install budget. Keep the per-group lock
             // and engine lifetime until publication completes.
             drop(_permit);
-            let publication = registry
-                .snapshot_install
-                .references(raft_group_id.0)
+            let references = registry.snapshot_install.references(raft_group_id.0);
+            // The object the install replaced is pinned for the GC grace, and
+            // the snapshot driver's next tick deletes what retired before
+            // (#669).
+            references.schedule_pass(crate::rt::time::Instant::now());
+            let publication = references
                 .publish_current(&registry.snapshot_store(), raft_group_id.0)
                 .await
                 .map_err(SnapshotInstallError::Publication);
@@ -2371,7 +2435,9 @@ mod tests {
     async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body() {
         let store = Arc::new(FailingReferenceStore::default());
         let shared: SharedSnapshotStore = store.clone();
-        let references = Arc::new(crate::snapshot_references::SnapshotReferences::default());
+        let references = Arc::new(crate::snapshot_references::SnapshotReferences::new(
+            std::time::Duration::from_secs(60),
+        ));
         let location = |id: &str| {
             SnapshotPointer::decode(external_snapshot(id).snapshot.get_ref())
                 .unwrap()
@@ -2402,10 +2468,12 @@ mod tests {
             store.current.lock().unwrap().as_deref(),
             Some("old-current.snap")
         );
+        // The replaced current stays pinned while it retires (#669).
         assert_eq!(
             *store.pins.lock().unwrap(),
             BTreeSet::from([
                 "new-current.snap".to_owned(),
+                "old-current.snap".to_owned(),
                 "pending-build.snap".to_owned(),
             ])
         );
@@ -2416,6 +2484,17 @@ mod tests {
             store.current.lock().unwrap().as_deref(),
             Some("new-current.snap")
         );
+        assert_eq!(
+            *store.pins.lock().unwrap(),
+            BTreeSet::from(["new-current.snap".to_owned(), "old-current.snap".to_owned()])
+        );
+        // Once its pin expires, the next publication drops it.
+        let expired = crate::rt::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(61))
+            .unwrap();
+        assert!(references.gc_due(expired));
+        assert!(references.expire_retiring(expired));
+        references.publish_current(&shared, 7).await.unwrap();
         assert_eq!(
             *store.pins.lock().unwrap(),
             BTreeSet::from(["new-current.snap".to_owned()])

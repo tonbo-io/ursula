@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ursula_raft::BuildsChanged;
 use ursula_raft::Handoff;
 use ursula_raft::LaggingGroups;
 use ursula_raft::RaftGroupHandleRegistry;
@@ -502,7 +503,12 @@ pub struct SnapshotDriveSettings {
 /// for that. Before its pass a tick purges each group's log through the
 /// snapshot that covers its removals ([`plan_scrub_purges`], #669), and
 /// holds the group's builds until that purge lands
-/// ([`SnapshotBuildCoordinator::hold_for_purge`]).
+/// ([`SnapshotBuildCoordinator::hold_for_purge`]). After its pass a tick
+/// runs the snapshot GC passes that are due, for at most
+/// `max_groups_per_tick` groups
+/// ([`RaftGroupHandleRegistry::collect_snapshot_garbage`], #669): the
+/// object a group replaced is deleted once its pin expired, unless another
+/// replica still names it.
 pub struct SnapshotDriver {
     registry: RaftGroupHandleRegistry,
     coordinator: SnapshotBuildCoordinator,
@@ -515,9 +521,11 @@ pub struct SnapshotDriver {
     /// The groups held out of the last pass, so that passes that only carry
     /// the same holds are neither logged nor counted.
     last_held: BTreeSet<u32>,
-    /// Whether the last pass ended without a build slot for an overdue
-    /// group (#669): the pause then ends once a build starts or ends.
-    wait_for_slot: bool,
+    /// Set when the last pass ended without a build slot for an overdue
+    /// group (#669): the pause then ends once a build starts or ends. The
+    /// subscription was taken before that group's wait for a slot, so a
+    /// build that ends before the pause still ends it.
+    wait_for_slot: Option<BuildsChanged>,
 }
 
 impl SnapshotDriver {
@@ -542,7 +550,7 @@ impl SnapshotDriver {
             metrics,
             held_groups: HeldGroups::default(),
             last_held: BTreeSet::new(),
-            wait_for_slot: false,
+            wait_for_slot: None,
         }
     }
 
@@ -561,12 +569,11 @@ impl SnapshotDriver {
     /// A pass that left an overdue group without a build slot ends its
     /// pause once a build starts or ends instead (#669).
     pub async fn pause(&mut self, pause: Duration) {
-        let slot = std::mem::take(&mut self.wait_for_slot);
-        let builds = async {
-            if slot {
-                self.coordinator.builds_changed().await;
-            } else {
-                std::future::pending::<()>().await;
+        let slot = self.wait_for_slot.take();
+        let builds = async move {
+            match slot {
+                Some(builds) => builds.changed().await,
+                None => std::future::pending::<()>().await,
             }
         };
         let lagging = async {
@@ -678,6 +685,9 @@ impl SnapshotDriver {
                 PassStep::Start { builds: now } => Some(now),
             };
             for (position, snapshot) in selected.into_iter().enumerate() {
+                // Taken before the wait for a slot, so that no build end
+                // between a `NoSlot` and the pause goes unseen.
+                let builds = (position < plan.overdue).then(|| coordinator.subscribe_builds());
                 let trigger = trigger_snapshot_build(
                     &self.registry,
                     &coordinator,
@@ -695,7 +705,7 @@ impl SnapshotDriver {
                     Trigger::NoSlot => {
                         // An overdue group left without a slot waits for one
                         // on the builds, not on a timer.
-                        self.wait_for_slot = position < plan.overdue;
+                        self.wait_for_slot = builds;
                         break;
                     }
                     Trigger::Outgrown => {
@@ -754,6 +764,20 @@ impl SnapshotDriver {
             }
         }
         self.last_held = held;
+        // Snapshot GC after the pass, so that store calls never hold back
+        // builds, and not while the store is in trouble: a failed pass runs
+        // again later.
+        if !store_trouble {
+            let gc = self
+                .registry
+                .collect_snapshot_garbage(self.limits.max_groups)
+                .await;
+            self.metrics
+                .record_snapshot_gc(gc.deleted, gc.skipped_unreferenced_voter);
+            if gc.left > 0 {
+                pause = pause.min(SNAPSHOT_PRESSURE_RETICK);
+            }
+        }
         pause
     }
 

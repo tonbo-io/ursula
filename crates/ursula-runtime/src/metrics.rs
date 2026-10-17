@@ -55,6 +55,13 @@ impl RuntimeMetrics {
     pub fn record_raft_deleted_data(&self, sample: RaftDeletedDataSample) {
         self.inner.record_raft_deleted_data(sample);
     }
+
+    /// Records snapshot GC passes (#669): the objects they deleted, and the
+    /// passes a configured voter without a reference held back.
+    pub fn record_snapshot_gc(&self, deleted: u64, skipped_unreferenced_voter: u64) {
+        self.inner
+            .record_snapshot_gc(deleted, skipped_unreferenced_voter);
+    }
 }
 
 /// Declares every runtime metric once and expands the four sections that were
@@ -450,6 +457,11 @@ runtime_metrics! {
     // `raft.deleted_data_max_age`.
     counter raft_deleted_data_oldest_age_ms;
     counter raft_deleted_data_overdue_groups;
+    // Snapshot GC (#669): the snapshot objects the node's GC passes
+    // deleted, and the passes that deleted nothing because a configured
+    // voter of the group had published no snapshot reference.
+    counter snapshot_gc_deleted_objects;
+    counter snapshot_gc_skipped_unreferenced_voter;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -791,6 +803,12 @@ impl RuntimeMetricsInner {
             .store_relaxed(sample.oldest_age_ms);
         self.raft_deleted_data_overdue_groups
             .store_relaxed(sample.overdue_groups);
+    }
+
+    pub(crate) fn record_snapshot_gc(&self, deleted: u64, skipped_unreferenced_voter: u64) {
+        self.snapshot_gc_deleted_objects.fetch_add_relaxed(deleted);
+        self.snapshot_gc_skipped_unreferenced_voter
+            .fetch_add_relaxed(skipped_unreferenced_voter);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
@@ -1232,6 +1250,8 @@ mod metric_manifest_tests {
         "raft_log_bytes_high_watermark",
         "raft_deleted_data_oldest_age_ms",
         "raft_deleted_data_overdue_groups",
+        "snapshot_gc_deleted_objects",
+        "snapshot_gc_skipped_unreferenced_voter",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",

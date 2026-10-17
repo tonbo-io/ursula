@@ -4430,6 +4430,7 @@ dependencies = [
  "http-body-util",
  "madsim",
  "memchr",
+ "opendal",
  "openraft",
  "opentelemetry",
  "proptest",
@@ -4461,6 +4462,7 @@ dependencies = [
  "ursula-runtime",
  "ursula-shard",
  "ursula-stream",
+ "zstd",
 ]
 
 [[package]]

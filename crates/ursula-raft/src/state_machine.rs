@@ -359,6 +359,22 @@ impl Drop for PendingHandoff<'_> {
     }
 }
 
+/// A subscription to the node's snapshot builds
+/// ([`SnapshotBuildCoordinator::subscribe_builds`]).
+#[derive(Debug)]
+pub struct BuildsChanged(watch::Receiver<BTreeMap<u64, BuildInFlight>>);
+
+impl BuildsChanged {
+    /// Waits until a build started or ended, or a hand-off was taken back,
+    /// since the subscription was taken.
+    pub async fn changed(mut self) {
+        // A closed registry never changes again.
+        if self.0.changed().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+}
+
 /// One snapshot build that holds a permit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BuildInFlight {
@@ -908,13 +924,11 @@ impl SnapshotBuildCoordinator {
         }
     }
 
-    /// Waits until a build starts or ends, or a hand-off is taken back.
-    pub async fn builds_changed(&self) {
-        let mut builds = self.inner.builds.subscribe();
-        // A closed registry never changes again.
-        if builds.changed().await.is_err() {
-            std::future::pending::<()>().await;
-        }
+    /// A subscription that ends once a build starts or ends, or a hand-off
+    /// is taken back, after this call. Take it when the wait is decided, so
+    /// that a change before the wait begins still ends it.
+    pub fn subscribe_builds(&self) -> BuildsChanged {
+        BuildsChanged(self.inner.builds.subscribe())
     }
 
     /// Waits until no build of `raft_group_id` holds a permit.
@@ -1272,7 +1286,14 @@ struct SnapshotInstallCoordinatorInner {
     prefetched: Mutex<BTreeMap<String, PrefetchedGroupSnapshot>>,
     references: Mutex<BTreeMap<u32, Arc<SnapshotReferences>>>,
     installs: Mutex<BTreeMap<u32, Arc<crate::rt::sync::Mutex<()>>>>,
+    /// G: how long each group's replaced snapshot object stays pinned
+    /// before a GC pass deletes it (#669).
+    gc_grace: Duration,
 }
+
+/// G when the server does not set it: a quarter of the default
+/// `raft.deleted_data_max_age`.
+pub const DEFAULT_SNAPSHOT_GC_GRACE: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Debug)]
 pub(crate) struct PrefetchedGroupSnapshot {
@@ -1289,15 +1310,47 @@ impl Default for SnapshotInstallCoordinator {
 
 impl SnapshotInstallCoordinator {
     pub fn new(max_concurrency: usize) -> Self {
+        Self::with_semaphore(
+            Arc::new(Semaphore::new(max_concurrency.max(1))),
+            DEFAULT_SNAPSHOT_GC_GRACE,
+        )
+    }
+
+    fn with_semaphore(semaphore: Arc<Semaphore>, gc_grace: Duration) -> Self {
         Self {
             inner: Arc::new(SnapshotInstallCoordinatorInner {
-                semaphore: Arc::new(Semaphore::new(max_concurrency.max(1))),
+                semaphore,
                 next_install: AtomicU64::new(0),
                 prefetched: Mutex::new(BTreeMap::new()),
                 references: Mutex::new(BTreeMap::new()),
                 installs: Mutex::new(BTreeMap::new()),
+                gc_grace,
             }),
         }
+    }
+
+    /// The coordinator with snapshot GC grace G (#669): how long a group's
+    /// replaced snapshot object stays pinned. Set it before any group
+    /// starts: the groups' references are created with the grace.
+    pub fn with_gc_grace(self, gc_grace: Duration) -> Self {
+        Self::with_semaphore(self.inner.semaphore.clone(), gc_grace)
+    }
+
+    /// The snapshot GC grace G.
+    pub fn gc_grace(&self) -> Duration {
+        self.inner.gc_grace
+    }
+
+    /// The groups whose snapshot GC is due by `now` (#669), in group order.
+    pub(crate) fn gc_due(&self, now: Instant) -> Vec<(u32, Arc<SnapshotReferences>)> {
+        self.inner
+            .references
+            .lock()
+            .expect("snapshot references mutex")
+            .iter()
+            .filter(|(_, references)| references.gc_due(now))
+            .map(|(group, references)| (*group, references.clone()))
+            .collect()
     }
 
     pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
@@ -1345,7 +1398,7 @@ impl SnapshotInstallCoordinator {
             .lock()
             .expect("snapshot references mutex")
             .entry(group)
-            .or_default()
+            .or_insert_with(|| Arc::new(SnapshotReferences::new(self.inner.gc_grace)))
             .clone()
     }
 
@@ -1403,8 +1456,6 @@ pub(crate) struct CurrentSnapshot {
     /// out-of-line backends (Local/S3) this is a tiny [`SnapshotPointer`].
     pointer_bytes: Vec<u8>,
 }
-
-const RETAINED_RETIRED_EXTERNAL_SNAPSHOTS: usize = 1;
 
 pub struct RaftGroupStateMachine {
     pub(crate) apply_stop_signal: Option<Arc<AtomicBool>>,
@@ -1596,6 +1647,10 @@ impl RaftGroupStateMachine {
         {
             tracing::warn!(%err, "restored snapshot remains pinned while current-reference publication is unavailable");
         }
+        // The reconcile above dropped the pins of the objects that were
+        // retiring before the restart. The snapshot driver deletes them once
+        // they are the GC grace old (#669).
+        references.schedule_pass_after_restore();
         Ok(())
     }
 
@@ -2202,8 +2257,6 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             }
         })
         .await?;
-        let chosen_pointer =
-            SnapshotPointer::decode(&chosen.pointer_bytes).map_err(|err| err.into_io())?;
         // The snapshot is durable now: its body uploaded and verified (or
         // inline), its reference pinned and its metadata persisted, and it is
         // the group's current snapshot. Nothing below fails the build: the
@@ -2219,20 +2272,28 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         {
             tracing::warn!(snapshot_id, %err, "snapshot remains pinned while current-reference publication is unavailable");
         }
-        if let Err(err) = self
-            .snapshot_store
-            .prune_retired(
-                self.placement.raft_group_id.0,
-                &chosen_pointer.location,
-                RETAINED_RETIRED_EXTERNAL_SNAPSHOTS,
-            )
+        // The object this build replaced stays pinned for the GC grace, so
+        // this pass deletes only what was retiring before (#669).
+        match self
+            .references
+            .prune(&self.snapshot_store, self.placement.raft_group_id.0)
             .await
         {
-            tracing::warn!(
-                snapshot_id = pointer.snapshot_id,
-                error = %err,
-                "failed to prune retired OpenRaft snapshots"
-            );
+            Ok(prune) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_snapshot_gc(
+                        prune.deleted(),
+                        u64::from(prune.skipped_unreferenced_voter()),
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    snapshot_id = pointer.snapshot_id,
+                    error = %err,
+                    "failed to prune retired OpenRaft snapshots"
+                );
+            }
         }
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
             meta: chosen.meta,
@@ -3442,9 +3503,12 @@ mod tests {
                 &'a self,
                 _raft_group_id: u32,
                 _current: &'a SnapshotLocation,
-                _retain_latest: usize,
-            ) -> SnapshotStoreFuture<'a, ()> {
-                self.step(Housekeeping::Prune)
+            ) -> SnapshotStoreFuture<'a, ursula_runtime::SnapshotPrune> {
+                let step = self.step(Housekeeping::Prune);
+                Box::pin(async move {
+                    step.await?;
+                    Ok(ursula_runtime::SnapshotPrune::Unmanaged)
+                })
             }
         }
 

@@ -605,6 +605,8 @@ struct StaticGrpcTestNodeStorage {
     apply_fault: Option<(RaftGroupId, ursula_raft::apply_failure::ApplyFault)>,
     /// Where the node's snapshots go (`None`: inline, the default).
     snapshot_store: Option<ursula_runtime::SharedSnapshotStore>,
+    /// Snapshot GC grace G (`None`: the registry's default).
+    snapshot_gc_grace: Option<Duration>,
 }
 
 /// The cluster every static gRPC test node is in: peers refuse a node of
@@ -622,7 +624,10 @@ async fn spawn_static_grpc_test_node(
     raft_group_count: usize,
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
-    let registry = RaftGroupHandleRegistry::default();
+    let registry = match storage.snapshot_gc_grace {
+        Some(gc_grace) => RaftGroupHandleRegistry::default().with_snapshot_gc_grace(gc_grace),
+        None => RaftGroupHandleRegistry::default(),
+    };
     if storage.start_maintenance_drained {
         registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
     }
@@ -7797,8 +7802,7 @@ mod snapshot_driver {
             &'a self,
             _raft_group_id: u32,
             _current: &'a SnapshotLocation,
-            _retain_latest: usize,
-        ) -> SnapshotStoreFuture<'a, ()> {
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::SnapshotPrune> {
             Box::pin(async move {
                 self.prunes
                     .send_modify(|prunes| *prunes = prunes.saturating_add(1));
@@ -7806,7 +7810,7 @@ mod snapshot_driver {
                     .subscribe()
                     .wait_for(|held| !*held)
                     .await
-                    .map(drop)
+                    .map(|_released| ursula_runtime::SnapshotPrune::Unmanaged)
                     .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))
             })
         }
@@ -8154,6 +8158,311 @@ mod snapshot_driver {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    /// An S3 snapshot store that remembers every object it uploaded, so a
+    /// test can check each one after snapshot GC ran.
+    #[derive(Debug)]
+    struct RecordingStore {
+        inner: ursula_runtime::S3SnapshotStore,
+        uploaded: std::sync::Mutex<Vec<SnapshotLocation>>,
+    }
+
+    impl RecordingStore {
+        fn record(&self, location: &SnapshotLocation) {
+            self.uploaded
+                .lock()
+                .expect("uploads mutex")
+                .push(location.clone());
+        }
+
+        /// The uploaded objects the store still holds that hold the marker.
+        async fn objects_with_marker(&self) -> usize {
+            let uploaded = self.uploaded.lock().expect("uploads mutex").clone();
+            let mut found = 0;
+            for location in &uploaded {
+                match self.inner.download(location).await {
+                    Ok(bytes) => {
+                        if bytes
+                            .windows(DELETED_MARKER.len())
+                            .any(|window| window == DELETED_MARKER)
+                        {
+                            found = found.saturating_add(1);
+                        }
+                    }
+                    Err(SnapshotStoreError::NotFound(_)) => {}
+                    Err(err) => panic!("read {location:?}: {err}"),
+                }
+            }
+            found
+        }
+    }
+
+    impl SnapshotStore for RecordingStore {
+        fn upload<'a>(
+            &'a self,
+            key: SnapshotKey,
+            bytes: Bytes,
+        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            Box::pin(async move {
+                let location = self.inner.upload(key, bytes).await?;
+                self.record(&location);
+                Ok(location)
+            })
+        }
+
+        fn upload_iter<'a>(
+            &'a self,
+            key: SnapshotKey,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            Box::pin(async move {
+                let location = self.inner.upload_iter(key, chunks).await?;
+                self.record(&location);
+                Ok(location)
+            })
+        }
+
+        fn download<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+            self.inner.download(location)
+        }
+
+        fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.delete(location)
+        }
+
+        fn prune_retired<'a>(
+            &'a self,
+            raft_group_id: u32,
+            current: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::SnapshotPrune> {
+            self.inner.prune_retired(raft_group_id, current)
+        }
+
+        fn publish_reference<'a>(
+            &'a self,
+            raft_group_id: u32,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.publish_reference(raft_group_id, location)
+        }
+
+        fn pin_reference<'a>(
+            &'a self,
+            raft_group_id: u32,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.pin_reference(raft_group_id, location)
+        }
+
+        fn reconcile_reference_pins<'a>(
+            &'a self,
+            raft_group_id: u32,
+            retained: &'a [SnapshotLocation],
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.reconcile_reference_pins(raft_group_id, retained)
+        }
+
+        fn verify_uploaded<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.verify_uploaded(location)
+        }
+    }
+
+    /// How the node's snapshot store treats an object nothing names.
+    #[derive(Debug, Clone, Copy)]
+    enum ObjectGrace {
+        /// Deleted once it is the GC grace old, as on a server.
+        GcGrace,
+        /// Kept for an hour: snapshot GC deletes nothing within the test.
+        Hour,
+    }
+
+    /// #669: one node with an S3 snapshot store (on a local directory)
+    /// deletes a stream that its snapshot object holds. Returns how many
+    /// uploaded objects held the marker right after the covering snapshot
+    /// and once `max_age` passed, and the node's metrics at the end.
+    async fn delete_with_s3_snapshots(
+        object_grace: ObjectGrace,
+    ) -> (usize, usize, ursula_runtime::RuntimeMetricsSnapshot) {
+        let max_age = Duration::from_secs(8);
+        let gc_grace = max_age.checked_div(4).expect("a quarter");
+        // A local directory: unlike the in-memory operator, its objects
+        // carry the modification time the GC grace reads.
+        let objects = tempfile::tempdir().expect("object root");
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default()
+                .root(objects.path().to_str().expect("a UTF-8 object root")),
+        )
+        .expect("object store")
+        .finish();
+        let store = Arc::new(RecordingStore {
+            inner: ursula_runtime::S3SnapshotStore::new(operator, "snapshots")
+                .with_references(ursula_runtime::SnapshotReferenceConfig {
+                    node_id: 1,
+                    default_voters: BTreeSet::from([1]),
+                    per_group_voters: BTreeMap::new(),
+                })
+                .with_gc_grace(match object_grace {
+                    ObjectGrace::GcGrace => gc_grace,
+                    ObjectGrace::Hour => Duration::from_secs(60 * 60),
+                }),
+            uploaded: std::sync::Mutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let peers = vec![(
+            1,
+            format!(
+                "http://127.0.0.1:{}",
+                listener.local_addr().expect("addr").port()
+            ),
+        )];
+        let node = spawn_static_grpc_test_node(
+            1,
+            listener,
+            peers.clone(),
+            peers,
+            true,
+            2,
+            StaticGrpcTestNodeStorage {
+                engine_config: Some(RaftEngineConfig {
+                    snapshot_drive_interval_ms: 100,
+                    max_in_snapshot_log_to_keep: 8,
+                    ..RaftEngineConfig::default()
+                }),
+                snapshot_store: Some(store.clone()),
+                snapshot_gc_grace: Some(gc_grace),
+                ..StaticGrpcTestNodeStorage::default()
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let participation = PeerParticipation::new(1, &[], reqwest::Client::new());
+        spawn_snapshot_driver(
+            &node.runtime,
+            &node.registry,
+            None,
+            StoreGateInputs {
+                s3: None,
+                cold_flush_interval: Duration::from_secs(1),
+                participation: &participation,
+            },
+            100,
+            SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
+            None,
+            16,
+        );
+        let stream_id = BucketStreamId::new("erased", "marked-s3");
+        let group = node.runtime.locate(&stream_id).raft_group_id;
+        let raft = node.registry.get(group).expect("registered group");
+        raft.wait(Some(Duration::from_secs(10)))
+            .current_leader(1, "the only voter leads")
+            .await
+            .expect("the group elects its leader");
+        node.runtime
+            .create_stream(CreateStreamRequest::new(
+                stream_id.clone(),
+                "application/octet-stream",
+            ))
+            .await
+            .expect("create the stream");
+        for _ in 0..3 {
+            node.runtime
+                .append(AppendRequest::from_bytes(
+                    stream_id.clone(),
+                    DELETED_MARKER.to_vec(),
+                ))
+                .await
+                .expect("append a marked record");
+        }
+        // A snapshot object holds the stream before it goes.
+        let applied = raft.metrics().borrow_watched().last_applied;
+        let mut covered = false;
+        for _ in 0..20 {
+            raft.trigger().snapshot().await.expect("trigger a snapshot");
+            covered = raft
+                .wait(Some(Duration::from_millis(500)))
+                .metrics(
+                    |metrics| metrics.snapshot >= applied,
+                    "the snapshot covers the marked records",
+                )
+                .await
+                .is_ok();
+            if covered {
+                break;
+            }
+        }
+        assert!(covered, "no snapshot covers the marked records");
+        assert!(store.objects_with_marker().await > 0);
+
+        node.runtime
+            .delete_stream(ursula_runtime::DeleteStreamRequest {
+                stream_id: stream_id.clone(),
+                if_incarnation: None,
+            })
+            .await
+            .expect("delete the stream");
+        let deleted_at = Instant::now();
+        let removal = raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("applied the deletion");
+        raft.wait(Some(max_age))
+            .metrics(
+                |metrics| metrics.snapshot >= Some(removal),
+                "a snapshot covers the deletion",
+            )
+            .await
+            .expect("snapshot the deletion within the bound");
+        // The object the covering snapshot replaced is pinned for the GC
+        // grace.
+        let pinned = store.objects_with_marker().await;
+        let deadline = deleted_at.checked_add(max_age).expect("deadline");
+        let mut left = store.objects_with_marker().await;
+        while left > 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            left = store.objects_with_marker().await;
+        }
+        let metrics = node.runtime.metrics().snapshot();
+        node.shutdown().await;
+        (pinned, left, metrics)
+    }
+
+    /// #669: within `raft.deleted_data_max_age` of a deletion, snapshot GC
+    /// has deleted every snapshot object that held the stream, the one the
+    /// covering snapshot replaced included, which stays pinned for the GC
+    /// grace first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn snapshot_gc_deletes_the_replaced_object_within_the_bound() {
+        let (pinned, left, metrics) = delete_with_s3_snapshots(ObjectGrace::GcGrace).await;
+        assert!(
+            pinned > 0,
+            "the object the covering snapshot replaced is pinned for the grace"
+        );
+        assert_eq!(left, 0, "snapshot objects still hold the deleted stream");
+        assert!(metrics.snapshot_gc_deleted_objects > 0);
+        assert_eq!(metrics.snapshot_gc_skipped_unreferenced_voter, 0);
+    }
+
+    /// The negative control: a store that keeps unnamed objects for an hour
+    /// still holds the deleted stream once the bound passed, so the check
+    /// above sees what snapshot GC deletes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn without_snapshot_gc_the_replaced_object_outlives_the_bound() {
+        let (_pinned, left, metrics) = delete_with_s3_snapshots(ObjectGrace::Hour).await;
+        assert!(left > 0, "a snapshot object still holds the deleted stream");
+        assert_eq!(metrics.snapshot_gc_deleted_objects, 0);
     }
 
     /// #519: past the hard limit the driver keeps as many builds in flight
