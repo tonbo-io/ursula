@@ -79,11 +79,13 @@ pub(super) const DRIVERS: DriverPlan = DriverPlan {
     keep: 8,
     interval: Duration::from_millis(200),
 };
-/// The drivers' settings the bound is checked with: the bound covers a
-/// pass of the driver too, which may wait [`ursula_raft::SNAPSHOT_HANDOFF_WAIT`]
-/// for a trigger another group's build does not claim.
+/// The drivers' settings the bound is checked with: twelve seconds, so the
+/// floor is three. The bound covers a pass of the driver too, which may wait
+/// [`ursula_raft::SNAPSHOT_HANDOFF_WAIT`] for a trigger another group's
+/// build does not claim, and a run fits the simulation's 30 s of virtual
+/// time.
 const BOUND_DRIVERS: DriverPlan = DriverPlan {
-    max_age: Duration::from_secs(30),
+    max_age: Duration::from_secs(12),
     ..DRIVERS
 };
 #[cfg(test)]
@@ -599,7 +601,7 @@ pub(super) async fn run_deleted_data_inner(
     // Every replica is checked once the bound passed since it applied the
     // removal.
     let mut checked = BTreeSet::new();
-    let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age.saturating_mul(4);
+    let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age.saturating_mul(2);
     while checked.len() < NODES.len() {
         seen.observe(&cluster, removal_index);
         let now = madsim::time::Instant::now();
