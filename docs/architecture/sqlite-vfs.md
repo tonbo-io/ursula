@@ -1152,8 +1152,8 @@ calls through one watermark while the stream holds its answer back".
 
 | kind | trigger | action | unacknowledged commits | next open |
 | --- | --- | --- | --- | --- |
-| `fenced` | `key-conflict`, `epoch-closed` or another producer `403` to an append, `receipt-evicted` for the in-flight seq, a lost continuation claim, a foreign frame in a pre-check | `stop` | kept for the next reconcile | takeover |
-| `stale` | a continuation found the stream moved on, an idle `producer-expired` without the owner's claim frame, a provisional open whose log lost acknowledged commits to a power loss | `reopen` | discarded | takeover, catch-up or rebuild |
+| `fenced` | `key-conflict`, `epoch-closed` or another producer `403` to an append, `receipt-evicted` for the in-flight seq, a lost continuation claim, a foreign claim in a pre-check | `stop` | kept for the next reconcile | takeover |
+| `stale` | a continuation found the stream moved on, a foreign commit in a pre-check (our commit id with other bytes included), an idle `producer-expired` without the owner's claim frame, a provisional open whose log lost acknowledged commits to a power loss | `reopen` | discarded | takeover, catch-up or rebuild |
 | `rewound` | a `412` confirmed by HEAD when the generation does not inherit | `reopen` | salvaged at the reopen | salvage, rebuild |
 | `deleted` | a `404` confirmed by HEAD with the generation's cluster id | `fix` | kept | `not_found` unless `recreate` |
 | `local_damage` | a failed fsync, a lost WAL page, an uncuttable log write, an unconfirmed commit, a foreign page 1 | `reopen` | kept | materialize |
