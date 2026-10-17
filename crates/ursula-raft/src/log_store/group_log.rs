@@ -20,6 +20,7 @@
 //! consecutive once every segment is read ([`GroupLog::finish_replay`]).
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::io;
 use std::ops::Bound;
@@ -170,6 +171,10 @@ pub(crate) struct GroupLog {
     index: EntryIndex,
     /// Live entry bytes per segment.
     live: BTreeMap<SegmentId, u64>,
+    /// Segments in which an entry stopped being live (purged, truncated,
+    /// written again or copied away by a rewrite) since the writer last
+    /// took them ([`GroupLog::take_died`]).
+    died: BTreeSet<SegmentId>,
     cache: EntryCache,
     /// The membership entries the log holds, by index (#613). A recovery
     /// plan's cut keeps the newest one at or below the committed index.
@@ -186,6 +191,7 @@ impl GroupLog {
             purged_at: None,
             index: EntryIndex::default(),
             live: BTreeMap::new(),
+            died: BTreeSet::new(),
             cache: EntryCache::new(cache_budget),
             memberships: BTreeMap::new(),
         }
@@ -421,9 +427,9 @@ impl GroupLog {
     }
 
     fn truncate_after(&mut self, last: Option<u64>) {
-        let live = &mut self.live;
+        let (live, died) = (&mut self.live, &mut self.died);
         self.index
-            .remove_after(last, |entry| remove_live(live, entry));
+            .remove_after(last, |entry| remove_live(live, died, entry));
         self.cache.truncate_after(last);
         match last {
             Some(last) => drop(self.memberships.split_off(&last.saturating_add(1))),
@@ -432,9 +438,9 @@ impl GroupLog {
     }
 
     fn purge_through(&mut self, index: u64) {
-        let live = &mut self.live;
+        let (live, died) = (&mut self.live, &mut self.died);
         self.index
-            .remove_through(index, |entry| remove_live(live, entry));
+            .remove_through(index, |entry| remove_live(live, died, entry));
         self.cache.purge_through(index);
         self.memberships = self.memberships.split_off(&index.saturating_add(1));
     }
@@ -445,7 +451,13 @@ impl GroupLog {
     }
 
     fn unlive(&mut self, entry: IndexedEntry) {
-        remove_live(&mut self.live, &entry);
+        remove_live(&mut self.live, &mut self.died, &entry);
+    }
+
+    /// The segments in which an entry stopped being live since the last
+    /// call: they hold dead frames of this group.
+    pub(crate) fn take_died(&mut self) -> BTreeSet<SegmentId> {
+        std::mem::take(&mut self.died)
     }
 
     /// Fails unless the log replay rebuilt is consecutive; then its index
@@ -664,8 +676,14 @@ impl Default for EntryIndex {
     }
 }
 
-/// Takes `entry` out of the live bytes of its segment.
-fn remove_live(live: &mut BTreeMap<SegmentId, u64>, entry: &IndexedEntry) {
+/// Takes `entry` out of the live bytes of its segment, which then holds a
+/// dead frame.
+fn remove_live(
+    live: &mut BTreeMap<SegmentId, u64>,
+    died: &mut BTreeSet<SegmentId>,
+    entry: &IndexedEntry,
+) {
+    died.insert(entry.frame.segment);
     if let Some(bytes) = live.get_mut(&entry.frame.segment) {
         *bytes = bytes.saturating_sub(u64::from(entry.storage_bytes));
         if *bytes == 0 {

@@ -102,6 +102,12 @@ pub enum Defence {
     /// stream and the purge through it leaves the stream's records in the
     /// log.
     RestorePurge,
+    /// A Raft log journal segment that has held dead frames (of entries
+    /// purged, truncated or copied away) for a quarter of
+    /// `raft.deleted_data_max_age` is sealed and freed (#669). Off, only
+    /// the journal's size frees segments, so a small journal keeps a
+    /// removed stream's records in its files.
+    WalDirtyAge,
 }
 
 #[cfg(madsim)]
@@ -111,8 +117,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 22]> = const { Cell::new([false; 22]) };
-        static FIRED: Cell<[u64; 22]> = const { Cell::new([0; 22]) };
+        static OFF: Cell<[bool; 23]> = const { Cell::new([false; 23]) };
+        static FIRED: Cell<[u64; 23]> = const { Cell::new([0; 23]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -139,6 +145,7 @@ mod switches {
             Defence::ScrubPurge => 19,
             Defence::ScrubPurgeHold => 20,
             Defence::RestorePurge => 21,
+            Defence::WalDirtyAge => 22,
         }
     }
 
@@ -161,7 +168,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 22]));
+        FIRED.with(|fired| fired.set([0; 23]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -11,7 +11,6 @@
 //! previous store, as a new process starts only after the old one has exited.
 
 use std::collections::BTreeMap;
-#[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,7 +93,6 @@ impl SimNodeWal {
     }
 
     /// The node directory; a power loss of the node covers everything below it.
-    #[cfg(test)]
     pub(super) fn root(&self) -> &Path {
         &self.root
     }
@@ -108,6 +106,12 @@ impl SimNodeWal {
         let started = RaftWal::start_with(&self.root, self.tuning, &self.topology)?;
         *run = Some(started.clone());
         Ok(started)
+    }
+
+    /// The node's current run, for its snapshot driver, which runs the
+    /// journals' maintenance passes (#669).
+    pub(super) fn raft_wal(&self) -> RaftWal {
+        self.run().expect("start a simulated node's Raft WAL")
     }
 
     /// How the node's current run opened its journals.

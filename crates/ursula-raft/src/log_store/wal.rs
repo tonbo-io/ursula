@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::Weak;
+use std::time::Duration;
 
 use futures_util::future::join_all;
 use ursula_config::WalFsync;
@@ -25,6 +26,7 @@ use crate::log_store::RecoveryState;
 use crate::log_store::WalOpening;
 use crate::log_store::WriterExited;
 use crate::log_store::core_dir;
+use crate::rt::time::Instant;
 
 /// The open writer of one core's journal, if any, and the signal that its
 /// worker stopped, which outlives the writer's last handle.
@@ -219,6 +221,17 @@ impl RaftWal {
             .map_err(|source| RaftWalError::OpenGroup { placement, source })
     }
 
+    /// What the snapshot driver needs of this WAL (#669): the lagging
+    /// groups and the maintenance passes of its core journals. It holds
+    /// neither the root's lock nor any journal, so a driver that outlives
+    /// the run keeps nothing open.
+    pub fn maintenance(&self) -> WalMaintenance {
+        WalMaintenance {
+            lagging: self.lagging.clone(),
+            core_writers: Arc::downgrade(&self.core_writers),
+        }
+    }
+
     /// Ends this run cleanly: closes every core writer, each of which
     /// `fsync`s its journal, and only then records a clean shutdown. Stop the
     /// Raft groups first; a write after this fails and no journal opens
@@ -252,7 +265,7 @@ impl RaftWal {
                 .close()
                 .await
                 .map_err(|source| RaftWalError::CloseJournal {
-                    core: *core,
+                    core: CoreId(*core),
                     source,
                 })
         }))
@@ -270,6 +283,80 @@ impl RaftWal {
             "shut down the Raft WAL cleanly"
         );
         Ok(())
+    }
+}
+
+/// The snapshot driver's handle on a node's Raft WAL ([`RaftWal::maintenance`]).
+#[derive(Debug, Clone)]
+pub struct WalMaintenance {
+    lagging: Arc<LaggingGroups>,
+    core_writers: Weak<Mutex<CoreWriterSlots>>,
+}
+
+impl WalMaintenance {
+    /// The groups whose live records keep old journal segments alive.
+    pub fn lagging_groups(&self) -> Arc<LaggingGroups> {
+        self.lagging.clone()
+    }
+
+    /// Runs one maintenance pass of every open core journal, as of `now` on
+    /// the snapshot driver's clock (#669): each writer stamps the dead
+    /// frames it learned of since its last pass with `now`, seals its active
+    /// segment once that segment has held dead frames for `max_dirty_age`,
+    /// and frees the oldest kept segment while a kept segment has, copying
+    /// at most its pass budget. The writers have no timer of their own: the
+    /// snapshot driver calls this, at most once per drive interval. Returns
+    /// once every pass ran, with the first writer that could not take one.
+    /// A core whose journal is opening right now is skipped until the next
+    /// call, and a WAL that shut down or is gone has nothing to maintain.
+    pub async fn maintain(
+        &self,
+        now: Instant,
+        max_dirty_age: Duration,
+    ) -> Result<(), RaftWalError> {
+        let Some(core_writers) = self.core_writers.upgrade() else {
+            return Ok(());
+        };
+        let slots = match &*core_writers
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+        {
+            CoreWriterSlots::Running(slots) => slots.clone(),
+            CoreWriterSlots::ShutDown => return Ok(()),
+        };
+        drop(core_writers);
+        // Each pass is asked for while the writer's handle is held, and
+        // the handle goes before the wait: holding the last one there would
+        // make its drop wait for the writer and keep the journal locked
+        // against a group that reopens meanwhile.
+        let mut answers = Vec::with_capacity(slots.len());
+        for (core, slot) in slots {
+            // Opening a journal holds its slot through the replay, so a busy
+            // slot is skipped rather than waited on.
+            let slot = match slot.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+                    return Err(RaftWalError::LockPoisoned);
+                }
+            };
+            let Some(writer) = slot.writer.upgrade() else {
+                continue;
+            };
+            drop(slot);
+            let answer = writer.send_maintenance(now, max_dirty_age);
+            drop(writer);
+            answers.push((CoreId(core), answer));
+        }
+        let passes = join_all(answers.into_iter().map(|(core, answer)| async move {
+            match answer {
+                Ok(answer) => answer.ran().await,
+                Err(source) => Err(source),
+            }
+            .map_err(|source| RaftWalError::MaintainJournal { core, source })
+        }))
+        .await;
+        passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
     }
 }
 
@@ -401,6 +488,60 @@ mod tests {
             Err(RaftWalError::ShutDown { .. })
         ));
         drop(store);
+    }
+
+    /// A maintenance pass that is still answering holds no handle on the
+    /// core's writer (#669): once the group's last store goes, the writer
+    /// goes too, and the group opens again at once instead of finding its
+    /// journal locked.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_waiting_maintenance_pass_keeps_no_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = RaftWal::start(root.path(), WalFsync::Never, &topology).unwrap();
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let store = wal.open(placement, metrics.clone()).unwrap();
+        let maintenance = wal.maintenance();
+        let mut pass =
+            std::pin::pin!(maintenance.maintain(Instant::now(), Duration::from_secs(60)));
+        // One poll asks for the pass and leaves it waiting, or done.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let polled = pass.as_mut().poll(&mut cx);
+        drop(store);
+        let writer_gone = {
+            let core_writers = wal.core_writers.lock().unwrap();
+            let CoreWriterSlots::Running(slots) = &*core_writers else {
+                panic!("a started WAL is running");
+            };
+            slots[&0].lock().unwrap().writer.upgrade().is_none()
+        };
+        assert!(
+            writer_gone,
+            "the pass kept the writer after its last store went ({polled:?})"
+        );
+        let reopened = wal.open(placement, metrics).expect("the group opens again");
+        if polled.is_pending() {
+            let ran = pass.await;
+            assert!(
+                matches!(
+                    ran,
+                    Ok(())
+                        | Err(RaftWalError::MaintainJournal {
+                            source: crate::log_store::CoreJournalError::WriterStopped { .. },
+                            ..
+                        })
+                ),
+                "{ran:?}"
+            );
+        }
+        drop(reopened);
+        wal.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]

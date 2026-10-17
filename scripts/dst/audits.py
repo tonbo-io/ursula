@@ -652,6 +652,7 @@ EXPECTED_PR_FAMILIES = {
     "marked-chunks-never-contradict",
     "recovery-plan-membership-rollback",
     "deleted-data-leaves-within-bound",
+    "deleted-data-across-segments",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
@@ -665,6 +666,7 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "marked-chunks-never-contradict-extended",
     "recovery-plan-membership-rollback-extended",
     "deleted-data-leaves-within-bound-extended",
+    "deleted-data-across-segments-extended",
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199", "503..=504"}
 

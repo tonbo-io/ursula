@@ -7254,6 +7254,8 @@ mod snapshot_driver {
     use crate::bootstrap::deleted_data_sample;
     use crate::bootstrap::group_log_progress;
     use crate::bootstrap::groups_to_drive;
+    use crate::bootstrap::plan_lagging_purges;
+    use crate::bootstrap::plan_purges;
     use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
@@ -7406,6 +7408,99 @@ mod snapshot_driver {
             through: 30,
             published: 30,
         }]);
+    }
+
+    /// #669: a group the Raft WAL reports lagging that applied nothing
+    /// since its snapshot is purged through that snapshot, so the entries
+    /// OpenRaft keeps below it never pin a journal segment. A lagging group
+    /// that applied entries since builds instead, and a group that is not
+    /// lagging, already purged, stopped or not running is left alone.
+    #[test]
+    fn snapshot_driver_purges_an_idle_lagging_group_through_its_snapshot() {
+        let running = |mut snapshot: RaftGroupMetricsSnapshot| {
+            snapshot.maintenance.running = true;
+            snapshot
+        };
+        let idle = GroupLogProgress {
+            has_snapshot: true,
+            ..GroupLogProgress::default()
+        };
+        let mut purged = running(snap(3, Some(30), Some(30), idle));
+        purged.purged = Some(super::RaftLogProgressSnapshot {
+            term: 1,
+            index: 30,
+            node_id: 1,
+        });
+        let mut stopped = running(snap(4, Some(30), Some(30), idle));
+        stopped.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 1,
+            index: 31,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "diagnostic".to_owned(),
+        });
+        let snapshots = vec![
+            running(snap(0, Some(30), Some(30), idle)),
+            // It applied entries since its snapshot: the pass builds it.
+            running(snap(1, Some(40), Some(30), log(MIB, MIB))),
+            // Not lagging.
+            running(snap(2, Some(30), Some(30), idle)),
+            purged,
+            stopped,
+            // Its Raft does not run.
+            snap(5, Some(30), Some(30), idle),
+            // No snapshot yet.
+            running(snap(6, Some(30), None, GroupLogProgress::default())),
+        ];
+        let lagging: BTreeSet<RaftGroupId> =
+            [0, 1, 3, 4, 5, 6].map(RaftGroupId).into_iter().collect();
+        assert_eq!(plan_lagging_purges(&snapshots, &lagging), vec![
+            ScrubPurge {
+                raft_group_id: 0,
+                through: 30,
+                published: 30,
+            }
+        ]);
+    }
+
+    /// #669: a tick purges each group at most once, through the higher of
+    /// its scrub purge and its idle lagging purge.
+    #[test]
+    fn snapshot_driver_purges_each_group_once_through_the_higher_index() {
+        let running = |mut snapshot: RaftGroupMetricsSnapshot| {
+            snapshot.maintenance.running = true;
+            snapshot
+        };
+        let idle = |through| GroupLogProgress {
+            has_snapshot: true,
+            scrub_purge_through: through,
+            ..GroupLogProgress::default()
+        };
+        let snapshots = vec![
+            // Both: the lagging purge goes further.
+            running(snap(0, Some(30), Some(30), idle(20))),
+            // A scrub purge only.
+            running(snap(1, Some(40), Some(30), GroupLogProgress {
+                scrub_purge_through: 30,
+                ..log(MIB, MIB)
+            })),
+            // A lagging purge only.
+            running(snap(2, Some(30), Some(30), idle(0))),
+        ];
+        let lagging: BTreeSet<RaftGroupId> = [0, 2].map(RaftGroupId).into_iter().collect();
+        let purge = |raft_group_id, through| ScrubPurge {
+            raft_group_id,
+            through,
+            published: 30,
+        };
+        assert_eq!(plan_purges(&snapshots, &lagging), vec![
+            purge(0, 30),
+            purge(1, 30),
+            purge(2, 30)
+        ]);
+        assert_eq!(plan_purges(&snapshots, &BTreeSet::new()), vec![
+            purge(0, 20),
+            purge(1, 30)
+        ]);
     }
 
     /// #669: a group with an overdue removal leads the pass, and while the

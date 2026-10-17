@@ -67,6 +67,8 @@ mod test_reexports {
     pub(crate) use super::snapshot::deleted_data_sample;
     pub(crate) use super::snapshot::group_log_progress;
     pub(crate) use super::snapshot::groups_to_drive;
+    pub(crate) use super::snapshot::plan_lagging_purges;
+    pub(crate) use super::snapshot::plan_purges;
     pub(crate) use super::snapshot::plan_scrub_purges;
     pub(crate) use super::snapshot::plan_snapshot_drive;
     pub(crate) use super::snapshot::resolve_snapshot_drive_interval_ms;

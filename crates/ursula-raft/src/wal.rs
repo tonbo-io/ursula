@@ -8,6 +8,7 @@ pub use crate::log_store::RaftGroupFileLogStore;
 pub use crate::log_store::RaftWal;
 pub use crate::log_store::RaftWalError;
 pub use crate::log_store::RecoveryState;
+pub use crate::log_store::WalMaintenance;
 pub use crate::log_store::WalOpening;
 
 /// Persisted-format diagnostics and simulation disk adapters.
