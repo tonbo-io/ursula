@@ -11,7 +11,9 @@
 //! [`parse_answer`] reads an answer in the light of the request it answers: a `409` to a keyed
 //! append is the producer's or a closed stream's, a `204` to a snapshot publish is a published
 //! snapshot. An answer to a write also carries what `ursula_headers::classify` reads from it
-//! ([`Answer::outcome`]), the one classification of write answers the VFS has.
+//! ([`Answer::outcome`]): the replicator (`replicator/answer.rs`) and the snapshotter
+//! (`snapshotter::transient`) read a write's answer by that outcome, never by a status table of
+//! their own.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -742,14 +744,124 @@ mod tests {
     use ursula_headers::ProducerWrite;
     use ursula_headers::Seq;
     use ursula_headers::SnapshotDigest;
+    use ursula_headers::WriteKind;
 
     use super::Method;
     use super::PRODUCER_ID;
     use super::RawAnswer;
     use super::Request;
+    use super::SnapshotPart;
     use super::Target;
     use super::Typed;
     use super::WireError;
+
+    /// `Request::write_kind` for each request the VFS sends, built as its sender builds it: the
+    /// kind `ursula_headers::classify` reads the answer as, and none for a read or a HEAD.
+    #[test]
+    fn every_request_the_vfs_sends_has_its_write_kind() {
+        let offset = Offset::from_u64(64);
+        let incarnation = Incarnation::try_from(1 << 52).unwrap();
+        let precondition = || ProducerRequestHeaders {
+            producer: None,
+            precondition: Some(IncarnationPrecondition { incarnation }),
+        };
+        // An append or a claim (`Producer-Seq: 0`): the replicator's and the import's.
+        let keyed = |seq: u64| Request {
+            keys: ProducerRequestHeaders {
+                producer: Some(ProducerWrite {
+                    id: ProducerId::new(PRODUCER_ID).unwrap(),
+                    epoch: Epoch::try_from(3).unwrap(),
+                    seq: Seq::try_from(seq).unwrap(),
+                    digest: Some(BodyDigest::from_bytes([7; 32])),
+                }),
+                precondition: Some(IncarnationPrecondition { incarnation }),
+            },
+            content_type: Some("application/vnd.ursula.sqlite-vfs.v2".to_owned()),
+            body: Arc::from(b"frame".to_vec()),
+            ..Request::new(Method::Post, Target::Stream)
+        };
+        let manifest = PartsManifest::new(vec![PartId::new("a.part").unwrap()]).unwrap();
+        let digest = SnapshotDigest::from_bytes([9; 32]);
+        let cases = [
+            ("append", keyed(4), Some(WriteKind::Producer)),
+            ("claim", keyed(0), Some(WriteKind::Producer)),
+            (
+                "create",
+                Request {
+                    content_type: Some("application/vnd.ursula.sqlite-vfs.v2".to_owned()),
+                    ..Request::new(Method::Put, Target::Stream)
+                },
+                Some(WriteKind::Create),
+            ),
+            (
+                "snapshot publish",
+                Request {
+                    keys: precondition(),
+                    snapshot_digest: Some(digest),
+                    body: Arc::from(b"USS3".to_vec()),
+                    ..Request::new(Method::Put, Target::Snapshot { offset })
+                },
+                Some(WriteKind::Publish),
+            ),
+            (
+                "parts commit",
+                Request {
+                    keys: precondition(),
+                    parts: Some(Box::new(PartsCommit::for_manifest(&manifest, digest))),
+                    body: Arc::from(manifest.render().into_bytes()),
+                    ..Request::new(Method::Put, Target::Snapshot { offset })
+                },
+                Some(WriteKind::Publish),
+            ),
+            (
+                "part",
+                Request {
+                    keys: precondition(),
+                    body: Arc::from(b"part".to_vec()),
+                    ..Request::new(Method::Post, Target::SnapshotParts { offset })
+                },
+                Some(WriteKind::PartStage),
+            ),
+            (
+                "parts discard",
+                Request {
+                    keys: precondition(),
+                    ..Request::new(Method::Delete, Target::StagedParts)
+                },
+                Some(WriteKind::PartsDiscard),
+            ),
+            (
+                "retention move",
+                Request {
+                    keys: precondition(),
+                    ..Request::new(Method::Put, Target::Retention { offset })
+                },
+                Some(WriteKind::Retention),
+            ),
+            ("HEAD", Request::new(Method::Head, Target::Stream), None),
+            ("read", Request::read(Some(offset), false, 1 << 20), None),
+            ("leader read", Request::read(None, true, 1 << 20), None),
+            (
+                "snapshot header read",
+                Request::snapshot_read(offset, incarnation, SnapshotPart::Header),
+                None,
+            ),
+            (
+                "snapshot chunk read",
+                Request::snapshot_read(offset, incarnation, SnapshotPart::Chunk {
+                    first: 0,
+                    last: 7,
+                }),
+                None,
+            ),
+        ];
+        for (what, request, kind) in cases {
+            assert_eq!(request.write_kind(), kind, "{what}");
+            // The answer carries an outcome exactly when the request is a write.
+            let answer = RawAnswer::new(503).parse(&request);
+            assert_eq!(answer.outcome.is_some(), kind.is_some(), "{what}");
+        }
+    }
 
     fn rendered(request: &Request) -> Vec<(&'static str, String)> {
         let mut out = Vec::new();

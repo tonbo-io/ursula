@@ -73,6 +73,7 @@ use std::time::Instant;
 
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
+use ursula_headers::ErrorCode;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationPrecondition;
 use ursula_headers::MAX_SNAPSHOT_PARTS;
@@ -80,12 +81,12 @@ use ursula_headers::Offset;
 use ursula_headers::PartsCommit;
 use ursula_headers::PartsManifest;
 use ursula_headers::ProducerRequestHeaders;
-use ursula_headers::RoutingAnswer;
 use ursula_headers::SizeLimit;
 use ursula_headers::SnapshotDigest;
 use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamHead;
+use ursula_headers::WriteOutcome;
 
 use crate::codec::PAGE;
 use crate::codec::digest::SnapshotDigester;
@@ -910,14 +911,31 @@ const COMMIT_DEADLINE: Duration = Duration::from_secs(30 * 60);
 /// The stagings a commit repeats after a `400`, before it fails.
 const COMMIT_RESTAGES: u32 = 1;
 
-/// Whether an answer decides nothing, so the request goes out again: `408`, `429`, a 5xx but
-/// `501` (which no repeat changes), or a node without a leader.
+/// Whether an answer decides nothing, so the request goes out again. A write's answer goes by
+/// what `ursula_headers::classify` read from it ([`Answer::outcome`]):
+///
+/// - `Unknown` at a `408`, a `429` or a `5xx` is sent again, but at a `501`, which no repeat
+///   changes. `classify` reads every `429` as `Refused` today. The `429` here keeps an untyped
+///   rate limit transient whatever it reads, since a snapshot write repeats safely by its offset
+///   and digest. An unknown `1xx`, `2xx` or `3xx` is no answer of Ursula's, and the snapshotter
+///   decides on it: a success never counts as published without the typed snapshot.
+/// - `Refused` for load or routing is sent again: a `408` cut before any of the body was
+///   forwarded, a `429`, and a `5xx` whose code proves nothing applied (`NO_LEADER` and the
+///   pressure codes), but `NO_COLD_STORE`, which no repeat changes. Every other refusal decides.
+/// - `Applied`, `Repeat` and `Redirected` decide.
+///
+/// A HEAD's answer, which is no write's, goes by the same statuses alone.
 pub(crate) fn transient(answer: &Answer) -> bool {
-    matches!(answer.status, 408 | 429 | 500 | 502..=599)
-        || matches!(
-            answer.typed,
-            Ok(Typed::Routing(RoutingAnswer::NoLeader { .. }))
-        )
+    match &answer.outcome {
+        Some(WriteOutcome::Unknown) => matches!(answer.status, 408 | 429 | 500 | 502..=599),
+        Some(WriteOutcome::Refused(code)) => match answer.status {
+            408 | 429 => true,
+            500..=599 => code != &ErrorCode::NoColdStore,
+            _ => false,
+        },
+        Some(WriteOutcome::Applied | WriteOutcome::Repeat | WriteOutcome::Redirected) => false,
+        None => matches!(answer.status, 408 | 429 | 500 | 502..=599),
+    }
 }
 
 /// [`transient`] for a part: a `429` naming the stream's limit of staged parts decides, since no
