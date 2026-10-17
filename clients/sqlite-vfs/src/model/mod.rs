@@ -840,14 +840,13 @@ impl ModelServer {
             Err(answer) => return answer,
         };
         self.retire_parts(path, token);
-        let (count, bytes) = self
-            .parts
-            .values()
-            .filter(|part| part.path == path)
-            .fold((0_u64, 0_u64), |(count, bytes), part| {
+        let (count, bytes) = self.parts.values().filter(|part| part.path == path).fold(
+            (0_u64, 0_u64),
+            |(count, bytes), part| {
                 let len = u64::try_from(part.body.len()).unwrap_or(u64::MAX);
                 (count.saturating_add(1), bytes.saturating_add(len))
-            });
+            },
+        );
         let len = u64::try_from(request.body.len()).unwrap_or(u64::MAX);
         let over = if count >= self.limits.max_staged_parts {
             Some(StagedPartsLimit::Parts(self.limits.max_staged_parts))
