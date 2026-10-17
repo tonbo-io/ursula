@@ -2694,25 +2694,25 @@ impl RaftProxy {
                     }
                     released.wait_for(|ready| *ready).await.unwrap();
                 }
+                let unreachable = || {
+                    axum::http::Response::builder()
+                        .status(axum::http::StatusCode::BAD_GATEWAY)
+                        .body(axum::body::Body::empty())
+                        .unwrap()
+                };
                 // Held until the target answers, so `partition` waits for
                 // every RPC that it lets through.
                 let reachable = gate.read().await;
                 let response = if *reachable {
                     match channel.oneshot(request.map(tonic::body::boxed)).await {
-                        Ok(response) => Some(response),
-                        Err(_transport) => None,
+                        Ok(response) => response.map(axum::body::Body::new),
+                        Err(_transport) => unreachable(),
                     }
                 } else {
-                    None
+                    unreachable()
                 };
                 drop(reachable);
-                Ok::<_, std::convert::Infallible>(match response {
-                    Some(response) => response.map(axum::body::Body::new),
-                    None => axum::http::Response::builder()
-                        .status(axum::http::StatusCode::BAD_GATEWAY)
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
-                })
+                Ok::<_, std::convert::Infallible>(response)
             }
         });
         let task = tokio::spawn(async move {
