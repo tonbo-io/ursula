@@ -1024,10 +1024,15 @@ fn snapshots_are_keyed_by_offset_and_digest() {
         Ok(Typed::SnapshotRead { range: Some(span), .. }) if (span.first(), span.total()) == (6, 11)
     ));
     assert_eq!(middle.body, b"at");
-    // A range that starts past the end: `416`, naming the length.
+    // A range that starts past the end: `416`, naming the length and the token.
     let past = chunk(11, 20);
     assert_eq!(past.status, 416);
-    assert_eq!(past.typed, Ok(Typed::Untyped));
+    assert_eq!(
+        past.typed,
+        Ok(Typed::ReadRefused {
+            incarnation: Some(token)
+        })
+    );
     assert!(past.body.is_empty());
     // A header read asks for the first bytes alone (`Range`), answered `206`.
     let header = world.send(&Request::snapshot_read(
@@ -1363,11 +1368,62 @@ fn s4_8_read_refusals_come_in_the_order_404_410_416_412() {
         })
     };
     assert_eq!(world.send(&retain).status, 204);
-    // A wrong token below retention, past the tail, then within range.
-    assert_eq!(world.send(&read(other(token), Some(10))).status, 410);
-    assert_eq!(world.send(&read(other(token), Some(101))).status, 416);
+    // A wrong token below retention, past the tail, then within range. The `410` and `416` name
+    // the token of the stream that refused them, the `404` of a missing stream none.
+    let refused = |status: u16, incarnation: Incarnation| {
+        (
+            status,
+            Ok(Typed::ReadRefused {
+                incarnation: Some(incarnation),
+            }),
+        )
+    };
+    let gone = world.send(&read(other(token), Some(10)));
+    assert_eq!((gone.status, gone.typed), refused(410, token));
+    let past = world.send(&read(other(token), Some(101)));
+    assert_eq!((past.status, past.typed), refused(416, token));
     assert_eq!(world.send(&read(other(token), Some(60))).status, 412);
-    assert_eq!(world.send(&read(tokened(token), Some(101))).status, 416);
+    let past = world.send(&read(tokened(token), Some(101)));
+    assert_eq!((past.status, past.typed), refused(416, token));
+    let missing = world.send(&missing);
+    assert_eq!(
+        (missing.status, missing.typed),
+        (404, Ok(Typed::ReadRefused { incarnation: None }))
+    );
+}
+
+/// A snapshot read's refusals in the server's order: `404` without the stream, `404` when the
+/// snapshot is not the latest and `416` for a range past its end, both naming the token, then the
+/// precondition (`412`).
+#[test]
+fn snapshot_read_refusals_name_the_token_before_the_412() {
+    let world = World::new();
+    let snapshot_read = |token, offset, first, last| {
+        world.send(&Request::snapshot_read(
+            Offset::from_u64(offset),
+            token,
+            crate::wire::SnapshotPart::Chunk { first, last },
+        ))
+    };
+    let unknown = Incarnation::try_from(1 << 52).unwrap();
+    let missing = snapshot_read(unknown, 60, 0, 1);
+    assert_eq!(
+        (missing.status, missing.typed),
+        (404, Ok(Typed::ReadRefused { incarnation: None }))
+    );
+    let token = world.create();
+    world.server().foreign_append(PATH, &[0; 100]).unwrap();
+    assert_eq!(world.send(&publish(token, 60, b"image").0).status, 204);
+    let other = Incarnation::try_from(token.get() ^ 1).unwrap();
+    let named = Ok(Typed::ReadRefused {
+        incarnation: Some(token),
+    });
+    let not_latest = snapshot_read(other, 40, 0, 1);
+    assert_eq!((not_latest.status, not_latest.typed), (404, named.clone()));
+    let past = snapshot_read(other, 60, 5, 9);
+    assert_eq!((past.status, past.typed), (416, named));
+    assert_eq!(snapshot_read(other, 60, 0, 1).status, 412);
+    assert_eq!(snapshot_read(token, 60, 0, 1).status, 206);
 }
 
 #[test]

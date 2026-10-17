@@ -741,7 +741,8 @@ impl ModelServer {
     }
 
     /// `GET {stream}?offset=`: up to a chunk of bytes from `from`, its refusals in #581's order:
-    /// `404`, `410` below retention, `416` past the tail, then the precondition (`412`).
+    /// `404`, `410` below retention, `416` past the tail, then the precondition (`412`). The `410`
+    /// and `416` name the stream's token.
     fn read(&mut self, path: &str, request: &Request, from: Option<Offset>) -> RawAnswer {
         let chunk = self.limits.read_chunk;
         let Some(stream) = self.streams.get(path) else {
@@ -750,10 +751,10 @@ impl ModelServer {
         let from = from.unwrap_or(Offset::ZERO);
         let tail = stream.tail();
         if from < stream.retained {
-            return RawAnswer::new(410);
+            return read_refused(410, stream.token_in(self.history));
         }
         if from > tail {
-            return RawAnswer::new(416);
+            return read_refused(416, stream.token_in(self.history));
         }
         if let Err(mismatch) = precondition(stream, request, self.history) {
             return mismatch;
@@ -1020,6 +1021,9 @@ impl ModelServer {
 
     /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`. A single
     /// `Range` is answered `206` with its bytes, or `416` when it selects none (extensions §2.5).
+    /// Its refusals come in the server's order: `404` without the stream, `404` when the snapshot
+    /// is not the latest, `416`, then the precondition (`412`). The `404` of an existing stream
+    /// and the `416` name the stream's token.
     fn snapshot_read(
         &mut self,
         path: &str,
@@ -1028,16 +1032,16 @@ impl ModelServer {
         ranges: Ranges,
     ) -> RawAnswer {
         let history = self.history;
-        let stream = match self.stream(path, request) {
-            Ok(stream) => stream,
-            Err(answer) => return answer,
+        let Some(stream) = self.streams.get(path) else {
+            return RawAnswer::new(404);
         };
+        let token = stream.token_in(history);
         let Some(snapshot) = stream
             .snapshot
             .as_ref()
             .filter(|s| s.snapshot.offset == offset)
         else {
-            return RawAnswer::new(404);
+            return read_refused(404, token);
         };
         let total = u64::try_from(snapshot.body.len()).unwrap_or(u64::MAX);
         let range = match ranges {
@@ -1048,24 +1052,28 @@ impl ModelServer {
         };
         let (status, body) = match range {
             None => (200, snapshot.body.as_ref()),
-            Some(ContentRange::Unsatisfied { .. }) => (416, &[][..]),
+            Some(unsatisfied @ ContentRange::Unsatisfied { .. }) => {
+                let mut answer = read_refused(416, token);
+                unsatisfied.render(answer.emit());
+                return answer;
+            }
             Some(ContentRange::Partial(span)) => {
                 let first = usize::try_from(span.first()).unwrap_or(usize::MAX);
                 let last = usize::try_from(span.last()).unwrap_or(usize::MAX);
                 (206, snapshot.body.get(first..=last).unwrap_or_default())
             }
         };
+        if let Err(mismatch) = precondition(stream, request, history) {
+            return mismatch;
+        }
         let mut answer = RawAnswer::new(status);
         if let Some(range) = range {
             range.render(answer.emit());
         }
-        if let Some(ContentRange::Unsatisfied { .. }) = range {
-            return answer;
-        }
         answer.header(names::ACCEPT_RANGES, ACCEPT_RANGES_BYTES);
         SnapshotRead {
             snapshot: snapshot.snapshot,
-            incarnation: stream.token_in(history),
+            incarnation: token,
             up_to_date: offset == stream.tail(),
         }
         .render(answer.emit());
@@ -1155,6 +1163,14 @@ fn precondition(stream: &Stream, request: &Request, history: u64) -> Result<(), 
         }
         Some(_) | None => Ok(()),
     }
+}
+
+/// A read's `404`, `410` or `416` of an existing stream, naming its token as the server does
+/// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
+fn read_refused(status: u16, token: Incarnation) -> RawAnswer {
+    let mut answer = RawAnswer::new(status);
+    answer.header(names::STREAM_INCARNATION, token.to_string());
+    answer
 }
 
 /// A snapshot publish's answer, rendered.

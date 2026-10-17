@@ -162,6 +162,16 @@ pub(crate) fn read(body: &[u8], next: u64) -> RawAnswer {
     raw
 }
 
+/// A read's refusal (`404`, `410` or `416`), naming `incarnation` as the server names the token
+/// of the stream that refused it.
+pub(crate) fn refused(status: u16, incarnation: Option<Incarnation>) -> RawAnswer {
+    let mut raw = RawAnswer::new(status);
+    if let Some(incarnation) = incarnation {
+        raw.header(names::STREAM_INCARNATION, incarnation.to_string());
+    }
+    raw
+}
+
 /// A HEAD's `200` of our stream with its tail at `tail`, naming `snapshot` as the latest.
 pub(crate) fn head_naming(snapshot: Option<SnapshotRef>, tail: u64) -> RawAnswer {
     let mut raw = RawAnswer::new(200);

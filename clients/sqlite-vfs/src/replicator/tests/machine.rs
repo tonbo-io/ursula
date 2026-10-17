@@ -3,6 +3,7 @@
 
 use ursula_headers::ClusterId;
 use ursula_headers::Delivery;
+use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::ProducerAnswer;
 use ursula_headers::ServerIdentity;
@@ -20,6 +21,7 @@ use super::off;
 use super::producer;
 use super::read;
 use super::receipt;
+use super::refused;
 use super::reset_of;
 use super::sends;
 use super::timer_of;
@@ -775,6 +777,49 @@ fn a_410_on_a_fresh_probe_fences_once_head_shows_our_token() {
     assert_eq!(h.last_request().method, Method::Head);
     let actions = h.answer(&super::head_naming(None, 37));
     assert_eq!(reset_of(&actions), Some(ResetKind::Fenced));
+}
+
+/// A `410` names the token of the stream that refused it. Naming ours, retention passed our tail
+/// under our stream: the probe resets `fenced` with no HEAD.
+#[test]
+fn a_410_naming_our_token_on_a_probe_fences_with_no_head() {
+    let mut h = streaming(0);
+    h.on(Event::Sync {
+        ticket: 1,
+        target: Position(0),
+    });
+    let actions = h.answer(&refused(410, Some(token())));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Fenced), "{actions:?}");
+    assert!(sends(&actions).is_empty(), "{actions:?}");
+}
+
+/// A `416` naming our token cannot happen (H1): it is resent after backoff with no HEAD, as a HEAD
+/// that found our token would have it resent. Another token, or none, sends the HEAD of a `412`.
+#[test]
+fn a_416_naming_our_token_on_a_probe_is_resent_with_no_head() {
+    let mut h = streaming(0);
+    h.on(Event::Sync {
+        ticket: 1,
+        target: Position(0),
+    });
+    let actions = h.answer(&refused(416, Some(token())));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert!(sends(&actions).is_empty(), "{actions:?}");
+    let (at, jitter) = timer_of(&actions).unwrap();
+    let actions = h.tick_at(at + jitter);
+    let methods: Vec<Method> = sends(&actions).iter().map(|r| r.method).collect();
+    assert_eq!(methods, vec![Method::Get], "{actions:?}");
+    let other = Incarnation::try_from((1 << 52) | 8).unwrap();
+    for named in [None, Some(other)] {
+        let mut h = streaming(0);
+        h.on(Event::Sync {
+            ticket: 1,
+            target: Position(0),
+        });
+        let actions = h.answer(&refused(416, named));
+        let methods: Vec<Method> = sends(&actions).iter().map(|r| r.method).collect();
+        assert_eq!(methods, vec![Method::Head], "{named:?}: {actions:?}");
+    }
 }
 
 #[test]

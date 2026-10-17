@@ -119,11 +119,11 @@ use self::answer::ClaimDecision;
 use self::answer::Common;
 use self::answer::HeadCheck;
 use self::answer::HeadDecision;
-use self::answer::HeadReason;
 use self::answer::ReadDecision;
 use self::answer::Unacked;
 use self::answer::decide_append;
 use self::answer::decide_claim;
+use self::answer::decide_gone;
 use self::answer::decide_head;
 use self::answer::decide_read;
 use self::answer::decide_status;
@@ -1327,7 +1327,7 @@ fn activating(
                     let step = Step::Reconcile { reconcile, link };
                     activating_head(outcome, kind, holding, ctx, step, actions)
                 }
-                Hit::Main => match decide_read(&exchange) {
+                Hit::Main => match decide_read(&exchange, ctx.incarnation) {
                     ReadDecision::Bytes { next } => {
                         ctx.set_condition(None, actions);
                         let body = match &exchange {
@@ -1337,7 +1337,9 @@ fn activating(
                         let fed = reconcile.feed(body, next, &mut ctx);
                         reconciled(kind, reconcile, fed, ctx, actions)
                     }
-                    ReadDecision::Gone => {
+                    // The rule reads the latest snapshot from a HEAD, whatever token the `410`
+                    // names: that HEAD also takes the history path under another.
+                    ReadDecision::Gone { .. } => {
                         ctx.set_condition(None, actions);
                         let link = Box::new(Link::send(head_request(), &mut ctx, actions));
                         Replicator::Activating {
@@ -1646,7 +1648,7 @@ impl PreChecking {
             PreCheck::Head => return self.head_answered(exchange, ctx, now_ms, actions),
             PreCheck::Read(reconcile) => reconcile,
         };
-        match decide_read(exchange) {
+        match decide_read(exchange, ctx.incarnation) {
             ReadDecision::Bytes { next } => {
                 ctx.set_condition(None, actions);
                 let body = match exchange {
@@ -1668,10 +1670,10 @@ impl PreChecking {
                 }
             }
             // Retention passed the log's acknowledged offset, or the read went to another
-            // history (its `410` comes before the `412`): the link's HEAD decides. Our token
-            // still there: the stream moved on, `stale`. Another takes the history path.
-            ReadDecision::Gone => {
-                let common = Common::Head(HeadReason::Gone(ResetKind::Stale));
+            // history (its `410` comes before the `412`). The `410` naming our token: the stream
+            // moved on, `stale`. Another token takes the history path through the link's HEAD.
+            ReadDecision::Gone { incarnation } => {
+                let common = decide_gone(incarnation, ctx.incarnation, ResetKind::Stale);
                 self.common(
                     PreCheck::Read(reconcile),
                     common,
@@ -1924,8 +1926,9 @@ impl Gone {
                     }
                 }
             }
-            // Superseded since the HEAD: the HEAD again names the latest.
-            Ok(Typed::Untyped) if answer.status == 404 => {
+            // Superseded since the HEAD: the HEAD again names the latest, and under another token
+            // takes the history path.
+            Ok(Typed::ReadRefused { .. }) if answer.status == 404 => {
                 let link = Link::send(head_request(), &mut ctx, actions);
                 Self {
                     link: Box::new(link),
@@ -2642,7 +2645,7 @@ impl Stream {
             self.probe = Some(Probe { from, link });
             return self.into();
         }
-        match decide_read(exchange) {
+        match decide_read(exchange, ctx.incarnation) {
             ReadDecision::Bytes { next } => {
                 let body = match exchange {
                     Exchange::Answered(answer) => answer.body.as_slice(),
@@ -2668,11 +2671,11 @@ impl Stream {
                 self.kick(actions)
             }
             // Retention passed our acknowledged tail, or the read went to another history (its
-            // `410` comes before the `412`): a HEAD decides. Our token still there: another owner
-            // moved the stream on, `fenced`. Another token takes the history path.
-            ReadDecision::Gone => {
+            // `410` comes before the `412`). The `410` naming our token: another owner moved the
+            // stream on, `fenced`. Another token takes the history path through a HEAD.
+            ReadDecision::Gone { incarnation } => {
                 let result = quietly(quiet, ctx, actions, |ctx, actions| {
-                    let common = Common::Head(HeadReason::Gone(ResetKind::Fenced));
+                    let common = decide_gone(incarnation, ctx.incarnation, ResetKind::Fenced);
                     link.common(common, None, now_ms, ctx, actions)
                 });
                 if let Err(halt) = result {

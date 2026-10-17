@@ -5,6 +5,12 @@
 //! the reconcile's reads, the `synced()` probe and the HEAD that a `412`, `404` or untyped `413`
 //! sends.
 //!
+//! A read's `410` and `416` name the token of the stream that refused them, and come before the
+//! `412` (extensions: Snapshot Metadata on HEAD and Stream Incarnation). [`decide_gone`] and
+//! [`decide_past_tail`] decide from that token where a HEAD would only have read it: our token
+//! settles the answer with no HEAD. Another token still sends one, for what that history inherited
+//! ([`inherits`]), and so does a refusal that names none.
+//!
 //! A write's answer is classified once, by `ursula_headers::classify` ([`Answer::outcome`]): it
 //! tells a producer answer from any other ([`producer_answer`]), and a refusal from an unknown
 //! outcome. [`decide_status`] maps that outcome to the VFS's action, and where the action is not
@@ -68,9 +74,10 @@ pub(crate) enum HeadReason {
     /// [`super::backoff::LOST_BEFORE_HEAD`] lost answers in a row for a large body: a layer in
     /// front of the server may have refused it unread.
     Unanswered,
-    /// A `410` on a read: retention passed our tail, or the read went to another history (a `410`
-    /// comes before a `412`). With our token unchanged the binding resets this kind: `fenced`
-    /// for a `synced()` probe (another owner moved on), `stale` for a provisional pre-check.
+    /// A `410` on a read that named no token, or another one ([`decide_gone`]): retention passed
+    /// our tail, or the read went to another history (a `410` comes before a `412`). With our
+    /// token unchanged the binding resets this kind: `fenced` for a `synced()` probe (another
+    /// owner moved on), `stale` for a provisional pre-check.
     Gone(ResetKind),
 }
 
@@ -136,8 +143,11 @@ pub(crate) enum ReadDecision {
     Bytes {
         next: Offset,
     },
-    /// `410`: below retention.
-    Gone,
+    /// `410`: below retention, of the stream whose token the refusal names (`None` when it names
+    /// none).
+    Gone {
+        incarnation: Option<Incarnation>,
+    },
     Common(Common),
 }
 
@@ -288,16 +298,53 @@ pub(crate) fn decide_claim(exchange: &Exchange) -> ClaimDecision {
     }
 }
 
-/// A read of the reconcile or the probe.
-pub(crate) fn decide_read(exchange: &Exchange) -> ReadDecision {
+/// A read under our token `ours`: of the reconcile, the probe, the pre-check, or an open's
+/// catch-up. A `416` decides by [`decide_past_tail`].
+pub(crate) fn decide_read(exchange: &Exchange, ours: Incarnation) -> ReadDecision {
     let answer = match exchange {
         Exchange::NoAnswer(_) => return ReadDecision::Common(no_answer()),
         Exchange::Answered(answer) => answer,
     };
     match &answer.typed {
         Ok(Typed::Read { next, .. }) if answer.status == 200 => ReadDecision::Bytes { next: *next },
-        Ok(Typed::Untyped) if answer.status == 410 => ReadDecision::Gone,
+        Ok(Typed::ReadRefused { incarnation }) if answer.status == 410 => ReadDecision::Gone {
+            incarnation: *incarnation,
+        },
+        Ok(Typed::ReadRefused { incarnation }) if answer.status == 416 => {
+            ReadDecision::Common(decide_past_tail(*incarnation, ours))
+        }
         _ => ReadDecision::Common(decide_status(answer)),
+    }
+}
+
+/// A `410` on the `synced()` probe or a pre-check, under our token `ours`: the refusal names our
+/// token, so retention passed our tail and the binding resets `kind` with no HEAD. A token derives
+/// from a history id the group draws at random, so ours names our stream and never one of another
+/// deployment, which the HEAD's cluster check would catch. Another token takes the history path
+/// through a HEAD, which names what that history inherited, and so does a refusal that names none.
+pub(crate) fn decide_gone(
+    incarnation: Option<Incarnation>,
+    ours: Incarnation,
+    kind: ResetKind,
+) -> Common {
+    match incarnation {
+        Some(token) if token == ours => Common::Reset(kind),
+        Some(_) | None => Common::Head(HeadReason::Gone(kind)),
+    }
+}
+
+/// A `416` on a read under our token `ours`, a read past the tail. Under our token that cannot
+/// happen (H1), and the precondition is checked after the range (extensions: Producer Write
+/// Answers). Naming our token, it is resent after backoff, as a HEAD that found our token would
+/// have it resent. Another token means the history changed, and that token or none sends the HEAD
+/// of a `412`.
+pub(crate) fn decide_past_tail(incarnation: Option<Incarnation>, ours: Incarnation) -> Common {
+    match incarnation {
+        Some(token) if token == ours => Common::Resend {
+            retry_after: None,
+            fresh: false,
+        },
+        Some(_) | None => Common::Head(HeadReason::Precondition),
     }
 }
 
