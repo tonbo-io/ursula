@@ -4507,9 +4507,11 @@ impl SnapshotBody {
     }
 }
 
-/// The answer of a snapshot read, for both snapshot resources: `404`,
-/// `410` and `412` first, then a revalidation (`304`), then the byte range
-/// (addendum 7).
+/// The answer of a snapshot read, for both snapshot resources, in the
+/// order of extensions Sections 2.4 and 2.5: `404` and `410` (the runtime's
+/// errors), then `416` for a range past the end, then the `Stream-Incarnation`
+/// precondition (`412`), then a revalidation (`304`), then the body or its
+/// range. A revalidation ignores the range, so it never answers `416`.
 pub(crate) async fn snapshot_answer(
     state: &HttpState,
     read: SnapshotAnswer,
@@ -4527,11 +4529,6 @@ pub(crate) async fn snapshot_answer(
         .await
     {
         Ok(mut response) => {
-            if let Some(refused) =
-                read_precondition_failed(read.if_incarnation, response.incarnation)
-            {
-                return refused;
-            }
             let object = response.object.take();
             let payload = Bytes::from(std::mem::take(&mut response.payload));
             let total = object.as_ref().map_or_else(
@@ -4571,6 +4568,11 @@ pub(crate) async fn snapshot_answer(
                     "the range lies outside the snapshot",
                     response_headers,
                 );
+            }
+            if let Some(refused) =
+                read_precondition_failed(read.if_incarnation, response.incarnation)
+            {
+                return refused;
             }
             // The headers of the `200` it stands for (extensions Section 4.3).
             if revalidated {

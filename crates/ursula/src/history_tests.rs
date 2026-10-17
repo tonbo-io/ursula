@@ -427,7 +427,8 @@ async fn assert_names_token(
 }
 
 /// A `410` or `416` of a read, and the `404` of a snapshot that is not the
-/// latest, come before the `Stream-Incarnation` precondition. Each names the
+/// latest, come before the `Stream-Incarnation` precondition, on stream and
+/// snapshot reads alike (extensions Section 2.4). Each names the
 /// token of the stream that decided it, so a client tells another
 /// incarnation from a real overshoot or a real gone offset without a HEAD,
 /// under the current token and under one a restore retired. A missing
@@ -530,9 +531,59 @@ async fn gone_and_beyond_tail_answers_name_the_serving_token() {
             vec![(names::STREAM_INCARNATION, stale.as_str())],
             StatusCode::RANGE_NOT_SATISFIABLE,
         ),
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(5)),
+            vec![(names::STREAM_INCARNATION, stale.as_str())],
+            StatusCode::NOT_FOUND,
+        ),
+        // A snapshot range past the end answers `416` before the
+        // precondition, and a range inside it `412`.
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(10)),
+            vec![
+                (names::STREAM_INCARNATION, stale.as_str()),
+                ("range", "bytes=100-"),
+            ],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (
+            snapshot(old, 10),
+            vec![("range", "bytes=100-")],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(10)),
+            vec![
+                (names::STREAM_INCARNATION, stale.as_str()),
+                ("range", "bytes=0-1"),
+            ],
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
+            snapshot(old, 10),
+            vec![("range", "bytes=0-1")],
+            StatusCode::PRECONDITION_FAILED,
+        ),
     ] {
         assert_names_token(&target, &uri, &headers, status, Some(restored)).await;
     }
+    // The `416` names the length of the snapshot the restored stream holds.
+    let response = send(
+        &target,
+        "GET",
+        &snapshot(old, 10),
+        &[("range", "bytes=100-")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .map(|value| value.as_bytes()),
+        Some(&b"bytes */8"[..])
+    );
 
     // No stream: no token.
     let response = send(&target, "DELETE", URI, &[], Body::empty()).await;
