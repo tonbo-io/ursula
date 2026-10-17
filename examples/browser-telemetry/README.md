@@ -15,10 +15,10 @@ installBrowserTelemetry(telemetry);
 telemetry.capture("application_started", { release: "2026.07.18" });
 ```
 
-Consumers read the stream by offset. Start at `offset=-1` for the oldest retained event, then pass back each response's `Stream-Next-Offset` to continue; `Stream-Up-To-Date: true` means the read reached the tail. Offsets are opaque: store the values Ursula returns rather than computing them. Ursula does not reorder events by `captured_at` and has no event-time read; filter on `captured_at` in the consumer, or build your own index that maps event times to offsets.
+Consumers read the stream by offset. Start at `offset=-1` for the oldest retained event, then pass back each response's `Stream-Next-Offset` to continue. `Stream-Up-To-Date: true` means the read reached the tail. Offsets are opaque: store the values Ursula returns rather than computing them. Ursula does not reorder events by `captured_at` and has no event-time read. Filter on `captured_at` in the consumer, or keep your own index that maps event times to offsets.
 
 ```bash
-curl -i 'http://127.0.0.1:4437/telemetry/browser-telemetry?offset=-1'
+curl -i 'http://127.0.0.1:4437/telemetry/events?offset=-1'
 ```
 
 This example does not require an Ursula SDK or Append Session. Production collectors should add durable local retry storage and an authenticated same-origin gateway appropriate to their environment.

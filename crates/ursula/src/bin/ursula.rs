@@ -96,4 +96,10 @@ mod tests {
             Command::Gateway(_)
         ));
     }
+
+    #[test]
+    fn removed_indexer_role_is_refused() {
+        let error = parse(&["ursula", "indexer"]).expect_err("the indexer role was removed");
+        assert!(error.to_string().contains("indexer"), "{error}");
+    }
 }

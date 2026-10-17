@@ -2,7 +2,7 @@
 
 This chart installs the long-running chaos workload, verifier, status publisher, and Kubernetes fault controller against an existing Ursula release. It does not install Ursula, the gateway, storage, or an EKS cluster.
 
-The workload combines the existing byte-stream integrity load with JSON record streams containing `captured_at`. The initial Kubernetes fault profile deletes one named voter Pod at a time and waits for StatefulSet recreation plus Raft recovery before the next injection.
+The workload combines the existing byte-stream integrity load with JSON record streams, kept so the byte and offset checks also cover `application/json` streams. The initial Kubernetes fault profile deletes one named voter Pod at a time and waits for StatefulSet recreation plus Raft recovery before the next injection.
 
 The Role is deliberately narrow: it can only `get` and `delete` the three voter Pod names configured under `target`. EC2-only `tc`, `iptables`, process-freeze, and S3-egress faults are not claimed as Kubernetes coverage.
 
