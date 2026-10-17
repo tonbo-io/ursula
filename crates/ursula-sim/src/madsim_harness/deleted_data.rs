@@ -340,6 +340,24 @@ async fn log_holds_marker(cluster: &JournalCluster, node_id: u64) -> Option<Stri
     })
 }
 
+/// What `node_id`'s replica shows of its snapshot work, for a failure.
+fn replica_state(cluster: &JournalCluster, node_id: u64) -> String {
+    let raft = metrics(cluster, GROUP, node_id);
+    let published = raft.snapshot.map(|snapshot| snapshot.index);
+    let log = cluster.node_registries[&node_id]
+        .metrics_snapshot()
+        .into_iter()
+        .find(|group| group.raft_group_id == GROUP)
+        .map(|group| group.log);
+    format!(
+        "applied {:?}, snapshot {published:?}, purged {:?}, state {:?}, work {:?}, log {log:?}",
+        raft.last_applied.map(|log_id| log_id.index),
+        raft.purged.map(|log_id| log_id.index),
+        raft.state,
+        cluster.coordinator(node_id).work(GROUP, published),
+    )
+}
+
 /// Fails the invariant when `node_id` still holds the removed stream.
 async fn check_replica(
     cluster: &JournalCluster,
@@ -353,7 +371,10 @@ async fn check_replica(
             trace,
             BOUND_INVARIANT,
             after,
-            format!("{context}: node {node_id}: {held}"),
+            format!(
+                "{context}: node {node_id}: {held} ({})",
+                replica_state(cluster, node_id)
+            ),
         );
     }
     if let Some(held) = log_holds_marker(cluster, node_id).await {
@@ -361,7 +382,10 @@ async fn check_replica(
             trace,
             BOUND_INVARIANT,
             after,
-            format!("{context}: node {node_id}: {held}"),
+            format!(
+                "{context}: node {node_id}: {held} ({})",
+                replica_state(cluster, node_id)
+            ),
         );
     }
     let read = cluster.engines[&(GROUP, node_id)]
