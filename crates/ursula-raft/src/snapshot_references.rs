@@ -358,7 +358,8 @@ impl SnapshotReferences {
     }
 }
 
-#[cfg(all(test, not(madsim)))]
+#[cfg(test)]
+#[cfg(not(madsim))]
 mod tests {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
