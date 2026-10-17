@@ -3815,13 +3815,15 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
             .recover_host(HostRequest::RecordReplacementTermination {
                 fence: state.operation().unwrap().fence.clone(),
                 candidate: candidate.clone(),
-                now_ms: native_epoch_ms(),
                 observation: HostTerminationObservation {
                     started_ms,
                     completed_ms: native_epoch_ms(),
                     provider_instance: candidate.provider_instance.clone(),
                     terminal_state: "terminated".into(),
                 },
+                // Read after the observation, so its completion time can never
+                // be in the request's future.
+                now_ms: native_epoch_ms(),
             })
             .unwrap();
         state = state
