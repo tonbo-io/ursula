@@ -148,6 +148,9 @@ impl DurableRaftGroupEngineFactory {
             PeerIdentity::new(SINGLE_NODE_ID, self.log_stores.cluster_id().clone()),
             BTreeMap::new(),
         );
+        if let Some(config) = &self.engine_config {
+            registry.set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
+        }
         self.registry = Some(registry);
         self
     }
@@ -161,9 +164,9 @@ impl DurableRaftGroupEngineFactory {
     /// entries below a snapshot, and the snapshot driver's policy
     /// (`SnapshotPolicy::Never`) while `config.snapshot_drive_interval_ms`
     /// is not 0, else OpenRaft's jittered entry count. With a registry
-    /// ([`Self::with_registry`], called first) every group shares its build
-    /// and install coordinators, whose gauges the driver, the metrics and
-    /// admission read, and the build coordinator gets
+    /// ([`Self::with_registry`], before or after this) every group shares
+    /// its build and install coordinators, whose gauges the driver, the
+    /// metrics and admission read, and the build coordinator gets
     /// `config.snapshot_build_max_concurrency` permits.
     pub fn with_engine_config(mut self, config: RaftEngineConfig) -> Self {
         if let Some(registry) = &self.registry {
@@ -818,6 +821,16 @@ mod tests {
         assert_eq!(config.max_in_snapshot_log_to_keep, 64);
         assert_eq!(config.snapshot_policy, SnapshotPolicy::Never);
         assert_eq!(registry.snapshot_build_coordinator().max_concurrency(), 3);
+        // The order of the two calls does not matter.
+        let registry = RaftGroupHandleRegistry::default();
+        let _config_first = DurableRaftGroupEngineFactory::new(wal.clone())
+            .with_engine_config(RaftEngineConfig {
+                snapshot_drive_interval_ms: 1_000,
+                snapshot_build_max_concurrency: 4,
+                ..RaftEngineConfig::default()
+            })
+            .with_registry(registry.clone());
+        assert_eq!(registry.snapshot_build_coordinator().max_concurrency(), 4);
 
         // With the driver off, OpenRaft's jittered entry count.
         let undriven = DurableRaftGroupEngineFactory::new(wal)

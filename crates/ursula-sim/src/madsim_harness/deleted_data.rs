@@ -152,7 +152,8 @@ const ACROSS_SEGMENTS: [std::ops::RangeInclusive<u64>; 2] = [528..=531, 630..=64
 /// Seeds of the `deleted-data-after-expiry` families: the marked stream
 /// expires, and its group's leader sweeps it in the background (#669).
 const AFTER_EXPIRY: [std::ops::RangeInclusive<u64>; 2] = [532..=539, 650..=679];
-/// How long after the run started the marked stream expires.
+/// How long after the cluster is up the marked stream expires: past its
+/// writes and the snapshots of every replica.
 const EXPIRES_AFTER: Duration = Duration::from_secs(3);
 /// How long before the expiry the leader stops in a `leader_stopped` run.
 const STOP_BEFORE_EXPIRY: Duration = Duration::from_millis(200);
@@ -895,18 +896,6 @@ pub(super) async fn run_deleted_data_inner(
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     let journals = Journals::for_seed(config.seed);
     let context = format!("seed {} {plan:?} {journals:?}", config.seed);
-    let mut background = match plan.removal {
-        Removal::Expiry(traffic) => Some(Background::new(traffic)),
-        Removal::Deletion | Removal::BucketPurge => None,
-    };
-    // The virtual clock of the expiry, and when it comes in this run.
-    let expiry = background.as_ref().map(|background| {
-        let at = madsim::time::Instant::now() + EXPIRES_AFTER;
-        let at_ms = background
-            .wall_ms()
-            .saturating_add(u64::try_from(EXPIRES_AFTER.as_millis()).expect("a short expiry"));
-        (at, at_ms)
-    });
     let mut cluster = JournalCluster::start_with_tuning(
         &format!("deleted-data-{}", config.seed),
         journals.tuning,
@@ -915,6 +904,19 @@ pub(super) async fn run_deleted_data_inner(
     // The quiet group's entries go first, so they share the segments of
     // the removed records and pin them.
     cluster.append(QUIET_GROUP, journals.quiet_entries).await;
+    let mut background = match plan.removal {
+        Removal::Expiry(traffic) => Some(Background::new(traffic)),
+        Removal::Deletion | Removal::BucketPurge => None,
+    };
+    // When the expiry comes in this run, and on its virtual wall clock:
+    // with the cluster up, past the stream's writes and snapshots.
+    let expiry = background.as_ref().map(|background| {
+        let at = madsim::time::Instant::now() + EXPIRES_AFTER;
+        let at_ms = background
+            .wall_ms()
+            .saturating_add(u64::try_from(EXPIRES_AFTER.as_millis()).expect("a short expiry"));
+        (at, at_ms)
+    });
     write_marked_stream(
         &mut cluster,
         plan.records,
@@ -922,6 +924,12 @@ pub(super) async fn run_deleted_data_inner(
         &context,
     )
     .await;
+    if let Some((expires_at, _)) = expiry {
+        assert!(
+            madsim::time::Instant::now() + STOP_BEFORE_EXPIRY < expires_at,
+            "{context}: the marked stream's writes and snapshots outlasted its expiry"
+        );
+    }
     let leader = wait_leader(&cluster, GROUP, &context).await;
     trace.push(SimEvent::LeaderElected { leader_id: leader });
     let followers = NODES

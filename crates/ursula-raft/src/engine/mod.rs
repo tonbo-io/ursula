@@ -836,25 +836,30 @@ impl RaftGroupEngine {
     /// `request.max_expiry_sweeps` times and for at most
     /// [`ursula_runtime::expiry_sweep::GROUP_BUDGET`]. Each command applies
     /// through [`Self::write`], with its apply-health, history and
-    /// leadership checks; a refusal there ends the sweep until the next
-    /// pass.
-    async fn sweep_expired_streams(
-        &self,
-        request: TidyStreamsRequest,
-    ) -> Result<TidyStreamsResponse, GroupEngineError> {
+    /// leadership checks. An error ends the sweep until the next pass,
+    /// keeps the commands committed so far in the report, and lets the
+    /// pass go on to `TidyStream`.
+    async fn sweep_expired_streams(&self, request: TidyStreamsRequest) -> TidyStreamsResponse {
         let mut report = TidyStreamsResponse::default();
         if request.max_expiry_sweeps == 0 || !expiry_sweep::enabled() {
-            return Ok(report);
+            return report;
         }
         let max = u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX);
         let now_ms = expiry_sweep::sweep_now_ms(request.now_ms);
         let started = crate::rt::time::Instant::now();
         loop {
-            let target = self
+            let target = match self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move { state_machine.engine.expiry_sweep_target(now_ms) })
                 })
-                .await?;
+                .await
+            {
+                Ok(target) => target,
+                Err(err) => {
+                    expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
+                    break;
+                }
+            };
             let Some(stream_id) = target else {
                 break;
             };
@@ -862,10 +867,15 @@ impl RaftGroupEngine {
                 report.expiry_due_groups = 1;
                 break;
             }
-            expiry_sweep::settle(self.write(expiry_sweep::command(stream_id, now_ms)).await)?;
+            if let Err(err) =
+                expiry_sweep::settle(self.write(expiry_sweep::command(stream_id, now_ms)).await)
+            {
+                expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
+                break;
+            }
             report.expiry_sweeps = report.expiry_sweeps.saturating_add(1);
         }
-        Ok(report)
+        report
     }
 
     pub(crate) async fn require_local_leader_for_read(
@@ -1579,7 +1589,7 @@ impl GroupEngine for RaftGroupEngine {
             if !self.raft.is_leader() {
                 return Ok(TidyStreamsResponse::default());
             }
-            let mut report = self.sweep_expired_streams(request).await?;
+            let mut report = self.sweep_expired_streams(request).await;
             let candidates = self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {

@@ -537,11 +537,9 @@ pub struct TidyStreamsResponse {
     /// Tidied streams that still report debt after their command.
     pub debt_remaining: u64,
     /// Expiry sweep commands committed by this pass.
-    #[serde(default)]
     pub expiry_sweeps: u64,
-    /// Groups whose sweep stopped at its command cap or its time budget
-    /// while expired streams remained (0 or 1 for one group).
-    #[serde(default)]
+    /// Groups whose sweep stopped at its command cap, its time budget or an
+    /// error while expired streams remained (0 or 1 for one group).
     pub expiry_due_groups: u64,
 }
 

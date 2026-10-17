@@ -127,8 +127,10 @@ fn parity_state() -> StreamStateMachine {
     machine
 }
 
-/// The sweep's command for the fixed stream, an expired one in the TTL
-/// index's first expiry.
+/// The sweep's command, naming a fixed stream so that the test also runs at
+/// `v0.8.0`, which has no front check: `tenant/s-001`, which expires at
+/// 10,500, the sweep's clock, while the TTL index's front is `other/s-000`
+/// at 9,000.
 fn sweep() -> StreamCommand {
     StreamCommand::TouchStreamAccess {
         stream_id: id(1),

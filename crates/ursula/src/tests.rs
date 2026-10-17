@@ -8385,6 +8385,84 @@ mod snapshot_driver {
         drop(root);
     }
 
+    /// #669: a single node never closes admission for its log, as in 0.8.0.
+    /// With its driver ticking once an hour, so that no snapshot frees the
+    /// log, the log grows past twice a tiny `raft.snapshot_log_budget`, the
+    /// driver's monitor reports it, and a write with a body still answers
+    /// `204`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_node_admits_writes_past_twice_its_log_budget() {
+        let root = tempfile::tempdir().expect("WAL root");
+        let budget = 64_u64 << 10;
+        let mut config = super::test_config(1, 1);
+        config.raft.snapshot_log_budget = ursula_config::HumanSize::bytes(budget);
+        config.storage.snapshot.drive_interval = Some(ursula_config::HumanDuration::hour(1));
+        let spawned = crate::bootstrap::spawn_runtime(
+            &config,
+            crate::bootstrap::Persistence::Raft {
+                log_dir: root.path().to_owned(),
+            },
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("spawn a single node");
+        let runtime = spawned.runtime.clone();
+        let registry = spawned.raft_registry.clone().expect("a Raft registry");
+        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let coordinator = registry.snapshot_build_coordinator();
+        let app = crate::client_router_with_admission(
+            HttpState::with_raft_registry(runtime.clone(), registry),
+            crate::IngressAdmission::new(&config.server)
+                .with_raft_log_pressure(Some(coordinator.clone())),
+        );
+        let stream = "/budget/stream";
+        let created = super::http_put(
+            &app,
+            stream,
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let limit = budget.saturating_mul(2);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("deadline");
+        while runtime.metrics().snapshot().raft_log_bytes <= limit {
+            assert!(
+                Instant::now() < deadline,
+                "the log stays below twice the budget"
+            );
+            let appended = super::http_post(
+                &app,
+                stream,
+                &[("content-type", "application/octet-stream")],
+                Body::from(vec![7_u8; 8 << 10]),
+            )
+            .await;
+            assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+        }
+        // Past twice the budget, which closes a cluster node's admission.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(runtime.metrics().snapshot().raft_log_bytes > limit);
+        assert!(!coordinator.log_pressured());
+        let appended = super::http_post(
+            &app,
+            stream,
+            &[("content-type", "application/octet-stream")],
+            Body::from(vec![7_u8; 8 << 10]),
+        )
+        .await;
+        assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+        drop(app);
+        drop(spawned);
+        drop(root);
+    }
+
     /// #669: `storage.snapshot.drive_interval = "0s"` turns a single node's
     /// driver off: nothing reports its log. Its groups still sweep an
     /// expired stream, which needs no driver.

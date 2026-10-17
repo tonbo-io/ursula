@@ -1731,10 +1731,17 @@ impl GroupEngine for InMemoryGroupEngine {
                         report.expiry_due_groups = 1;
                         break;
                     }
-                    crate::expiry_sweep::settle(self.apply_committed_write(
+                    if let Err(err) = crate::expiry_sweep::settle(self.apply_committed_write(
                         crate::expiry_sweep::command(stream_id, now_ms),
                         placement,
-                    ))?;
+                    )) {
+                        crate::expiry_sweep::interrupted(
+                            placement.raft_group_id,
+                            &err,
+                            &mut report,
+                        );
+                        break;
+                    }
                     report.expiry_sweeps = report.expiry_sweeps.saturating_add(1);
                 }
             }

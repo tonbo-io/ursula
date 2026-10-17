@@ -362,12 +362,17 @@ pub(crate) fn cluster_cadence(raft: &ursula_config::RaftConfig, groups: usize) -
 }
 
 /// The snapshot policy of a single node (#669): a cluster node's, with its
-/// entry backstop at `raft.snapshot_logs_since_last` if that is nearer.
-/// OpenRaft snapshotted a single node's groups every
-/// `raft.snapshot_logs_since_last` entries before the driver ran there, and
-/// entry count is what bounds a group's log index in memory and its replay
-/// at restart, so a group of small entries never snapshots less often than
-/// it did then. The driver only adds triggers.
+/// entry backstop at `raft.snapshot_logs_since_last` (5,000 by default) if
+/// that is nearer. Before the driver ran there, OpenRaft's default policy
+/// snapshotted a single node's groups every 5,000 entries, and entry count
+/// is what bounds a group's log index in memory and its replay at restart,
+/// so a group of small entries is due no later than it was then. A due group
+/// still waits for the node's build slot: below the budget the driver runs
+/// one build at a time across the node, where each group used to build on
+/// its own. Under many small appends to many groups, due groups queue and
+/// their logs grow past the backstop until a slot comes free, which
+/// `raft.snapshot_build_max_concurrency` and the pressure pass past the
+/// budget relieve.
 pub(crate) fn single_node_cadence(
     raft: &ursula_config::RaftConfig,
     groups: usize,

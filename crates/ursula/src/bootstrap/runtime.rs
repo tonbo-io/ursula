@@ -392,7 +392,13 @@ fn spawn_singleton(
                 cold_store.clone(),
             )
             .with_registry(registry);
-            if let Some(engine_config) = raft_engine_config {
+            // With the driver off (`storage.snapshot.drive_interval = "0s"`)
+            // a single node runs as 0.8.0 did: OpenRaft's own snapshot
+            // policy, entries kept below a snapshot and coordinator per
+            // group.
+            if let Some(engine_config) = raft_engine_config
+                .filter(|engine_config| engine_config.snapshot_drive_interval_ms > 0)
+            {
                 factory = factory.with_engine_config(engine_config);
             }
             ShardRuntime::spawn_with_engine_factory_and_cold_store(

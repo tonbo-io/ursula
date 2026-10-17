@@ -21,12 +21,13 @@
 //! renewal a node whose clock is up to that much behind sends at the
 //! deadline is not beaten by the sweep. Per group and pass it proposes at
 //! most [`MAX_COMMANDS_PER_GROUP`] commands and, on an engine with a log,
-//! spends at most [`GROUP_BUDGET`], so a large backlog drains over a few
+//! starts none after [`GROUP_BUDGET`], so a large backlog drains over a few
 //! passes.
 
 use std::time::Duration;
 
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::sim_controls::Defence;
@@ -34,11 +35,13 @@ use ursula_stream::sim_controls::Defence;
 use crate::command::GroupWriteCommand;
 use crate::engine::GroupEngineError;
 use crate::engine::GroupWriteResponse;
+use crate::request::TidyStreamsResponse;
 
-/// Sweep commands one pass proposes per group, each removing up to 257
-/// expired streams.
+/// Sweep commands one pass proposes per group, each removing the named
+/// stream and up to 256 more.
 pub const MAX_COMMANDS_PER_GROUP: usize = 16;
-/// The longest one group's sweep takes per pass, on an engine with a log.
+/// After this long in one group's sweep, on an engine with a log, the pass
+/// starts no more commands there.
 pub const GROUP_BUDGET: Duration = Duration::from_millis(250);
 /// How far past a stream's expiry, by the leader's clock, the sweep removes
 /// it.
@@ -105,6 +108,19 @@ pub fn settle(
         }
         Err(err) => Err(err),
     }
+}
+
+/// A sweep that `err` ended before its group was done: logged, and the
+/// group is left due for the next pass, which sweeps again. The commands
+/// committed so far stay in `report`, and the pass goes on to `TidyStream`.
+pub fn interrupted(group: RaftGroupId, err: &GroupEngineError, report: &mut TidyStreamsResponse) {
+    tracing::warn!(
+        raft_group_id = group.0,
+        sweeps = report.expiry_sweeps,
+        error = %err,
+        "expiry sweep stopped early; the next pass sweeps again"
+    );
+    report.expiry_due_groups = 1;
 }
 
 #[cfg(test)]
