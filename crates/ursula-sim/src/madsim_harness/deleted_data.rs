@@ -70,12 +70,21 @@ const GROUP: u32 = 0;
 const MARKER: &[u8] = b"deleted-data-marker-669;";
 /// The bucket of the removed stream, which a purge erases.
 const BUCKET: &str = "erased";
-/// The drivers' settings: a bound of a few seconds of virtual time, so the
-/// floor is one second, and OpenRaft keeps 8 entries below a snapshot.
+/// The drivers' settings with a short bound: four seconds of virtual time,
+/// so the floor is one second, and OpenRaft keeps 8 entries below a
+/// snapshot. Short enough that a purge the leader defers for a slow
+/// follower is still pending when the operator snapshots.
 pub(super) const DRIVERS: DriverPlan = DriverPlan {
     max_age: Duration::from_secs(4),
     keep: 8,
     interval: Duration::from_millis(200),
+};
+/// The drivers' settings the bound is checked with: the bound covers a
+/// pass of the driver too, which may wait [`ursula_raft::SNAPSHOT_HANDOFF_WAIT`]
+/// for a trigger another group's build does not claim.
+const BOUND_DRIVERS: DriverPlan = DriverPlan {
+    max_age: Duration::from_secs(30),
+    ..DRIVERS
 };
 #[cfg(test)]
 /// How long the leader's appends to the slow follower take in the
@@ -127,9 +136,9 @@ impl Controls {
 struct Switched;
 
 impl Switched {
-    fn apply(controls: Controls) -> Self {
+    fn apply(controls: Controls, drivers: DriverPlan) -> Self {
         set_defences(controls);
-        set_snapshot_drivers(Some(DRIVERS));
+        set_snapshot_drivers(Some(drivers));
         ursula_stream::sim_controls::reset_fired();
         Self
     }
@@ -475,7 +484,7 @@ pub(super) async fn run_deleted_data_inner(
     config: ThreeNodeRaftSimConfig,
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
-    let _switched = Switched::apply(controls);
+    let _switched = Switched::apply(controls, BOUND_DRIVERS);
     let plan = Plan::from_seed(config.seed);
     let mut trace = SimTrace::default();
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
@@ -553,7 +562,7 @@ pub(super) async fn run_deleted_data_inner(
         }
         Fault::PowerLossAfterSnapshot => {
             // The first replica whose snapshot covers the removal.
-            let deadline = madsim::time::Instant::now() + DRIVERS.max_age;
+            let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age;
             let covered = loop {
                 seen.observe(&cluster, removal_index);
                 let covered = NODES
@@ -590,14 +599,16 @@ pub(super) async fn run_deleted_data_inner(
     // Every replica is checked once the bound passed since it applied the
     // removal.
     let mut checked = BTreeSet::new();
-    let deadline = madsim::time::Instant::now() + DRIVERS.max_age.saturating_mul(4);
+    let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age.saturating_mul(4);
     while checked.len() < NODES.len() {
         seen.observe(&cluster, removal_index);
         let now = madsim::time::Instant::now();
         let due = seen
             .at
             .iter()
-            .filter(|(node_id, at)| !checked.contains(*node_id) && now >= **at + DRIVERS.max_age)
+            .filter(|(node_id, at)| {
+                !checked.contains(*node_id) && now >= **at + BOUND_DRIVERS.max_age
+            })
             .map(|(node_id, _)| *node_id)
             .collect::<Vec<_>>();
         for node_id in due {
@@ -642,7 +653,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
     config: ThreeNodeRaftSimConfig,
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
-    let _switched = Switched::apply(controls);
+    let _switched = Switched::apply(controls, DRIVERS);
     let mut trace = SimTrace::default();
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     let context = format!("seed {} operator snapshot under a purge", config.seed);

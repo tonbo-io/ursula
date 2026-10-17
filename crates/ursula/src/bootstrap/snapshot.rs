@@ -506,9 +506,10 @@ pub struct SnapshotDriveSettings {
 /// [`SnapshotCadence::pass_step`]): fewer as the pass brings the log down,
 /// one below the budget. A pass ends early once the log has climbed to a
 /// higher pressure than when the pass was planned, so the next pass plans
-/// for that. The tick then purges each group's log through the snapshot that
-/// covers its removals ([`plan_scrub_purges`], #669), and holds the group's
-/// builds until that purge lands ([`SnapshotBuildCoordinator::hold_for_purge`]).
+/// for that. Before its pass a tick purges each group's log through the
+/// snapshot that covers its removals ([`plan_scrub_purges`], #669), and
+/// holds the group's builds until that purge lands
+/// ([`SnapshotBuildCoordinator::hold_for_purge`]).
 pub struct SnapshotDriver {
     registry: RaftGroupHandleRegistry,
     coordinator: SnapshotBuildCoordinator,
@@ -572,14 +573,23 @@ impl SnapshotDriver {
         }
     }
 
-    /// One tick: a pass of snapshot builds, then the purges through
-    /// covering snapshots. `store_trouble` says that the store health gate's
+    /// One tick: the purges through covering snapshots, then a pass of
+    /// snapshot builds. `store_trouble` says that the store health gate's
     /// latest tick was bad ([`should_drive_snapshots`]). Returns the pause
     /// before the next tick.
     pub async fn tick(&mut self, store_trouble: bool) -> Duration {
         let coordinator = self.coordinator.clone();
         let cadence = self.cadence;
         let limits = self.limits;
+        let lagging = self
+            .wal_lagging
+            .as_ref()
+            .map(|lagging| lagging.groups())
+            .unwrap_or_default();
+        // The purges through covering snapshots first (#669): they are
+        // cheap, and a pass may wait long for build slots and hand-offs.
+        self.purge_through_covering_snapshots(&self.registry.metrics_snapshot(), &lagging)
+            .await;
         // The builds first: a group whose build ends after this read still
         // counts as in flight, and one whose build ended before it shows, in
         // the metrics read next, the log after the build freed it, never the
@@ -606,11 +616,6 @@ impl SnapshotDriver {
         );
         coordinator.add_purging(&mut building);
         let mut pause = self.interval;
-        let lagging = self
-            .wal_lagging
-            .as_ref()
-            .map(|lagging| lagging.groups())
-            .unwrap_or_default();
         if !lagging.is_empty() {
             tracing::info!(
                 groups = ?lagging,
@@ -731,8 +736,6 @@ impl SnapshotDriver {
             }
         }
         self.last_held = held;
-        self.purge_through_covering_snapshots(&snaps, &lagging)
-            .await;
         pause
     }
 
