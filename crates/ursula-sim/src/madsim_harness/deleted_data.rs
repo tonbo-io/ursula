@@ -61,6 +61,7 @@ use super::journal_cluster::set_snapshot_drivers;
 use super::journal_cluster::wait_leader;
 
 pub(super) const BOUND_INVARIANT: &str = "deleted_data_leaves_within_bound";
+#[cfg(test)]
 pub(super) const HOLD_INVARIANT: &str = "operator_snapshot_waits_for_a_scrub_purge";
 
 /// The group the marked stream lives in.
@@ -76,6 +77,7 @@ pub(super) const DRIVERS: DriverPlan = DriverPlan {
     keep: 8,
     interval: Duration::from_millis(200),
 };
+#[cfg(test)]
 /// How long the leader's appends to the slow follower take in the
 /// operator-snapshot scenario.
 const SLOW_FOLLOWER: Duration = Duration::from_secs(5);
@@ -349,12 +351,23 @@ fn replica_state(cluster: &JournalCluster, node_id: u64) -> String {
         .into_iter()
         .find(|group| group.raft_group_id == GROUP)
         .map(|group| group.log);
+    let coordinator = cluster.coordinator(node_id);
     format!(
-        "applied {:?}, snapshot {published:?}, purged {:?}, state {:?}, work {:?}, log {log:?}",
+        "applied {:?}, snapshot {published:?}, purged {:?}, state {:?}, work {:?}, log {log:?}, \
+         driver running {}, builds {}, builds in flight {:?}, other groups {:?}",
         raft.last_applied.map(|log_id| log_id.index),
         raft.purged.map(|log_id| log_id.index),
         raft.state,
-        cluster.coordinator(node_id).work(GROUP, published),
+        coordinator.work(GROUP, published),
+        cluster.driver_running(node_id),
+        coordinator.running_builds(),
+        coordinator.builds_in_flight(),
+        cluster.node_registries[&node_id]
+            .metrics_snapshot()
+            .into_iter()
+            .filter(|group| group.raft_group_id != GROUP)
+            .map(|group| (group.raft_group_id, group.snapshot, group.purged, group.log))
+            .collect::<Vec<_>>(),
     )
 }
 
@@ -616,6 +629,7 @@ pub(super) async fn run_deleted_data_inner(
     }
 }
 
+#[cfg(test)]
 /// An operator's snapshot interleaved with a purge through a covering
 /// snapshot that the leader defers: the leader's appends to one follower
 /// take [`SLOW_FOLLOWER`], so its replication of the removal is in flight

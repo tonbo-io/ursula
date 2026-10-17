@@ -358,6 +358,13 @@ impl JournalCluster {
         }
     }
 
+    /// Whether `node_id`'s snapshot driver task runs.
+    pub(super) fn driver_running(&self, node_id: u64) -> bool {
+        self.driver_tasks
+            .get(&node_id)
+            .is_some_and(|driver| !driver.is_finished())
+    }
+
     /// The snapshot build coordinator `node_id`'s replicas share when the
     /// nodes run drivers.
     pub(super) fn coordinator(&self, node_id: u64) -> ursula_raft::SnapshotBuildCoordinator {

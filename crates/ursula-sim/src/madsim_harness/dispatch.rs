@@ -18,6 +18,7 @@ use super::accepted_loss::Shape as RecoveryPlanShape;
 use super::accepted_loss::run_recovery_plan_inner;
 use super::deleted_data::Controls as DeletedDataControls;
 use super::deleted_data::run_deleted_data_inner;
+#[cfg(test)]
 use super::deleted_data::run_operator_snapshot_under_purge_inner;
 use super::has_cold_write_fault_in_fault_plan;
 use super::has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan;
@@ -316,6 +317,7 @@ impl ThreeNodeRaftSim {
         )
     }
 
+    #[cfg(test)]
     /// Runs an operator's snapshot interleaved with a deferred purge
     /// through a covering snapshot (#669) with `controls`.
     pub(super) fn run_operator_snapshot_under_purge_report(
