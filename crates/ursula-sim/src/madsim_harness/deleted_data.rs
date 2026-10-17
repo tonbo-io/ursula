@@ -652,6 +652,8 @@ pub(super) async fn run_deleted_data_inner(
                 madsim::time::sleep(POLL).await;
             };
             let before_stop = metrics(&cluster, GROUP, covered);
+            // Counted before the restart, so the no-install check covers it.
+            let sent_before_restart = cluster.full_snapshots_to(GROUP, covered);
             cluster.stop_node(covered).await;
             cluster.wals[&covered].power_loss_losing_unsynced().await;
             trace.push(SimEvent::FaultApplied {
@@ -684,7 +686,7 @@ pub(super) async fn run_deleted_data_inner(
                     before_stop.purged.map(|log_id| log_id.index),
                     "{context}: node {covered} purged its log at startup"
                 );
-                restart = Some((covered, cluster.full_snapshots_to(GROUP, covered)));
+                restart = Some((covered, sent_before_restart));
                 ursula_stream::sim_controls::set_off(
                     ursula_stream::sim_controls::Defence::ScrubPurge,
                     false,
