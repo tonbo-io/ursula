@@ -131,6 +131,8 @@ const BOUND_DRIVERS: DriverPlan = DriverPlan {
 /// How long the leader's appends to the slow follower take in the
 /// operator-snapshot scenario.
 const SLOW_FOLLOWER: Duration = Duration::from_secs(5);
+/// How long a stopped follower stays down after the removal applied.
+const FOLLOWER_DOWN_AFTER_REMOVAL: Duration = Duration::from_secs(1);
 /// How long the leader stays down after it applied the removal: longer
 /// than the bound less a quarter of it.
 const LEADER_DOWN: Duration = Duration::from_secs(10);
@@ -1037,7 +1039,7 @@ pub(super) async fn run_deleted_data_inner(
         Fault::None => {}
         Fault::FollowerDown => {
             let node_id = down.expect("a follower is down");
-            seen.wait(&mut cluster, &mut background, Duration::from_secs(1))
+            seen.wait(&mut cluster, &mut background, FOLLOWER_DOWN_AFTER_REMOVAL)
                 .await;
             cluster.start_node(node_id).await;
             trace.push(SimEvent::FaultApplied {
@@ -1216,16 +1218,17 @@ pub(super) async fn run_deleted_data_inner(
     match (plan.removal, background, expiry) {
         (Removal::Expiry(traffic), Some(background), Some((expires_at, _))) => {
             // The expiry anchor: every replica kept the bound within the
-            // sweep's interval and grace, and the bound, of the expiry.
+            // sweep's interval and grace, and the bound, of the expiry, and
+            // a replica a fault kept down within the bound of its return.
             let anchor = expires_at
                 + expiry_sweep::interval(BOUND_DRIVERS.max_age)
                 + expiry_sweep::CLOCK_GRACE
                 + EXPIRY_SLACK
                 + BOUND_DRIVERS.max_age
-                + if plan.fault == Fault::LeaderStopped {
-                    EXPIRY_LEADER_DOWN
-                } else {
-                    Duration::ZERO
+                + match plan.fault {
+                    Fault::LeaderStopped => EXPIRY_LEADER_DOWN,
+                    Fault::FollowerDown => FOLLOWER_DOWN_AFTER_REMOVAL + EXPIRY_SLACK,
+                    Fault::None | Fault::PowerLossAfterSnapshot => Duration::ZERO,
                 };
             if madsim::time::Instant::now() > anchor + POLL {
                 fail(
