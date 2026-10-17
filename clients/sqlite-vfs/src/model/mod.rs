@@ -1021,9 +1021,10 @@ impl ModelServer {
 
     /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`. A single
     /// `Range` is answered `206` with its bytes, or `416` when it selects none (extensions §2.5).
-    /// Its refusals come in the server's order: `404` without the stream, `404` when the snapshot
-    /// is not the latest, `416`, then the precondition (`412`). The `404` of an existing stream
-    /// and the `416` name the stream's token.
+    /// Its refusals come in the specification's order (extensions: Snapshot Metadata on HEAD and
+    /// Stream Incarnation, and Immutable Resources): `404` without the stream, `404` when the
+    /// snapshot is not the latest, `416`, then the precondition (`412`). The `404` of an existing
+    /// stream and the `416` name the stream's token.
     fn snapshot_read(
         &mut self,
         path: &str,

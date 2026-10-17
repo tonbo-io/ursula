@@ -298,8 +298,10 @@ pub(crate) fn decide_claim(exchange: &Exchange) -> ClaimDecision {
     }
 }
 
-/// A read under our token `ours`: of the reconcile, the probe, the pre-check, or an open's
-/// catch-up. A `416` decides by [`decide_past_tail`].
+/// A read under our token `ours`: of the reconcile, the probe or the pre-check, whose `416`
+/// decides by [`decide_past_tail`]. An open's catch-up reads its answers here too, but decides
+/// every one but bytes and a `410` again from [`decide_status`], so its `416` sends the HEAD that
+/// re-runs the open table whatever token it names.
 pub(crate) fn decide_read(exchange: &Exchange, ours: Incarnation) -> ReadDecision {
     let answer = match exchange {
         Exchange::NoAnswer(_) => return ReadDecision::Common(no_answer()),

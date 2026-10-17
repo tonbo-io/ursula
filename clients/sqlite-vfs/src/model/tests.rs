@@ -1391,7 +1391,7 @@ fn s4_8_read_refusals_come_in_the_order_404_410_416_412() {
     assert_eq!((past.status, past.typed), refused(416, token));
 }
 
-/// A snapshot read's refusals in the server's order: `404` without the stream, `404` when the
+/// A snapshot read's refusals in the specification's order: `404` without the stream, `404` when the
 /// snapshot is not the latest and `416` for a range past its end, both naming the token, then the
 /// precondition (`412`).
 #[test]
