@@ -2669,7 +2669,11 @@ struct RaftProxy {
 impl RaftProxy {
     async fn start(target: &str) -> Self {
         use tower::ServiceExt;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // A reserved port: an ephemeral one could be a port `free_port`
+        // already handed to a node that has not bound it yet.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", free_port()))
+            .await
+            .unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         let channel = tonic::transport::Endpoint::from_shared(target.to_owned())
             .unwrap()
