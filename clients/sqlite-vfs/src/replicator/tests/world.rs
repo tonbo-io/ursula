@@ -1036,8 +1036,15 @@ impl World {
                     self.salvaged.extend(log.applied.iter().cloned());
                     self.salvaged.push(Arc::clone(&log.rebuilt));
                 }
+                // A log a power loss emptied builds afresh, and the commits it lost may still land
+                // from requests its process had out: the fresh generation's first claim keeps
+                // property 13's exemption (design: Resets, `stale`).
+                let power_lost = self.owners[index].power_lost;
                 let (owner, actions) = self.fresh_owner(false, activation);
-                self.owners[index] = owner;
+                self.owners[index] = Owner {
+                    power_lost,
+                    ..owner
+                };
                 let before = Before {
                     takeover: true,
                     ..Before::default()
@@ -4854,5 +4861,58 @@ fn copies_bind_past_claims_under_the_activations_they_share() {
             Vec::<String>::new(),
             "seed {seed}"
         );
+    }
+}
+
+/// Found at two million cases: owner 0's host loses power with its commits unsynced, one of them
+/// still out, and the log holds no data; its reopen builds afresh at the tail. The lost commit then
+/// lands from the request its process had out, before the fresh generation's claim applies, and
+/// a provisional open of that generation finds it past its acknowledged offset: `stale`, the
+/// power loss's exemption of property 13 (design: Resets) carried across the fresh build.
+#[test]
+fn a_commit_lost_to_a_power_loss_landing_after_a_fresh_build_goes_stale() {
+    use Op::Commit;
+    use Op::Deliver;
+    let ops = vec![
+        Deliver(0),
+        Deliver(0),
+        Commit(0),
+        Deliver(0),
+        Commit(0),
+        Deliver(0),
+        Op::PowerLoss(0, 2),
+        Op::Retain(0),
+        Op::Reopen(0),
+        Commit(0),
+        Op::Reopen(0),
+        Op::LowerLimit,
+        Deliver(3),
+        Op::DropRequest(0),
+        Op::DropRequest(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Op::ProvisionalRestart(0, 0),
+        Commit(0),
+    ];
+    for shared_activation in [false, true] {
+        let knobs = Knobs {
+            shared_activation,
+            ..Knobs::default()
+        };
+        let mut world = World::new(knobs, 0, Arc::default());
+        for op in &ops {
+            world.step(op);
+        }
+        world.heal();
+        assert!(
+            matches!(
+                world.owners[0].inst.replicator,
+                Replicator::Reset(ResetKind::Stale)
+            ),
+            "{:?}",
+            world.owners[0].inst.replicator
+        );
+        assert_eq!(world.violations, Vec::<String>::new());
     }
 }
