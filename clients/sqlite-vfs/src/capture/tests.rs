@@ -40,6 +40,10 @@ impl Wal {
 
     /// Writes `data` at `off`; at the commit point returns the captured record, whose page count
     /// the commit limit's check counted without reading anything back.
+    #[expect(
+        clippy::panic_in_result_fn,
+        reason = "every capture shape test checks the commit limit's page count"
+    )]
     fn write(
         &mut self,
         off: i64,
