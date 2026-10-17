@@ -37,6 +37,7 @@ use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
 use ursula_headers::WriteOutcome;
 use ursula_headers::names;
+use ursula_headers::write_outcome::inventory;
 
 use super::CheckpointId;
 use super::HistoryEvent;
@@ -1033,7 +1034,7 @@ fn snapshots_are_keyed_by_offset_and_digest() {
             incarnation: Some(token)
         })
     );
-    assert!(past.body.is_empty());
+    assert_eq!(error_code(&past), ErrorCode::RangeNotSatisfiable);
     // A header read asks for the first bytes alone (`Range`), answered `206`.
     let header = world.send(&Request::snapshot_read(
         Offset::from_u64(64),
@@ -1930,4 +1931,399 @@ fn parts_need_a_cold_store_and_are_swept_after_a_day() {
         assert_eq!(error_code(&refused), code);
         assert_eq!(refused.outcome, Some(outcome));
     }
+}
+
+/// Every refusal the model answers, as a client reads it: the server's error body (extensions §11)
+/// with the code the server gives the same case, the JSON content type and `Cache-Control:
+/// no-store`. A write's answer reads as `Refused` with that code through
+/// `ursula_headers::classify`, and where the write-outcome inventory has the case's row, which
+/// the server's own tests pin, its status, code and outcome are the model's.
+#[test]
+fn every_refusal_carries_the_servers_error_body() {
+    const MISSING: &str = "/v1/stream/b/missing";
+    let world = World::new();
+    let refused = |what: &str,
+                   path: &str,
+                   request: &Request,
+                   status: u16,
+                   code: ErrorCode,
+                   row: Option<&str>| {
+        let raw = world.server().handle(path, request);
+        let header = |name: &str| {
+            raw.headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(raw.status, status, "{what}");
+        assert_eq!(header("cache-control"), Some("no-store"), "{what}");
+        assert_eq!(
+            header("content-type"),
+            Some(ErrorBody::CONTENT_TYPE),
+            "{what}"
+        );
+        let answer = raw.parse(request);
+        if request.method == Method::Head {
+            assert!(answer.body.is_empty(), "{what}: a HEAD answer has no body");
+            return;
+        }
+        let body = ErrorBody::parse(&answer.body).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert_eq!(body.code, code, "{what}");
+        assert!(!body.message.is_empty(), "{what}");
+        if request.write_kind().is_some() && (400..500).contains(&status) {
+            assert_eq!(
+                answer.outcome,
+                Some(WriteOutcome::Refused(code.clone())),
+                "{what}"
+            );
+        }
+        if let Some(id) = row {
+            let row = inventory::row(id).unwrap_or_else(|| panic!("{what}: no row {id}"));
+            assert_eq!(
+                (row.status, row.code.as_ref(), answer.outcome.as_ref()),
+                (status, Some(&code), Some(&row.outcome)),
+                "{what}: row {id}"
+            );
+        }
+    };
+    let token = world.create();
+    let other = Incarnation::try_from(token.get() ^ 1).unwrap();
+    let snapshot_read =
+        |offset: u64, part| Request::snapshot_read(Offset::from_u64(offset), token, part);
+    let header_read = || snapshot_read(0, crate::wire::SnapshotPart::Header);
+
+    // No stream.
+    let head = Request::new(Method::Head, Target::Stream);
+    refused("HEAD", MISSING, &head, 404, ErrorCode::StreamNotFound, None);
+    let claim = write(tokened(token), 1, 0, b"claim");
+    refused(
+        "append",
+        MISSING,
+        &claim,
+        404,
+        ErrorCode::StreamNotFound,
+        Some("not-found"),
+    );
+    let from_start = read(None, None);
+    refused(
+        "read",
+        MISSING,
+        &from_start,
+        404,
+        ErrorCode::StreamNotFound,
+        None,
+    );
+    refused(
+        "snapshot read",
+        MISSING,
+        &header_read(),
+        404,
+        ErrorCode::StreamNotFound,
+        None,
+    );
+    let delete = Request::new(Method::Delete, Target::Stream);
+    refused(
+        "DELETE",
+        PATH,
+        &delete,
+        405,
+        ErrorCode::MethodNotAllowed,
+        None,
+    );
+
+    // Creates.
+    let keyed_create = Request {
+        keys: claim.keys.clone(),
+        ..create()
+    };
+    refused(
+        "keyed create",
+        PATH,
+        &keyed_create,
+        400,
+        ErrorCode::InvalidProducer,
+        None,
+    );
+    let other_create = Request {
+        content_type: Some("text/plain".to_owned()),
+        ..create()
+    };
+    refused(
+        "create of another configuration",
+        PATH,
+        &other_create,
+        409,
+        ErrorCode::StreamAlreadyExistsConflict,
+        None,
+    );
+
+    // Writes.
+    let mismatched = write(tokened(other), 1, 0, b"claim");
+    refused(
+        "another token",
+        PATH,
+        &mismatched,
+        412,
+        ErrorCode::IncarnationMismatch,
+        Some("incarnation-mismatch"),
+    );
+    world.producer(&claim);
+    let next = |body: &[u8]| write(tokened(token), 1, 1, body);
+    refused(
+        "a seq gap",
+        PATH,
+        &write(tokened(token), 1, 5, b"gap"),
+        409,
+        ErrorCode::ProducerSeqConflict,
+        Some("producer-seq-gap"),
+    );
+    refused(
+        "a held key",
+        PATH,
+        &write(tokened(token), 1, 0, b"another claim"),
+        403,
+        ErrorCode::ProducerKeyConflict,
+        Some("producer-key-conflict"),
+    );
+    refused(
+        "an empty append",
+        PATH,
+        &next(b""),
+        400,
+        ErrorCode::EmptyAppend,
+        Some("bad-request"),
+    );
+    let untyped = Request {
+        content_type: None,
+        ..next(b"x")
+    };
+    refused(
+        "no content type",
+        PATH,
+        &untyped,
+        400,
+        ErrorCode::MissingContentType,
+        None,
+    );
+    let text = Request {
+        content_type: Some("text/plain".to_owned()),
+        ..next(b"x")
+    };
+    refused(
+        "another content type",
+        PATH,
+        &text,
+        409,
+        ErrorCode::ContentTypeMismatch,
+        Some("conflict"),
+    );
+    refused(
+        "a body unlike its digest",
+        PATH,
+        &with_body(&next(b"x"), b"y"),
+        400,
+        ErrorCode::ProducerDigestMismatch,
+        None,
+    );
+    let closing = Request {
+        closes: true,
+        ..next(b"x")
+    };
+    refused(
+        "an append that closes",
+        PATH,
+        &closing,
+        501,
+        ErrorCode::Internal,
+        None,
+    );
+
+    // Reads, at the tail 5.
+    refused(
+        "a read past the tail",
+        PATH,
+        &read(tokened(token), Some(6)),
+        416,
+        ErrorCode::OffsetOutOfRange,
+        None,
+    );
+    refused(
+        "a read under another token",
+        PATH,
+        &read(tokened(other), None),
+        412,
+        ErrorCode::IncarnationMismatch,
+        None,
+    );
+    refused(
+        "no snapshot",
+        PATH,
+        &header_read(),
+        404,
+        ErrorCode::SnapshotNotFound,
+        None,
+    );
+
+    // Snapshots and retention.
+    let retain = |offset: u64| Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        ..Request::new(Method::Put, Target::Retention {
+            offset: Offset::from_u64(offset),
+        })
+    };
+    refused(
+        "retention without a snapshot",
+        PATH,
+        &retain(1),
+        409,
+        ErrorCode::SnapshotConflict,
+        None,
+    );
+    refused(
+        "a publish beyond the tail",
+        PATH,
+        &publish(token, 6, b"image").0,
+        409,
+        ErrorCode::SnapshotConflict,
+        None,
+    );
+    let (mut tampered, _) = publish(token, 5, b"image");
+    tampered.body = Arc::from(&b"tampered"[..]);
+    refused(
+        "a snapshot unlike its digest",
+        PATH,
+        &tampered,
+        400,
+        ErrorCode::SnapshotDigestMismatch,
+        None,
+    );
+    assert_eq!(world.send(&publish(token, 5, b"image").0).status, 204);
+    assert_eq!(world.send(&retain(5)).status, 204);
+    refused(
+        "a publish below retention",
+        PATH,
+        &publish(token, 4, b"image").0,
+        410,
+        ErrorCode::StreamGone,
+        Some("gone"),
+    );
+    refused(
+        "another snapshot at the latest's offset",
+        PATH,
+        &publish(token, 5, b"other").0,
+        409,
+        ErrorCode::SnapshotConflict,
+        Some("snapshot-conflict"),
+    );
+    refused(
+        "a range outside the snapshot",
+        PATH,
+        &snapshot_read(5, crate::wire::SnapshotPart::Chunk {
+            first: 100,
+            last: 200,
+        }),
+        416,
+        ErrorCode::RangeNotSatisfiable,
+        None,
+    );
+    refused(
+        "a read below retention",
+        PATH,
+        &read(tokened(token), Some(4)),
+        410,
+        ErrorCode::StreamGone,
+        None,
+    );
+
+    // Parts, past the latest snapshot at 5.
+    world.producer(&next(b"more"));
+    let unknown = PartId::new("never-staged.part").unwrap();
+    let probe = commit(token, 9, std::slice::from_ref(&unknown), digest_of(b"x"));
+    refused(
+        "a commit without a cold store",
+        PATH,
+        &probe,
+        501,
+        ErrorCode::NoColdStore,
+        None,
+    );
+    with_cold_store(&world);
+    refused(
+        "an unknown part",
+        PATH,
+        &probe,
+        400,
+        ErrorCode::UnknownPart,
+        None,
+    );
+    let miscounted = Request {
+        body: Arc::from(&b""[..]),
+        ..probe.clone()
+    };
+    refused(
+        "a malformed manifest",
+        PATH,
+        &miscounted,
+        400,
+        ErrorCode::InvalidPartsCommit,
+        None,
+    );
+    let part = stage(&world, token, 9, b"part").unwrap();
+    refused(
+        "parts unlike their digest",
+        PATH,
+        &commit(token, 9, &[part], digest_of(b"other")),
+        400,
+        ErrorCode::SnapshotDigestMismatch,
+        None,
+    );
+    let part = stage(&world, token, 9, b"part").unwrap();
+    let limits = world.server().limits();
+    world.server().set_limits(Limits {
+        max_snapshot_bytes: Some(1),
+        ..limits
+    });
+    refused(
+        "parts above the snapshot limit",
+        PATH,
+        &commit(token, 9, &[part], digest_of(b"part")),
+        413,
+        ErrorCode::SnapshotTooLarge,
+        None,
+    );
+    refused(
+        "a commit beyond the tail",
+        PATH,
+        &commit(token, 10, std::slice::from_ref(&unknown), digest_of(b"x")),
+        409,
+        ErrorCode::SnapshotConflict,
+        None,
+    );
+
+    // The request limit, then the closed stream.
+    world.server().set_limits(Limits {
+        max_request_bytes: 4,
+        ..limits
+    });
+    refused(
+        "a body above the request limit",
+        PATH,
+        &write(tokened(token), 1, 2, b"too large"),
+        413,
+        ErrorCode::RequestTooLarge,
+        Some("too-large"),
+    );
+    world.server().set_limits(Limits::default());
+    world.server().close(PATH).unwrap();
+    refused(
+        "an append to a closed stream",
+        PATH,
+        &write(tokened(token), 1, 2, b"late"),
+        409,
+        ErrorCode::StreamClosed,
+        Some("stream-closed"),
+    );
 }

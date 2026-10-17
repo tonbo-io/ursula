@@ -13,8 +13,10 @@
 //! snapshots uploaded in parts (#618: minted part ids, the commit's key checked first, the parts a
 //! final answer consumes, the one-day sweep on the model's clock; #622: the `429` bound per stream
 //! id, `DELETE {stream}/snapshot/parts`, and the `503` of a second commit or discard of one stream
-//! incarnation, scripted), monotonic retention, and scripted faults. Out of scope: immutable
-//! reads, the timing of answers before the body, the producer cap, SSE and JSON streams.
+//! incarnation, scripted), monotonic retention, every refusal with the server's error body and
+//! its code (extensions §11), and scripted faults, which answer as the layer they stand for. Out
+//! of scope: immutable reads, the timing of answers before the body, the producer cap, SSE and
+//! JSON streams.
 //!
 //! Requests come in through [`ModelServer::exchange`] (with faults) or [`ModelServer::handle`]
 //! (without), in process ([`crate::transport::model::ModelTransport`]) or over HTTP/1.1
@@ -109,6 +111,10 @@ pub(crate) const MAX_STAGED_BYTES: u64 = 2 << 30;
 /// How long before a part's or a discard's `HEAD` a part of an earlier incarnation of the stream
 /// was staged for that request to delete it (#622).
 const RETIRED_MIN_AGE_MS: u64 = 60 * 1000;
+
+/// `Cache-Control`, and its value on every error answer of the server.
+const CACHE_CONTROL: &str = "cache-control";
+const NO_STORE: &str = "no-store";
 
 /// The base protocol's content type of a stream created without one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -489,9 +495,7 @@ impl ModelServer {
 
     /// The typed `413` of the request limit (extensions: Server Metadata).
     fn too_large(&mut self) -> RawAnswer {
-        let mut answer = RawAnswer::new(SizeLimit::STATUS);
-        SizeLimit::Request(self.limits.max_request_bytes).render(answer.emit());
-        answer
+        size_refusal(SizeLimit::Request(self.limits.max_request_bytes))
     }
 
     /// The next scripted fault for `method` around the server's answer, `handle`.
@@ -564,7 +568,7 @@ impl ModelServer {
                 self.snapshot_read(path, request, offset, ranges)
             }
             (Method::Put, Target::Retention { offset }) => self.retain(path, request, offset),
-            _ => RawAnswer::new(405),
+            _ => refusal(405, ErrorCode::MethodNotAllowed),
         }
     }
 
@@ -575,21 +579,24 @@ impl ModelServer {
         let stream = self
             .streams
             .get_mut(path)
-            .ok_or_else(|| RawAnswer::new(404))?;
+            .ok_or_else(|| refusal(404, ErrorCode::StreamNotFound))?;
         precondition(stream, request, history)?;
         Ok(stream)
     }
 
     /// `HEAD`: the server's identity on every answer, `404` included
     /// (extensions: Server Metadata), and the stream's metadata
-    /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
+    /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation). The `404` has the headers
+    /// of its error answer and, as every answer to a `HEAD`, no body.
     fn head(&mut self, path: &str) -> RawAnswer {
-        let mut answer = RawAnswer::new(404);
-        self.identity.render(answer.emit());
         let Some(stream) = self.streams.get(path) else {
+            let mut answer = refusal(404, ErrorCode::StreamNotFound);
+            answer.body.clear();
+            self.identity.render(answer.emit());
             return answer;
         };
-        answer.status = 200;
+        let mut answer = RawAnswer::new(200);
+        self.identity.render(answer.emit());
         let head = StreamHead::new(
             stream.token_in(self.history),
             stream.tail(),
@@ -613,7 +620,7 @@ impl ModelServer {
     /// `409` otherwise, `400` with producer headers.
     fn create(&mut self, path: &str, request: &Request) -> RawAnswer {
         if request.keys.producer.is_some() {
-            return RawAnswer::new(400);
+            return refusal(400, ErrorCode::InvalidProducer);
         }
         let content_type = request
             .content_type
@@ -622,7 +629,7 @@ impl ModelServer {
         let history = self.history;
         if let Some(stream) = self.streams.get(path) {
             if stream.content_type != content_type || stream.closed != request.closes {
-                return RawAnswer::new(409);
+                return refusal(409, ErrorCode::StreamAlreadyExistsConflict);
             }
             return created(200, stream, history);
         }
@@ -689,7 +696,7 @@ impl ModelServer {
             if close_only && applying.is_none() {
                 return closed_append(stream.tail());
             }
-            let mut answer = RawAnswer::new(StreamClosedConflict::STATUS);
+            let mut answer = refusal(StreamClosedConflict::STATUS, ErrorCode::StreamClosed);
             StreamClosedConflict {
                 final_offset: stream.tail(),
             }
@@ -697,7 +704,8 @@ impl ModelServer {
             return answer;
         }
         if request.closes && !close_only {
-            return RawAnswer::new(501);
+            // Not modeled: the code the server's net gives a `5xx` that no handler rendered.
+            return refusal(501, ErrorCode::Internal);
         }
         if let Some(refusal) = content_refusal(stream, request, close_only) {
             return refusal;
@@ -746,15 +754,19 @@ impl ModelServer {
     fn read(&mut self, path: &str, request: &Request, from: Option<Offset>) -> RawAnswer {
         let chunk = self.limits.read_chunk;
         let Some(stream) = self.streams.get(path) else {
-            return RawAnswer::new(404);
+            return refusal(404, ErrorCode::StreamNotFound);
         };
         let from = from.unwrap_or(Offset::ZERO);
         let tail = stream.tail();
         if from < stream.retained {
-            return read_refused(410, stream.token_in(self.history));
+            return read_refused(410, ErrorCode::StreamGone, stream.token_in(self.history));
         }
         if from > tail {
-            return read_refused(416, stream.token_in(self.history));
+            return read_refused(
+                416,
+                ErrorCode::OffsetOutOfRange,
+                stream.token_in(self.history),
+            );
         }
         if let Err(mismatch) = precondition(stream, request, self.history) {
             return mismatch;
@@ -780,20 +792,29 @@ impl ModelServer {
 
     /// `PUT {stream}/snapshot/{offset}`, keyed by `(offset, digest)` (extensions: Publish
     /// Snapshot): `204` with the digest while it is the latest, `409` naming the latest otherwise.
+    /// After the model's own checks of the body, in the server's order: `410` below retention,
+    /// `409` beyond the tail, then the latest snapshot, each naming `Stream-Next-Offset`.
     fn publish(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
         let history = self.history;
         let stream = match self.stream(path, request) {
             Ok(stream) => stream,
             Err(answer) => return answer,
         };
-        let (Some(content_type), Some(digest)) = (&request.content_type, request.snapshot_digest)
-        else {
-            return RawAnswer::new(400);
+        // The model's own checks, which the server does not make: the VFS always names both, and
+        // the body matching its digest.
+        let Some(content_type) = &request.content_type else {
+            return refusal(400, ErrorCode::MissingContentType);
+        };
+        let Some(digest) = request.snapshot_digest else {
+            return refusal(400, ErrorCode::InvalidHeader);
         };
         let mut digester = SnapshotDigester::new(content_type);
         digester.update(&request.body);
-        if digester.finalize() != digest || offset > stream.tail() {
-            return RawAnswer::new(400);
+        if digester.finalize() != digest {
+            return refusal(400, ErrorCode::SnapshotDigestMismatch);
+        }
+        if let Some(refused) = out_of_range(offset, stream.retained, stream.tail()) {
+            return refused;
         }
         let published = SnapshotRef { offset, digest };
         let answer = match &stream.snapshot {
@@ -801,9 +822,11 @@ impl ModelServer {
                 if latest.snapshot.offset > offset
                     || (latest.snapshot.offset == offset && latest.snapshot.digest != digest) =>
             {
-                SnapshotPublishAnswer::Conflict {
+                let mut answer = publish_answer(&SnapshotPublishAnswer::Conflict {
                     latest: latest.snapshot,
-                }
+                });
+                answer.header(names::STREAM_NEXT_OFFSET, stream.tail().to_string());
+                return answer;
             }
             _ => {
                 if stream.snapshot.as_ref().map(|s| s.snapshot) != Some(published) {
@@ -819,9 +842,7 @@ impl ModelServer {
                 }
             }
         };
-        let mut raw = RawAnswer::new(answer.status());
-        answer.render(raw.emit());
-        raw
+        publish_answer(&answer)
     }
 
     /// `POST {stream}/snapshot/{offset}/parts` (extensions §2.2): `201` naming a part id minted
@@ -962,21 +983,15 @@ impl ModelServer {
             }
             Some(_) | None => {}
         }
-        if offset < retained {
-            let mut answer = RawAnswer::new(410);
-            answer.header(names::STREAM_NEXT_OFFSET, retained.to_string());
-            return answer;
+        if let Some(refused) = out_of_range(offset, retained, tail) {
+            return refused;
         }
-        if offset > tail {
-            let mut answer = RawAnswer::new(409);
-            answer.header(names::STREAM_NEXT_OFFSET, tail.to_string());
-            return answer;
-        }
+        // The model's own check, which the server does not make: the VFS always names it.
         let Some(content_type) = request.content_type.clone() else {
-            return RawAnswer::new(400);
+            return refusal(400, ErrorCode::MissingContentType);
         };
         let Ok(manifest) = PartsManifest::parse(commit.parts, &request.body) else {
-            return RawAnswer::new(400);
+            return refusal(400, ErrorCode::InvalidPartsCommit);
         };
         let mut bodies = Vec::with_capacity(manifest.parts().len());
         for id in manifest.parts() {
@@ -984,16 +999,14 @@ impl ModelServer {
                 Some(part) if part.path == path && part.token == token => {
                     bodies.push(Arc::clone(&part.body));
                 }
-                Some(_) | None => return RawAnswer::new(400),
+                Some(_) | None => return refusal(400, ErrorCode::UnknownPart),
             }
         }
         let total = bodies.iter().try_fold(0_u64, |total, body| {
             total.checked_add(u64::try_from(body.len()).ok()?)
         });
         if total.is_none_or(|total| total > max_snapshot) {
-            let mut answer = RawAnswer::new(SizeLimit::STATUS);
-            SizeLimit::Snapshot(max_snapshot).render(answer.emit());
-            return answer;
+            return size_refusal(SizeLimit::Snapshot(max_snapshot));
         }
         let assembled: Arc<[u8]> = Arc::from(bodies.concat());
         // The copy consumes the parts, whatever its digest.
@@ -1003,10 +1016,10 @@ impl ModelServer {
         let mut digester = SnapshotDigester::new(&content_type);
         digester.update(&assembled);
         if digester.finalize() != commit.digest {
-            return RawAnswer::new(400);
+            return refusal(400, ErrorCode::SnapshotDigestMismatch);
         }
         let Some(stream) = self.streams.get_mut(path) else {
-            return RawAnswer::new(404);
+            return refusal(404, ErrorCode::StreamNotFound);
         };
         stream.snapshot = Some(Snapshot {
             snapshot: ours,
@@ -1034,7 +1047,7 @@ impl ModelServer {
     ) -> RawAnswer {
         let history = self.history;
         let Some(stream) = self.streams.get(path) else {
-            return RawAnswer::new(404);
+            return refusal(404, ErrorCode::StreamNotFound);
         };
         let token = stream.token_in(history);
         let Some(snapshot) = stream
@@ -1042,7 +1055,7 @@ impl ModelServer {
             .as_ref()
             .filter(|s| s.snapshot.offset == offset)
         else {
-            return read_refused(404, token);
+            return read_refused(404, ErrorCode::SnapshotNotFound, token);
         };
         let total = u64::try_from(snapshot.body.len()).unwrap_or(u64::MAX);
         let range = match ranges {
@@ -1054,7 +1067,7 @@ impl ModelServer {
         let (status, body) = match range {
             None => (200, snapshot.body.as_ref()),
             Some(unsatisfied @ ContentRange::Unsatisfied { .. }) => {
-                let mut answer = read_refused(416, token);
+                let mut answer = read_refused(416, ErrorCode::RangeNotSatisfiable, token);
                 unsatisfied.render(answer.emit());
                 return answer;
             }
@@ -1084,7 +1097,8 @@ impl ModelServer {
     }
 
     /// `PUT {stream}/retention/{offset}`, monotonic (extensions: Publish Snapshot): `204` with the
-    /// retained offset, at or above `offset`, and `409` for a boundary past the latest snapshot.
+    /// retained offset, at or above `offset`, and `409` naming the tail for a boundary that moves
+    /// retention past the latest snapshot.
     fn retain(&mut self, path: &str, request: &Request, offset: Offset) -> RawAnswer {
         let history = self.history;
         let stream = match self.stream(path, request) {
@@ -1092,13 +1106,17 @@ impl ModelServer {
             Err(answer) => return answer,
         };
         // Extensions §2.2: a boundary newer than the latest published snapshot is refused, so is
-        // any boundary of a stream without one.
-        if stream
-            .snapshot
-            .as_ref()
-            .is_none_or(|latest| offset > latest.snapshot.offset)
+        // any boundary of a stream without one; one at or below the retained one is a repeat, as
+        // the server answers it.
+        if offset > stream.retained
+            && stream
+                .snapshot
+                .as_ref()
+                .is_none_or(|latest| offset > latest.snapshot.offset)
         {
-            return RawAnswer::new(409);
+            let mut answer = refusal(409, ErrorCode::SnapshotConflict);
+            answer.header(names::STREAM_NEXT_OFFSET, stream.tail().to_string());
+            return answer;
         }
         stream.retained = stream.retained.max(offset);
         let mut answer = RawAnswer::new(204);
@@ -1120,12 +1138,12 @@ fn content_refusal(stream: &Stream, request: &Request, close_only: bool) -> Opti
     if close_only {
         // Its body is empty, so its digest is checked alike below.
     } else if request.body.is_empty() {
-        return Some(RawAnswer::new(400));
+        return Some(refusal(400, ErrorCode::EmptyAppend));
     } else {
         match request.content_type.as_deref() {
-            None => return Some(RawAnswer::new(400)),
+            None => return Some(refusal(400, ErrorCode::MissingContentType)),
             Some(content_type) if content_type != stream.content_type => {
-                let mut answer = RawAnswer::new(409);
+                let mut answer = refusal(409, ErrorCode::ContentTypeMismatch);
                 answer.header(names::STREAM_NEXT_OFFSET, stream.tail().to_string());
                 return Some(answer);
             }
@@ -1138,7 +1156,7 @@ fn content_refusal(stream: &Stream, request: &Request, close_only: bool) -> Opti
         .as_ref()
         .and_then(|write| write.digest)
         .is_none_or(|digest| digest == producer_digest(&request.body));
-    (!digest_ok).then(|| RawAnswer::new(400))
+    (!digest_ok).then(|| refusal(400, ErrorCode::ProducerDigestMismatch))
 }
 
 /// The answer to an unkeyed close-only write: `204`, the tail and `Stream-Closed: true`.
@@ -1155,7 +1173,7 @@ fn precondition(stream: &Stream, request: &Request, history: u64) -> Result<(), 
     let current = stream.token_in(history);
     match request.keys.precondition {
         Some(precondition) if precondition.incarnation != current => {
-            let mut answer = RawAnswer::new(IncarnationMismatch::STATUS);
+            let mut answer = refusal(IncarnationMismatch::STATUS, ErrorCode::IncarnationMismatch);
             IncarnationMismatch {
                 current: Some(current),
             }
@@ -1168,15 +1186,35 @@ fn precondition(stream: &Stream, request: &Request, history: u64) -> Result<(), 
 
 /// A read's `404`, `410` or `416` of an existing stream, naming its token as the server does
 /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation).
-fn read_refused(status: u16, token: Incarnation) -> RawAnswer {
-    let mut answer = RawAnswer::new(status);
+fn read_refused(status: u16, code: ErrorCode, token: Incarnation) -> RawAnswer {
+    let mut answer = refusal(status, code);
     answer.header(names::STREAM_INCARNATION, token.to_string());
     answer
 }
 
-/// A snapshot publish's answer, rendered.
+/// A snapshot publish's own range refusals, each naming `Stream-Next-Offset`: `410` below
+/// `retained`, naming it, and `409` beyond `tail`, naming it. `None` within the stream.
+fn out_of_range(offset: Offset, retained: Offset, tail: Offset) -> Option<RawAnswer> {
+    let (status, code, next) = if offset < retained {
+        (410, ErrorCode::StreamGone, retained)
+    } else if offset > tail {
+        (409, ErrorCode::SnapshotConflict, tail)
+    } else {
+        return None;
+    };
+    let mut answer = refusal(status, code);
+    answer.header(names::STREAM_NEXT_OFFSET, next.to_string());
+    Some(answer)
+}
+
+/// A snapshot publish's answer, rendered: a conflict with its error body.
 fn publish_answer(answer: &SnapshotPublishAnswer) -> RawAnswer {
-    let mut raw = RawAnswer::new(answer.status());
+    let mut raw = match answer {
+        SnapshotPublishAnswer::Published { .. } => RawAnswer::new(answer.status()),
+        SnapshotPublishAnswer::Conflict { .. } => {
+            refusal(answer.status(), ErrorCode::SnapshotConflict)
+        }
+    };
     answer.render(raw.emit());
     raw
 }
@@ -1197,15 +1235,39 @@ fn no_cold_store() -> RawAnswer {
     answer
 }
 
-/// The error body of `code` with its fixed message, as the server renders it (extensions §11).
-fn error_body(answer: &mut RawAnswer, code: ErrorCode) {
-    answer.header(CONTENT_TYPE, ErrorBody::CONTENT_TYPE);
-    answer.body = ErrorBody::fixed(code).render().into_bytes();
+/// An error answer of `status` with the error body of `code`, as the server renders every one.
+fn refusal(status: u16, code: ErrorCode) -> RawAnswer {
+    let mut answer = RawAnswer::new(status);
+    error_body(&mut answer, code);
+    answer
 }
 
-/// A producer answer, rendered.
+/// The error body of `code` with its fixed message, as the server renders it (extensions §11).
+fn error_body(answer: &mut RawAnswer, code: ErrorCode) {
+    render_error(answer, &ErrorBody::fixed(code));
+}
+
+/// `body` as the server's one renderer of an error answer sends it: `Cache-Control: no-store`,
+/// the JSON content type and the body.
+fn render_error(answer: &mut RawAnswer, body: &ErrorBody) {
+    answer.header(CACHE_CONTROL, NO_STORE);
+    answer.header(CONTENT_TYPE, ErrorBody::CONTENT_TYPE);
+    answer.body = body.render().into_bytes();
+}
+
+/// The typed `413` of `limit` with the error body of its code, as the server's size refusal.
+fn size_refusal(limit: SizeLimit) -> RawAnswer {
+    let mut answer = refusal(SizeLimit::STATUS, limit.error_code());
+    limit.render(answer.emit());
+    answer
+}
+
+/// A producer answer, rendered: a refusal with the error body of its code.
 fn producer_answer(answer: &ProducerAnswer) -> RawAnswer {
-    let mut raw = RawAnswer::new(answer.status());
+    let mut raw = match answer.error_code() {
+        Some(code) => refusal(answer.status(), code),
+        None => RawAnswer::new(answer.status()),
+    };
     answer.render(raw.emit());
     raw
 }

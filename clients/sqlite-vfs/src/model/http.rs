@@ -13,6 +13,9 @@
 //! answers every write after its body, in the order of #581 addendum 4, which an early answer
 //! follows too, so the answer is the same.
 //!
+//! Every refusal carries the server's error body (extensions §11), but those of a head the model
+//! cannot read (`400`, `431`), which hyper sends bare before the server's handlers run.
+//!
 //! Control routes, under `/__model/` (query values are taken verbatim, not percent-decoded):
 //!
 //! - `GET /__model/health`: `200`.
@@ -44,6 +47,8 @@ use std::time::Duration;
 
 use ursula_headers::ClusterId;
 use ursula_headers::Epoch;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
 use ursula_headers::SizeLimit;
 
@@ -56,6 +61,9 @@ use super::ModelServer;
 use super::faults::Fault;
 use super::faults::FaultSyntax;
 use super::faults::Scripted;
+use super::refusal;
+use super::render_error;
+use super::size_refusal;
 use crate::wire::Method;
 use crate::wire::RawAnswer;
 use crate::wire::Request;
@@ -210,8 +218,9 @@ fn read_request(
             .map(|(_, value)| String::from_utf8_lossy(value).into_owned())
     };
     let close = header("connection").is_some_and(|v| v.eq_ignore_ascii_case("close"));
+    // Not modeled: the code the server's net gives a `5xx` that no handler rendered.
     if header("transfer-encoding").is_some() {
-        return Ok(Err(answer(RawAnswer::new(501))));
+        return Ok(Err(answer(refusal(501, ErrorCode::Internal))));
     }
     let control = target.starts_with("/__model/");
     let limit = if control {
@@ -220,7 +229,9 @@ fn read_request(
         lock(server).limits().max_request_bytes
     };
     let length = match header("content-length").map(|v| v.parse::<u64>()) {
-        None if matches!(method, "PUT" | "POST") => return Ok(Err(answer(RawAnswer::new(411)))),
+        None if matches!(method, "PUT" | "POST") => {
+            return Ok(Err(answer(refusal(411, ErrorCode::InvalidRequest))));
+        }
         None => 0,
         Some(Ok(length)) if length <= limit => length,
         // Decided from `Content-Length`, before the body (extensions: Server Metadata), through the
@@ -235,17 +246,13 @@ fn read_request(
             if !expects_continue && length <= MAX_DRAIN_BYTES {
                 io::copy(&mut reader.by_ref().take(length), &mut io::sink())?;
             }
-            let refusal = match Method::parse(method) {
+            let refused = match Method::parse(method) {
                 Some(method) if !control => {
                     delivered(lock(server).exchange_too_large(method), method)
                 }
-                _ => {
-                    let mut refusal = RawAnswer::new(SizeLimit::STATUS);
-                    SizeLimit::Request(limit).render(refusal.emit());
-                    answer(refusal)
-                }
+                _ => answer(size_refusal(SizeLimit::Request(limit))),
             };
-            return Ok(Err(refusal));
+            return Ok(Err(refused));
         }
         Some(Err(_not_a_length)) => return Ok(Err(answer(RawAnswer::new(400)))),
     };
@@ -275,26 +282,34 @@ fn trim_line(line: &[u8]) -> &[u8] {
 
 fn reply(incoming: &Incoming, server: &Mutex<ModelServer>) -> Reply {
     let Some(method) = Method::parse(&incoming.method) else {
-        return answer(RawAnswer::new(405));
+        return answer(refusal(405, ErrorCode::MethodNotAllowed));
     };
     if let Some(route) = incoming.target.strip_prefix("/__model/") {
         return answer(control(method, route, &incoming.body, server));
     }
-    let request = Target::split(method, &incoming.target).and_then(|(path, target)| {
-        let request = Request::parse(
-            method,
-            target,
-            incoming
-                .headers
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_slice())),
-            incoming.body.clone(),
-        )?;
-        Ok((path, request))
-    });
-    let (path, request) = match request {
+    let (path, target) = match Target::split(method, &incoming.target) {
+        Ok(split) => split,
+        // An offset in the path, or the read's query.
+        Err(e) => {
+            let code = match e {
+                WireError::Header(_) => ErrorCode::InvalidOffset,
+                WireError::Query(_) => ErrorCode::InvalidQuery,
+            };
+            return answer(malformed(code, &e));
+        }
+    };
+    let request = Request::parse(
+        method,
+        target,
+        incoming
+            .headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_slice())),
+        incoming.body.clone(),
+    );
+    let request = match request {
         Ok(request) => request,
-        Err(e) => return answer(text(400, &e.to_string())),
+        Err(e) => return answer(malformed(ErrorCode::InvalidHeader, &e)),
     };
     let mut model = lock(server);
     if model.holds(&request) {
@@ -330,6 +345,13 @@ fn answer(answer: RawAnswer) -> Reply {
         answer,
         head_only: false,
     }
+}
+
+/// The `400` of a malformed request, with the error body of `code` naming why.
+fn malformed(code: ErrorCode, why: &WireError) -> RawAnswer {
+    let mut answer = RawAnswer::new(400);
+    render_error(&mut answer, &ErrorBody::new(code, why.to_string()));
+    answer
 }
 
 fn text(status: u16, body: &str) -> RawAnswer {
