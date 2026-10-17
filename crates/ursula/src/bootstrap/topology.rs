@@ -49,6 +49,17 @@ impl Topology {
         }
     }
 
+    /// Whether the node's groups snapshot to the configured external
+    /// snapshot store (`snapshot_store_configured`). A single node keeps its
+    /// snapshots inline whatever `storage.snapshot.backend` says (#669): a
+    /// single node rolled back to 0.8.0 reads only its inline pointer files.
+    pub fn uses_snapshot_store(&self, snapshot_store_configured: bool) -> bool {
+        match self {
+            Topology::SingleNode { .. } => false,
+            Topology::StaticCluster { .. } => snapshot_store_configured,
+        }
+    }
+
     /// Construct a [`Topology::StaticCluster`] with validated membership.
     pub fn static_cluster(
         node_id: u64,

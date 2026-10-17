@@ -173,6 +173,19 @@ impl StreamRegistry {
         }
     }
 
+    /// The stream of the TTL heap's front entry, when that entry is due at
+    /// `now_ms`; `None` when the heap is empty or its front is not due yet.
+    ///
+    /// `None` is exact: every live stream with an expiry has one armed entry
+    /// at or before its true expiry, so a front past `now_ms` means no
+    /// stream has expired. `Some` may name a stale entry, of a stream that
+    /// was removed or renewed since. A sweep at `now_ms` still makes
+    /// progress on it: [`Self::pop_expired`] discards or re-arms that front.
+    pub(super) fn ttl_front_due(&self, now_ms: u64) -> Option<BucketStreamId> {
+        let Reverse(front) = self.ttl.entries.peek()?;
+        (front.expires_at_ms <= now_ms).then(|| front.stream_id.clone())
+    }
+
     fn arm_ttl_entry(&mut self, stream_id: &BucketStreamId, key: StreamKey) {
         let Some(slot) = self.slots.get(key) else {
             return;
@@ -381,14 +394,28 @@ mod tests {
                         reference.push(&registry, &stream_id);
                     }
                     _ => loop {
+                        let due = registry.ttl_front_due(now);
                         let actual = registry.pop_expired(now);
                         let expected = reference.pop_expired(&registry, now);
                         assert_eq!(actual, expected, "seed {seed} at {now}");
+                        // The front check is exact when it finds nothing due.
+                        if due.is_none() {
+                            assert_eq!(actual, None, "seed {seed} at {now}: front not due");
+                        }
                         let Some(expired) = actual else {
                             break;
                         };
                         registry.remove(&expired);
                     },
+                }
+                // A front not due means no live stream has expired.
+                if registry.ttl_front_due(now).is_none() {
+                    assert!(
+                        registry
+                            .slots()
+                            .all(|slot| !stream_is_expired(&slot.metadata, now)),
+                        "seed {seed} at {now}: an expired stream behind a front not due"
+                    );
                 }
                 assert!(
                     registry.ttl.entries.len() <= 2 * live_ttl_streams(&registry) + 1,

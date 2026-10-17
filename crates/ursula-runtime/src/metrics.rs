@@ -463,6 +463,11 @@ runtime_metrics! {
     counter snapshot_gc_deleted_objects;
     counter snapshot_gc_skipped_unreferenced_voter;
     counter snapshot_gc_failed_passes;
+    // The leader's background expiry sweep (#669): the sweep commands its
+    // passes committed, and the groups the latest pass left with expired
+    // streams for the next one.
+    counter ttl_expiry_sweeps;
+    counter ttl_expiry_sweep_due_groups;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -815,6 +820,12 @@ impl RuntimeMetricsInner {
             .fetch_add_relaxed(sample.skipped_unreferenced_voter);
         self.snapshot_gc_failed_passes
             .fetch_add_relaxed(sample.failed);
+    }
+
+    /// Records one expiry sweep pass over the node's groups (#669).
+    pub(crate) fn record_ttl_expiry_sweep(&self, sweeps: u64, due_groups: u64) {
+        self.ttl_expiry_sweeps.fetch_add_relaxed(sweeps);
+        self.ttl_expiry_sweep_due_groups.store_relaxed(due_groups);
     }
 
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
@@ -1261,6 +1272,8 @@ mod metric_manifest_tests {
         "snapshot_gc_deleted_objects",
         "snapshot_gc_skipped_unreferenced_voter",
         "snapshot_gc_failed_passes",
+        "ttl_expiry_sweeps",
+        "ttl_expiry_sweep_due_groups",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",

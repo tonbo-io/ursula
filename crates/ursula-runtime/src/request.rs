@@ -516,12 +516,17 @@ pub struct AdvanceRetentionResponse {
     pub hot_backlog: Option<WriteHotBacklog>,
 }
 
-/// One leader-side `TidyStream` pass over a group (bounded-state F0): the
-/// engine proposes `TidyStream` for at most `max_streams` streams with
-/// normalization debt at `now_ms`. Followers propose nothing.
+/// One leader-side tidy pass over a group (bounded-state F0). The engine
+/// first sweeps expired streams: it proposes at most `max_expiry_sweeps`
+/// `TouchStreamAccess { renew_ttl: false }` commands at
+/// [`crate::expiry_sweep::sweep_now_ms`] of `now_ms`, each naming the front
+/// of the group's TTL index ([`crate::expiry_sweep`]). It then proposes
+/// `TidyStream` for at most `max_streams` streams with normalization debt at
+/// `now_ms`. Followers propose nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TidyStreamsRequest {
     pub max_streams: usize,
+    pub max_expiry_sweeps: usize,
     pub now_ms: u64,
 }
 
@@ -531,6 +536,25 @@ pub struct TidyStreamsResponse {
     pub tidied: u64,
     /// Tidied streams that still report debt after their command.
     pub debt_remaining: u64,
+    /// Expiry sweep commands committed by this pass.
+    #[serde(default)]
+    pub expiry_sweeps: u64,
+    /// Groups whose sweep stopped at its command cap or its time budget
+    /// while expired streams remained (0 or 1 for one group).
+    #[serde(default)]
+    pub expiry_due_groups: u64,
+}
+
+impl TidyStreamsResponse {
+    /// Adds another group's pass to this total.
+    pub fn add(&mut self, other: &Self) {
+        self.tidied = self.tidied.saturating_add(other.tidied);
+        self.debt_remaining = self.debt_remaining.saturating_add(other.debt_remaining);
+        self.expiry_sweeps = self.expiry_sweeps.saturating_add(other.expiry_sweeps);
+        self.expiry_due_groups = self
+            .expiry_due_groups
+            .saturating_add(other.expiry_due_groups);
+    }
 }
 
 /// Result of one replicated `TidyStream` command.

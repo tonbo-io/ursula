@@ -4584,3 +4584,167 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
         });
     }
 }
+
+/// A create of `stream_id` that expires at `expires_at_ms`.
+#[cfg(not(madsim))]
+fn expiring_create(
+    stream_id: ursula_shard::BucketStreamId,
+    expires_at_ms: u64,
+) -> GroupWriteCommand {
+    let mut request = create_req(stream_id);
+    request.stream_expires_at_ms = Some(expires_at_ms);
+    request.now_ms = 1;
+    GroupWriteCommand::from(request)
+}
+
+/// #669: a group's leader sweeps the streams that expired in it in its
+/// tidy pass, and the only entries the sweep appends are
+/// `TouchStreamAccess { renew_ttl: false }` at its clock less the grace:
+/// the command a read of an expired stream already proposed in 0.8.0, which
+/// a 0.8.0 replica applies the same way.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_leader_sweeps_expired_streams_with_the_0_8_0_touch_only() {
+    let (_wal_root, log_store) = fresh_journal_store();
+    let mut engine =
+        RaftGroupEngine::new_single_node_on_log_store(placement(), log_store.clone(), None)
+            .await
+            .expect("create raft group engine");
+    wait_history(&engine).await;
+    for index in 0..300 {
+        engine
+            .raft
+            .client_write(expiring_create(
+                bsid(&format!("expiring-{index:03}")),
+                5_000,
+            ))
+            .await
+            .expect("create an expiring stream");
+    }
+    engine
+        .raft
+        .client_write(create_command(bsid("live")))
+        .await
+        .expect("create a live stream");
+    let before = engine
+        .snapshot(placement())
+        .await
+        .expect("snapshot")
+        .group_commit_index;
+
+    let report = engine
+        .tidy_streams(
+            ursula_runtime::TidyStreamsRequest {
+                max_streams: 0,
+                max_expiry_sweeps: 16,
+                now_ms: 20_000,
+            },
+            placement(),
+        )
+        .await
+        .expect("a tidy pass");
+    // 257 streams, then the other 43.
+    assert_eq!(report.expiry_sweeps, 2, "{report:?}");
+    assert_eq!(report.expiry_due_groups, 0, "{report:?}");
+    let snapshot = engine.snapshot(placement()).await.expect("snapshot");
+    assert_eq!(snapshot.group_commit_index, before.saturating_add(2));
+
+    let mut store = log_store.clone();
+    let mut reader = store.get_log_reader().await;
+    let entries = reader
+        .try_get_log_entries(before.saturating_add(1)..=snapshot.group_commit_index)
+        .await
+        .expect("read the sweep's entries");
+    assert_eq!(entries.len(), 2);
+    for entry in &entries {
+        assert!(
+            matches!(
+                &entry.payload,
+                EntryPayload::Normal(GroupWriteCommand::Stream(
+                    ursula_stream::StreamCommand::TouchStreamAccess {
+                        now_ms: 19_000,
+                        renew_ttl: false,
+                        ..
+                    }
+                ))
+            ),
+            "the sweep appended {:?}",
+            entry.payload
+        );
+    }
+    let gauges = engine.state_gauges(placement()).await.expect("gauges");
+    assert_eq!(gauges.streams, 1);
+
+    // Nothing left: the next pass appends nothing.
+    let report = engine
+        .tidy_streams(
+            ursula_runtime::TidyStreamsRequest {
+                max_streams: 0,
+                max_expiry_sweeps: 16,
+                now_ms: 20_000,
+            },
+            placement(),
+        )
+        .await
+        .expect("an idle pass");
+    assert_eq!(report.expiry_sweeps, 0);
+    engine.shutdown().await.expect("shutdown raft group engine");
+}
+
+/// #669: only a group's leader sweeps: a follower's tidy pass proposes
+/// nothing, and the leader's removes the streams on every replica.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_follower_proposes_no_expiry_sweep() {
+    let (_registry, mut engines, leader_id, _wal_roots) =
+        build_three_node_cluster("ursula-expiry-sweep-follower-test", None).await;
+    let leader_index = usize::try_from(leader_id.saturating_sub(1)).expect("leader id fits usize");
+    let follower_index = if leader_index == 0 { 1 } else { 0 };
+    wait_history(&engines[leader_index]).await;
+    let created = engines[leader_index]
+        .raft
+        .client_write(expiring_create(bsid("expiring"), 5_000))
+        .await
+        .expect("create an expiring stream");
+    let created_index = created.log_id.index();
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(created_index), "create replicated")
+            .await
+            .expect("wait for the create");
+    }
+    let request = ursula_runtime::TidyStreamsRequest {
+        max_streams: 0,
+        max_expiry_sweeps: 16,
+        now_ms: 20_000,
+    };
+    let report = engines[follower_index]
+        .tidy_streams(request, placement())
+        .await
+        .expect("a follower's pass");
+    assert_eq!(report, ursula_runtime::TidyStreamsResponse::default());
+    let report = engines[leader_index]
+        .tidy_streams(request, placement())
+        .await
+        .expect("the leader's pass");
+    assert_eq!(report.expiry_sweeps, 1, "{report:?}");
+    let swept = created_index.saturating_add(1);
+    for engine in &engines {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .applied_index_at_least(Some(swept), "sweep replicated")
+            .await
+            .expect("wait for the sweep");
+        let read = read_stream_via_state_machine(engine, bsid("expiring"), 16)
+            .await
+            .expect("access the state machine");
+        assert!(
+            matches!(&read, Err(err) if err.code() == Some(StreamErrorCode::StreamNotFound)),
+            "the replica still holds the expired stream: {read:?}"
+        );
+    }
+    shutdown_all(&engines).await;
+}

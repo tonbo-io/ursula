@@ -271,7 +271,8 @@ probe flapping.
 
 `RAFT_LOG_PRESSURE` means the node's unsnapshotted Raft log is over twice
 `raft.snapshot_log_budget`. The node refuses writes with a body until
-snapshots bring the log below 1.5 times the budget. Before it gets there, the
+snapshots bring the log below 1.5 times the budget. Only a cluster node answers
+it. A node without `raft.peers` never refuses writes for its log in 0.8.x. Before it gets there, the
 snapshot driver runs more snapshot builds at once the further the log is past
 the budget, up to `raft.snapshot_build_max_concurrency`. When writes still
 reach the limit, the node's metrics show how far the log got

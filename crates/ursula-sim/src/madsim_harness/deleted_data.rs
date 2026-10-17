@@ -20,6 +20,18 @@
 //! replica's time counts from when it applies the removal, again after it
 //! restarts.
 //!
+//! The `deleted-data-after-expiry` seeds remove the stream by its TTL
+//! instead: it expires, nothing reads it, and the group either writes
+//! nothing more or takes plain appends to another stream, which never sweep.
+//! The run plays the tidy worker's role, which cannot run under madsim: every
+//! [`ursula_runtime::expiry_sweep::interval`] of the bound, each replica's
+//! tidy pass sweeps at the run's virtual wall clock, and only the leader's
+//! proposes. A replica's time counts from the first look at which its local
+//! read answers not found, again after it restarts. Every replica keeps the
+//! bound within the sweep's interval, its clock grace and the bound of the
+//! expiry. Seeds stop a follower across the expiry, stop the leader just
+//! before it, or cut a replica's power right after its covering snapshot.
+//!
 //! A second scenario interleaves an operator's snapshot with a purge
 //! through a covering snapshot that the leader defers while a slow
 //! follower's replication reads the range: the operator's build starts only
@@ -42,6 +54,9 @@
 //! - [`Controls::WAL_AGE_OFF`]: the log drops the records, but a journal
 //!   segment that held their dead frames is freed only once the journal
 //!   outgrows its budget, so a small journal keeps them in its files (a).
+//! - [`Controls::SWEEP_OFF`]: no leader sweeps, so an expired stream that
+//!   nothing reads stays in the group, quiet or taking plain appends, and in
+//!   its snapshot.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -61,6 +76,8 @@ use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
+use ursula_runtime::TidyStreamsRequest;
+use ursula_runtime::expiry_sweep;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
 
@@ -73,6 +90,8 @@ use super::journal_cluster::DriverPlan;
 use super::journal_cluster::JournalCluster;
 use super::journal_cluster::NODES;
 use super::journal_cluster::group_placement;
+use super::journal_cluster::group_stream;
+use super::journal_cluster::leader_by_state;
 use super::journal_cluster::metrics;
 use super::journal_cluster::set_snapshot_drivers;
 use super::journal_cluster::wait_leader;
@@ -127,6 +146,24 @@ const POLL: Duration = Duration::from_millis(50);
 /// of entries before the removal: freeing the removed records copies across
 /// several segments and reports the quiet group lagging (#669).
 const ACROSS_SEGMENTS: [std::ops::RangeInclusive<u64>; 2] = [528..=531, 630..=649];
+
+/// Seeds of the `deleted-data-after-expiry` families: the marked stream
+/// expires, and its group's leader sweeps it in the background (#669).
+const AFTER_EXPIRY: [std::ops::RangeInclusive<u64>; 2] = [532..=539, 650..=679];
+/// How long after the run started the marked stream expires.
+const EXPIRES_AFTER: Duration = Duration::from_secs(3);
+/// How long before the expiry the leader stops in a `leader_stopped` run.
+const STOP_BEFORE_EXPIRY: Duration = Duration::from_millis(200);
+/// How long that leader stays down.
+const EXPIRY_LEADER_DOWN: Duration = Duration::from_secs(4);
+/// How often an `appends` run appends to the group's other stream.
+const TRAFFIC_EVERY: Duration = Duration::from_millis(100);
+/// The run's virtual wall clock at its start: any time past the epoch.
+const SIM_WALL_START_MS: u64 = 1_700_000_000_000;
+/// Past the clock grace, how late after the sweep's interval a replica may
+/// drop the expired stream: the sweep's own commands, and a new leader's
+/// election after a `leader_stopped` fault.
+const EXPIRY_SLACK: Duration = Duration::from_millis(500);
 
 /// The journals of a run of `seed`, and how many entries the quiet group
 /// writes before the removal.
@@ -184,6 +221,8 @@ pub(super) struct Controls {
     /// A journal segment that held dead frames is never sealed or freed for
     /// their age.
     wal_age_off: bool,
+    /// No leader sweeps expired streams in the background.
+    sweep_off: bool,
 }
 
 #[cfg(test)]
@@ -195,6 +234,7 @@ impl Controls {
         restore_off: false,
         purge_after_restart: false,
         wal_age_off: false,
+        sweep_off: false,
     };
     pub(super) const FLOOR_OFF: Self = Self {
         floor_off: true,
@@ -222,6 +262,10 @@ impl Controls {
     };
     pub(super) const WAL_AGE_OFF: Self = Self {
         wal_age_off: true,
+        ..Self::NONE
+    };
+    pub(super) const SWEEP_OFF: Self = Self {
+        sweep_off: true,
         ..Self::NONE
     };
 }
@@ -254,6 +298,7 @@ fn set_defences(controls: Controls) {
     set_off(Defence::ScrubPurgeHold, controls.hold_off);
     set_off(Defence::RestorePurge, controls.restore_off);
     set_off(Defence::WalDirtyAge, controls.wal_age_off);
+    set_off(Defence::ExpirySweep, controls.sweep_off);
     if controls.purge_after_restart {
         set_off(Defence::ScrubPurge, true);
     }
@@ -297,11 +342,40 @@ impl Fault {
     }
 }
 
+/// How the marked stream leaves its group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A deletion of the stream.
+    Deletion,
+    /// A purge of its bucket.
+    BucketPurge,
+    /// Its TTL runs out and the leader's background sweep removes it.
+    Expiry(Traffic),
+}
+
+/// What else the marked stream's group writes in an expiry run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Traffic {
+    /// Nothing.
+    Quiet,
+    /// A plain append to the group's other stream every [`TRAFFIC_EVERY`],
+    /// which never sweeps.
+    Appends,
+}
+
+impl Traffic {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Appends => "appends",
+        }
+    }
+}
+
 /// The plan of one run.
 #[derive(Debug)]
 struct Plan {
-    /// A bucket purge, else a deletion of the stream.
-    purge: bool,
+    removal: Removal,
     fault: Fault,
     /// The marked records the stream holds.
     records: usize,
@@ -318,8 +392,20 @@ impl Plan {
             2 => Fault::LeaderStopped,
             _ => Fault::PowerLossAfterSnapshot,
         };
+        let purge = rng.next_bounded(2) == 0;
+        let removal = if AFTER_EXPIRY.iter().any(|seeds| seeds.contains(&seed)) {
+            Removal::Expiry(if (seed / 4) % 2 == 1 {
+                Traffic::Quiet
+            } else {
+                Traffic::Appends
+            })
+        } else if purge {
+            Removal::BucketPurge
+        } else {
+            Removal::Deletion
+        };
         Self {
-            purge: rng.next_bounded(2) == 0,
+            removal,
             fault,
             records: 1_usize.saturating_add(usize::try_from(rng.next_bounded(3)).expect("small")),
             pick: rng.next(),
@@ -346,13 +432,21 @@ macro_rules! on_leader {
     }};
 }
 
-/// Creates the marked stream on the group's leader and appends `records`
-/// marked records, then snapshots every replica once it applied them, so
-/// that every current snapshot holds the stream before it is removed.
-async fn write_marked_stream(cluster: &mut JournalCluster, records: usize, context: &str) {
+/// Creates the marked stream on the group's leader, expiring at
+/// `expires_at_ms` when set, and appends `records` marked records, then
+/// snapshots every replica once it applied them, so that every current
+/// snapshot holds the stream before it is removed.
+async fn write_marked_stream(
+    cluster: &mut JournalCluster,
+    records: usize,
+    expires_at_ms: Option<u64>,
+    context: &str,
+) {
     let placement = group_placement(GROUP);
+    let mut create = CreateStreamRequest::new(marked_stream(), "application/octet-stream");
+    create.stream_expires_at_ms = expires_at_ms;
     on_leader!(cluster, context, |engine| engine.create_stream(
-        CreateStreamRequest::new(marked_stream(), "application/octet-stream"),
+        create.clone(),
         placement,
         ColdWriteAdmission::default(),
     ));
@@ -596,20 +690,43 @@ async fn check_replica(
     }
 }
 
-/// When each running replica applied the removal at `index`, as observed:
-/// first, and last, which a restart resets as the replica applies it again.
-#[derive(Debug, Default)]
+/// How the run sees that a replica removed the stream.
+#[derive(Debug, Clone, Copy)]
+enum Detect {
+    /// It applied the removal at this log index.
+    Applied(u64),
+    /// Its local read of the stream answers not found: the stream expired
+    /// and a sweep the run cannot index in advance removed it.
+    Dropped,
+}
+
+/// When each running replica removed the stream, as observed: first, and
+/// last, which a restart resets as the replica removes it again.
+#[derive(Debug)]
 struct Applied {
+    detect: Detect,
     at: BTreeMap<u64, madsim::time::Instant>,
     last: BTreeMap<u64, madsim::time::Instant>,
 }
 
 impl Applied {
-    /// Records the replicas that applied `index` since the last look.
-    fn observe(&mut self, cluster: &JournalCluster, index: u64) {
+    fn new(detect: Detect) -> Self {
+        Self {
+            detect,
+            at: BTreeMap::new(),
+            last: BTreeMap::new(),
+        }
+    }
+
+    /// Records the replicas that removed the stream since the last look.
+    async fn observe(&mut self, cluster: &JournalCluster) {
         let now = madsim::time::Instant::now();
         for node_id in NODES {
-            if applied(cluster, node_id) >= Some(index) {
+            let removed = match self.detect {
+                Detect::Applied(index) => applied(cluster, node_id) >= Some(index),
+                Detect::Dropped => dropped(cluster, node_id).await,
+            };
+            if removed {
                 self.at.entry(node_id).or_insert(now);
                 self.last.entry(node_id).or_insert(now);
             } else {
@@ -623,16 +740,146 @@ impl Applied {
         self.last.remove(&node_id);
     }
 
-    /// Waits `duration`, observing all along.
-    async fn wait(&mut self, cluster: &JournalCluster, index: u64, duration: Duration) {
+    /// Waits `duration`, observing all along, while `background` runs.
+    async fn wait(
+        &mut self,
+        cluster: &mut JournalCluster,
+        background: &mut Option<Background>,
+        duration: Duration,
+    ) {
         let until = madsim::time::Instant::now() + duration;
         loop {
-            self.observe(cluster, index);
+            tick(background, cluster).await;
+            self.observe(cluster).await;
             if madsim::time::Instant::now() >= until {
                 return;
             }
             madsim::time::sleep(POLL).await;
         }
+    }
+}
+
+/// A read of the marked stream from `node_id`'s local state, at a clock
+/// before every expiry, so that the read itself removes nothing.
+async fn read_marked(
+    cluster: &JournalCluster,
+    node_id: u64,
+) -> Option<Result<ursula_runtime::ReadStreamResponse, ursula_runtime::GroupEngineError>> {
+    let engine = cluster.engines.get(&(GROUP, node_id))?;
+    Some(
+        engine
+            .sim_read_local_stream(
+                ReadStreamRequest {
+                    stream_id: marked_stream(),
+                    offset: 0,
+                    max_len: 1 << 20,
+                    now_ms: 0,
+                    leader_only: false,
+                    read_index: None,
+                    follower: FollowerRead::Prefix,
+                },
+                group_placement(GROUP),
+            )
+            .await,
+    )
+}
+
+/// Whether `node_id` runs and its local state no longer holds the stream.
+async fn dropped(cluster: &JournalCluster, node_id: u64) -> bool {
+    use ursula_runtime::StreamErrorCode;
+    matches!(
+        read_marked(cluster, node_id).await,
+        Some(Err(error)) if matches!(
+            error.code(),
+            Some(
+                StreamErrorCode::StreamNotFound
+                    | StreamErrorCode::BucketNotFound
+                    | StreamErrorCode::BucketErased
+            )
+        )
+    )
+}
+
+/// What runs beside the checks of an expiry run: the tidy worker's sweep,
+/// which cannot run under madsim (its wall clock reads 0 there), and the
+/// group's traffic.
+#[derive(Debug)]
+struct Background {
+    started: madsim::time::Instant,
+    traffic: Traffic,
+    next_sweep: madsim::time::Instant,
+    next_append: madsim::time::Instant,
+    /// Sweep commands the leaders committed.
+    sweeps: u64,
+}
+
+impl Background {
+    fn new(traffic: Traffic) -> Self {
+        let now = madsim::time::Instant::now();
+        Self {
+            started: now,
+            traffic,
+            next_sweep: now + expiry_sweep::interval(BOUND_DRIVERS.max_age),
+            next_append: now,
+            sweeps: 0,
+        }
+    }
+
+    /// The run's virtual wall clock.
+    fn wall_ms(&self) -> u64 {
+        SIM_WALL_START_MS
+            .saturating_add(u64::try_from(self.started.elapsed().as_millis()).expect("a short run"))
+    }
+
+    /// Runs what is due: an append to the group's other stream, then every
+    /// running replica's tidy pass, of which only the leader's proposes.
+    async fn tick(&mut self, cluster: &mut JournalCluster) {
+        let now = madsim::time::Instant::now();
+        if self.traffic == Traffic::Appends && now >= self.next_append {
+            self.next_append = now + TRAFFIC_EVERY;
+            if let Some(leader) = leader_by_state(cluster, GROUP)
+                && let Some(engine) = cluster.engines.get_mut(&(GROUP, leader))
+            {
+                // A lost append is followed by the next one.
+                drop(
+                    engine
+                        .append(
+                            AppendRequest::from_bytes(group_stream(GROUP), b"traffic;".to_vec()),
+                            group_placement(GROUP),
+                            ColdWriteAdmission::default(),
+                        )
+                        .await,
+                );
+            }
+        }
+        if now < self.next_sweep {
+            return;
+        }
+        self.next_sweep = now + expiry_sweep::interval(BOUND_DRIVERS.max_age);
+        let now_ms = self.wall_ms();
+        for node_id in NODES {
+            if let Some(engine) = cluster.engines.get_mut(&(GROUP, node_id))
+                && let Ok(report) = engine
+                    .tidy_streams(
+                        TidyStreamsRequest {
+                            max_streams: 0,
+                            max_expiry_sweeps: expiry_sweep::MAX_COMMANDS_PER_GROUP,
+                            now_ms,
+                        },
+                        group_placement(GROUP),
+                    )
+                    .await
+            {
+                self.sweeps = self.sweeps.saturating_add(report.expiry_sweeps);
+            }
+        }
+    }
+}
+
+/// Runs what of `background` is due, if the run has one.
+async fn tick(background: &mut Option<Background>, cluster: &mut JournalCluster) {
+    if let Some(background) = background {
+        background.tick(cluster).await;
     }
 }
 
@@ -646,6 +893,18 @@ pub(super) async fn run_deleted_data_inner(
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     let journals = Journals::for_seed(config.seed);
     let context = format!("seed {} {plan:?} {journals:?}", config.seed);
+    let mut background = match plan.removal {
+        Removal::Expiry(traffic) => Some(Background::new(traffic)),
+        Removal::Deletion | Removal::BucketPurge => None,
+    };
+    // The virtual clock of the expiry, and when it comes in this run.
+    let expiry = background.as_ref().map(|background| {
+        let at = madsim::time::Instant::now() + EXPIRES_AFTER;
+        let at_ms = background
+            .wall_ms()
+            .saturating_add(u64::try_from(EXPIRES_AFTER.as_millis()).expect("a short expiry"));
+        (at, at_ms)
+    });
     let mut cluster = JournalCluster::start_with_tuning(
         &format!("deleted-data-{}", config.seed),
         journals.tuning,
@@ -654,7 +913,13 @@ pub(super) async fn run_deleted_data_inner(
     // The quiet group's entries go first, so they share the segments of
     // the removed records and pin them.
     cluster.append(QUIET_GROUP, journals.quiet_entries).await;
-    write_marked_stream(&mut cluster, plan.records, &context).await;
+    write_marked_stream(
+        &mut cluster,
+        plan.records,
+        expiry.map(|(_, at_ms)| at_ms),
+        &context,
+    )
+    .await;
     let leader = wait_leader(&cluster, GROUP, &context).await;
     trace.push(SimEvent::LeaderElected { leader_id: leader });
     let followers = NODES
@@ -675,43 +940,124 @@ pub(super) async fn run_deleted_data_inner(
     }
     let placement = group_placement(GROUP);
     let before = applied_anywhere(&cluster);
-    let (remover, ()) = if plan.purge {
-        on_leader!(cluster, &context, |engine| async {
-            engine
-                .purge_bucket(BUCKET.to_owned(), placement)
-                .await
-                .map(drop)
-        })
-    } else {
-        on_leader!(cluster, &context, |engine| async {
-            engine
-                .delete_stream(
-                    DeleteStreamRequest {
-                        stream_id: marked_stream(),
-                        if_incarnation: None,
-                    },
-                    placement,
-                )
-                .await
-                .map(drop)
-        })
+    // The replica that removed the stream first, the log index it applied
+    // through then, and how the run sees the others remove it.
+    let (remover, removal_index, mut seen) = match plan.removal {
+        Removal::Deletion | Removal::BucketPurge => {
+            let (remover, ()) = if plan.removal == Removal::BucketPurge {
+                on_leader!(cluster, &context, |engine| async {
+                    engine
+                        .purge_bucket(BUCKET.to_owned(), placement)
+                        .await
+                        .map(drop)
+                })
+            } else {
+                on_leader!(cluster, &context, |engine| async {
+                    engine
+                        .delete_stream(
+                            DeleteStreamRequest {
+                                stream_id: marked_stream(),
+                                if_incarnation: None,
+                            },
+                            placement,
+                        )
+                        .await
+                        .map(drop)
+                })
+            };
+            let removal_index = removal_applied(&cluster, remover, before, &context).await;
+            let mut seen = Applied::new(Detect::Applied(removal_index));
+            seen.observe(&cluster).await;
+            (remover, removal_index, seen)
+        }
+        Removal::Expiry(_) => {
+            let (expires_at, _) = expiry.expect("an expiry run has an expiry");
+            let mut seen = Applied::new(Detect::Dropped);
+            if plan.fault == Fault::LeaderStopped {
+                let stop_at = expires_at
+                    .checked_sub(STOP_BEFORE_EXPIRY)
+                    .expect("the expiry is past the start");
+                let now = madsim::time::Instant::now();
+                if stop_at > now {
+                    seen.wait(&mut cluster, &mut background, stop_at - now)
+                        .await;
+                }
+                cluster.stop_node(leader).await;
+                trace.push(SimEvent::FaultApplied {
+                    phase: "leader_stopped_before_expiry".to_owned(),
+                });
+            }
+            // Within the sweep's interval and grace after the expiry, the
+            // first replica drops the stream.
+            let deadline = expires_at
+                + expiry_sweep::interval(BOUND_DRIVERS.max_age)
+                + expiry_sweep::CLOCK_GRACE
+                + EXPIRY_SLACK
+                + if plan.fault == Fault::LeaderStopped {
+                    EXPIRY_LEADER_DOWN
+                } else {
+                    Duration::ZERO
+                };
+            loop {
+                tick(&mut background, &mut cluster).await;
+                seen.observe(&cluster).await;
+                let first = seen.at.keys().next().copied();
+                if let Some(node_id) = first {
+                    let index = applied(&cluster, node_id).unwrap_or(0);
+                    break (node_id, index, seen);
+                }
+                if madsim::time::Instant::now() >= deadline {
+                    let holder = NODES
+                        .into_iter()
+                        .find(|node_id| cluster.engines.contains_key(&(GROUP, *node_id)))
+                        .expect("a running replica");
+                    let held = snapshot_holds_marker(&cluster, holder)
+                        .await
+                        .unwrap_or_else(|| "its state holds the stream".to_owned());
+                    fail(
+                        &mut trace,
+                        BOUND_INVARIANT,
+                        "stream_expired",
+                        format!(
+                            "{context}: node {holder}: {held}, past the sweep after the expiry \
+                             ({})",
+                            replica_state(&cluster, holder)
+                        ),
+                    );
+                }
+                madsim::time::sleep(POLL).await;
+            }
+        }
     };
-    let removal_index = removal_applied(&cluster, remover, before, &context).await;
     // The replica restarted after its covering snapshot, and the full
     // snapshots sent to it by then.
     let mut restart = None;
-    let mut seen = Applied::default();
-    seen.observe(&cluster, removal_index);
 
     match plan.fault {
         Fault::None => {}
         Fault::FollowerDown => {
             let node_id = down.expect("a follower is down");
-            seen.wait(&cluster, removal_index, Duration::from_secs(1))
+            seen.wait(&mut cluster, &mut background, Duration::from_secs(1))
                 .await;
             cluster.start_node(node_id).await;
             trace.push(SimEvent::FaultApplied {
                 phase: "follower_restarted_after_removal".to_owned(),
+            });
+        }
+        Fault::LeaderStopped if matches!(plan.removal, Removal::Expiry(_)) => {
+            // The leader stopped before the expiry: it drops the stream once
+            // it is back, from the new leader's log or snapshot.
+            let (expires_at, _) = expiry.expect("an expiry run has an expiry");
+            let back_at = expires_at - STOP_BEFORE_EXPIRY + EXPIRY_LEADER_DOWN;
+            let now = madsim::time::Instant::now();
+            if back_at > now {
+                seen.wait(&mut cluster, &mut background, back_at - now)
+                    .await;
+            }
+            cluster.start_node(leader).await;
+            seen.restarted(leader);
+            trace.push(SimEvent::FaultApplied {
+                phase: "leader_restarted_after_expiry".to_owned(),
             });
         }
         Fault::LeaderStopped => {
@@ -723,7 +1069,7 @@ pub(super) async fn run_deleted_data_inner(
             trace.push(SimEvent::FaultApplied {
                 phase: "leader_stopped_after_removal".to_owned(),
             });
-            seen.wait(&cluster, removal_index, LEADER_DOWN).await;
+            seen.wait(&mut cluster, &mut background, LEADER_DOWN).await;
             cluster.start_node(remover).await;
             seen.restarted(remover);
         }
@@ -731,13 +1077,15 @@ pub(super) async fn run_deleted_data_inner(
             // The first replica whose snapshot covers the removal.
             let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age;
             let covered = loop {
-                seen.observe(&cluster, removal_index);
+                tick(&mut background, &mut cluster).await;
+                seen.observe(&cluster).await;
                 let covered = NODES
                     .into_iter()
                     .filter(|node_id| {
-                        metrics(&cluster, GROUP, *node_id)
-                            .snapshot
-                            .is_some_and(|snapshot| snapshot.index >= removal_index)
+                        cluster.engines.contains_key(&(GROUP, *node_id))
+                            && metrics(&cluster, GROUP, *node_id)
+                                .snapshot
+                                .is_some_and(|snapshot| snapshot.index >= removal_index)
                     })
                     .collect::<Vec<_>>();
                 if !covered.is_empty() {
@@ -798,13 +1146,14 @@ pub(super) async fn run_deleted_data_inner(
         }
     }
 
-    // Every replica is checked once the bound passed since it applied the
-    // removal, and its files once the bound passed since it last did.
+    // Every replica is checked once the bound passed since it removed the
+    // stream, and its files once the bound passed since it last did.
     let mut checked = BTreeSet::new();
     let mut files_checked = BTreeSet::new();
     let deadline = madsim::time::Instant::now() + BOUND_DRIVERS.max_age.saturating_mul(2);
     while checked.len() < NODES.len() || files_checked.len() < NODES.len() {
-        seen.observe(&cluster, removal_index);
+        tick(&mut background, &mut cluster).await;
+        seen.observe(&cluster).await;
         let now = madsim::time::Instant::now();
         let due = seen
             .at
@@ -855,7 +1204,7 @@ pub(super) async fn run_deleted_data_inner(
         }
         assert!(
             now < deadline,
-            "{context}: replicas {:?} never applied the removal at {removal_index}",
+            "{context}: replicas {:?} never removed the stream (removal at {removal_index})",
             NODES
                 .iter()
                 .filter(|node_id| !seen.at.contains_key(*node_id))
@@ -863,15 +1212,50 @@ pub(super) async fn run_deleted_data_inner(
         );
         madsim::time::sleep(POLL).await;
     }
-    trace.push(SimEvent::DeletedDataLeft {
-        removal_index,
-        purge: plan.purge,
-        fault: plan.fault.name().to_owned(),
-        replicas: u64::try_from(checked.len()).expect("replica count fits u64"),
-        restore_purges: ursula_stream::sim_controls::fired(
-            ursula_stream::sim_controls::Defence::RestorePurge,
-        ),
-    });
+    let replicas = u64::try_from(checked.len()).expect("replica count fits u64");
+    match (plan.removal, background, expiry) {
+        (Removal::Expiry(traffic), Some(background), Some((expires_at, _))) => {
+            // The expiry anchor: every replica kept the bound within the
+            // sweep's interval and grace, and the bound, of the expiry.
+            let anchor = expires_at
+                + expiry_sweep::interval(BOUND_DRIVERS.max_age)
+                + expiry_sweep::CLOCK_GRACE
+                + EXPIRY_SLACK
+                + BOUND_DRIVERS.max_age
+                + if plan.fault == Fault::LeaderStopped {
+                    EXPIRY_LEADER_DOWN
+                } else {
+                    Duration::ZERO
+                };
+            if madsim::time::Instant::now() > anchor + POLL {
+                fail(
+                    &mut trace,
+                    BOUND_INVARIANT,
+                    "deleted_data_bound_passed",
+                    format!(
+                        "{context}: the replicas kept the bound only {:?} after the expiry",
+                        madsim::time::Instant::now() - expires_at
+                    ),
+                );
+            }
+            trace.push(SimEvent::ExpiredDataLeft {
+                removal_index,
+                traffic: traffic.name().to_owned(),
+                fault: plan.fault.name().to_owned(),
+                replicas,
+                sweeps: background.sweeps,
+            });
+        }
+        _ => trace.push(SimEvent::DeletedDataLeft {
+            removal_index,
+            purge: plan.removal == Removal::BucketPurge,
+            fault: plan.fault.name().to_owned(),
+            replicas,
+            restore_purges: ursula_stream::sim_controls::fired(
+                ursula_stream::sim_controls::Defence::RestorePurge,
+            ),
+        }),
+    }
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
         leader_id: leader,
@@ -903,7 +1287,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
         Journals::for_seed(config.seed).tuning,
     )
     .await;
-    write_marked_stream(&mut cluster, 2, &context).await;
+    write_marked_stream(&mut cluster, 2, None, &context).await;
     let leader = wait_leader(&cluster, GROUP, &context).await;
     trace.push(SimEvent::LeaderElected { leader_id: leader });
     let slow = NODES
@@ -1069,6 +1453,57 @@ mod tests {
                 first.outcome.trace.events.last()
             );
         }
+    }
+
+    /// #669: an expired stream that nothing reads, in a quiet group or one
+    /// that takes only plain appends, leaves every replica within the bound
+    /// once the leader's background sweep removed it, under every fault of
+    /// the family, the same way twice per seed.
+    #[test]
+    fn deleted_data_after_expiry_replays() {
+        let _guard = sim_test_guard();
+        for seed in 532..=539 {
+            let first = ThreeNodeRaftSim::run_deleted_data_with_controls_report(
+                config(seed),
+                Controls::default(),
+            );
+            let second = ThreeNodeRaftSim::run_deleted_data_with_controls_report(
+                config(seed),
+                Controls::default(),
+            );
+            assert_eq!(first, second, "seed {seed}");
+            assert!(
+                first.outcome.trace.events.iter().any(|event| matches!(
+                    event,
+                    SimEvent::ExpiredDataLeft {
+                        replicas: 3,
+                        sweeps: 1..,
+                        ..
+                    }
+                )),
+                "seed {seed}: {:?}",
+                first.outcome.trace.events.last()
+            );
+        }
+    }
+
+    /// Without the leader's sweep, an expired stream in a quiet group stays
+    /// in the group and its snapshot.
+    #[test]
+    fn negative_control_an_expired_stream_without_the_sweep_stays_in_a_quiet_group() {
+        let _guard = sim_test_guard();
+        let message = assert_fails(532, Controls::SWEEP_OFF, BOUND_INVARIANT);
+        assert!(message.contains("holds stream"), "{message}");
+    }
+
+    /// Without the leader's sweep, plain appends to the group's other stream
+    /// never remove the expired stream either: an engine applies a plain
+    /// append without the state machine's sweep.
+    #[test]
+    fn negative_control_plain_appends_never_sweep_an_expired_stream() {
+        let _guard = sim_test_guard();
+        let message = assert_fails(536, Controls::SWEEP_OFF, BOUND_INVARIANT);
+        assert!(message.contains("holds stream"), "{message}");
     }
 
     /// Runs `seed` under `controls`, which must fail `invariant`, and

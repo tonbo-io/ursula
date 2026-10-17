@@ -61,6 +61,7 @@ mod test_reexports {
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::participation::PeerParticipation;
+    pub(crate) use super::snapshot::LogWriteGate;
     pub(crate) use super::snapshot::ScrubPurge;
     pub(crate) use super::snapshot::StoreGateInputs;
     pub(crate) use super::snapshot::Trigger;
@@ -72,6 +73,7 @@ mod test_reexports {
     pub(crate) use super::snapshot::plan_scrub_purges;
     pub(crate) use super::snapshot::plan_snapshot_drive;
     pub(crate) use super::snapshot::resolve_snapshot_drive_interval_ms;
+    pub(crate) use super::snapshot::single_node_cadence;
     pub(crate) use super::snapshot::spawn_snapshot_driver;
     pub(crate) use super::snapshot::trigger_snapshot_build;
     pub(crate) use super::util::leader_counts;

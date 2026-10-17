@@ -108,6 +108,11 @@ pub enum Defence {
     /// the journal's size frees segments, so a small journal keeps a
     /// removed stream's records in its files.
     WalDirtyAge,
+    /// Each group's leader proposes `TouchStreamAccess { renew_ttl: false }`
+    /// for the streams that expired in its group, in its background tidy
+    /// pass (#669). Off, an expired stream leaves a group that takes no
+    /// write other than plain appends only once a request reaches it.
+    ExpirySweep,
 }
 
 #[cfg(madsim)]
@@ -117,8 +122,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 23]> = const { Cell::new([false; 23]) };
-        static FIRED: Cell<[u64; 23]> = const { Cell::new([0; 23]) };
+        static OFF: Cell<[bool; 24]> = const { Cell::new([false; 24]) };
+        static FIRED: Cell<[u64; 24]> = const { Cell::new([0; 24]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -146,6 +151,7 @@ mod switches {
             Defence::ScrubPurgeHold => 20,
             Defence::RestorePurge => 21,
             Defence::WalDirtyAge => 22,
+            Defence::ExpirySweep => 23,
         }
     }
 
@@ -168,7 +174,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 23]));
+        FIRED.with(|fired| fired.set([0; 24]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

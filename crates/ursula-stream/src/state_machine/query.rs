@@ -55,6 +55,17 @@ impl StreamStateMachine {
         Ok(renew_ttl && stream_ttl_renewal_due(stream, now_ms))
     }
 
+    /// The stream a leader's background expiry sweep names in the
+    /// `TouchStreamAccess { renew_ttl: false }` it proposes at `now_ms`
+    /// (bounded-stream-state F0), or `None` once no stream has expired at
+    /// `now_ms`. O(1): the front of the TTL index. The name may be stale, of
+    /// a stream removed or renewed since its entry was armed. The command's
+    /// apply still sweeps at `now_ms`, which discards or re-arms that front,
+    /// so each command makes progress.
+    pub fn expiry_sweep_target(&self, now_ms: u64) -> Option<BucketStreamId> {
+        self.registry.ttl_front_due(now_ms)
+    }
+
     /// Up to `max` stream ids strictly after `after`, in (bucket, stream)
     /// order. Leader-side cursors walk a group's streams with it.
     pub fn stream_ids_after(

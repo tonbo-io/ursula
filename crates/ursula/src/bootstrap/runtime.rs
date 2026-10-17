@@ -154,7 +154,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         .map(|interval| interval.as_duration().as_millis() as usize);
     let snapshot_drive_interval_ms = snapshot::resolve_snapshot_drive_interval_ms(
         configured_snapshot_drive_interval_ms,
-        snapshot_store.is_some(),
+        topology.uses_snapshot_store(snapshot_store.is_some()),
     );
     engine_config.snapshot_drive_interval_ms = snapshot_drive_interval_ms as u64;
     let registry = RaftGroupHandleRegistry::default()
@@ -222,7 +222,10 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         Some(registry),
     )?;
 
-    ursula_runtime::tidy_worker::spawn_tidy_worker(&spawned.runtime);
+    ursula_runtime::tidy_worker::spawn_tidy_worker(
+        &spawned.runtime,
+        config.raft.effective_deleted_data_max_age(),
+    );
     if spawned.runtime.has_cold_store() {
         spawn_cold_flush_worker_if_configured(&spawned.runtime, &config.storage.cold);
         spawn_cold_compaction_worker_if_configured(&spawned.runtime, &config.storage.cold);
@@ -230,6 +233,24 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         spawn_cold_index_repair_worker(&spawned.runtime);
         spawn_cold_orphan_sweep_worker(&spawned.runtime);
         spawn_cold_ref_offload_worker(&spawned.runtime);
+    }
+
+    // A single node that runs Raft drives its snapshots as a cluster node
+    // does (#669), with inline snapshots, an entry backstop no farther than
+    // OpenRaft's policy took it in 0.8.0, and no write gate.
+    if let (Topology::SingleNode { .. }, Some(registry), Some(wal)) =
+        (&topology, &spawned.raft_registry, &spawned.raft_wal)
+    {
+        snapshot::spawn_snapshot_driver(
+            &spawned.runtime,
+            registry,
+            None,
+            snapshot::LogWriteGate::Open,
+            snapshot_drive_interval_ms,
+            snapshot::single_node_cadence(&config.raft, topology.raft_group_count()),
+            Some(wal.maintenance()),
+            config.raft.snapshot_pressure_max_groups_per_tick,
+        );
     }
 
     if let (Topology::StaticCluster { peers, .. }, Some(participation)) =
@@ -242,19 +263,16 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         snapshot::spawn_snapshot_driver(
             &spawned.runtime,
             &registry,
-            snapshot_store,
-            StoreGateInputs {
-                s3: config.storage.cold.s3.as_ref(),
-                cold_flush_interval: config.storage.cold.flush_interval.as_duration(),
-                participation,
-            },
+            snapshot_store.map(|store| {
+                (store, StoreGateInputs {
+                    s3: config.storage.cold.s3.as_ref(),
+                    cold_flush_interval: config.storage.cold.flush_interval.as_duration(),
+                    participation,
+                })
+            }),
+            snapshot::LogWriteGate::RefuseAtHardLimit,
             snapshot_drive_interval_ms,
-            ursula_raft::snapshot_cadence::SnapshotCadence::new(
-                config.raft.snapshot_log_budget.as_bytes(),
-                topology.raft_group_count(),
-                config.raft.snapshot_backstop_logs,
-            )
-            .with_deleted_data_max_age(config.raft.effective_deleted_data_max_age()),
+            snapshot::cluster_cadence(&config.raft, topology.raft_group_count()),
             spawned
                 .raft_wal
                 .as_ref()
@@ -317,7 +335,13 @@ fn spawn_runtime_core(
     registry: Option<RaftGroupHandleRegistry>,
 ) -> Result<SpawnedRuntime, RuntimeError> {
     match topology {
-        Topology::SingleNode { .. } => spawn_singleton(runtime_config, cold_store, storage),
+        Topology::SingleNode { .. } => spawn_singleton(
+            runtime_config,
+            cold_store,
+            storage,
+            raft_engine_config,
+            registry.unwrap_or_default(),
+        ),
         Topology::StaticCluster {
             node_id,
             peers,
@@ -340,10 +364,15 @@ fn spawn_runtime_core(
     }
 }
 
+/// A single node: the in-memory engine, or single-node Raft groups that
+/// publish themselves in `registry` and run with `raft_engine_config`'s
+/// snapshot settings (#669).
 fn spawn_singleton(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,
     storage: GroupStorage,
+    raft_engine_config: Option<RaftEngineConfig>,
+    registry: RaftGroupHandleRegistry,
 ) -> Result<SpawnedRuntime, RuntimeError> {
     let raft_wal = storage.raft_wal();
     let mut raft_registry = None;
@@ -357,13 +386,15 @@ fn spawn_singleton(
             )?
         }
         GroupStorage::Raft(log_stores) => {
-            let registry = ursula_raft::RaftGroupHandleRegistry::default();
             raft_registry = Some(registry.clone());
-            let factory = ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
+            let mut factory = ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
                 log_stores,
                 cold_store.clone(),
             )
             .with_registry(registry);
+            if let Some(engine_config) = raft_engine_config {
+                factory = factory.with_engine_config(engine_config);
+            }
             ShardRuntime::spawn_with_engine_factory_and_cold_store(
                 runtime_config,
                 factory,

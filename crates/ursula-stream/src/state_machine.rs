@@ -904,6 +904,10 @@ mod derived_boundaries_tests;
 #[cfg(test)]
 mod derived_cold_tests;
 #[cfg(test)]
+mod expiry_parity_tests;
+#[cfg(test)]
+mod expiry_sweep_tests;
+#[cfg(test)]
 mod external_locators_tests;
 #[cfg(test)]
 mod history_tests;

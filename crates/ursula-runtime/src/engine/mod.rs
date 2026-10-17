@@ -435,9 +435,11 @@ pub trait GroupEngine: Send + 'static {
         })
     }
 
-    /// One leader-side `TidyStream` pass (bounded-state F0): proposes
-    /// `TidyStream` for up to `request.max_streams` streams with debt. A
-    /// follower or an engine without support tidies nothing.
+    /// One leader-side tidy pass (bounded-state F0): first the expiry sweep
+    /// ([`crate::expiry_sweep`]), at most `request.max_expiry_sweeps`
+    /// `TouchStreamAccess { renew_ttl: false }` commands, then `TidyStream`
+    /// for up to `request.max_streams` streams with debt. A follower or an
+    /// engine without support proposes nothing.
     fn tidy_streams<'a>(
         &'a mut self,
         _request: crate::request::TidyStreamsRequest,
