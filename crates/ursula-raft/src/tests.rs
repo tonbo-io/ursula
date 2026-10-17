@@ -4626,12 +4626,18 @@ async fn a_leader_sweeps_expired_streams_with_the_0_8_0_touch_only() {
         .client_write(create_command(bsid("live")))
         .await
         .expect("create a live stream");
-    let applied = |engine: &RaftGroupEngine| {
-        openraft::rt::WatchReceiver::borrow_watched(&engine.raft.metrics())
-            .last_applied
+    // The log's last index: an answered write was appended before it
+    // applied.
+    let last_index = |store: Arc<RaftGroupFileLogStore>| async move {
+        let mut store = store;
+        store
+            .get_log_state()
+            .await
+            .expect("log state")
+            .last_log_id
             .map_or(0, |log_id| log_id.index)
     };
-    let before = applied(&engine);
+    let before = last_index(log_store.clone()).await;
 
     let report = engine
         .tidy_streams(
@@ -4647,7 +4653,7 @@ async fn a_leader_sweeps_expired_streams_with_the_0_8_0_touch_only() {
     // 257 streams, then the other 43.
     assert_eq!(report.expiry_sweeps, 2, "{report:?}");
     assert_eq!(report.expiry_due_groups, 0, "{report:?}");
-    let after = applied(&engine);
+    let after = last_index(log_store.clone()).await;
     assert_eq!(after, before.saturating_add(2));
 
     let mut store = log_store.clone();
