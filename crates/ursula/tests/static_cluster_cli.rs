@@ -1592,6 +1592,19 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
     )
     .await;
     assert_eq!(replicated, b"same-cluster");
+    // Every group serves on every node before node 3 goes. The write above
+    // shows only the stream's group: group 0 bootstraps once all three
+    // voters answer that they are empty, and the replaced node 3 never
+    // answers for this cluster again.
+    for peer in &peers {
+        wait_readiness(
+            &client,
+            std::slice::from_ref(peer),
+            &mut children,
+            |ready| ready.ready,
+        )
+        .await;
+    }
 
     // Node 3 comes back on an empty disk, configured for another cluster.
     drop(children.pop());
@@ -1613,20 +1626,20 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
     };
     // The leader of group 0, from the metrics of a node of the cluster. Its
     // appends to node 3 are refused there.
-    let leader_id = wait_group_leader(&client, &peers[0].1, &mut children).await;
+    let leader_id = wait_group_leader(&client, &peers[0].1, &peers, &mut children).await;
     let leader = peers
         .iter()
         .position(|(node_id, _)| *node_id == leader_id)
         .unwrap();
     assert!(leader < 2, "node 3 cannot lead: {leader_id}");
     let (_, status, leader_ready) =
-        wait_any_peer_cluster_mismatch(&client, &peers[leader..=leader], &mut children, |ready| {
+        wait_readiness(&client, &peers[leader..=leader], &mut children, |ready| {
             ready.peer_cluster_mismatches.contains(&mismatch(3, OTHER))
         })
         .await;
     assert_eq!(leader_ready.cluster_id, cluster(CLUSTER));
     let (_, other_status, other_ready) =
-        wait_any_peer_cluster_mismatch(&client, &peers[2..], &mut children, |ready| {
+        wait_readiness(&client, &peers[2..], &mut children, |ready| {
             ready
                 .peer_cluster_mismatches
                 .contains(&mismatch(leader_id, CLUSTER))
@@ -1656,7 +1669,7 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
     .await;
     assert_eq!(replicated, b"same-cluster-still-serving");
     let (_, leader_status, _) =
-        wait_any_peer_cluster_mismatch(&client, &peers[leader..=leader], &mut children, |ready| {
+        wait_readiness(&client, &peers[leader..=leader], &mut children, |ready| {
             ready.ready && ready.peer_cluster_mismatches.contains(&mismatch(3, OTHER))
         })
         .await;
@@ -1780,12 +1793,21 @@ fn spawn_node_logging_info(binary: &str, config_path: &Path) -> ChildGuard {
     spawn_child(command, child_label("durable-node", config_path))
 }
 
-/// The leader of group 0 as `base_url`'s metrics report it, once known.
+/// The leader of group 0 that `base_url`'s metrics name, once that node's
+/// own metrics show it leads the group with a live quorum: a follower can
+/// still name a leader that is gone.
 async fn wait_group_leader(
     client: &reqwest::Client,
     base_url: &str,
+    peers: &[(u64, String)],
     children: &mut [ChildGuard],
 ) -> u64 {
+    let group_0 = |metrics: ursula_proto::admin::NodeMetrics| {
+        metrics
+            .groups
+            .into_iter()
+            .find(|group| group.raft_group_id == 0)
+    };
     let deadline = std::time::Instant::now()
         .checked_add(Duration::from_secs(30))
         .unwrap();
@@ -1793,33 +1815,38 @@ async fn wait_group_leader(
         if let Some(report) = exited_child_report(children) {
             panic!("a node exited while waiting for a leader:\n{report}");
         }
-        let metrics: ursula_proto::admin::NodeMetrics = client
-            .get(format!("{base_url}/__ursula/metrics"))
-            .send()
-            .await
-            .expect("metrics")
-            .json()
-            .await
-            .expect("metrics JSON");
-        if let Some(leader) = metrics
-            .groups
-            .iter()
-            .find(|group| group.raft_group_id == 0)
-            .and_then(|group| group.current_leader)
+        let view = group_0(node_metrics(client, base_url).await);
+        if let Some(leader) = view.as_ref().and_then(|group| group.current_leader)
+            && let Some((_, leader_url)) = peers.iter().find(|(node_id, _)| *node_id == leader)
+            && group_0(node_metrics(client, leader_url).await).is_some_and(|group| group.leads_live)
         {
             return leader;
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "group 0 has no leader: {metrics:?}"
+            "group 0 has no live leader: {view:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
+async fn node_metrics(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> ursula_proto::admin::NodeMetrics {
+    client
+        .get(format!("{base_url}/__ursula/metrics"))
+        .send()
+        .await
+        .expect("metrics")
+        .json()
+        .await
+        .expect("metrics JSON")
+}
+
 /// Polls the readiness of `nodes` until one's answer satisfies `done`, and
 /// returns its index in `nodes` and its answer.
-async fn wait_any_peer_cluster_mismatch(
+async fn wait_readiness(
     client: &reqwest::Client,
     nodes: &[(u64, String)],
     children: &mut [ChildGuard],
@@ -1834,7 +1861,7 @@ async fn wait_any_peer_cluster_mismatch(
         .unwrap();
     loop {
         if let Some(report) = exited_child_report(children) {
-            panic!("a node exited while waiting for a peer cluster mismatch:\n{report}");
+            panic!("a node exited while waiting for readiness:\n{report}");
         }
         let mut answers = Vec::new();
         for (index, (_, base_url)) in nodes.iter().enumerate() {
@@ -1853,7 +1880,7 @@ async fn wait_any_peer_cluster_mismatch(
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "no node reported the peer cluster mismatch: {answers:?}"
+            "no node reported the awaited readiness: {answers:?}"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
