@@ -15,24 +15,10 @@ installBrowserTelemetry(telemetry);
 telemetry.capture("application_started", { release: "2026.07.18" });
 ```
 
-`ursula indexer` (experimental) is the persistent implementation of the external derived-index contract from issue #86. It reads the stream with ordinary offset reads, writes immutable Parquet parts sorted by `(captured_at, offset)` to S3, conditionally publishes how far the stream is indexed, and returns `(offset, len)` locators. Events without a usable `captured_at` are skipped and counted; retention that trims events before they were indexed is reported as `"complete": false`. S3 is authoritative; the local directory is only a bounded cache and can disappear between invocations.
+Consumers read the stream by offset. Start at `offset=-1` for the oldest retained event, then pass back each response's `Stream-Next-Offset` to continue. `Stream-Up-To-Date: true` means the read reached the tail. Offsets are opaque: store the values Ursula returns rather than computing them. Ursula does not reorder events by `captured_at` and has no event-time read. Filter on `captured_at` in the consumer, or keep your own index that maps event times to offsets.
 
 ```bash
-cargo run -p ursula --bin ursula -- indexer \
-  --stream-url http://127.0.0.1:4437/telemetry/browser-telemetry \
-  --timestamp-field captured_at \
-  --s3-bucket my-telemetry-index \
-  --s3-prefix production/browser-telemetry \
-  --cache-dir ./target/browser-telemetry-cache
-```
-
-For a local run, use `--object-dir ./target/browser-telemetry-objects` instead of the S3 options. This exercises the same immutable manifest and conditional `CURRENT` design; it is not the production durability boundary.
-
-Query event time over ordinary HTTP. A query returns entries with an opaque `offset` and a `len`; fetch an event with `GET {stream}?offset=<offset>&max_bytes=<len>`, continuing from `Stream-Next-Offset` until `len` bytes have arrived. Subsequent pages pass the previous response's `next` as `after` and its `coverage.through` as `through`.
-
-```bash
-curl 'http://127.0.0.1:4493/v1/events?from=2026-07-18T10%3A00%3A00Z&until=2026-07-18T11%3A00%3A00Z&limit=100'
-curl 'http://127.0.0.1:4493/v1/status'
+curl -i 'http://127.0.0.1:4437/telemetry/events?offset=-1'
 ```
 
 This example does not require an Ursula SDK or Append Session. Production collectors should add durable local retry storage and an authenticated same-origin gateway appropriate to their environment.

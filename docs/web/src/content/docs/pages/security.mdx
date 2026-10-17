@@ -150,7 +150,7 @@ The Helm chart serves the cluster plane on its own port by default (`server.clus
 
 A Service only decides what gets a stable name. Any pod in the cluster can still dial a pod IP on any port. Set `server.networkPolicy.enabled: true` to render a NetworkPolicy for the server pods, on a CNI that enforces NetworkPolicy:
 
-- The client port admits the sources in `server.networkPolicy.clientIngressFrom`, a list of NetworkPolicy peers. Empty, the default, admits every source. The release's gateway, indexer and Helm test pods are always admitted when they are enabled. List every other client: applications, anything that polls `/__ursula/metrics`, and an `ipBlock` for traffic that arrives through a `LoadBalancer` or `NodePort` client Service.
+- The client port admits the sources in `server.networkPolicy.clientIngressFrom`, a list of NetworkPolicy peers. Empty, the default, admits every source. The release's gateway and Helm test pods are always admitted when they are enabled. List every other client: applications, anything that polls `/__ursula/metrics`, and an `ipBlock` for traffic that arrives through a `LoadBalancer` or `NodePort` client Service.
 - The cluster port admits only the release's own server pods.
 - The admin port needs no rule, because it listens on loopback. The chart refuses to render the policy when `server.adminListen` is not on loopback.
 

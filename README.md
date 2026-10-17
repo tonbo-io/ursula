@@ -35,13 +35,11 @@ cargo run --bin ursula -- server --preset default
 It binds `127.0.0.1:4437`, picks a core count from your CPU, and uses an in-memory engine. Use `--config` to load a TOML config file, or `--preset` to choose a built-in resource preset. Any other preset, and a config file, runs Raft on the disk WAL under `raft.wal.path`. A single node without that path keeps its WAL in a temporary directory that is removed on clean shutdown.
 
 The `ursula` deployment binary also provides the independently scalable
-`gateway` and (experimental) `indexer` roles. `ursulactl` remains a separate, lightweight
-operator CLI:
+`gateway` role. `ursulactl` remains a separate, lightweight operator CLI:
 
 ```bash
 ursula server --config ursula.toml
 ursula gateway --upstream http://ursula-0:4437
-ursula indexer --s3-bucket my-bucket --cache-dir /var/cache/ursula-index
 ursulactl status --config cluster.yaml
 ```
 

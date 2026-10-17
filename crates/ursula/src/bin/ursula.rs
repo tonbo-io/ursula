@@ -4,7 +4,6 @@ use clap::Parser;
 use clap::Subcommand;
 use ursula::server::ServerArgs;
 use ursula_gateway::service::GatewayArgs;
-use ursula_index::service::IndexerArgs;
 
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
@@ -23,8 +22,6 @@ enum Command {
     Server(ServerArgs),
     /// Run the stateless public HTTP/SSE gateway.
     Gateway(Box<GatewayArgs>),
-    /// Run the rebuildable event-time indexer worker pool (experimental).
-    Indexer(Box<IndexerArgs>),
 }
 
 #[derive(Parser, Debug)]
@@ -38,7 +35,6 @@ async fn main() {
     let result = match parse_command() {
         Command::Server(args) => ursula::server::run(args).await,
         Command::Gateway(args) => ursula_gateway::service::run(*args).await,
-        Command::Indexer(args) => ursula_index::service::run(*args).await.map_err(Into::into),
     };
     if let Err(error) = result {
         clap::Error::raw(clap::error::ErrorKind::Io, error.to_string()).exit();
@@ -54,8 +50,7 @@ fn parse_command_from(args: impl IntoIterator<Item = OsString>) -> Result<Comman
     let first = args.get(1).and_then(|value| value.to_str());
     match first {
         None => Ok(Command::Server(ServerArgs::default())),
-        Some("server" | "gateway" | "indexer" | "help")
-        | Some("-h" | "--help" | "-V" | "--version") => {
+        Some("server" | "gateway" | "help") | Some("-h" | "--help" | "-V" | "--version") => {
             Cli::try_parse_from(args).map(|cli| cli.command)
         }
         Some(value) if value.starts_with('-') => {
@@ -100,17 +95,11 @@ mod tests {
                 .expect("gateway command"),
             Command::Gateway(_)
         ));
-        assert!(matches!(
-            parse(&[
-                "ursula",
-                "indexer",
-                "--object-dir",
-                "/tmp/index",
-                "--cache-dir",
-                "/tmp/cache"
-            ])
-            .expect("indexer command"),
-            Command::Indexer(_)
-        ));
+    }
+
+    #[test]
+    fn removed_indexer_role_is_refused() {
+        let error = parse(&["ursula", "indexer"]).expect_err("the indexer role was removed");
+        assert!(error.to_string().contains("indexer"), "{error}");
     }
 }

@@ -28,9 +28,6 @@ deploymentContract:
   serverServiceAccountName: ""
   serverRoleArn: ""
   serverS3Prefix: ""
-  indexerServiceAccountName: ""
-  indexerRoleArn: ""
-  indexerS3Prefix: ""
 
 serviceAccount:
   # Create a dedicated ServiceAccount for Ursula server, gateway, and test pods.
@@ -157,7 +154,7 @@ server:
     enabled: false
     # NetworkPolicy peers (podSelector, namespaceSelector, ipBlock) allowed to
     # reach the client port. Empty admits every source. This release's
-    # gateway, indexer and Helm test pods are always admitted.
+    # gateway and Helm test pods are always admitted.
     clientIngressFrom: []
   # Extra annotations applied to Ursula server pods.
   podAnnotations: {}
@@ -482,126 +479,6 @@ gateway:
     topologySpreadConstraints: []
   # Init containers to run before the gateway container.
   initContainers: []
-
-indexer:
-  # Experimental in 0.6: the API and the S3 format may change in a minor
-  # release, which then needs a new or emptied prefix and re-registration.
-  # Deploy a fixed worker pool. Streams are registered dynamically over HTTP;
-  # pod count is independent of stream count.
-  enabled: false
-  replicaCount: 2
-  # Empty bucket/region/endpoint values inherit the top-level S3 settings. The
-  # prefix owns the shared registration catalog and per-stream namespaces.
-  s3:
-    bucket: ""
-    region: ""
-    endpoint: ""
-    prefix: event-index
-  image:
-    repository: ""
-    tag: ""
-    pullPolicy: ""
-  serviceAccount:
-    create: true
-    name: ""
-    # Use eks.amazonaws.com/role-arn for EKS IRSA, or associate this ServiceAccount
-    # with an EKS Pod Identity role outside the chart.
-    annotations: {}
-    automountServiceAccountToken: false
-  ports:
-    http: 4493
-  service:
-    enabled: true
-    type: ClusterIP
-    port: 4493
-    annotations: {}
-  rustLog: "ursula_index=info"
-  cache:
-    servingMaxBytes: 1073741824
-    maintenanceMaxBytes: 268435456
-    emptyDir:
-      sizeLimit: 2Gi
-  ingest:
-    # Maximum messages (entries plus skips) in one committed segment, and so
-    # entries in one uncompacted part.
-    flushEntries: 65536
-    rowGroupEntries: 16384
-    pollIntervalMs: 250
-    # Bound near-tail indexing latency without publishing one tiny Parquet part
-    # on every poll. Full worker segments are published immediately.
-    tailFlushIntervalMs: 5000
-  workers:
-    # Concurrent stream tasks per pod.
-    concurrency: 4
-    # Source bytes read before a segment is committed. Each stream has one
-    # claim at a time, which starts at its first unindexed byte.
-    segmentBytes: 33554432
-    # Claims reduce duplicate work only; manifest CAS remains authoritative.
-    leaseMs: 60000
-  compaction:
-    fanIn: 8
-    maxEntries: 1000000
-    maintenanceIntervalMs: 1000
-    # One pool replica compacts and garbage-collects at a time.
-    maintenanceLeaseMs: 300000
-  garbageCollection:
-    intervalSeconds: 3600
-    graceSeconds: 86400
-    retainGenerations: 8
-  probes:
-    startup:
-      enabled: true
-      failureThreshold: 60
-      periodSeconds: 5
-      timeoutSeconds: 2
-    readiness:
-      enabled: true
-      periodSeconds: 5
-      timeoutSeconds: 2
-    liveness:
-      enabled: true
-      periodSeconds: 10
-      timeoutSeconds: 2
-  podDisruptionBudget:
-    enabled: true
-    maxUnavailable: 1
-  networkPolicy:
-    # Restrict query/admin HTTP ingress to this release namespace. Egress remains
-    # open for cluster DNS, the Ursula source, and S3.
-    enabled: true
-    additionalIngress: []
-  podAnnotations: {}
-  podLabels: {}
-  podSecurityContext:
-    fsGroup: 10001
-    fsGroupChangePolicy: OnRootMismatch
-  securityContext:
-    runAsUser: 10001
-    runAsGroup: 10001
-    runAsNonRoot: true
-    readOnlyRootFilesystem: true
-    allowPrivilegeEscalation: false
-    capabilities:
-      drop:
-        - ALL
-  resources:
-    requests:
-      cpu: 250m
-      memory: 512Mi
-      ephemeral-storage: 2Gi
-    limits:
-      cpu: "2"
-      memory: 2Gi
-      ephemeral-storage: 3Gi
-  terminationGracePeriodSeconds: 120
-  extraArgs: []
-  extraEnv: []
-  extraEnvFrom: []
-  scheduling:
-    nodeSelector: {}
-    tolerations: []
-    affinity: {}
-    topologySpreadConstraints: []
 
 tests:
   # Render Helm test Pod.
