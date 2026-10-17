@@ -5,8 +5,8 @@
 //! due, and every replica's apply decides what goes: the named stream if it
 //! expired, then up to 256 more in (expiry, stream id) order.
 
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::HashSet;
 
 use proptest::collection::vec;
 use proptest::prelude::*;
@@ -76,7 +76,7 @@ fn sweep_command(stream_id: BucketStreamId, now_ms: u64) -> StreamCommand {
 }
 
 /// Every live stream's metadata, by id.
-fn live(machine: &StreamStateMachine) -> BTreeMap<BucketStreamId, StreamMetadata> {
+fn live(machine: &StreamStateMachine) -> HashMap<BucketStreamId, StreamMetadata> {
     machine
         .snapshot()
         .streams
@@ -265,8 +265,8 @@ proptest! {
             for entry in &removed {
                 prop_assert!(entry.len() <= TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE + 1);
                 // Each command takes the earliest due streams.
-                let taken = order.drain(..entry.len()).collect::<BTreeSet<_>>();
-                prop_assert_eq!(&taken, &entry.iter().cloned().collect::<BTreeSet<_>>());
+                let taken = order.drain(..entry.len()).collect::<HashSet<_>>();
+                prop_assert_eq!(&taken, &entry.iter().cloned().collect::<HashSet<_>>());
             }
             prop_assert!(order.is_empty(), "left {order:?}");
             let commands = removed.len();
@@ -280,7 +280,7 @@ proptest! {
                 expected.len()
             );
             for (id, metadata) in &after {
-                prop_assert_eq!(Some(metadata), before.get(id), "{id} changed");
+                prop_assert_eq!(Some(metadata), before.get(id), "{} changed", id);
             }
         }
     }
