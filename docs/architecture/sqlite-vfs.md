@@ -318,8 +318,12 @@ implies our digest, since a key conflict is decided first.
   pending commits.
 - A HEAD follows three lost answers in a row for a body above 64 KiB, since a layer that refuses a
   large body without reading it looks like a lost answer.
-- A `synced()` probe or a pre-check answered `410` sends a HEAD first. With our token still there,
-  a probe resets `fenced` and a pre-check resets `stale`. Another token takes the history path.
+- Every `410` and `416` of a read names the token of the stream that refused it, and comes before
+  the `412`. A `synced()` probe or a pre-check whose `410` names our token resets with no HEAD: a
+  probe `fenced`, a pre-check `stale`. A `410` that names another token, or none, sends a HEAD,
+  which takes the history path, or with our token still there resets the same way. A `416` of a
+  replicator's read that names our token is resent after backoff. Another token, or none, sends
+  the HEAD of a `412`.
 
 Tests: `replicator/tests/answer_rows.rs`, one test per row
 (`append_row_1_a_200_at_the_expected_tail_acknowledges` through
@@ -329,11 +333,15 @@ Tests: `replicator/tests/answer_rows.rs`, one test per row
 `claim_rows_otherwise_follow_the_append_rules`). Also `replicator/tests/machine.rs`
 `a_401_rereads_the_token_once_then_blocks`, `redirects_are_resent_a_few_times_then_block`,
 `a_typed_413_below_the_smallest_limit_lowers_it_and_blocks`,
-`a_410_on_a_fresh_probe_fences_once_head_shows_our_token`, `replicator/tests/parts.rs`
+`a_410_on_a_fresh_probe_fences_once_head_shows_our_token`,
+`a_410_naming_our_token_on_a_probe_fences_with_no_head`,
+`a_416_naming_our_token_on_a_probe_is_resent_with_no_head`, `replicator/tests/parts.rs`
 `a_413_inside_a_run_claims_the_next_epoch_and_seals_again_smaller`,
 `three_lost_answers_for_a_large_body_send_a_head_whose_limit_recuts`, and
 `replicator/tests/rekey.rs`
-`a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expiry_goes_stale`.
+`a_provisional_claim_meeting_an_evicted_receipt_claims_the_next_epoch_and_expiry_goes_stale`,
+`a_410_on_a_probe_after_a_history_event_takes_the_history_path`,
+`a_416_on_a_read_sends_head_unless_it_names_our_token`.
 
 ### Claims
 
@@ -369,8 +377,9 @@ its acknowledged offset do not claim at once. They first:
 
 1. Send a HEAD, which gives the token, the cluster id and the request limit.
 2. Read from the log's acknowledged offset to the tail that HEAD named, with `consistency=leader`
-   and the incarnation precondition. Any foreign frame resets with nothing sent. A `410` sends a
-   HEAD first: our token still there resets `stale`, another token takes the history path.
+   and the incarnation precondition. Any foreign frame resets with nothing sent. A `410` that
+   names our token resets `stale`. One that names another token, or none, sends a HEAD: our
+   token still there resets `stale`, another token takes the history path.
 3. Only then send the log's latest claim again, same epoch and body. Nothing is logged before. A
    repeat receipt, or `receipt-evicted`, means that claim applied before, and one continuation
    claim of the next epoch follows.
@@ -1300,6 +1309,7 @@ against, and the e2e suites run against a real server in CI.
 | 11 | Every `413` carries the limit it applied, decided from `Content-Length` | Server Metadata | [Answers](#answers) |
 | 12 | The cluster id is stable across restarts, upgrades, leader changes and history events, and unique among the deployments a client reaches | Server Metadata | [Log](#log), [Identity](#identity) |
 | 13 | Leader-consistent reads with the incarnation precondition | Leader Consistency | [Reconcile](#reconcile), [Synced](#synced) |
+| 14 | Every `410` and `416` of a read, and the `404` of a snapshot that is not the latest, carry the token of the stream that refused them and come before the `412`. A missing stream's `404` carries none | Snapshot Metadata on HEAD and Stream Incarnation | [Answers](#answers), [Pre-check](#pre-check) |
 
 Tests: `model/tests.rs` and `model/producer.rs` (one test per producer row, the floor, digests,
 history events and inheritance, HEAD identity on `200` and `404`, typed `413`s, snapshots, parts

@@ -3,9 +3,10 @@
 //!
 //! Every header #581 types goes through `ursula_headers`, never a local parser: producer keys and
 //! answers, HEAD metadata, snapshot answers, the typed `413`, the `412` of the incarnation
-//! precondition, the `409` of a closed stream and routing answers. Three answers the crate does
-//! not type yet (a read's `Stream-Next-Offset`, a create's `Stream-Incarnation`, retention's
-//! `Stream-Retained-Offset`) are picked out here and parsed with the crate's value types.
+//! precondition, the `409` of a closed stream and routing answers. Four answers the crate does
+//! not type yet (a read's `Stream-Next-Offset`, a create's `Stream-Incarnation`, the
+//! `Stream-Incarnation` of a read's refusal, retention's `Stream-Retained-Offset`) are picked out
+//! here and parsed with the crate's value types.
 //! `Retry-After`, `Location` and `Content-Type` are plain HTTP and read here.
 //!
 //! [`parse_answer`] reads an answer in the light of the request it answers: a `409` to a keyed
@@ -454,6 +455,12 @@ pub(crate) enum Typed {
         read: SnapshotRead,
         range: Option<ByteSpan>,
     },
+    /// A read's `404`, `410` or `416` (a catch-up read or a snapshot read). `incarnation` is the
+    /// token of the stream that refused it: the server names it on every `410` and `416` of a
+    /// read and on the `404` of a snapshot that is not the latest, and none when no stream exists
+    /// (extensions: Snapshot Metadata on HEAD and Stream Incarnation). These come before the
+    /// `412`, so a token other than the request's means the read went to another history.
+    ReadRefused { incarnation: Option<Incarnation> },
     /// `200` to a read: the bytes in the body end at `next`.
     Read {
         next: Offset,
@@ -659,6 +666,15 @@ where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
             Typed::SnapshotRead {
                 read: SnapshotRead::parse(headers)?,
                 range,
+            }
+        }
+        (Method::Get, Target::Read { .. } | Target::Snapshot { .. })
+            if matches!(status, 404 | 410 | 416) =>
+        {
+            Typed::ReadRefused {
+                incarnation: text(headers, names::STREAM_INCARNATION)?
+                    .map(|token| Incarnation::parse(names::STREAM_INCARNATION, token))
+                    .transpose()?,
             }
         }
         (Method::Get, Target::Read { .. }) if status == 200 => Typed::Read {

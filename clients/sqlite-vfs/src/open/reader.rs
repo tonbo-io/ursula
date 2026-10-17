@@ -187,7 +187,7 @@ impl Opening {
         lineage: Lineage,
         now_ms: u64,
     ) -> OpenStep {
-        match decide_read(exchange) {
+        match decide_read(exchange, catch_up.head.incarnation()) {
             ReadDecision::Bytes { next } => {
                 self.retry.succeeded();
                 let body = match exchange {
@@ -200,8 +200,9 @@ impl Opening {
                     Err(e) => OpenStep::Fail(e),
                 }
             }
-            // Retention passed what the reader generation acknowledged: a build replaces it.
-            ReadDecision::Gone => {
+            // Retention passed what the reader generation acknowledged: a build replaces it, from
+            // a HEAD whatever token the `410` names.
+            ReadDecision::Gone { .. } => {
                 self.retry.succeeded();
                 drop(m);
                 let CatchUp {

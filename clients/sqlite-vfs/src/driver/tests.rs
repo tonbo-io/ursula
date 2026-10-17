@@ -5647,6 +5647,41 @@ fn a_reader_whose_catch_up_meets_a_412_heads_again() {
     );
 }
 
+/// A reader's catch-up read answered `416` naming our token still sends a HEAD: the open decides
+/// every read answer but bytes and a `410` from its status, so the HEAD re-runs the reader rows,
+/// which catch up in place.
+#[test]
+fn a_reader_whose_catch_up_meets_a_416_naming_our_token_heads_again() {
+    let dir = TempDir::new("driver-reader-416");
+    let mut w = World::new();
+    let o = w.core();
+    let owner = owner_with_a_commit(&mut w, dir.path(), o, 1);
+    let r = w.core();
+    let generation = reader_once(&mut w, r, dir.path());
+    w.commit(o, &owner, 2).unwrap();
+    w.run_for(1_000);
+    let token = w.server.token(PATH).unwrap();
+    let mut refused = false;
+    w.rewrite = Some(Box::new(move |request, answer| {
+        if refused
+            || request.method != Method::Get
+            || !matches!(request.target, Target::Read { .. })
+        {
+            return;
+        }
+        refused = true;
+        *answer = RawAnswer::new(416);
+        answer.header("stream-incarnation", token.to_string());
+    }));
+    let heads_before = heads(&w, r);
+    let again = w.open(r, reader_spec(dir.path()));
+    // The open's HEAD and the one after the `416`.
+    assert_eq!(heads(&w, r) - heads_before, 2);
+    assert_eq!(again.handle.attach, Attach::CaughtUp);
+    assert_eq!(again.handle.generation, generation);
+    assert_eq!(db_bytes(&again), page_on_disk(generation.lineage, 2));
+}
+
 /// A reader reads a closed stream, which an owner refuses.
 #[test]
 fn a_reader_reads_a_closed_stream() {

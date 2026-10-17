@@ -16,10 +16,12 @@ use super::off;
 use super::producer;
 use super::read;
 use super::receipt;
+use super::refused;
 use super::reset_of;
 use super::sends;
 use super::snapshot_body;
 use super::snapshot_read;
+use super::timer_of;
 use super::token;
 use crate::codec::frame;
 use crate::codec::frame::Frame;
@@ -312,6 +314,40 @@ fn row_6_a_410_at_the_start_rebuilds_a_takeover_and_resets_a_continuation_stale(
     let (mut h, _) = reconcile(KINDS[1], &p1.frame, Some(RawAnswer::new(410)));
     let actions = h.answer(&head_naming(None, tail));
     assert_eq!(reset_of(&actions), Some(ResetKind::Stale));
+}
+
+/// A `410` naming our token still sends the rule's HEAD, which names the latest snapshot, and a
+/// `416` naming our token cannot happen (H1): the read goes again after backoff, with no HEAD.
+#[test]
+fn row_6_a_410_naming_our_token_heads_and_a_416_naming_it_is_resent() {
+    let p1 = commit(LINEAGE, 1, 1);
+    for kind in KINDS {
+        let (_, actions) = reconcile(kind, &p1.frame, Some(refused(410, Some(token()))));
+        assert_eq!(reset_of(&actions), None, "{kind:?}: {actions:?}");
+        let methods: Vec<Method> = sends(&actions).iter().map(|r| r.method).collect();
+        assert_eq!(methods, vec![Method::Head], "{kind:?}: {actions:?}");
+        let (mut h, actions) = reconcile(kind, &p1.frame, Some(refused(416, Some(token()))));
+        assert_eq!(reset_of(&actions), None, "{kind:?}: {actions:?}");
+        assert!(sends(&actions).is_empty(), "{kind:?}: {actions:?}");
+        assert!(
+            matches!(h.replicator, Replicator::Activating { .. }),
+            "{kind:?}"
+        );
+        let (at, jitter) = timer_of(&actions).unwrap();
+        let actions = h.tick_at(at + jitter);
+        let resent: Vec<(Method, Target)> = sends(&actions)
+            .iter()
+            .map(|r| (r.method, r.target))
+            .collect();
+        assert_eq!(
+            resent,
+            vec![(Method::Get, Target::Read {
+                from: Some(off(0)),
+                leader: true,
+            })],
+            "{kind:?}: {actions:?}"
+        );
+    }
 }
 
 /// Pending records 1 and 2 landed before the claim, retention passed them, and the latest

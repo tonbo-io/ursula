@@ -875,7 +875,7 @@ impl Build {
                     }
                 }
                 // Superseded since the HEAD: the HEAD again names the latest.
-                Ok(Typed::Untyped) if answer.status == 404 => {
+                Ok(Typed::ReadRefused { .. }) if answer.status == 404 => {
                     self.succeeded();
                     self.stage = BuildStage::Head;
                     self.next()
@@ -883,7 +883,7 @@ impl Build {
                 // Shorter than the bytes downloaded: the HEAD again names the latest, whose
                 // download starts from its first byte. It counts as a recheck, so a server that
                 // keeps answering `416` to the reads its HEAD asks for cannot loop the build.
-                Ok(Typed::Untyped) if answer.status == 416 => {
+                Ok(Typed::ReadRefused { .. }) if answer.status == 416 => {
                     self.succeeded();
                     self.recheck(now_ms)
                 }
@@ -1044,7 +1044,7 @@ impl Build {
 
     /// The answer to a read of the tail.
     fn tail_answered(&mut self, exchange: &Exchange, now_ms: u64) -> BuildStep {
-        match decide_read(exchange) {
+        match decide_read(exchange, self.fetch.incarnation) {
             ReadDecision::Bytes { next } => {
                 self.retry.succeeded();
                 self.recheck = Policy::default();
@@ -1061,7 +1061,8 @@ impl Build {
             }
             // Retention passed what this build installed: it starts over in a fresh `.tmp`, from
             // the snapshot the HEAD names then, after the open's backoff, a few times at most.
-            ReadDecision::Gone => {
+            // That HEAD names the snapshot, so it goes whatever token the `410` names.
+            ReadDecision::Gone { .. } => {
                 self.restarts = self.restarts.saturating_add(1);
                 if self.restarts > MAX_BUILD_RESTARTS {
                     return BuildStep::Fail(OpenError::StreamState(StreamState::BelowRetention {

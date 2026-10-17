@@ -25,6 +25,7 @@ use super::off;
 use super::producer;
 use super::read;
 use super::receipt;
+use super::refused;
 use super::reset_of;
 use super::sends;
 use super::seq;
@@ -733,17 +734,33 @@ fn a_follow_up_after_a_repeat_cross_checks_the_streamed_epoch() {
     );
 }
 
-/// A `416` answers a read past the tail, which cannot happen under our token (H1): the history
-/// changed, so it checks HEAD like a `412`.
+/// A `416` answers a read past the tail, which cannot happen under our token (H1). Naming another
+/// token, or none, the history changed, so it checks HEAD like a `412`. Naming ours, it is resent
+/// with no HEAD.
 #[test]
-fn a_416_on_a_read_sends_head() {
+fn a_416_on_a_read_sends_head_unless_it_names_our_token() {
+    use crate::replicator::answer::Common;
+    use crate::replicator::answer::HeadReason;
+    use crate::replicator::answer::ReadDecision;
+    use crate::replicator::answer::decide_read;
     let request = Request::read(Some(off(40)), true, 1 << 20);
-    let exchange = Exchange::Answered(Box::new(RawAnswer::new(416).parse(&request)));
+    let decide = |named: Option<Incarnation>| {
+        let exchange = Exchange::Answered(Box::new(refused(416, named).parse(&request)));
+        decide_read(&exchange, token())
+    };
+    for named in [None, Some(new_token())] {
+        assert_eq!(
+            decide(named),
+            ReadDecision::Common(Common::Head(HeadReason::Precondition)),
+            "{named:?}"
+        );
+    }
     assert_eq!(
-        crate::replicator::answer::decide_read(&exchange),
-        crate::replicator::answer::ReadDecision::Common(crate::replicator::answer::Common::Head(
-            crate::replicator::answer::HeadReason::Precondition
-        ))
+        decide(Some(token())),
+        ReadDecision::Common(Common::Resend {
+            retry_after: None,
+            fresh: false,
+        })
     );
 }
 
@@ -934,6 +951,7 @@ fn a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent() {
         assert_eq!(reset_of(&actions), reset, "{actions:?}");
         assert_eq!(claim_of(&actions).is_some(), reset.is_none(), "{actions:?}");
     }
+    // A `410` that names no token sends a HEAD: our token still there, `stale`.
     let mut h = provisional(Vec::new());
     h.answer(&head(token(), 2 * CLAIM, None));
     let actions = h.answer(&RawAnswer::new(410));
@@ -941,9 +959,18 @@ fn a_provisional_pre_check_resets_on_a_foreign_frame_with_nothing_sent() {
     assert_eq!(h.last_request().method, Method::Head);
     let actions = h.answer(&head(token(), 2 * CLAIM, None));
     assert_eq!(reset_of(&actions), Some(ResetKind::Stale), "{actions:?}");
+    // One that names our token is `stale` with no HEAD.
     let mut h = provisional(Vec::new());
     h.answer(&head(token(), 2 * CLAIM, None));
-    h.answer(&RawAnswer::new(410));
+    let actions = h.answer(&refused(410, Some(token())));
+    assert_eq!(reset_of(&actions), Some(ResetKind::Stale), "{actions:?}");
+    assert!(sends(&actions).is_empty(), "{actions:?}");
+    // One that names another token takes the history path through a HEAD.
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), 2 * CLAIM, None));
+    let actions = h.answer(&refused(410, Some(new_token())));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(h.last_request().method, Method::Head);
     let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
     assert_eq!(reset_of(&actions), None, "{actions:?}");
     assert_eq!(h.last_request().method, Method::Head, "{actions:?}");
@@ -1084,9 +1111,15 @@ fn a_provisional_claim_found_in_the_pre_check_claims_on_after_idle_expiry() {
 /// the `410` (it comes before the `412`), and the HEAD it sends takes the history path. A history
 /// that keeps every byte acknowledged re-keys, one that lost some resets `rewound`, never
 /// `fenced`.
+///
+/// The `410` names the new token, or none from a layer that dropped it: either way the HEAD goes,
+/// since only it names what the new history inherited.
 #[test]
 fn a_410_on_a_probe_after_a_history_event_takes_the_history_path() {
-    for (inherited, rewound) in [(CLAIM, false), (0, true)] {
+    let cases = [(CLAIM, false), (0, true)]
+        .into_iter()
+        .flat_map(|case| [(case, None), (case, Some(new_token()))]);
+    for ((inherited, rewound), named) in cases {
         let mut h = Harness::activate(
             ClaimKind::Takeover {
                 round: 1,
@@ -1101,8 +1134,8 @@ fn a_410_on_a_probe_after_a_history_event_takes_the_history_path() {
             target: Position(0),
         });
         assert_eq!(h.last_request().method, Method::Get);
-        let actions = h.answer(&RawAnswer::new(410));
-        assert_eq!(reset_of(&actions), None, "{actions:?}");
+        let actions = h.answer(&refused(410, named));
+        assert_eq!(reset_of(&actions), None, "{named:?}: {actions:?}");
         assert_eq!(h.last_request().method, Method::Head);
         let actions = h.answer(&head(new_token(), CLAIM, Some((token(), inherited))));
         if rewound {
