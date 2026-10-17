@@ -16,6 +16,9 @@ use super::ThreeNodeRaftSimOutcome;
 use super::accepted_loss::Controls as RecoveryPlanControls;
 use super::accepted_loss::Shape as RecoveryPlanShape;
 use super::accepted_loss::run_recovery_plan_inner;
+use super::deleted_data::Controls as DeletedDataControls;
+use super::deleted_data::run_deleted_data_inner;
+use super::deleted_data::run_operator_snapshot_under_purge_inner;
 use super::has_cold_write_fault_in_fault_plan;
 use super::has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan;
 use super::has_corrupt_http_live_sse_next_offset_expectation_in_fault_plan;
@@ -294,7 +297,37 @@ impl ThreeNodeRaftSim {
                     MembershipRollbackControls::default(),
                 )
             }
+            SimScenario::DeletedDataLeavesWithinBound => {
+                Self::run_deleted_data_with_controls_report(config, DeletedDataControls::default())
+            }
         }
+    }
+
+    /// Runs the deleted-data bound scenario (#669) with `controls`.
+    pub(super) fn run_deleted_data_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: DeletedDataControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::DeletedDataLeavesWithinBound,
+            seed,
+            run_deleted_data_inner(config, controls),
+        )
+    }
+
+    /// Runs an operator's snapshot interleaved with a deferred purge
+    /// through a covering snapshot (#669) with `controls`.
+    pub(super) fn run_operator_snapshot_under_purge_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: DeletedDataControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::DeletedDataLeavesWithinBound,
+            seed,
+            run_operator_snapshot_under_purge_inner(config, controls),
+        )
     }
 
     /// Runs the routing-before-the-body scenario (#603) with `controls`.

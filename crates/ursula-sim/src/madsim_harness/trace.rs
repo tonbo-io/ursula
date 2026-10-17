@@ -744,6 +744,26 @@ pub enum SimEvent {
         committed: u64,
         point: u64,
     },
+    /// `deleted_data_leaves_within_bound` held (#669): within
+    /// `raft.deleted_data_max_age` of applying the removal at
+    /// `removal_index` (`purge`: a bucket purge, else a deletion), each of
+    /// `replicas` replicas held the removed stream in neither its current
+    /// snapshot nor its retained log, and read it as not found. `fault`
+    /// names what the run did around the removal.
+    DeletedDataLeft {
+        removal_index: u64,
+        purge: bool,
+        fault: String,
+        replicas: u64,
+    },
+    /// An operator's snapshot of a group whose leader deferred a purge
+    /// through a covering snapshot started only once that purge landed
+    /// (#669): the log was purged through `purged` when the build covering
+    /// `snapshot` started.
+    OperatorSnapshotHeldForPurge {
+        purged: u64,
+        snapshot: u64,
+    },
     LeaderReadObserved {
         phase: String,
         probe: String,

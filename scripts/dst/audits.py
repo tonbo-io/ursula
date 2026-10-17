@@ -651,6 +651,7 @@ EXPECTED_PR_FAMILIES = {
     "routing-before-body-under-leader-churn",
     "marked-chunks-never-contradict",
     "recovery-plan-membership-rollback",
+    "deleted-data-leaves-within-bound",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
@@ -663,6 +664,7 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "routing-before-body-under-leader-churn-extended",
     "marked-chunks-never-contradict-extended",
     "recovery-plan-membership-rollback-extended",
+    "deleted-data-leaves-within-bound-extended",
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199", "503..=504"}
 

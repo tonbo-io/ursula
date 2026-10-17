@@ -3598,6 +3598,77 @@ async fn openraft_state_machine_applies_group_write_commands() {
     assert_eq!(snapshot.stream_append_counts[0].append_count, 1);
 }
 
+/// #669: an applied entry that removes streams records what they held in a
+/// group snapshot, their hot bytes and the per-command overhead each, for a
+/// deletion and a bucket purge alike. Other entries record nothing.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn applied_removals_record_what_the_snapshot_held() {
+    use crate::snapshot_cadence::RemovalProgress;
+
+    let overhead = ursula_stream::COMMAND_LOG_OVERHEAD_BYTES;
+    let kept = bsid("removal-kept");
+    let deleted = bsid("removal-deleted");
+    let purged = ursula_shard::BucketStreamId::new("removal-purged", "a");
+    let empty = ursula_shard::BucketStreamId::new("removal-purged", "b");
+    let mut sm = RaftGroupStateMachine::new(placement());
+    apply_entries(&mut sm, vec![
+        normal_entry(1, genesis_command()),
+        normal_entry(2, create_command(kept.clone())),
+        normal_entry(3, create_command(deleted.clone())),
+        normal_entry(4, append_command(deleted.clone(), b"abcd")),
+        normal_entry(5, create_command(purged.clone())),
+        normal_entry(6, append_command(purged, b"xyz")),
+        normal_entry(7, create_command(empty)),
+    ])
+    .await;
+    assert_eq!(sm.log_progress().removal, RemovalProgress::Clear);
+
+    let owed = |sm: &RaftGroupStateMachine| match sm.log_progress().removal {
+        RemovalProgress::Owed { bytes, .. } => bytes,
+        other => panic!("a removal is owed: {other:?}"),
+    };
+    apply_entries(&mut sm, vec![normal_entry(
+        8,
+        GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
+            stream_id: deleted,
+        }),
+    )])
+    .await;
+    let deleted_bytes = overhead.saturating_add(4);
+    assert_eq!(owed(&sm), deleted_bytes);
+    apply_entries(&mut sm, vec![normal_entry(
+        9,
+        GroupWriteCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
+            bucket_id: "removal-purged".to_owned(),
+        }),
+    )])
+    .await;
+    let purged_bytes = deleted_bytes
+        .saturating_add(overhead.saturating_add(3))
+        .saturating_add(overhead);
+    assert_eq!(owed(&sm), purged_bytes);
+    apply_entries(&mut sm, vec![normal_entry(
+        10,
+        append_command(kept, b"more"),
+    )])
+    .await;
+    assert_eq!(owed(&sm), purged_bytes);
+}
+
+/// Applies `entries` to `sm` in one batch.
+#[cfg(not(madsim))]
+async fn apply_entries(
+    sm: &mut RaftGroupStateMachine,
+    entries: Vec<<UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry>,
+) {
+    sm.apply(stream::iter(
+        entries.into_iter().map(|entry| Ok((entry, None))),
+    ))
+    .await
+    .expect("apply raft entries");
+}
+
 #[tokio::test]
 async fn openraft_snapshot_round_trips_group_state() {
     let stream_id = bsid("raft-snapshot");

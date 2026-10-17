@@ -7449,8 +7449,8 @@ mod snapshot_driver {
             &BTreeMap::from([(1, 0)]),
             &BTreeSet::new(),
         );
-        assert_eq!((plan.overdue, plan.groups), (0, vec![0]));
         assert_eq!(groups_to_drive(&plan, true), 0);
+        assert_eq!((plan.overdue, plan.groups), (0, vec![0]));
     }
 
     /// #669: the node gauges report the oldest removal no snapshot covers
@@ -7970,6 +7970,201 @@ mod snapshot_driver {
                 Instant::now() < deadline,
                 "the log stays at {} bytes",
                 coordinator.node_log_bytes()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The bytes every record of the stream the deleted-data test removes
+    /// carries.
+    const DELETED_MARKER: &[u8] = b"deleted-data-marker-669;";
+
+    /// What of the removed stream `raft`'s current snapshot holds, if any:
+    /// inline snapshots hold the whole group.
+    async fn snapshot_holds_marker(
+        raft: &ursula_raft::OwnerRaftHandle,
+        stream_id: &BucketStreamId,
+    ) -> bool {
+        let snapshot = raft
+            .get_snapshot()
+            .await
+            .expect("read the current snapshot")
+            .expect("a current snapshot");
+        let pointer = ursula_runtime::SnapshotPointer::decode(snapshot.snapshot.get_ref())
+            .expect("decode the snapshot pointer");
+        let SnapshotLocation::Inline { bytes } = &pointer.location else {
+            panic!("an inline snapshot: {:?}", pointer.location);
+        };
+        ursula_raft::decode_group_snapshot(bytes)
+            .expect("decode the snapshot")
+            .stream_snapshot
+            .streams
+            .iter()
+            .any(|entry| {
+                &entry.metadata.stream_id == stream_id
+                    || entry
+                        .payload
+                        .windows(DELETED_MARKER.len())
+                        .any(|window| window == DELETED_MARKER)
+            })
+    }
+
+    /// #669: the production driver snapshots a group a quarter of
+    /// `raft.deleted_data_max_age` after it deleted a stream, purges its log
+    /// through that snapshot, and reports the deleted data its groups hold
+    /// meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_driver_scrubs_a_deleted_stream_within_the_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let peers = vec![(
+            1,
+            format!(
+                "http://127.0.0.1:{}",
+                listener.local_addr().expect("addr").port()
+            ),
+        )];
+        let node = spawn_static_grpc_test_node(
+            1,
+            listener,
+            peers.clone(),
+            peers,
+            true,
+            2,
+            StaticGrpcTestNodeStorage {
+                engine_config: Some(RaftEngineConfig {
+                    snapshot_drive_interval_ms: 100,
+                    max_in_snapshot_log_to_keep: 8,
+                    ..RaftEngineConfig::default()
+                }),
+                ..StaticGrpcTestNodeStorage::default()
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let max_age = Duration::from_secs(4);
+        let participation = PeerParticipation::new(1, &[], reqwest::Client::new());
+        spawn_snapshot_driver(
+            &node.runtime,
+            &node.registry,
+            None,
+            StoreGateInputs {
+                s3: None,
+                cold_flush_interval: Duration::from_secs(1),
+                participation: &participation,
+            },
+            100,
+            SnapshotCadence::new(1 << 30, 2, 100_000)
+                .with_deleted_data_max_age(max_age)
+                .with_log_keep(8),
+            None,
+            16,
+        );
+        let stream_id = BucketStreamId::new("erased", "marked");
+        let group = node.runtime.locate(&stream_id).raft_group_id;
+        let raft = node.registry.get(group).expect("registered group");
+        raft.wait(Some(Duration::from_secs(10)))
+            .current_leader(1, "the only voter leads")
+            .await
+            .expect("the group elects its leader");
+        node.runtime
+            .create_stream(CreateStreamRequest::new(
+                stream_id.clone(),
+                "application/octet-stream",
+            ))
+            .await
+            .expect("create the stream");
+        for _ in 0..3 {
+            node.runtime
+                .append(AppendRequest::from_bytes(
+                    stream_id.clone(),
+                    DELETED_MARKER.to_vec(),
+                ))
+                .await
+                .expect("append a marked record");
+        }
+        // A snapshot holds the stream before it goes. OpenRaft drops a
+        // trigger while the driver's first build of the group runs.
+        let applied = raft.metrics().borrow_watched().last_applied;
+        let mut covered = false;
+        for _ in 0..20 {
+            raft.trigger().snapshot().await.expect("trigger a snapshot");
+            covered = raft
+                .wait(Some(Duration::from_millis(500)))
+                .metrics(
+                    |metrics| metrics.snapshot >= applied,
+                    "the snapshot covers the marked records",
+                )
+                .await
+                .is_ok();
+            if covered {
+                break;
+            }
+        }
+        assert!(covered, "no snapshot covers the marked records");
+        assert!(snapshot_holds_marker(&raft, &stream_id).await);
+
+        node.runtime
+            .delete_stream(ursula_runtime::DeleteStreamRequest {
+                stream_id: stream_id.clone(),
+                if_incarnation: None,
+            })
+            .await
+            .expect("delete the stream");
+        let deleted_at = Instant::now();
+        let removal = raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("applied the deletion");
+        // The node reports the removal it still holds.
+        let deadline = deleted_at
+            .checked_add(Duration::from_secs(1))
+            .expect("deadline");
+        while node
+            .runtime
+            .metrics()
+            .snapshot()
+            .raft_deleted_data_oldest_ms
+            == 0
+        {
+            assert!(Instant::now() < deadline, "the removal is never reported");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Within the bound the snapshot covers the deletion and the log is
+        // purged through it.
+        let scrubbed = raft
+            .wait(Some(max_age))
+            .metrics(
+                |metrics| {
+                    metrics.snapshot >= Some(removal)
+                        && metrics.purged.map(|purged| purged.index)
+                            >= metrics.snapshot.map(|snapshot| snapshot.index)
+                },
+                "the log is purged through the snapshot that covers the deletion",
+            )
+            .await
+            .expect("scrub the deleted stream within the bound");
+        assert!(deleted_at.elapsed() >= max_age.checked_div(4).expect("a quarter"));
+        assert!(!snapshot_holds_marker(&raft, &stream_id).await);
+        assert!(scrubbed.purged >= scrubbed.snapshot);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("deadline");
+        loop {
+            let metrics = node.runtime.metrics().snapshot();
+            if metrics.raft_deleted_data_oldest_ms == 0
+                && metrics.raft_deleted_data_overdue_groups == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scrubbed removal is still reported"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

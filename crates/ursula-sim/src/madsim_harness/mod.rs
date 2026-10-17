@@ -163,6 +163,7 @@ pub enum SimScenario {
     RoutingBeforeBodyUnderLeaderChurn,
     MarkedChunksNeverContradict,
     RecoveryPlanMembershipRollback,
+    DeletedDataLeavesWithinBound,
 }
 
 #[derive(Clone)]
@@ -213,6 +214,7 @@ impl SimScenario {
             Self::RoutingBeforeBodyUnderLeaderChurn => "routing-before-body-under-leader-churn",
             Self::MarkedChunksNeverContradict => "marked-chunks-never-contradict",
             Self::RecoveryPlanMembershipRollback => "recovery-plan-membership-rollback",
+            Self::DeletedDataLeavesWithinBound => "deleted-data-leaves-within-bound",
         }
     }
 }
@@ -555,6 +557,7 @@ use cold_path::run_cold_read_truncate_inner;
 use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
 mod accepted_loss;
+mod deleted_data;
 mod history;
 mod http;
 mod immutable_reads;

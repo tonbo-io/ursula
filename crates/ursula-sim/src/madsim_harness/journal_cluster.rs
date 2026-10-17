@@ -60,6 +60,34 @@ use super::recovery_wiring;
 use super::recovery_wiring::VoteLog;
 use super::sim_wal::SimNodeWal;
 
+/// The production snapshot driver on every node of a [`JournalCluster`]
+/// (#669): its settings, and the entries OpenRaft keeps below a snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct DriverPlan {
+    /// `raft.deleted_data_max_age`.
+    pub(super) max_age: Duration,
+    /// `raft.max_in_snapshot_log_to_keep`.
+    pub(super) keep: u64,
+    /// The pause between the driver's ticks.
+    pub(super) interval: Duration,
+}
+
+std::thread_local! {
+    /// The drivers the next [`JournalCluster`] on this simulation's thread
+    /// runs ([`set_snapshot_drivers`]).
+    static SNAPSHOT_DRIVERS: std::cell::Cell<Option<DriverPlan>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes the [`JournalCluster`]s this simulation's thread starts run the
+/// production snapshot driver on every node, under OpenRaft's
+/// `SnapshotPolicy::Never` as in production, or none with `None`. A
+/// scenario sets it inside its simulation, which runs on a thread of its
+/// own.
+pub(super) fn set_snapshot_drivers(plan: Option<DriverPlan>) {
+    SNAPSHOT_DRIVERS.with(|drivers| drivers.set(plan));
+}
+
 /// The cluster's nodes.
 pub(super) const NODES: [u64; 3] = [1, 2, 3];
 
@@ -167,6 +195,14 @@ pub(super) struct JournalCluster {
     /// Nodes `voters + 1..=voters + spares`: provisioned, outside the
     /// bootstrap membership, started only when a scenario starts them.
     pub(super) spares: u64,
+    /// The snapshot driver every node runs, if any ([`set_snapshot_drivers`]).
+    pub(super) drivers: Option<DriverPlan>,
+    /// Each node's registry of its replicas, as a node's runtime keeps it:
+    /// its snapshot driver plans over it, and its replicas share its
+    /// snapshot build coordinator when the nodes run drivers.
+    pub(super) node_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
+    /// The snapshot driver task of each running node.
+    driver_tasks: BTreeMap<u64, madsim::task::JoinHandle<()>>,
 }
 
 impl JournalCluster {
@@ -236,17 +272,21 @@ impl JournalCluster {
 
     fn unstarted_voters(name: &str, tuning: JournalTuning, voters: u64, spares: u64) -> Self {
         let nodes = voters.saturating_add(spares);
-        let config = Arc::new(
-            Config {
-                cluster_name: name.to_owned(),
-                heartbeat_interval: 10,
-                election_timeout_min: 50,
-                election_timeout_max: 100,
-                ..Default::default()
-            }
-            .validate()
-            .expect("valid raft config"),
-        );
+        let drivers = SNAPSHOT_DRIVERS.with(std::cell::Cell::get);
+        let mut config = Config {
+            cluster_name: name.to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 50,
+            election_timeout_max: 100,
+            ..Default::default()
+        };
+        if let Some(drivers) = drivers {
+            // As a node with a snapshot driver configures OpenRaft.
+            config.snapshot_policy = openraft::SnapshotPolicy::Never;
+            config.max_in_snapshot_log_to_keep = drivers.keep;
+            config.purge_batch_size = 1;
+        }
+        let config = Arc::new(config.validate().expect("valid raft config"));
         let (policy, votes) = recovery_wiring::vote_recording_network_policy();
         Self {
             config,
@@ -276,6 +316,11 @@ impl JournalCluster {
             plan_leaders: std::collections::BTreeSet::new(),
             voters,
             spares,
+            drivers,
+            node_registries: (1..=nodes)
+                .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
+                .collect(),
+            driver_tasks: BTreeMap::new(),
         }
     }
 
@@ -288,6 +333,35 @@ impl JournalCluster {
         for group in JOURNAL_GROUPS {
             self.start_replica(group, node_id).await;
         }
+        if let Some(drivers) = self.drivers
+            && !self.driver_tasks.contains_key(&node_id)
+        {
+            let max_age = drivers.max_age;
+            let driver = ursula::SnapshotDriver::new(
+                &self.node_registries[&node_id],
+                self.metrics[&node_id].clone(),
+                None,
+                ursula::SnapshotDriveSettings {
+                    interval: drivers.interval,
+                    cadence: ursula_raft::snapshot_cadence::SnapshotCadence::new(
+                        ursula_raft::snapshot_cadence::DEFAULT_NODE_LOG_BUDGET_BYTES,
+                        JOURNAL_GROUPS.len(),
+                        ursula_raft::snapshot_cadence::DEFAULT_SNAPSHOT_BACKSTOP_ENTRIES,
+                    )
+                    .with_deleted_data_max_age(max_age)
+                    .with_log_keep(drivers.keep),
+                    max_groups_per_tick: 16,
+                },
+            );
+            self.driver_tasks
+                .insert(node_id, madsim::task::spawn(driver.run()));
+        }
+    }
+
+    /// The snapshot build coordinator `node_id`'s replicas share when the
+    /// nodes run drivers.
+    pub(super) fn coordinator(&self, node_id: u64) -> ursula_raft::SnapshotBuildCoordinator {
+        self.node_registries[&node_id].snapshot_build_coordinator()
     }
 
     /// Starts `node_id`'s replica of `group` from its log store, as the
@@ -307,6 +381,9 @@ impl JournalCluster {
         let mut config = (*self.config).clone();
         config.enable_elect = ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
         let mut options = RaftGroupEngineOptions::default();
+        if self.drivers.is_some() {
+            options.snapshot_build = Some(self.coordinator(node_id));
+        }
         options.apply_fault = self
             .faulty
             .filter(|(faulty, _)| *faulty == group)
@@ -346,6 +423,9 @@ impl JournalCluster {
             &voters,
         );
         registry.register(node_id, &engine);
+        if self.drivers.is_some() {
+            self.node_registries[&node_id].register_engine_for_simulation(&engine);
+        }
         self.engines.insert((group, node_id), engine);
         self.rejoins.insert((group, node_id), rejoin);
     }
@@ -355,6 +435,7 @@ impl JournalCluster {
     /// stops, its log store closes, and the replica starts again from it.
     pub(super) async fn restart_replica(&mut self, group: u32, node_id: u64) {
         self.registries[&group].unregister(node_id);
+        self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
         self.rejoins.remove(&(group, node_id));
         if let Some(engine) = self.engines.remove(&(group, node_id)) {
             engine.shutdown().await.expect("stop the replica");
@@ -381,8 +462,13 @@ impl JournalCluster {
     }
 
     pub(super) async fn stop_node(&mut self, node_id: u64) {
+        // The node's driver goes with its process.
+        if let Some(driver) = self.driver_tasks.remove(&node_id) {
+            driver.abort();
+        }
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
+            self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
             match self.engines.remove(&(group, node_id)) {
                 Some(engine) => engine.shutdown().await.expect("stop the replica"),
                 None => {
@@ -551,28 +637,30 @@ impl JournalCluster {
         wait: Duration,
     ) -> Result<u64, &'static str> {
         let raft = self.engines[&(group, node_id)].raft_handle();
-        let applied = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
-            .last_applied
-            .map_or(0, |log_id| log_id.index);
-        raft.trigger()
-            .snapshot()
-            .await
-            .map_err(|_fatal| "trigger a snapshot")?;
-        let snapshot = raft
-            .wait(Some(wait))
-            .metrics(
-                |metrics| {
-                    metrics
-                        .snapshot
-                        .is_some_and(|snapshot| snapshot.index >= applied)
-                },
-                "snapshot built",
-            )
-            .await
-            .map_err(|_timeout| "wait for the snapshot")?
-            .snapshot
-            .ok_or("snapshot log id")?;
-        let purge_upto = snapshot.index.saturating_sub(keep);
+        let snapshot = self.operator_snapshot(group, node_id, wait).await?;
+        let purge_upto = snapshot.saturating_sub(keep);
+        if self.drivers.is_some() {
+            // Under the hold rule every purge of the drivers' nodes keeps
+            // (#669): while a build of the group runs or OpenRaft has not
+            // published one, a purge could stop the group's Raft core.
+            let coordinator = self.coordinator(node_id);
+            let deadline = madsim::time::Instant::now() + wait;
+            while coordinator
+                .hold_for_purge(
+                    group,
+                    Some(snapshot),
+                    purge_upto,
+                    self.config.max_in_snapshot_log_to_keep,
+                    raft.metrics(),
+                )
+                .is_err()
+            {
+                if madsim::time::Instant::now() >= deadline {
+                    return Err("hold the group's builds for the purge");
+                }
+                madsim::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
         raft.trigger()
             .purge_log(purge_upto)
             .await
@@ -589,6 +677,57 @@ impl JournalCluster {
             .await
             .map_err(|_timeout| "wait for the purge")?;
         Ok(purge_upto)
+    }
+
+    /// Snapshots `node_id`'s replica of `group` as an operator's
+    /// `POST /__ursula/raft/{group}/snapshot` does, and answers the last log
+    /// index of the snapshot OpenRaft then shows, once it covers what the
+    /// replica applied. On the drivers' nodes the start goes through the
+    /// node's build coordinator (#669); without drivers each replica's own
+    /// coordinator takes the trigger.
+    pub(super) async fn operator_snapshot(
+        &self,
+        group: u32,
+        node_id: u64,
+        wait: Duration,
+    ) -> Result<u64, &'static str> {
+        let raft = self.engines[&(group, node_id)].raft_handle();
+        let wanted = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).last_applied;
+        let applied = wanted.map_or(0, |log_id| log_id.index);
+        let published = |metrics: &RaftMetrics<UrsulaRaftTypeConfig>| {
+            metrics
+                .snapshot
+                .is_some_and(|snapshot| snapshot.index >= applied)
+        };
+        if self.drivers.is_some() {
+            self.coordinator(node_id)
+                .start_snapshot(
+                    group,
+                    wanted,
+                    wait,
+                    || {
+                        published(&openraft::rt::WatchReceiver::borrow_watched(
+                            &raft.metrics(),
+                        ))
+                    },
+                    std::future::pending(),
+                    || async { raft.trigger().snapshot().await },
+                )
+                .await
+                .map_err(|_not_started| "start a snapshot")?;
+        } else {
+            raft.trigger()
+                .snapshot()
+                .await
+                .map_err(|_fatal| "trigger a snapshot")?;
+        }
+        raft.wait(Some(wait))
+            .metrics(published, "snapshot built")
+            .await
+            .map_err(|_timeout| "wait for the snapshot")?
+            .snapshot
+            .map(|snapshot| snapshot.index)
+            .ok_or("snapshot log id")
     }
 
     /// Stops `node_id` and gives it an empty WAL named `name`, as a lost

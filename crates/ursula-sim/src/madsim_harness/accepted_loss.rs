@@ -99,6 +99,10 @@ pub(super) struct Controls {
     /// The tool sends the plan to the members first, without a plan term,
     /// and to the leader last, as before the second #581 review.
     leader_last: bool,
+    /// Every node runs the production snapshot driver (#669), whose purges
+    /// through covering snapshots and restored snapshots land at any time.
+    /// Not a defence: the plans must hold with it.
+    drivers: Option<super::journal_cluster::DriverPlan>,
 }
 
 #[cfg(test)]
@@ -109,6 +113,12 @@ impl Controls {
         replication_fence_off: false,
         plan_term_vote_off: false,
         leader_last: false,
+        drivers: None,
+    };
+    /// Every defence on, and the snapshot driver on every node.
+    pub(super) const WITH_DRIVERS: Self = Self {
+        drivers: Some(super::deleted_data::DRIVERS),
+        ..Self::NONE
     };
     pub(super) const DEFERRED_CUT: Self = Self {
         deferred_cut: true,
@@ -179,6 +189,7 @@ pub(super) struct Switched;
 impl Switched {
     pub(super) fn apply(controls: Controls) -> Self {
         set_defences(controls);
+        super::journal_cluster::set_snapshot_drivers(controls.drivers);
         ursula_stream::sim_controls::reset_fired();
         Self
     }
@@ -187,6 +198,7 @@ impl Switched {
 impl Drop for Switched {
     fn drop(&mut self) {
         set_defences(Controls::default());
+        super::journal_cluster::set_snapshot_drivers(None);
     }
 }
 
@@ -783,6 +795,23 @@ mod tests {
             );
             assert_eq!(first, second, "seed {seed}");
             assert_eq!(first.scenario, scenario);
+        }
+    }
+
+    /// #669, reruns of the #647 recovery DSTs: with the production snapshot
+    /// driver on every node and a short floor, purges through covering and
+    /// restored snapshots land at any time, and every plan still holds.
+    #[test]
+    fn scrub_driver_keeps_recovery_plans_with_cuts() {
+        let _guard = sim_test_guard();
+        let scenario = SimScenario::RecoveryPlanCutUnderRestarts;
+        for seed in 385..=389 {
+            let report = ThreeNodeRaftSim::run_recovery_plan_with_controls_report(
+                config(seed, scenario),
+                scenario,
+                Controls::WITH_DRIVERS,
+            );
+            assert_eq!(report.scenario, scenario, "seed {seed}");
         }
     }
 
