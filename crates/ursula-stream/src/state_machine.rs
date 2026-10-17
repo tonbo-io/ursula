@@ -175,6 +175,35 @@ pub struct StreamStateMachine {
     /// The group's latest history event (#581 section 4.2); `None` until
     /// its genesis applies, while the group serves nothing.
     history: Option<HistoryEvent>,
+    /// What this state machine removed since it was built or restored
+    /// (#669). Neither replicated nor part of snapshots: the Raft state
+    /// machine reads it around each entry to learn that the entry removed a
+    /// stream, so that the replica scrubs the stream's copies from its
+    /// snapshot and log in bounded time. Restore starts it at zero.
+    removed: RemovedState,
+}
+
+/// Streams a group's state machine removed and the bytes they held in a
+/// group snapshot (#669): cumulative since the state machine was built or
+/// restored. A deletion, a bucket purge, a TTL expiry and a create over an
+/// expired stream all remove a stream through one path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemovedState {
+    /// Streams removed.
+    pub streams: u64,
+    /// What those streams added to a group snapshot: their hot bytes, any
+    /// inline snapshot body, and [`crate::COMMAND_LOG_OVERHEAD_BYTES`] each.
+    pub bytes: u64,
+}
+
+impl RemovedState {
+    /// What was removed between `earlier` and this tally.
+    pub fn since(self, earlier: Self) -> Self {
+        Self {
+            streams: self.streams.saturating_sub(earlier.streams),
+            bytes: self.bytes.saturating_sub(earlier.bytes),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +233,12 @@ struct StreamSlot {
 impl StreamStateMachine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// What this state machine removed since it was built or restored
+    /// ([`RemovedState`], #669).
+    pub fn removed_state(&self) -> RemovedState {
+        self.removed
     }
 
     fn stream_slot(&self, stream_id: &BucketStreamId) -> Option<&StreamSlot> {

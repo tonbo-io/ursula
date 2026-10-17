@@ -95,6 +95,8 @@ use axum::routing::post;
 use axum::routing::put;
 pub use bootstrap::PeerAddressChanged;
 pub use bootstrap::Persistence;
+pub use bootstrap::SnapshotDriveSettings;
+pub use bootstrap::SnapshotDriver;
 pub use bootstrap::SpawnRuntimeError;
 pub use bootstrap::SpawnedRuntime;
 pub use bootstrap::Topology;
@@ -2233,6 +2235,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
         raft_grpc_unidentified_peer_refusals: state.unidentified_peer_refusals(),
         peer_cluster_mismatches: state.peer_cluster_mismatches(),
         staged_snapshot_part_bytes: state.staged_part_bytes_total(),
+        deleted_data: render::deleted_data(&raft_groups),
     })
     .into_response()
 }

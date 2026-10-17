@@ -82,6 +82,21 @@ pub enum Defence {
     /// a refusal before the proposal would: the write's repeat then gets its
     /// receipt.
     RefusalMeansUnapplied,
+    /// A removal no snapshot covers makes its group due once it is a quarter
+    /// of `raft.deleted_data_max_age` old (#669). Off, only the removed
+    /// bytes count toward the group's snapshot, so a small removal on a
+    /// quiet group stays in its snapshot and log.
+    RemovalFloor,
+    /// The snapshot driver purges a group's log through the snapshot that
+    /// covers its removals (#669). Off, OpenRaft keeps
+    /// `raft.max_in_snapshot_log_to_keep` entries below it, the removed
+    /// stream's records among them.
+    ScrubPurge,
+    /// A purge through a covering snapshot starts only while the group's
+    /// snapshot work is idle, and holds the group's builds until it lands
+    /// (#669). Off, a build that ends while a leader defers that purge
+    /// schedules a lower one, which OpenRaft's debug assertion reports.
+    ScrubPurgeHold,
 }
 
 #[cfg(madsim)]
@@ -91,8 +106,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 18]> = const { Cell::new([false; 18]) };
-        static FIRED: Cell<[u64; 18]> = const { Cell::new([0; 18]) };
+        static OFF: Cell<[bool; 21]> = const { Cell::new([false; 21]) };
+        static FIRED: Cell<[u64; 21]> = const { Cell::new([0; 21]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -115,6 +130,9 @@ mod switches {
             Defence::CommitScreenChain => 15,
             Defence::CommitScreenPurged => 16,
             Defence::RefusalMeansUnapplied => 17,
+            Defence::RemovalFloor => 18,
+            Defence::ScrubPurge => 19,
+            Defence::ScrubPurgeHold => 20,
         }
     }
 
@@ -137,7 +155,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 18]));
+        FIRED.with(|fired| fired.set([0; 21]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -50,6 +50,11 @@ impl RuntimeMetrics {
     pub fn record_raft_log_pressure(&self, sample: RaftLogPressureSample) {
         self.inner.record_raft_log_pressure(sample);
     }
+
+    /// Records the deleted data the node's groups still hold (#669).
+    pub fn record_raft_deleted_data(&self, sample: RaftDeletedDataSample) {
+        self.inner.record_raft_deleted_data(sample);
+    }
 }
 
 /// Declares every runtime metric once and expands the four sections that were
@@ -439,6 +444,11 @@ runtime_metrics! {
     counter raft_snapshot_builds_in_flight_max;
     counter raft_log_bytes;
     counter raft_log_bytes_high_watermark;
+    // Gauges of the deleted data the node's groups still hold (#669): the
+    // age of the oldest removal no snapshot covers, and the groups that
+    // hold one past a quarter of `raft.deleted_data_max_age`.
+    counter raft_deleted_data_oldest_ms;
+    counter raft_deleted_data_overdue_groups;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -775,6 +785,13 @@ impl RuntimeMetricsInner {
             .fetch_max_relaxed(sample.log_bytes);
     }
 
+    fn record_raft_deleted_data(&self, sample: RaftDeletedDataSample) {
+        self.raft_deleted_data_oldest_ms
+            .store_relaxed(sample.oldest_ms);
+        self.raft_deleted_data_overdue_groups
+            .store_relaxed(sample.overdue_groups);
+    }
+
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
         self.cold_pack_uploads.fetch_add_relaxed(1);
         self.cold_pack_bytes.fetch_add_relaxed(bytes);
@@ -1044,6 +1061,7 @@ impl PaddedAtomicU64 {
 mod metric_manifest_tests {
     use std::sync::Arc;
 
+    use crate::metrics::RaftDeletedDataSample;
     use crate::metrics::RaftLogPressureSample;
     use crate::metrics::RuntimeMetrics;
     use crate::metrics::RuntimeMetricsInner;
@@ -1051,7 +1069,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 170] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 172] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1211,6 +1229,8 @@ mod metric_manifest_tests {
         "raft_snapshot_builds_in_flight_max",
         "raft_log_bytes",
         "raft_log_bytes_high_watermark",
+        "raft_deleted_data_oldest_ms",
+        "raft_deleted_data_overdue_groups",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",
@@ -1279,6 +1299,28 @@ mod metric_manifest_tests {
         assert_eq!(snapshot.raft_snapshot_body_bytes_max, 11);
     }
 
+    /// #669: the deleted-data gauges follow the latest poll.
+    #[test]
+    fn raft_deleted_data_gauges_follow_the_latest_poll() {
+        let metrics = metrics_for_test();
+        metrics.record_raft_deleted_data(RaftDeletedDataSample {
+            oldest_ms: 90_000,
+            overdue_groups: 3,
+        });
+        metrics.record_raft_deleted_data(RaftDeletedDataSample {
+            oldest_ms: 1_000,
+            overdue_groups: 0,
+        });
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            (
+                snapshot.raft_deleted_data_oldest_ms,
+                snapshot.raft_deleted_data_overdue_groups,
+            ),
+            (1_000, 0)
+        );
+    }
+
     /// #519: the log-pressure gauges follow the latest poll while their
     /// highs stay, and pressure passes add up their builds and time.
     #[test]
@@ -1319,6 +1361,19 @@ mod metric_manifest_tests {
             (2, 48, 10_000)
         );
     }
+}
+
+/// The deleted data a node's groups still hold, as the snapshot driver's
+/// monitor sees it on one poll (#669).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RaftDeletedDataSample {
+    /// How long ago the oldest removal no snapshot covers applied, 0 for
+    /// none.
+    pub oldest_ms: u64,
+    /// Groups that hold a removal past a quarter of
+    /// `raft.deleted_data_max_age`, or one replayed at startup, which no
+    /// snapshot covers yet.
+    pub overdue_groups: u64,
 }
 
 /// What the snapshot driver's log-pressure monitor sees on one poll

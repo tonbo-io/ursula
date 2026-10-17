@@ -241,6 +241,14 @@ pub struct RaftConfig {
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
+    /// How long a replica keeps a deleted, purged or expired stream in its
+    /// current Raft snapshot and its Raft log after it applies the removal
+    /// (#669). The snapshot driver snapshots a group a quarter of this
+    /// after its oldest removal no snapshot covers, sooner when the removed
+    /// bytes reach the group's snapshot threshold, and then purges the
+    /// group's log through that snapshot. At least eight times
+    /// `install_snapshot_timeout`.
+    pub deleted_data_max_age: HumanDuration,
 }
 
 impl RaftConfig {
@@ -250,6 +258,17 @@ impl RaftConfig {
     /// builds of large groups already hold gigabytes. A larger value is
     /// taken for a mistake.
     pub const MAX_SNAPSHOT_BUILD_CONCURRENCY: usize = 16;
+    /// `deleted_data_max_age` is at least this many `install_snapshot_timeout`s
+    /// (#669): a replica keeps the snapshot it replaced for a quarter of the
+    /// age, which must outlast two installs of it.
+    pub const DELETED_DATA_MAX_AGE_INSTALLS: u32 = 8;
+
+    /// The shortest `deleted_data_max_age` this config allows.
+    pub fn min_deleted_data_max_age(&self) -> std::time::Duration {
+        self.install_snapshot_timeout
+            .as_duration()
+            .saturating_mul(Self::DELETED_DATA_MAX_AGE_INSTALLS)
+    }
 }
 
 impl Default for RaftConfig {
@@ -278,6 +297,7 @@ impl Default for RaftConfig {
             snapshot_log_budget: HumanSize::gib(1),
             snapshot_backstop_logs: 100_000,
             max_in_snapshot_log_to_keep: 64,
+            deleted_data_max_age: HumanDuration::hour(1),
         }
     }
 }

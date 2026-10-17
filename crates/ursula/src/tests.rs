@@ -7222,6 +7222,7 @@ mod snapshot_driver {
     use ursula_raft::snapshot_cadence::DriveLimits;
     use ursula_raft::snapshot_cadence::GroupLogProgress;
     use ursula_raft::snapshot_cadence::LogPressure;
+    use ursula_raft::snapshot_cadence::RemovalProgress;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
     use ursula_runtime::AppendRequest;
     use ursula_runtime::CreateStreamRequest;
@@ -7242,9 +7243,13 @@ mod snapshot_driver {
     use crate::HttpState;
     use crate::admin_router;
     use crate::bootstrap::PeerParticipation;
+    use crate::bootstrap::ScrubPurge;
     use crate::bootstrap::StoreGateInputs;
     use crate::bootstrap::Trigger;
+    use crate::bootstrap::deleted_data_sample;
     use crate::bootstrap::group_log_progress;
+    use crate::bootstrap::groups_to_drive;
+    use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
     use crate::bootstrap::spawn_snapshot_driver;
@@ -7285,6 +7290,7 @@ mod snapshot_driver {
             log_entries: (log_bytes / 256).saturating_add(1),
             last_snapshot_bytes,
             has_snapshot: last_snapshot_bytes > 0,
+            ..GroupLogProgress::default()
         }
     }
 
@@ -7346,6 +7352,138 @@ mod snapshot_driver {
         assert!(group_log_progress(&installed).has_snapshot);
     }
 
+    fn removal(age_ms: u64) -> GroupLogProgress {
+        GroupLogProgress {
+            removal: RemovalProgress::Owed { bytes: 10, age_ms },
+            ..log(512, MIB)
+        }
+    }
+
+    /// #669: the driver purges a group's log through the snapshot that
+    /// covers its removals once OpenRaft shows that snapshot, and a lagging
+    /// group that applied nothing since its snapshot through that snapshot.
+    #[test]
+    fn snapshot_driver_purges_through_the_covering_snapshot() {
+        let covering = |through| GroupLogProgress {
+            scrub_purge_through: through,
+            ..log(MIB, MIB)
+        };
+        let mut purged = snap(3, Some(40), Some(30), covering(30));
+        purged.purged = Some(super::RaftLogProgressSnapshot {
+            term: 1,
+            index: 30,
+            node_id: 1,
+        });
+        let mut stopped = snap(4, Some(40), Some(30), covering(30));
+        stopped.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 1,
+            index: 41,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "diagnostic".to_owned(),
+        });
+        let idle = GroupLogProgress {
+            log_bytes: 0,
+            log_entries: 0,
+            ..covering(0)
+        };
+        let snapshots = vec![
+            snap(0, Some(40), Some(30), covering(30)),
+            // OpenRaft does not show the covering snapshot yet.
+            snap(1, Some(40), Some(20), covering(30)),
+            // No snapshot covered a removal.
+            snap(2, Some(40), Some(30), covering(0)),
+            purged,
+            stopped,
+            // Lagging and idle: through its snapshot.
+            snap(5, Some(36), Some(36), idle),
+            // Lagging, but it applied log since its snapshot: a build of it
+            // comes first.
+            snap(6, Some(40), Some(36), covering(0)),
+        ];
+        let lagging = BTreeSet::from([RaftGroupId(5), RaftGroupId(6)]);
+        assert_eq!(plan_scrub_purges(&snapshots, &lagging), vec![
+            ScrubPurge {
+                raft_group_id: 0,
+                through: 30,
+                published: 30,
+            },
+            ScrubPurge {
+                raft_group_id: 5,
+                through: 36,
+                published: 36,
+            },
+        ]);
+    }
+
+    /// #669: a group with an overdue removal leads the pass, and while the
+    /// snapshot store is in trouble the driver still snapshots it, and only
+    /// it, unless the log is under pressure.
+    #[test]
+    fn snapshot_driver_drives_overdue_groups_through_store_trouble() {
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000)
+            .with_deleted_data_max_age(Duration::from_secs(60));
+        let snapshots = vec![
+            snap(0, Some(9), Some(5), log(16 * MIB, MIB)),
+            snap(1, Some(9), Some(5), removal(15_000)),
+            snap(2, Some(9), Some(5), removal(14_999)),
+        ];
+        let (plan, selected) = plan_snapshot_drive(
+            &snapshots,
+            &cadence,
+            limits(16),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(plan.pressure, LogPressure::Calm);
+        assert_eq!(plan.overdue, 1);
+        assert_eq!(ids(&selected), vec![1, 0]);
+        assert_eq!(groups_to_drive(&plan, true), 1);
+        assert_eq!(groups_to_drive(&plan, false), 2);
+        // A group that builds or is held is not planned, overdue or not.
+        let (plan, _) = plan_snapshot_drive(
+            &snapshots,
+            &cadence,
+            limits(16),
+            &BTreeSet::new(),
+            &BTreeMap::from([(1, 0)]),
+            &BTreeSet::new(),
+        );
+        assert_eq!((plan.overdue, plan.groups), (0, vec![0]));
+        assert_eq!(groups_to_drive(&plan, true), 0);
+    }
+
+    /// #669: the node gauges report the oldest removal no snapshot covers
+    /// and the groups that hold one past the floor.
+    #[test]
+    fn snapshot_driver_reports_the_deleted_data_its_groups_hold() {
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000)
+            .with_deleted_data_max_age(Duration::from_secs(60));
+        let groups = [
+            log(MIB, MIB),
+            removal(20_000),
+            removal(3_000),
+            GroupLogProgress {
+                removal: RemovalProgress::Replayed {
+                    bytes: 1,
+                    age_ms: 100,
+                },
+                ..log(512, MIB)
+            },
+        ];
+        assert_eq!(
+            deleted_data_sample(&cadence, &groups),
+            ursula_runtime::RaftDeletedDataSample {
+                oldest_ms: 20_000,
+                overdue_groups: 2,
+            }
+        );
+        assert_eq!(
+            deleted_data_sample(&cadence, &[log(MIB, MIB)]),
+            ursula_runtime::RaftDeletedDataSample::default()
+        );
+    }
+
     #[test]
     fn snapshot_driver_follows_log_bytes_not_entry_counts() {
         // 128 groups and a 1 GiB budget: a 4 MiB floor.
@@ -7363,6 +7501,7 @@ mod snapshot_driver {
                 log_entries: 89_990,
                 last_snapshot_bytes: MIB,
                 has_snapshot: true,
+                ..GroupLogProgress::default()
             }),
         ];
         let (plan, selected) = plan_snapshot_drive(
@@ -7450,6 +7589,7 @@ mod snapshot_driver {
             log_entries: 60,
             last_snapshot_bytes: 3 * MIB,
             has_snapshot: true,
+            ..GroupLogProgress::default()
         });
         // The last log id renders as one term and index, apart from the
         // replica's current term.

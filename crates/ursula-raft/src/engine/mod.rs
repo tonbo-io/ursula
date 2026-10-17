@@ -425,6 +425,9 @@ impl RaftGroupEngine {
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
+        // A purge an earlier incarnation of the group's Raft held its builds
+        // for is not pending in the new one (#669).
+        snapshot_build.release_purge(placement.raft_group_id.0);
         let snapshot_install = snapshot_install.unwrap_or_default();
         let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
@@ -473,6 +476,9 @@ impl RaftGroupEngine {
                 .err()
                 .unwrap_or_else(|| GroupEngineError::new(format!("create OpenRaft group: {err}")))
         })?;
+        // `Raft::new` applied the log the restored snapshot does not cover:
+        // a removal it applied again is due at once (#669).
+        log_gauge.replay_ended();
 
         // Every replica runs the history driver: a leader proposes the
         // event it owes, and every replica retires a satisfied plan.

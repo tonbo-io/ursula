@@ -130,6 +130,9 @@ data:
     snapshot_build_max_concurrency = {{ .Values.raft.snapshotBuildMaxConcurrency }}
 {{- end }}
     max_in_snapshot_log_to_keep = {{ .Values.raft.maxInSnapshotLogToKeep }}
+{{- if not (eq .Values.raft.deletedDataMaxAgeMs nil) }}
+    deleted_data_max_age = "{{ .Values.raft.deletedDataMaxAgeMs | int64 }}ms"
+{{- end }}
 {{- if not (eq .Values.raft.maxUncommittedBytesPerGroup nil) }}
     max_uncommitted_size_per_group = "{{ .Values.raft.maxUncommittedBytesPerGroup }}"
 {{- end }}

@@ -107,6 +107,7 @@ pub use state_machine::ColdFlushPressure;
 pub use state_machine::GroupStateGauges;
 pub use state_machine::MAX_STAGED_EXTERNAL_REFS;
 pub use state_machine::RETENTION_COLD_GC_GRACE_MS;
+pub use state_machine::RemovedState;
 pub use state_machine::SHARED_REF_COMPACTION_THRESHOLD;
 pub use state_machine::SHARED_REF_IDLE_MS;
 pub use state_machine::STAGED_EXTERNAL_REF_MAX_AGE_MS;

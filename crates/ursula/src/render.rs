@@ -864,6 +864,31 @@ pub(crate) struct MetricsResponse {
     /// Bytes of staged, unused snapshot parts in the streams this node
     /// leads and counts.
     pub staged_snapshot_part_bytes: u64,
+    /// The groups whose replica on this node still holds removed streams in
+    /// its current snapshot (#669): what they removed and how long ago.
+    pub deleted_data: Vec<GroupDeletedData>,
+}
+
+/// Removed streams one group's replica still holds in its current snapshot
+/// (#669).
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct GroupDeletedData {
+    pub raft_group_id: u32,
+    #[serde(flatten)]
+    pub removal: ursula_raft::snapshot_cadence::RemovalProgress,
+}
+
+/// [`GroupDeletedData`] of every group in `raft_groups` that still holds
+/// removed streams.
+pub(crate) fn deleted_data(raft_groups: &[RaftGroupMetricsSnapshot]) -> Vec<GroupDeletedData> {
+    raft_groups
+        .iter()
+        .filter(|group| group.log.removal != ursula_raft::snapshot_cadence::RemovalProgress::Clear)
+        .map(|group| GroupDeletedData {
+            raft_group_id: group.raft_group_id,
+            removal: group.log.removal,
+        })
+        .collect()
 }
 
 #[derive(serde::Serialize)]

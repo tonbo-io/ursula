@@ -4615,3 +4615,124 @@ fn flush_planner_flushes_tails_older_than_the_max_hot_age() {
     assert_eq!(pass.candidates.len(), 1);
     assert_eq!(pass.candidates[0].stream_id, stream("young"));
 }
+
+/// How a generated stream leaves the group in
+/// [`prop_removed_state_counts_every_removal_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Leaves {
+    /// It stays until the bucket purge, if any.
+    Stays,
+    /// `DeleteStream`.
+    Deleted,
+    /// Its TTL runs out and a later command's sweep removes it.
+    Expires,
+    /// Its TTL runs out and a create of the same id replaces it.
+    Recreated,
+}
+
+fn leaves_strategy() -> impl Strategy<Value = Leaves> {
+    prop_oneof![
+        Just(Leaves::Stays),
+        Just(Leaves::Deleted),
+        Just(Leaves::Expires),
+        Just(Leaves::Recreated),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(128))]
+
+    /// #669: every way a stream leaves a group (a deletion, a TTL expiry, a
+    /// create over an expired stream and a bucket purge) counts the stream
+    /// and the bytes it held in a group snapshot, its hot bytes and the
+    /// per-command overhead, once. A restore starts the tally at zero.
+    #[test]
+    fn prop_removed_state_counts_every_removal_path(
+        streams in vec((vec(payload_strategy(), 0..=4), leaves_strategy()), 1..=6),
+        purge in any::<bool>(),
+    ) {
+        let mut machine = machine();
+        let overhead = crate::COMMAND_LOG_OVERHEAD_BYTES;
+        let mut held = Vec::new();
+        for (index, (payloads, leaves)) in streams.into_iter().enumerate() {
+            let stream_id = stream(&format!("removed-{index}"));
+            let ttl_seconds = matches!(leaves, Leaves::Expires | Leaves::Recreated).then_some(1);
+            let created = machine.apply(create_cmd(stream_id.clone(), Create {
+                ttl_seconds,
+                ..Create::default()
+            }));
+            prop_assert!(matches!(created, StreamResponse::Created { .. }), "{:?}", created);
+            let mut bytes = 0u64;
+            for payload in payloads {
+                bytes = bytes.saturating_add(u64::try_from(payload.len()).unwrap());
+                let appended = machine.apply(append_cmd(stream_id.clone(), &payload, Append::default()));
+                prop_assert!(matches!(appended, StreamResponse::Appended { .. }), "{:?}", appended);
+            }
+            held.push((stream_id, bytes.saturating_add(overhead), leaves));
+        }
+        prop_assert_eq!(machine.removed_state(), RemovedState::default());
+
+        // Deletions carry no clock, so nothing expires meanwhile.
+        let mut expected = RemovedState::default();
+        for (stream_id, bytes, leaves) in &held {
+            if *leaves == Leaves::Deleted {
+                prop_assert_eq!(machine.apply(delete_cmd(stream_id.clone())), StreamResponse::Deleted);
+                expected.streams = expected.streams.saturating_add(1);
+                expected.bytes = expected.bytes.saturating_add(*bytes);
+                prop_assert_eq!(machine.removed_state(), expected);
+            }
+        }
+
+        // One second on, every stream with a TTL expired. A touch or a
+        // create at that time removes it, or an earlier command's sweep did.
+        let mut recreated = 0u64;
+        for (stream_id, bytes, leaves) in &held {
+            match leaves {
+                Leaves::Expires => {
+                    // An earlier command's sweep may have removed it.
+                    let touched = machine.apply(touch_cmd(stream_id.clone(), 1_000));
+                    prop_assert!(
+                        matches!(
+                            touched,
+                            StreamResponse::Accessed { .. } | StreamResponse::Error { .. }
+                        ),
+                        "{:?}",
+                        touched
+                    );
+                }
+                Leaves::Recreated => {
+                    let created = machine.apply(create_cmd(stream_id.clone(), Create {
+                        now_ms: 1_000,
+                        ..Create::default()
+                    }));
+                    prop_assert!(matches!(created, StreamResponse::Created { .. }), "{:?}", created);
+                    recreated = recreated.saturating_add(1);
+                }
+                Leaves::Stays | Leaves::Deleted => continue,
+            }
+            expected.streams = expected.streams.saturating_add(1);
+            expected.bytes = expected.bytes.saturating_add(*bytes);
+        }
+        prop_assert_eq!(machine.removed_state(), expected);
+
+        if purge {
+            let purged = machine.apply(StreamCommand::PurgeBucket {
+                bucket_id: "benchcmp".to_owned(),
+            });
+            prop_assert!(matches!(purged, StreamResponse::BucketPurged { .. }), "{:?}", purged);
+            for (_, bytes, leaves) in &held {
+                if *leaves == Leaves::Stays {
+                    expected.streams = expected.streams.saturating_add(1);
+                    expected.bytes = expected.bytes.saturating_add(*bytes);
+                }
+            }
+            // The streams created over expired ones hold no bytes.
+            expected.streams = expected.streams.saturating_add(recreated);
+            expected.bytes = expected.bytes.saturating_add(recreated.saturating_mul(overhead));
+            prop_assert_eq!(machine.removed_state(), expected);
+        }
+
+        let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
+        prop_assert_eq!(restored.removed_state(), RemovedState::default());
+    }
+}
