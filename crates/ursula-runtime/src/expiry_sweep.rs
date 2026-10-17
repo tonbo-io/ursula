@@ -1,8 +1,10 @@
 //! Leader-side background expiry sweep (bounded-stream-state F0, #669).
 //!
 //! An expired stream reads as gone at once, but it leaves its group's state
-//! only when a command sweeps it: a write other than a plain append sweeps
-//! up to 256 expired streams at its `now_ms`, and a read of an expired
+//! only when a command sweeps it: a create, an external append, a snapshot
+//! publish, a retention advance or a close sweeps up to 256 expired streams
+//! at its `now_ms` (a plain append, a deletion, a bucket purge and the cold,
+//! tidy and history commands do not), and a read of an expired
 //! stream proposes `TouchStreamAccess`, which removes it. A group that takes
 //! only plain appends, or no writes at all, kept its expired streams.
 //!
@@ -66,7 +68,7 @@ pub fn sweep_now_ms(now_ms: u64) -> u64 {
     now_ms.saturating_sub(grace_ms)
 }
 
-/// Whether the sweep runs: always, but in a simulation's negative control.
+/// Whether the sweep runs: always, except in a simulation's negative control.
 pub fn enabled() -> bool {
     !ursula_stream::sim_controls::off(Defence::ExpirySweep)
 }

@@ -2307,6 +2307,31 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
     for _ in 0..3 {
         post_until_no_content(&client, &stream, DELETED_MARKER).await;
     }
+    // A live stream in the same group, across several journal segments,
+    // which the node must read back whole after the scrub and a restart.
+    let live = format!("{base_url}/expiring/live");
+    put_until_created(&client, &live).await;
+    let mut written = Vec::new();
+    for index in 0..96 {
+        let record = format!("live-record-{index:03};{}\n", "x".repeat(1_000));
+        let mut appended = false;
+        for _ in 0..100 {
+            if let Ok(response) = client
+                .post(&live)
+                .header("content-type", "text/plain")
+                .body(record.clone())
+                .send()
+                .await
+                && response.status() == reqwest::StatusCode::NO_CONTENT
+            {
+                appended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(appended, "append {index} to {live}");
+        written.extend_from_slice(record.as_bytes());
+    }
     // The node's snapshot holds the stream before it expires.
     let snapshot = admin_test_post(&client, format!("{admin}/__ursula/raft/0/snapshot"))
         .await
@@ -2356,6 +2381,42 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
         .await
         .expect("read the expired stream");
     assert_eq!(read.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // A single node has no peer to repair from: after the purges and the
+    // journal rewrites, a restart, here a kill, reads the live stream back
+    // byte for byte.
+    drop(children);
+    let mut children = vec![spawn_node_with_cluster_config(binary, &config)];
+    wait_until_ready(&client, &base_url, &mut children).await;
+    let mut read_back = Vec::new();
+    let mut offset = "0".to_owned();
+    for _ in 0..200 {
+        if read_back.len() >= written.len() {
+            break;
+        }
+        let Ok(response) = client.get(format!("{live}?offset={offset}")).send().await else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        if response.status() != reqwest::StatusCode::OK {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        let next = response
+            .headers()
+            .get("stream-next-offset")
+            .and_then(|value| value.to_str().ok())
+            .expect("a next offset")
+            .to_owned();
+        read_back.extend_from_slice(&response.bytes().await.expect("read the live stream"));
+        offset = next;
+    }
+    assert_eq!(
+        read_back.len(),
+        written.len(),
+        "the live stream after the restart"
+    );
+    assert!(read_back == written, "the live stream's bytes changed");
 
     drop(children);
     std::fs::remove_dir_all(&root).expect("remove temp root");

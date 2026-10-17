@@ -370,9 +370,11 @@ pub(crate) fn cluster_cadence(raft: &ursula_config::RaftConfig, groups: usize) -
 /// still waits for the node's build slot: below the budget the driver runs
 /// one build at a time across the node, where each group used to build on
 /// its own. Under many small appends to many groups, due groups queue and
-/// their logs grow past the backstop until a slot comes free, which
-/// `raft.snapshot_build_max_concurrency` and the pressure pass past the
-/// budget relieve.
+/// their logs grow past the backstop until a slot comes free. Below the
+/// budget that holds whatever `raft.snapshot_build_max_concurrency` says,
+/// since the setting adds builds only past it.
+/// `storage.snapshot.drive_interval = "0s"` goes back to a build per group,
+/// as in 0.8.0.
 pub(crate) fn single_node_cadence(
     raft: &ursula_config::RaftConfig,
     groups: usize,

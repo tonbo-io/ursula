@@ -177,12 +177,14 @@ stay at 0 without it. Alert when `raft_deleted_data_oldest_age_ms` nears half of
 
 Each group's leader removes expired streams in the background (see
 [Deleted data](/docs/operations#deleted-data)). `ttl_expiry_sweeps` counts the
-Raft entries the node's leaders wrote for it, each of which removes the
-expired stream it names and up to 256 more, and `ttl_expiry_sweep_due_groups`
-reports the groups the latest pass left with expired streams for the next one.
-A value that stays above 0 across passes means a group expires streams faster
-than about 4,100 a minute, or that its commits are slow enough to reach the
-sweep's 250 ms per group and pass. Both work without the snapshot driver, and in the in-memory mode.
+sweep commands the node's leaders committed, each of which removes the expired
+stream it names and up to 256 more, and `ttl_expiry_sweep_due_groups` reports
+the groups the latest pass left with expired streams for the next one. A value
+that stays above 0 across passes means a group expires streams faster than
+about 4,100 a minute, that its commits are slow enough to reach the sweep's
+250 ms per group and pass, or that the sweep stopped on an error, such as a
+group whose history is pending or whose apply stopped. Both work without the
+snapshot driver, and in the in-memory mode.
 
 With an S3 snapshot store, `snapshot_gc_deleted_objects` counts the snapshot
 objects the node's snapshot GC deleted, and
