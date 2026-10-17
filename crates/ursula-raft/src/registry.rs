@@ -27,7 +27,9 @@ use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::rt::WatchReceiver;
+#[cfg(any(test, feature = "fault-injection"))]
 use openraft::storage::RaftSnapshotBuilder;
+#[cfg(any(test, feature = "fault-injection"))]
 use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 use openraft::vote::RaftLeaderId;
@@ -1638,6 +1640,7 @@ impl RaftGroupHandleRegistry {
         Ok(snapshot)
     }
 
+    #[cfg(any(test, feature = "fault-injection"))]
     fn require_group(&self, group: RaftGroupId) -> Result<OwnerRaftHandle, GroupEngineError> {
         Ok(self.entry(group)?.raft().clone())
     }
