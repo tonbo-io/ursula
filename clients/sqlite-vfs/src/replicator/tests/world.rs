@@ -1840,6 +1840,18 @@ impl World {
         });
     }
 
+    /// Whether the claim frame `(epoch, activation)` is `owner`'s own (properties 9 and 10): its
+    /// log holds that claim, so another copy's claim under an activation they share is not. An
+    /// explicit open's claim under the activation the instance runs under counts too: a claim
+    /// frame of its activation is the replicator's (design: Claims), so a second open under one
+    /// activation (a platform's constant `activation`, or a clone and its original reopened under
+    /// the one they share) is the residual case of a shared activation.
+    fn owns_claim(&self, owner: &Owner, epoch: Epoch, activation: Activation) -> bool {
+        let current = owner.inst.replicator.ctx().map(|ctx| ctx.activation);
+        owner.log.claims.contains(&(epoch, activation))
+            || (current == Some(activation) && self.explicit.contains(&(epoch, activation)))
+    }
+
     /// Property 10: what lies between the previous acknowledged offset and `offset`.
     fn between_acks(&mut self, index: usize, offset: Offset, takeover: bool) {
         let owner = &mut self.owners[index];
@@ -1858,11 +1870,12 @@ impl World {
             .unwrap_or_default();
         let own_frames: Vec<&[u8]> = owner.log.commits.values().map(|p| &p.frame[..]).collect();
         let frames = decode_all(range);
-        // Its own: a claim whose epoch and activation its log holds. Under one activation for every
+        // Its own: a claim whose epoch and activation its log holds, or an explicit open's under
+        // the activation it runs under ([`World::owns_claim`]). Under one activation for every
         // instance, any claim is its own to the replicator (design: Claims).
         let own_claim = |frame: &Option<Frame>| {
             matches!(frame, Some(Frame::Claim { epoch, activation })
-                if owner.log.claims.contains(&(*epoch, *activation)))
+                if self.owns_claim(&owner, *epoch, *activation))
         };
         let shared = self.knobs.shared_activation;
         // A claim of its own after a foreign one, other than the claim it binds with at the end,
@@ -1871,23 +1884,25 @@ impl World {
             .iter()
             .take(frames.len().saturating_sub(1))
             .rposition(|(_, _, frame)| own_claim(frame));
-        for (i, (start, len, frame)) in frames.iter().enumerate() {
-            let (start, len) = (*start, *len);
-            let bytes = range.get(start..start + len).unwrap_or_default();
-            let fine = match frame {
-                Some(Frame::Claim { .. }) => {
-                    shared || takeover || own_claim(frame) || superseder.is_some_and(|s| s > i)
-                }
-                Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
-                _ => false,
-            };
-            if !fine {
-                self.violation(format!(
-                    "property 10: owner {index} acknowledged past a foreign frame at {}",
-                    previous.get() + u64::try_from(start).unwrap()
-                ));
-                return;
-            }
+        let foreign = frames
+            .iter()
+            .enumerate()
+            .find_map(|(i, (start, len, frame))| {
+                let bytes = range.get(*start..*start + *len).unwrap_or_default();
+                let fine = match frame {
+                    Some(Frame::Claim { .. }) => {
+                        shared || takeover || own_claim(frame) || superseder.is_some_and(|s| s > i)
+                    }
+                    Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
+                    _ => false,
+                };
+                (!fine).then_some(*start)
+            });
+        if let Some(start) = foreign {
+            self.violation(format!(
+                "property 10: owner {index} acknowledged past a foreign frame at {}",
+                previous.get() + u64::try_from(start).unwrap()
+            ));
         }
     }
 
@@ -1919,7 +1934,7 @@ impl World {
                 let bytes = past.get(start..start + len).unwrap_or_default();
                 let own = match frame {
                     Some(Frame::Claim { epoch, activation }) => {
-                        owner.log.claims.contains(&(epoch, activation))
+                        self.owns_claim(&owner, epoch, activation)
                     }
                     Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
                     _ => false,
@@ -4633,6 +4648,43 @@ fn a_clone_reopened_under_the_shared_activation_is_one_owner_to_the_other() {
     ];
     assert_eq!(
         run(Knobs::default(), 194_716_899_250_413_353, &ops),
+        Vec::<String>::new()
+    );
+}
+
+/// Found at a million cases: owner 0 restarts provisionally, is cloned, and a restore empties the
+/// stream; owner 0 reopens under the activation it shares with the clone and takes over afresh.
+/// The clone's re-keyed pre-check reads that takeover's claim as its own (design: Claims) and binds
+/// past it: the residual case of a shared activation, an explicit open's claim under the
+/// activation the clone runs under (properties 9 and 10).
+#[test]
+fn a_clone_binds_past_its_originals_takeover_under_the_shared_activation() {
+    use Op::Commit;
+    use Op::Deliver;
+    let ops = vec![
+        Op::Flush,
+        Op::ProvisionalRestart(0, 1),
+        Deliver(0),
+        Deliver(0),
+        Deliver(0),
+        Deliver(0),
+        Deliver(0),
+        Op::LowerLimit,
+        Deliver(0),
+        Op::Clone(0),
+        Op::Flush,
+        Op::Restore(0),
+        Op::Reopen(2),
+        Deliver(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+    ];
+    assert_eq!(
+        run(Knobs::default(), 20_272_985_525_704_585, &ops),
         Vec::<String>::new()
     );
 }
