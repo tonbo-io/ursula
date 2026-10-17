@@ -5,7 +5,7 @@ description: Changes that affect clients and operators, newest first.
 
 ## 0.8.1
 
-0.8.1 is a drop-in patch for 0.8.0: format epoch 4, the server's storage and protocol formats and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged. 0.8.0 and 0.8.1 nodes run in one cluster during a rolling upgrade, 0.8.0 and 0.8.1 owners and readers of one stream work side by side, and owners upgrade one at a time.
+0.8.1 is a drop-in patch for 0.8.0: format epoch 4, the server's storage and protocol formats and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged. 0.8.0 and 0.8.1 nodes run in one cluster during a rolling upgrade, 0.8.0 and 0.8.1 owners and readers of one stream work side by side, and owners upgrade one at a time. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Rolling back to 0.8.0 is safe.
 
 ### Server
 
@@ -39,7 +39,7 @@ description: Changes that affect clients and operators, newest first.
 
 ### Known issues
 
-The known issues of [0.8.0](#080) remain open. 0.8.1 adds these:
+0.8.1 fixes [#490](https://github.com/tonbo-io/ursula/issues/490) and [#494](https://github.com/tonbo-io/ursula/issues/494) of the known issues of [0.8.0](#080): snapshot GC no longer fails a pass when a pin it listed is released before it reads it, and the old snapshot objects of a group that stops building are pruned. The rest of 0.8.0's known issues remain open. 0.8.1 adds these:
 
 - [#687](https://github.com/tonbo-io/ursula/issues/687): snapshot objects are named by their content, so a build whose bytes match an old object that no replica names reuses that object. If a GC pass deletes the old object between the upload and the build's pin, the new snapshot names an object that is gone, and an install or a restore of it fails with `NotFound`. The window is short and needs identical bytes, and the shorter grace of 0.8.1 makes the old object's age easier to reach.
 - [#698](https://github.com/tonbo-io/ursula/issues/698): when the bound replacement candidate of a host recovery dies after its group leaders started rebuilding it, they keep it as a learner in those groups, so `ursulactl verify-survivors` refuses for good and the host restaging cannot proceed without manual work. No acknowledged write is at risk, since the survivors refuse.
