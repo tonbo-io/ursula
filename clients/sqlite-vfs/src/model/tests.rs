@@ -1353,8 +1353,12 @@ fn s4_8_the_snapshot_offset_is_never_above_inherited_until_a_new_publish() {
 fn s4_8_read_refusals_come_in_the_order_404_410_416_412() {
     let world = World::new();
     let other = |token: Incarnation| tokened(Incarnation::try_from(token.get() ^ 1).unwrap());
-    let missing = read(None, Some(0));
-    assert_eq!(world.send(&missing).status, 404);
+    // A missing stream's `404` names no token.
+    let missing = world.send(&read(None, Some(0)));
+    assert_eq!(
+        (missing.status, missing.typed),
+        (404, Ok(Typed::ReadRefused { incarnation: None }))
+    );
     let token = world.create();
     world.server().foreign_append(PATH, &[0; 100]).unwrap();
     assert_eq!(world.send(&publish(token, 60, b"image").0).status, 204);
@@ -1369,7 +1373,7 @@ fn s4_8_read_refusals_come_in_the_order_404_410_416_412() {
     };
     assert_eq!(world.send(&retain).status, 204);
     // A wrong token below retention, past the tail, then within range. The `410` and `416` name
-    // the token of the stream that refused them, the `404` of a missing stream none.
+    // the token of the stream that refused them.
     let refused = |status: u16, incarnation: Incarnation| {
         (
             status,
@@ -1385,11 +1389,6 @@ fn s4_8_read_refusals_come_in_the_order_404_410_416_412() {
     assert_eq!(world.send(&read(other(token), Some(60))).status, 412);
     let past = world.send(&read(tokened(token), Some(101)));
     assert_eq!((past.status, past.typed), refused(416, token));
-    let missing = world.send(&missing);
-    assert_eq!(
-        (missing.status, missing.typed),
-        (404, Ok(Typed::ReadRefused { incarnation: None }))
-    );
 }
 
 /// A snapshot read's refusals in the server's order: `404` without the stream, `404` when the
