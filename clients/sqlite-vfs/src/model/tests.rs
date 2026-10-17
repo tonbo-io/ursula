@@ -2540,17 +2540,21 @@ fn every_refusal_carries_the_servers_error_body() {
     );
 }
 
+/// A producer refusal: what it is, the request drawing it from a stream holding the claim
+/// `(2, 0)`, its status, its code and its inventory row.
+type ProducerCase = (
+    &'static str,
+    fn(&World, Incarnation) -> Request,
+    u16,
+    ErrorCode,
+    &'static str,
+);
+
 /// The producer refusals with their codes (extensions: Producer Write Answers), each on a fresh
 /// stream holding the claim `(2, 0)`.
 #[test]
 fn producer_refusals_carry_the_servers_error_body() {
-    let cases: [(
-        &str,
-        fn(&World, Incarnation) -> Request,
-        u16,
-        ErrorCode,
-        &str,
-    ); 4] = [
+    let cases: [ProducerCase; 4] = [
         (
             "a closed epoch",
             |world, token| {
@@ -2630,8 +2634,9 @@ fn raw_exchange(
         .windows(4)
         .position(|window| window == b"\r\n\r\n")
         .unwrap();
-    let head = String::from_utf8(answer[..end].to_vec()).unwrap();
-    let body = answer[end + 4..].to_vec();
+    let (head, rest) = answer.split_at(end);
+    let head = String::from_utf8(head.to_vec()).unwrap();
+    let body = rest.strip_prefix(b"\r\n\r\n").unwrap().to_vec();
     let mut lines = head.split("\r\n");
     let status = lines
         .next()
@@ -2649,6 +2654,10 @@ fn raw_exchange(
         .collect();
     (status, headers, body)
 }
+
+/// A refusal of the HTTP front: what it is, the raw request head, its status, its code and the
+/// headers it names.
+type FrontCase<'a> = (&'a str, String, u16, ErrorCode, &'a [(&'a str, &'a str)]);
 
 /// The refusals the HTTP front decides before the server sees a request, through
 /// `http::serve`: each with the server's error body, its code and `Cache-Control: no-store`.
@@ -2668,7 +2677,7 @@ fn the_http_front_refuses_with_the_servers_error_body() {
         super::http::serve(listener, server)
     }));
     let zero = Offset::ZERO.to_string();
-    let cases: [(&str, String, u16, ErrorCode, &[(&str, &str)]); 9] = [
+    let cases: [FrontCase<'_>; 9] = [
         (
             "an unknown method",
             format!("BREW {PATH} HTTP/1.1\r\n"),
