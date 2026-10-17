@@ -2654,16 +2654,19 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
-/// Preserve HTTP/2 bodies and trailers while delaying only snapshot transfer.
-/// Metrics and readiness use the server's real listeners directly.
-struct SnapshotProxy {
+/// Stands in front of node 3's Raft endpoint and preserves HTTP/2 bodies and
+/// trailers. It can delay only snapshot transfer, or partition the node from
+/// every inbound RPC. Metrics and readiness use the server's real listeners
+/// directly.
+struct RaftProxy {
     url: String,
     release: tokio::sync::watch::Sender<bool>,
     blocked: tokio::sync::watch::Receiver<bool>,
+    reachable: Arc<tokio::sync::RwLock<bool>>,
     task: tokio::task::JoinHandle<()>,
 }
 
-impl SnapshotProxy {
+impl RaftProxy {
     async fn start(target: &str) -> Self {
         use tower::ServiceExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2673,10 +2676,13 @@ impl SnapshotProxy {
             .connect_lazy();
         let (release, released) = tokio::sync::watch::channel(true);
         let (blocked_tx, blocked) = tokio::sync::watch::channel(false);
+        let reachable = Arc::new(tokio::sync::RwLock::new(true));
+        let gate = Arc::clone(&reachable);
         let proxy = tower::service_fn(move |request: axum::http::Request<axum::body::Body>| {
             let channel = channel.clone();
             let mut released = released.clone();
             let blocked_tx = blocked_tx.clone();
+            let gate = Arc::clone(&gate);
             async move {
                 if request.uri().path() == ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH {
                     if !*released.borrow() {
@@ -2684,10 +2690,21 @@ impl SnapshotProxy {
                     }
                     released.wait_for(|ready| *ready).await.unwrap();
                 }
-                let response = channel.oneshot(request.map(tonic::body::boxed)).await;
+                // Held until the target answers, so `partition` waits for
+                // every RPC that it lets through.
+                let reachable = gate.read().await;
+                let response = if *reachable {
+                    match channel.oneshot(request.map(tonic::body::boxed)).await {
+                        Ok(response) => Some(response),
+                        Err(_transport) => None,
+                    }
+                } else {
+                    None
+                };
+                drop(reachable);
                 Ok::<_, std::convert::Infallible>(match response {
-                    Ok(response) => response.map(axum::body::Body::new),
-                    Err(_transport) => axum::http::Response::builder()
+                    Some(response) => response.map(axum::body::Body::new),
+                    None => axum::http::Response::builder()
                         .status(axum::http::StatusCode::BAD_GATEWAY)
                         .body(axum::body::Body::empty())
                         .unwrap(),
@@ -2703,12 +2720,24 @@ impl SnapshotProxy {
             url,
             release,
             blocked,
+            reachable,
             task,
         }
     }
+
+    /// Refuses every later RPC, as for an unreachable node. Returns once the
+    /// RPCs it let through before have been answered, so none of them reaches
+    /// a process started afterwards.
+    async fn partition(&self) {
+        *self.reachable.write().await = false;
+    }
+
+    async fn heal(&self) {
+        *self.reachable.write().await = true;
+    }
 }
 
-impl Drop for SnapshotProxy {
+impl Drop for RaftProxy {
     fn drop(&mut self) {
         self.release.send_replace(true);
         self.task.abort();
@@ -2729,7 +2758,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     };
     let ports = [free_port(), free_port(), free_port()];
     let public = |node_id: u64| format!("http://127.0.0.1:{}", node_port(&ports, node_id));
-    let mut snapshot_proxy = SnapshotProxy::start(&public(3)).await;
+    let mut snapshot_proxy = RaftProxy::start(&public(3)).await;
     let peers = [1_u64, 2, 3]
         .into_iter()
         .map(|node_id| {
@@ -3289,7 +3318,21 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     let binary = env!("CARGO_BIN_EXE_ursula");
     let ports = [free_port(), free_port(), free_port()];
     let public = |id: u64| format!("http://127.0.0.1:{}", node_port(&ports, id));
-    let peers = (1..=3).map(|id| (id, public(id))).collect::<Vec<_>>();
+    // Node 3's peers reach its Raft endpoint only through this proxy, so the
+    // test decides whether its group leaders can contact a candidate.
+    let node_3_raft = RaftProxy::start(&public(3)).await;
+    let peers = (1..=3)
+        .map(|id| {
+            (
+                id,
+                if id == 3 {
+                    node_3_raft.url.clone()
+                } else {
+                    public(id)
+                },
+            )
+        })
+        .collect::<Vec<_>>();
     let wal_root = tempfile::tempdir().expect("WAL root");
     let mut children = Vec::new();
     let mut nodes = Vec::new();
@@ -3463,6 +3506,14 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         );
     }
     drop(children.pop());
+    // A candidate that dies after its group leaders started rebuilding it
+    // stays a learner in their groups, and the survivors refuse the proof that
+    // restaging needs (`docs/architecture/cluster-membership.md`). This test
+    // covers the candidate that dies first, so its leaders must not reach it
+    // until it has been killed.
+    if interrupt_candidate {
+        node_3_raft.partition().await;
+    }
     // The replacement host starts with an empty WAL.
     remove_test_path(node_wal_dir(wal_root.path(), 3));
     std::fs::write(&replacement_config, replacement_text).unwrap();
@@ -3501,6 +3552,7 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         // persistent binding. Never clear that binding merely on timeout.
         children[2].child.kill().unwrap();
         children[2].child.wait().unwrap();
+        node_3_raft.heal().await;
         let deadline = tokio::time::Instant::now()
             .checked_add(Duration::from_secs(60))
             .unwrap();
