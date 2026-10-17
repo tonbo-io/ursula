@@ -338,12 +338,86 @@ pub(crate) fn deleted_data_sample<'a>(
         })
 }
 
+/// Whether a node refuses client writes with a body while its
+/// unsnapshotted Raft log is past [`SnapshotCadence::hard_limit_bytes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LogWriteGate {
+    /// From the hard limit until the log is back at
+    /// [`SnapshotCadence::resume_bytes`], HTTP admission answers such writes
+    /// `503 RAFT_LOG_PRESSURE`: a cluster node.
+    RefuseAtHardLimit,
+    /// Never: a single node, which 0.8.0 never refused for its log, and
+    /// which a patch release does not start refusing.
+    Open,
+}
+
+/// The snapshot policy of a cluster node (F12e, #519, #669).
+pub(crate) fn cluster_cadence(raft: &ursula_config::RaftConfig, groups: usize) -> SnapshotCadence {
+    SnapshotCadence::new(
+        raft.snapshot_log_budget.as_bytes(),
+        groups,
+        raft.snapshot_backstop_logs,
+    )
+    .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
+}
+
+/// The snapshot policy of a single node (#669): a cluster node's, with its
+/// entry backstop at `raft.snapshot_logs_since_last` (5,000 by default) if
+/// that is nearer. Before the driver ran there, OpenRaft's default policy
+/// snapshotted a single node's groups every 5,000 entries, and entry count
+/// is what bounds a group's log index in memory and its replay at restart,
+/// so a group of small entries is due no later than it was then. A due group
+/// still waits for the node's build slot: below the budget the driver runs
+/// one build at a time across the node, where each group used to build on
+/// its own. Under many small appends to many groups, due groups queue and
+/// their logs grow past the backstop until a slot comes free. Below the
+/// budget that holds whatever `raft.snapshot_build_max_concurrency` says,
+/// since the setting adds builds only past it.
+/// `storage.snapshot.drive_interval = "0s"` goes back to a build per group,
+/// as in 0.8.0.
+pub(crate) fn single_node_cadence(
+    raft: &ursula_config::RaftConfig,
+    groups: usize,
+) -> SnapshotCadence {
+    SnapshotCadence::new(
+        raft.snapshot_log_budget.as_bytes(),
+        groups,
+        raft.snapshot_backstop_logs
+            .min(raft.snapshot_logs_since_last),
+    )
+    .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
+}
+
+/// Sets the coordinator's log-pressure flag, which HTTP admission reads,
+/// from the node's unsnapshotted Raft log bytes under `gate`.
+fn gate_writes(
+    coordinator: &SnapshotBuildCoordinator,
+    gate: LogWriteGate,
+    log_bytes: u64,
+    limit: u64,
+    resume: u64,
+) {
+    if gate == LogWriteGate::Open {
+        return;
+    }
+    match coordinator.observe_log_bytes(log_bytes, limit, resume) {
+        Some(true) => tracing::warn!(
+            log_bytes,
+            limit,
+            "raft log over its hard limit: refusing client writes until snapshots catch up"
+        ),
+        Some(false) => tracing::info!(log_bytes, resume, "raft log pressure cleared"),
+        None => {}
+    }
+}
+
 /// Keeps the coordinator's log-pressure flag (read by HTTP admission) in step
-/// with the node's unsnapshotted Raft log bytes, and reports the pressure
-/// the snapshot driver works under and the deleted data its groups still
-/// hold (#669).
+/// with the node's unsnapshotted Raft log bytes under `gate`, and reports the
+/// pressure the snapshot driver works under and the deleted data its groups
+/// still hold (#669).
 fn spawn_log_pressure_monitor(
     coordinator: SnapshotBuildCoordinator,
+    gate: LogWriteGate,
     cadence: SnapshotCadence,
     max_builds: usize,
     metrics: RuntimeMetrics,
@@ -364,15 +438,7 @@ fn spawn_log_pressure_monitor(
                 &cadence,
                 &coordinator.running_log_progress(),
             ));
-            match coordinator.observe_log_bytes(log_bytes, limit, resume) {
-                Some(true) => tracing::warn!(
-                    log_bytes,
-                    limit,
-                    "raft log over its hard limit: refusing client writes until snapshots catch up"
-                ),
-                Some(false) => tracing::info!(log_bytes, resume, "raft log pressure cleared"),
-                None => {}
-            }
+            gate_writes(&coordinator, gate, log_bytes, limit, resume);
             tokio::time::sleep(LOG_PRESSURE_POLL).await;
         }
     });
@@ -578,14 +644,15 @@ pub struct SnapshotDriveSettings {
 /// holds the group's builds until that purge lands
 /// ([`SnapshotBuildCoordinator::hold_for_purge`]). It purges a lagging group
 /// that applied nothing since its snapshot through that snapshot the same
-/// way ([`plan_lagging_purges`]), and then runs a maintenance pass of every
-/// core journal of the node's Raft WAL ([`WalMaintenance::maintain`]), which frees
-/// journal segments that held dead frames for a quarter of
-/// `raft.deleted_data_max_age`. After its pass a tick runs the snapshot GC
-/// passes that are due, for at most `max_groups_per_tick` groups
-/// ([`RaftGroupHandleRegistry::collect_snapshot_garbage`], #669): the
-/// object a group replaced is deleted once its pin expired, unless another
-/// replica still names it.
+/// way ([`plan_lagging_purges`]). It then starts a maintenance pass of every
+/// core journal of the node's Raft WAL ([`WalMaintenance::maintain`]) in a
+/// task of its own, at most once per interval, which frees journal segments
+/// that held dead frames for a quarter of `raft.deleted_data_max_age`. After
+/// its pass a tick runs the snapshot GC passes that are due, for at most
+/// `max_groups_per_tick` groups
+/// ([`RaftGroupHandleRegistry::collect_snapshot_garbage`], #669): the object
+/// a group replaced is deleted once its pin expired, unless another replica
+/// still names it.
 pub struct SnapshotDriver {
     registry: RaftGroupHandleRegistry,
     coordinator: SnapshotBuildCoordinator,
@@ -739,10 +806,11 @@ impl SnapshotDriver {
         let mut building = coordinator.builds_in_flight();
         let held = self.held_groups.held(Instant::now());
         let snaps = self.registry.metrics_snapshot();
-        // The purges through covering snapshots before the pass (#669): they
-        // are cheap, and a pass may wait long for build slots and hand-offs.
-        // A group they hold counts as building below. So is the WAL's
-        // maintenance pass, which copies at most a pass's budget per core.
+        // The purges through covering snapshots go before the pass (#669):
+        // they are cheap, and a pass may wait long for build slots and
+        // hand-offs. A group they hold counts as building below. The WAL's
+        // maintenance pass starts before the pass too, in a task of its own,
+        // and copies at most a pass's budget per core.
         self.purge_through_snapshots(&snaps, &lagging).await;
         self.maintain_wal();
         coordinator.add_publishing(
@@ -996,13 +1064,15 @@ impl SnapshotDriver {
 /// ([`spawn_store_health_gate`]) on the same interval, and owns it: the gate
 /// stops when the driver does. Only an external store is probed: inline
 /// snapshots depend on nothing outside the node, so the inline driver never
-/// sheds leadership. A drive interval of 0 turns both off, and with them the
-/// bound on how long deleted data stays (#669).
+/// sheds leadership. `write_gate` says whether the node refuses client
+/// writes while its log is past the hard limit. A drive interval of 0 turns
+/// the driver and the gates off, and with them the bound on how long deleted
+/// data stays (#669).
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
-    snapshot_store: Option<SharedSnapshotStore>,
-    store_gate: StoreGateInputs<'_>,
+    store: Option<(SharedSnapshotStore, StoreGateInputs<'_>)>,
+    write_gate: LogWriteGate,
     interval_ms: usize,
     cadence: SnapshotCadence,
     wal: Option<WalMaintenance>,
@@ -1017,7 +1087,7 @@ pub fn spawn_snapshot_driver(
         return;
     }
     let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
-    let mut gate = snapshot_store.map(|store| {
+    let mut gate = store.map(|(store, store_gate)| {
         let default_s3 = ursula_config::S3Config::default();
         spawn_store_health_gate(
             runtime,
@@ -1038,6 +1108,7 @@ pub fn spawn_snapshot_driver(
     });
     spawn_log_pressure_monitor(
         driver.coordinator.clone(),
+        write_gate,
         cadence,
         driver.limits.max_builds,
         runtime.metrics(),
@@ -1068,14 +1139,17 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::Duration;
 
+    use ursula_raft::SnapshotBuildCoordinator;
     use ursula_raft::snapshot_cadence::LogPressure;
 
     use super::FIRST_HOLD;
     use super::HeldGroups;
+    use super::LogWriteGate;
     use super::PassOutcome;
     use super::SNAPSHOT_PRESSURE_RETICK;
     use super::Trigger;
     use super::clock::Instant;
+    use super::gate_writes;
     use super::next_pause;
     use super::should_drive_snapshots;
 
@@ -1230,6 +1304,22 @@ mod tests {
             next_pause(interval, left, &none, now),
             SNAPSHOT_PRESSURE_RETICK
         );
+    }
+
+    /// #669: a single node, which 0.8.0 never refused for its log, never
+    /// closes admission for it. A cluster node does past the hard limit,
+    /// until its log is back at the resume level.
+    #[test]
+    fn a_single_node_never_refuses_writes_for_its_log() {
+        let coordinator = SnapshotBuildCoordinator::default();
+        gate_writes(&coordinator, LogWriteGate::Open, 10, 5, 3);
+        assert!(!coordinator.log_pressured());
+        gate_writes(&coordinator, LogWriteGate::RefuseAtHardLimit, 10, 5, 3);
+        assert!(coordinator.log_pressured());
+        gate_writes(&coordinator, LogWriteGate::RefuseAtHardLimit, 4, 5, 3);
+        assert!(coordinator.log_pressured());
+        gate_writes(&coordinator, LogWriteGate::RefuseAtHardLimit, 2, 5, 3);
+        assert!(!coordinator.log_pressured());
     }
 
     #[test]

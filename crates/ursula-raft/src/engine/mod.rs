@@ -103,6 +103,7 @@ use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::collect_retained_cold_objects;
 use ursula_runtime::default_snapshot_store;
+use ursula_runtime::expiry_sweep;
 use ursula_runtime::immutable_read;
 use ursula_runtime::repair_cold_index_response;
 use ursula_runtime::repair_cold_index_streams;
@@ -828,6 +829,55 @@ impl RaftGroupEngine {
         Ok(Some(response))
     }
 
+    /// The leader's expiry sweep of one tidy pass (#669,
+    /// [`ursula_runtime::expiry_sweep`]): while the front of the group's TTL
+    /// index is due at the pass's sweep clock, proposes the
+    /// `TouchStreamAccess { renew_ttl: false }` that names it, at most
+    /// `request.max_expiry_sweeps` times and for at most
+    /// [`ursula_runtime::expiry_sweep::GROUP_BUDGET`]. Each command applies
+    /// through [`Self::write`], with its apply-health, history and
+    /// leadership checks. An error ends the sweep until the next pass,
+    /// keeps the commands committed so far in the report, and lets the
+    /// pass go on to `TidyStream`.
+    async fn sweep_expired_streams(&self, request: TidyStreamsRequest) -> TidyStreamsResponse {
+        let mut report = TidyStreamsResponse::default();
+        if request.max_expiry_sweeps == 0 || !expiry_sweep::enabled() {
+            return report;
+        }
+        let max = u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX);
+        let now_ms = expiry_sweep::sweep_now_ms(request.now_ms);
+        let started = crate::rt::time::Instant::now();
+        loop {
+            let target = match self
+                .with_state_machine(move |state_machine| {
+                    Box::pin(async move { state_machine.engine.expiry_sweep_target(now_ms) })
+                })
+                .await
+            {
+                Ok(target) => target,
+                Err(err) => {
+                    expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
+                    break;
+                }
+            };
+            let Some(stream_id) = target else {
+                break;
+            };
+            if report.expiry_sweeps >= max || started.elapsed() >= expiry_sweep::GROUP_BUDGET {
+                report.expiry_due_groups = 1;
+                break;
+            }
+            if let Err(err) =
+                expiry_sweep::settle(self.write(expiry_sweep::command(stream_id, now_ms)).await)
+            {
+                expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
+                break;
+            }
+            report.expiry_sweeps = report.expiry_sweeps.saturating_add(1);
+        }
+        report
+    }
+
     pub(crate) async fn require_local_leader_for_read(
         &self,
         operation: &str,
@@ -1539,6 +1589,7 @@ impl GroupEngine for RaftGroupEngine {
             if !self.raft.is_leader() {
                 return Ok(TidyStreamsResponse::default());
             }
+            let mut report = self.sweep_expired_streams(request).await;
             let candidates = self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {
@@ -1548,7 +1599,6 @@ impl GroupEngine for RaftGroupEngine {
                     })
                 })
                 .await??;
-            let mut report = TidyStreamsResponse::default();
             for stream_id in candidates {
                 let response = self
                     .tidy_stream(stream_id, request.now_ms, placement)

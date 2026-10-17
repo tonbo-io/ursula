@@ -282,7 +282,9 @@ use, raise `raft.snapshot_build_max_concurrency` (the chart's
 `raft.snapshotBuildMaxConcurrency`) or the budget. Each build holds its group's
 captured state and, while it uploads, the compressed snapshot, so raise the
 builds only as far as the node's memory holds that many builds of its largest
-groups. Set it to `1` to keep one build at a time, as before 0.7.4.
+groups. Set it to `1` to keep one build at a time, as before 0.7.4. Only a
+cluster node answers `RAFT_LOG_PRESSURE`. A node without `raft.peers` never
+refuses writes for its log in 0.8.x.
 
 `INGRESS_BODY_BYTES_LIMIT_REACHED` means the write bodies in flight on the node
 leave too little of `server.http_inflight_body_size` for this one.

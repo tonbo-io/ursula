@@ -1111,12 +1111,12 @@ mod tests {
         crate::bootstrap::snapshot::spawn_snapshot_driver(
             &store.runtime,
             registry,
-            Some(store.clone()),
-            StoreGateInputs {
+            Some((store.clone(), StoreGateInputs {
                 s3,
                 cold_flush_interval,
                 participation: &participation,
-            },
+            })),
+            crate::bootstrap::snapshot::LogWriteGate::RefuseAtHardLimit,
             5_000,
             SnapshotCadence::new(1 << 30, 1, 100_000),
             None,

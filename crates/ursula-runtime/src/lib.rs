@@ -28,7 +28,10 @@
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
 //! - [`read_index`]: the per-group ReadIndex barrier that linearizes reads
 //!   before they are queued to the group actor (D10).
-//! - [`tidy_worker`]: leader-side `TidyStream` driver (bounded-state F0).
+//! - [`tidy_worker`]: leader-side tidy driver (bounded-state F0): the
+//!   expiry sweep and `TidyStream`.
+//! - [`expiry_sweep`]: the leader's background sweep of expired streams
+//!   through the existing `TouchStreamAccess` command (F0, #669).
 
 mod admission;
 pub mod cold_index;
@@ -41,6 +44,7 @@ mod core_worker;
 mod engine;
 
 mod error;
+pub mod expiry_sweep;
 pub mod format_marker;
 mod group_actor;
 mod metrics;

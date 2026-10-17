@@ -2269,6 +2269,186 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// #669: a node without `raft.peers` runs the snapshot driver, and its
+/// group's leader sweeps expired streams in the background. A stream whose
+/// TTL ran out and that nothing reads or writes again leaves the node's
+/// snapshot, its Raft log and every file in its Raft log directory within
+/// `raft.deleted_data_max_age` of the sweep, and a read of it answers 404.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the single-node TTL CLI test");
+        return;
+    };
+    let port = free_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let root = std::env::temp_dir().join(format!(
+        "ursula-cli-single-node-ttl-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    remove_test_path(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let max_age = Duration::from_secs(16);
+    let config = root.join("node.toml");
+    let wal_dir = root.join("node-log");
+    let admin_port = write_cluster_config(&config, port, 1, 1, &[], false, &wal_dir);
+    let text = std::fs::read_to_string(&config).expect("read node config");
+    assert!(text.contains("[raft.wal]\n"));
+    std::fs::write(
+        &config,
+        text.replace(
+            "init_membership_per_group = false\n",
+            "init_membership_per_group = false\ndeleted_data_max_age = \"16s\"\n\
+             install_snapshot_timeout = \"2s\"\n",
+        )
+        .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n"),
+    )
+    .expect("write node config");
+    let admin = format!("http://127.0.0.1:{admin_port}");
+    let mut children = vec![spawn_node_with_cluster_config(binary, &config)];
+    let client = reqwest::Client::new();
+    wait_until_ready(&client, &base_url, &mut children).await;
+
+    let stream = format!("{base_url}/expiring/marked");
+    let mut created = false;
+    for _ in 0..100 {
+        if let Ok(response) = client
+            .put(&stream)
+            .header("content-type", "text/plain")
+            .header("Stream-TTL", "2")
+            .send()
+            .await
+            && response.status() == reqwest::StatusCode::CREATED
+        {
+            created = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(created, "create {stream}");
+    for _ in 0..3 {
+        post_until_no_content(&client, &stream, DELETED_MARKER).await;
+    }
+    // A live stream in the same group, across several journal segments,
+    // which the node must read back whole after the scrub and a restart.
+    let live = format!("{base_url}/expiring/live");
+    put_until_created(&client, &live).await;
+    let mut written = Vec::new();
+    for index in 0..96 {
+        let record = format!("live-record-{index:03};{}\n", "x".repeat(1_000));
+        let mut appended = false;
+        for _ in 0..100 {
+            if let Ok(response) = client
+                .post(&live)
+                .header("content-type", "text/plain")
+                .body(record.clone())
+                .send()
+                .await
+                && response.status() == reqwest::StatusCode::NO_CONTENT
+            {
+                appended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(appended, "append {index} to {live}");
+        written.extend_from_slice(record.as_bytes());
+    }
+    // The node's snapshot holds the stream before it expires.
+    let snapshot = admin_test_post(&client, format!("{admin}/__ursula/raft/0/snapshot"))
+        .await
+        .send()
+        .await
+        .expect("trigger a snapshot");
+    assert_eq!(snapshot.status(), reqwest::StatusCode::OK);
+    assert!(
+        !snapshot_files_with_marker(&wal_dir).is_empty(),
+        "the snapshot before the expiry holds the stream"
+    );
+
+    // Nothing reads or writes the stream again: the leader's sweep removes
+    // it within the TTL, the sweep's grace and its interval.
+    let mut removal_index = None;
+    for _ in 0..200 {
+        let (applied, .., metrics) = group_zero_progress(&client, &base_url).await;
+        if metrics["ttl_expiry_sweeps"]
+            .as_u64()
+            .is_some_and(|sweeps| sweeps > 0)
+        {
+            removal_index = applied;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let removal_index = removal_index.expect("the leader swept the expired stream");
+    let swept_at = tokio::time::Instant::now();
+    loop {
+        assert!(
+            swept_at.elapsed() < max_age.saturating_add(Duration::from_secs(10)),
+            "the node still holds the expired stream past the bound"
+        );
+        let (_, snapshot, purged, metrics) = group_zero_progress(&client, &base_url).await;
+        if snapshot >= Some(removal_index)
+            && purged >= snapshot
+            && wal_files_with_marker(&wal_dir).is_empty()
+            && metrics["raft_deleted_data_oldest_age_ms"] == 0
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let read = client
+        .get(format!("{stream}?offset=0"))
+        .send()
+        .await
+        .expect("read the expired stream");
+    assert_eq!(read.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // A single node has no peer to repair from: after the purges and the
+    // journal rewrites, a restart, here a kill, reads the live stream back
+    // byte for byte.
+    drop(children);
+    let mut children = vec![spawn_node_with_cluster_config(binary, &config)];
+    wait_until_ready(&client, &base_url, &mut children).await;
+    let mut read_back = Vec::new();
+    let mut offset = "0".to_owned();
+    for _ in 0..200 {
+        if read_back.len() >= written.len() {
+            break;
+        }
+        let Ok(response) = client.get(format!("{live}?offset={offset}")).send().await else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        if response.status() != reqwest::StatusCode::OK {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        }
+        let next = response
+            .headers()
+            .get("stream-next-offset")
+            .and_then(|value| value.to_str().ok())
+            .expect("a next offset")
+            .to_owned();
+        read_back.extend_from_slice(&response.bytes().await.expect("read the live stream"));
+        offset = next;
+    }
+    assert_eq!(
+        read_back.len(),
+        written.len(),
+        "the live stream after the restart"
+    );
+    assert!(read_back == written, "the live stream's bytes changed");
+
+    drop(children);
+    std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
 /// The S3 snapshot objects of group 0 under the snapshot prefix that hold
 /// [`DELETED_MARKER`], read through `cold_store`, whose root is the
 /// snapshot store's.

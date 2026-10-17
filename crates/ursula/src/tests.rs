@@ -7247,9 +7247,11 @@ mod snapshot_driver {
     use crate::ADMIN_SNAPSHOT_PUBLISH_WAIT;
     use crate::HttpState;
     use crate::admin_router;
+    use crate::bootstrap::LogWriteGate;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ScrubPurge;
     use crate::bootstrap::StoreGateInputs;
+    use crate::bootstrap::Topology;
     use crate::bootstrap::Trigger;
     use crate::bootstrap::deleted_data_sample;
     use crate::bootstrap::group_log_progress;
@@ -7259,6 +7261,7 @@ mod snapshot_driver {
     use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
+    use crate::bootstrap::single_node_cadence;
     use crate::bootstrap::spawn_snapshot_driver;
     use crate::bootstrap::trigger_snapshot_build;
 
@@ -7344,6 +7347,52 @@ mod snapshot_driver {
             resolve_snapshot_drive_interval_ms(Some(15_000), true),
             15_000
         );
+    }
+
+    /// #669: a single node keeps its snapshots inline whatever
+    /// `storage.snapshot.backend` says, so its driver ticks on the inline
+    /// default, and its entry backstop is no farther than OpenRaft's policy
+    /// took it before it ran the driver.
+    #[test]
+    fn a_single_node_drives_inline_snapshots_with_a_near_entry_backstop() {
+        let single = Topology::SingleNode {
+            raft_group_count: 4,
+        };
+        assert!(!single.uses_snapshot_store(true));
+        assert!(!single.uses_snapshot_store(false));
+        let cluster = Topology::static_cluster(
+            1,
+            vec![(1, "http://127.0.0.1:4437".to_owned())],
+            4,
+            true,
+            Default::default(),
+        )
+        .expect("topology");
+        assert!(cluster.uses_snapshot_store(true));
+        assert!(!cluster.uses_snapshot_store(false));
+        assert_eq!(
+            resolve_snapshot_drive_interval_ms(None, single.uses_snapshot_store(true)),
+            1_000
+        );
+
+        let mut raft = ursula_config::RaftConfig::default();
+        let cadence = single_node_cadence(&raft, 64);
+        assert_eq!(cadence.backstop_entries, raft.snapshot_logs_since_last);
+        assert_eq!(cadence.backstop_entries, 5_000);
+        // The rest is a cluster node's policy.
+        let clustered = SnapshotCadence::new(
+            raft.snapshot_log_budget.as_bytes(),
+            64,
+            raft.snapshot_backstop_logs,
+        )
+        .with_deleted_data_max_age(raft.effective_deleted_data_max_age());
+        assert_eq!(cadence.floor_bytes, clustered.floor_bytes);
+        assert_eq!(cadence.floor_bytes, 8 * MIB);
+        assert_eq!(cadence.removal_floor, clustered.removal_floor);
+        assert_eq!(clustered.backstop_entries, 100_000);
+        // A nearer configured backstop stays.
+        raft.snapshot_backstop_logs = 1_000;
+        assert_eq!(single_node_cadence(&raft, 64).backstop_entries, 1_000);
     }
 
     #[test]
@@ -8033,12 +8082,12 @@ mod snapshot_driver {
         spawn_snapshot_driver(
             &node.runtime,
             &node.registry,
-            Some(store.clone()),
-            StoreGateInputs {
+            Some((store.clone(), StoreGateInputs {
                 s3: None,
                 cold_flush_interval: Duration::from_secs(1),
                 participation: &participation,
-            },
+            })),
+            LogWriteGate::RefuseAtHardLimit,
             interval_ms,
             cadence,
             None,
@@ -8096,6 +8145,352 @@ mod snapshot_driver {
             })
     }
 
+    /// The first file under `root` that holds [`DELETED_MARKER`].
+    fn file_holding_marker(root: &std::path::Path) -> Option<std::path::PathBuf> {
+        let mut dirs = vec![root.to_path_buf()];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).expect("list a WAL directory") {
+                let path = entry.expect("a WAL directory entry").path();
+                if path.is_dir() {
+                    dirs.push(path);
+                } else if std::fs::read(&path).is_ok_and(|bytes| {
+                    bytes
+                        .windows(DELETED_MARKER.len())
+                        .any(|window| window == DELETED_MARKER)
+                }) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
+    fn wall_ms() -> u64 {
+        u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("after the epoch")
+                .as_millis(),
+        )
+        .expect("wall clock fits u64")
+    }
+
+    /// A single node with Raft over a fresh WAL root, its snapshot driver at
+    /// `drive_interval`, `raft.deleted_data_max_age` of 8 s and OpenRaft
+    /// keeping 8 entries below a snapshot.
+    fn single_node(
+        drive_interval: Option<ursula_config::HumanDuration>,
+    ) -> (
+        crate::bootstrap::SpawnedRuntime,
+        tempfile::TempDir,
+        Duration,
+    ) {
+        let root = tempfile::tempdir().expect("WAL root");
+        let mut config = super::test_config(1, 2);
+        config.raft.install_snapshot_timeout = ursula_config::HumanDuration::sec(1);
+        config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(8));
+        config.raft.max_in_snapshot_log_to_keep = 8;
+        config.raft.wal.segment_size = ursula_config::HumanSize::kib(64);
+        config.storage.snapshot.drive_interval = drive_interval;
+        let spawned = crate::bootstrap::spawn_runtime(
+            &config,
+            crate::bootstrap::Persistence::Raft {
+                log_dir: root.path().to_owned(),
+            },
+            Topology::SingleNode {
+                raft_group_count: 2,
+            },
+        )
+        .expect("spawn a single node");
+        (spawned, root, config.raft.effective_deleted_data_max_age())
+    }
+
+    /// Creates `stream_id`, expiring at `expires_at_ms` when set, and appends
+    /// three marked records to it at the wall clock.
+    async fn write_marked(
+        runtime: &ursula_runtime::ShardRuntime,
+        stream_id: &BucketStreamId,
+        expires_at_ms: Option<u64>,
+    ) {
+        let mut create = CreateStreamRequest::new(stream_id.clone(), "application/octet-stream");
+        create.stream_expires_at_ms = expires_at_ms;
+        create.now_ms = wall_ms();
+        runtime
+            .create_stream(create)
+            .await
+            .expect("create the stream");
+        for _ in 0..3 {
+            let mut append = AppendRequest::from_bytes(stream_id.clone(), DELETED_MARKER.to_vec());
+            append.now_ms = wall_ms();
+            runtime
+                .append(append)
+                .await
+                .expect("append a marked record");
+        }
+    }
+
+    /// Waits until `stream_id`'s group no longer holds it, without a read of
+    /// it (which would remove an expired stream itself), and returns the
+    /// group's applied index then.
+    async fn wait_until_removed(
+        runtime: &ursula_runtime::ShardRuntime,
+        raft: &ursula_raft::OwnerRaftHandle,
+        streams_before: u64,
+        group: RaftGroupId,
+        within: Duration,
+    ) -> u64 {
+        let deadline = Instant::now().checked_add(within).expect("deadline");
+        loop {
+            let streams = runtime
+                .state_gauges_all_groups()
+                .await
+                .into_iter()
+                .find(|(id, _)| *id == group)
+                .and_then(|(_, gauges)| gauges.ok())
+                .map(|gauges| gauges.streams);
+            if streams.is_some_and(|streams| streams < streams_before) {
+                return raft
+                    .metrics()
+                    .borrow_watched()
+                    .last_applied
+                    .expect("applied the removal")
+                    .index;
+            }
+            assert!(Instant::now() < deadline, "the group keeps the stream");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// #669: a single node runs the snapshot driver. A deleted stream and an
+    /// expired stream that nothing reads, in groups that take no other write,
+    /// leave the node's snapshots, its logs and every file under its WAL root
+    /// within `raft.deleted_data_max_age`, its gauges go back to 0, and reads
+    /// of them answer 404.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_node_scrubs_deleted_and_expired_streams_within_the_bound() {
+        let (spawned, root, max_age) = single_node(None);
+        let runtime = spawned.runtime.clone();
+        let registry = spawned.raft_registry.clone().expect("a Raft registry");
+        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        // Two streams in different groups.
+        let deleted = BucketStreamId::new("scrub", "deleted");
+        let expiring = (0..64)
+            .map(|index| BucketStreamId::new("scrub", format!("expiring-{index}")))
+            .find(|id| runtime.locate(id).raft_group_id != runtime.locate(&deleted).raft_group_id)
+            .expect("a stream in the other group");
+        write_marked(&runtime, &deleted, None).await;
+        let expires_at_ms = wall_ms().saturating_add(1_500);
+        write_marked(&runtime, &expiring, Some(expires_at_ms)).await;
+        // The driver runs: its monitor reports the node's log.
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .expect("deadline");
+        while runtime.metrics().snapshot().raft_log_bytes == 0 {
+            assert!(Instant::now() < deadline, "no driver reports the log");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let deleted_group = runtime.locate(&deleted).raft_group_id;
+        let deleted_raft = registry.get(deleted_group).expect("registered group");
+        runtime
+            .delete_stream(ursula_runtime::DeleteStreamRequest {
+                stream_id: deleted.clone(),
+                if_incarnation: None,
+            })
+            .await
+            .expect("delete the stream");
+        let deleted_at = Instant::now();
+        let deleted_index = deleted_raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("applied the deletion")
+            .index;
+
+        // The leader's background sweep removes the expired stream within
+        // its interval and grace after the expiry.
+        let expiring_group = runtime.locate(&expiring).raft_group_id;
+        let expiring_raft = registry.get(expiring_group).expect("registered group");
+        let interval = ursula_runtime::expiry_sweep::interval(max_age);
+        let until_swept = Duration::from_millis(1_500)
+            .saturating_add(ursula_runtime::expiry_sweep::CLOCK_GRACE)
+            .saturating_add(interval)
+            .saturating_add(Duration::from_secs(2));
+        let expired_index =
+            wait_until_removed(&runtime, &expiring_raft, 1, expiring_group, until_swept).await;
+        let expired_at = Instant::now();
+        assert!(runtime.metrics().snapshot().ttl_expiry_sweeps >= 1);
+
+        for (raft, removal, removed_at) in [
+            (&deleted_raft, deleted_index, deleted_at),
+            (&expiring_raft, expired_index, expired_at),
+        ] {
+            let left = max_age
+                .saturating_add(Duration::from_secs(2))
+                .saturating_sub(removed_at.elapsed());
+            raft.wait(Some(left))
+                .metrics(
+                    |metrics| {
+                        metrics.snapshot.map(|snapshot| snapshot.index) >= Some(removal)
+                            && metrics.purged.map(|purged| purged.index)
+                                >= metrics.snapshot.map(|snapshot| snapshot.index)
+                    },
+                    "the log is purged through the snapshot that covers the removal",
+                )
+                .await
+                .expect("scrub the removed stream within the bound");
+        }
+        assert!(!snapshot_holds_marker(&deleted_raft, &deleted).await);
+        assert!(!snapshot_holds_marker(&expiring_raft, &expiring).await);
+        // No file under the WAL root holds the records once the bound
+        // passed since the later removal.
+        let deadline = expired_at
+            .checked_add(max_age.saturating_add(Duration::from_secs(2)))
+            .expect("deadline");
+        while let Some(path) = file_holding_marker(root.path()) {
+            assert!(
+                Instant::now() < deadline,
+                "{} holds the removed records",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(2))
+            .expect("deadline");
+        loop {
+            let metrics = runtime.metrics().snapshot();
+            if metrics.raft_deleted_data_oldest_age_ms == 0
+                && metrics.raft_deleted_data_overdue_groups == 0
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the removals are still reported");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let app = crate::router(runtime.clone());
+        for stream_id in [&deleted, &expiring] {
+            let response = super::http_get(
+                &app,
+                &format!("/{}/{}?offset=0", stream_id.bucket_id, stream_id.stream_id),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{stream_id}");
+        }
+        drop(app);
+        drop(spawned);
+        drop(root);
+    }
+
+    /// #669: a single node never closes admission for its log, as in 0.8.0.
+    /// With its driver ticking once an hour, so that no snapshot frees the
+    /// log, the log grows past twice a tiny `raft.snapshot_log_budget`, the
+    /// driver's monitor reports it, and a write with a body still answers
+    /// `204`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_node_admits_writes_past_twice_its_log_budget() {
+        let root = tempfile::tempdir().expect("WAL root");
+        let budget = 64_u64 << 10;
+        let mut config = super::test_config(1, 1);
+        config.raft.snapshot_log_budget = ursula_config::HumanSize::bytes(budget);
+        config.storage.snapshot.drive_interval = Some(ursula_config::HumanDuration::hour(1));
+        let spawned = crate::bootstrap::spawn_runtime(
+            &config,
+            crate::bootstrap::Persistence::Raft {
+                log_dir: root.path().to_owned(),
+            },
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("spawn a single node");
+        let runtime = spawned.runtime.clone();
+        let registry = spawned.raft_registry.clone().expect("a Raft registry");
+        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let coordinator = registry.snapshot_build_coordinator();
+        let app = crate::client_router_with_admission(
+            HttpState::with_raft_registry(runtime.clone(), registry),
+            crate::IngressAdmission::new(&config.server)
+                .with_raft_log_pressure(Some(coordinator.clone())),
+        );
+        let stream = "/budget/stream";
+        let created = super::http_put(
+            &app,
+            stream,
+            &[("content-type", "application/octet-stream")],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let limit = budget.saturating_mul(2);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("deadline");
+        while runtime.metrics().snapshot().raft_log_bytes <= limit {
+            assert!(
+                Instant::now() < deadline,
+                "the log stays below twice the budget"
+            );
+            let appended = super::http_post(
+                &app,
+                stream,
+                &[("content-type", "application/octet-stream")],
+                Body::from(vec![7_u8; 8 << 10]),
+            )
+            .await;
+            assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+        }
+        // Past twice the budget, which closes a cluster node's admission.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(runtime.metrics().snapshot().raft_log_bytes > limit);
+        assert!(!coordinator.log_pressured());
+        let appended = super::http_post(
+            &app,
+            stream,
+            &[("content-type", "application/octet-stream")],
+            Body::from(vec![7_u8; 8 << 10]),
+        )
+        .await;
+        assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+        drop(app);
+        drop(spawned);
+        drop(root);
+    }
+
+    /// #669: `storage.snapshot.drive_interval = "0s"` turns a single node's
+    /// driver off: nothing reports its log. Its groups still sweep an
+    /// expired stream, which needs no driver.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_single_node_without_its_driver_still_sweeps_expired_streams() {
+        let (spawned, root, max_age) = single_node(Some(ursula_config::HumanDuration::sec(0)));
+        let runtime = spawned.runtime.clone();
+        let registry = spawned.raft_registry.clone().expect("a Raft registry");
+        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let expiring = BucketStreamId::new("scrub", "expiring");
+        write_marked(&runtime, &expiring, Some(wall_ms().saturating_add(500))).await;
+        let group = runtime.locate(&expiring).raft_group_id;
+        let raft = registry.get(group).expect("registered group");
+        let until_swept = Duration::from_millis(500)
+            .saturating_add(ursula_runtime::expiry_sweep::CLOCK_GRACE)
+            .saturating_add(ursula_runtime::expiry_sweep::interval(max_age))
+            .saturating_add(Duration::from_secs(2));
+        wait_until_removed(&runtime, &raft, 1, group, until_swept).await;
+        let metrics = runtime.metrics().snapshot();
+        assert_eq!(metrics.raft_log_bytes, 0, "no driver runs");
+        assert!(metrics.ttl_expiry_sweeps >= 1);
+        drop(spawned);
+        drop(root);
+    }
+
     /// #669: the production driver snapshots a group a quarter of
     /// `raft.deleted_data_max_age` after it deleted a stream, purges its log
     /// through that snapshot, and reports the deleted data its groups hold
@@ -8134,16 +8529,11 @@ mod snapshot_driver {
             .expect("warm the groups in time")
             .expect("warm the groups");
         let max_age = Duration::from_secs(4);
-        let participation = PeerParticipation::new(1, &[], reqwest::Client::new());
         spawn_snapshot_driver(
             &node.runtime,
             &node.registry,
             None,
-            StoreGateInputs {
-                s3: None,
-                cold_flush_interval: Duration::from_secs(1),
-                participation: &participation,
-            },
+            LogWriteGate::RefuseAtHardLimit,
             100,
             SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
@@ -8442,16 +8832,11 @@ mod snapshot_driver {
             .await
             .expect("warm the groups in time")
             .expect("warm the groups");
-        let participation = PeerParticipation::new(1, &[], reqwest::Client::new());
         spawn_snapshot_driver(
             &node.runtime,
             &node.registry,
             None,
-            StoreGateInputs {
-                s3: None,
-                cold_flush_interval: Duration::from_secs(1),
-                participation: &participation,
-            },
+            LogWriteGate::RefuseAtHardLimit,
             100,
             SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
@@ -9651,6 +10036,7 @@ mod leadership_shed {
     use super::StaticGrpcTestNodeStorage;
     use super::spawn_static_grpc_test_node;
     use crate::bootstrap::LeadershipShed;
+    use crate::bootstrap::LogWriteGate;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::ShedPace;
@@ -10043,12 +10429,12 @@ mod leadership_shed {
         crate::bootstrap::spawn_snapshot_driver(
             &node_1.runtime,
             &node_1.registry,
-            Some(store.clone()),
-            StoreGateInputs {
+            Some((store.clone(), StoreGateInputs {
                 s3: None,
                 cold_flush_interval: Duration::from_secs(1),
                 participation: &participation,
-            },
+            })),
+            LogWriteGate::RefuseAtHardLimit,
             1_000,
             SnapshotCadence::new(1 << 30, usize::try_from(GROUPS).unwrap(), 100_000),
             None,

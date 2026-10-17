@@ -140,7 +140,8 @@ snapshot driver with the segments kept only for them (`wal_lagging_groups`,
 entries (`wal_dirty_segments`), which the journal frees within a quarter of
 `raft.deleted_data_max_age`. A core that keeps writing always has some, so
 `wal_dirty_segments` is rarely 0 there and is no signal to alert on. Reads
-report entries served from the cache and read from disk (`wal_cache_hits`, `wal_cache_misses`) and the frames and bytes read
+report entries served from the cache and read from disk (`wal_cache_hits`,
+`wal_cache_misses`) and the frames and bytes read
 (`wal_disk_reads`, `wal_disk_read_bytes`), per core and per group. Each group
 reports its cached bytes and indexed entries (`wal_cache_bytes`,
 `wal_indexed_entries`). Startup scan work is under `wal_recovery_ns`,
@@ -173,6 +174,17 @@ snapshot or a Raft log on the node still holds (`raft_deleted_data_oldest_age_ms
 with their state, bytes and age. Both gauges come from the snapshot driver and
 stay at 0 without it. Alert when `raft_deleted_data_oldest_age_ms` nears half of
 `raft.deleted_data_max_age`.
+
+Each group's leader removes expired streams in the background (see
+[Deleted data](/docs/operations#deleted-data)). `ttl_expiry_sweeps` counts the
+sweep commands the node's leaders committed, each of which removes the expired
+stream it names and up to 256 more, and `ttl_expiry_sweep_due_groups` reports
+the groups the latest pass left with expired streams for the next one. A value
+that stays above 0 across passes means a group expires streams faster than
+about 4,100 a minute, that its commits are slow enough to reach the sweep's
+250 ms per group and pass, or that the sweep stopped on an error, such as a
+group whose history is pending or whose apply stopped. Both work without the
+snapshot driver, and in the in-memory mode.
 
 With an S3 snapshot store, `snapshot_gc_deleted_objects` counts the snapshot
 objects the node's snapshot GC deleted, and

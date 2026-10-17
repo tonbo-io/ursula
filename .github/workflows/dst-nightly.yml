@@ -71,7 +71,9 @@ jobs:
             --seed-family deleted-data-leaves-within-bound \
             --seed-family deleted-data-leaves-within-bound-extended \
             --seed-family deleted-data-across-segments \
-            --seed-family deleted-data-across-segments-extended
+            --seed-family deleted-data-across-segments-extended \
+            --seed-family deleted-data-after-expiry \
+            --seed-family deleted-data-after-expiry-extended
           RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- smoke \
             --seed-family pipeline-smoke-runtime-raft-network-randomized-read-corruption \
             --expect-failures \

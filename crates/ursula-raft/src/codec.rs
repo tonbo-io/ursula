@@ -185,6 +185,22 @@ mod tests {
                 && backup_digest == [0xab; 32]
                 && snapshot.buckets == ["tenant"]
         ));
+        // #669: the leader's background expiry sweep writes the
+        // `TouchStreamAccess { renew_ttl: false }` a read of an expired
+        // stream wrote in 0.8.0. These bytes were encoded at `v0.8.0`, so a
+        // 0.8.0 replica decodes every sweep entry.
+        let touch: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "touch_stream_access_entry");
+        assert_eq!(touch.log_id, log);
+        assert!(matches!(
+            touch.payload,
+            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::TouchStreamAccess {
+                    ref stream_id,
+                    now_ms: 1_700_000_000_000,
+                    renew_ttl: false,
+                }
+            )) if stream_id == &ursula_shard::BucketStreamId::new("tenant", "expired")
+        ));
         // S4 of the fifth #613 review: a history event inside an imported
         // snapshot, as a backup taken after a recovery carries it.
         let import: EntryOf<UrsulaRaftTypeConfig> =

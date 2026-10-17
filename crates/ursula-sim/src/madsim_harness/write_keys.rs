@@ -999,7 +999,7 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
     if plan.tidy {
         cluster
             .runtime
-            .tidy_streams_all_groups_once(16, idle_now)
+            .tidy_streams_all_groups_once(16, 0, idle_now)
             .await
             .expect("tidy pass");
         trace.push(SimEvent::FaultApplied {

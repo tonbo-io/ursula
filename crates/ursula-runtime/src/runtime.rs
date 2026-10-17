@@ -993,14 +993,16 @@ impl ShardRuntime {
         report
     }
 
-    /// One leader-side `TidyStream` pass over every Raft group
-    /// (bounded-state F0): each group this node leads proposes `TidyStream`
-    /// for at most `max_streams_per_group` streams with normalization debt.
-    /// A failing group does not stop the others; the first error is
-    /// returned after every group had its pass.
+    /// One leader-side tidy pass over every Raft group (bounded-state F0):
+    /// each group this node leads first sweeps expired streams with at most
+    /// `max_expiry_sweeps_per_group` commands ([`crate::expiry_sweep`]),
+    /// then proposes `TidyStream` for at most `max_streams_per_group`
+    /// streams with normalization debt. A failing group does not stop the
+    /// others; the first error is returned after every group had its pass.
     pub async fn tidy_streams_all_groups_once(
         &self,
         max_streams_per_group: usize,
+        max_expiry_sweeps_per_group: usize,
         now_ms: u64,
     ) -> Result<TidyStreamsResponse, RuntimeError> {
         let mut total = TidyStreamsResponse::default();
@@ -1008,14 +1010,11 @@ impl ShardRuntime {
         for group_id in 0..self.shard_map.raft_group_count() {
             let request = TidyStreamsRequest {
                 max_streams: max_streams_per_group,
+                max_expiry_sweeps: max_expiry_sweeps_per_group,
                 now_ms,
             };
             match self.tidy_streams(RaftGroupId(group_id), request).await {
-                Ok(report) => {
-                    total.tidied = total.tidied.saturating_add(report.tidied);
-                    total.debt_remaining =
-                        total.debt_remaining.saturating_add(report.debt_remaining);
-                }
+                Ok(report) => total.add(&report),
                 Err(err) => {
                     tracing::warn!(
                         raft_group_id = group_id,
@@ -1025,6 +1024,10 @@ impl ShardRuntime {
                     first_error.get_or_insert(err);
                 }
             }
+        }
+        if max_expiry_sweeps_per_group > 0 {
+            self.metrics
+                .record_ttl_expiry_sweep(total.expiry_sweeps, total.expiry_due_groups);
         }
         match first_error {
             Some(err) => Err(err),

@@ -974,6 +974,12 @@ impl InMemoryGroupEngine {
         self.state_machine.tidy_candidates(now_ms, limit)
     }
 
+    /// The stream the leader's expiry sweep names next at `now_ms`
+    /// ([`crate::expiry_sweep`]), `None` once none expired.
+    pub fn expiry_sweep_target(&self, now_ms: u64) -> Option<BucketStreamId> {
+        self.state_machine.expiry_sweep_target(now_ms)
+    }
+
     pub fn head_stream_after_access(
         &mut self,
         request: &HeadStreamRequest,
@@ -1716,6 +1722,29 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupTidyStreamsFuture<'a> {
         Box::pin(async move {
             let mut report = TidyStreamsResponse::default();
+            if request.max_expiry_sweeps > 0 && crate::expiry_sweep::enabled() {
+                let now_ms = crate::expiry_sweep::sweep_now_ms(request.now_ms);
+                while let Some(stream_id) = self.expiry_sweep_target(now_ms) {
+                    if report.expiry_sweeps
+                        >= u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX)
+                    {
+                        report.expiry_due_groups = 1;
+                        break;
+                    }
+                    if let Err(err) = crate::expiry_sweep::settle(self.apply_committed_write(
+                        crate::expiry_sweep::command(stream_id, now_ms),
+                        placement,
+                    )) {
+                        crate::expiry_sweep::interrupted(
+                            placement.raft_group_id,
+                            &err,
+                            &mut report,
+                        );
+                        break;
+                    }
+                    report.expiry_sweeps = report.expiry_sweeps.saturating_add(1);
+                }
+            }
             for stream_id in self.tidy_candidates(request.now_ms, request.max_streams) {
                 let response = self
                     .tidy_stream(stream_id, request.now_ms, placement)

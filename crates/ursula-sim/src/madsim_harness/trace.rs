@@ -759,6 +759,21 @@ pub enum SimEvent {
         /// watermark (`Defence::RestorePurge`).
         restore_purges: u64,
     },
+    /// `deleted_data_leaves_within_bound` held for an expired stream
+    /// (#669): the group's leader swept it in the background with `sweeps`
+    /// commands, the first replica to drop it applied through
+    /// `removal_index`, and within `raft.deleted_data_max_age` of dropping it
+    /// each of `replicas` replicas held it in neither its current snapshot,
+    /// its retained log nor its files, and read it as not found. `traffic`
+    /// names what else the group wrote, and `fault` what the run did around
+    /// the expiry.
+    ExpiredDataLeft {
+        removal_index: u64,
+        traffic: String,
+        fault: String,
+        replicas: u64,
+        sweeps: u64,
+    },
     /// An operator's snapshot of a group whose leader deferred a purge
     /// through a covering snapshot started only once that purge landed
     /// (#669): the log was purged through `purged` when the build covering

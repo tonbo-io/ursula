@@ -465,6 +465,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         generate: generate_deleted_data_leaves_within_bound,
     },
     SeedFamily {
+        name: "deleted-data-after-expiry",
+        start: 532,
+        end: 539,
+        kind: "deleted-data-leaves-within-bound",
+        generate: generate_deleted_data_leaves_within_bound,
+    },
+    SeedFamily {
+        name: "deleted-data-after-expiry-extended",
+        start: 650,
+        end: 679,
+        kind: "deleted-data-leaves-within-bound",
+        generate: generate_deleted_data_leaves_within_bound,
+    },
+    SeedFamily {
         name: "history-rewind-under-leader-churn-extended",
         start: 850,
         end: 879,
