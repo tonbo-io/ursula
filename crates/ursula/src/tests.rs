@@ -7255,6 +7255,7 @@ mod snapshot_driver {
     use crate::bootstrap::group_log_progress;
     use crate::bootstrap::groups_to_drive;
     use crate::bootstrap::plan_lagging_purges;
+    use crate::bootstrap::plan_purges;
     use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
@@ -7458,6 +7459,47 @@ mod snapshot_driver {
                 through: 30,
                 published: 30,
             }
+        ]);
+    }
+
+    /// #669: a tick purges each group at most once, through the higher of
+    /// its scrub purge and its idle lagging purge.
+    #[test]
+    fn snapshot_driver_purges_each_group_once_through_the_higher_index() {
+        let running = |mut snapshot: RaftGroupMetricsSnapshot| {
+            snapshot.maintenance.running = true;
+            snapshot
+        };
+        let idle = |through| GroupLogProgress {
+            has_snapshot: true,
+            scrub_purge_through: through,
+            ..GroupLogProgress::default()
+        };
+        let snapshots = vec![
+            // Both: the lagging purge goes further.
+            running(snap(0, Some(30), Some(30), idle(20))),
+            // A scrub purge only.
+            running(snap(1, Some(40), Some(30), GroupLogProgress {
+                scrub_purge_through: 30,
+                ..log(MIB, MIB)
+            })),
+            // A lagging purge only.
+            running(snap(2, Some(30), Some(30), idle(0))),
+        ];
+        let lagging: BTreeSet<RaftGroupId> = [0, 2].map(RaftGroupId).into_iter().collect();
+        let purge = |raft_group_id, through| ScrubPurge {
+            raft_group_id,
+            through,
+            published: 30,
+        };
+        assert_eq!(plan_purges(&snapshots, &lagging), vec![
+            purge(0, 30),
+            purge(1, 30),
+            purge(2, 30)
+        ]);
+        assert_eq!(plan_purges(&snapshots, &BTreeSet::new()), vec![
+            purge(0, 20),
+            purge(1, 30)
         ]);
     }
 

@@ -221,45 +221,15 @@ impl RaftWal {
             .map_err(|source| RaftWalError::OpenGroup { placement, source })
     }
 
-    /// Runs one maintenance pass of every open core journal, as of `now` on
-    /// the snapshot driver's clock (#669): each writer stamps the dead
-    /// frames it learned of since its last pass with `now`, seals its active
-    /// segment once that segment has held dead frames for `max_dirty_age`,
-    /// and frees the oldest kept segment while a kept segment has, copying
-    /// at most its pass budget. The writers have no timer of their own: the
-    /// snapshot driver's tick calls this. Returns once every pass ran, with
-    /// the first writer that could not take one. A WAL that shut down has
-    /// nothing to maintain.
-    pub async fn maintain(
-        &self,
-        now: Instant,
-        max_dirty_age: Duration,
-    ) -> Result<(), RaftWalError> {
-        let slots = match &*self
-            .core_writers
-            .lock()
-            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
-        {
-            CoreWriterSlots::Running(slots) => slots.clone(),
-            CoreWriterSlots::ShutDown => return Ok(()),
-        };
-        let mut writers = Vec::with_capacity(slots.len());
-        for (core, slot) in slots {
-            let slot = slot
-                .lock()
-                .map_err(|_poisoned| RaftWalError::LockPoisoned)?;
-            writers.extend(slot.writer.upgrade().map(|writer| (core, writer)));
+    /// What the snapshot driver needs of this WAL (#669): the lagging
+    /// groups and the maintenance passes of its core journals. It holds
+    /// neither the root's lock nor any journal, so a driver that outlives
+    /// the run keeps nothing open.
+    pub fn maintenance(&self) -> WalMaintenance {
+        WalMaintenance {
+            lagging: self.lagging.clone(),
+            core_writers: Arc::downgrade(&self.core_writers),
         }
-        let passes = join_all(writers.iter().map(|(core, writer)| async move {
-            writer.maintain(now, max_dirty_age).await.map_err(|source| {
-                RaftWalError::MaintainJournal {
-                    core: *core,
-                    source,
-                }
-            })
-        }))
-        .await;
-        passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
     }
 
     /// Ends this run cleanly: closes every core writer, each of which
@@ -295,7 +265,7 @@ impl RaftWal {
                 .close()
                 .await
                 .map_err(|source| RaftWalError::CloseJournal {
-                    core: *core,
+                    core: CoreId(*core),
                     source,
                 })
         }))
@@ -313,6 +283,71 @@ impl RaftWal {
             "shut down the Raft WAL cleanly"
         );
         Ok(())
+    }
+}
+
+/// The snapshot driver's handle on a node's Raft WAL ([`RaftWal::maintenance`]).
+#[derive(Debug, Clone)]
+pub struct WalMaintenance {
+    lagging: Arc<LaggingGroups>,
+    core_writers: Weak<Mutex<CoreWriterSlots>>,
+}
+
+impl WalMaintenance {
+    /// The groups whose live records keep old journal segments alive.
+    pub fn lagging_groups(&self) -> Arc<LaggingGroups> {
+        self.lagging.clone()
+    }
+
+    /// Runs one maintenance pass of every open core journal, as of `now` on
+    /// the snapshot driver's clock (#669): each writer stamps the dead
+    /// frames it learned of since its last pass with `now`, seals its active
+    /// segment once that segment has held dead frames for `max_dirty_age`,
+    /// and frees the oldest kept segment while a kept segment has, copying
+    /// at most its pass budget. The writers have no timer of their own: the
+    /// snapshot driver calls this, at most once per drive interval. Returns
+    /// once every pass ran, with the first writer that could not take one.
+    /// A core whose journal is opening right now is skipped until the next
+    /// call, and a WAL that shut down or is gone has nothing to maintain.
+    pub async fn maintain(
+        &self,
+        now: Instant,
+        max_dirty_age: Duration,
+    ) -> Result<(), RaftWalError> {
+        let Some(core_writers) = self.core_writers.upgrade() else {
+            return Ok(());
+        };
+        let slots = match &*core_writers
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+        {
+            CoreWriterSlots::Running(slots) => slots.clone(),
+            CoreWriterSlots::ShutDown => return Ok(()),
+        };
+        drop(core_writers);
+        let mut writers = Vec::with_capacity(slots.len());
+        for (core, slot) in slots {
+            // Opening a journal holds its slot through the replay, so a busy
+            // slot is skipped rather than waited on.
+            let slot = match slot.try_lock() {
+                Ok(slot) => slot,
+                Err(std::sync::TryLockError::WouldBlock) => continue,
+                Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+                    return Err(RaftWalError::LockPoisoned);
+                }
+            };
+            writers.extend(slot.writer.upgrade().map(|writer| (CoreId(core), writer)));
+        }
+        let passes = join_all(writers.iter().map(|(core, writer)| async move {
+            writer.maintain(now, max_dirty_age).await.map_err(|source| {
+                RaftWalError::MaintainJournal {
+                    core: *core,
+                    source,
+                }
+            })
+        }))
+        .await;
+        passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
     }
 }
 

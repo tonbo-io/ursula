@@ -327,10 +327,13 @@ segment and from which segments hold dead entries:
 **Dead entries age out (#669).** An entry is dead once it is purged, truncated,
 written again or copied forward by a rewrite. Its frame stays in its segment
 until the segment is deleted. The writer keeps, per segment, since when it holds
-a dead entry. The writer has no timer: on every tick the snapshot driver sends
-each core writer a maintenance pass with the driver's time and the age A, a
-quarter of `raft.deleted_data_max_age`. The pass stamps the deaths since the last
-pass with that time. It seals the active segment once its dead entries are A
+a dead entry. The writer has no timer: at most once per drive interval
+(`storage.snapshot.drive_interval`), however often the driver ticks, the
+snapshot driver sends each core writer a maintenance pass with the driver's time
+and the age A, a quarter of `raft.deleted_data_max_age`. The driver runs the
+passes in a task of its own and starts the next only once the last one ended,
+so a slow writer holds up no snapshot build. The pass stamps the deaths since
+the last pass with that time, counting how long the writer waited for it. It seals the active segment once its dead entries are A
 old, so that a quiet core frees it like any other. Then, even when the journal
 is within its budget, a kept segment that held dead entries for A frees the
 oldest kept segment as step 2 does, under the same quarter-segment rule and
@@ -340,7 +343,9 @@ more than a quarter segment there is reported lagging. The driver snapshots it
 first, or, when it applied nothing since its snapshot, purges its log through
 that snapshot, so that the entries OpenRaft keeps below a snapshot never pin the
 segment. These rewrites run only in the driver's passes, at most an eighth
-segment per core per tick, so a mass removal does not saturate the disk. A
+segment per core per drive interval, so a mass removal does not saturate the
+disk: 8 MiB per second per core at the default 64 MiB segments and the 1 s
+interval of inline snapshots, 1.6 MiB per second with an S3 snapshot store. A
 journal without old dead entries is never rewritten for their age, so an idle
 core settles after one round. At open, replay finds the dead entries again, and
 a segment's age is the time since its modification time (`JournalDisk::modified`,
@@ -377,14 +382,26 @@ plus the active one and any archives. Live bytes are what the snapshot cadence
 leaves unpurged, bounded by its node log budget. Restart scan work follows.
 
 **Dead entries.** A segment that holds a dead entry is deleted within A, a
-quarter of `raft.deleted_data_max_age`, of the tick after the entry died, plus
-the passes the copies take at an eighth segment per tick, provided the groups
-that hold more than a quarter segment in the segments before it are snapshotted
-or purged. A restart restarts no clock: a segment's age is its modification
-time, at most one A later than its oldest death, and a dirty newest segment is
-sealed at open. So across a restart the bound is at most 2A. The cost is that the
-small live logs of quiet groups are copied forward about once per A, which
-`wal_rewritten_bytes` shows. Archives of apply-stopped groups are not covered.
+quarter of `raft.deleted_data_max_age`, of the pass after the entry died, plus
+the passes the copies take at an eighth segment per drive interval, provided the
+groups that hold more than a quarter segment in the segments before it are
+snapshotted or purged. At open a segment's age is the time since its
+modification time, which is at most one A later than its oldest death, and a
+dirty newest segment is sealed, so a plain restart keeps the bound within 2A.
+An open that rewrites every kept segment (a verified-prefix replay after a host
+crash under `fsync = never`, or a journal that ended in an invalid frame) resets
+their modification times, and their age then starts at the open. Archives of
+apply-stopped groups are not covered.
+
+The age rule has three costs, all visible in `wal_rewritten_bytes`:
+
+- The small live logs of quiet groups are copied forward about once per A.
+- Groups whose live log in such a segment passes a quarter segment are reported
+  lagging and snapshotted, or purged through their snapshot, about once per A.
+- The first passes after an upgrade to 0.8.1 or a restart find every old dead
+  entry at once. They copy the live remainders of all kept segments, up to about
+  twice the core's live bytes, at the per-interval rate, and snapshot the groups
+  reported lagging, before the journal settles.
 
 **Free space.** Free space on the WAL filesystem is sampled every second. Below
 `min_available_size`, writes get `503 WalDiskPressure`, readiness answers `503`

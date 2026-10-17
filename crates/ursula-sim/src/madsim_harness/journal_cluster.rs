@@ -340,7 +340,7 @@ impl JournalCluster {
             let driver = ursula::SnapshotDriver::new(
                 &self.node_registries[&node_id],
                 self.metrics[&node_id].clone(),
-                Some(self.wals[&node_id].raft_wal()),
+                Some(self.wals[&node_id].raft_wal().maintenance()),
                 ursula::SnapshotDriveSettings {
                     interval: drivers.interval,
                     cadence: ursula_raft::snapshot_cadence::SnapshotCadence::new(

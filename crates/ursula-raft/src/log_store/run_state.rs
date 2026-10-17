@@ -414,17 +414,17 @@ pub enum RaftWalError {
     RecordRunState(#[source] JournalError),
     #[error("the Raft WAL under '{}' has shut down", .root.display())]
     ShutDown { root: PathBuf },
-    #[error("stop the journal of core {core}: {source}")]
+    #[error("stop the journal of core {}: {source}", .core.0)]
     CloseJournal {
-        core: u16,
+        core: ursula_shard::CoreId,
         #[source]
         source: super::CoreJournalError,
     },
     /// A maintenance pass of a core's journal could not be asked for: its
     /// writer stopped or is poisoned.
-    #[error("maintain the journal of core {core}: {source}")]
+    #[error("maintain the journal of core {}: {source}", .core.0)]
     MaintainJournal {
-        core: u16,
+        core: ursula_shard::CoreId,
         #[source]
         source: super::CoreJournalError,
     },

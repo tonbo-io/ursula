@@ -6,9 +6,9 @@ use ursula_raft::BuildsChanged;
 use ursula_raft::Handoff;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
-use ursula_raft::RaftWal;
 use ursula_raft::SNAPSHOT_HANDOFF_WAIT;
 use ursula_raft::SnapshotBuildCoordinator;
+use ursula_raft::WalMaintenance;
 use ursula_raft::snapshot_cadence::DriveLimits;
 use ursula_raft::snapshot_cadence::GroupDriveState;
 use ursula_raft::snapshot_cadence::GroupLogProgress;
@@ -44,6 +44,21 @@ mod clock {
     pub(super) use tokio::time::sleep;
     #[cfg(not(madsim))]
     pub(super) use tokio::time::timeout;
+
+    /// A task the driver spawns and keeps.
+    #[cfg(madsim)]
+    pub(super) type Task = madsim::task::JoinHandle<()>;
+    #[cfg(not(madsim))]
+    pub(super) type Task = tokio::task::JoinHandle<()>;
+
+    #[cfg(madsim)]
+    pub(super) fn spawn(task: impl std::future::Future<Output = ()> + Send + 'static) -> Task {
+        madsim::task::spawn(task)
+    }
+    #[cfg(not(madsim))]
+    pub(super) fn spawn(task: impl std::future::Future<Output = ()> + Send + 'static) -> Task {
+        tokio::spawn(task)
+    }
 }
 
 /// The longest a tick spends starting snapshot GC passes (#669), so that
@@ -521,7 +536,7 @@ pub(crate) fn plan_lagging_purges(
 
 /// The purges a tick starts: [`plan_scrub_purges`] and
 /// [`plan_lagging_purges`], at most one per group, through the higher index.
-fn plan_purges(
+pub(crate) fn plan_purges(
     snapshots: &[RaftGroupMetricsSnapshot],
     lagging: &BTreeSet<RaftGroupId>,
 ) -> Vec<ScrubPurge> {
@@ -564,7 +579,7 @@ pub struct SnapshotDriveSettings {
 /// ([`SnapshotBuildCoordinator::hold_for_purge`]). It purges a lagging group
 /// that applied nothing since its snapshot through that snapshot the same
 /// way ([`plan_lagging_purges`]), and then runs a maintenance pass of every
-/// core journal of the node's Raft WAL ([`RaftWal::maintain`]), which frees
+/// core journal of the node's Raft WAL ([`WalMaintenance::maintain`]), which frees
 /// journal segments that held dead frames for a quarter of
 /// `raft.deleted_data_max_age`. After its pass a tick runs the snapshot GC
 /// passes that are due, for at most `max_groups_per_tick` groups
@@ -577,7 +592,14 @@ pub struct SnapshotDriver {
     cadence: SnapshotCadence,
     limits: DriveLimits,
     interval: Duration,
-    wal: Option<RaftWal>,
+    wal: Option<WalMaintenance>,
+    /// When the last maintenance pass of the Raft WAL started, and the task
+    /// that runs it. A pass runs at most once per `interval`, however often
+    /// the driver ticks, so the journals' copies keep their rate, and the
+    /// next one waits for the last one to end.
+    maintenance: Maintenance,
+    /// The lagging groups the last tick logged.
+    last_lagging: BTreeSet<RaftGroupId>,
     metrics: RuntimeMetrics,
     held_groups: HeldGroups,
     /// The groups held out of the last pass, so that passes that only carry
@@ -590,11 +612,42 @@ pub struct SnapshotDriver {
     wait_for_slot: Option<BuildsChanged>,
 }
 
+/// The driver's maintenance passes of the Raft WAL.
+enum Maintenance {
+    /// None started yet.
+    Idle,
+    /// The last one started `at`, in `task`.
+    Started { at: Instant, task: clock::Task },
+}
+
+impl Maintenance {
+    /// Whether a pass starts at `now`: once `interval` passed since the
+    /// last one started and that one ended.
+    fn due(&self, now: Instant, interval: Duration) -> bool {
+        match self {
+            Self::Idle => true,
+            Self::Started { at, task } => {
+                now.saturating_duration_since(*at) >= interval && task.is_finished()
+            }
+        }
+    }
+}
+
+impl Drop for SnapshotDriver {
+    /// The pass in flight goes with the driver, so that nothing of it keeps
+    /// a journal writer.
+    fn drop(&mut self) {
+        if let Maintenance::Started { task, .. } = &self.maintenance {
+            task.abort();
+        }
+    }
+}
+
 impl SnapshotDriver {
     pub fn new(
         registry: &RaftGroupHandleRegistry,
         metrics: RuntimeMetrics,
-        wal: Option<RaftWal>,
+        wal: Option<WalMaintenance>,
         settings: SnapshotDriveSettings,
     ) -> Self {
         let coordinator = registry.snapshot_build_coordinator();
@@ -609,6 +662,8 @@ impl SnapshotDriver {
             limits,
             interval: settings.interval,
             wal,
+            maintenance: Maintenance::Idle,
+            last_lagging: BTreeSet::new(),
             metrics,
             held_groups: HeldGroups::default(),
             last_held: BTreeSet::new(),
@@ -689,7 +744,7 @@ impl SnapshotDriver {
         // A group they hold counts as building below. So is the WAL's
         // maintenance pass, which copies at most a pass's budget per core.
         self.purge_through_snapshots(&snaps, &lagging).await;
-        self.maintain_wal().await;
+        self.maintain_wal();
         coordinator.add_publishing(
             &mut building,
             snaps.iter().map(|snapshot| {
@@ -701,12 +756,13 @@ impl SnapshotDriver {
         );
         coordinator.add_purging(&mut building);
         let mut pause = self.interval;
-        if !lagging.is_empty() {
+        if !lagging.is_empty() && lagging != self.last_lagging {
             tracing::info!(
                 groups = ?lagging,
                 "snapshot driver: the Raft WAL reports groups keeping old segments"
             );
         }
+        self.last_lagging.clone_from(&lagging);
         let (plan, mut selected) =
             plan_snapshot_drive(&snaps, &cadence, limits, &lagging, &building, &held);
         // Overdue groups the pass could not plan for its cap. Those that
@@ -856,22 +912,31 @@ impl SnapshotDriver {
         pause
     }
 
-    /// Runs a maintenance pass of every core journal as of now, freeing
+    /// Starts a maintenance pass of every core journal as of now, freeing
     /// segments that held dead frames for the removal floor, a quarter of
-    /// `raft.deleted_data_max_age` (#669).
-    async fn maintain_wal(&self) {
+    /// `raft.deleted_data_max_age` (#669). It runs in a task of its own, so
+    /// a core writer that is slow to answer holds up no snapshot build, and
+    /// at most once per drive interval, so ticks that come sooner under
+    /// pressure or after the lagging groups changed copy no more.
+    fn maintain_wal(&mut self) {
         let Some(wal) = &self.wal else {
             return;
         };
-        if let Err(err) = wal
-            .maintain(Instant::now(), self.cadence.removal_floor)
-            .await
-        {
-            tracing::warn!(
-                %err,
-                "snapshot driver: a Raft WAL maintenance pass did not run; the next tick retries"
-            );
+        let now = Instant::now();
+        if !self.maintenance.due(now, self.interval) {
+            return;
         }
+        let wal = wal.clone();
+        let max_age = self.cadence.removal_floor;
+        let task = clock::spawn(async move {
+            if let Err(err) = wal.maintain(now, max_age).await {
+                tracing::warn!(
+                    %err,
+                    "snapshot driver: a Raft WAL maintenance pass did not run; a later tick retries"
+                );
+            }
+        });
+        self.maintenance = Maintenance::Started { at: now, task };
     }
 
     /// Purges each group's log through the snapshot that covers its
@@ -940,7 +1005,7 @@ pub fn spawn_snapshot_driver(
     store_gate: StoreGateInputs<'_>,
     interval_ms: usize,
     cadence: SnapshotCadence,
-    wal: Option<RaftWal>,
+    wal: Option<WalMaintenance>,
     max_groups_per_tick: usize,
 ) {
     if interval_ms == 0 {

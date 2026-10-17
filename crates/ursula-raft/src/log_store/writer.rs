@@ -735,12 +735,14 @@ impl CoreFileLogWriter {
         // Replay found the dead frames again. How long they have been dead
         // is unknown, but no longer than since their segment last changed.
         let wall_clock = Disk::wall_clock();
+        let learned = Instant::now();
         let dirty = died
             .into_iter()
             .filter(|id| *id == active_id || sealed.iter().any(|(kept, _)| kept == id))
             .map(|id| {
                 (id, DirtySince::Unstamped {
                     age: segment_age(&dir, id, wall_clock),
+                    learned,
                 })
             })
             .collect();
@@ -1371,6 +1373,7 @@ impl CoreJournal {
         for segment in segments {
             self.dirty.entry(segment).or_insert(DirtySince::Unstamped {
                 age: Duration::ZERO,
+                learned: Instant::now(),
             });
         }
     }
@@ -1378,8 +1381,9 @@ impl CoreJournal {
     /// The snapshot driver's tick at `now`: stamps the deaths learned of
     /// since the last one, and plans with `max_dirty_age` from now on.
     fn tick(&mut self, now: Instant, max_dirty_age: Duration) {
+        let writer_now = Instant::now();
         for since in self.dirty.values_mut() {
-            *since = since.stamped(now, max_dirty_age);
+            *since = since.stamped(now, max_dirty_age, writer_now);
         }
         self.age = if ursula_stream::sim_controls::off(
             ursula_stream::sim_controls::Defence::WalDirtyAge,
@@ -1432,7 +1436,12 @@ impl CoreJournal {
     ) -> Result<(), JournalError> {
         let since = self.dirty.get(&self.active_id()).copied();
         let dirty = match pass {
-            Pass::Start => since.is_some(),
+            Pass::Start => {
+                since.is_some()
+                    && !ursula_stream::sim_controls::off(
+                        ursula_stream::sim_controls::Defence::WalDirtyAge,
+                    )
+            }
             Pass::AfterBatch => false,
             Pass::Maintenance => reclaim::rotates_active(self.age, since),
         };

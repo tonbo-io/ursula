@@ -2119,6 +2119,7 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
         let admin_port =
             write_cluster_config(&config, port, node_id, 1, &peers, node_id == 1, &wal_dir);
         let text = std::fs::read_to_string(&config).expect("read node config");
+        assert!(text.contains("[raft.wal]\n"));
         assert!(text.contains("init_membership_per_group = false\n"));
         std::fs::write(
             &config,

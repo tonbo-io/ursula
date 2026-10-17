@@ -74,22 +74,27 @@ pub(crate) struct GroupPin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirtySince {
     /// Not yet on the snapshot driver's clock: `age` is how old the dead
-    /// frames were when the writer learned of them, zero for a death since
-    /// the last maintenance pass, and the segment's age by its modification
-    /// time for one replay found. The next maintenance pass stamps it
-    /// ([`DirtySince::stamped`]).
-    Unstamped { age: Duration },
+    /// frames were when the writer learned of them at `learned` on its own
+    /// clock, zero for a death since the last maintenance pass, and the
+    /// segment's age by its modification time for one replay found. The
+    /// next maintenance pass stamps it ([`DirtySince::stamped`]), counting
+    /// the time since `learned` too, so a slow startup counts.
+    Unstamped { age: Duration, learned: Instant },
     /// Since this time on the driver's clock.
     At(Instant),
 }
 
 impl DirtySince {
-    /// This on the clock of a maintenance pass at `now`. An age longer than
-    /// `max_age` counts as `max_age`, which already frees the segment, so
-    /// it fits the clock however long ago the frames died.
-    pub(crate) fn stamped(self, now: Instant, max_age: Duration) -> Self {
+    /// This on the clock of a maintenance pass at `now`, which the writer
+    /// receives at `writer_now` on its own clock. An age longer than
+    /// `max_age` counts as `max_age`, which already frees the segment, so it
+    /// fits the clock however long ago the frames died.
+    pub(crate) fn stamped(self, now: Instant, max_age: Duration, writer_now: Instant) -> Self {
         match self {
-            Self::Unstamped { age } => Self::At(now.checked_sub(age.min(max_age)).unwrap_or(now)),
+            Self::Unstamped { age, learned } => {
+                let age = age.saturating_add(writer_now.saturating_duration_since(learned));
+                Self::At(now.checked_sub(age.min(max_age)).unwrap_or(now))
+            }
             at @ Self::At(_) => at,
         }
     }
@@ -451,6 +456,7 @@ mod tests {
         );
         let unstamped = BTreeMap::from([(SegmentId(1), DirtySince::Unstamped {
             age: MAX_AGE.saturating_mul(2),
+            learned: start,
         })]);
         assert_eq!(
             plan(shape(&sealed, 1_000, &pins, &unstamped, at(late)), limits()),
@@ -506,26 +512,34 @@ mod tests {
     }
 
     /// An age learned at open counts on the clock of the first maintenance
-    /// pass, capped at the age that frees the segment.
+    /// pass, with the time the writer waited for that pass, capped at the
+    /// age that frees the segment.
     #[test]
     fn an_unstamped_age_is_stamped_on_the_pass_clock() {
-        let now = later(Instant::now(), MAX_AGE.saturating_mul(4));
+        let learned = Instant::now();
+        let writer_now = later(learned, Duration::from_secs(2));
+        let now = later(learned, MAX_AGE.saturating_mul(4));
         let young = DirtySince::Unstamped {
             age: Duration::from_secs(1),
+            learned,
         };
         assert_eq!(
-            young.stamped(now, MAX_AGE),
-            DirtySince::At(earlier(now, Duration::from_secs(1)))
+            young.stamped(now, MAX_AGE, writer_now),
+            DirtySince::At(earlier(now, Duration::from_secs(3)))
         );
         let old = DirtySince::Unstamped {
             age: MAX_AGE.saturating_mul(3),
+            learned,
         };
         assert_eq!(
-            old.stamped(now, MAX_AGE),
+            old.stamped(now, MAX_AGE, writer_now),
             DirtySince::At(earlier(now, MAX_AGE))
         );
-        assert!(at(now).expired(Some(old.stamped(now, MAX_AGE))));
+        assert!(at(now).expired(Some(old.stamped(now, MAX_AGE, writer_now))));
         let stamped = DirtySince::At(now);
-        assert_eq!(stamped.stamped(later(now, MAX_AGE), MAX_AGE), stamped);
+        assert_eq!(
+            stamped.stamped(later(now, MAX_AGE), MAX_AGE, writer_now),
+            stamped
+        );
     }
 }

@@ -112,6 +112,7 @@ pub use state_file::StateFileKind;
 pub(crate) use state_file::replace_file;
 pub use topology::generate_cluster_id;
 pub use wal::RaftWal;
+pub use wal::WalMaintenance;
 pub(crate) use writer::CoreFileLogWriter;
 pub use writer::CoreJournalError;
 pub(crate) use writer::CoreJournalOptions;

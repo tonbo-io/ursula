@@ -393,6 +393,44 @@ async fn dead_frames_age_from_the_modification_time_after_a_reopen(name: &str) {
     assert_eq!(log_ids(&quiet).await, [1, 2, 3]);
 }
 
+/// A newest segment that holds dead frames is sealed at open, so that a
+/// restart never keeps them in a segment that only grows, and the next
+/// passes free it like any other.
+async fn a_dirty_newest_segment_is_sealed_at_open(name: &str) {
+    let journal = Journal::new(name, WalFsync::Always);
+    let writer = journal.writer();
+    let mut removed = journal.store(&writer, REMOVED);
+    append(
+        &mut removed,
+        (1..=3).map(|index| entry(index, &marked(200))),
+    )
+    .await;
+    removed.purge(log_id(3)).await.expect("purge");
+    drop(removed);
+    writer.close().await.expect("close the writer");
+    drop(writer);
+    let before = journal.segments();
+    assert_eq!(before.len(), 1, "the dead frames are in the newest segment");
+
+    let writer = journal.writer();
+    // The open's own pass ran before this one answers.
+    let start = Instant::now();
+    writer.maintain(start, MAX_AGE).await.expect("a pass");
+    let after = journal.segments();
+    assert_eq!(
+        after.len(),
+        2,
+        "the dirty newest segment was sealed: {after:?}"
+    );
+    assert_eq!(after.first(), before.first());
+    assert!(!holds_marker(&journal.active()));
+    journal
+        .maintain_until_clean(&writer, later(start, MAX_AGE))
+        .await;
+    let removed = journal.store(&writer, REMOVED);
+    assert_eq!(log_ids(&removed).await, Vec::<u64>::new());
+}
+
 /// Makes every file of the journal `by` older than now: on the operating
 /// system's disk its modification time moves back, on the simulated disk
 /// time moves on.
@@ -428,6 +466,24 @@ async fn dead_frames_age_from_the_modification_time_on_disk() {
     dead_frames_age_from_the_modification_time_after_a_reopen("dead-frames-age").await;
 }
 
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_dirty_newest_segment_is_sealed_at_open_on_disk() {
+    a_dirty_newest_segment_is_sealed_at_open("dirty-newest").await;
+}
+
+#[cfg(madsim)]
+#[test]
+fn a_dirty_newest_segment_is_sealed_at_a_simulated_open() {
+    crate::tests::check_madsim_determinism(672, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            672,
+            a_dirty_newest_segment_is_sealed_at_open("dirty-newest"),
+        )
+        .await;
+    });
+}
+
 #[cfg(madsim)]
 #[test]
 fn a_removed_groups_frames_leave_every_simulated_segment() {
@@ -452,10 +508,12 @@ fn dead_frames_age_from_the_simulated_modification_time() {
     });
 }
 
-/// A power loss in the middle of a rewrite loses no live entry: copies that
-/// were not durable yet are lost with the power and the originals stay, and
-/// copies that were durable stand in for originals that were not deleted
-/// yet. Either way the next passes free the dead frames.
+/// A power loss in the middle of a rewrite loses no live entry and brings
+/// back no purged one: copies that were not durable yet are lost with the
+/// power and the originals stay, copies that were durable stand in for
+/// originals that were not deleted yet or whose deletion was, and a deletion
+/// whose directory `fsync` failed comes back with the purge that freed it.
+/// In every case the next passes free the dead frames.
 #[cfg(madsim)]
 #[test]
 fn a_power_loss_mid_rewrite_loses_no_live_entry() {
@@ -463,6 +521,8 @@ fn a_power_loss_mid_rewrite_loses_no_live_entry() {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(671, async {
             power_loss_mid_rewrite(RewriteCut::BeforeCopiesSync).await;
             power_loss_mid_rewrite(RewriteCut::BeforeOriginalsDeleted).await;
+            power_loss_mid_rewrite(RewriteCut::AfterOriginalsDeleted).await;
+            power_loss_mid_rewrite(RewriteCut::DeletionNotDurable).await;
         })
         .await;
     });
@@ -474,6 +534,14 @@ fn a_power_loss_mid_rewrite_loses_no_live_entry() {
 enum RewriteCut {
     /// The `fsync` of the copies fails, which stops the writer.
     BeforeCopiesSync,
+    /// After the pass that deleted the originals' segment, losing all that
+    /// was not synced: only the synced copies hold the quiet group's
+    /// entries.
+    AfterOriginalsDeleted,
+    /// The `fsync` of the directory after the deletion of the originals'
+    /// segment fails, which stops the writer, so the deletion may not be
+    /// durable.
+    DeletionNotDurable,
     /// After the pass that made the copies durable, before a later pass
     /// deletes the segment of the originals.
     BeforeOriginalsDeleted,
@@ -514,15 +582,52 @@ async fn power_loss_mid_rewrite(cut: RewriteCut) {
             );
             writer.abort_simulated();
         }
+        RewriteCut::AfterOriginalsDeleted | RewriteCut::DeletionNotDurable => {
+            let first = journal.segments().first().cloned().expect("a segment");
+            writer
+                .maintain(later(start, MAX_AGE), MAX_AGE)
+                .await
+                .expect("the pass that copies");
+            if cut == RewriteCut::DeletionNotDurable {
+                SimDisk::inject_fault(&journal.dir, SimDiskFault::Sync).expect("arm the fault");
+            }
+            let deleted = writer.maintain(later(start, MAX_AGE), MAX_AGE).await;
+            assert!(
+                !Disk::exists(&first),
+                "{cut:?}: the pass deleted the originals"
+            );
+            assert_eq!(
+                deleted.is_err(),
+                cut == RewriteCut::DeletionNotDurable,
+                "{cut:?}: {deleted:?}"
+            );
+            writer.abort_simulated();
+        }
     }
     drop((quiet, removed));
     drop(writer);
-    SimDisk::power_loss(&root).expect("cut the power");
+    match cut {
+        RewriteCut::AfterOriginalsDeleted => {
+            SimDisk::power_loss_losing_unsynced(&root).expect("cut the power");
+        }
+        RewriteCut::BeforeCopiesSync
+        | RewriteCut::BeforeOriginalsDeleted
+        | RewriteCut::DeletionNotDurable => {
+            SimDisk::power_loss(&root).expect("cut the power");
+        }
+    }
     age_the_journal(&journal, MAX_AGE.saturating_mul(2)).await;
 
     let writer = journal.writer();
     let quiet = journal.store(&writer, QUIET);
+    let removed = journal.store(&writer, REMOVED);
     assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{cut:?}");
+    assert_eq!(
+        log_ids(&removed).await,
+        Vec::<u64>::new(),
+        "{cut:?}: no purged entry comes back"
+    );
     journal.maintain_until_clean(&writer, Instant::now()).await;
     assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{cut:?}");
+    assert_eq!(log_ids(&removed).await, Vec::<u64>::new(), "{cut:?}");
 }

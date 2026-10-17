@@ -8,9 +8,13 @@
 //! purged. On each replica, from when it applied the removal, within the
 //! bound: its current snapshot holds neither the stream nor the marker, no
 //! entry its log retains holds the marker, and a read of the stream answers
-//! not found. From the last time it applied the removal, again as it replays
-//! its log after a restart, within the bound: (a) no file under its WAL
-//! root, a journal segment or another, holds the marker. Seeds stop a
+//! not found. (a) No file under its WAL root, a journal segment or another,
+//! holds the marker within the bound of when it first applied the removal,
+//! or, when it applied it again as it replayed its log after a restart, within
+//! half the bound and a second of that: a removal applied again is due at
+//! once, and the purge after it frees the segments a quarter of the bound
+//! later. So a replica that restarts soon after the removal keeps the
+//! bound, and only one down for most of it gets the restart's margin. Seeds stop a
 //! follower across the removal, stop the leader right after it, or cut a
 //! replica's power right after the snapshot that covers the removal. A
 //! replica's time counts from when it applies the removal, again after it
@@ -45,6 +49,7 @@ use std::time::Duration;
 
 use openraft::storage::RaftLogReader;
 use ursula_config::WalFsync;
+use ursula_raft::JournalTuning;
 use ursula_raft::wal::diagnostics::JournalDisk;
 use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
@@ -78,6 +83,9 @@ pub(super) const HOLD_INVARIANT: &str = "operator_snapshot_waits_for_a_scrub_pur
 
 /// The group the marked stream lives in.
 const GROUP: u32 = 0;
+/// The other group, which writes nothing after the cluster starts but in
+/// the `deleted-data-across-segments` families.
+const QUIET_GROUP: u32 = 1;
 /// The bytes every record of the removed stream carries.
 const MARKER: &[u8] = b"deleted-data-marker-669;";
 /// The bucket of the removed stream, which a purge erases.
@@ -107,8 +115,49 @@ const SLOW_FOLLOWER: Duration = Duration::from_secs(5);
 /// How long the leader stays down after it applied the removal: longer
 /// than the bound less a quarter of it.
 const LEADER_DOWN: Duration = Duration::from_secs(10);
+/// How long past half the bound after its restart a replica's files may
+/// still hold the marker: the replayed removal's snapshot and purge, and the
+/// driver's passes that free the segments (invariant (a)).
+const RESTART_FILES_SLACK: Duration = Duration::from_secs(1);
 /// How often the run observes the replicas.
 const POLL: Duration = Duration::from_millis(50);
+
+/// Seeds of the `deleted-data-across-segments` families, whose journals
+/// run segments of 4, 16 or 64 KiB and whose quiet group holds half a segment
+/// of entries before the removal: freeing the removed records copies across
+/// several segments and reports the quiet group lagging (#669).
+const ACROSS_SEGMENTS: [std::ops::RangeInclusive<u64>; 2] = [528..=531, 630..=649];
+
+/// The journals of a run of `seed`, and how many entries the quiet group
+/// writes before the removal.
+#[derive(Debug, Clone, Copy)]
+struct Journals {
+    tuning: JournalTuning,
+    quiet_entries: usize,
+}
+
+impl Journals {
+    fn for_seed(seed: u64) -> Self {
+        let mut tuning = JournalTuning::new(WalFsync::Always);
+        if !ACROSS_SEGMENTS.iter().any(|seeds| seeds.contains(&seed)) {
+            return Self {
+                tuning,
+                quiet_entries: 0,
+            };
+        }
+        tuning.segment_bytes = match seed % 3 {
+            0 => 4 * 1024,
+            1 => 16 * 1024,
+            _ => 64 * 1024,
+        };
+        Self {
+            tuning,
+            // Half a segment: a quiet entry weighs about 150 bytes in the
+            // journal.
+            quiet_entries: usize::try_from(tuning.segment_bytes / 300).expect("a small count"),
+        }
+    }
+}
 
 fn marked_stream() -> BucketStreamId {
     BucketStreamId::new(BUCKET, "marked")
@@ -595,12 +644,16 @@ pub(super) async fn run_deleted_data_inner(
     let plan = Plan::from_seed(config.seed);
     let mut trace = SimTrace::default();
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
-    let context = format!("seed {} {plan:?}", config.seed);
-    let mut cluster = JournalCluster::start_with_fsync(
+    let journals = Journals::for_seed(config.seed);
+    let context = format!("seed {} {plan:?} {journals:?}", config.seed);
+    let mut cluster = JournalCluster::start_with_tuning(
         &format!("deleted-data-{}", config.seed),
-        WalFsync::Always,
+        journals.tuning,
     )
     .await;
+    // The quiet group's entries go first, so they share the segments of
+    // the removed records and pin them.
+    cluster.append(QUIET_GROUP, journals.quiet_entries).await;
     write_marked_stream(&mut cluster, plan.records, &context).await;
     let leader = wait_leader(&cluster, GROUP, &context).await;
     trace.push(SimEvent::LeaderElected { leader_id: leader });
@@ -778,10 +831,13 @@ pub(super) async fn run_deleted_data_inner(
         let files_due = seen
             .last
             .iter()
-            .filter(|(node_id, at)| {
-                !files_checked.contains(*node_id) && now >= **at + BOUND_DRIVERS.max_age
+            .filter(|(node_id, _)| !files_checked.contains(*node_id))
+            .filter_map(|(node_id, last)| {
+                let first = seen.at.get(node_id)?;
+                let due = (*first + BOUND_DRIVERS.max_age)
+                    .max(*last + BOUND_DRIVERS.max_age / 2 + RESTART_FILES_SLACK);
+                (now >= due).then_some(*node_id)
             })
-            .map(|(node_id, _)| *node_id)
             .collect::<Vec<_>>();
         for node_id in files_due {
             if let Some(held) = wal_file_holds_marker(&cluster, node_id) {
@@ -842,9 +898,9 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
     let mut trace = SimTrace::default();
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     let context = format!("seed {} operator snapshot under a purge", config.seed);
-    let mut cluster = JournalCluster::start_with_fsync(
+    let mut cluster = JournalCluster::start_with_tuning(
         &format!("operator-snapshot-under-purge-{}", config.seed),
-        WalFsync::Always,
+        Journals::for_seed(config.seed).tuning,
     )
     .await;
     write_marked_stream(&mut cluster, 2, &context).await;
@@ -985,6 +1041,36 @@ mod tests {
         }
     }
 
+    /// The same with journal segments of 4 to 64 KiB and a quiet group that
+    /// pins them: the removed records leave every segment, across several,
+    /// the quiet group's entries are copied forward or, past a quarter of a
+    /// segment, reported lagging and snapshotted or purged.
+    #[test]
+    fn deleted_data_across_segments_replays() {
+        let _guard = sim_test_guard();
+        for seed in 528..=531 {
+            let first = ThreeNodeRaftSim::run_deleted_data_with_controls_report(
+                config(seed),
+                Controls::default(),
+            );
+            let second = ThreeNodeRaftSim::run_deleted_data_with_controls_report(
+                config(seed),
+                Controls::default(),
+            );
+            assert_eq!(first, second, "seed {seed}");
+            assert!(
+                first
+                    .outcome
+                    .trace
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, SimEvent::DeletedDataLeft { replicas: 3, .. })),
+                "seed {seed}: {:?}",
+                first.outcome.trace.events.last()
+            );
+        }
+    }
+
     /// Runs `seed` under `controls`, which must fail `invariant`, and
     /// returns the failure's message.
     fn assert_fails(seed: u64, controls: Controls, invariant: &str) -> String {
@@ -1057,8 +1143,8 @@ mod tests {
         let _guard = sim_test_guard();
         let message = assert_fails(520, Controls::WAL_AGE_OFF, BOUND_INVARIANT);
         assert!(
-            message.contains("file") && message.contains("holds the marker"),
-            "{message}"
+            message.contains("/journal-") && message.contains(".seg holds the marker"),
+            "a journal segment holds it: {message}"
         );
     }
 
@@ -1138,25 +1224,28 @@ mod tests {
     #[test]
     fn scrub_purge_holds_an_operator_snapshot() {
         let _guard = sim_test_guard();
-        let first = ThreeNodeRaftSim::run_operator_snapshot_under_purge_report(
-            config(524),
-            Controls::default(),
-        );
-        let second = ThreeNodeRaftSim::run_operator_snapshot_under_purge_report(
-            config(524),
-            Controls::default(),
-        );
-        assert_eq!(first, second);
-        assert!(
-            first
-                .outcome
-                .trace
-                .events
-                .iter()
-                .any(|event| matches!(event, SimEvent::OperatorSnapshotHeldForPurge { .. })),
-            "{:?}",
-            first.outcome.trace.events.last()
-        );
+        // Seed 529 runs 16 KiB segments.
+        for seed in [524, 529] {
+            let first = ThreeNodeRaftSim::run_operator_snapshot_under_purge_report(
+                config(seed),
+                Controls::default(),
+            );
+            let second = ThreeNodeRaftSim::run_operator_snapshot_under_purge_report(
+                config(seed),
+                Controls::default(),
+            );
+            assert_eq!(first, second, "seed {seed}");
+            assert!(
+                first
+                    .outcome
+                    .trace
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, SimEvent::OperatorSnapshotHeldForPurge { .. })),
+                "seed {seed}: {:?}",
+                first.outcome.trace.events.last()
+            );
+        }
     }
 
     /// Without the hold, the operator's build ends while the leader still
