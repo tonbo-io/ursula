@@ -2677,7 +2677,7 @@ fn the_http_front_refuses_with_the_servers_error_body() {
         super::http::serve(listener, server)
     }));
     let zero = Offset::ZERO.to_string();
-    let cases: [FrontCase<'_>; 9] = [
+    let cases: [FrontCase<'_>; 10] = [
         (
             "an unknown method",
             format!("BREW {PATH} HTTP/1.1\r\n"),
@@ -2724,6 +2724,13 @@ fn the_http_front_refuses_with_the_servers_error_body() {
             ),
             400,
             ErrorCode::InvalidProducer,
+            &[],
+        ),
+        (
+            "a malformed precondition on an append",
+            format!("POST {PATH} HTTP/1.1\r\ncontent-length: 0\r\nstream-incarnation: soon\r\n"),
+            400,
+            ErrorCode::InvalidHeader,
             &[],
         ),
         (

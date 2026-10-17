@@ -50,6 +50,7 @@ use ursula_headers::Epoch;
 use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
+use ursula_headers::IncarnationPrecondition;
 use ursula_headers::PartsCommit;
 use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::SizeLimit;
@@ -349,14 +350,18 @@ fn answer(answer: RawAnswer) -> Reply {
     }
 }
 
-/// The code the server gives a request whose headers [`Request::parse`] refused, by route and by
-/// the header that failed: the producer headers and `Stream-Incarnation` of an append or a create
-/// are the producer key (`INVALID_PRODUCER`), a malformed `Stream-Snapshot-Parts` is a malformed
-/// commit (`INVALID_PARTS_COMMIT`), and any other header, the `Stream-Incarnation` precondition of
-/// the other routes among them, is `INVALID_HEADER`.
+/// The code the server gives a request whose headers [`Request::parse`] refused, in the server's
+/// order: a malformed `Stream-Incarnation` precondition is `INVALID_HEADER` on every route,
+/// checked first; then the producer headers of an append or a create are the producer key
+/// (`INVALID_PRODUCER`), and a malformed `Stream-Snapshot-Parts` is a malformed commit
+/// (`INVALID_PARTS_COMMIT`). Any other header is `INVALID_HEADER`, among them a `Stream-Closed`
+/// other than `true`, which is the model's own check: the server reads it as not closed.
 fn malformed_code<'a, I>(method: Method, target: Target, headers: I) -> ErrorCode
 where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
     let keyed_route = target == Target::Stream && matches!(method, Method::Post | Method::Put);
+    if IncarnationPrecondition::parse(headers.clone()).is_err() {
+        return ErrorCode::InvalidHeader;
+    }
     match (
         ProducerRequestHeaders::parse(headers.clone()),
         PartsCommit::parse(headers),
