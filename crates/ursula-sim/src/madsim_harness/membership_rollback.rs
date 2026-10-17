@@ -2102,7 +2102,9 @@ async fn assert_node_kept(
 }
 
 /// Fails G1 when the learner no longer holds the committed entry it held
-/// before the loss: a plan overwrote it.
+/// before the loss, in its log or as its last purged entry: a plan
+/// overwrote it. A snapshot driver (#669) may purge the log through a
+/// snapshot that covers the entry.
 async fn assert_learner_kept(
     cluster: &JournalCluster,
     ahead: &std::collections::BTreeMap<u32, LogIdOf<UrsulaRaftTypeConfig>>,
@@ -2112,12 +2114,18 @@ async fn assert_learner_kept(
         let mut store = cluster.wals[&LEARNER]
             .store(RaftGroupId(*group))
             .expect("the learner runs");
+        let purged = store
+            .get_log_state()
+            .await
+            .expect("read the learner's log state")
+            .last_purged_log_id;
         let held = store
             .try_get_log_entries(committed.index..=committed.index)
             .await
             .expect("read the learner's log")
             .first()
-            .map(|entry| entry.log_id);
+            .map(|entry| entry.log_id)
+            .or(purged.filter(|purged| purged.index == committed.index));
         if held != Some(*committed) {
             fail(
                 trace,
