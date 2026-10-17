@@ -11,6 +11,8 @@ use ursula_headers::ClosedEpoch;
 use ursula_headers::ClusterId;
 use ursula_headers::Delivery;
 use ursula_headers::Epoch;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
@@ -33,6 +35,7 @@ use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRef;
 use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
+use ursula_headers::WriteOutcome;
 use ursula_headers::names;
 
 use super::CheckpointId;
@@ -1432,6 +1435,26 @@ fn commit(token: Incarnation, offset: u64, parts: &[PartId], digest: SnapshotDig
     }
 }
 
+/// `DELETE {stream}/snapshot/parts`, under `token` when one is given.
+fn discard(token: Option<Incarnation>) -> Request {
+    Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: token.and_then(tokened),
+        },
+        ..Request::new(Method::Delete, Target::StagedParts)
+    }
+}
+
+/// The code of an answer's error body, as the server renders it (extensions §11).
+fn error_code(answer: &Answer) -> ErrorCode {
+    assert_eq!(
+        answer.content_type.as_deref(),
+        Some(ErrorBody::CONTENT_TYPE)
+    );
+    ErrorBody::parse(&answer.body).unwrap().code
+}
+
 fn digest_of(body: &[u8]) -> SnapshotDigest {
     let mut digester = SnapshotDigester::new(CONTENT_TYPE);
     digester.update(body);
@@ -1595,6 +1618,160 @@ fn staged_parts_are_bounded_and_discarded_together() {
     );
 }
 
+// The server's 429 (#622): `Ursula-Max-Staged-Parts` or `-Bytes` set to the bound, the stream's
+// current token, the code STAGED_PARTS_LIMIT and no `Retry-After`. The bound is per stream id:
+// a part of an earlier incarnation counts until a part or a discard deletes it, which it does
+// once that part was staged more than a minute before.
+#[test]
+fn a_part_past_the_staged_bound_is_429_staged_parts_limit_per_stream_id() {
+    let world = World::new();
+    with_cold_store(&world);
+    let old = world.create();
+    world.server().foreign_append(PATH, &[0; 64]).unwrap();
+    let mut limits = world.server().limits();
+    limits.max_staged_parts = 2;
+    limits.max_staged_bytes = 3;
+    world.server().set_limits(limits);
+    stage(&world, old, 64, b"a").unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::NewHistory)
+        .unwrap();
+    let token = world.server().token(PATH).unwrap();
+    assert_ne!(token, old);
+    stage(&world, token, 64, b"b").unwrap();
+    let part = |body: &[u8]| Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        body: Arc::from(body),
+        ..Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(64),
+        })
+    };
+    // The old incarnation's part counts: two parts held.
+    let full = world.send(&part(b"c"));
+    assert_eq!(full.status, 429);
+    assert_eq!(full.typed, Ok(Typed::StagedPartsFull));
+    assert_eq!(
+        full.outcome,
+        Some(WriteOutcome::Refused(ErrorCode::StagedPartsLimit))
+    );
+    assert_eq!(full.retry_after, None);
+    assert_eq!(error_code(&full), ErrorCode::StagedPartsLimit);
+    let raw = world.server().handle(PATH, &part(b"c"));
+    assert!(
+        raw.headers
+            .contains(&(names::URSULA_MAX_STAGED_PARTS, "2".to_owned())),
+        "{raw:?}"
+    );
+    assert!(
+        raw.headers
+            .contains(&(names::STREAM_INCARNATION, token.to_string())),
+        "{raw:?}"
+    );
+    assert!(
+        !raw.headers
+            .iter()
+            .any(|(name, _)| *name == names::URSULA_MAX_STAGED_BYTES)
+    );
+    assert_eq!(world.server().staged_parts(), 2);
+    // A minute after staging the old part still counts; past it, the next part deletes it.
+    world.server().advance(super::RETIRED_MIN_AGE_MS);
+    assert_eq!(world.send(&part(b"c")).status, 429);
+    world.server().advance(1);
+    stage(&world, token, 64, b"c").unwrap();
+    assert_eq!(world.server().staged_parts(), 2, "b and c");
+    // The bytes bound: b and c hold 2 bytes, 2 more would pass 3.
+    assert_eq!(world.send(&discard(Some(token))).status, 204);
+    stage(&world, token, 64, b"ab").unwrap();
+    let bytes = world.send(&part(b"cd"));
+    assert_eq!(
+        (bytes.status, bytes.typed.clone()),
+        (429, Ok(Typed::StagedPartsFull))
+    );
+    assert_eq!(error_code(&bytes), ErrorCode::StagedPartsLimit);
+    let raw = world.server().handle(PATH, &part(b"cd"));
+    assert!(
+        raw.headers
+            .contains(&(names::URSULA_MAX_STAGED_BYTES, "3".to_owned())),
+        "{raw:?}"
+    );
+    assert!(
+        raw.headers
+            .contains(&(names::STREAM_INCARNATION, token.to_string()))
+    );
+}
+
+// `DELETE {stream}/snapshot/parts` as the server answers it (#622): 501 NO_COLD_STORE without a
+// cold store, before the stream; 404 without the stream; 412 naming the current token under
+// another; 204 with the token, discarding the current incarnation's parts and an earlier one's
+// staged more than a minute before; and a commit or discard of the incarnation that runs
+// meanwhile is 503 SNAPSHOT_COMMIT_IN_PROGRESS with `Retry-After`, discarding nothing.
+#[test]
+fn discarding_staged_parts_answers_as_the_server_does() {
+    let world = World::new();
+    let unsupported = world.send(&discard(None));
+    assert_eq!(unsupported.status, 501);
+    assert_eq!(error_code(&unsupported), ErrorCode::NoColdStore);
+    assert_eq!(
+        unsupported.outcome,
+        Some(WriteOutcome::Refused(ErrorCode::NoColdStore))
+    );
+    with_cold_store(&world);
+    assert_eq!(world.send(&discard(None)).status, 404);
+    let old = world.create();
+    world.server().foreign_append(PATH, &[0; 64]).unwrap();
+    stage(&world, old, 64, b"old").unwrap();
+    world
+        .server()
+        .history_event(HistoryEvent::NewHistory)
+        .unwrap();
+    let token = world.server().token(PATH).unwrap();
+    stage(&world, token, 64, b"one").unwrap();
+    stage(&world, token, 64, b"two").unwrap();
+    let stale = world.server().handle(PATH, &discard(Some(old)));
+    assert_eq!(stale.status, 412);
+    assert!(
+        stale
+            .headers
+            .contains(&(names::STREAM_INCARNATION, token.to_string())),
+        "{stale:?}"
+    );
+    assert_eq!(world.server().staged_parts(), 3);
+    // A commit or discard of this incarnation runs: 503, nothing discarded.
+    world.server().inject(Scripted {
+        method: Some(Method::Delete),
+        fault: Fault::CommitRefused(super::faults::CommitRefusal::InProgress),
+        times: 1,
+    });
+    let running = world.send(&discard(Some(token)));
+    assert_eq!(running.status, 503);
+    assert_eq!(running.retry_after, Some(std::time::Duration::from_secs(1)));
+    assert_eq!(error_code(&running), ErrorCode::SnapshotCommitInProgress);
+    assert_eq!(running.outcome, Some(WriteOutcome::Unknown));
+    assert_eq!(world.server().staged_parts(), 3);
+    // The current incarnation's parts go; the old one, staged under a minute ago, stays.
+    let raw = world.server().handle(PATH, &discard(Some(token)));
+    assert_eq!(raw.status, 204);
+    assert!(
+        raw.headers
+            .contains(&(names::STREAM_INCARNATION, token.to_string())),
+        "{raw:?}"
+    );
+    assert_eq!(world.server().staged_parts(), 1);
+    world.server().advance(super::RETIRED_MIN_AGE_MS + 1);
+    let done = world.send(&discard(None));
+    assert_eq!(done.status, 204);
+    assert_eq!(done.outcome, Some(WriteOutcome::Applied));
+    assert_eq!(world.server().staged_parts(), 0);
+    // A delete of the stream takes its parts with it.
+    stage(&world, token, 64, b"x").unwrap();
+    world.server().delete(PATH).unwrap();
+    assert_eq!(world.server().staged_parts(), 0);
+}
+
 // After the key: an unknown or listed-twice part, or a wrong count, is 400 and the parts stay
 // for a corrected commit; a snapshot above the limit is 413 naming it, the parts kept; another
 // token is 412; a digest that differs is 400 and consumes them.
@@ -1654,7 +1831,8 @@ fn a_commit_refuses_its_parts_as_the_server_does() {
 }
 
 // Without a cold store a part and a commit are 501; parts no commit used are swept after a day
-// on the model's clock; Busy and InProgress are scripted 503s with `Retry-After`.
+// on the model's clock; Busy and InProgress are scripted 503s with `Retry-After` and the server's
+// codes: one commit or discard of a stream incarnation runs at a time (#622).
 #[test]
 fn parts_need_a_cold_store_and_are_swept_after_a_day() {
     let world = World::new();
@@ -1663,7 +1841,9 @@ fn parts_need_a_cold_store_and_are_swept_after_a_day() {
     assert_eq!(stage(&world, token, 64, b"x"), Err(501));
     let unknown = PartId::new("never-staged.part").unwrap();
     let probe = commit(token, 64, std::slice::from_ref(&unknown), digest_of(b"x"));
-    assert_eq!(world.send(&probe).status, 501);
+    let unsupported = world.send(&probe);
+    assert_eq!(unsupported.status, 501);
+    assert_eq!(error_code(&unsupported), ErrorCode::NoColdStore);
     with_cold_store(&world);
     let part = stage(&world, token, 64, b"x").unwrap();
     world.server().advance(super::PART_GRACE_MS - 1);
@@ -1672,11 +1852,16 @@ fn parts_need_a_cold_store_and_are_swept_after_a_day() {
     let swept = world.send(&commit(token, 64, &[part], digest_of(b"x")));
     assert_eq!(swept.status, 400, "swept");
     assert_eq!(world.server().staged_parts(), 0);
-    for (refusal, code) in [
-        (super::faults::CommitRefusal::Busy, "SnapshotCommitsBusy"),
+    for (refusal, code, outcome) in [
+        (
+            super::faults::CommitRefusal::Busy,
+            ErrorCode::SnapshotCommitsBusy,
+            WriteOutcome::Refused(ErrorCode::SnapshotCommitsBusy),
+        ),
         (
             super::faults::CommitRefusal::InProgress,
-            "SnapshotCommitInProgress",
+            ErrorCode::SnapshotCommitInProgress,
+            WriteOutcome::Unknown,
         ),
     ] {
         world.server().inject(Scripted {
@@ -1687,6 +1872,7 @@ fn parts_need_a_cold_store_and_are_swept_after_a_day() {
         let refused = world.send(&probe);
         assert_eq!(refused.status, 503);
         assert_eq!(refused.retry_after, Some(std::time::Duration::from_secs(1)));
-        assert!(String::from_utf8_lossy(&refused.body).contains(code));
+        assert_eq!(error_code(&refused), code);
+        assert_eq!(refused.outcome, Some(outcome));
     }
 }

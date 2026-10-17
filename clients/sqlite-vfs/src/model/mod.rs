@@ -11,9 +11,10 @@
 //! untyped `413`, create keyed by configuration, reads with the incarnation precondition (`412`,
 //! `410`), snapshots keyed by offset and digest, snapshot reads in one byte range (`206`, `416`),
 //! snapshots uploaded in parts (#618: minted part ids, the commit's key checked first, the parts a
-//! final answer consumes, the one-day sweep on the model's clock), monotonic retention, and
-//! scripted faults. Out of scope: immutable reads, the timing of answers before the body, the
-//! producer cap, SSE and JSON streams.
+//! final answer consumes, the one-day sweep on the model's clock; #622: the `429` bound per stream
+//! id, `DELETE {stream}/snapshot/parts`, and the `503` of a second commit or discard of one stream
+//! incarnation, scripted), monotonic retention, and scripted faults. Out of scope: immutable
+//! reads, the timing of answers before the body, the producer cap, SSE and JSON streams.
 //!
 //! Requests come in through [`ModelServer::exchange`] (with faults) or [`ModelServer::handle`]
 //! (without), in process ([`crate::transport::model::ModelTransport`]) or over HTTP/1.1
@@ -46,6 +47,8 @@ use ursula_headers::ContentRange;
 use ursula_headers::CurrentEpoch;
 use ursula_headers::Delivery;
 use ursula_headers::Epoch;
+use ursula_headers::ErrorBody;
+use ursula_headers::ErrorCode;
 use ursula_headers::Incarnation;
 use ursula_headers::IncarnationMismatch;
 use ursula_headers::IncarnationPrecondition;
@@ -65,6 +68,7 @@ use ursula_headers::SizeLimit;
 use ursula_headers::SnapshotPublishAnswer;
 use ursula_headers::SnapshotRead;
 use ursula_headers::SnapshotRef;
+use ursula_headers::StagedPartsLimit;
 use ursula_headers::StreamClosedConflict;
 use ursula_headers::StreamHead;
 use ursula_headers::names;
@@ -101,6 +105,10 @@ const PART_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 /// The most unused parts a stream holds staged, and their most bytes (#622).
 pub(crate) const MAX_STAGED_PARTS: u64 = 8192;
 pub(crate) const MAX_STAGED_BYTES: u64 = 2 << 30;
+
+/// How long before a part's or a discard's `HEAD` a part of an earlier incarnation of the stream
+/// was staged for that request to delete it (#622).
+const RETIRED_MIN_AGE_MS: u64 = 60 * 1000;
 
 /// The base protocol's content type of a stream created without one.
 const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
@@ -456,11 +464,13 @@ impl ModelServer {
     }
 
     /// Deletes the stream. A create at its path later starts a new incarnation.
+    /// Its staged parts go with it: the model knows every incarnation it staged parts for (#622).
     pub(crate) fn delete(&mut self, path: &str) -> Result<(), ModelError> {
         self.streams
             .remove(path)
-            .map(drop)
-            .ok_or_else(|| ModelError::NoStream(path.to_owned()))
+            .ok_or_else(|| ModelError::NoStream(path.to_owned()))?;
+        self.parts.retain(|_, part| part.path != path);
+        Ok(())
     }
 
     /// A request through the scripted faults, then the server.
@@ -815,10 +825,13 @@ impl ModelServer {
 
     /// `POST {stream}/snapshot/{offset}/parts` (extensions §2.2): `201` naming a part id minted
     /// for this request alone, bound to the stream and its token, never to the offset. Not
-    /// idempotent: a repeat stages another part. `501` without a cold store.
+    /// idempotent: a repeat stages another part. `501` without a cold store. The bound is per
+    /// stream id (#622): the parts of earlier incarnations count until they are deleted, and a
+    /// part deletes those staged more than [`RETIRED_MIN_AGE_MS`] ago. A part past either bound is
+    /// `429 STAGED_PARTS_LIMIT` naming it, with the stream's token and no `Retry-After`.
     fn stage_part(&mut self, path: &str, request: &Request) -> RawAnswer {
         if self.limits.max_snapshot_bytes.is_none() {
-            return RawAnswer::new(501);
+            return no_cold_store();
         }
         self.sweep_parts();
         let (history, now_ms) = (self.history, self.clock_ms);
@@ -826,26 +839,27 @@ impl ModelServer {
             Ok(stream) => stream.token_in(history),
             Err(answer) => return answer,
         };
-        let (count, bytes) = self
-            .parts
-            .values()
-            .filter(|part| part.path == path && part.token == token)
-            .fold((0_u64, 0_u64), |(count, bytes), part| {
+        self.retire_parts(path, token);
+        let (count, bytes) = self.parts.values().filter(|part| part.path == path).fold(
+            (0_u64, 0_u64),
+            |(count, bytes), part| {
                 let len = u64::try_from(part.body.len()).unwrap_or(u64::MAX);
                 (count.saturating_add(1), bytes.saturating_add(len))
-            });
+            },
+        );
         let len = u64::try_from(request.body.len()).unwrap_or(u64::MAX);
         let over = if count >= self.limits.max_staged_parts {
-            Some((crate::wire::MAX_STAGED_PARTS, self.limits.max_staged_parts))
+            Some(StagedPartsLimit::Parts(self.limits.max_staged_parts))
         } else if bytes.saturating_add(len) > self.limits.max_staged_bytes {
-            Some((crate::wire::MAX_STAGED_BYTES, self.limits.max_staged_bytes))
+            Some(StagedPartsLimit::Bytes(self.limits.max_staged_bytes))
         } else {
             None
         };
-        if let Some((name, limit)) = over {
-            let mut answer = RawAnswer::new(429);
-            answer.header(name, limit.to_string());
+        if let Some(limit) = over {
+            let mut answer = RawAnswer::new(StagedPartsLimit::STATUS);
+            limit.render(answer.emit());
             answer.header(names::STREAM_INCARNATION, token.to_string());
+            error_body(&mut answer, limit.error_code());
             return answer;
         }
         self.minted = self.minted.saturating_add(1);
@@ -862,9 +876,15 @@ impl ModelServer {
         answer
     }
 
-    /// `DELETE {stream}/snapshot/parts` (#622): discards every part staged under the stream's
-    /// current token, after the precondition; `204` whether any was staged or not.
+    /// `DELETE {stream}/snapshot/parts` (#622): `501` without a cold store, before the stream;
+    /// then the precondition (`404`, `412`); then discards every part staged under the stream's
+    /// current token and the parts of its earlier incarnations staged more than
+    /// [`RETIRED_MIN_AGE_MS`] ago, `204` with the token whether any was staged or not. A commit or
+    /// discard that runs meanwhile is scripted (`commit-in-progress`).
     fn discard_parts(&mut self, path: &str, request: &Request) -> RawAnswer {
+        if self.limits.max_snapshot_bytes.is_none() {
+            return no_cold_store();
+        }
         let history = self.history;
         let token = match self.stream(path, request) {
             Ok(stream) => stream.token_in(history),
@@ -872,9 +892,21 @@ impl ModelServer {
         };
         self.parts
             .retain(|_, part| part.path != path || part.token != token);
+        self.retire_parts(path, token);
         let mut answer = RawAnswer::new(204);
         answer.header(names::STREAM_INCARNATION, token.to_string());
         answer
+    }
+
+    /// Deletes the parts of the stream at `path` staged for an incarnation other than `token`
+    /// more than [`RETIRED_MIN_AGE_MS`] ago.
+    fn retire_parts(&mut self, path: &str, token: Incarnation) {
+        let now_ms = self.clock_ms;
+        self.parts.retain(|_, part| {
+            part.path != path
+                || part.token == token
+                || now_ms.saturating_sub(part.staged_ms) <= RETIRED_MIN_AGE_MS
+        });
     }
 
     /// Reclaims every part older than its grace, used or not.
@@ -900,7 +932,7 @@ impl ModelServer {
         commit: PartsCommit,
     ) -> RawAnswer {
         let Some(max_snapshot) = self.limits.max_snapshot_bytes else {
-            return RawAnswer::new(501);
+            return no_cold_store();
         };
         self.sweep_parts();
         let history = self.history;
@@ -1133,13 +1165,25 @@ fn publish_answer(answer: &SnapshotPublishAnswer) -> RawAnswer {
 }
 
 /// The `503` of a node that refuses a parts commit for now, as the server sends it:
-/// `Retry-After: 1` and the JSON `error` code.
+/// `Retry-After: 1` and the error body of its code.
 fn commit_refused(refusal: CommitRefusal) -> RawAnswer {
     let mut answer = RawAnswer::new(503);
     answer.header(RETRY_AFTER, "1");
-    answer.header(CONTENT_TYPE, "application/json");
-    answer.body = format!("{{\"error\":\"{}\"}}", refusal.code()).into_bytes();
+    error_body(&mut answer, refusal.code());
     answer
+}
+
+/// The `501` of a node without a cold store to a part, a parts commit or a discard.
+fn no_cold_store() -> RawAnswer {
+    let mut answer = RawAnswer::new(501);
+    error_body(&mut answer, ErrorCode::NoColdStore);
+    answer
+}
+
+/// The error body of `code` with its fixed message, as the server renders it (extensions §11).
+fn error_body(answer: &mut RawAnswer, code: ErrorCode) {
+    answer.header(CONTENT_TYPE, ErrorBody::CONTENT_TYPE);
+    answer.body = ErrorBody::fixed(code).render().into_bytes();
 }
 
 /// A producer answer, rendered.
