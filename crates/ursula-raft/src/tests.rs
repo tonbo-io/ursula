@@ -4814,9 +4814,10 @@ async fn a_snapshot_build_that_outlives_its_engine_publishes_nothing() {
 
 /// A single-node engine of `placement()` over `wal` whose snapshot metadata
 /// lives at the WAL's own path, as the factory builds it. The previous
-/// engine's store may still be open for a moment after its shutdown: the
-/// OpenRaft state-machine worker it leaves running holds it until it exits
-/// (#709).
+/// engine's store and its core journal may still be open for a moment after
+/// its shutdown: the OpenRaft state-machine worker it leaves running holds
+/// the store until it exits, and dropping the last store stops the core
+/// writer, which then releases the journal lock (#709).
 #[cfg(not(madsim))]
 async fn reopen_journal_engine(wal: &RaftWal, cluster_name: &str) -> RaftGroupEngine {
     let store = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4826,10 +4827,18 @@ async fn reopen_journal_engine(wal: &RaftWal, cluster_name: &str) -> RaftGroupEn
                 ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
             ) {
                 Ok(store) => break store,
-                Err(crate::log_store::RaftWalError::OpenGroup {
-                    source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
-                    ..
-                }) => tokio::time::sleep(Duration::from_millis(10)).await,
+                // Still registered in the core writer, or the writer whose
+                // last handle the worker dropped still holds the journal lock.
+                Err(
+                    crate::log_store::RaftWalError::OpenGroup {
+                        source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
+                        ..
+                    }
+                    | crate::log_store::RaftWalError::OpenCore {
+                        source: crate::log_store::CoreJournalError::Locked { .. },
+                        ..
+                    },
+                ) => tokio::time::sleep(Duration::from_millis(10)).await,
                 Err(err) => panic!("open the group's log store: {err}"),
             }
         }
