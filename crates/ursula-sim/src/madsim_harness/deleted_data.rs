@@ -337,6 +337,37 @@ fn applied(cluster: &JournalCluster, node_id: u64) -> Option<u64> {
         .map(|log_id| log_id.index)
 }
 
+/// The highest index any running replica applied.
+fn applied_anywhere(cluster: &JournalCluster) -> u64 {
+    NODES
+        .into_iter()
+        .filter_map(|node_id| applied(cluster, node_id))
+        .max()
+        .unwrap_or(0)
+}
+
+/// The log index of the removal `remover` answered, nothing else being
+/// written: the first index past `before` its metrics show applied. Its
+/// metrics follow the apply a moment after the answer.
+async fn removal_applied(
+    cluster: &JournalCluster,
+    remover: u64,
+    before: u64,
+    context: &str,
+) -> u64 {
+    let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(index) = applied(cluster, remover).filter(|index| *index > before) {
+            return index;
+        }
+        assert!(
+            madsim::time::Instant::now() < deadline,
+            "{context}: node {remover} never shows the removal applied"
+        );
+        madsim::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn holds_marker(bytes: &[u8]) -> bool {
     bytes.windows(MARKER.len()).any(|window| window == MARKER)
 }
@@ -542,6 +573,7 @@ pub(super) async fn run_deleted_data_inner(
         });
     }
     let placement = group_placement(GROUP);
+    let before = applied_anywhere(&cluster);
     let (remover, ()) = if plan.purge {
         on_leader!(cluster, &context, |engine| async {
             engine
@@ -563,7 +595,7 @@ pub(super) async fn run_deleted_data_inner(
                 .map(drop)
         })
     };
-    let removal_index = applied(&cluster, remover).expect("the leader applied the removal");
+    let removal_index = removal_applied(&cluster, remover, before, &context).await;
     let mut seen = Applied::default();
     seen.observe(&cluster, removal_index);
 
@@ -616,11 +648,6 @@ pub(super) async fn run_deleted_data_inner(
                 }
                 madsim::time::sleep(POLL).await;
             };
-            if controls.purge_after_restart {
-                trace.push(SimEvent::FaultApplied {
-                    phase: format!("node {covered} stops: {}", replica_state(&cluster, covered)),
-                });
-            }
             cluster.stop_node(covered).await;
             if controls.purge_after_restart {
                 // A process restart: the replica restores its snapshot and
@@ -641,14 +668,6 @@ pub(super) async fn run_deleted_data_inner(
                     ursula_stream::sim_controls::Defence::ScrubPurge,
                     false,
                 );
-                seen.wait(&cluster, removal_index, Duration::from_millis(500))
-                    .await;
-                trace.push(SimEvent::FaultApplied {
-                    phase: format!(
-                        "node {covered} restarted: {}",
-                        replica_state(&cluster, covered)
-                    ),
-                });
             }
         }
     }
@@ -730,6 +749,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
         .policy
         .set_entries_delay(leader, slow, Some(SLOW_FOLLOWER));
     let placement = group_placement(GROUP);
+    let before = applied_anywhere(&cluster);
     let (remover, ()) = on_leader!(cluster, &context, |engine| async {
         engine
             .delete_stream(
@@ -743,7 +763,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
             .map(drop)
     });
     assert_eq!(remover, leader, "{context}: the leader stays");
-    let removal_index = applied(&cluster, leader).expect("the leader applied the removal");
+    let removal_index = removal_applied(&cluster, leader, before, &context).await;
     // The driver snapshots the removal once it is a quarter of the bound
     // old, and purges the log through it a tick later.
     let deadline = madsim::time::Instant::now() + DRIVERS.max_age;
