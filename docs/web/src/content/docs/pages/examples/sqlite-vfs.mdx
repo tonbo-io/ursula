@@ -8,7 +8,7 @@ sidebarTitle: SQLite (VFS)
 Start a single node in a terminal of its own. It keeps nothing across restarts.
 
 ```bash
-docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.8.0
+docker run --rm -p 4437:4437 ghcr.io/tonbo-io/ursula:0.8.1
 ```
 
 Install the package, which needs Node.js 22.19 or later, and run:
@@ -233,7 +233,7 @@ Operations changes:
 
 - `URSULA_VFS_RETRY_MS` is gone: appends are resent until a definite answer. `URSULA_VFS_MAX_FRAME_BYTES` becomes `URSULA_VFS_MAX_REQUEST_BYTES`. Commits up to the commit limit (`URSULA_VFS_MAX_COMMIT_BYTES`) go out, in parts above the request limit. `URSULA_VFS_SNAPSHOT_MIN_BYTES` is gone: a snapshot is due past the database's size or 8 MiB, whichever is larger.
 - The default cache root is `<user cache>/sqlite-ursula/0.8`, and the `sqlite3` shell cannot open a cache.
-- The extension sends `User-Agent: sqlite-ursula-vfs/0.8.0`. Update any proxy, WAF or log rule keyed on it.
+- The extension sends `User-Agent: sqlite-ursula-vfs/0.8.x`. Update any proxy, WAF or log rule keyed on it.
 - Multi-node clusters need `server.cluster_id`, and snapshots above 32 MiB compressed need a cold backend (see [What the cluster needs](#what-the-cluster-needs)).
 
 ## What the cluster needs
