@@ -427,7 +427,8 @@ async fn assert_names_token(
 }
 
 /// A `410` or `416` of a read, and the `404` of a snapshot that is not the
-/// latest, come before the `Stream-Incarnation` precondition. Each names the
+/// latest, come before the `Stream-Incarnation` precondition, on stream and
+/// snapshot reads alike (extensions Section 2.4). Each names the
 /// token of the stream that decided it, so a client tells another
 /// incarnation from a real overshoot or a real gone offset without a HEAD,
 /// under the current token and under one a restore retired. A missing
@@ -530,8 +531,119 @@ async fn gone_and_beyond_tail_answers_name_the_serving_token() {
             vec![(names::STREAM_INCARNATION, stale.as_str())],
             StatusCode::RANGE_NOT_SATISFIABLE,
         ),
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(5)),
+            vec![(names::STREAM_INCARNATION, stale.as_str())],
+            StatusCode::NOT_FOUND,
+        ),
+        // A snapshot range past the end answers `416` before the
+        // precondition, and a range inside it `412`.
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(10)),
+            vec![
+                (names::STREAM_INCARNATION, stale.as_str()),
+                ("range", "bytes=100-"),
+            ],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (
+            snapshot(old, 10),
+            vec![("range", "bytes=100-")],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (
+            format!("{URI}/snapshot/{}", Offset::from_u64(10)),
+            vec![
+                (names::STREAM_INCARNATION, stale.as_str()),
+                ("range", "bytes=0-1"),
+            ],
+            StatusCode::PRECONDITION_FAILED,
+        ),
+        (
+            snapshot(old, 10),
+            vec![("range", "bytes=0-1")],
+            StatusCode::PRECONDITION_FAILED,
+        ),
     ] {
         assert_names_token(&target, &uri, &headers, status, Some(restored)).await;
+    }
+    // The `416` names the length of the snapshot the restored stream holds.
+    let response = send(
+        &target,
+        "GET",
+        &snapshot(old, 10),
+        &[("range", "bytes=100-")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::CONTENT_RANGE)
+            .map(|value| value.as_bytes()),
+        Some(&b"bytes */8"[..])
+    );
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::RangeNotSatisfiable
+    );
+
+    // A matching `If-None-Match` ignores the range, so a retired token
+    // answers `412`, never `304` or `416`.
+    let latest = format!("{URI}/snapshot/{}", Offset::from_u64(10));
+    let response = send(&target, "GET", &latest, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response
+        .headers()
+        .get("etag")
+        .expect("an etag")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let restored_header = restored.to_string();
+    for (uri, headers) in [
+        (latest.clone(), vec![
+            (names::STREAM_INCARNATION, stale.as_str()),
+            ("if-none-match", etag.as_str()),
+        ]),
+        (latest, vec![
+            (names::STREAM_INCARNATION, stale.as_str()),
+            ("if-none-match", etag.as_str()),
+            ("range", "bytes=100-"),
+        ]),
+        (snapshot(old, 10), vec![("if-none-match", etag.as_str())]),
+        (snapshot(old, 10), vec![
+            ("if-none-match", etag.as_str()),
+            ("range", "bytes=100-"),
+        ]),
+    ] {
+        assert_names_token(
+            &target,
+            &uri,
+            &headers,
+            StatusCode::PRECONDITION_FAILED,
+            Some(restored),
+        )
+        .await;
+    }
+    // The immutable route reads its token from the path and ignores a
+    // `Stream-Incarnation` header naming the current one.
+    for (range, status) in [
+        ("bytes=100-", StatusCode::RANGE_NOT_SATISFIABLE),
+        ("bytes=0-1", StatusCode::PRECONDITION_FAILED),
+    ] {
+        assert_names_token(
+            &target,
+            &snapshot(old, 10),
+            &[
+                (names::STREAM_INCARNATION, restored_header.as_str()),
+                ("range", range),
+            ],
+            status,
+            Some(restored),
+        )
+        .await;
     }
 
     // No stream: no token.
