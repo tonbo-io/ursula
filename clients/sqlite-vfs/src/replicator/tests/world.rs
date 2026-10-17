@@ -864,6 +864,20 @@ impl World {
         } else {
             Offset::from_u64(u64::try_from(self.stream().len()).unwrap())
         };
+        // A build notes the highest epoch of the claims it read (`open::Fetch`), so its takeover
+        // claims above every claim in the stream, its own earlier generation's under the same
+        // activation too.
+        let highest_epoch = if lagging {
+            None
+        } else {
+            decode_all(&self.stream())
+                .into_iter()
+                .filter_map(|(_, _, frame)| match frame {
+                    Some(Frame::Claim { epoch, .. }) => Some(epoch),
+                    _ => None,
+                })
+                .max()
+        };
         let log = LogModel {
             lineage,
             commits: BTreeMap::new(),
@@ -890,7 +904,7 @@ impl World {
             logged: Position(0),
             pending: Vec::new(),
             claims: Vec::new(),
-            highest_epoch: None,
+            highest_epoch,
             max_request_bytes: self.limits(),
             configured_max_request_bytes: None,
             db_bytes: db_bytes(family),
@@ -3436,14 +3450,11 @@ fn negative_controls_fail_the_proptest_too() {
         // `settle_while_activating` is left to its fixed script too: its early `Synced` needs a
         // proof from before a continuation claim and a `synced()` call between two reads of
         // that claim's reconcile.
-        // `trust_clone_snapshot` and `match_commits_by_id` are left to their fixed scripts as
-        // well: each needs two copies of one lineage at one moment (a copy's snapshot above the
-        // other's acknowledged position read by a `410`, a copy's commit at the id of the other's
-        // pending record in its reconcile), which this fixed seed does not reach within 512 cases.
-        replicator_knobs(ReplicatorKnobs {
-            probe_skips_own_claims: true,
-            ..ReplicatorKnobs::default()
-        }),
+        // `trust_clone_snapshot`, `match_commits_by_id` and `probe_skips_own_claims` are left to
+        // their fixed scripts as well: each needs two copies of one lineage at one moment (a
+        // copy's snapshot above the other's acknowledged position read by a `410`, a copy's commit
+        // at the id of the other's pending record in its reconcile, a copy's claim past the other's
+        // tail when it probes), which this fixed seed does not reach within 512 cases.
     ] {
         // A fixed seed: the fixed scripts above always trip, and this search is a bonus that
         // must not flake.
@@ -4543,4 +4554,49 @@ fn an_offline_copy_and_the_original_both_reset() {
     );
     world.heal();
     assert_eq!(world.violations, Vec::<String>::new());
+}
+
+/// Found by the random run once reopens kept the activation: owner 0's commit is pending when a
+/// history that loses nothing comes, and it reopens under the same activation. The open table
+/// salvages the log (it holds a commit after its latest ACK) and a fresh build takes over. That
+/// build read owner 0's first claim, so its takeover claims above it: a claim of the same epoch
+/// would be byte-identical to that first claim, and its repeat, whose receipt lies below the build's
+/// offset, would reset `stream_state` with no other writer (property 21).
+#[test]
+fn a_fresh_build_under_the_same_activation_claims_above_the_claims_it_read() {
+    use Op::Commit;
+    use Op::Tick;
+    let ops = vec![
+        Op::Flush,
+        Op::NewHistory,
+        Commit(0),
+        Op::Reopen(0),
+        Commit(0),
+        Tick(0),
+        Commit(0),
+        Commit(0),
+        Tick(0),
+        Op::DropAnswerAfterApply(62),
+        Commit(0),
+        Op::Retain(0),
+        Commit(0),
+        Op::Flush,
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+        Commit(0),
+    ];
+    for shared_activation in [false, true] {
+        let knobs = Knobs {
+            shared_activation,
+            ..Knobs::default()
+        };
+        assert_eq!(
+            run(knobs, 11_059_917_130_020_041_608, &ops),
+            Vec::<String>::new(),
+            "shared activation {shared_activation}"
+        );
+    }
 }
