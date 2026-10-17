@@ -1458,16 +1458,7 @@ fn malformed_answers_are_protocol_violations() {
 
 /// Stages `body` as a part of the snapshot at `offset`: its id, or the answer's status.
 fn stage(world: &World, token: Incarnation, offset: u64, body: &[u8]) -> Result<PartId, u16> {
-    let answer = world.send(&Request {
-        keys: ProducerRequestHeaders {
-            producer: None,
-            precondition: tokened(token),
-        },
-        body: Arc::from(body),
-        ..Request::new(Method::Post, Target::SnapshotParts {
-            offset: Offset::from_u64(offset),
-        })
-    });
+    let answer = world.send(&stage_request(token, offset, body));
     match answer.typed {
         Ok(Typed::PartStaged(staged)) if answer.status == 201 => Ok(staged.part),
         _ => Err(answer.status),
@@ -1933,102 +1924,175 @@ fn parts_need_a_cold_store_and_are_swept_after_a_day() {
     }
 }
 
-/// Every refusal the model answers, as a client reads it: the server's error body (extensions §11)
-/// with the code the server gives the same case, the JSON content type and `Cache-Control:
-/// no-store`. A write's answer reads as `Refused` with that code through
-/// `ursula_headers::classify`, and where the write-outcome inventory has the case's row, which
-/// the server's own tests pin, its status, code and outcome are the model's.
+/// One refusal the model answers: what it is, the status and code the server gives the same case,
+/// the headers it names beside the error body, and its write-outcome inventory row, if any.
+struct Refusal<'a> {
+    what: &'a str,
+    status: u16,
+    code: ErrorCode,
+    headers: &'a [(&'a str, &'a str)],
+    row: Option<&'a str>,
+}
+
+/// The outcome `ursula_headers::classify` reads from a refusal of `status` with `code`: `Refused`
+/// for a `4xx`, and for a `5xx` whose code proves nothing applied (`NO_COLD_STORE`), `Unknown`
+/// for any other `5xx` (`INTERNAL`). The two sides of the snapshotter's `transient` split.
+fn refused_outcome(status: u16, code: &ErrorCode) -> WriteOutcome {
+    match (status, code) {
+        (500..=599, ErrorCode::Internal) => WriteOutcome::Unknown,
+        _ => WriteOutcome::Refused(code.clone()),
+    }
+}
+
+/// Checks `expected` on an answer as it arrived: its status, `headers` (lowercase names) and
+/// body, the answer `parsed` as the client reads it for `request`. Every error answer carries
+/// `Cache-Control: no-store`, the JSON content type and, but on a `HEAD`, the error body; a
+/// write's reads as [`refused_outcome`]; the inventory row, which the server's own tests pin,
+/// has the model's status, code and outcome.
+fn check_refusal(
+    expected: &Refusal<'_>,
+    status: u16,
+    headers: &[(String, String)],
+    body: &[u8],
+    request: Option<&Request>,
+) {
+    let what = expected.what;
+    let header = |name: &str| {
+        headers
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    };
+    assert_eq!(status, expected.status, "{what}");
+    assert_eq!(header("cache-control"), Some("no-store"), "{what}");
+    assert_eq!(
+        header("content-type"),
+        Some(ErrorBody::CONTENT_TYPE),
+        "{what}"
+    );
+    for (name, value) in expected.headers {
+        assert_eq!(header(name), Some(*value), "{what}: {name}");
+    }
+    if request.is_some_and(|request| request.method == Method::Head) {
+        assert!(body.is_empty(), "{what}: a HEAD answer has no body");
+        return;
+    }
+    let parsed = ErrorBody::parse(body).unwrap_or_else(|e| panic!("{what}: {e}"));
+    assert_eq!(parsed.code, expected.code, "{what}");
+    assert!(!parsed.message.is_empty(), "{what}");
+    let Some(request) = request else {
+        return;
+    };
+    let answer = crate::wire::parse_answer(
+        request,
+        status,
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        body.to_vec(),
+    );
+    let outcome = request
+        .write_kind()
+        .map(|_| refused_outcome(status, &expected.code));
+    assert_eq!(answer.outcome, outcome, "{what}");
+    if let Some(id) = expected.row {
+        let row = inventory::row(id).unwrap_or_else(|| panic!("{what}: no row {id}"));
+        assert_eq!(
+            (row.status, row.code.as_ref(), Some(&row.outcome)),
+            (status, Some(&expected.code), answer.outcome.as_ref()),
+            "{what}: row {id}"
+        );
+    }
+}
+
+/// Sends `request` for the stream at `path` to the model in process, through the faults, and
+/// checks its answer is `expected`.
+fn assert_refused(world: &World, path: &str, request: &Request, expected: &Refusal<'_>) {
+    let delivered = world.server().exchange(path, request);
+    let super::Delivered::Answered { answer: raw, .. } = delivered else {
+        panic!("{}: {delivered:?}", expected.what);
+    };
+    let headers: Vec<(String, String)> = raw
+        .headers
+        .iter()
+        .map(|(name, value)| ((*name).to_owned(), value.clone()))
+        .collect();
+    check_refusal(expected, raw.status, &headers, &raw.body, Some(request));
+}
+
+fn refusal<'a>(
+    what: &'a str,
+    status: u16,
+    code: ErrorCode,
+    headers: &'a [(&'a str, &'a str)],
+    row: Option<&'a str>,
+) -> Refusal<'a> {
+    Refusal {
+        what,
+        status,
+        code,
+        headers,
+        row,
+    }
+}
+
+/// Every refusal the model answers in process, as a client reads it: the server's error body
+/// (extensions §11) with the code the server gives the same case, the JSON content type,
+/// `Cache-Control: no-store` and the headers the refusal names. A write's answer reads through
+/// `ursula_headers::classify` as the server's does, and where the write-outcome inventory has the
+/// case's row its status, code and outcome are the model's. The refusals of the HTTP front are in
+/// `the_http_front_refuses_with_the_servers_error_body`, the scripted `503`s of a commit in
+/// `parts_need_a_cold_store_and_are_swept_after_a_day`.
 #[test]
 fn every_refusal_carries_the_servers_error_body() {
     const MISSING: &str = "/v1/stream/b/missing";
     let world = World::new();
-    let refused = |what: &str,
-                   path: &str,
-                   request: &Request,
-                   status: u16,
-                   code: ErrorCode,
-                   row: Option<&str>| {
-        let raw = world.server().handle(path, request);
-        let header = |name: &str| {
-            raw.headers
-                .iter()
-                .find(|(n, _)| n.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value.as_str())
-        };
-        assert_eq!(raw.status, status, "{what}");
-        assert_eq!(header("cache-control"), Some("no-store"), "{what}");
-        assert_eq!(
-            header("content-type"),
-            Some(ErrorBody::CONTENT_TYPE),
-            "{what}"
-        );
-        let answer = raw.parse(request);
-        if request.method == Method::Head {
-            assert!(answer.body.is_empty(), "{what}: a HEAD answer has no body");
-            return;
-        }
-        let body = ErrorBody::parse(&answer.body).unwrap_or_else(|e| panic!("{what}: {e}"));
-        assert_eq!(body.code, code, "{what}");
-        assert!(!body.message.is_empty(), "{what}");
-        if request.write_kind().is_some() && (400..500).contains(&status) {
-            assert_eq!(
-                answer.outcome,
-                Some(WriteOutcome::Refused(code.clone())),
-                "{what}"
-            );
-        }
-        if let Some(id) = row {
-            let row = inventory::row(id).unwrap_or_else(|| panic!("{what}: no row {id}"));
-            assert_eq!(
-                (row.status, row.code.as_ref(), answer.outcome.as_ref()),
-                (status, Some(&code), Some(&row.outcome)),
-                "{what}: row {id}"
-            );
-        }
-    };
     let token = world.create();
+    let token_text = token.to_string();
+    let incarnation: &[(&str, &str)] = &[(names::STREAM_INCARNATION, token_text.as_str())];
+    let offset = |n: u64| Offset::from_u64(n).to_string();
     let other = Incarnation::try_from(token.get() ^ 1).unwrap();
     let snapshot_read =
         |offset: u64, part| Request::snapshot_read(Offset::from_u64(offset), token, part);
     let header_read = || snapshot_read(0, crate::wire::SnapshotPart::Header);
+    let check = |path: &str, request: &Request, expected: Refusal<'_>| {
+        assert_refused(&world, path, request, &expected);
+    };
 
     // No stream.
     let head = Request::new(Method::Head, Target::Stream);
-    refused("HEAD", MISSING, &head, 404, ErrorCode::StreamNotFound, None);
+    check(
+        MISSING,
+        &head,
+        refusal("HEAD", 404, ErrorCode::StreamNotFound, &[], None),
+    );
     let claim = write(tokened(token), 1, 0, b"claim");
-    refused(
-        "append",
+    check(
         MISSING,
         &claim,
-        404,
-        ErrorCode::StreamNotFound,
-        Some("not-found"),
+        refusal(
+            "append",
+            404,
+            ErrorCode::StreamNotFound,
+            &[],
+            Some("not-found"),
+        ),
     );
-    let from_start = read(None, None);
-    refused(
-        "read",
+    check(
         MISSING,
-        &from_start,
-        404,
-        ErrorCode::StreamNotFound,
-        None,
+        &read(None, None),
+        refusal("read", 404, ErrorCode::StreamNotFound, &[], None),
     );
-    refused(
-        "snapshot read",
+    check(
         MISSING,
         &header_read(),
-        404,
-        ErrorCode::StreamNotFound,
-        None,
+        refusal("snapshot read", 404, ErrorCode::StreamNotFound, &[], None),
     );
-    let delete = Request::new(Method::Delete, Target::Stream);
-    refused(
-        "DELETE",
+    // Not modeled: the server deletes the stream.
+    check(
         PATH,
-        &delete,
-        405,
-        ErrorCode::MethodNotAllowed,
-        None,
+        &Request::new(Method::Delete, Target::Stream),
+        refusal("DELETE", 405, ErrorCode::MethodNotAllowed, &[], None),
     );
 
     // Creates.
@@ -2036,132 +2100,160 @@ fn every_refusal_carries_the_servers_error_body() {
         keys: claim.keys.clone(),
         ..create()
     };
-    refused(
-        "keyed create",
+    check(
         PATH,
         &keyed_create,
-        400,
-        ErrorCode::InvalidProducer,
-        None,
+        refusal("keyed create", 400, ErrorCode::InvalidProducer, &[], None),
     );
     let other_create = Request {
         content_type: Some("text/plain".to_owned()),
         ..create()
     };
-    refused(
-        "create of another configuration",
+    check(
         PATH,
         &other_create,
-        409,
-        ErrorCode::StreamAlreadyExistsConflict,
-        None,
+        refusal(
+            "create of another configuration",
+            409,
+            ErrorCode::StreamAlreadyExistsConflict,
+            &[],
+            None,
+        ),
     );
 
     // Writes.
-    let mismatched = write(tokened(other), 1, 0, b"claim");
-    refused(
-        "another token",
+    check(
         PATH,
-        &mismatched,
-        412,
-        ErrorCode::IncarnationMismatch,
-        Some("incarnation-mismatch"),
+        &write(tokened(other), 1, 0, b"claim"),
+        refusal(
+            "another token",
+            412,
+            ErrorCode::IncarnationMismatch,
+            incarnation,
+            Some("incarnation-mismatch"),
+        ),
     );
     world.producer(&claim);
     let next = |body: &[u8]| write(tokened(token), 1, 1, body);
-    refused(
-        "a seq gap",
+    check(
         PATH,
         &write(tokened(token), 1, 5, b"gap"),
-        409,
-        ErrorCode::ProducerSeqConflict,
-        Some("producer-seq-gap"),
+        refusal(
+            "a seq gap",
+            409,
+            ErrorCode::ProducerSeqConflict,
+            &[],
+            Some("producer-seq-gap"),
+        ),
     );
-    refused(
-        "a held key",
+    check(
         PATH,
         &write(tokened(token), 1, 0, b"another claim"),
-        403,
-        ErrorCode::ProducerKeyConflict,
-        Some("producer-key-conflict"),
+        refusal(
+            "a held key",
+            403,
+            ErrorCode::ProducerKeyConflict,
+            &[],
+            Some("producer-key-conflict"),
+        ),
     );
-    refused(
-        "an empty append",
+    check(
         PATH,
         &next(b""),
-        400,
-        ErrorCode::EmptyAppend,
-        Some("bad-request"),
+        refusal(
+            "an empty append",
+            400,
+            ErrorCode::EmptyAppend,
+            &[],
+            Some("bad-request"),
+        ),
     );
     let untyped = Request {
         content_type: None,
         ..next(b"x")
     };
-    refused(
-        "no content type",
+    check(
         PATH,
         &untyped,
-        400,
-        ErrorCode::MissingContentType,
-        None,
+        refusal(
+            "no content type",
+            400,
+            ErrorCode::MissingContentType,
+            &[],
+            None,
+        ),
     );
     let text = Request {
         content_type: Some("text/plain".to_owned()),
         ..next(b"x")
     };
-    refused(
-        "another content type",
+    let tail = offset(5);
+    check(
         PATH,
         &text,
-        409,
-        ErrorCode::ContentTypeMismatch,
-        Some("conflict"),
+        refusal(
+            "another content type",
+            409,
+            ErrorCode::ContentTypeMismatch,
+            &[(names::STREAM_NEXT_OFFSET, tail.as_str())],
+            Some("conflict"),
+        ),
     );
-    refused(
-        "a body unlike its digest",
+    check(
         PATH,
         &with_body(&next(b"x"), b"y"),
-        400,
-        ErrorCode::ProducerDigestMismatch,
-        None,
+        refusal(
+            "a body unlike its digest",
+            400,
+            ErrorCode::ProducerDigestMismatch,
+            &[],
+            None,
+        ),
     );
     let closing = Request {
         closes: true,
         ..next(b"x")
     };
-    refused(
-        "an append that closes",
+    // Not modeled: the server applies an append that closes.
+    check(
         PATH,
         &closing,
-        501,
-        ErrorCode::Internal,
-        None,
+        refusal("an append that closes", 501, ErrorCode::Internal, &[], None),
     );
 
     // Reads, at the tail 5.
-    refused(
-        "a read past the tail",
+    check(
         PATH,
         &read(tokened(token), Some(6)),
-        416,
-        ErrorCode::OffsetOutOfRange,
-        None,
+        refusal(
+            "a read past the tail",
+            416,
+            ErrorCode::OffsetOutOfRange,
+            incarnation,
+            None,
+        ),
     );
-    refused(
-        "a read under another token",
+    check(
         PATH,
         &read(tokened(other), None),
-        412,
-        ErrorCode::IncarnationMismatch,
-        None,
+        refusal(
+            "a read under another token",
+            412,
+            ErrorCode::IncarnationMismatch,
+            incarnation,
+            None,
+        ),
     );
-    refused(
-        "no snapshot",
+    check(
         PATH,
         &header_read(),
-        404,
-        ErrorCode::SnapshotNotFound,
-        None,
+        refusal(
+            "no snapshot",
+            404,
+            ErrorCode::SnapshotNotFound,
+            incarnation,
+            None,
+        ),
     );
 
     // Snapshots and retention.
@@ -2174,133 +2266,247 @@ fn every_refusal_carries_the_servers_error_body() {
             offset: Offset::from_u64(offset),
         })
     };
-    refused(
-        "retention without a snapshot",
+    // A boundary at the retained one is a repeat, without a snapshot too.
+    let repeat = world.send(&retain(0));
+    assert_eq!(
+        (repeat.status, repeat.typed),
+        (
+            204,
+            Ok(Typed::Retained {
+                offset: Offset::ZERO
+            })
+        )
+    );
+    check(
         PATH,
         &retain(1),
-        409,
-        ErrorCode::SnapshotConflict,
-        None,
+        refusal(
+            "retention without a snapshot",
+            409,
+            ErrorCode::SnapshotConflict,
+            &[(names::STREAM_NEXT_OFFSET, tail.as_str())],
+            None,
+        ),
     );
-    refused(
-        "a publish beyond the tail",
+    check(
         PATH,
         &publish(token, 6, b"image").0,
-        409,
-        ErrorCode::SnapshotConflict,
-        None,
+        refusal(
+            "a publish beyond the tail",
+            409,
+            ErrorCode::SnapshotConflict,
+            &[(names::STREAM_NEXT_OFFSET, tail.as_str())],
+            None,
+        ),
     );
+    // The model's own checks of a publish: the server makes none of them.
     let (mut tampered, _) = publish(token, 5, b"image");
     tampered.body = Arc::from(&b"tampered"[..]);
-    refused(
-        "a snapshot unlike its digest",
+    check(
         PATH,
         &tampered,
-        400,
-        ErrorCode::SnapshotDigestMismatch,
-        None,
+        refusal(
+            "a snapshot unlike its digest",
+            400,
+            ErrorCode::SnapshotDigestMismatch,
+            &[],
+            None,
+        ),
+    );
+    let untyped = Request {
+        content_type: None,
+        ..publish(token, 5, b"image").0
+    };
+    check(
+        PATH,
+        &untyped,
+        refusal(
+            "a snapshot without a content type",
+            400,
+            ErrorCode::MissingContentType,
+            &[],
+            None,
+        ),
+    );
+    let undigested = Request {
+        snapshot_digest: None,
+        ..publish(token, 5, b"image").0
+    };
+    check(
+        PATH,
+        &undigested,
+        refusal(
+            "a snapshot without a digest",
+            400,
+            ErrorCode::InvalidHeader,
+            &[],
+            None,
+        ),
     );
     assert_eq!(world.send(&publish(token, 5, b"image").0).status, 204);
     assert_eq!(world.send(&retain(5)).status, 204);
-    refused(
-        "a publish below retention",
+    check(
         PATH,
         &publish(token, 4, b"image").0,
-        410,
-        ErrorCode::StreamGone,
-        Some("gone"),
+        refusal(
+            "a publish below retention",
+            410,
+            ErrorCode::StreamGone,
+            &[(names::STREAM_NEXT_OFFSET, tail.as_str())],
+            Some("gone"),
+        ),
     );
-    refused(
-        "another snapshot at the latest's offset",
+    check(
         PATH,
         &publish(token, 5, b"other").0,
-        409,
-        ErrorCode::SnapshotConflict,
-        Some("snapshot-conflict"),
+        refusal(
+            "another snapshot at the latest's offset",
+            409,
+            ErrorCode::SnapshotConflict,
+            &[
+                (names::STREAM_NEXT_OFFSET, tail.as_str()),
+                (names::STREAM_SNAPSHOT_OFFSET, tail.as_str()),
+            ],
+            Some("snapshot-conflict"),
+        ),
     );
-    refused(
-        "a range outside the snapshot",
+    check(
         PATH,
         &snapshot_read(5, crate::wire::SnapshotPart::Chunk {
             first: 100,
             last: 200,
         }),
-        416,
-        ErrorCode::RangeNotSatisfiable,
-        None,
+        refusal(
+            "a range outside the snapshot",
+            416,
+            ErrorCode::RangeNotSatisfiable,
+            &[
+                (names::STREAM_INCARNATION, token_text.as_str()),
+                (names::CONTENT_RANGE, "bytes */5"),
+            ],
+            None,
+        ),
     );
-    refused(
-        "a read below retention",
+    check(
         PATH,
         &read(tokened(token), Some(4)),
-        410,
-        ErrorCode::StreamGone,
-        None,
+        refusal(
+            "a read below retention",
+            410,
+            ErrorCode::StreamGone,
+            incarnation,
+            None,
+        ),
     );
 
     // Parts, past the latest snapshot at 5.
     world.producer(&next(b"more"));
     let unknown = PartId::new("never-staged.part").unwrap();
     let probe = commit(token, 9, std::slice::from_ref(&unknown), digest_of(b"x"));
-    refused(
-        "a commit without a cold store",
-        PATH,
-        &probe,
-        501,
-        ErrorCode::NoColdStore,
-        None,
-    );
+    for (what, request) in [
+        ("a part without a cold store", stage_request(token, 9, b"x")),
+        ("a commit without a cold store", probe.clone()),
+        ("a discard without a cold store", discard(Some(token))),
+    ] {
+        let row = (request.method == Method::Post).then_some("no-cold-store");
+        check(
+            PATH,
+            &request,
+            refusal(what, 501, ErrorCode::NoColdStore, &[], row),
+        );
+    }
     with_cold_store(&world);
-    refused(
-        "an unknown part",
+    check(
         PATH,
         &probe,
-        400,
-        ErrorCode::UnknownPart,
-        None,
+        refusal("an unknown part", 400, ErrorCode::UnknownPart, &[], None),
     );
     let miscounted = Request {
         body: Arc::from(&b""[..]),
         ..probe.clone()
     };
-    refused(
-        "a malformed manifest",
+    check(
         PATH,
         &miscounted,
-        400,
-        ErrorCode::InvalidPartsCommit,
-        None,
+        refusal(
+            "a malformed manifest",
+            400,
+            ErrorCode::InvalidPartsCommit,
+            &[],
+            None,
+        ),
+    );
+    // The model's own check of a commit: the server makes none.
+    let untyped = Request {
+        content_type: None,
+        ..probe.clone()
+    };
+    check(
+        PATH,
+        &untyped,
+        refusal(
+            "a commit without a content type",
+            400,
+            ErrorCode::MissingContentType,
+            &[],
+            None,
+        ),
     );
     let part = stage(&world, token, 9, b"part").unwrap();
-    refused(
-        "parts unlike their digest",
+    check(
         PATH,
         &commit(token, 9, &[part], digest_of(b"other")),
-        400,
-        ErrorCode::SnapshotDigestMismatch,
-        None,
+        refusal(
+            "parts unlike their digest",
+            400,
+            ErrorCode::SnapshotDigestMismatch,
+            &[],
+            None,
+        ),
     );
     let part = stage(&world, token, 9, b"part").unwrap();
     let limits = world.server().limits();
     world.server().set_limits(Limits {
         max_snapshot_bytes: Some(1),
+        max_staged_parts: 1,
         ..limits
     });
-    refused(
-        "parts above the snapshot limit",
+    check(
         PATH,
-        &commit(token, 9, &[part], digest_of(b"part")),
-        413,
-        ErrorCode::SnapshotTooLarge,
-        None,
+        &commit(token, 9, std::slice::from_ref(&part), digest_of(b"part")),
+        refusal(
+            "parts above the snapshot limit",
+            413,
+            ErrorCode::SnapshotTooLarge,
+            &[(names::URSULA_MAX_SNAPSHOT_BYTES, "1")],
+            None,
+        ),
     );
-    refused(
-        "a commit beyond the tail",
+    check(
+        PATH,
+        &stage_request(token, 9, b"x"),
+        refusal(
+            "a part past the staged bound",
+            429,
+            ErrorCode::StagedPartsLimit,
+            &[
+                (names::STREAM_INCARNATION, token_text.as_str()),
+                (names::URSULA_MAX_STAGED_PARTS, "1"),
+            ],
+            Some("staged-parts-limit"),
+        ),
+    );
+    let beyond = offset(9);
+    check(
         PATH,
         &commit(token, 10, std::slice::from_ref(&unknown), digest_of(b"x")),
-        409,
-        ErrorCode::SnapshotConflict,
-        None,
+        refusal(
+            "a commit beyond the tail",
+            409,
+            ErrorCode::SnapshotConflict,
+            &[(names::STREAM_NEXT_OFFSET, beyond.as_str())],
+            None,
+        ),
     );
 
     // The request limit, then the closed stream.
@@ -2308,22 +2514,247 @@ fn every_refusal_carries_the_servers_error_body() {
         max_request_bytes: 4,
         ..limits
     });
-    refused(
-        "a body above the request limit",
+    check(
         PATH,
         &write(tokened(token), 1, 2, b"too large"),
-        413,
-        ErrorCode::RequestTooLarge,
-        Some("too-large"),
+        refusal(
+            "a body above the request limit",
+            413,
+            ErrorCode::RequestTooLarge,
+            &[(names::URSULA_MAX_REQUEST_BYTES, "4")],
+            Some("too-large"),
+        ),
     );
     world.server().set_limits(Limits::default());
     world.server().close(PATH).unwrap();
-    refused(
-        "an append to a closed stream",
+    check(
         PATH,
         &write(tokened(token), 1, 2, b"late"),
-        409,
-        ErrorCode::StreamClosed,
-        Some("stream-closed"),
+        refusal(
+            "an append to a closed stream",
+            409,
+            ErrorCode::StreamClosed,
+            &[(names::STREAM_CLOSED, "true")],
+            Some("stream-closed"),
+        ),
     );
+}
+
+/// The producer refusals with their codes (extensions: Producer Write Answers), each on a fresh
+/// stream holding the claim `(2, 0)`.
+#[test]
+fn producer_refusals_carry_the_servers_error_body() {
+    let cases: [(
+        &str,
+        fn(&World, Incarnation) -> Request,
+        u16,
+        ErrorCode,
+        &str,
+    ); 4] = [
+        (
+            "a closed epoch",
+            |world, token| {
+                world.producer(&write(tokened(token), 3, 0, b"claim-3"));
+                write(tokened(token), 2, 1, b"x")
+            },
+            403,
+            ErrorCode::ProducerEpochClosed,
+            "producer-epoch-closed",
+        ),
+        (
+            "a stale epoch",
+            |_, token| write(tokened(token), 1, 1, b"x"),
+            403,
+            ErrorCode::ProducerEpochStale,
+            "producer-stale-epoch",
+        ),
+        (
+            "an expired producer",
+            |world, token| {
+                world.server().advance(IDLE_RETIREMENT_MS);
+                write(tokened(token), 2, 1, b"x")
+            },
+            403,
+            ErrorCode::ProducerExpired,
+            "producer-expired",
+        ),
+        (
+            "an epoch never claimed",
+            |_, token| write(tokened(token), 6, 1, b"x"),
+            400,
+            ErrorCode::InvalidProducer,
+            "producer-epoch-not-claimed",
+        ),
+    ];
+    for (what, refused, status, code, row) in cases {
+        let world = World::new();
+        let token = world.create();
+        world.producer(&write(tokened(token), 2, 0, b"claim"));
+        let request = refused(&world, token);
+        assert_refused(
+            &world,
+            PATH,
+            &request,
+            &refusal(what, status, code, &[], Some(row)),
+        );
+    }
+}
+
+/// A part of the snapshot at `offset`, staged under `token`.
+fn stage_request(token: Incarnation, offset: u64, body: &[u8]) -> Request {
+    Request {
+        keys: ProducerRequestHeaders {
+            producer: None,
+            precondition: tokened(token),
+        },
+        body: Arc::from(body),
+        ..Request::new(Method::Post, Target::SnapshotParts {
+            offset: Offset::from_u64(offset),
+        })
+    }
+}
+
+/// Sends `raw`, a whole HTTP/1.1 request that closes its connection, to `address` and returns
+/// the answer's status, headers (lowercase names) and body.
+fn raw_exchange(
+    address: std::net::SocketAddr,
+    raw: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    use std::io::Read;
+    use std::io::Write;
+    let mut connection = std::net::TcpStream::connect(address).unwrap();
+    connection.write_all(raw).unwrap();
+    let mut answer = Vec::new();
+    connection.read_to_end(&mut answer).unwrap();
+    let end = answer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .unwrap();
+    let head = String::from_utf8(answer[..end].to_vec()).unwrap();
+    let body = answer[end + 4..].to_vec();
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .unwrap()
+        .split(' ')
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let headers = lines
+        .map(|line| {
+            let (name, value) = line.split_once(':').unwrap();
+            (name.trim().to_ascii_lowercase(), value.trim().to_owned())
+        })
+        .collect();
+    (status, headers, body)
+}
+
+/// The refusals the HTTP front decides before the server sees a request, through
+/// `http::serve`: each with the server's error body, its code and `Cache-Control: no-store`.
+#[test]
+fn the_http_front_refuses_with_the_servers_error_body() {
+    let world = World::new();
+    let token = world.create();
+    world.server().set_limits(Limits {
+        max_request_bytes: 4,
+        ..Limits::default()
+    });
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = Arc::clone(&world.server);
+    // The serving thread lives as long as the test process.
+    drop(std::thread::spawn(move || {
+        super::http::serve(listener, server)
+    }));
+    let zero = Offset::ZERO.to_string();
+    let cases: [(&str, String, u16, ErrorCode, &[(&str, &str)]); 9] = [
+        (
+            "an unknown method",
+            format!("BREW {PATH} HTTP/1.1\r\n"),
+            405,
+            ErrorCode::MethodNotAllowed,
+            &[],
+        ),
+        // The model's own check: the server reads no length as an empty body.
+        (
+            "a POST without a length",
+            format!("POST {PATH} HTTP/1.1\r\n"),
+            411,
+            ErrorCode::InvalidRequest,
+            &[],
+        ),
+        // Not modeled: the server reads a chunked body.
+        (
+            "a chunked body",
+            format!("POST {PATH} HTTP/1.1\r\ntransfer-encoding: chunked\r\n"),
+            501,
+            ErrorCode::Internal,
+            &[],
+        ),
+        (
+            "a malformed offset",
+            format!("GET {PATH}/snapshot/12 HTTP/1.1\r\n"),
+            400,
+            ErrorCode::InvalidOffset,
+            &[],
+        ),
+        // The model's own check: the server ignores an unknown parameter.
+        (
+            "an unknown query parameter",
+            format!("GET {PATH}?cursor=1 HTTP/1.1\r\n"),
+            400,
+            ErrorCode::InvalidQuery,
+            &[],
+        ),
+        (
+            "a malformed producer key",
+            format!(
+                "POST {PATH} HTTP/1.1\r\ncontent-length: 0\r\nproducer-id: {PRODUCER_ID}\r\n\
+                 producer-epoch: one\r\nproducer-seq: 0\r\n"
+            ),
+            400,
+            ErrorCode::InvalidProducer,
+            &[],
+        ),
+        (
+            "a malformed precondition",
+            format!("GET {PATH}/snapshot/{zero} HTTP/1.1\r\nstream-incarnation: soon\r\n"),
+            400,
+            ErrorCode::InvalidHeader,
+            &[],
+        ),
+        (
+            "a malformed parts commit",
+            format!(
+                "PUT {PATH}/snapshot/{zero} HTTP/1.1\r\ncontent-length: 0\r\n\
+                 stream-incarnation: {token}\r\nstream-snapshot-parts: many\r\n"
+            ),
+            400,
+            ErrorCode::InvalidPartsCommit,
+            &[],
+        ),
+        (
+            "a body above the request limit",
+            format!("POST {PATH} HTTP/1.1\r\ncontent-length: 10\r\n\r\n0123456789"),
+            413,
+            ErrorCode::RequestTooLarge,
+            &[(names::URSULA_MAX_REQUEST_BYTES, "4")],
+        ),
+    ];
+    for (what, head, status, code, headers) in cases {
+        let mut raw = head.into_bytes();
+        // Every request but the one with a body ends its head here.
+        if !raw.ends_with(b"0123456789") {
+            raw.extend_from_slice(b"connection: close\r\n\r\n");
+        }
+        let (got, answer_headers, body) = raw_exchange(address, &raw);
+        check_refusal(
+            &refusal(what, status, code, headers, None),
+            got,
+            &answer_headers,
+            &body,
+            None,
+        );
+    }
 }

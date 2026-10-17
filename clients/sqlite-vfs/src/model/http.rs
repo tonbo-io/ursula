@@ -50,6 +50,8 @@ use ursula_headers::Epoch;
 use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
 use ursula_headers::HeaderError;
+use ursula_headers::PartsCommit;
+use ursula_headers::ProducerRequestHeaders;
 use ursula_headers::SizeLimit;
 
 use super::CheckpointId;
@@ -229,6 +231,8 @@ fn read_request(
         lock(server).limits().max_request_bytes
     };
     let length = match header("content-length").map(|v| v.parse::<u64>()) {
+        // The model's own check: hyper reads a `PUT` or `POST` without a length as an empty
+        // body, so the server never answers `411`.
         None if matches!(method, "PUT" | "POST") => {
             return Ok(Err(answer(refusal(411, ErrorCode::InvalidRequest))));
         }
@@ -289,7 +293,8 @@ fn reply(incoming: &Incoming, server: &Mutex<ModelServer>) -> Reply {
     }
     let (path, target) = match Target::split(method, &incoming.target) {
         Ok(split) => split,
-        // An offset in the path, or the read's query.
+        // An offset in the path, or the read's query. The server ignores an unknown query
+        // parameter: refusing one is the model's own check.
         Err(e) => {
             let code = match e {
                 WireError::Header(_) => ErrorCode::InvalidOffset,
@@ -298,18 +303,15 @@ fn reply(incoming: &Incoming, server: &Mutex<ModelServer>) -> Reply {
             return answer(malformed(code, &e));
         }
     };
-    let request = Request::parse(
-        method,
-        target,
+    let headers = || {
         incoming
             .headers
             .iter()
-            .map(|(name, value)| (name.as_str(), value.as_slice())),
-        incoming.body.clone(),
-    );
-    let request = match request {
+            .map(|(name, value)| (name.as_str(), value.as_slice()))
+    };
+    let request = match Request::parse(method, target, headers(), incoming.body.clone()) {
         Ok(request) => request,
-        Err(e) => return answer(malformed(ErrorCode::InvalidHeader, &e)),
+        Err(e) => return answer(malformed(malformed_code(method, target, headers()), &e)),
     };
     let mut model = lock(server);
     if model.holds(&request) {
@@ -344,6 +346,24 @@ fn answer(answer: RawAnswer) -> Reply {
     Reply::Answer {
         answer,
         head_only: false,
+    }
+}
+
+/// The code the server gives a request whose headers [`Request::parse`] refused, by route and by
+/// the header that failed: the producer headers and `Stream-Incarnation` of an append or a create
+/// are the producer key (`INVALID_PRODUCER`), a malformed `Stream-Snapshot-Parts` is a malformed
+/// commit (`INVALID_PARTS_COMMIT`), and any other header, the `Stream-Incarnation` precondition of
+/// the other routes among them, is `INVALID_HEADER`.
+fn malformed_code<'a, I>(method: Method, target: Target, headers: I) -> ErrorCode
+where I: IntoIterator<Item = (&'a str, &'a [u8])> + Clone {
+    let keyed_route = target == Target::Stream && matches!(method, Method::Post | Method::Put);
+    match (
+        ProducerRequestHeaders::parse(headers.clone()),
+        PartsCommit::parse(headers),
+    ) {
+        (Err(_), _) if keyed_route => ErrorCode::InvalidProducer,
+        (Ok(_), Err(_)) => ErrorCode::InvalidPartsCommit,
+        _ => ErrorCode::InvalidHeader,
     }
 }
 

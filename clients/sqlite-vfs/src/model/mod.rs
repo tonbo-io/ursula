@@ -112,8 +112,10 @@ pub(crate) const MAX_STAGED_BYTES: u64 = 2 << 30;
 /// was staged for that request to delete it (#622).
 const RETIRED_MIN_AGE_MS: u64 = 60 * 1000;
 
-/// `Cache-Control`, and its value on every error answer of the server.
+/// `Cache-Control` header name. Only the model sends it, so it lives here rather than in `wire`.
 const CACHE_CONTROL: &str = "cache-control";
+
+/// The `Cache-Control` of every error answer of the server.
 const NO_STORE: &str = "no-store";
 
 /// The base protocol's content type of a stream created without one.
@@ -568,6 +570,8 @@ impl ModelServer {
                 self.snapshot_read(path, request, offset, ranges)
             }
             (Method::Put, Target::Retention { offset }) => self.retain(path, request, offset),
+            // Not modeled (a `DELETE` of the stream among them, which the server serves): the
+            // code the server's net gives a method no route serves.
             _ => refusal(405, ErrorCode::MethodNotAllowed),
         }
     }
@@ -878,10 +882,9 @@ impl ModelServer {
             None
         };
         if let Some(limit) = over {
-            let mut answer = RawAnswer::new(StagedPartsLimit::STATUS);
+            let mut answer = refusal(StagedPartsLimit::STATUS, limit.error_code());
             limit.render(answer.emit());
             answer.header(names::STREAM_INCARNATION, token.to_string());
-            error_body(&mut answer, limit.error_code());
             return answer;
         }
         self.minted = self.minted.saturating_add(1);
@@ -1221,30 +1224,22 @@ fn publish_answer(answer: &SnapshotPublishAnswer) -> RawAnswer {
 
 /// The `503` of a node that refuses a parts commit for now, as the server sends it:
 /// `Retry-After: 1` and the error body of its code.
-fn commit_refused(refusal: CommitRefusal) -> RawAnswer {
-    let mut answer = RawAnswer::new(503);
+fn commit_refused(refused: CommitRefusal) -> RawAnswer {
+    let mut answer = refusal(503, refused.code());
     answer.header(RETRY_AFTER, "1");
-    error_body(&mut answer, refusal.code());
     answer
 }
 
 /// The `501` of a node without a cold store to a part, a parts commit or a discard.
 fn no_cold_store() -> RawAnswer {
-    let mut answer = RawAnswer::new(501);
-    error_body(&mut answer, ErrorCode::NoColdStore);
-    answer
+    refusal(501, ErrorCode::NoColdStore)
 }
 
 /// An error answer of `status` with the error body of `code`, as the server renders every one.
 fn refusal(status: u16, code: ErrorCode) -> RawAnswer {
     let mut answer = RawAnswer::new(status);
-    error_body(&mut answer, code);
+    render_error(&mut answer, &ErrorBody::fixed(code));
     answer
-}
-
-/// The error body of `code` with its fixed message, as the server renders it (extensions §11).
-fn error_body(answer: &mut RawAnswer, code: ErrorCode) {
-    render_error(answer, &ErrorBody::fixed(code));
 }
 
 /// `body` as the server's one renderer of an error answer sends it: `Cache-Control: no-store`,
