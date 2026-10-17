@@ -68,8 +68,6 @@ pub const MIN_SNAPSHOT_FLOOR_BYTES: u64 = 64 << 10;
 pub const DEFAULT_SNAPSHOT_BACKSTOP_ENTRIES: u64 = 100_000;
 /// Default `raft.deleted_data_max_age` (#669).
 pub const DEFAULT_DELETED_DATA_MAX_AGE: Duration = Duration::from_secs(60 * 60);
-/// Default `raft.max_in_snapshot_log_to_keep`.
-pub const DEFAULT_LOG_KEEP: u64 = 64;
 
 /// Log a group applied since its last snapshot, and that snapshot's size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -83,7 +81,8 @@ pub struct GroupLogProgress {
     pub last_snapshot_bytes: u64,
     /// Whether the group holds any snapshot yet.
     pub has_snapshot: bool,
-    /// Removed streams the replica's latest snapshot still holds (#669).
+    /// Removed streams the replica's latest snapshot or its log still holds
+    /// (#669).
     pub removal: RemovalProgress,
     /// The log index the replica purges its log through once its snapshot
     /// reaches it (#669): the latest snapshot that covered a removal, or
@@ -91,8 +90,8 @@ pub struct GroupLogProgress {
     pub scrub_purge_through: u64,
 }
 
-/// Removed streams a replica's latest snapshot still holds (#669), as
-/// [`GroupLogGauge::progress`] samples them.
+/// Removed streams a replica's latest snapshot or its log still holds
+/// (#669), as [`GroupLogGauge::progress`] samples them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum RemovalProgress {
@@ -114,25 +113,34 @@ pub enum RemovalProgress {
         /// How long ago the replay ended.
         age_ms: u64,
     },
+    /// A snapshot covers every removal, but the log still holds entries up
+    /// to `through`, the snapshot's last index, until it is purged through
+    /// it.
+    Purging {
+        /// How long ago the oldest removal the log still holds applied.
+        age_ms: u64,
+        /// The log index the log is purged through.
+        through: u64,
+    },
 }
 
 impl RemovalProgress {
     /// What the removals no snapshot covers held in a group snapshot.
     pub fn bytes(&self) -> u64 {
         match self {
-            Self::Clear => 0,
+            Self::Clear | Self::Purging { .. } => 0,
             Self::Owed { bytes, .. } | Self::Replayed { bytes, .. } => *bytes,
         }
     }
 
-    /// How long the oldest removal no snapshot covers has been held, `None`
-    /// when there is none.
+    /// How long the oldest removal the replica's snapshot or log still
+    /// holds has been held, `None` when there is none.
     pub fn age(&self) -> Option<Duration> {
         match self {
             Self::Clear => None,
-            Self::Owed { age_ms, .. } | Self::Replayed { age_ms, .. } => {
-                Some(Duration::from_millis(*age_ms))
-            }
+            Self::Owed { age_ms, .. }
+            | Self::Replayed { age_ms, .. }
+            | Self::Purging { age_ms, .. } => Some(Duration::from_millis(*age_ms)),
         }
     }
 }
@@ -258,11 +266,6 @@ pub struct SnapshotCadence {
     /// How old a removal no snapshot covers may get before its group is due
     /// (#669): a quarter of `raft.deleted_data_max_age`.
     pub removal_floor: Duration,
-    /// Entries OpenRaft keeps below a snapshot it built
-    /// (`raft.max_in_snapshot_log_to_keep`). A purge through a snapshot
-    /// holds the group's builds until it lands or the group applied this
-    /// many entries past it ([`crate::SnapshotBuildCoordinator`]).
-    pub log_keep: u64,
 }
 
 impl SnapshotCadence {
@@ -278,7 +281,6 @@ impl SnapshotCadence {
             node_budget_bytes: node_budget_bytes.max(1),
             backstop_entries: backstop_entries.max(1),
             removal_floor: removal_floor_of(DEFAULT_DELETED_DATA_MAX_AGE),
-            log_keep: DEFAULT_LOG_KEEP,
         }
     }
 
@@ -290,14 +292,6 @@ impl SnapshotCadence {
         self
     }
 
-    /// This policy for a node whose OpenRaft keeps `log_keep` entries below
-    /// each snapshot it built.
-    #[must_use]
-    pub fn with_log_keep(mut self, log_keep: u64) -> Self {
-        self.log_keep = log_keep;
-        self
-    }
-
     /// Whether `progress` holds a removal past [`Self::removal_floor`], or
     /// one replayed at startup, which no snapshot covers (#669). Its group
     /// is due, ahead of every other group of a pass.
@@ -306,7 +300,7 @@ impl SnapshotCadence {
             return false;
         }
         match progress.removal {
-            RemovalProgress::Clear => false,
+            RemovalProgress::Clear | RemovalProgress::Purging { .. } => false,
             RemovalProgress::Owed { age_ms, .. } => {
                 Duration::from_millis(age_ms) >= self.removal_floor
             }
@@ -568,16 +562,17 @@ pub struct SnapshotPlan {
     pub node_log_bytes: u64,
 }
 
-/// Lock-free per-group log counters, written by the group's state machine
-/// and read by the snapshot driver. Applied counters are cumulative; a
+/// Per-group log counters, written by the group's state machine and read by
+/// the snapshot driver. The log counters are atomics; the removal ledger
+/// (#669) sits behind one mutex. Applied counters are cumulative; a
 /// snapshot records the counter values it covers, so log applied while a
 /// snapshot builds still counts toward the next one.
 ///
 /// The gauge also keeps the replica's removal ledger (#669): what its state
 /// machine removed, what its latest snapshot covers of it, and since when it
-/// owes a snapshot that drops the rest. The ledger is local to the replica
-/// and kept in memory only: each replica scrubs its own copies, by its own
-/// clock.
+/// owes a snapshot that drops the rest, or a purge of its log through the
+/// snapshot that did. The ledger is local to the replica and kept in memory
+/// only: each replica scrubs its own copies, by its own clock.
 #[derive(Debug, Default)]
 pub struct GroupLogGauge {
     /// The membership the state machine applied last (#613): what a replica
@@ -615,6 +610,27 @@ pub enum RemovalDebt {
         /// When the replay ended.
         since: Instant,
     },
+    /// A snapshot covers every removal it applied, and its log still holds
+    /// entries up to `through`, that snapshot's last index, until a purge
+    /// through it lands ([`GroupLogGauge::observe_purged`]).
+    Purging {
+        /// When the oldest removal its log still holds applied.
+        since: Instant,
+        /// The log index the log is purged through.
+        through: u64,
+    },
+}
+
+impl RemovalDebt {
+    /// When the oldest removal the debt is for applied, `None` when clear.
+    fn since(self) -> Option<Instant> {
+        match self {
+            Self::Clear => None,
+            Self::Owed { since } | Self::Replayed { since } | Self::Purging { since, .. } => {
+                Some(since)
+            }
+        }
+    }
 }
 
 /// The removal counters of a [`GroupLogGauge`] (#669).
@@ -631,6 +647,9 @@ struct RemovalLedger {
     debt: RemovalDebt,
     /// See [`GroupLogProgress::scrub_purge_through`].
     purge_through: u64,
+    /// Entries the group's OpenRaft keeps below a snapshot it built
+    /// (`max_in_snapshot_log_to_keep`), once its engine started.
+    log_keep: Option<u64>,
 }
 
 /// Counter values a snapshot covers; see [`GroupLogGauge::mark`].
@@ -686,16 +705,42 @@ impl GroupLogGauge {
 
     /// Counts an applied entry that removed streams holding `bytes` in a
     /// group snapshot (#669). A replica that owed no snapshot owes one from
-    /// now.
+    /// now, and one whose log still holds earlier removals owes it from
+    /// when the oldest of them applied.
     pub fn record_removal(&self, bytes: u64) {
         let mut ledger = self.ledger();
         ledger.removals = ledger.removals.saturating_add(1);
         ledger.removed_bytes = ledger.removed_bytes.saturating_add(bytes);
-        if ledger.debt == RemovalDebt::Clear {
-            ledger.debt = RemovalDebt::Owed {
+        ledger.debt = match ledger.debt {
+            RemovalDebt::Clear => RemovalDebt::Owed {
                 since: Instant::now(),
-            };
+            },
+            RemovalDebt::Purging { since, .. } => RemovalDebt::Owed { since },
+            owed @ (RemovalDebt::Owed { .. } | RemovalDebt::Replayed { .. }) => owed,
+        };
+    }
+
+    /// Records that the group's log is purged through `purged`: a purge
+    /// through the snapshot that covers every removal ends the debt.
+    pub fn observe_purged(&self, purged: Option<u64>) {
+        let mut ledger = self.ledger();
+        if let RemovalDebt::Purging { through, .. } = ledger.debt
+            && purged >= Some(through)
+        {
+            ledger.debt = RemovalDebt::Clear;
         }
+    }
+
+    /// Records the entries the group's OpenRaft keeps below a snapshot it
+    /// built (`max_in_snapshot_log_to_keep`).
+    pub(crate) fn set_log_keep(&self, log_keep: u64) {
+        self.ledger().log_keep = Some(log_keep);
+    }
+
+    /// The entries the group's OpenRaft keeps below a snapshot it built,
+    /// `None` before its engine started.
+    pub(crate) fn log_keep(&self) -> Option<u64> {
+        self.ledger().log_keep
     }
 
     /// The startup replay ended (#669): a removal it applied again first
@@ -726,11 +771,13 @@ impl GroupLogGauge {
     /// installed.
     ///
     /// A snapshot that covers a removal no earlier one covered raises the
-    /// scrub purge watermark to `index`. The replica owes no snapshot once
-    /// it covers every removal applied so far. A removal that applied while
-    /// the snapshot was built makes it owe the next one from now, at most
-    /// one build late, so a group whose streams keep expiring snapshots once
-    /// per [`SnapshotCadence::removal_floor`], not back to back.
+    /// scrub purge watermark to `index`. Once it covers every removal
+    /// applied so far, the replica owes a purge of its log through the
+    /// watermark ([`RemovalDebt::Purging`]). A removal that applied while
+    /// the snapshot was built makes it owe the next snapshot from now, at
+    /// most one build late, so a group whose streams keep expiring
+    /// snapshots once per [`SnapshotCadence::removal_floor`], not back to
+    /// back.
     pub fn record_snapshot(&self, mark: GroupLogMark, snapshot_bytes: u64, index: u64) {
         self.snapshot_bytes_mark
             .fetch_max(mark.bytes, AtomicOrdering::Relaxed);
@@ -747,7 +794,12 @@ impl GroupLogGauge {
             ledger.purge_through = ledger.purge_through.max(index);
         }
         if ledger.removals <= ledger.covered_removals {
-            ledger.debt = RemovalDebt::Clear;
+            if let Some(since) = ledger.debt.since() {
+                ledger.debt = RemovalDebt::Purging {
+                    since,
+                    through: ledger.purge_through,
+                };
+            }
         } else if covers_new {
             ledger.debt = RemovalDebt::Owed {
                 since: Instant::now(),
@@ -762,6 +814,9 @@ impl GroupLogGauge {
     /// restart, whose purge through its snapshot the restart cut short.
     pub fn record_restored_snapshot(&self, mark: GroupLogMark, snapshot_bytes: u64, index: u64) {
         self.record_snapshot(mark, snapshot_bytes, index);
+        if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::RestorePurge) {
+            return;
+        }
         let mut ledger = self.ledger();
         ledger.purge_through = ledger.purge_through.max(index);
     }
@@ -792,6 +847,10 @@ impl GroupLogGauge {
             RemovalDebt::Replayed { since } => RemovalProgress::Replayed {
                 bytes: owed_bytes,
                 age_ms: age_ms(since),
+            },
+            RemovalDebt::Purging { since, through } => RemovalProgress::Purging {
+                age_ms: age_ms(since),
+                through,
             },
         };
         GroupLogProgress {
@@ -1157,12 +1216,8 @@ mod tests {
     fn the_removal_floor_is_a_quarter_of_the_max_age() {
         let cadence = SnapshotCadence::new(GIB, 128, 100_000);
         assert_eq!(cadence.removal_floor, Duration::from_secs(15 * 60));
-        assert_eq!(cadence.log_keep, 64);
-        let cadence = cadence
-            .with_deleted_data_max_age(Duration::from_secs(60))
-            .with_log_keep(8);
+        let cadence = cadence.with_deleted_data_max_age(Duration::from_secs(60));
         assert_eq!(cadence.removal_floor, Duration::from_secs(15));
-        assert_eq!(cadence.log_keep, 8);
     }
 
     /// #669: the bytes a group removed since its last snapshot count toward
@@ -1188,6 +1243,12 @@ mod tests {
             age_ms: 0,
         });
         assert!(cadence.removal_overdue(&replayed) && cadence.is_due(&replayed));
+        // A removal the snapshot dropped waits for the purge, not a build.
+        let purging = removed(RemovalProgress::Purging {
+            age_ms: 60_000,
+            through: 9,
+        });
+        assert!(!cadence.removal_overdue(&purging) && !cadence.is_due(&purging));
         // Nothing applied since the last snapshot: nothing to build.
         let built = GroupLogProgress {
             log_entries: 0,
@@ -1261,31 +1322,51 @@ mod removal_ledger_tests {
     use super::RemovalProgress;
 
     #[test]
-    fn a_covering_snapshot_clears_the_debt_and_raises_the_purge_watermark() {
+    fn a_covering_snapshot_owes_a_purge_until_the_log_is_purged_through_it() {
         let gauge = GroupLogGauge::default();
         gauge.record_applied(10);
         let before = gauge.mark();
         gauge.record_applied(10);
         gauge.record_removal(300);
-        assert!(matches!(gauge.removal_debt(), RemovalDebt::Owed { .. }));
+        let RemovalDebt::Owed { since } = gauge.removal_debt() else {
+            panic!("a removal is owed");
+        };
         assert!(matches!(gauge.progress().removal, RemovalProgress::Owed {
             bytes: 300,
             ..
         }));
         // A snapshot from before the removal covers none of it.
         gauge.record_snapshot(before, 1_000, 4);
-        assert!(matches!(gauge.removal_debt(), RemovalDebt::Owed { .. }));
+        assert_eq!(gauge.removal_debt(), RemovalDebt::Owed { since });
         assert_eq!(gauge.progress().removal.bytes(), 300);
         assert_eq!(gauge.progress().scrub_purge_through, 0);
-        // One that covers it clears the debt, and the log goes through it.
+        // One that covers it raises the watermark, and the debt lasts until
+        // the log is purged through it, from when the removal applied.
         gauge.record_snapshot(gauge.mark(), 1_000, 7);
+        assert_eq!(gauge.removal_debt(), RemovalDebt::Purging {
+            since,
+            through: 7
+        });
+        assert!(matches!(
+            gauge.progress().removal,
+            RemovalProgress::Purging { through: 7, .. }
+        ));
+        assert_eq!(gauge.progress().removal.bytes(), 0);
+        assert!(gauge.progress().removal.age().is_some());
+        assert_eq!(gauge.progress().scrub_purge_through, 7);
+        gauge.observe_purged(None);
+        gauge.observe_purged(Some(6));
+        assert!(matches!(gauge.removal_debt(), RemovalDebt::Purging { .. }));
+        gauge.observe_purged(Some(7));
         assert_eq!(gauge.removal_debt(), RemovalDebt::Clear);
         assert_eq!(gauge.progress().removal, RemovalProgress::Clear);
-        assert_eq!(gauge.progress().scrub_purge_through, 7);
-        // A later snapshot that covers no new removal leaves the watermark.
+        // A later snapshot that covers no new removal leaves the watermark,
+        // and a purge observed with nothing owed changes nothing.
         gauge.record_applied(10);
         gauge.record_snapshot(gauge.mark(), 1_000, 9);
+        gauge.observe_purged(Some(9));
         assert_eq!(gauge.progress().scrub_purge_through, 7);
+        assert_eq!(gauge.removal_debt(), RemovalDebt::Clear);
     }
 
     #[test]
@@ -1309,8 +1390,23 @@ mod removal_ledger_tests {
         ));
         assert_eq!(gauge.progress().removal.bytes(), 50);
         gauge.record_snapshot(gauge.mark(), 1_000, 6);
-        assert_eq!(gauge.removal_debt(), RemovalDebt::Clear);
+        assert!(matches!(gauge.removal_debt(), RemovalDebt::Purging {
+            through: 6,
+            ..
+        }));
         assert_eq!(gauge.progress().scrub_purge_through, 6);
+    }
+
+    #[test]
+    fn a_removal_while_a_purge_is_pending_is_owed_from_the_oldest() {
+        let gauge = GroupLogGauge::default();
+        gauge.record_removal(10);
+        let RemovalDebt::Owed { since } = gauge.removal_debt() else {
+            panic!("a removal is owed");
+        };
+        gauge.record_snapshot(gauge.mark(), 1_000, 3);
+        gauge.record_removal(10);
+        assert_eq!(gauge.removal_debt(), RemovalDebt::Owed { since });
     }
 
     #[test]
@@ -1331,12 +1427,24 @@ mod removal_ledger_tests {
             gauge.progress().removal,
             RemovalProgress::Replayed { bytes: 70, .. }
         ));
-        // Another removal keeps it replayed, and a covering snapshot clears it.
+        // Another removal keeps it replayed, and a covering snapshot owes a
+        // purge through itself.
         gauge.record_removal(5);
         assert!(matches!(gauge.removal_debt(), RemovalDebt::Replayed { .. }));
         gauge.record_snapshot(gauge.mark(), 1_000, 20);
-        assert_eq!(gauge.removal_debt(), RemovalDebt::Clear);
+        assert!(matches!(gauge.removal_debt(), RemovalDebt::Purging {
+            through: 20,
+            ..
+        }));
         assert_eq!(gauge.progress().scrub_purge_through, 20);
+    }
+
+    #[test]
+    fn the_log_keep_is_unknown_until_the_engine_sets_it() {
+        let gauge = GroupLogGauge::default();
+        assert_eq!(gauge.log_keep(), None);
+        gauge.set_log_keep(8);
+        assert_eq!(gauge.log_keep(), Some(8));
     }
 }
 
@@ -1376,6 +1484,8 @@ mod proptests {
                 .prop_map(|(bytes, age_ms)| RemovalProgress::Owed { bytes, age_ms }),
             1 => (0..=max_bytes, 0..=FLOOR_MS)
                 .prop_map(|(bytes, age_ms)| RemovalProgress::Replayed { bytes, age_ms }),
+            1 => (0..=FLOOR_MS.saturating_mul(2), 0..=max_bytes)
+                .prop_map(|(age_ms, through)| RemovalProgress::Purging { age_ms, through }),
         ]
     }
 

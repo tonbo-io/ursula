@@ -198,17 +198,11 @@ max_in_snapshot_log_to_keep = 128
         assert_eq!(config.raft.max_in_snapshot_log_to_keep, 128);
     }
 
-    /// #669: `raft.deleted_data_max_age` defaults to an hour and parses as a
+    /// #669: `raft.deleted_data_max_age` is unset by default and parses as a
     /// duration.
     #[test]
     fn raft_deleted_data_max_age_parses() {
-        assert_eq!(
-            UrsulaConfig::default()
-                .raft
-                .deleted_data_max_age
-                .as_duration(),
-            std::time::Duration::from_secs(3_600)
-        );
+        assert_eq!(UrsulaConfig::default().raft.deleted_data_max_age, None);
         let config: UrsulaConfig = toml::from_str(
             r#"
 [raft]
@@ -217,7 +211,7 @@ deleted_data_max_age = "30m"
         )
         .expect("deleted_data_max_age parses");
         assert_eq!(
-            config.raft.deleted_data_max_age.as_duration(),
+            config.raft.effective_deleted_data_max_age(),
             std::time::Duration::from_secs(1_800)
         );
     }

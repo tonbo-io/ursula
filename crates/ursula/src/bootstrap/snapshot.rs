@@ -551,6 +551,7 @@ impl SnapshotDriver {
 
     /// Ticks until the task is dropped, without a store health gate: a
     /// simulation's driver.
+    #[cfg(madsim)]
     pub async fn run(mut self) {
         loop {
             let pause = self.tick(false).await;
@@ -752,23 +753,18 @@ impl SnapshotDriver {
             let Some(raft) = self.registry.get(RaftGroupId(purge.raft_group_id)) else {
                 continue;
             };
-            match self.coordinator.hold_for_purge(
+            if let Err(busy) = self.coordinator.hold_for_purge(
                 purge.raft_group_id,
                 Some(purge.published),
                 purge.through,
-                self.cadence.log_keep,
                 raft.metrics(),
             ) {
-                Ok(()) => {}
-                Err(work) => {
-                    tracing::debug!(
-                        raft_group_id = purge.raft_group_id,
-                        through = purge.through,
-                        ?work,
-                        "snapshot driver: purging through the covering snapshot later"
-                    );
-                    continue;
-                }
+                tracing::debug!(
+                    through = purge.through,
+                    %busy,
+                    "snapshot driver: purging through the covering snapshot later"
+                );
+                continue;
             }
             if let Err(err) = raft.trigger().purge_log(purge.through).await {
                 self.coordinator.release_purge(purge.raft_group_id);

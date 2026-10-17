@@ -428,6 +428,9 @@ impl RaftGroupEngine {
         // A purge an earlier incarnation of the group's Raft held its builds
         // for is not pending in the new one (#669).
         snapshot_build.release_purge(placement.raft_group_id.0);
+        // A purge through a snapshot holds the group's builds until the log
+        // is purged or as many entries applied past it as OpenRaft keeps.
+        log_gauge.set_log_keep(config.max_in_snapshot_log_to_keep);
         let snapshot_install = snapshot_install.unwrap_or_default();
         let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,

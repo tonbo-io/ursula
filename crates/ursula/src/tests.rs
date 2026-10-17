@@ -8058,9 +8058,7 @@ mod snapshot_driver {
                 participation: &participation,
             },
             100,
-            SnapshotCadence::new(1 << 30, 2, 100_000)
-                .with_deleted_data_max_age(max_age)
-                .with_log_keep(8),
+            SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
             16,
         );
@@ -8545,6 +8543,64 @@ mod snapshot_driver {
         );
         assert_eq!(store.uploads().started, 1);
         store.open();
+        node.shutdown().await;
+    }
+
+    /// #669: an operator's purge follows the hold rule of every purge: while
+    /// a build of the group runs it answers 503 with `Retry-After`, and once
+    /// the group is idle it purges through the snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_purge_answers_503_while_its_group_builds() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store, 2).await;
+        store.release(1);
+        let snapshot = snapshot_index(operator_snapshot(&admin, 0).await.expect("snapshot"))
+            .await
+            .expect("a snapshot index");
+        let purge = |admin: Router| async move {
+            send(
+                &admin,
+                "POST",
+                &format!("/__ursula/raft/0/purge?upto={snapshot}"),
+                &[],
+                Body::empty(),
+            )
+            .await
+        };
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger group 0's snapshot");
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        let busy = purge(admin.clone()).await;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        store.open();
+        node.registry
+            .snapshot_build_coordinator()
+            .build_ended(0)
+            .await;
+        let mut purged = None;
+        for _ in 0..100 {
+            let response = purge(admin.clone()).await;
+            if response.status() == StatusCode::OK {
+                purged = Some(response);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            purged.is_some(),
+            "the purge never ran once the group was idle"
+        );
         node.shutdown().await;
     }
 

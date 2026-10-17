@@ -97,6 +97,11 @@ pub enum Defence {
     /// (#669). Off, a build that ends while a leader defers that purge
     /// schedules a lower one, which OpenRaft's debug assertion reports.
     ScrubPurgeHold,
+    /// A replica that restores its snapshot at startup purges its log
+    /// through it (#669). Off, a restart between the snapshot that dropped a
+    /// stream and the purge through it leaves the stream's records in the
+    /// log.
+    RestorePurge,
 }
 
 #[cfg(madsim)]
@@ -106,8 +111,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 21]> = const { Cell::new([false; 21]) };
-        static FIRED: Cell<[u64; 21]> = const { Cell::new([0; 21]) };
+        static OFF: Cell<[bool; 22]> = const { Cell::new([false; 22]) };
+        static FIRED: Cell<[u64; 22]> = const { Cell::new([0; 22]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -133,6 +138,7 @@ mod switches {
             Defence::RemovalFloor => 18,
             Defence::ScrubPurge => 19,
             Defence::ScrubPurgeHold => 20,
+            Defence::RestorePurge => 21,
         }
     }
 
@@ -155,7 +161,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 21]));
+        FIRED.with(|fired| fired.set([0; 22]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

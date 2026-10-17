@@ -348,8 +348,7 @@ impl JournalCluster {
                         JOURNAL_GROUPS.len(),
                         ursula_raft::snapshot_cadence::DEFAULT_SNAPSHOT_BACKSTOP_ENTRIES,
                     )
-                    .with_deleted_data_max_age(max_age)
-                    .with_log_keep(drivers.keep),
+                    .with_deleted_data_max_age(max_age),
                     max_groups_per_tick: 16,
                 },
             );
@@ -489,6 +488,10 @@ impl JournalCluster {
                 }
             }
         }
+        // The next start is a new process, with nothing of this one's
+        // build coordinator, gauges or holds.
+        self.node_registries
+            .insert(node_id, ursula_raft::RaftGroupHandleRegistry::default());
     }
 
     pub(super) async fn leader(&self, group: u32) -> u64 {
@@ -657,13 +660,7 @@ impl JournalCluster {
             let coordinator = self.coordinator(node_id);
             let deadline = madsim::time::Instant::now() + wait;
             while coordinator
-                .hold_for_purge(
-                    group,
-                    Some(snapshot),
-                    purge_upto,
-                    self.config.max_in_snapshot_log_to_keep,
-                    raft.metrics(),
-                )
+                .hold_for_purge(group, Some(snapshot), purge_upto, raft.metrics())
                 .is_err()
             {
                 if madsim::time::Instant::now() >= deadline {

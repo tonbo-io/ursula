@@ -210,6 +210,7 @@ pub use snapshot_codec::decode_group_snapshot;
 pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::GroupSnapshotWork;
 pub use state_machine::Handoff;
+pub use state_machine::PurgeBusy;
 pub use state_machine::RaftGroupSnapshotBuilder;
 pub use state_machine::RaftGroupStateMachine;
 pub use state_machine::RaftMetricsWatch;

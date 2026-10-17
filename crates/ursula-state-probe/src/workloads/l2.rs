@@ -133,31 +133,7 @@ async fn shutdown(rt: &ShardRuntime, wal: Option<TempWal>) -> Result<()> {
         .shutdown()
         .await
         .context("shut the Raft WAL down")?;
-    std::fs::remove_dir_all(&wal.root).with_context(|| {
-        format!(
-            "remove the Raft WAL directory, which still holds {:?}",
-            leftovers(&wal.root)
-        )
-    })
-}
-
-/// The paths under `dir`, for a removal that found it not empty.
-fn leftovers(dir: &std::path::Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path.clone());
-            }
-            found.push(path);
-        }
-    }
-    found
+    std::fs::remove_dir_all(&wal.root).context("remove the Raft WAL directory")
 }
 
 /// Spawns a runtime of `engine`. The Raft engine's journals live in the

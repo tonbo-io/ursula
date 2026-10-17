@@ -1775,7 +1775,7 @@
         "deletedDataMaxAgeMs": {
           "type": ["integer", "null"],
           "minimum": 1,
-          "description": "Milliseconds a replica keeps a deleted, purged or expired stream in its current Raft snapshot and its Raft log after it applies the removal. At least eight times the install snapshot timeout. Null keeps each server's own default of 1 hour."
+          "description": "Milliseconds a replica keeps a deleted, purged or expired stream in its current Raft snapshot and its Raft log after it applies the removal. At least eight times the install snapshot timeout. Null keeps each server's own default, the larger of 1 hour and eight install timeouts."
         }
       },
       "additionalProperties": false

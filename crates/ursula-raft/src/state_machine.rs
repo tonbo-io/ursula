@@ -150,21 +150,35 @@ pub enum GroupSnapshotWork {
     /// yet. OpenRaft schedules the purge that build calls for when it does.
     Unpublished,
     /// A purge through `through` has not landed: the log is not purged
-    /// through it yet, and the group has not applied
-    /// [`crate::snapshot_cadence::SnapshotCadence::log_keep`] entries past
-    /// it, after which any build's own purge reaches it.
+    /// through it yet, and the group has not applied as many entries past
+    /// it as its OpenRaft keeps below a snapshot
+    /// (`max_in_snapshot_log_to_keep`), after which any build's own purge
+    /// reaches it.
     Purging {
         /// The log index the purge goes through.
         through: u64,
     },
 }
 
+/// Why [`SnapshotBuildCoordinator::hold_for_purge`] did not hold a group
+/// for a purge: its snapshot work is not idle. The purge can start once it
+/// is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("raft group {raft_group_id}'s snapshot work is {work:?}; a purge waits until it is idle")]
+pub struct PurgeBusy {
+    pub raft_group_id: u32,
+    /// The work that stands in the way.
+    pub work: GroupSnapshotWork,
+}
+
 /// A purge through a covering snapshot that holds its group's builds until
 /// it lands ([`GroupSnapshotWork::Purging`]).
 struct PurgeHold {
     through: u64,
-    /// Entries OpenRaft keeps below a snapshot it built.
-    keep: u64,
+    /// Entries the group's OpenRaft keeps below a snapshot it built
+    /// (`max_in_snapshot_log_to_keep`), `None` when its engine has not
+    /// said: the hold then lasts until the log is purged.
+    keep: Option<u64>,
     metrics: RaftMetricsWatch,
 }
 
@@ -186,12 +200,25 @@ impl PurgeHold {
         metrics
             .purged
             .is_some_and(|purged| purged.index >= self.through)
-            || metrics
-                .last_applied
-                .is_some_and(|applied| applied.index >= self.through.saturating_add(self.keep))
+            || self.keep.is_some_and(|keep| {
+                metrics
+                    .last_applied
+                    .is_some_and(|applied| applied.index >= self.through.saturating_add(keep))
+            })
             || metrics.running_state.is_err()
             || metrics.state == openraft::ServerState::Shutdown
     }
+}
+
+/// Why a build OpenRaft triggered defers
+/// ([`SnapshotBuildCoordinator::lease_for_build`]). OpenRaft retries on a
+/// later trigger.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildDeferred {
+    /// A purge through a snapshot holds the group until it lands (#669).
+    PurgePending { through: u64 },
+    /// Other groups hold every build permit.
+    NoPermit,
 }
 
 /// The snapshot a group's latest build made
@@ -745,23 +772,28 @@ impl SnapshotBuildCoordinator {
     /// its work is [`GroupSnapshotWork::Idle`], judged with
     /// `published_index`, the last log index of the snapshot OpenRaft's
     /// metrics show. The hold lasts until the group's `metrics` show the
-    /// purge landed: the log purged through `through`, or `keep` entries
-    /// applied past it. Otherwise answers the work that stands in the way.
+    /// purge landed: the log purged through `through`, or as many entries
+    /// applied past it as the group's OpenRaft keeps below a snapshot.
     pub fn hold_for_purge(
         &self,
         raft_group_id: u32,
         published_index: Option<u64>,
         through: u64,
-        keep: u64,
         metrics: RaftMetricsWatch,
-    ) -> Result<(), GroupSnapshotWork> {
+    ) -> Result<(), PurgeBusy> {
         if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::ScrubPurgeHold) {
             return Ok(());
         }
+        let keep = self.log_gauge(raft_group_id).log_keep();
         let handoffs = self.handoffs();
         match self.work_with(&handoffs, raft_group_id, published_index) {
             GroupSnapshotWork::Idle => {}
-            work => return Err(work),
+            work => {
+                return Err(PurgeBusy {
+                    raft_group_id,
+                    work,
+                });
+            }
         }
         self.purges().insert(raft_group_id, PurgeHold {
             through,
@@ -908,26 +940,29 @@ impl SnapshotBuildCoordinator {
     /// so that one group's apply worker never waits behind another group's
     /// snapshot build (bounded-stream-state F12d). Both under one hand-off
     /// lock, so no hand-off is parked on the group between the two
-    /// ([`SnapshotBuildCoordinator::hand_off`]).
-    fn lease_for_build(&self, raft_group_id: u32, log_mark: u64) -> Option<SnapshotBuildLease> {
+    /// ([`SnapshotBuildCoordinator::hand_off`]). No build starts while a
+    /// purge through a snapshot holds the group (#669).
+    fn lease_for_build(
+        &self,
+        raft_group_id: u32,
+        log_mark: u64,
+    ) -> Result<SnapshotBuildLease, BuildDeferred> {
         let mut handoffs = self.handoffs();
-        // No build starts while a purge through a snapshot holds the group
-        // (#669); OpenRaft retries on a later trigger.
         if let Some(through) = self.purging(raft_group_id) {
-            tracing::debug!(
-                raft_group_id,
-                through,
-                "deferring OpenRaft snapshot build until the purge through a snapshot lands"
-            );
-            return None;
+            return Err(BuildDeferred::PurgePending { through });
         }
         let permit = match handoffs.remove(&raft_group_id) {
             Some(handed) => handed.permit,
-            None => self.inner.semaphore.clone().try_acquire_owned().ok()?,
+            None => self
+                .inner
+                .semaphore
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_none_free| BuildDeferred::NoPermit)?,
         };
         let lease = self.lease(permit, raft_group_id, log_mark);
         drop(handoffs);
-        Some(lease)
+        Ok(lease)
     }
 
     /// Takes a build permit only if one is free right now: a build that
@@ -1780,18 +1815,32 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         // policy-triggered build otherwise defers instead of waiting for the
         // node-wide permit on this group's state-machine worker; OpenRaft
         // retries on a later trigger.
-        let Some(build) = self.snapshot_build.lease_for_build(raft_group_id, log_mark) else {
-            tracing::debug!(
-                raft_group_id,
-                "deferring OpenRaft snapshot build while other groups hold every build permit"
-            );
-            return None;
+        let build = match self.snapshot_build.lease_for_build(raft_group_id, log_mark) {
+            Ok(build) => build,
+            Err(BuildDeferred::PurgePending { through }) => {
+                tracing::debug!(
+                    raft_group_id,
+                    through,
+                    "deferring OpenRaft snapshot build until the purge through a snapshot lands"
+                );
+                return None;
+            }
+            Err(BuildDeferred::NoPermit) => {
+                tracing::debug!(
+                    raft_group_id,
+                    "deferring OpenRaft snapshot build while other groups hold every build permit"
+                );
+                return None;
+            }
         };
         Some(self.snapshot_builder_with_lease(build).await)
     }
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         let raft_group_id = self.placement.raft_group_id.0;
+        // A build here waits for a purge through a snapshot to land, like
+        // every other build of the group (#669).
+        self.snapshot_build.purge_landed(raft_group_id).await;
         let log_mark = self.log_gauge.mark().bytes();
         // A permit already handed to this group would otherwise be held
         // while this build waits for another one.
@@ -3495,38 +3544,51 @@ mod tests {
         use openraft::type_config::TypeConfigExt;
 
         let build = SnapshotBuildCoordinator::new(2);
+        build.log_gauge(7).set_log_keep(4);
         let (sender, metrics) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Idle);
         // Busy groups take no purge.
         let running = build.try_lease(8, 0).expect("a free permit");
         assert_eq!(
-            build.hold_for_purge(8, Some(10), 10, 4, metrics.clone()),
-            Err(GroupSnapshotWork::Building)
+            build.hold_for_purge(8, Some(10), 10, metrics.clone()),
+            Err(PurgeBusy {
+                raft_group_id: 8,
+                work: GroupSnapshotWork::Building
+            })
         );
         drop(running);
         let token = build
             .hand_off(8, build.acquire().await.expect("a permit"))
             .expect("not busy");
         assert_eq!(
-            build.hold_for_purge(8, Some(10), 10, 4, metrics.clone()),
-            Err(GroupSnapshotWork::HandedOff)
+            build.hold_for_purge(8, Some(10), 10, metrics.clone()),
+            Err(PurgeBusy {
+                raft_group_id: 8,
+                work: GroupSnapshotWork::HandedOff
+            })
         );
         assert!(build.reclaim_handoff(8, token));
 
         build
-            .hold_for_purge(7, Some(10), 10, 4, metrics.clone())
+            .hold_for_purge(7, Some(10), 10, metrics.clone())
             .expect("an idle group");
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Purging {
             through: 10
         });
         assert_eq!(
-            build.hold_for_purge(7, Some(10), 12, 4, metrics.clone()),
-            Err(GroupSnapshotWork::Purging { through: 10 })
+            build.hold_for_purge(7, Some(10), 12, metrics.clone()),
+            Err(PurgeBusy {
+                raft_group_id: 7,
+                work: GroupSnapshotWork::Purging { through: 10 }
+            })
         );
         // No build of the group starts meanwhile: OpenRaft's defers, and a
         // hand-off answers busy.
         assert!(build.busy(7));
-        assert!(build.lease_for_build(7, 0).is_none());
+        assert!(matches!(
+            build.lease_for_build(7, 0),
+            Err(BuildDeferred::PurgePending { through: 10 })
+        ));
         let busy = build.hand_off(7, build.acquire().await.expect("a permit"));
         assert!(matches!(busy, Err(ref _permit)), "{busy:?}");
         drop(busy);
@@ -3550,7 +3612,7 @@ mod tests {
 
         // A purged log lands it too.
         build
-            .hold_for_purge(7, Some(20), 20, 4, metrics.clone())
+            .hold_for_purge(7, Some(20), 20, metrics.clone())
             .expect("an idle group");
         assert!(build.busy(7));
         sender
@@ -3576,14 +3638,17 @@ mod tests {
         drop(lease);
         assert_eq!(build.work(7, Some(10)), GroupSnapshotWork::Unpublished);
         assert_eq!(
-            build.hold_for_purge(7, Some(10), 10, 4, metrics.clone()),
-            Err(GroupSnapshotWork::Unpublished)
+            build.hold_for_purge(7, Some(10), 10, metrics.clone()),
+            Err(PurgeBusy {
+                raft_group_id: 7,
+                work: GroupSnapshotWork::Unpublished
+            })
         );
         // A hand-off is not refused for it: OpenRaft drops the trigger.
         assert!(!build.busy(7));
         assert_eq!(build.work(7, Some(12)), GroupSnapshotWork::Idle);
         build
-            .hold_for_purge(7, Some(12), 12, 4, metrics)
+            .hold_for_purge(7, Some(12), 12, metrics)
             .expect("published");
     }
 
@@ -3599,7 +3664,7 @@ mod tests {
         let build = SnapshotBuildCoordinator::new(2);
         let (sender, metrics) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
         build
-            .hold_for_purge(7, Some(10), 10, 4, metrics)
+            .hold_for_purge(7, Some(10), 10, metrics)
             .expect("an idle group");
         let triggers = AtomicU64::new(0);
         let start = build.start_snapshot(
@@ -3641,7 +3706,7 @@ mod tests {
         let build = SnapshotBuildCoordinator::new(1);
         let (sender, metrics) = UrsulaRaftTypeConfig::watch_channel(purge_metrics(10, None));
         build
-            .hold_for_purge(7, Some(10), 10, 4, metrics)
+            .hold_for_purge(7, Some(10), 10, metrics)
             .expect("an idle group");
         let landed = build.purge_landed(7);
         tokio::pin!(landed);
@@ -3666,7 +3731,10 @@ mod tests {
         assert_eq!(build.available_permits(), 1);
         let free = build.lease_for_build(8, 0).expect("a free permit");
         assert_eq!(build.available_permits(), 0);
-        assert!(build.lease_for_build(9, 0).is_none());
+        assert!(matches!(
+            build.lease_for_build(9, 0),
+            Err(BuildDeferred::NoPermit)
+        ));
         drop((claimed, free));
         assert_eq!(build.available_permits(), 2);
     }

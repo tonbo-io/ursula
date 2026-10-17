@@ -152,7 +152,7 @@ impl SimNodeWal {
     pub(super) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
         self.run()
             .expect("start a simulated node's Raft WAL")
-            .snapshot_metadata_path(placement)
+            .sim_snapshot_metadata_path(placement)
     }
 
     /// The group's open store, if its engine still holds it.

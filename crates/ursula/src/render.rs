@@ -865,12 +865,13 @@ pub(crate) struct MetricsResponse {
     /// leads and counts.
     pub staged_snapshot_part_bytes: u64,
     /// The groups whose replica on this node still holds removed streams in
-    /// its current snapshot (#669): what they removed and how long ago.
+    /// its current snapshot or its Raft log (#669): what they removed, how
+    /// long ago, and the purge the log waits for.
     pub deleted_data: Vec<GroupDeletedData>,
 }
 
 /// Removed streams one group's replica still holds in its current snapshot
-/// (#669).
+/// or its Raft log (#669).
 #[derive(Debug, serde::Serialize)]
 pub(crate) struct GroupDeletedData {
     pub raft_group_id: u32,

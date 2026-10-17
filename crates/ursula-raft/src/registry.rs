@@ -1070,6 +1070,12 @@ impl RaftGroupHandleRegistry {
             let raft = entry.raft();
             let health = &entry.apply_health;
             let metrics = raft.metrics().borrow_watched().clone();
+            // A removal's debt lasts until the log is purged through the
+            // snapshot that dropped it (#669).
+            entry
+                .log_gauge
+                .observe_purged(metrics.purged.map(|purged| purged.index));
+            let log = entry.log_gauge.progress();
             // `RaftMetrics` carry only the index of the last log id. The data
             // metrics carry the whole id, so its term and index match.
             let last_log = raft.data_metrics().borrow_watched().last_log;
@@ -1537,6 +1543,10 @@ impl RaftGroupHandleRegistry {
             .map_err(|source| IncomingTransferError::Raft { group, source })
     }
 
+    /// Builds a snapshot outside OpenRaft's own build path, which OpenRaft
+    /// never publishes: tests only, since the group's next purge waits for
+    /// OpenRaft to publish every build (#669).
+    #[cfg(any(test, feature = "fault-injection"))]
     pub async fn build_snapshot_for_transfer(
         &self,
         raft_group_id: RaftGroupId,

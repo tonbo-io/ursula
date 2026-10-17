@@ -2840,11 +2840,40 @@ pub(crate) async fn trigger_raft_purge(
     axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::PurgeQuery>,
 ) -> Response {
     let upto = query.upto;
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
+    let Some(registry) = state.raft_registry() else {
+        return *no_raft_registry();
+    };
+    let (raft_group_id, raft) = match resolve_registered_raft_group(registry, raft_group_id) {
         Ok(resolved) => resolved,
         Err(response) => return *response,
     };
+    // The purge follows the hold rule of every purge (#669): it starts only
+    // while no build of the group runs or waits for OpenRaft to publish it,
+    // and holds the group's builds until it lands. OpenRaft purges at most
+    // through its snapshot, so the hold is for that much.
+    let coordinator = registry.snapshot_build_coordinator();
+    let published = raft
+        .metrics()
+        .borrow_watched()
+        .snapshot
+        .map(|log_id| log_id.index);
+    if let Some(published) = published
+        && let Err(busy) = coordinator.hold_for_purge(
+            raft_group_id.0,
+            Some(published),
+            upto.min(published),
+            raft.metrics(),
+        )
+    {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            format!("{busy}; retry"),
+        )
+            .into_response();
+    }
     if let Err(err) = raft.trigger().purge_log(upto).await {
+        coordinator.release_purge(raft_group_id.0);
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("trigger raft purge: {err}"),

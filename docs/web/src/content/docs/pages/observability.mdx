@@ -162,12 +162,13 @@ trigger in a row up to 16 s, until a trigger of it is claimed) add up in
 `raft_snapshot_pressure_pass_ns`.
 
 For deleted data (see [Deleted data](/docs/operations#deleted-data)), the JSON
-snapshot reports how long ago the oldest removal that no snapshot on the node
-covers yet applied (`raft_deleted_data_oldest_ms`, 0 for none) and the groups
-that hold one past a quarter of `raft.deleted_data_max_age`
-(`raft_deleted_data_overdue_groups`). `deleted_data` lists each group whose
-replica still holds removed streams in its current snapshot, with their bytes
-and age. Alert when `raft_deleted_data_oldest_ms` nears half of
+snapshot reports how long ago the oldest removal applied whose stream a
+snapshot or a Raft log on the node still holds (`raft_deleted_data_oldest_ms`,
+0 for none) and the groups whose snapshot holds one past a quarter of
+`raft.deleted_data_max_age` (`raft_deleted_data_overdue_groups`).
+`deleted_data` lists each group whose replica still holds removed streams,
+with their state, bytes and age. Both gauges come from the snapshot driver and
+stay at 0 without it. Alert when `raft_deleted_data_oldest_ms` nears half of
 `raft.deleted_data_max_age`.
 
 The OTLP collection interval defaults to 60s. For a quick check, shorten it so

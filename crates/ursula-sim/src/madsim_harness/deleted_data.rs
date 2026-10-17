@@ -28,6 +28,10 @@
 //! - [`Controls::HOLD_OFF`]: the operator's build ends under the deferred
 //!   purge and schedules a lower one, which OpenRaft's debug assertion
 //!   reports.
+//! - [`Controls::RESTORE_OFF`]: a replica that lost power between the
+//!   snapshot that dropped the stream and the purge through it does not
+//!   purge through the snapshot it restores, so its log keeps the records.
+//!   With the purge on ([`Controls::CRASH_BEFORE_PURGE`]) the bound holds.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -92,6 +96,9 @@ const BOUND_DRIVERS: DriverPlan = DriverPlan {
 /// How long the leader's appends to the slow follower take in the
 /// operator-snapshot scenario.
 const SLOW_FOLLOWER: Duration = Duration::from_secs(5);
+/// How long the leader stays down after it applied the removal: longer
+/// than the bound less a quarter of it.
+const LEADER_DOWN: Duration = Duration::from_secs(10);
 /// How often the run observes the replicas.
 const POLL: Duration = Duration::from_millis(50);
 
@@ -110,6 +117,13 @@ pub(super) struct Controls {
     /// A purge through a covering snapshot neither waits for its group's
     /// builds nor holds them.
     hold_off: bool,
+    /// A replica that restores its snapshot at startup does not purge its
+    /// log through it.
+    restore_off: bool,
+    /// The drivers purge nothing until the replica that lost power is back,
+    /// so it crashes between the snapshot that dropped the stream and the
+    /// purge through it.
+    purge_after_restart: bool,
 }
 
 #[cfg(test)]
@@ -118,6 +132,8 @@ impl Controls {
         floor_off: false,
         purge_off: false,
         hold_off: false,
+        restore_off: false,
+        purge_after_restart: false,
     };
     pub(super) const FLOOR_OFF: Self = Self {
         floor_off: true,
@@ -129,6 +145,18 @@ impl Controls {
     };
     pub(super) const HOLD_OFF: Self = Self {
         hold_off: true,
+        ..Self::NONE
+    };
+    /// Every defence on, and the crash between the covering snapshot and
+    /// the purge through it.
+    pub(super) const CRASH_BEFORE_PURGE: Self = Self {
+        purge_after_restart: true,
+        ..Self::NONE
+    };
+    /// The same crash without the purge through the restored snapshot.
+    pub(super) const RESTORE_OFF: Self = Self {
+        restore_off: true,
+        purge_after_restart: true,
         ..Self::NONE
     };
 }
@@ -159,6 +187,10 @@ fn set_defences(controls: Controls) {
     set_off(Defence::RemovalFloor, controls.floor_off);
     set_off(Defence::ScrubPurge, controls.purge_off);
     set_off(Defence::ScrubPurgeHold, controls.hold_off);
+    set_off(Defence::RestorePurge, controls.restore_off);
+    if controls.purge_after_restart {
+        set_off(Defence::ScrubPurge, true);
+    }
 }
 
 fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, message: String) -> ! {
@@ -463,12 +495,6 @@ impl Applied {
         }
     }
 
-    /// Forgets `node_id`, which stopped: it keeps its copies until it is
-    /// back, and its time counts again from when it applies the removal.
-    fn forget(&mut self, node_id: u64) {
-        self.at.remove(&node_id);
-    }
-
     /// Waits `duration`, observing all along.
     async fn wait(&mut self, cluster: &JournalCluster, index: u64, duration: Duration) {
         let until = madsim::time::Instant::now() + duration;
@@ -553,13 +579,15 @@ pub(super) async fn run_deleted_data_inner(
             });
         }
         Fault::LeaderStopped => {
+            // Its time still counts from when it first applied the removal:
+            // down longer than the bound less its floor, it would miss the
+            // bound if the time counted from when it applies the removal
+            // again at its restart. A replayed removal is due at once.
             cluster.stop_node(remover).await;
-            seen.forget(remover);
             trace.push(SimEvent::FaultApplied {
                 phase: "leader_stopped_after_removal".to_owned(),
             });
-            seen.wait(&cluster, removal_index, Duration::from_millis(1_500))
-                .await;
+            seen.wait(&cluster, removal_index, LEADER_DOWN).await;
             cluster.start_node(remover).await;
         }
         Fault::PowerLossAfterSnapshot => {
@@ -589,12 +617,17 @@ pub(super) async fn run_deleted_data_inner(
                 madsim::time::sleep(POLL).await;
             };
             cluster.stop_node(covered).await;
-            seen.forget(covered);
             cluster.wals[&covered].power_loss_losing_unsynced().await;
             trace.push(SimEvent::FaultApplied {
                 phase: "power_lost_after_covering_snapshot".to_owned(),
             });
             cluster.start_node(covered).await;
+            if controls.purge_after_restart {
+                ursula_stream::sim_controls::set_off(
+                    ursula_stream::sim_controls::Defence::ScrubPurge,
+                    false,
+                );
+            }
         }
     }
 
@@ -847,6 +880,41 @@ mod tests {
         assert!(message.contains("holds the marker"), "{message}");
     }
 
+    /// A replica that loses power between the snapshot that dropped the
+    /// stream and the purge through it restores that snapshot and purges
+    /// its log through it within the bound.
+    #[test]
+    fn scrub_a_restored_snapshot_purges_what_a_crash_left() {
+        let _guard = sim_test_guard();
+        let report = ThreeNodeRaftSim::run_deleted_data_with_controls_report(
+            config(CRASH_SEED),
+            Controls::CRASH_BEFORE_PURGE,
+        );
+        assert!(
+            report
+                .outcome
+                .trace
+                .events
+                .iter()
+                .any(|event| matches!(event, SimEvent::DeletedDataLeft { replicas: 3, .. })),
+            "{:?}",
+            report.outcome.trace.events.last()
+        );
+    }
+
+    /// Without the purge through the restored snapshot, the same crash
+    /// leaves the stream's records in the restarted replica's log.
+    #[test]
+    fn negative_control_a_restore_without_its_purge_keeps_the_records() {
+        let _guard = sim_test_guard();
+        let message = assert_fails(CRASH_SEED, Controls::RESTORE_OFF, BOUND_INVARIANT);
+        assert!(message.contains("holds the marker"), "{message}");
+    }
+
+    /// A seed whose run cuts a replica's power after its covering
+    /// snapshot.
+    const CRASH_SEED: u64 = 523;
+
     /// #669 review: an operator's snapshot that interleaves with a purge
     /// through a covering snapshot the leader defers starts only once that
     /// purge landed, the same way twice.
@@ -901,9 +969,6 @@ mod tests {
                     .map(|text| (*text).to_owned())
             })
             .unwrap_or_default();
-        assert!(
-            message.contains("purge_upto") || message.contains(HOLD_INVARIANT),
-            "{message}"
-        );
+        assert!(message.contains("purge_upto"), "{message}");
     }
 }

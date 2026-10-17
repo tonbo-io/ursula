@@ -445,8 +445,9 @@ runtime_metrics! {
     counter raft_log_bytes;
     counter raft_log_bytes_high_watermark;
     // Gauges of the deleted data the node's groups still hold (#669): the
-    // age of the oldest removal no snapshot covers, and the groups that
-    // hold one past a quarter of `raft.deleted_data_max_age`.
+    // age of the oldest removal a snapshot or log still holds, and the
+    // groups whose snapshot holds one past a quarter of
+    // `raft.deleted_data_max_age`.
     counter raft_deleted_data_oldest_ms;
     counter raft_deleted_data_overdue_groups;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
@@ -1367,8 +1368,8 @@ mod metric_manifest_tests {
 /// monitor sees it on one poll (#669).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RaftDeletedDataSample {
-    /// How long ago the oldest removal no snapshot covers applied, 0 for
-    /// none.
+    /// How long ago the oldest removal applied whose stream a snapshot or a
+    /// Raft log on the node still holds, 0 for none.
     pub oldest_ms: u64,
     /// Groups that hold a removal past a quarter of
     /// `raft.deleted_data_max_age`, or one replayed at startup, which no

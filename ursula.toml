@@ -125,8 +125,9 @@ init_membership_per_group = false
 # snapshot_install_max_concurrency = 1
 
 # How long a replica keeps a deleted, purged or expired stream in its current
-# Raft snapshot and its Raft log after it applies the removal.  At least eight
-# times install_snapshot_timeout.
+# Raft snapshot and its Raft log after it applies the removal.  Unset, the
+# larger of 1h and eight times install_snapshot_timeout.  A set value must be
+# at least eight times install_snapshot_timeout.
 # deleted_data_max_age = "1h"
 
 # ------------------------------------------------------------------------------

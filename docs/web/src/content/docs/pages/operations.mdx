@@ -416,9 +416,11 @@ Within that time after a replica applies the removal:
 
 Removed bytes count toward a group's next snapshot, so a large removal is cleaned up within minutes. A small removal makes its group take a snapshot a quarter of `raft.deleted_data_max_age` after the replica applied it, and the replica then purges its Raft log through that snapshot. Cold chunks, cold indexes and external payloads are deleted by cold GC, usually within seconds, and a bucket purge reports when they are gone.
 
-The time counts per replica, from when that replica applies the removal. A replica that is down keeps its copies until it is back. It then applies the removal from the leader's log, or installs a newer snapshot, and the time counts from there. A restart does not extend the bound. A removal a replica applies again while it replays its log at startup is due at once, and the replica purges its log through the snapshot it restored.
+The time counts per replica, from when that replica first applies the removal. A replica that is down when the removal commits keeps its copies until it is back. It then applies the removal from the leader's log, or installs a newer snapshot, and the time counts from there. A restart after the replica applied the removal does not extend the bound: a removal it applies again while it replays its log at startup is due at once, and it purges its log through the snapshot it restored. One exception: a replica that loses the removal from its log in a host crash under `raft.wal.fsync = "never"` learns it again from the leader, and its time counts from then.
 
-The bound needs the snapshot driver, which runs on every node of a cluster by default. With `storage.snapshot.drive_interval = "0s"` nothing enforces it, and the server logs a warning at startup. A single node runs no snapshot driver yet, so the bound does not hold there.
+The bound and its gauges need the snapshot driver, which runs on every node of a cluster by default. With `storage.snapshot.drive_interval = "0s"` nothing enforces the bound, the gauges below stay at 0, and the server logs a warning at startup. A single node runs no snapshot driver yet, so the bound does not hold there.
+
+While the driver purges a group's log through a snapshot, the group takes no new snapshot until that purge lands, which is usually at once. An operator's `POST /__ursula/raft/{group}/snapshot` waits for it, and answers `503` with `Retry-After` when the wait passes 10 seconds. An operator's `POST /__ursula/raft/{group}/purge` follows the same rule: while a snapshot of the group builds, or OpenRaft has not published the one it built, it answers `503` with `Retry-After`. The driver also purges the log of a group that holds old WAL segments and applied nothing since its last snapshot, so the WAL can free those segments.
 
 Later releases bound two more places, which this one leaves as they were:
 
@@ -434,7 +436,7 @@ The bound does not cover:
 - Freed disk blocks and memory. Ursula deletes and replaces files but does not overwrite the blocks they used, and read caches keep blocks of a deleted stream until they are evicted. Use encrypted volumes and buckets where that matters.
 - A group whose committed application failed. It keeps its whole log for replay until it is repaired.
 
-`raft_deleted_data_oldest_ms` in `/__ursula/metrics` reports how long ago the oldest removal on the node that no snapshot covers yet applied, and `raft_deleted_data_overdue_groups` counts the groups that hold one past a quarter of `raft.deleted_data_max_age`. `deleted_data` lists each such group with the bytes and age of what it still holds. Alert when `raft_deleted_data_oldest_ms` nears half of `raft.deleted_data_max_age`.
+`raft_deleted_data_oldest_ms` in `/__ursula/metrics` reports how long ago the oldest removal on the node applied whose stream its current snapshot or its Raft log still holds, and `raft_deleted_data_overdue_groups` counts the groups whose snapshot still holds one past a quarter of `raft.deleted_data_max_age`. `deleted_data` lists each such group with what it still holds: `owed` or `replayed` while its snapshot holds the stream, with the bytes and age, and `purging` while only its log does, with the age and the index the log is purged through. Alert when `raft_deleted_data_oldest_ms` nears half of `raft.deleted_data_max_age`.
 
 ## Cleaning S3
 
