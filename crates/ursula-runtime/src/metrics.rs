@@ -55,6 +55,11 @@ impl RuntimeMetrics {
     pub fn record_raft_deleted_data(&self, sample: RaftDeletedDataSample) {
         self.inner.record_raft_deleted_data(sample);
     }
+
+    /// Records snapshot GC passes (#669).
+    pub fn record_snapshot_gc(&self, sample: SnapshotGcSample) {
+        self.inner.record_snapshot_gc(sample);
+    }
 }
 
 /// Declares every runtime metric once and expands the four sections that were
@@ -450,6 +455,13 @@ runtime_metrics! {
     // `raft.deleted_data_max_age`.
     counter raft_deleted_data_oldest_age_ms;
     counter raft_deleted_data_overdue_groups;
+    // Snapshot GC (#669): the snapshot objects the node's GC passes
+    // deleted, and the passes that deleted nothing because a configured
+    // voter of the group had published no snapshot reference,
+    // and the passes that failed, which run again later.
+    counter snapshot_gc_deleted_objects;
+    counter snapshot_gc_skipped_unreferenced_voter;
+    counter snapshot_gc_failed_passes;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
     // must be able to recover after a flush. The separate per-group `*_max`
@@ -793,6 +805,15 @@ impl RuntimeMetricsInner {
             .store_relaxed(sample.overdue_groups);
     }
 
+    pub(crate) fn record_snapshot_gc(&self, sample: SnapshotGcSample) {
+        self.snapshot_gc_deleted_objects
+            .fetch_add_relaxed(sample.deleted);
+        self.snapshot_gc_skipped_unreferenced_voter
+            .fetch_add_relaxed(sample.skipped_unreferenced_voter);
+        self.snapshot_gc_failed_passes
+            .fetch_add_relaxed(sample.failed);
+    }
+
     pub(crate) fn record_cold_pack(&self, bytes: u64, slices: u64) {
         self.cold_pack_uploads.fetch_add_relaxed(1);
         self.cold_pack_bytes.fetch_add_relaxed(bytes);
@@ -1070,7 +1091,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 172] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 175] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1232,6 +1253,9 @@ mod metric_manifest_tests {
         "raft_log_bytes_high_watermark",
         "raft_deleted_data_oldest_age_ms",
         "raft_deleted_data_overdue_groups",
+        "snapshot_gc_deleted_objects",
+        "snapshot_gc_skipped_unreferenced_voter",
+        "snapshot_gc_failed_passes",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",
         "cold_hot_group_bytes_max",
@@ -1362,6 +1386,18 @@ mod metric_manifest_tests {
             (2, 48, 10_000)
         );
     }
+}
+
+/// What snapshot GC passes did (#669), added to the node's counters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SnapshotGcSample {
+    /// The snapshot objects the passes deleted.
+    pub deleted: u64,
+    /// The passes that deleted nothing because a configured voter of the
+    /// group had published no snapshot reference.
+    pub skipped_unreferenced_voter: u64,
+    /// The passes that failed, a build's prune included.
+    pub failed: u64,
 }
 
 /// The deleted data a node's groups still hold, as the snapshot driver's

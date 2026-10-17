@@ -877,6 +877,11 @@ impl GroupEngineMetrics {
         );
     }
 
+    /// Records one snapshot GC pass (#669).
+    pub fn record_snapshot_gc(&self, sample: crate::metrics::SnapshotGcSample) {
+        self.inner.record_snapshot_gc(sample);
+    }
+
     pub fn record_raft_snapshot_build(
         &self,
         placement: ShardPlacement,

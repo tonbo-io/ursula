@@ -2227,6 +2227,264 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// The S3 snapshot objects of group 0 under the snapshot prefix that hold
+/// [`DELETED_MARKER`], read through `cold_store`, whose root is the
+/// snapshot store's.
+async fn snapshot_objects_with_marker(cold_store: &ColdStore) -> Vec<String> {
+    let dir = "snapshots/group-0/objects/";
+    let mut found = Vec::new();
+    for name in cold_store
+        .list_file_names(dir)
+        .await
+        .expect("list the snapshot objects")
+    {
+        if !name.ends_with(".snap") {
+            continue;
+        }
+        let path = format!("{dir}{name}");
+        // Another replica's GC may delete it between the listing and here.
+        let Ok(size) = cold_store.object_size(&path).await else {
+            continue;
+        };
+        let Ok(stored) = cold_store
+            .read_whole_object_range(&path, size, 0, usize::try_from(size).unwrap())
+            .await
+        else {
+            continue;
+        };
+        let body = zstd::stream::decode_all(stored.as_slice()).expect("decode a snapshot object");
+        if body
+            .windows(DELETED_MARKER.len())
+            .any(|window| window == DELETED_MARKER.as_bytes())
+        {
+            found.push(path);
+        }
+    }
+    found
+}
+
+/// #669, with S3 snapshots: within `raft.deleted_data_max_age` of a
+/// stream's deletion, snapshot GC has deleted every snapshot object of the
+/// group that held it, the objects each replica replaced included. The data
+/// stays hot, so only the snapshots hold it. Runs on real S3 in CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
+    let _guard = static_cluster_cli_test_guard().await;
+    if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
+        tracing::warn!(
+            "skipping the S3 snapshot GC test; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
+        );
+        return;
+    }
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the S3 snapshot GC test");
+        return;
+    };
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let cold_root = match std::env::var("URSULA_S3_PREFIX") {
+        Ok(prefix) => format!("{prefix}/ursula-cli-s3-snapshot-gc/{suffix}"),
+        Err(_) => format!("ursula-cli-s3-snapshot-gc/{suffix}"),
+    };
+    let ports = [free_port(), free_port(), free_port()];
+    let peers: Vec<(u64, String)> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let root = std::env::temp_dir().join(format!(
+        "ursula-cli-s3-snapshot-gc-{}-{suffix}",
+        std::process::id()
+    ));
+    remove_test_path(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let max_age = Duration::from_secs(90);
+    let mut configs = Vec::new();
+    let mut admins = Vec::new();
+    for (node_id, port) in (1_u64..).zip(ports) {
+        let config = root.join(format!("node-{node_id}.toml"));
+        let wal_dir = root.join(format!("node-{node_id}-log"));
+        let admin_port = write_node_toml(
+            &config,
+            port,
+            node_id,
+            1,
+            &peers,
+            node_id == 1,
+            &wal_dir,
+            "s3",
+            Some(&cold_root),
+        );
+        let text = std::fs::read_to_string(&config).expect("read node config");
+        assert!(text.contains("init_membership_per_group = false\n"));
+        assert!(text.contains("flush_interval = \"1s\"\n"));
+        // Keep the records hot, so that the snapshots hold them.
+        std::fs::write(
+            &config,
+            text.replace(
+                "init_membership_per_group = false\n",
+                "init_membership_per_group = false\ndeleted_data_max_age = \"90s\"\n\
+                 install_snapshot_timeout = \"10s\"\n",
+            )
+            .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n"),
+        )
+        .expect("write node config");
+        admins.push(format!("http://127.0.0.1:{admin_port}"));
+        configs.push(config);
+    }
+    let config = ursula_config::load_config(Some(&configs[0]), None, None)
+        .unwrap_or_else(|err| panic!("load config for the cold store: {err}"));
+    let cold_store = ColdStore::try_new(&config.storage.cold)
+        .unwrap_or_else(|err| panic!("cold store creation failed: {err}"));
+    let mut children = configs
+        .iter()
+        .map(|config| spawn_node_with_cluster_config_and_cold_s3(binary, config))
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::new();
+    for (_, url) in &peers {
+        wait_until_ready(&client, url, &mut children).await;
+    }
+
+    let stream = format!("{}/erased/marked", peers[0].1);
+    put_until_created(&client, &stream).await;
+    for _ in 0..3 {
+        post_until_no_content(&client, &stream, DELETED_MARKER).await;
+    }
+    for (_, url) in &peers {
+        read_until_matches(
+            &client,
+            &format!("{url}/erased/marked?offset=0&max_bytes=1024"),
+            DELETED_MARKER.repeat(3).as_bytes(),
+        )
+        .await;
+    }
+    // Every replica's current snapshot object holds the stream before it
+    // goes, and every voter has published its reference.
+    for admin in &admins {
+        let snapshot = admin_test_post(&client, format!("{admin}/__ursula/raft/0/snapshot"))
+            .await
+            .send()
+            .await
+            .expect("trigger a snapshot");
+        assert_eq!(snapshot.status(), reqwest::StatusCode::OK);
+    }
+    assert!(
+        !snapshot_objects_with_marker(&cold_store).await.is_empty(),
+        "the snapshot objects before the deletion hold the stream"
+    );
+
+    let mut deleted = false;
+    for _ in 0..100 {
+        if let Ok(response) = client.delete(&stream).send().await
+            && response.status().is_success()
+        {
+            deleted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(deleted, "delete {stream}");
+    let deleted_at = tokio::time::Instant::now();
+    loop {
+        let left = snapshot_objects_with_marker(&cold_store).await;
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            deleted_at.elapsed() < max_age.saturating_add(Duration::from_secs(30)),
+            "snapshot objects {left:?} still hold the deleted stream past the bound"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let mut deleted_objects = 0_u64;
+    for (_, url) in &peers {
+        let (.., metrics) = group_zero_progress(&client, url).await;
+        deleted_objects = deleted_objects.saturating_add(
+            metrics["snapshot_gc_deleted_objects"]
+                .as_u64()
+                .expect("snapshot_gc_deleted_objects"),
+        );
+    }
+    assert!(deleted_objects > 0, "snapshot GC deleted no object");
+
+    // GC never deleted what a replica still names: the object each
+    // replica's reference names exists.
+    for (node_id, _) in &peers {
+        let reference_path = format!("snapshots/group-0/references/node-{node_id}.json");
+        let size = cold_store
+            .object_size(&reference_path)
+            .await
+            .unwrap_or_else(|err| panic!("node {node_id} has no snapshot reference: {err}"));
+        let bytes = cold_store
+            .read_whole_object_range(&reference_path, size, 0, usize::try_from(size).unwrap())
+            .await
+            .expect("read a snapshot reference");
+        let reference: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("a snapshot reference record");
+        let key = reference["snapshot_key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("node {node_id} names no S3 snapshot: {reference}"));
+        cold_store
+            .object_size(key)
+            .await
+            .unwrap_or_else(|err| panic!("node {node_id}'s current snapshot {key} is gone: {err}"));
+    }
+    // A restarted replica restores its current snapshot from the store and
+    // serves group 0 again.
+    let (applied_before, ..) = group_zero_progress(&client, &peers[2].1).await;
+    drop(children.remove(2));
+    children.push(spawn_node_with_cluster_config_and_cold_s3(
+        binary,
+        &configs[2],
+    ));
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
+    let mut served = false;
+    for _ in 0..300 {
+        if let Ok(response) = client
+            .get(format!("{}/__ursula/metrics", peers[2].1))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            let (applied, ..) = group_zero_progress(&client, &peers[2].1).await;
+            if applied >= applied_before {
+                served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "the restarted replica serves group 0 again");
+    let mut status = None;
+    for _ in 0..100 {
+        status = client
+            .get(format!("{}/erased/marked?offset=0", peers[2].1))
+            .send()
+            .await
+            .ok()
+            .map(|response| response.status());
+        if status == Some(reqwest::StatusCode::NOT_FOUND) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        status,
+        Some(reqwest::StatusCode::NOT_FOUND),
+        "the restarted replica reads the deleted stream as gone"
+    );
+
+    drop(children);
+    cold_store
+        .remove_all("")
+        .await
+        .expect("clear the S3 test root");
+    std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart() {
     let _guard = static_cluster_cli_test_guard().await;

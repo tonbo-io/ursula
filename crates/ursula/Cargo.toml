@@ -73,6 +73,9 @@ anyhow = { workspace = true }
 ursula-headers = { workspace = true, features = ["test-support"] }
 criterion = { workspace = true }
 flate2 = { workspace = true }
+# A local operator whose objects carry a modification time, for the
+# snapshot GC tests (#669).
+opendal = { workspace = true, features = ["services-fs"] }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
@@ -81,6 +84,7 @@ tracing-subscriber = { workspace = true }
 # manifest, so `ursula` publishes without waiting for `ursula-ctl`.
 ursula-ctl = { path = "../ursula-ctl" }
 ursula-raft = { workspace = true, features = ["fault-injection"] }
+zstd = { workspace = true }
 
 [[bench]]
 name = "json_text"

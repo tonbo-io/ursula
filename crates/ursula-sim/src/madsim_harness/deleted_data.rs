@@ -870,7 +870,6 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
 mod tests {
     use super::BOUND_INVARIANT;
     use super::Controls;
-    use super::HOLD_INVARIANT;
     use crate::madsim_harness::SimEvent;
     use crate::madsim_harness::SimScenario;
     use crate::madsim_harness::SimTrace;
