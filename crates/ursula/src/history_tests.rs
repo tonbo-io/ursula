@@ -584,6 +584,67 @@ async fn gone_and_beyond_tail_answers_name_the_serving_token() {
             .map(|value| value.as_bytes()),
         Some(&b"bytes */8"[..])
     );
+    assert_eq!(
+        crate::render::error_code_of(response).await,
+        ursula_headers::ErrorCode::RangeNotSatisfiable
+    );
+
+    // A matching `If-None-Match` ignores the range, so a retired token
+    // answers `412`, never `304` or `416`.
+    let latest = format!("{URI}/snapshot/{}", Offset::from_u64(10));
+    let response = send(&target, "GET", &latest, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let etag = response
+        .headers()
+        .get("etag")
+        .expect("an etag")
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let restored_header = restored.to_string();
+    for (uri, headers) in [
+        (latest.clone(), vec![
+            (names::STREAM_INCARNATION, stale.as_str()),
+            ("if-none-match", etag.as_str()),
+        ]),
+        (latest, vec![
+            (names::STREAM_INCARNATION, stale.as_str()),
+            ("if-none-match", etag.as_str()),
+            ("range", "bytes=100-"),
+        ]),
+        (snapshot(old, 10), vec![("if-none-match", etag.as_str())]),
+        (snapshot(old, 10), vec![
+            ("if-none-match", etag.as_str()),
+            ("range", "bytes=100-"),
+        ]),
+    ] {
+        assert_names_token(
+            &target,
+            &uri,
+            &headers,
+            StatusCode::PRECONDITION_FAILED,
+            Some(restored),
+        )
+        .await;
+    }
+    // The immutable route reads its token from the path and ignores a
+    // `Stream-Incarnation` header naming the current one.
+    for (range, status) in [
+        ("bytes=100-", StatusCode::RANGE_NOT_SATISFIABLE),
+        ("bytes=0-1", StatusCode::PRECONDITION_FAILED),
+    ] {
+        assert_names_token(
+            &target,
+            &snapshot(old, 10),
+            &[
+                (names::STREAM_INCARNATION, restored_header.as_str()),
+                ("range", range),
+            ],
+            status,
+            Some(restored),
+        )
+        .await;
+    }
 
     // No stream: no token.
     let response = send(&target, "DELETE", URI, &[], Body::empty()).await;

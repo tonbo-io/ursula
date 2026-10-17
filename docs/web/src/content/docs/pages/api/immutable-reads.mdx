@@ -56,5 +56,5 @@ curl -i "http://127.0.0.1:4437/demo/hello/incarnation/$TOKEN/snapshot/0000000000
 </RequestExample>
 
 <Info>
-After a restore or another history rewrite the stream has a new token, so every URL of the old one answers `412` and a cache never needs purging. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
+After a restore or another history rewrite the stream has a new token, so every URL of the old one answers `412`, or a `404`, `410` or `416` naming the new token, and a cache never needs purging. See [`Stream-Incarnation`](/docs/specs/extensions#24-snapshot-metadata-on-head-and-stream-incarnation).
 </Info>

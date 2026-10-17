@@ -235,7 +235,7 @@ Returns the snapshot blob at the specified offset.
 - `Stream-Snapshot-Digest`: The snapshot digest returned at publish time.
 - `Stream-Next-Offset`: The next offset after the snapshot.
 - `Stream-Up-To-Date: true`: Present when no update follows the snapshot (the snapshot offset is the stream's tail); absent otherwise. Clients then read on from `Stream-Next-Offset`.
-- `ETag`: A strong tag of the whole snapshot. A request whose `If-None-Match` names it answers `304 Not Modified` with the same headers, before any byte range.
+- `ETag`: A strong tag of the whole snapshot. A request whose `If-None-Match` names it answers `304 Not Modified` with the same headers, and ignores any byte range.
 
 > **Note (informative).** Ursula's snapshot `ETag` is the snapshot's digest in quotes.
 
@@ -246,7 +246,7 @@ A server MAY honor a single byte range [RFC9110] on a snapshot read: `Range: byt
 - MUST send `Accept-Ranges: bytes` on every snapshot answer, and answers `206 Partial Content` with only the selected bytes and `Content-Range: bytes first-last/total`;
 - MUST answer a range that starts at or past the end of the snapshot with `416 Range Not Satisfiable` and `Content-Range: bytes */total`;
 - answers a request with several ranges, a range it cannot parse, or `If-Range` with the whole snapshot as `200`;
-- decides `404` and `410` before it looks at the range, and `412` after it: a range that cannot be satisfied answers `416` under any token (Section 2.4);
+- decides `404` and `410` first, then `416` for a range that cannot be satisfied, then `412`, then `304`. A request whose `If-None-Match` names the `ETag` ignores the range, so it answers `412` or `304`, never `416`;
 - sends the same `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Next-Offset`, `Stream-Incarnation` and `ETag` as for the whole body. The digest always covers the whole snapshot, never the range.
 
 Stream reads keep their offset protocol and ignore `Range`.

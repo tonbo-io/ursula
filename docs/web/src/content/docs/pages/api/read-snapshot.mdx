@@ -38,7 +38,7 @@ api: "GET /{bucket}/{stream}/snapshot/{offset}"
 | `502` | The snapshot body is in the cold tier and could not be read. |
 | `503` | The group has no known leader, or the leader could not confirm its leadership in time. Retry after `Retry-After`. |
 
-Response headers include `Content-Type`, `Content-Length`, `Accept-Ranges: bytes`, `ETag` (the snapshot digest in quotes), `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. They describe the whole snapshot on a `206` too: the digest always covers the whole body. A `404` or `412` comes before the range is looked at, and a revalidation with `If-None-Match` answers `304` before it too. To read a snapshot through a cache, use [immutable reads](/docs/api/immutable-reads). A body stored in the cold tier is streamed from it. Snapshot answers are never compressed.
+Response headers include `Content-Type`, `Content-Length`, `Accept-Ranges: bytes`, `ETag` (the snapshot digest in quotes), `Stream-Next-Offset`, `Stream-Snapshot-Offset`, `Stream-Snapshot-Digest`, `Stream-Incarnation`, and `Stream-Up-To-Date: true` when the snapshot offset is the stream's tail. They describe the whole snapshot on a `206` too: the digest always covers the whole body. A `404` comes before the range is looked at, then `416`, then `412`. A revalidation with `If-None-Match` ignores the range and answers `412` or `304`. To read a snapshot through a cache, use [immutable reads](/docs/api/immutable-reads). A body stored in the cold tier is streamed from it. Snapshot answers are never compressed.
 
 <RequestExample>
 ```bash Read specific offset

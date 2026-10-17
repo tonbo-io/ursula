@@ -7,6 +7,10 @@ description: Changes that affect clients and operators, newest first.
 
 0.8.1 is a drop-in patch for 0.8.0: format epoch 4 and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged, so 0.8.0 and 0.8.1 owners and readers of one stream work side by side and owners upgrade one at a time.
 
+### Snapshots
+
+- **A snapshot range past the end answers `416` under a retired token.** A snapshot read whose range starts past the end answers `416` naming the current token under any `Stream-Incarnation`, on both snapshot resources. 0.8.0 answered `412` under a retired token. A matching `If-None-Match` still ignores the range and answers `412` or `304`.
+
 ### SQLite VFS
 
 - **A commit above the commit limit fails as `too_large`.** A commit whose pages take more than `URSULA_VFS_MAX_COMMIT_BYTES` (128 MiB by default, from 4096 bytes to 1 GiB) fails at its COMMIT with `SQLITE_IOERR_AUTH` (7178), action `fix`. SQLite rolls the whole transaction back, nothing of it is logged or sent, and the database stays usable. 0.8.0 bounded a commit only by memory. Readers apply every commit a frame holds, whatever their own limit, and a run of parts too long for any commit frame now fails at its first part instead of after it is joined.
