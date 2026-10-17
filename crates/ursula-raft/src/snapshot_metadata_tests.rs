@@ -397,12 +397,13 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
                         .build_snapshot()
                         .await
                         .unwrap_err();
-                    assert!(
+                    assert!(matches!(
                         error
                             .get_ref()
                             .unwrap()
-                            .is::<super::SnapshotMetadataStopped>()
-                    );
+                            .downcast_ref::<super::SnapshotMetadataStopped>(),
+                        Some(super::SnapshotMetadataStopped::AfterFailure)
+                    ));
                     assert_eq!(
                         visible_pointer(&path).encode_binary().unwrap(),
                         candidate.encode_binary().unwrap()

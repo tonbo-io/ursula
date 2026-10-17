@@ -2128,6 +2128,13 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         self.apply_health
             .check(self.placement.raft_group_id)
             .map_err(group_engine_io_error)?;
+        // A build of an engine that already shut down would be refused at its
+        // publication anyway. Refusing it here skips its upload and its pin,
+        // and hands the node-wide build permit back sooner. The check under
+        // the publication's lock stays the one that counts.
+        if snapshot_metadata_closed(&self.metadata_serial) {
+            return Err(SnapshotMetadataStopped::EngineShutDown.into_io());
+        }
         let snapshot = self
             .snapshot
             .as_ref()
@@ -2218,18 +2225,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         };
         let pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
         let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
-        let inline_fallback = !external_upload;
-        if let Some(metrics) = &self.metrics {
-            metrics.record_raft_snapshot_build(
-                self.placement,
-                stream_count,
-                usize::try_from(pointer.location.size_hint()).unwrap_or(usize::MAX),
-                pointer_bytes.len(),
-                elapsed_ns(started_at),
-                external_upload,
-                inline_fallback,
-            );
-        }
+        let snapshot_bytes = usize::try_from(pointer.location.size_hint()).unwrap_or(usize::MAX);
+        let pointer_len = pointer_bytes.len();
         let current_snapshot = self.current_snapshot.clone();
         let metadata_path = self.snapshot_metadata_path.clone();
         let meta = self.meta.clone();
@@ -2268,6 +2265,18 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             }
         })
         .await?;
+        // Only a build whose publication ran counts as built.
+        if let Some(metrics) = &self.metrics {
+            metrics.record_raft_snapshot_build(
+                self.placement,
+                stream_count,
+                snapshot_bytes,
+                pointer_len,
+                elapsed_ns(started_at),
+                external_upload,
+                !external_upload,
+            );
+        }
         // The snapshot is durable now: its body uploaded and verified (or
         // inline), its reference pinned and its metadata persisted, and it is
         // the group's current snapshot. Nothing below fails the build: the
@@ -2320,20 +2329,56 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     }
 }
 
-/// Local snapshot metadata errors stop OpenRaft. Queued pointer operations
-/// must observe the same terminal boundary even before RaftCore sees the error.
+/// Where a group's snapshot metadata publication stands. Local snapshot
+/// metadata errors stop OpenRaft, and queued pointer operations must observe
+/// the same terminal boundary even before RaftCore sees the error. A group
+/// engine that shut down publishes nothing more: OpenRaft runs each snapshot
+/// build in a task that its shutdown neither stops nor waits for, so a build
+/// can reach its publication after the engine stopped, while the WAL closes
+/// or a restarted replica of the group owns the same metadata file (#489).
 #[derive(Debug, Default)]
 pub(crate) enum MetadataPublicationState {
     #[default]
     Ready,
     Failed,
+    ShutDown,
 }
 
+/// Why a snapshot metadata publication was refused without running.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "snapshot metadata publication stopped after an earlier failure; restart to resolve the durable pointer"
-)]
-struct SnapshotMetadataStopped;
+pub(crate) enum SnapshotMetadataStopped {
+    #[error(
+        "snapshot metadata publication stopped after an earlier failure; restart to resolve the durable pointer"
+    )]
+    AfterFailure,
+    #[error("snapshot metadata publication stopped because the group engine shut down")]
+    EngineShutDown,
+}
+
+impl SnapshotMetadataStopped {
+    /// The refusal as the io::Error OpenRaft's snapshot storage API requires.
+    fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, self)
+    }
+}
+
+/// Whether the group engine closed its snapshot metadata publication. A
+/// publication running now holds the lock and counts as open: the check
+/// under the lock in [`snapshot_metadata_work`] decides.
+fn snapshot_metadata_closed(serial: &crate::rt::sync::Mutex<MetadataPublicationState>) -> bool {
+    serial
+        .try_lock()
+        .is_ok_and(|state| matches!(*state, MetadataPublicationState::ShutDown))
+}
+
+/// Ends a group's snapshot metadata publication for good, once a publication
+/// that is running finished: a blocking fsync cannot be cancelled. Every
+/// later publication is refused with [`SnapshotMetadataStopped::EngineShutDown`].
+pub(crate) async fn close_snapshot_metadata(
+    serial: &crate::rt::sync::Mutex<MetadataPublicationState>,
+) {
+    *serial.lock().await = MetadataPublicationState::ShutDown;
+}
 
 /// Keep metadata fsync and the serialized pointer transition off core workers.
 pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
@@ -2342,12 +2387,13 @@ pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
 ) -> Result<T, io::Error> {
     let mut serial = serial.lock_owned().await;
     let work = move || {
-        if matches!(*serial, MetadataPublicationState::Failed) {
-            // OpenRaft's snapshot storage API requires an io::Error here.
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                SnapshotMetadataStopped,
-            ));
+        let refused = match *serial {
+            MetadataPublicationState::Ready => None,
+            MetadataPublicationState::Failed => Some(SnapshotMetadataStopped::AfterFailure),
+            MetadataPublicationState::ShutDown => Some(SnapshotMetadataStopped::EngineShutDown),
+        };
+        if let Some(refused) = refused {
+            return Err(refused.into_io());
         }
         let result = work();
         if result.is_err() {
@@ -2513,7 +2559,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap_err();
-        assert!(error.get_ref().unwrap().is::<SnapshotMetadataStopped>());
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<SnapshotMetadataStopped>(),
+            Some(SnapshotMetadataStopped::AfterFailure)
+        ));
         assert!(!executed.load(Ordering::Acquire));
     }
 
