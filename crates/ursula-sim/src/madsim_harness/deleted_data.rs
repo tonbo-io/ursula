@@ -658,8 +658,16 @@ pub(super) async fn run_deleted_data_inner(
                 phase: "power_lost_after_covering_snapshot".to_owned(),
             });
             cluster.start_node(covered).await;
-            let restarted = metrics(&cluster, GROUP, covered);
             if controls.purge_after_restart {
+                // OpenRaft publishes the restored state from its core task,
+                // after the engine started.
+                let deadline = madsim::time::Instant::now() + Duration::from_secs(1);
+                while metrics(&cluster, GROUP, covered).last_applied.is_none()
+                    && madsim::time::Instant::now() < deadline
+                {
+                    madsim::time::sleep(Duration::from_millis(1)).await;
+                }
+                let restarted = metrics(&cluster, GROUP, covered);
                 // What the restore purge is for: the replica restored the
                 // snapshot that dropped the stream, and OpenRaft's startup
                 // purged none of its log (it purges only a log that ends
@@ -668,7 +676,8 @@ pub(super) async fn run_deleted_data_inner(
                 assert!(
                     restored >= Some(removal_index),
                     "{context}: node {covered} restored snapshot {restored:?}, below the \
-                     removal at {removal_index}"
+                     removal at {removal_index} ({})",
+                    replica_state(&cluster, covered)
                 );
                 assert_eq!(
                     restarted.purged.map(|log_id| log_id.index),
