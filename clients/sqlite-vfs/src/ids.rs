@@ -6,6 +6,8 @@
 
 use std::fs::File;
 use std::io::Read;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 /// The device read for random identifiers.
 pub const URANDOM: &str = "/dev/urandom";
@@ -48,6 +50,24 @@ impl GenId {
 /// 16 bytes per activation of a host, carried by CLAIM frames (design: Claims, Clones).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Activation(pub [u8; 16]);
+
+impl Activation {
+    /// A fresh activation for an open that names none: 16 random bytes per open (design: Claims).
+    /// Without [`URANDOM`], the clock, the process id and a per-process count, so two opens of one
+    /// process still differ.
+    pub fn draw() -> Activation {
+        static DRAWN: AtomicU64 = AtomicU64::new(0);
+        let bytes = random16().unwrap_or_else(|_unavailable| {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let count = DRAWN.fetch_add(1, Ordering::Relaxed);
+            let salt = u128::from(std::process::id()).rotate_left(64) | u128::from(count);
+            (nanos ^ salt).to_le_bytes()
+        });
+        Activation(bytes)
+    }
+}
 
 /// A record's place in its log: positions grow by one per record.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]

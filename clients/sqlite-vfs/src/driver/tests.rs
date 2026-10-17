@@ -4859,6 +4859,97 @@ fn a_provisional_open_waits_for_its_claim_then_goes_live() {
     }));
 }
 
+/// An owner that bound and never wrote under its claim, then crashed or (with `clean`) closed:
+/// its generation and the epoch of its claim, acknowledged up to the claim's end.
+fn idle_owner(w: &mut World, dir: &Path, clean: bool) -> (PathBuf, Epoch) {
+    let c = w.core();
+    let bound = w.open(c, spec(dir, 1));
+    w.run_for(2_000);
+    let own = *w.claims(c).last().unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    if clean {
+        w.retire(c, &bound);
+        drop(bound);
+    } else {
+        drop(bound);
+        w.crash(c);
+    }
+    (generation, own)
+}
+
+/// The owner never wrote under its claim, so its ACK sits at the claim's end: the pre-check has
+/// nothing to read, and the claim sent again meets a repeat whose receipt ends at the acknowledged
+/// offset. That is our own record, not a stream that lost state: the claim of `own + 1` follows,
+/// the commit made offline goes out, `synced()` resolves and the binding is live, after a crash as
+/// after a clean close.
+#[test]
+fn a_provisional_open_of_an_owner_that_never_wrote_goes_live() {
+    for clean in [false, true] {
+        let dir = TempDir::new("driver-provisional-idle");
+        let mut w = World::new();
+        let (generation, own) = idle_owner(&mut w, dir.path(), clean);
+        let c = w.core();
+        let bound = open_provisionally(&mut w, c, dir.path());
+        assert_eq!(bound.handle.generation.dir, generation);
+        let x = w.commit(c, &bound, 2).unwrap();
+        let ticket = w.sync(c, bound.binding);
+        w.down[c] = false;
+        w.run_for(10_000);
+        assert!(w.resets(c).is_empty(), "clean {clean}: {:?}", w.resets(c));
+        assert_eq!(w.outcome(c, ticket), Some(Ok(())), "clean {clean}");
+        assert!(!bound.handle.provisional());
+        let next = Epoch::try_from(own.get() + 1).unwrap();
+        assert_eq!(claimed(&w, c), vec![own, next], "clean {clean}");
+        assert_eq!(w.stream_commits(), vec![x], "clean {clean}");
+    }
+}
+
+/// An open that names no activation draws its own (design: Claims, 16 random bytes per open), so
+/// two opens of one process differ. A reopen under a new activation still knows the claims its log
+/// holds from the open before as its own: offline, it continues them at `own + 1`.
+#[test]
+fn each_open_draws_an_activation_and_a_reopen_continues_the_claims_before_it() {
+    let (first, second) = (Activation::draw(), Activation::draw());
+    assert_ne!(first, second);
+    let dir = TempDir::new("driver-activation-per-open");
+    let mut w = World::new();
+    let c = w.core();
+    let bound = w.open(c, OpenSpec {
+        activation: first,
+        ..spec(dir.path(), 0)
+    });
+    let x = w.commit(c, &bound, 1).unwrap();
+    w.run_for(2_000);
+    assert_eq!(bound.handle.pending_bytes(), 0);
+    let own = *w.claims(c).last().unwrap();
+    let generation = bound.handle.generation.dir.clone();
+    w.retire(c, &bound);
+    drop(bound);
+    let c2 = w.core();
+    w.down[c2] = true;
+    let bound = w.open(c2, OpenSpec {
+        activation: second,
+        ..spec(dir.path(), 0)
+    });
+    assert!(bound.handle.provisional());
+    w.down[c2] = false;
+    w.run_for(10_000);
+    assert!(w.resets(c2).is_empty(), "{:?}", w.resets(c2));
+    assert!(!bound.handle.provisional());
+    let next = Epoch::try_from(own.get() + 1).unwrap();
+    assert_eq!(claimed(&w, c2), vec![own, next]);
+    let records = log_records(&generation);
+    assert!(records.contains(&RecordBody::Claim {
+        epoch: own,
+        activation: first,
+    }));
+    assert!(records.contains(&RecordBody::Claim {
+        epoch: next,
+        activation: second,
+    }));
+    assert_eq!(w.stream_commits(), vec![x]);
+}
+
 /// A provisional binding with nothing pending retires once its last connection closes, its
 /// pre-check still out, and logged nothing: the next open, which reaches the stream, takes over
 /// the same generation, its claim above the log's.

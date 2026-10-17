@@ -906,6 +906,71 @@ fn a_provisional_open_sends_its_logs_claim_again_after_the_pre_check() {
     );
 }
 
+/// An owner that bound and never wrote under its claim acknowledged up to the claim's end: the
+/// provisional open's pre-check has nothing to read, and the claim sent again meets a repeat whose
+/// receipt ends at the acknowledged offset. That is the record this generation acknowledged, not a
+/// stream that lost state: one continuation claim of the next epoch follows and binds.
+#[test]
+fn a_provisional_claim_repeated_at_the_acknowledged_offset_claims_the_next_epoch() {
+    let mut h = provisional(Vec::new());
+    let actions = h.answer(&head(token(), CLAIM, None));
+    assert_eq!(claim_of(&actions), Some((3, PRIOR)), "{actions:?}");
+    let actions = h.answer(&producer(&receipt(Delivery::Repeat, 3, 0, 0, CLAIM, None)));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert!(actions.contains(&Action::PersistClaim {
+        epoch: epoch(4),
+        activation: ACTIVATION,
+    }));
+    assert_eq!(claim_of(&actions), Some((4, ACTIVATION)), "{actions:?}");
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Applied,
+        4,
+        0,
+        CLAIM,
+        2 * CLAIM,
+        None,
+    )));
+    assert!(
+        actions.iter().any(|a| matches!(a, Action::Bound { .. })),
+        "{actions:?}"
+    );
+}
+
+/// The same after an inheriting history event: the pre-check re-keys, and the claim sent again
+/// under the new token meets the repeat row the history carried over (it comes before the history
+/// fence). Its receipt ends at the acknowledged offset, so the next epoch follows.
+#[test]
+fn a_provisional_claim_repeated_at_the_acknowledged_offset_after_a_re_key_claims_on() {
+    let mut h = provisional(Vec::new());
+    let actions = h.answer(&head(new_token(), CLAIM, Some((token(), CLAIM))));
+    assert_eq!(claim_of(&actions), Some((3, PRIOR)), "{actions:?}");
+    let actions = h.answer(&receipt_new(Delivery::Repeat, 3, 0, 0, CLAIM, None));
+    assert_eq!(reset_of(&actions), None, "{actions:?}");
+    assert_eq!(claim_of(&actions), Some((4, ACTIVATION)), "{actions:?}");
+}
+
+/// A repeat receipt that starts below the acknowledged offset and ends past it is no record this
+/// generation acknowledged: the stream holds other bytes than ours there, `stream_state`.
+#[test]
+fn a_provisional_claim_repeated_across_the_acknowledged_offset_resets_stream_state() {
+    let mut h = provisional(Vec::new());
+    h.answer(&head(token(), CLAIM, None));
+    let actions = h.answer(&producer(&receipt(
+        Delivery::Repeat,
+        3,
+        0,
+        CLAIM - 1,
+        2 * CLAIM - 1,
+        None,
+    )));
+    assert_eq!(
+        reset_of(&actions),
+        Some(ResetKind::StreamState),
+        "{actions:?}"
+    );
+    assert!(claim_of(&actions).is_none(), "{actions:?}");
+}
+
 /// `receipt-evicted` for the claim sent again: its digest is ours, and later writes under it
 /// evicted its receipt, so it applied before and the next epoch follows. `producer-expired` naming
 /// its epoch, the pre-check without its frame, proves nothing about whose record retired: the

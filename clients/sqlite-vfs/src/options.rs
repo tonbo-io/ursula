@@ -28,7 +28,7 @@ pub(crate) enum Access {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OpenOptions {
     pub(crate) max_pending_bytes: u64,
-    /// The platform activation id, 32 hex digits; a random one per process otherwise.
+    /// The platform activation id, 32 hex digits; a random one per open otherwise.
     pub(crate) activation: Option<Activation>,
     /// The bearer token (one per process).
     pub(crate) token: Option<String>,
