@@ -358,8 +358,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(*NAMED, 
             "--set",
-            "s3.bucket=bkt",
-            "--set",
             "gateway.enabled=true",
         )
 
@@ -834,6 +832,30 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(removed.split("=", 1)[0].rsplit(".", 1)[1], result.stderr)
+
+    def test_removed_indexer_values_are_refused(self) -> None:
+        for removed in (
+            "indexer.enabled=false",
+            "deploymentContract.indexerRoleArn=arn:aws:iam::123456789012:role/indexer",
+        ):
+            with self.subTest(removed=removed):
+                result = subprocess.run(
+                    [
+                        "helm",
+                        "template",
+                        "test",
+                        "charts/ursula",
+                        "--set",
+                        "s3.bucket=bkt",
+                        "--set",
+                        removed,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("indexer", result.stderr)
 
     def test_cold_max_hot_bytes_zero_is_rendered(self) -> None:
         config = render_config(*NAMED, 

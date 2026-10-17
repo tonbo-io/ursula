@@ -69,4 +69,4 @@ processors:
     send_batch_max_size: 2048
 ```
 
-Ursula does not decompress request bodies, so keep `compression: none`, and keep batches well under the 32 MiB request limit. Each export request is stored as one message; replay and tail the stream by offset as above.
+Ursula does not decompress request bodies, so keep `compression: none`, and keep batches well under the 32 MiB request limit. Each export request is stored as one message. Replay and tail the stream by offset as above.
