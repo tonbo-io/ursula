@@ -2739,7 +2739,7 @@ impl Stream {
                     Exchange::Answered(answer) => answer.body.as_slice(),
                     Exchange::NoAnswer(_) => &[],
                 };
-                if (body.is_empty() || probe_skips(body, ctx)) && next == from {
+                if (body.is_empty() && next == from) || probe_skips(body, ctx) {
                     // The append slot keeps its own condition (a blocked append stays blocked).
                     if matches!(self.work, Work::Idle) {
                         ctx.set_condition(None, actions);
