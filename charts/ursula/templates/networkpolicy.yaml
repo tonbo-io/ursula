@@ -25,11 +25,6 @@ spec:
             matchLabels:
               {{- include "ursula.gatewaySelectorLabels" $ | nindent 14 }}
         {{- end }}
-        {{- if $.Values.indexer.enabled }}
-        - podSelector:
-            matchLabels:
-              {{- include "ursula.indexerSelectorLabels" $ | nindent 14 }}
-        {{- end }}
         {{- if $.Values.tests.enabled }}
         - podSelector:
             matchLabels:

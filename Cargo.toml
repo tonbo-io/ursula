@@ -14,7 +14,6 @@ members = [
     "crates/ursula-sim",
     "crates/ursula-observability",
     "crates/ursula-gateway",
-    "crates/ursula-index",
     "crates/ursula-state-probe",
 ]
 exclude = ["third_party"]
@@ -35,8 +34,6 @@ categories = ["database-implementations", "network-programming"]
 anyhow = "1"
 arc-swap = "1.9"
 axum = "0.8"
-arrow-array = "59.1.0"
-arrow-schema = "59.1.0"
 base64 = "0.22"
 bitflags = "2"
 bytes = "1.7"
@@ -63,8 +60,6 @@ blake3 = "1"
 opentelemetry = "0.30"
 opentelemetry_sdk = { version = "0.30", features = ["metrics"] }
 opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics"] }
-parquet = { version = "59.1.0", default-features = false, features = ["arrow", "async", "zstd"] }
-foyer = { version = "0.22.3", features = ["nightly"] }
 fs4 = "0.13"
 # OpenRaft and the crates it publishes in lockstep stay on one exact release.
 # OpenRaft names its macros and runtime crates with a prerelease range, so
@@ -107,7 +102,6 @@ ursula-control = { path = "crates/ursula-control", version = "=0.8.0" }
 ursula-ctl = { path = "crates/ursula-ctl", version = "=0.8.0" }
 ursula-gateway = { path = "crates/ursula-gateway", version = "=0.8.0" }
 ursula-headers = { path = "crates/ursula-headers", version = "=0.8.0" }
-ursula-index = { path = "crates/ursula-index", version = "=0.8.0" }
 ursula-proto = { path = "crates/ursula-proto", version = "=0.8.0" }
 ursula-raft = { path = "crates/ursula-raft", version = "=0.8.0" }
 ursula-runtime = { path = "crates/ursula-runtime", version = "=0.8.0" }

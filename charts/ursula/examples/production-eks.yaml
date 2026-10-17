@@ -70,14 +70,3 @@ gateway:
           matchLabels:
             app.kubernetes.io/name: ursula-gateway
             app.kubernetes.io/instance: ursula
-
-indexer:
-  enabled: true
-  replicaCount: 2
-  s3:
-    prefix: indexes
-  serviceAccount:
-    annotations:
-      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
-  podDisruptionBudget:
-    enabled: true

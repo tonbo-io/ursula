@@ -60,7 +60,7 @@ A JSON message boundary is an offset whose preceding stored byte is LF, plus the
 
 The server does not assign a timestamp to messages. Applications that need event time SHOULD include one client-supplied timestamp in each JSON value, for example a `captured_at` field in a telemetry event.
 
-Client event times MAY be out of order and MUST NOT change committed message order, stored bytes, or offsets. Their HTTP metadata representation and any secondary index over them are outside this document; Ursula's experimental event-time indexer is one such index.
+Client event times MAY be out of order and MUST NOT change committed message order, stored bytes, or offsets. Their HTTP metadata representation and any secondary index over them are outside this document.
 
 ## 1. Buckets
 

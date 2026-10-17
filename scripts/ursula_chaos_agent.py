@@ -478,10 +478,6 @@ class ChaosAgent:
         if args.record_stream_count < 0 or args.record_stream_count > self.workload_stream_count:
             raise SystemExit("--record-stream-count must be between 0 and --stream-count")
         self.record_stream_count = args.record_stream_count
-        self.indexer_url = args.indexer_url.rstrip("/")
-        self.index_source_base_url = args.index_source_base_url.rstrip("/")
-        self.index_registration_prefix = args.index_registration_prefix.strip("-")
-        self.index_cleanup_done = False
         self.workload_stream_ttl_secs = max(0, args.workload_stream_ttl_secs)
         self.workload_run_secs = max(0, args.workload_run_secs)
         if (
@@ -578,9 +574,6 @@ class ChaosAgent:
         self.gc_churn_errors = 0
         self.gc_churn_pending: deque[tuple[str, float]] = deque()
         self.last_gc_churn_success = 0
-        self.index_registration_success = 0
-        self.index_registration_errors = 0
-        self.last_indexer_error: str | None = None
         self.restored_workload_coverage: dict[str, Any] = {}
         self.restored_started_at: datetime | None = None
         self.restore_published_state()
@@ -927,7 +920,6 @@ class ChaosAgent:
         return False
 
     def create_streams(self) -> None:
-        self.cleanup_stale_index_registrations()
         self.create_workload_run_streams(
             self.run_id,
             self.streams,
@@ -953,7 +945,6 @@ class ChaosAgent:
                 last_error = f"{node.name}: {exc}"
                 continue
             if status in {200, 201, 409}:
-                self.register_index_stream(stream)
                 self.created_streams.add(stream.name)
                 return
             last_error = f"{node.name}: status={status}"
@@ -961,85 +952,6 @@ class ChaosAgent:
             f"unable to create chaos stream {stream.name} on any node"
             + (f" ({last_error})" if last_error else "")
         )
-
-    def register_index_stream(self, stream: WorkloadStream) -> None:
-        if stream.content_type != "application/json" or not self.indexer_url:
-            return
-        source_base = self.index_source_base_url or self.nodes[0].base_url
-        index_id = urllib.parse.quote(self.index_registration_id(stream), safe="")
-        payload = json.dumps(
-            {
-                "stream_url": f"{source_base}/{BUCKET}/{stream.name}",
-                "timestamp_field": "captured_at",
-            }
-        ).encode()
-        status, body, _ = self.request(
-            "PUT",
-            f"{self.indexer_url}/v1/indexes/{index_id}",
-            body=payload,
-            headers={"Content-Type": "application/json"},
-            timeout_secs=15,
-        )
-        if status in {200, 201, 204}:
-            self.index_registration_success += 1
-            self.last_indexer_error = None
-            return
-        self.index_registration_errors += 1
-        self.last_indexer_error = (
-            f"register {stream.name}: status={status} body={body[:160].decode(errors='replace')!r}"
-        )
-        raise RuntimeError(self.last_indexer_error)
-
-    def index_registration_id(self, stream: WorkloadStream) -> str:
-        if not self.index_registration_prefix:
-            return stream.name
-        return f"{self.index_registration_prefix}-{stream.name}"
-
-    def unregister_index_stream(self, stream: WorkloadStream) -> None:
-        if stream.content_type != "application/json" or not self.indexer_url:
-            return
-        index_id = urllib.parse.quote(self.index_registration_id(stream), safe="")
-        status, body, _ = self.request(
-            "DELETE",
-            f"{self.indexer_url}/v1/indexes/{index_id}",
-            timeout_secs=15,
-        )
-        if status in {204, 404}:
-            return
-        self.index_registration_errors += 1
-        self.last_indexer_error = (
-            f"unregister {stream.name}: status={status} body={body[:160].decode(errors='replace')!r}"
-        )
-        self.event("warn", self.last_indexer_error)
-
-    def cleanup_stale_index_registrations(self) -> None:
-        if self.index_cleanup_done or not self.indexer_url or not self.index_registration_prefix:
-            return
-        status, body, _ = self.request("GET", f"{self.indexer_url}/v1/indexes", timeout_secs=15)
-        if status != 200:
-            raise RuntimeError(f"list index registrations failed: status={status}")
-        registrations = json.loads(body)
-        current_ids = {
-            self.index_registration_id(stream)
-            for stream in self.streams
-            if stream.content_type == "application/json"
-        }
-        prefix = f"{self.index_registration_prefix}-"
-        for registration in registrations if isinstance(registrations, list) else []:
-            registration_id = registration.get("id") if isinstance(registration, dict) else None
-            if not isinstance(registration_id, str) or not registration_id.startswith(prefix):
-                continue
-            if registration_id in current_ids:
-                continue
-            encoded_id = urllib.parse.quote(registration_id, safe="")
-            delete_status, _, _ = self.request(
-                "DELETE", f"{self.indexer_url}/v1/indexes/{encoded_id}", timeout_secs=15
-            )
-            if delete_status not in {204, 404}:
-                raise RuntimeError(
-                    f"delete stale index registration {registration_id} failed: status={delete_status}"
-                )
-        self.index_cleanup_done = True
 
     def create_workload_run_streams(
         self,
@@ -1102,7 +1014,6 @@ class ChaosAgent:
             raise
         with self.state_lock:
             previous_run_id = self.run_id
-            previous_streams = self.streams
             self.run_generation = next_generation
             self.run_id = next_run_id
             self.current_run_started_at = utc_now()
@@ -1116,8 +1027,6 @@ class ChaosAgent:
             self.rollover_forced_with_unknown_appends = False
             self.next_workload_rollover_at = time.monotonic() + self.workload_run_secs
         self.event("info", f"rolled workload streams {previous_run_id} -> {next_run_id}")
-        for stream in previous_streams:
-            self.unregister_index_stream(stream)
 
     def append_once(self, lane_id: int | None = None) -> bool:
         with self.state_lock:
@@ -3092,7 +3001,6 @@ class ChaosAgent:
         running_nodes = sum(1 for node in nodes if node.get("instance_state") == "running")
         metrics_ok = sum(1 for node in nodes if node.get("metrics_state") == "ok")
         storage = self.storage_status(nodes)
-        indexer = self.sample_indexer()
         raft_lag_status = self.raft_replica_lag_status(topology)
         raft_replicas_caught_up = raft_lag_status["ok"]
         full_raft_nodes = sum(
@@ -3397,7 +3305,6 @@ class ChaosAgent:
                 "record_stream_count": sum(
                     1 for stream in self.streams if stream.content_type == "application/json"
                 ),
-                "indexer": indexer,
                 "gc_churn_created_total": self.gc_churn_created,
                 "gc_churn_deleted_total": self.gc_churn_deleted,
                 "gc_churn_error_total": self.gc_churn_errors,
@@ -3446,35 +3353,6 @@ class ChaosAgent:
             self.last_status_cold_backpressure_events = cold_backpressure_events
         self.last_status_published_at = published_at
         return status
-
-    def sample_indexer(self) -> dict[str, Any]:
-        if not self.indexer_url:
-            return {"enabled": False}
-        status, body, _ = self.request(
-            "GET", f"{self.indexer_url}/v1/indexes", timeout_secs=10
-        )
-        result: dict[str, Any] = {
-            "enabled": True,
-            "url": self.indexer_url,
-            "registration_success_total": self.index_registration_success,
-            "registration_error_total": self.index_registration_errors,
-            "last_error": self.last_indexer_error,
-        }
-        if status != 200:
-            result.update({"status": "unavailable", "http_status": status})
-            return result
-        try:
-            registrations = json.loads(body)
-        except ValueError as exc:
-            result.update({"status": "invalid_response", "last_error": str(exc)})
-            return result
-        result.update(
-            {
-                "status": "ready",
-                "registered_streams": len(registrations) if isinstance(registrations, list) else None,
-            }
-        )
-        return result
 
     def storage_status(self, nodes: list[dict[str, Any]]) -> dict[str, Any]:
         def numeric(node: dict[str, Any], field: str) -> int:
@@ -3703,17 +3581,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="number of workload streams that append JSON records with captured_at",
-    )
-    parser.add_argument("--indexer-url", default="")
-    parser.add_argument(
-        "--index-registration-prefix",
-        default="",
-        help="ownership prefix used to clean stale dynamic index registrations",
-    )
-    parser.add_argument(
-        "--index-source-base-url",
-        default="",
-        help="Ursula base URL reachable by the indexer; defaults to the first --node URL",
     )
     parser.add_argument("--workload-stream-ttl-secs", type=int, default=7200,
                         help="server-side TTL for main workload streams (0 disables)")
