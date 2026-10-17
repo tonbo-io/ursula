@@ -3,14 +3,15 @@
 // restores a snapshot of it does, and opened by another process.
 //
 // - A copy opened while the stream answers takes it over, and the original resets `fenced` at its
-//   next commit. Every row the original synced survives.
+//   next commit or `synced()`. Every row the original synced survives.
 // - Two copies that open with one `activation` send one claim and share its epoch. The first
 //   divergent commit fences exactly one of them, and the other goes on.
 // - An offline copy whose original kept writing finds the original's commits in its pre-check and
 //   resets `stale` with nothing sent.
 // - An offline copy of an idle original holds the original's claim in its log, so the pre-check
 //   finds nothing foreign: it claims the next epoch, goes live and fences the original.
-// - A copy that fell behind retention never trusts the original's snapshot. It rebuilds from it.
+// - A copy behind retention, opened while the stream answers, does not take the original's
+//   snapshot as covering its own commits. It rebuilds from it into a new generation.
 //
 // In every case no commit id reaches the stream twice.
 import { randomBytes } from "node:crypto";
@@ -18,7 +19,7 @@ import { cpSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { loadUrsulaVfs, open } from "../src/index.ts";
-import { Child, directUrl, ext, freshDir, fromStream, frames, gate, killChildren, onModel, retired, stream } from "./kit.ts";
+import { Child, directUrl, ext, freshDir, fromStream, frames, gate, killChildren, retired, stream, streamBytes } from "./kit.ts";
 
 loadUrsulaVfs(ext());
 
@@ -31,7 +32,9 @@ interface Status {
 	epoch: number;
 	path: string;
 	reset: { kind: string; action: string } | null;
-	attach: { local: string };
+	attach: { local: string; snapshot_offset: number | null };
+	commits: { logged: number; acknowledged: number };
+	snapshot: { offset: number | null };
 }
 
 /** A copy of the cache root `dir`, taken as it is, its owner running or not. */
@@ -86,27 +89,10 @@ async function head(path: string): Promise<{ retained: number; tail: number }> {
 	return { retained: Number(r.headers.get("stream-retained-offset") ?? "0"), tail: Number(tail) };
 }
 
-/** Every byte of the stream at `path` from its retained offset: the model's frames, or reads to the tail. */
-async function retainedBytes(path: string): Promise<Uint8Array> {
-	if (onModel()) return new Uint8Array(await (await fetch(`${directUrl()}/__model/frames?path=${path}`)).arrayBuffer());
-	const { retained } = await head(path);
-	const chunks: Uint8Array[] = [];
-	for (let offset = retained === 0 ? "-1" : String(retained); ; ) {
-		const r = await fetch(`${directUrl()}${path}?offset=${offset}`);
-		expect(r.status, `read ${path} from ${offset}`).toBe(200);
-		const chunk = new Uint8Array(await r.arrayBuffer());
-		chunks.push(chunk);
-		const next = r.headers.get("stream-next-offset");
-		expect(next).not.toBeNull();
-		if (r.headers.has("stream-up-to-date") || chunk.length === 0 || next === offset) break;
-		offset = next as string;
-	}
-	return new Uint8Array(Buffer.concat(chunks));
-}
-
 /** No commit id `(lineage, position)` is in the stream at `path` twice, as far as it is retained. */
 async function commitsOnce(path: string): Promise<void> {
-	const bytes = await retainedBytes(path);
+	const { retained } = await head(path);
+	const bytes = await streamBytes(path, retained === 0 ? "-1" : String(retained));
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
 	const ids: string[] = [];
 	for (let at = 0; at < bytes.length; at += 13 + view.getUint32(at + 5, true)) {
@@ -152,10 +138,13 @@ describe("copies of a live cache", () => {
 		const s = stream("clone-activation");
 		const dir = freshDir();
 		const first = await open(s.url, { dir });
-		first.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
-		await first.synced();
 		const location = first.location() as string;
-		first.close();
+		try {
+			first.exec("CREATE TABLE t(x); INSERT INTO t VALUES (1)");
+			await first.synced();
+		} finally {
+			first.close();
+		}
 		await retired(location);
 		const before = await frames(s.path);
 
@@ -259,13 +248,18 @@ describe("copies of a live cache", () => {
 				const epoch = (await status(original)).epoch;
 
 				const copy = await offline(s.path, copyOf(dir), wrote ? "INSERT INTO t VALUES (2)" : "CREATE TABLE t(x); INSERT INTO t VALUES (2)");
+				const before = await frames(s.path);
 				await mode("forward");
 				await synced(copy);
-				// The pre-check found nothing foreign, and the copy continued the original's claim.
+				// The pre-check found nothing foreign, the resent claim was a repeat, and exactly one
+				// continuation of the original's claim landed.
 				expect(await status(copy)).toMatchObject({ state: "live", reset: null, epoch: epoch + 1 });
+				expect((await frames(s.path)).claims).toBe(before.claims + 1);
 
-				await original.exec(wrote ? "INSERT INTO t VALUES (3)" : "CREATE TABLE t(x); INSERT INTO t VALUES (3)");
+				// The original's output gate finds the copy's claim past its tail, with no commit of its own.
+				await rejects(original, "fenced");
 				expect((await resetOf(original)).reset).toEqual({ kind: "fenced", action: "stop" });
+				expect(await original.send({ exec: "INSERT INTO t VALUES (3)" })).toMatchObject({ ok: false });
 				await original.stop();
 
 				await copy.exec("INSERT INTO t VALUES (4)");
@@ -287,17 +281,24 @@ describe("copies of a live cache", () => {
 		await original.opened();
 		await original.exec("CREATE TABLE t(x, pad); INSERT INTO t VALUES (1, randomblob(2000))");
 		await synced(original);
-		// Its latest ACK is written at most once a second.
-		await sleep(1_500);
+		// The first snapshot fsyncs BASE and ACK before it publishes: copied after, the copy holds
+		// an exact ACK and no checkpoint in progress.
+		const deadline = Date.now() + 30_000;
+		for (;;) {
+			const st = await status(original);
+			if (st.snapshot.offset !== null && st.commits.acknowledged === st.commits.logged) break;
+			expect(Date.now(), `no snapshot: ${JSON.stringify(st)}`).toBeLessThan(deadline);
+			await sleep(50);
+		}
 		const copied = copyOf(dir);
 		const [generation, ...others] = generations(copied);
 		expect(others).toEqual([]);
 		const { tail } = await head(s.path);
 
 		// The original writes on until retention passes everything the copy holds.
-		const deadline = Date.now() + 60_000;
+		const writes = Date.now() + 60_000;
 		for (let x = 2; (await head(s.path)).retained <= tail; x++) {
-			expect(Date.now(), "retention never passed the copy").toBeLessThan(deadline);
+			expect(Date.now(), "retention never passed the copy").toBeLessThan(writes);
 			await original.exec(`INSERT INTO t VALUES (${x}, randomblob(2000))`);
 			await synced(original);
 			await sleep(300);
@@ -309,6 +310,9 @@ describe("copies of a live cache", () => {
 		expect(opened.state).toBe("live");
 		// Rebuilt into a new generation from the latest snapshot and the tail.
 		expect(opened.path).not.toContain(generation as string);
+		const attach = (await status(copy)).attach;
+		expect(attach.local).toBe("built");
+		expect(attach.snapshot_offset).toBeGreaterThan(tail);
 		expect(await copy.rows("SELECT x, hex(pad) AS pad FROM t ORDER BY x")).toEqual(rows);
 
 		await original.exec("INSERT INTO t VALUES (-1, NULL)");
