@@ -2320,20 +2320,40 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     }
 }
 
-/// Local snapshot metadata errors stop OpenRaft. Queued pointer operations
-/// must observe the same terminal boundary even before RaftCore sees the error.
+/// Where a group's snapshot metadata publication stands. Local snapshot
+/// metadata errors stop OpenRaft, and queued pointer operations must observe
+/// the same terminal boundary even before RaftCore sees the error. A group
+/// engine that shut down publishes nothing more: OpenRaft runs each snapshot
+/// build in a task that its shutdown neither stops nor waits for, so a build
+/// can reach its publication after the engine stopped, while the WAL closes
+/// or a restarted replica of the group owns the same metadata file (#489).
 #[derive(Debug, Default)]
 pub(crate) enum MetadataPublicationState {
     #[default]
     Ready,
     Failed,
+    ShutDown,
 }
 
+/// Why a snapshot metadata publication was refused without running.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "snapshot metadata publication stopped after an earlier failure; restart to resolve the durable pointer"
-)]
-struct SnapshotMetadataStopped;
+pub(crate) enum SnapshotMetadataStopped {
+    #[error(
+        "snapshot metadata publication stopped after an earlier failure; restart to resolve the durable pointer"
+    )]
+    AfterFailure,
+    #[error("snapshot metadata publication stopped because the group engine shut down")]
+    EngineShutDown,
+}
+
+/// Ends a group's snapshot metadata publication for good, once a publication
+/// that is running finished: a blocking fsync cannot be cancelled. Every
+/// later publication is refused with [`SnapshotMetadataStopped::EngineShutDown`].
+pub(crate) async fn close_snapshot_metadata(
+    serial: &crate::rt::sync::Mutex<MetadataPublicationState>,
+) {
+    *serial.lock().await = MetadataPublicationState::ShutDown;
+}
 
 /// Keep metadata fsync and the serialized pointer transition off core workers.
 pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
@@ -2342,12 +2362,14 @@ pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
 ) -> Result<T, io::Error> {
     let mut serial = serial.lock_owned().await;
     let work = move || {
-        if matches!(*serial, MetadataPublicationState::Failed) {
+        let refused = match *serial {
+            MetadataPublicationState::Ready => None,
+            MetadataPublicationState::Failed => Some(SnapshotMetadataStopped::AfterFailure),
+            MetadataPublicationState::ShutDown => Some(SnapshotMetadataStopped::EngineShutDown),
+        };
+        if let Some(refused) = refused {
             // OpenRaft's snapshot storage API requires an io::Error here.
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                SnapshotMetadataStopped,
-            ));
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, refused));
         }
         let result = work();
         if result.is_err() {
@@ -2513,7 +2535,13 @@ mod tests {
             .await
             .unwrap()
             .unwrap_err();
-        assert!(error.get_ref().unwrap().is::<SnapshotMetadataStopped>());
+        assert!(matches!(
+            error
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<SnapshotMetadataStopped>(),
+            Some(SnapshotMetadataStopped::AfterFailure)
+        ));
         assert!(!executed.load(Ordering::Acquire));
     }
 

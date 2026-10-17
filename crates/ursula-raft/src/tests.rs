@@ -4755,3 +4755,59 @@ async fn a_follower_proposes_no_expiry_sweep() {
     }
     shutdown_all(&engines).await;
 }
+
+/// OpenRaft runs a snapshot build in a task of its own that its shutdown
+/// neither stops nor waits for. A build still running when its group engine
+/// shuts down publishes no snapshot metadata afterwards, so nothing writes
+/// the WAL directory once the WAL closes, and a restarted replica of the
+/// group owns its metadata file alone (#489).
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_build_that_outlives_its_engine_publishes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metadata_path = wal.snapshot_metadata_path(placement());
+    let store = wal
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .unwrap();
+    let engine = RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config("build-outlives-engine", 30, 60),
+        store,
+        RaftGroupEngineOptions {
+            snapshot_metadata_path: Some(metadata_path.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Stand in for the build OpenRaft detached: its builder, taken while the
+    // group runs, builds only after the engine shut down.
+    let mut builder = engine
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.get_snapshot_builder().await })
+        })
+        .await
+        .unwrap();
+    engine.shutdown().await.unwrap();
+    wal.shutdown().await.unwrap();
+
+    let error = builder.build_snapshot().await.unwrap_err();
+    assert!(matches!(
+        error.get_ref().and_then(
+            |source| source.downcast_ref::<crate::state_machine::SnapshotMetadataStopped>()
+        ),
+        Some(crate::state_machine::SnapshotMetadataStopped::EngineShutDown)
+    ));
+    assert!(
+        !metadata_path.exists() && !metadata_path.with_extension("json.tmp").exists(),
+        "a build published snapshot metadata after its engine shut down"
+    );
+    drop(builder);
+    fs::remove_dir_all(root.path()).expect("nothing writes the closed WAL directory");
+}
