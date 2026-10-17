@@ -784,7 +784,11 @@ impl SnapshotDriver {
                 .collect_snapshot_garbage(self.limits.max_groups, SNAPSHOT_GC_TICK_BUDGET)
                 .await;
             self.metrics
-                .record_snapshot_gc(gc.deleted, gc.skipped_unreferenced_voter);
+                .record_snapshot_gc(ursula_runtime::SnapshotGcSample {
+                    deleted: gc.deleted,
+                    skipped_unreferenced_voter: gc.skipped_unreferenced_voter,
+                    failed: u64::try_from(gc.failed).unwrap_or(u64::MAX),
+                });
             if gc.left > 0 {
                 pause = pause.min(SNAPSHOT_PRESSURE_RETICK);
             }

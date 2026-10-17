@@ -2410,6 +2410,73 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     }
     assert!(deleted_objects > 0, "snapshot GC deleted no object");
 
+    // GC never deleted what a replica still names: the object each
+    // replica's reference names exists.
+    for (node_id, _) in &peers {
+        let reference_path = format!("snapshots/group-0/references/node-{node_id}.json");
+        let size = cold_store
+            .object_size(&reference_path)
+            .await
+            .unwrap_or_else(|err| panic!("node {node_id} has no snapshot reference: {err}"));
+        let bytes = cold_store
+            .read_whole_object_range(&reference_path, size, 0, usize::try_from(size).unwrap())
+            .await
+            .expect("read a snapshot reference");
+        let reference: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("a snapshot reference record");
+        let key = reference["snapshot_key"]
+            .as_str()
+            .unwrap_or_else(|| panic!("node {node_id} names no S3 snapshot: {reference}"));
+        cold_store
+            .object_size(key)
+            .await
+            .unwrap_or_else(|err| panic!("node {node_id}'s current snapshot {key} is gone: {err}"));
+    }
+    // A restarted replica restores its current snapshot from the store and
+    // serves group 0 again.
+    let (applied_before, ..) = group_zero_progress(&client, &peers[2].1).await;
+    drop(children.remove(2));
+    children.push(spawn_node_with_cluster_config_and_cold_s3(
+        binary,
+        &configs[2],
+    ));
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
+    let mut served = false;
+    for _ in 0..300 {
+        if let Ok(response) = client
+            .get(format!("{}/__ursula/metrics", peers[2].1))
+            .send()
+            .await
+            && response.status().is_success()
+        {
+            let (applied, ..) = group_zero_progress(&client, &peers[2].1).await;
+            if applied >= applied_before {
+                served = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(served, "the restarted replica serves group 0 again");
+    let mut status = None;
+    for _ in 0..100 {
+        status = client
+            .get(format!("{}/erased/marked?offset=0", peers[2].1))
+            .send()
+            .await
+            .ok()
+            .map(|response| response.status());
+        if status == Some(reqwest::StatusCode::NOT_FOUND) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        status,
+        Some(reqwest::StatusCode::NOT_FOUND),
+        "the restarted replica reads the deleted stream as gone"
+    );
+
     drop(children);
     cold_store
         .remove_all("")

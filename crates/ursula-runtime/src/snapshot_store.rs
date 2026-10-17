@@ -512,8 +512,10 @@ mod s3 {
         }
 
         /// How old an object must be before pruning may delete it (#669).
-        /// A server passes `min(raft.deleted_data_max_age / 4, 1h)`, the time
-        /// a replica keeps the object it replaced pinned. An object nobody
+        /// A server passes `RaftConfig::snapshot_gc_grace`, a quarter of
+        /// `raft.deleted_data_max_age` capped at the longer of an hour and two
+        /// `raft.install_snapshot_timeout`s, the time a replica keeps the
+        /// object it replaced pinned. An object nobody
         /// pins, such as the upload of a build a newer install overtook, is
         /// then deleted once it is that old.
         ///

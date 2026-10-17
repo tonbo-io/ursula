@@ -26,8 +26,20 @@ use ursula_runtime::SnapshotStoreError;
 use crate::rt::sync::Mutex as AsyncMutex;
 use crate::rt::time::Instant;
 
-/// How long after a failed GC pass of a group the next one runs.
+/// How long after a failed GC pass of a group the next one runs, doubled
+/// for each failed pass in a row up to [`SNAPSHOT_GC_MAX_RETRY`].
 const SNAPSHOT_GC_RETRY: Duration = Duration::from_secs(30);
+/// The longest wait before a failed group's next GC pass.
+const SNAPSHOT_GC_MAX_RETRY: Duration = Duration::from_secs(15 * 60);
+
+/// The wait before the next GC pass after `failures` failed passes in a
+/// row: [`SNAPSHOT_GC_RETRY`], doubled for each further failure, at most
+/// [`SNAPSHOT_GC_MAX_RETRY`].
+fn gc_retry_delay(failures: u32) -> Duration {
+    SNAPSHOT_GC_RETRY
+        .saturating_mul(2_u32.saturating_pow(failures.saturating_sub(1).min(16)))
+        .min(SNAPSHOT_GC_MAX_RETRY)
+}
 /// The longest G a group uses. A server's G is at most a few hours
 /// (`RaftConfig::snapshot_gc_grace`), and this clamp keeps every deadline G
 /// after an instant representable.
@@ -60,6 +72,9 @@ struct ReferenceState {
     retiring: Vec<RetiringObject>,
     /// The GC passes the group owes (#669).
     passes: GcPasses,
+    /// GC passes of the group that failed in a row, which back the next
+    /// one off ([`gc_retry_delay`]).
+    gc_failures: u32,
 }
 
 /// An external object that was this node's current snapshot until another
@@ -173,8 +188,8 @@ impl ReferenceState {
     }
 }
 
-/// A GC pass of one group that failed (#669). The pass runs again
-/// [`SNAPSHOT_GC_RETRY`] later.
+/// A GC pass of one group that failed (#669). The pass runs again later,
+/// backed off by [`gc_retry_delay`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SnapshotGcError {
     /// Publishing this node's current reference, or reconciling its pins,
@@ -326,11 +341,13 @@ impl SnapshotReferences {
         self.schedule_pass_in(self.gc_grace);
     }
 
-    /// A restore owes a GC pass about G later: its reconcile dropped the
-    /// pins of the objects that were retiring before the restart, and once
-    /// they are G old the pass deletes them. The passes of a node's groups
-    /// spread over a further quarter of G by group, so that a restart does
-    /// not bring every group's pass due at once.
+    /// A restore owes a GC pass about G later. Its reconcile dropped the
+    /// pins of the objects that were retiring before the restart: the
+    /// restart ended this process's sends of them, so they need no pin, and
+    /// any node's pass may delete them at once. This pass only makes sure
+    /// that one does. The passes of a node's groups spread over a further
+    /// quarter of G by group, so that a restart does not bring every
+    /// group's pass due at once.
     pub(crate) fn schedule_pass_after_restore(&self, group: u32) {
         let spread = self
             .gc_grace
@@ -382,8 +399,8 @@ impl SnapshotReferences {
 
     /// One GC pass of the group at `now` (#669): drops the retirements due,
     /// publishes the current reference, whose reconcile removes the expired
-    /// pins, and prunes. A failed pass runs again [`SNAPSHOT_GC_RETRY`]
-    /// later.
+    /// pins, and prunes. A failed pass runs again later, backed off
+    /// exponentially ([`gc_retry_delay`]) until a pass succeeds.
     pub(crate) async fn collect_garbage(
         &self,
         store: &SharedSnapshotStore,
@@ -395,8 +412,17 @@ impl SnapshotReferences {
             Ok(()) => self.prune(store, group).await,
             Err(error) => Err(SnapshotGcError::Publish(error)),
         };
-        if pass.is_err() {
-            self.schedule_pass_in(SNAPSHOT_GC_RETRY);
+        let failures = {
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+            state.gc_failures = if pass.is_err() {
+                state.gc_failures.saturating_add(1)
+            } else {
+                0
+            };
+            state.gc_failures
+        };
+        if failures > 0 {
+            self.schedule_pass_in(gc_retry_delay(failures));
         }
         pass
     }
@@ -469,9 +495,11 @@ mod tests {
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
 
+    use super::SNAPSHOT_GC_MAX_RETRY;
     use super::SNAPSHOT_GC_RETRY;
     use super::SnapshotGcError;
     use super::SnapshotReferences;
+    use super::gc_retry_delay;
     use crate::rt::time::Instant;
 
     const GRACE: Duration = Duration::from_secs(60);
@@ -717,6 +745,46 @@ mod tests {
         ) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async { Err(SnapshotStoreError::Backend("down".to_owned())) })
         }
+    }
+
+    /// The retry after failed passes doubles from 30 s and stops at 15 min.
+    #[test]
+    fn gc_retries_back_off_exponentially_up_to_a_cap() {
+        assert_eq!(gc_retry_delay(1), SNAPSHOT_GC_RETRY);
+        assert_eq!(gc_retry_delay(2), Duration::from_secs(60));
+        assert_eq!(gc_retry_delay(3), Duration::from_secs(120));
+        assert_eq!(gc_retry_delay(5), Duration::from_secs(480));
+        assert_eq!(gc_retry_delay(6), SNAPSHOT_GC_MAX_RETRY);
+        assert_eq!(gc_retry_delay(u32::MAX), SNAPSHOT_GC_MAX_RETRY);
+    }
+
+    /// Failed passes in a row back the next pass off, and a pass that
+    /// succeeds resets the back-off.
+    #[tokio::test(start_paused = true)]
+    async fn failed_gc_passes_back_off_until_one_succeeds() {
+        let failing: SharedSnapshotStore = Arc::new(UnpublishableStore);
+        let references = SnapshotReferences::new(GRACE);
+        for (failures, delay) in [(1, 30), (2, 60), (3, 120)] {
+            let now = Instant::now();
+            references
+                .collect_garbage(&failing, 7, now)
+                .await
+                .unwrap_err();
+            assert_eq!(references.state.lock().unwrap().gc_failures, failures);
+            assert!(!references.gc_due(later(now, Duration::from_secs(delay.saturating_sub(1)))));
+            assert!(references.gc_due(later(now, Duration::from_secs(delay))));
+            tokio::time::advance(Duration::from_secs(delay)).await;
+        }
+        // The default store publishes and prunes nothing, and succeeds.
+        let healthy: SharedSnapshotStore = Arc::new(ursula_runtime::InlineSnapshotStore);
+        // Past the publication back-off the failures left.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        references
+            .collect_garbage(&healthy, 7, Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(references.state.lock().unwrap().gc_failures, 0);
+        assert!(!references.gc_due(later(Instant::now(), SNAPSHOT_GC_MAX_RETRY)));
     }
 
     /// A failed pass keeps the pin it could not drop and runs again later.

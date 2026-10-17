@@ -877,11 +877,9 @@ impl GroupEngineMetrics {
         );
     }
 
-    /// Records one snapshot GC pass (#669): the objects it deleted, and
-    /// whether a configured voter without a reference held it back.
-    pub fn record_snapshot_gc(&self, deleted: u64, skipped_unreferenced_voter: u64) {
-        self.inner
-            .record_snapshot_gc(deleted, skipped_unreferenced_voter);
+    /// Records one snapshot GC pass (#669).
+    pub fn record_snapshot_gc(&self, sample: crate::metrics::SnapshotGcSample) {
+        self.inner.record_snapshot_gc(sample);
     }
 
     pub fn record_raft_snapshot_build(

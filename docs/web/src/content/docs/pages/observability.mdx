@@ -177,6 +177,10 @@ objects the node's snapshot GC deleted, and
 nothing because a configured voter of the group has never stored a snapshot
 reference. A count that keeps rising points at a voter that never came up, or
 at a voter list that names a node the cluster does not run.
+`snapshot_gc_failed_passes` counts the GC passes that failed, for example
+because the store refuses deletes, and a failed pass runs again later, backed
+off up to 15 minutes. Alert when it keeps rising: while GC fails, old snapshot
+objects that hold deleted streams stay in the store.
 
 The OTLP collection interval defaults to 60s. For a quick check, shorten it so
 readings arrive without waiting (and without relying on the shutdown flush):

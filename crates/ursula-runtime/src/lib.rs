@@ -189,6 +189,7 @@ pub use metrics::RaftLogPressureSample;
 pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;
+pub use metrics::SnapshotGcSample;
 pub use read_index::LinearizableReadBarrier;
 pub use read_index::ReadIndexFuture;
 pub use request::AckColdGcResponse;

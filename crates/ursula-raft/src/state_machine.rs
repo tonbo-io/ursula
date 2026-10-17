@@ -1654,8 +1654,9 @@ impl RaftGroupStateMachine {
             tracing::warn!(%err, "restored snapshot remains pinned while current-reference publication is unavailable");
         }
         // The reconcile above dropped the pins of the objects that were
-        // retiring before the restart. The snapshot driver deletes them once
-        // they are the GC grace old (#669).
+        // retiring before the restart: the restart ended this process's
+        // sends of them, so they need no pin. This pass makes sure they are
+        // deleted (#669).
         references.schedule_pass_after_restore(self.placement.raft_group_id.0);
         Ok(())
     }
@@ -2291,13 +2292,20 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         {
             Ok(prune) => {
                 if let Some(metrics) = &self.metrics {
-                    metrics.record_snapshot_gc(
-                        prune.deleted(),
-                        u64::from(prune.skipped_unreferenced_voter()),
-                    );
+                    metrics.record_snapshot_gc(ursula_runtime::SnapshotGcSample {
+                        deleted: prune.deleted(),
+                        skipped_unreferenced_voter: u64::from(prune.skipped_unreferenced_voter()),
+                        failed: 0,
+                    });
                 }
             }
             Err(err) => {
+                if let Some(metrics) = &self.metrics {
+                    metrics.record_snapshot_gc(ursula_runtime::SnapshotGcSample {
+                        failed: 1,
+                        ..ursula_runtime::SnapshotGcSample::default()
+                    });
+                }
                 tracing::warn!(
                     snapshot_id = pointer.snapshot_id,
                     error = %err,
