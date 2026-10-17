@@ -60,8 +60,8 @@
 //!     explicit open of another owner made past the background owner's acknowledged offset and its
 //!     own latest claim (design: Claims, its last paragraph), unless that claim landed after a
 //!     provisional instance's pre-check read the tail (the round trip the pre-check accepts,
-//!     design: Pre-check), or every instance runs under one activation (whose claims are all its
-//!     own, design: Claims);
+//!     design: Pre-check), or that claim carries an activation the background instance holds
+//!     (whose claims are all its own, design: Claims: a shared activation);
 //! 21. an owner resets `stream_state` only when another writer, owner or clone was on the stream
 //!     (the gate of property 13);
 //! 22. within one history, every producer key the server acknowledged (a receipt, applied or a
@@ -2101,15 +2101,20 @@ impl World {
     /// acknowledged offset and its own latest claim in the stream lies below it, unless it landed
     /// after the instance's pre-check read the tail.
     fn background_claim_applied(&mut self, uid: u64, epoch: Epoch, start: Offset) {
-        // Under one activation every claim is the replicator's own (design: Claims): a background
-        // claim reads an explicit owner's claim as its own and may go above it.
-        if self.knobs.shared_activation {
-            return;
-        }
         let Some(owner) = self.owners.iter().find(|o| o.inst.uid == uid) else {
             return;
         };
-        let ours: Vec<Activation> = owner.log.claims.iter().map(|(_, a)| *a).collect();
+        // A claim frame of an activation in the log, or of the instance's own, is the replicator's
+        // (design: Claims). One another owner made under that activation (one activation for every
+        // instance, or a clone and its original reopened under the activation they share) is the
+        // residual case of a shared activation, which nothing on the stream tells apart.
+        let ours: Vec<Activation> = owner
+            .log
+            .claims
+            .iter()
+            .map(|(_, a)| *a)
+            .chain(owner.inst.replicator.ctx().map(|ctx| ctx.activation))
+            .collect();
         let race_from = owner
             .inst
             .provisional
@@ -4599,4 +4604,35 @@ fn a_fresh_build_under_the_same_activation_claims_above_the_claims_it_read() {
             "shared activation {shared_activation}"
         );
     }
+}
+
+/// Found at a million cases: owner 0's takeover claim applies with its answer lost, it reopens
+/// under the same activation, then provisionally under another, and is cloned; a restore empties
+/// the stream and the clone reopens under the activation it shares with owner 0. The clone's log
+/// lost commits to the restore, so it salvages and takes over afresh, claiming epoch 1 under that
+/// activation. Owner 0's background claim then reads that claim as its own (design: Claims) and
+/// applies above it: the residual case of a shared activation, outside property 20.
+#[test]
+fn a_clone_reopened_under_the_shared_activation_is_one_owner_to_the_other() {
+    use Op::Commit;
+    use Op::Reopen;
+    let ops = vec![
+        Op::DropAnswerAfterApply(0),
+        Op::Deliver(0),
+        Reopen(0),
+        Op::ProvisionalRestart(0, 0),
+        Op::Takeover(false),
+        Op::Deliver(46),
+        Commit(2),
+        Op::Clone(2),
+        Op::Restore(0),
+        Reopen(2),
+        Op::Flush,
+        Commit(0),
+        Commit(0),
+    ];
+    assert_eq!(
+        run(Knobs::default(), 194_716_899_250_413_353, &ops),
+        Vec::<String>::new()
+    );
 }
