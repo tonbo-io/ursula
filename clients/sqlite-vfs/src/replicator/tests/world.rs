@@ -31,11 +31,12 @@
 //!    other bytes diverge unless the later one was made after catching the earlier one up);
 //! 9. `Synced` never fires while a pre-call foreign frame sits past the acknowledged offset, nor
 //!    for a target later discarded (a claim is the owner's own only when its log holds that epoch
-//!    and activation, so another copy's claim under a shared activation is foreign);
+//!    and activation, or an explicit open made it under the activation the owner runs under, so
+//!    another copy's continuation claim under a shared activation is foreign);
 //! 10. the bytes between an owner's consecutive acknowledged offsets are its own frames (a claim
-//!     as in 9), frames it caught up, or foreign claims in a takeover's reconcile or followed by a
-//!     claim of its own before the one it binds with, unless it rebuilt (with one activation for
-//!     every instance, any claim);
+//!     of an activation its log holds or it runs under, as its reconcile reads it, design: Claims),
+//!     frames it caught up, or foreign claims in a takeover's reconcile or followed by a claim of
+//!     its own before the one it binds with, unless it rebuilt;
 //! 11. after `Heal`, every ticket of an owner that ends acknowledged resolved or was abandoned;
 //! 12. no append carries a frame the owner caught up;
 //! 13. an owner resets `fenced` or `stale` only when another writer, owner or clone was on the
@@ -1840,8 +1841,9 @@ impl World {
         });
     }
 
-    /// Whether the claim frame `(epoch, activation)` is `owner`'s own (properties 9 and 10): its
-    /// log holds that claim, so another copy's claim under an activation they share is not. An
+    /// Whether the claim frame `(epoch, activation)` is `owner`'s own (property 9): its log holds
+    /// that claim, so another copy's claim under an activation they share is not (a probe never
+    /// reads past one; a `synced()` past it would be another copy's state). An
     /// explicit open's claim under the activation the instance runs under counts too: a claim
     /// frame of its activation is the replicator's (design: Claims), so a second open under one
     /// activation (a platform's constant `activation`, or a clone and its original reopened under
@@ -1870,14 +1872,17 @@ impl World {
             .unwrap_or_default();
         let own_frames: Vec<&[u8]> = owner.log.commits.values().map(|p| &p.frame[..]).collect();
         let frames = decode_all(range);
-        // Its own: a claim whose epoch and activation its log holds, or an explicit open's under
-        // the activation it runs under ([`World::owns_claim`]). Under one activation for every
-        // instance, any claim is its own to the replicator (design: Claims).
+        // Its own: a claim of an activation its log holds or it runs under, as its reconcile reads
+        // it (design: Claims, a claim frame whose activation is in the log is ours). A clone, a
+        // copy of its cache or a second open under one activation makes claims the reconcile skips
+        // as its own (design: Clones, copies share the activation): the residual case of a shared
+        // activation, which only digests make safe (properties 8 and 22).
+        let current = owner.inst.replicator.ctx().map(|ctx| ctx.activation);
         let own_claim = |frame: &Option<Frame>| {
-            matches!(frame, Some(Frame::Claim { epoch, activation })
-                if self.owns_claim(&owner, *epoch, *activation))
+            matches!(frame, Some(Frame::Claim { activation, .. })
+                if current == Some(*activation)
+                    || owner.log.claims.iter().any(|(_, a)| a == activation))
         };
-        let shared = self.knobs.shared_activation;
         // A claim of its own after a foreign one, other than the claim it binds with at the end,
         // applied after it (design: Reconcile, superseded).
         let superseder = frames
@@ -1891,7 +1896,7 @@ impl World {
                 let bytes = range.get(*start..*start + *len).unwrap_or_default();
                 let fine = match frame {
                     Some(Frame::Claim { .. }) => {
-                        shared || takeover || own_claim(frame) || superseder.is_some_and(|s| s > i)
+                        takeover || own_claim(frame) || superseder.is_some_and(|s| s > i)
                     }
                     Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
                     _ => false,
@@ -4687,4 +4692,167 @@ fn a_clone_binds_past_its_originals_takeover_under_the_shared_activation() {
         run(Knobs::default(), 20_272_985_525_704_585, &ops),
         Vec::<String>::new()
     );
+}
+
+/// Found at a million cases while property 10 counted only the claims a log holds: a clone or a
+/// copy of a cache reconciles past another owner's claim under an activation its log holds or it
+/// runs under, which its reconcile skips as its own (design: Claims) and binds above. The
+/// residual case of a shared activation, which digests keep safe (properties 8 and 22).
+#[test]
+fn copies_bind_past_claims_under_the_activations_they_share() {
+    use FaultKind::Status;
+    use Op::Clone;
+    use Op::Commit;
+    use Op::CopyCache;
+    use Op::Deliver;
+    use Op::DropAnswerAfterApply;
+    use Op::DropRequest;
+    use Op::Duplicate;
+    use Op::Fault;
+    use Op::ProvisionalRestart;
+    use Op::Reopen;
+    use Op::Restart;
+    use Op::Restore;
+    use Op::Tick;
+    let scripts: [(u64, Vec<Op>); 4] = [
+        (1_062_010_968_389_940_577, vec![
+            Clone(0),
+            Deliver(8),
+            Fault(Status(402, None), false, 1),
+            Commit(0),
+            Op::Partition(0, false),
+            Clone(0),
+            Deliver(4),
+            Commit(1),
+            Deliver(0),
+            Restart(2, 0),
+            Deliver(20),
+            Commit(3),
+            ProvisionalRestart(2, 0),
+            DropAnswerAfterApply(0),
+            DropRequest(0),
+            Deliver(1),
+            DropRequest(0),
+            Op::Takeover(false),
+            Duplicate(0),
+            Restore(0),
+            Deliver(53),
+            DropRequest(0),
+            CopyCache(0, false, false),
+            Deliver(12),
+            Tick(2),
+            Deliver(3),
+            Deliver(3),
+            Deliver(0),
+            CopyCache(2, false, false),
+            Deliver(2),
+            Op::Misroute(false, false),
+            Restart(3, 0),
+            Deliver(0),
+            Deliver(4),
+            DropRequest(0),
+            Fault(Status(503, Some(1)), false, 1),
+            Duplicate(0),
+            Restore(0),
+            Deliver(2),
+            Deliver(4),
+            DropRequest(0),
+            Deliver(5),
+            Commit(0),
+            DropRequest(0),
+            Commit(0),
+            Commit(0),
+            Commit(0),
+            Commit(0),
+        ]),
+        (1_089_235_872_279_982_342, vec![
+            ProvisionalRestart(0, 0),
+            Deliver(0),
+            Deliver(2),
+            Clone(0),
+            Reopen(1),
+            Deliver(32),
+            Deliver(15),
+            Deliver(0),
+            Restart(1, 0),
+            ProvisionalRestart(5, 0),
+            Deliver(13),
+            Deliver(4),
+            Deliver(11),
+            Deliver(43),
+            DropRequest(0),
+            Deliver(34),
+            Deliver(29),
+            Deliver(17),
+            Deliver(2),
+            Clone(0),
+            Op::NewHistory,
+            Clone(0),
+            Reopen(2),
+            DropRequest(0),
+            Op::Takeover(false),
+            DropRequest(0),
+            Commit(5),
+            Restore(0),
+            Reopen(2),
+            Commit(0),
+        ]),
+        (1_881_754_625_953_425, vec![
+            Clone(0),
+            DropRequest(0),
+            CopyCache(0, false, false),
+            Deliver(21),
+            Deliver(19),
+            Restore(0),
+            Clone(1),
+            Deliver(0),
+            Deliver(0),
+            ProvisionalRestart(6, 1),
+            Deliver(0),
+            Deliver(0),
+            DropRequest(0),
+            Deliver(0),
+            Tick(3),
+            Deliver(0),
+            Tick(2),
+            Tick(4),
+            Commit(0),
+            Deliver(52),
+            Deliver(24),
+            Deliver(2),
+            Deliver(2),
+            Reopen(3),
+            Restore(0),
+            Commit(0),
+        ]),
+        (318_026_087_158_888_953, vec![
+            DropAnswerAfterApply(0),
+            Op::Checkpoint,
+            Op::LowerLimit,
+            Deliver(0),
+            CopyCache(0, false, false),
+            Clone(6),
+            Deliver(0),
+            Restore(0),
+            CopyCache(7, false, true),
+            Op::PowerLoss(1, 1),
+            Deliver(19),
+            Deliver(47),
+            Deliver(31),
+            Deliver(61),
+            Deliver(7),
+            Deliver(47),
+            DropRequest(0),
+            Fault(Status(503, Some(1)), false, 1),
+            Restore(0),
+            Clone(0),
+        ]),
+    ];
+    for (seed, ops) in &scripts {
+        assert_eq!(
+            run(Knobs::default(), *seed, ops),
+            Vec::<String>::new(),
+            "seed {seed}"
+        );
+    }
 }
