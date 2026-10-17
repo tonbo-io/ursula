@@ -7222,6 +7222,7 @@ mod snapshot_driver {
     use ursula_raft::snapshot_cadence::DriveLimits;
     use ursula_raft::snapshot_cadence::GroupLogProgress;
     use ursula_raft::snapshot_cadence::LogPressure;
+    use ursula_raft::snapshot_cadence::RemovalProgress;
     use ursula_raft::snapshot_cadence::SnapshotCadence;
     use ursula_runtime::AppendRequest;
     use ursula_runtime::CreateStreamRequest;
@@ -7242,9 +7243,13 @@ mod snapshot_driver {
     use crate::HttpState;
     use crate::admin_router;
     use crate::bootstrap::PeerParticipation;
+    use crate::bootstrap::ScrubPurge;
     use crate::bootstrap::StoreGateInputs;
     use crate::bootstrap::Trigger;
+    use crate::bootstrap::deleted_data_sample;
     use crate::bootstrap::group_log_progress;
+    use crate::bootstrap::groups_to_drive;
+    use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
     use crate::bootstrap::resolve_snapshot_drive_interval_ms;
     use crate::bootstrap::spawn_snapshot_driver;
@@ -7285,6 +7290,7 @@ mod snapshot_driver {
             log_entries: (log_bytes / 256).saturating_add(1),
             last_snapshot_bytes,
             has_snapshot: last_snapshot_bytes > 0,
+            ..GroupLogProgress::default()
         }
     }
 
@@ -7346,6 +7352,126 @@ mod snapshot_driver {
         assert!(group_log_progress(&installed).has_snapshot);
     }
 
+    fn removal(age_ms: u64) -> GroupLogProgress {
+        GroupLogProgress {
+            removal: RemovalProgress::Owed { bytes: 10, age_ms },
+            ..log(512, MIB)
+        }
+    }
+
+    /// #669: the driver purges a group's log through the snapshot that
+    /// covers its removals once OpenRaft shows that snapshot, and leaves a
+    /// group whose Raft stopped alone.
+    #[test]
+    fn snapshot_driver_purges_through_the_covering_snapshot() {
+        let covering = |through| GroupLogProgress {
+            scrub_purge_through: through,
+            ..log(MIB, MIB)
+        };
+        let running = |mut snapshot: RaftGroupMetricsSnapshot| {
+            snapshot.maintenance.running = true;
+            snapshot
+        };
+        let mut purged = running(snap(3, Some(40), Some(30), covering(30)));
+        purged.purged = Some(super::RaftLogProgressSnapshot {
+            term: 1,
+            index: 30,
+            node_id: 1,
+        });
+        let mut stopped = running(snap(4, Some(40), Some(30), covering(30)));
+        stopped.apply_failure = Some(ursula_proto::admin::ApplyFailure {
+            term: 1,
+            index: 41,
+            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
+            message: "diagnostic".to_owned(),
+        });
+        let snapshots = vec![
+            running(snap(0, Some(40), Some(30), covering(30))),
+            // OpenRaft does not show the covering snapshot yet.
+            running(snap(1, Some(40), Some(20), covering(30))),
+            // No snapshot covered a removal.
+            running(snap(2, Some(40), Some(30), covering(0))),
+            purged,
+            stopped,
+            // Its Raft does not run.
+            snap(5, Some(40), Some(30), covering(30)),
+        ];
+        assert_eq!(plan_scrub_purges(&snapshots), vec![ScrubPurge {
+            raft_group_id: 0,
+            through: 30,
+            published: 30,
+        }]);
+    }
+
+    /// #669: a group with an overdue removal leads the pass, and while the
+    /// snapshot store is in trouble the driver still snapshots it, and only
+    /// it, unless the log is under pressure.
+    #[test]
+    fn snapshot_driver_drives_overdue_groups_through_store_trouble() {
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000)
+            .with_deleted_data_max_age(Duration::from_secs(60));
+        let snapshots = vec![
+            snap(0, Some(9), Some(5), log(16 * MIB, MIB)),
+            snap(1, Some(9), Some(5), removal(15_000)),
+            snap(2, Some(9), Some(5), removal(14_999)),
+        ];
+        let (plan, selected) = plan_snapshot_drive(
+            &snapshots,
+            &cadence,
+            limits(16),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        assert_eq!(plan.pressure, LogPressure::Calm);
+        assert_eq!(plan.overdue, 1);
+        assert_eq!(ids(&selected), vec![1, 0]);
+        assert_eq!(groups_to_drive(&plan, true), 1);
+        assert_eq!(groups_to_drive(&plan, false), 2);
+        // A group that builds or is held is not planned, overdue or not.
+        let (plan, _) = plan_snapshot_drive(
+            &snapshots,
+            &cadence,
+            limits(16),
+            &BTreeSet::new(),
+            &BTreeMap::from([(1, 0)]),
+            &BTreeSet::new(),
+        );
+        assert_eq!(groups_to_drive(&plan, true), 0);
+        assert_eq!((plan.overdue, plan.groups), (0, vec![0]));
+    }
+
+    /// #669: the node gauges report the oldest removal no snapshot covers
+    /// and the groups that hold one past the floor.
+    #[test]
+    fn snapshot_driver_reports_the_deleted_data_its_groups_hold() {
+        let cadence = SnapshotCadence::new(1 << 30, 128, 100_000)
+            .with_deleted_data_max_age(Duration::from_secs(60));
+        let groups = [
+            log(MIB, MIB),
+            removal(20_000),
+            removal(3_000),
+            GroupLogProgress {
+                removal: RemovalProgress::Replayed {
+                    bytes: 1,
+                    age_ms: 100,
+                },
+                ..log(512, MIB)
+            },
+        ];
+        assert_eq!(
+            deleted_data_sample(&cadence, &groups),
+            ursula_runtime::RaftDeletedDataSample {
+                oldest_age_ms: 20_000,
+                overdue_groups: 2,
+            }
+        );
+        assert_eq!(
+            deleted_data_sample(&cadence, &[log(MIB, MIB)]),
+            ursula_runtime::RaftDeletedDataSample::default()
+        );
+    }
+
     #[test]
     fn snapshot_driver_follows_log_bytes_not_entry_counts() {
         // 128 groups and a 1 GiB budget: a 4 MiB floor.
@@ -7363,6 +7489,7 @@ mod snapshot_driver {
                 log_entries: 89_990,
                 last_snapshot_bytes: MIB,
                 has_snapshot: true,
+                ..GroupLogProgress::default()
             }),
         ];
         let (plan, selected) = plan_snapshot_drive(
@@ -7450,6 +7577,7 @@ mod snapshot_driver {
             log_entries: 60,
             last_snapshot_bytes: 3 * MIB,
             has_snapshot: true,
+            ..GroupLogProgress::default()
         });
         // The last log id renders as one term and index, apart from the
         // replica's current term.
@@ -7835,6 +7963,199 @@ mod snapshot_driver {
         }
     }
 
+    /// The bytes every record of the stream the deleted-data test removes
+    /// carries.
+    const DELETED_MARKER: &[u8] = b"deleted-data-marker-669;";
+
+    /// What of the removed stream `raft`'s current snapshot holds, if any:
+    /// inline snapshots hold the whole group.
+    async fn snapshot_holds_marker(
+        raft: &ursula_raft::OwnerRaftHandle,
+        stream_id: &BucketStreamId,
+    ) -> bool {
+        let snapshot = raft
+            .get_snapshot()
+            .await
+            .expect("read the current snapshot")
+            .expect("a current snapshot");
+        let pointer = ursula_runtime::SnapshotPointer::decode(snapshot.snapshot.get_ref())
+            .expect("decode the snapshot pointer");
+        let SnapshotLocation::Inline { bytes } = &pointer.location else {
+            panic!("an inline snapshot: {:?}", pointer.location);
+        };
+        ursula_raft::decode_group_snapshot(bytes)
+            .expect("decode the snapshot")
+            .stream_snapshot
+            .streams
+            .iter()
+            .any(|entry| {
+                &entry.metadata.stream_id == stream_id
+                    || entry
+                        .payload
+                        .windows(DELETED_MARKER.len())
+                        .any(|window| window == DELETED_MARKER)
+            })
+    }
+
+    /// #669: the production driver snapshots a group a quarter of
+    /// `raft.deleted_data_max_age` after it deleted a stream, purges its log
+    /// through that snapshot, and reports the deleted data its groups hold
+    /// meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_driver_scrubs_a_deleted_stream_within_the_bound() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let peers = vec![(
+            1,
+            format!(
+                "http://127.0.0.1:{}",
+                listener.local_addr().expect("addr").port()
+            ),
+        )];
+        let node = spawn_static_grpc_test_node(
+            1,
+            listener,
+            peers.clone(),
+            peers,
+            true,
+            2,
+            StaticGrpcTestNodeStorage {
+                engine_config: Some(RaftEngineConfig {
+                    snapshot_drive_interval_ms: 100,
+                    max_in_snapshot_log_to_keep: 8,
+                    ..RaftEngineConfig::default()
+                }),
+                ..StaticGrpcTestNodeStorage::default()
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let max_age = Duration::from_secs(4);
+        let participation = PeerParticipation::new(1, &[], reqwest::Client::new());
+        spawn_snapshot_driver(
+            &node.runtime,
+            &node.registry,
+            None,
+            StoreGateInputs {
+                s3: None,
+                cold_flush_interval: Duration::from_secs(1),
+                participation: &participation,
+            },
+            100,
+            SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
+            None,
+            16,
+        );
+        let stream_id = BucketStreamId::new("erased", "marked");
+        let group = node.runtime.locate(&stream_id).raft_group_id;
+        let raft = node.registry.get(group).expect("registered group");
+        raft.wait(Some(Duration::from_secs(10)))
+            .current_leader(1, "the only voter leads")
+            .await
+            .expect("the group elects its leader");
+        node.runtime
+            .create_stream(CreateStreamRequest::new(
+                stream_id.clone(),
+                "application/octet-stream",
+            ))
+            .await
+            .expect("create the stream");
+        for _ in 0..3 {
+            node.runtime
+                .append(AppendRequest::from_bytes(
+                    stream_id.clone(),
+                    DELETED_MARKER.to_vec(),
+                ))
+                .await
+                .expect("append a marked record");
+        }
+        // A snapshot holds the stream before it goes. OpenRaft drops a
+        // trigger while the driver's first build of the group runs.
+        let applied = raft.metrics().borrow_watched().last_applied;
+        let mut covered = false;
+        for _ in 0..20 {
+            raft.trigger().snapshot().await.expect("trigger a snapshot");
+            covered = raft
+                .wait(Some(Duration::from_millis(500)))
+                .metrics(
+                    |metrics| metrics.snapshot >= applied,
+                    "the snapshot covers the marked records",
+                )
+                .await
+                .is_ok();
+            if covered {
+                break;
+            }
+        }
+        assert!(covered, "no snapshot covers the marked records");
+        assert!(snapshot_holds_marker(&raft, &stream_id).await);
+
+        node.runtime
+            .delete_stream(ursula_runtime::DeleteStreamRequest {
+                stream_id: stream_id.clone(),
+                if_incarnation: None,
+            })
+            .await
+            .expect("delete the stream");
+        let deleted_at = Instant::now();
+        let removal = raft
+            .metrics()
+            .borrow_watched()
+            .last_applied
+            .expect("applied the deletion");
+        // The node reports the removal it still holds.
+        let deadline = deleted_at
+            .checked_add(Duration::from_secs(1))
+            .expect("deadline");
+        while node
+            .runtime
+            .metrics()
+            .snapshot()
+            .raft_deleted_data_oldest_age_ms
+            == 0
+        {
+            assert!(Instant::now() < deadline, "the removal is never reported");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // Within the bound the snapshot covers the deletion and the log is
+        // purged through it.
+        let scrubbed = raft
+            .wait(Some(max_age))
+            .metrics(
+                |metrics| {
+                    metrics.snapshot >= Some(removal)
+                        && metrics.purged.map(|purged| purged.index)
+                            >= metrics.snapshot.map(|snapshot| snapshot.index)
+                },
+                "the log is purged through the snapshot that covers the deletion",
+            )
+            .await
+            .expect("scrub the deleted stream within the bound");
+        assert!(deleted_at.elapsed() >= max_age.checked_div(4).expect("a quarter"));
+        assert!(!snapshot_holds_marker(&raft, &stream_id).await);
+        assert!(scrubbed.purged >= scrubbed.snapshot);
+        let deadline = Instant::now()
+            .checked_add(Duration::from_secs(1))
+            .expect("deadline");
+        loop {
+            let metrics = node.runtime.metrics().snapshot();
+            if metrics.raft_deleted_data_oldest_age_ms == 0
+                && metrics.raft_deleted_data_overdue_groups == 0
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the scrubbed removal is still reported"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// #519: past the hard limit the driver keeps as many builds in flight
     /// as the node allows, and reports the escalation. The node runs as many
     /// builds at once as the server's default config gives it: two.
@@ -8210,6 +8531,64 @@ mod snapshot_driver {
         );
         assert_eq!(store.uploads().started, 1);
         store.open();
+        node.shutdown().await;
+    }
+
+    /// #669: an operator's purge follows the hold rule of every purge: while
+    /// a build of the group runs it answers 503 with `Retry-After`, and once
+    /// the group is idle it purges through the snapshot.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_operator_purge_answers_503_while_its_group_builds() {
+        let store = GatedStore::new();
+        let (node, admin) = operator_node(&store, 2).await;
+        store.release(1);
+        let snapshot = snapshot_index(operator_snapshot(&admin, 0).await.expect("snapshot"))
+            .await
+            .expect("a snapshot index");
+        let purge = |admin: Router| async move {
+            send(
+                &admin,
+                "POST",
+                &format!("/__ursula/raft/0/purge?upto={snapshot}"),
+                &[],
+                Body::empty(),
+            )
+            .await
+        };
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .trigger()
+            .snapshot()
+            .await
+            .expect("trigger group 0's snapshot");
+        store.wait_for_uploads(1, Duration::from_secs(30)).await;
+        let busy = purge(admin.clone()).await;
+        assert_eq!(busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            busy.headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("1")
+        );
+        store.open();
+        node.registry
+            .snapshot_build_coordinator()
+            .build_ended(0)
+            .await;
+        let mut purged = None;
+        for _ in 0..100 {
+            let response = purge(admin.clone()).await;
+            if response.status() == StatusCode::OK {
+                purged = Some(response);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(
+            purged.is_some(),
+            "the purge never ran once the group was idle"
+        );
         node.shutdown().await;
     }
 

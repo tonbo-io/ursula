@@ -249,7 +249,8 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
                 config.raft.snapshot_log_budget.as_bytes(),
                 topology.raft_group_count(),
                 config.raft.snapshot_backstop_logs,
-            ),
+            )
+            .with_deleted_data_max_age(config.raft.effective_deleted_data_max_age()),
             spawned.raft_wal.as_ref().map(|wal| wal.lagging_groups()),
             config.raft.snapshot_pressure_max_groups_per_tick,
         );

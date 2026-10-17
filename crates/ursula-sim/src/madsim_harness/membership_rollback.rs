@@ -198,6 +198,10 @@ pub(super) struct Controls {
     /// B1 of the fifth #613 review: the screen reads the store's marker
     /// alone and skips every index at or below the last purged entry.
     purge_unscreened: bool,
+    /// Every node runs the production snapshot driver (#669), whose purges
+    /// through covering snapshots and restored snapshots land at any time.
+    /// Not a defence: the plans must hold with it.
+    drivers: Option<super::journal_cluster::DriverPlan>,
 }
 
 #[cfg(test)]
@@ -210,6 +214,12 @@ impl Controls {
         install_unscreened: false,
         chain_unscreened: false,
         purge_unscreened: false,
+        drivers: None,
+    };
+    /// Every defence on, and the snapshot driver on every node.
+    pub(super) const WITH_DRIVERS: Self = Self {
+        drivers: Some(super::deleted_data::DRIVERS),
+        ..Self::NONE
     };
     pub(super) const R2_EFFECTIVE: Self = Self {
         r2_effective: true,
@@ -249,6 +259,7 @@ struct Switched;
 impl Switched {
     fn apply(controls: Controls) -> Self {
         set_defences(controls);
+        super::journal_cluster::set_snapshot_drivers(controls.drivers);
         ursula_stream::sim_controls::reset_fired();
         Self
     }
@@ -257,6 +268,7 @@ impl Switched {
 impl Drop for Switched {
     fn drop(&mut self) {
         set_defences(Controls::default());
+        super::journal_cluster::set_snapshot_drivers(None);
     }
 }
 
@@ -2090,7 +2102,9 @@ async fn assert_node_kept(
 }
 
 /// Fails G1 when the learner no longer holds the committed entry it held
-/// before the loss: a plan overwrote it.
+/// before the loss, in its log or as its last purged entry: a plan
+/// overwrote it. A snapshot driver (#669) may purge the log through a
+/// snapshot that covers the entry.
 async fn assert_learner_kept(
     cluster: &JournalCluster,
     ahead: &std::collections::BTreeMap<u32, LogIdOf<UrsulaRaftTypeConfig>>,
@@ -2100,12 +2114,18 @@ async fn assert_learner_kept(
         let mut store = cluster.wals[&LEARNER]
             .store(RaftGroupId(*group))
             .expect("the learner runs");
+        let purged = store
+            .get_log_state()
+            .await
+            .expect("read the learner's log state")
+            .last_purged_log_id;
         let held = store
             .try_get_log_entries(committed.index..=committed.index)
             .await
             .expect("read the learner's log")
             .first()
-            .map(|entry| entry.log_id);
+            .map(|entry| entry.log_id)
+            .or(purged.filter(|purged| purged.index == committed.index));
         if held != Some(*committed) {
             fail(
                 trace,
@@ -2398,6 +2418,22 @@ mod tests {
             message.contains("self.committed()") || message.contains(HISTORY_INVARIANT),
             "{message}"
         );
+    }
+
+    /// #669, reruns of the #647 recovery DSTs: with the production snapshot
+    /// driver on every node and a short floor, purges through covering and
+    /// restored snapshots land at any time, and every variant's plan still
+    /// holds.
+    #[test]
+    fn scrub_driver_keeps_membership_rollback_plans() {
+        let _guard = sim_test_guard();
+        for seed in 505..=513 {
+            let report = ThreeNodeRaftSim::run_membership_rollback_with_controls_report(
+                config(seed),
+                Controls::WITH_DRIVERS,
+            );
+            assert_eq!(report.scenario, SCENARIO, "seed {seed}");
+        }
     }
 
     /// Runs `seed` under `controls`, which must panic, and returns the

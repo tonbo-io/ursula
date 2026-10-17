@@ -925,6 +925,42 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertNotIn("snapshot_build_max_concurrency", parsed["raft"])
 
+    def test_deleted_data_max_age_renders_only_when_set(self) -> None:
+        # Unset, the key is not rendered, so a pod that still runs an older
+        # image never gets a key it does not know.
+        parsed = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))
+        self.assertNotIn("deleted_data_max_age", parsed["raft"])
+
+        config = render_config(
+            *NAMED,
+            "--set",
+            "raft.deletedDataMaxAgeMs=7200000",
+            "--set",
+            "s3.bucket=bkt",
+        )
+        parsed = tomllib.loads(config)
+        self.assertEqual(parsed["raft"]["deleted_data_max_age"], "7200000ms")
+
+    def test_deleted_data_max_age_below_one_is_refused(self) -> None:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                "charts/ursula",
+                "--set",
+                "s3.bucket=bkt",
+                "--set",
+                "raft.deletedDataMaxAgeMs=0",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("deletedDataMaxAgeMs", result.stderr)
+
     def test_snapshot_build_concurrency_below_one_is_refused(self) -> None:
         result = subprocess.run(
             [

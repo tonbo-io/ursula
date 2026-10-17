@@ -260,6 +260,12 @@ raft:
   snapshotBuildMaxConcurrency: null
   # Payload-bearing log entries retained per group after snapshot coverage.
   maxInSnapshotLogToKeep: 64
+  # How long, in milliseconds, a replica keeps a deleted, purged or expired stream in its current
+  # Raft snapshot and its Raft log after it applies the removal. At least eight times the install
+  # snapshot timeout (16 minutes at the default). Unset, each server keeps its own default, the
+  # larger of 1 hour and eight install timeouts, so a pod that still runs an older image never
+  # gets a key it does not know.
+  deletedDataMaxAgeMs: null
 
 # Every server pod gets a raft-data PVC for its Raft WAL.
 persistence:

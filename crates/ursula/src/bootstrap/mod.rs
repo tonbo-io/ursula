@@ -32,6 +32,8 @@ pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
 pub(crate) use runtime::spawn_runtime_with_maintenance_drain;
+pub use snapshot::SnapshotDriveSettings;
+pub use snapshot::SnapshotDriver;
 // Internals the crate's unit tests exercise directly.
 #[cfg(test)]
 pub(crate) use test_reexports::*;
@@ -59,9 +61,13 @@ mod test_reexports {
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::participation::PeerParticipation;
+    pub(crate) use super::snapshot::ScrubPurge;
     pub(crate) use super::snapshot::StoreGateInputs;
     pub(crate) use super::snapshot::Trigger;
+    pub(crate) use super::snapshot::deleted_data_sample;
     pub(crate) use super::snapshot::group_log_progress;
+    pub(crate) use super::snapshot::groups_to_drive;
+    pub(crate) use super::snapshot::plan_scrub_purges;
     pub(crate) use super::snapshot::plan_snapshot_drive;
     pub(crate) use super::snapshot::resolve_snapshot_drive_interval_ms;
     pub(crate) use super::snapshot::spawn_snapshot_driver;

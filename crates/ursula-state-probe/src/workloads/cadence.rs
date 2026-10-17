@@ -235,7 +235,8 @@ pub fn run(args: &CadenceArgs, sink: &mut Sink) -> Result<Outcome> {
                 };
                 let mark = group.gauge.mark();
                 let bytes = snapshot_bytes(group)?;
-                group.gauge.record_snapshot(mark, bytes);
+                // The probe removes nothing, so no purge watermark moves.
+                group.gauge.record_snapshot(mark, bytes, appended);
                 snapshots = snapshots.saturating_add(1);
                 snapshot_total = snapshot_total.saturating_add(bytes);
                 largest_snapshot = largest_snapshot.max(bytes);

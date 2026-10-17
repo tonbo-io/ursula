@@ -334,6 +334,10 @@ fn generate_recovery_plan_membership_rollback(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::RecoveryPlanMembershipRollback)
 }
 
+fn generate_deleted_data_leaves_within_bound(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::DeletedDataLeavesWithinBound)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -431,6 +435,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 999,
         kind: "recovery-plan-membership-rollback",
         generate: generate_recovery_plan_membership_rollback,
+    },
+    SeedFamily {
+        name: "deleted-data-leaves-within-bound",
+        start: 520,
+        end: 527,
+        kind: "deleted-data-leaves-within-bound",
+        generate: generate_deleted_data_leaves_within_bound,
+    },
+    SeedFamily {
+        name: "deleted-data-leaves-within-bound-extended",
+        start: 600,
+        end: 629,
+        kind: "deleted-data-leaves-within-bound",
+        generate: generate_deleted_data_leaves_within_bound,
     },
     SeedFamily {
         name: "history-rewind-under-leader-churn-extended",

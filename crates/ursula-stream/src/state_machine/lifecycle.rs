@@ -392,6 +392,7 @@ impl StreamStateMachine {
         let Some(slot) = self.registry.remove(stream_id) else {
             return false;
         };
+        self.record_removed(&slot);
         self.flush_planner.unmark_hot(stream_id);
         self.remove_hot_payload_bytes(
             u64::try_from(slot.hot_buffer.len()).expect("payload len fits u64"),
@@ -450,6 +451,25 @@ impl StreamStateMachine {
         }
         self.release_shared_cold_objects(&stream_id.bucket_id, shared_paths, 0);
         true
+    }
+
+    /// Counts a removed stream and what it held in a group snapshot (#669).
+    fn record_removed(&mut self, slot: &StreamSlot) {
+        let hot = u64::try_from(slot.hot_buffer.len()).unwrap_or(u64::MAX);
+        let inline_snapshot = slot
+            .visible_snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.object.is_none())
+            .map_or(0, |snapshot| {
+                u64::try_from(snapshot.payload.len()).unwrap_or(u64::MAX)
+            });
+        self.removed.streams = self.removed.streams.saturating_add(1);
+        self.removed.bytes = self
+            .removed
+            .bytes
+            .saturating_add(hot)
+            .saturating_add(inline_snapshot)
+            .saturating_add(crate::COMMAND_LOG_OVERHEAD_BYTES);
     }
 
     /// The `Stream-Incarnation` precondition (D12) of `command` at apply

@@ -147,6 +147,14 @@ impl SimNodeWal {
         Ok(store)
     }
 
+    /// Where `placement`'s record of its current snapshot lives in the
+    /// node's current run, as the production engine factories place it.
+    pub(super) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
+        self.run()
+            .expect("start a simulated node's Raft WAL")
+            .sim_snapshot_metadata_path(placement)
+    }
+
     /// The group's open store, if its engine still holds it.
     pub(super) fn store(&self, raft_group_id: RaftGroupId) -> Option<Arc<RaftGroupFileLogStore>> {
         self.handed_out(raft_group_id)?.upgrade()

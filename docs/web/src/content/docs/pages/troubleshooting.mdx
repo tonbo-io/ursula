@@ -398,10 +398,12 @@ These are admin-plane endpoints (`server.admin_listen`, loopback `:4438` by defa
 ```bash
 process_incarnation=$(curl --fail http://127.0.0.1:4438/__ursula/metrics | jq -er .process_incarnation)
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/snapshot
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/{group_id}/purge
+curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/{group_id}/purge?upto={index}"
 ```
 
 The snapshot request answers once the group has a snapshot of everything it had applied when the request arrived. It waits while a build of the group runs and while other snapshot builds hold all of the node's build permits, and a snapshot that a build begun since the request made answers it too. When no build of the group can start within 10 seconds, it answers `503` with `Retry-After: 1`. Send it again then. Unless the group's published snapshot already covers the request, it then waits up to 10 seconds for the group's running build to end and up to 10 more for the snapshot to show, and answers `500` when it does not.
+
+The purge request drops log entries through `upto`, at most through the group's published snapshot. While a snapshot of the group builds, OpenRaft has not published the one it built, or an earlier purge of the group has not landed, it answers `503` with `Retry-After: 1`. Send it again then.
 
 Purge only after the snapshot replicates. Otherwise a slow follower may need log entries you just dropped.
 

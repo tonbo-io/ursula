@@ -1961,14 +1961,11 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         .and_then(serde_json::Value::as_u64)
         .expect("snapshot index");
 
-    let purge = admin_test_post(
+    let purge = admin_purge(
         &client,
         format!("{node1_admin}/__ursula/raft/0/purge?upto={snapshot_index}"),
     )
-    .await
-    .send()
-    .await
-    .expect("trigger leader purge");
+    .await;
     assert_eq!(purge.status(), reqwest::StatusCode::OK);
 
     children.push(spawn_node_with_cluster_config(binary, &node3_config));
@@ -2008,6 +2005,223 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
     )
     .await;
     assert_eq!(late_payload, b"cli-late-learner-payload");
+
+    drop(children);
+    std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
+/// The bytes every record of the stream the deleted-data test removes
+/// carries.
+const DELETED_MARKER: &str = "deleted-data-marker-669;";
+
+/// The `raft_groups[0]` progress of `base_url`'s metrics: last applied,
+/// snapshot and purged index.
+async fn group_zero_progress(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> (Option<u64>, Option<u64>, Option<u64>, serde_json::Value) {
+    let metrics: serde_json::Value = client
+        .get(format!("{base_url}/__ursula/metrics"))
+        .send()
+        .await
+        .expect("read metrics")
+        .json()
+        .await
+        .expect("metrics JSON");
+    let group = &metrics["raft_groups"][0];
+    let index = |key: &str| group[key].as_u64();
+    (
+        index("last_applied_index"),
+        index("snapshot_index"),
+        index("purged_index"),
+        metrics,
+    )
+}
+
+/// Every node-local snapshot file under `wal_dir` that holds
+/// [`DELETED_MARKER`].
+fn snapshot_files_with_marker(wal_dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(".snapshot.json"))
+                && std::fs::read(&path).is_ok_and(|bytes| {
+                    bytes
+                        .windows(DELETED_MARKER.len())
+                        .any(|window| window == DELETED_MARKER.as_bytes())
+                })
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(wal_dir, &mut found);
+    found
+}
+
+/// #669: within `raft.deleted_data_max_age` of a stream's deletion, each
+/// replica's current snapshot no longer holds it and its Raft log is purged
+/// through that snapshot. Inline snapshots: the snapshot file in each
+/// node's Raft log directory is the whole snapshot. The WAL's segment files
+/// are bounded by a later change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the deleted-data CLI test");
+        return;
+    };
+    let ports = [free_port(), free_port(), free_port()];
+    let peers: Vec<(u64, String)> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let root = std::env::temp_dir().join(format!(
+        "ursula-cli-deleted-data-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos()
+    ));
+    remove_test_path(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let max_age = Duration::from_secs(90);
+    let mut children = Vec::new();
+    let mut admins = Vec::new();
+    let mut wal_dirs = Vec::new();
+    for (node_id, port) in (1_u64..).zip(ports) {
+        let config = root.join(format!("node-{node_id}.toml"));
+        let wal_dir = root.join(format!("node-{node_id}-log"));
+        let admin_port =
+            write_cluster_config(&config, port, node_id, 1, &peers, node_id == 1, &wal_dir);
+        let text = std::fs::read_to_string(&config).expect("read node config");
+        assert!(text.contains("init_membership_per_group = false\n"));
+        std::fs::write(
+            &config,
+            text.replace(
+                "init_membership_per_group = false\n",
+                "init_membership_per_group = false\ndeleted_data_max_age = \"90s\"\n\
+                 install_snapshot_timeout = \"10s\"\n",
+            ),
+        )
+        .expect("write node config");
+        admins.push(format!("http://127.0.0.1:{admin_port}"));
+        wal_dirs.push(wal_dir);
+        children.push(spawn_node_with_cluster_config(binary, &config));
+    }
+    let client = reqwest::Client::new();
+    for (_, url) in &peers {
+        wait_until_ready(&client, url, &mut children).await;
+    }
+
+    let stream = format!("{}/erased/marked", peers[0].1);
+    put_until_created(&client, &stream).await;
+    for _ in 0..3 {
+        post_until_no_content(&client, &stream, DELETED_MARKER).await;
+    }
+    for (_, url) in &peers {
+        let payload = read_until_matches(
+            &client,
+            &format!("{url}/erased/marked?offset=0&max_bytes=1024"),
+            DELETED_MARKER.repeat(3).as_bytes(),
+        )
+        .await;
+        assert_eq!(payload, DELETED_MARKER.repeat(3).as_bytes());
+    }
+    // Every replica's current snapshot holds the stream before it goes.
+    for (admin, wal_dir) in admins.iter().zip(&wal_dirs) {
+        let snapshot = admin_test_post(&client, format!("{admin}/__ursula/raft/0/snapshot"))
+            .await
+            .send()
+            .await
+            .expect("trigger a snapshot");
+        assert_eq!(snapshot.status(), reqwest::StatusCode::OK);
+        assert!(
+            !snapshot_files_with_marker(wal_dir).is_empty(),
+            "{admin}: the snapshot before the deletion holds the stream"
+        );
+    }
+
+    let mut deleted = false;
+    for _ in 0..100 {
+        if let Ok(response) = client.delete(&stream).send().await
+            && response.status().is_success()
+        {
+            deleted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(deleted, "delete {stream}");
+    let deleted_at = tokio::time::Instant::now();
+    let mut removal_index = 0;
+    for (_, url) in &peers {
+        let (applied, ..) = group_zero_progress(&client, url).await;
+        removal_index = removal_index.max(applied.expect("applied index"));
+    }
+    // The replicas owe a snapshot that drops the stream, and report it.
+    for (_, url) in &peers {
+        let mut reported = serde_json::Value::Null;
+        for _ in 0..100 {
+            let (.., metrics) = group_zero_progress(&client, url).await;
+            reported = metrics["deleted_data"].clone();
+            if reported
+                .as_array()
+                .is_some_and(|groups| groups.iter().any(|group| group["raft_group_id"] == 0))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            reported
+                .as_array()
+                .is_some_and(|groups| groups.iter().any(|group| group["state"] == "owed")),
+            "{url}: {reported}"
+        );
+    }
+
+    let mut pending = (0..peers.len()).collect::<Vec<_>>();
+    while !pending.is_empty() {
+        assert!(
+            deleted_at.elapsed() < max_age.saturating_add(Duration::from_secs(30)),
+            "replicas {pending:?} still hold the deleted stream past the bound"
+        );
+        let mut still = Vec::new();
+        for index in pending {
+            let (applied, snapshot, purged, metrics) =
+                group_zero_progress(&client, &peers[index].1).await;
+            let scrubbed = applied >= Some(removal_index)
+                && snapshot >= Some(removal_index)
+                && purged >= snapshot
+                && snapshot_files_with_marker(&wal_dirs[index]).is_empty()
+                && metrics["raft_deleted_data_oldest_age_ms"] == 0;
+            if !scrubbed {
+                still.push(index);
+            }
+        }
+        pending = still;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    for (_, url) in &peers {
+        let read = client
+            .get(format!("{url}/erased/marked?offset=0"))
+            .send()
+            .await
+            .expect("read the deleted stream");
+        assert_eq!(read.status(), reqwest::StatusCode::NOT_FOUND);
+    }
 
     drop(children);
     std::fs::remove_dir_all(&root).expect("remove temp root");
@@ -2335,11 +2549,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             let result: ursula_proto::admin::SnapshotResponse = response.json().await.unwrap();
             let index = result.snapshot_index.unwrap();
-            let response = admin_test_post(&client, format!("{root}/purge?upto={index}"))
-                .await
-                .send()
-                .await
-                .unwrap();
+            let response = admin_purge(&client, format!("{root}/purge?upto={index}")).await;
             assert_eq!(response.status(), reqwest::StatusCode::OK);
         }
     }
@@ -4160,6 +4370,24 @@ async fn admin_test_post(client: &reqwest::Client, url: String) -> reqwest::Requ
         ursula_proto::admin::PROCESS_INCARNATION_HEADER,
         metrics["process_incarnation"].as_str().expect("identity"),
     )
+}
+
+/// Asks for an admin purge, again while the group's snapshot work is not
+/// idle: the route answers 503 with `Retry-After` then, as when the snapshot
+/// driver builds the group (#669).
+async fn admin_purge(client: &reqwest::Client, url: String) -> reqwest::Response {
+    for _ in 0..100 {
+        let response = admin_test_post(client, url.clone())
+            .await
+            .send()
+            .await
+            .expect("send an admin purge");
+        if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the admin purge at {url} stayed unavailable");
 }
 
 /// Remove a temporary test file or directory, tolerating its absence.

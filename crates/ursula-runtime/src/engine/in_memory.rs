@@ -961,6 +961,13 @@ impl InMemoryGroupEngine {
         self.state_machine.state_gauges()
     }
 
+    /// What the applied state removed since it was built or restored
+    /// (#669): the Raft state machine reads it around each entry to learn
+    /// that the entry removed a stream.
+    pub fn removed_state(&self) -> ursula_stream::RemovedState {
+        self.state_machine.removed_state()
+    }
+
     /// Streams with `TidyStream` debt (bounded-state F0), for the leader's
     /// tidy driver. Public so the Raft engine can serve it.
     pub fn tidy_candidates(&self, now_ms: u64, limit: usize) -> Vec<BucketStreamId> {

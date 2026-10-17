@@ -62,6 +62,15 @@ pub enum ValidationError {
          cold backend"
     )]
     InflightBodyBudgetTooSmall { budget: u64, minimum: u64 },
+    /// A bound on deleted data shorter than eight snapshot installs (#669).
+    #[error(
+        "raft.deleted_data_max_age ({value:?}) must be at least {minimum:?}, eight times \
+         raft.install_snapshot_timeout"
+    )]
+    DeletedDataMaxAgeTooShort {
+        value: std::time::Duration,
+        minimum: std::time::Duration,
+    },
     #[error("{0}")]
     Other(String),
 }
@@ -158,6 +167,14 @@ impl UrsulaConfig {
         let builds = self.raft.snapshot_build_max_concurrency;
         if !(1..=RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY).contains(&builds) {
             return Err(ValidationError::SnapshotBuildConcurrency { value: builds });
+        }
+        // Only a set value is checked: unset, the bound follows the install
+        // timeout, so a config without the key stays valid.
+        if let Some(value) = self.raft.deleted_data_max_age.map(|age| age.as_duration()) {
+            let minimum = self.raft.min_deleted_data_max_age();
+            if value < minimum {
+                return Err(ValidationError::DeletedDataMaxAgeTooShort { value, minimum });
+            }
         }
         if self.raft.snapshot_pressure_max_groups_per_tick == 0 {
             return Err(ValidationError::Other(
@@ -425,6 +442,56 @@ mod tests {
             .validate()
             .expect_err("shedding at the backpressure cliff must be rejected");
         assert!(error.to_string().contains("max_hot_size_per_group"));
+    }
+
+    /// #669: the bound on deleted data is at least eight snapshot installs.
+    #[test]
+    fn deleted_data_max_age_is_at_least_eight_installs() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        assert_eq!(config.raft.deleted_data_max_age, None);
+        assert_eq!(
+            config.raft.effective_deleted_data_max_age(),
+            std::time::Duration::from_secs(3_600)
+        );
+        config.validate().expect("the defaults are valid");
+        config.raft.deleted_data_max_age = Some(HumanDuration::min(16));
+        config
+            .validate()
+            .expect("eight times the default install timeout");
+        config.raft.deleted_data_max_age = Some(HumanDuration::sec(959));
+        let err = config.validate().expect_err("shorter than eight installs");
+        assert!(
+            matches!(
+                err,
+                ValidationError::DeletedDataMaxAgeTooShort { value, minimum }
+                    if value == std::time::Duration::from_secs(959)
+                        && minimum == std::time::Duration::from_secs(960)
+            ),
+            "{err}"
+        );
+        config.raft.install_snapshot_timeout = HumanDuration::sec(10);
+        config.raft.deleted_data_max_age = Some(HumanDuration::sec(80));
+        config
+            .validate()
+            .expect("eight times a shorter install timeout");
+    }
+
+    /// #669: a 0.8.0 config with a long install timeout and no
+    /// `deleted_data_max_age` stays valid: the unset bound follows the
+    /// install timeout.
+    #[test]
+    fn an_unset_deleted_data_max_age_follows_a_long_install_timeout() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.raft.install_snapshot_timeout = HumanDuration::min(10);
+        config
+            .validate()
+            .expect("an unset bound never refuses a config");
+        assert_eq!(
+            config.raft.effective_deleted_data_max_age(),
+            std::time::Duration::from_secs(80 * 60)
+        );
     }
 
     #[test]

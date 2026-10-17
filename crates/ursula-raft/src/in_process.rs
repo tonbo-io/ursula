@@ -294,6 +294,9 @@ pub struct InProcessRaftNetworkPolicy {
 struct InProcessRaftNetworkPolicyState {
     delay: Option<Duration>,
     partitions: BTreeSet<(u64, u64)>,
+    /// How long appends that carry entries take from one node to another
+    /// ([`InProcessRaftNetworkPolicy::set_entries_delay`]).
+    entries_delays: BTreeMap<(u64, u64), Duration>,
 }
 
 impl Debug for InProcessRaftNetworkPolicy {
@@ -320,6 +323,37 @@ impl InProcessRaftNetworkPolicy {
             .expect("in-process raft network policy mutex")
             .delay = delay;
         self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::SetDelay(delay));
+    }
+
+    /// Holds every append that carries entries from `source` to `target`
+    /// for `delay`, or no longer with `None`. Heartbeats carry none and pass
+    /// at once, so `target` keeps its leader while its log falls behind, and
+    /// a leader's request to it stays in flight for `delay`.
+    pub fn set_entries_delay(&self, source: u64, target: u64, delay: Option<Duration>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("in-process raft network policy mutex");
+        match delay {
+            Some(delay) => {
+                inner.entries_delays.insert((source, target), delay);
+            }
+            None => {
+                inner.entries_delays.remove(&(source, target));
+            }
+        }
+    }
+
+    /// How long an append that carries entries takes from `source` to
+    /// `target`.
+    fn entries_delay(&self, source: Option<u64>, target: u64) -> Option<Duration> {
+        let source = source?;
+        self.inner
+            .lock()
+            .expect("in-process raft network policy mutex")
+            .entries_delays
+            .get(&(source, target))
+            .copied()
     }
 
     pub fn partition_bidirectional(&self, a: u64, b: u64) {
@@ -352,6 +386,7 @@ impl InProcessRaftNetworkPolicy {
             .expect("in-process raft network policy mutex");
         inner.delay = None;
         inner.partitions.clear();
+        inner.entries_delays.clear();
         self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::Clear);
     }
 
@@ -564,6 +599,11 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_rpc(InProcessRaftRpcKind::AppendEntries)
             .await
             .map_err(RPCError::Unreachable)?;
+        if !rpc.entries.is_empty()
+            && let Some(delay) = self.policy.entries_delay(self.source, self.target)
+        {
+            sleep_in_process_raft_network(delay).await;
+        }
         let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {

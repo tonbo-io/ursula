@@ -147,6 +147,13 @@ impl RaftWal {
         core_dir(self.root(), core_id.0)
     }
 
+    /// Where a group's node-local record of its current snapshot lives, for
+    /// a simulation that builds its engines itself.
+    #[cfg(madsim)]
+    pub fn sim_snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
+        self.snapshot_metadata_path(placement)
+    }
+
     pub(crate) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
         self.root()
             .join(format!("core-{}", placement.core_id.0))

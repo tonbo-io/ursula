@@ -241,6 +241,16 @@ pub struct RaftConfig {
     /// Maximum number of payload-bearing Raft log entries retained per group
     /// after they are covered by a snapshot.
     pub max_in_snapshot_log_to_keep: u64,
+    /// How long a replica keeps a deleted, purged or expired stream in its
+    /// current Raft snapshot and its Raft log after it applies the removal
+    /// (#669). The snapshot driver snapshots a group a quarter of this
+    /// after its oldest removal no snapshot covers, sooner when the removed
+    /// bytes reach the group's snapshot threshold, and then purges the
+    /// group's log through that snapshot. Unset, it is the larger of one
+    /// hour and eight times `install_snapshot_timeout`
+    /// ([`RaftConfig::effective_deleted_data_max_age`]). A set value must be
+    /// at least eight times `install_snapshot_timeout`.
+    pub deleted_data_max_age: Option<HumanDuration>,
 }
 
 impl RaftConfig {
@@ -250,6 +260,33 @@ impl RaftConfig {
     /// builds of large groups already hold gigabytes. A larger value is
     /// taken for a mistake.
     pub const MAX_SNAPSHOT_BUILD_CONCURRENCY: usize = 16;
+    /// `deleted_data_max_age` is at least this many `install_snapshot_timeout`s
+    /// (#669). The floor is reserved for the snapshot GC pin that lands next:
+    /// it will keep the snapshot object a replica replaced for a quarter of
+    /// the age, which must outlast two installs of that object.
+    pub const DELETED_DATA_MAX_AGE_INSTALLS: u32 = 8;
+    /// `deleted_data_max_age` when it is unset and the install timeout
+    /// allows it.
+    pub const DEFAULT_DELETED_DATA_MAX_AGE: std::time::Duration =
+        std::time::Duration::from_secs(60 * 60);
+
+    /// The shortest `deleted_data_max_age` this config allows.
+    pub fn min_deleted_data_max_age(&self) -> std::time::Duration {
+        self.install_snapshot_timeout
+            .as_duration()
+            .saturating_mul(Self::DELETED_DATA_MAX_AGE_INSTALLS)
+    }
+
+    /// The bound on deleted data the node keeps: the configured
+    /// `deleted_data_max_age`, or, unset, the larger of one hour and
+    /// [`RaftConfig::min_deleted_data_max_age`], so a config without it
+    /// stays valid whatever its install timeout.
+    pub fn effective_deleted_data_max_age(&self) -> std::time::Duration {
+        self.deleted_data_max_age.map_or_else(
+            || Self::DEFAULT_DELETED_DATA_MAX_AGE.max(self.min_deleted_data_max_age()),
+            |configured| configured.as_duration(),
+        )
+    }
 }
 
 impl Default for RaftConfig {
@@ -278,6 +315,7 @@ impl Default for RaftConfig {
             snapshot_log_budget: HumanSize::gib(1),
             snapshot_backstop_logs: 100_000,
             max_in_snapshot_log_to_keep: 64,
+            deleted_data_max_age: None,
         }
     }
 }

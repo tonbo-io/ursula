@@ -160,7 +160,8 @@ jobs:
             --seed-family recovery-plan-survivor-campaigns \
             --seed-family routing-before-body-under-leader-churn \
             --seed-family marked-chunks-never-contradict \
-            --seed-family recovery-plan-membership-rollback
+            --seed-family recovery-plan-membership-rollback \
+            --seed-family deleted-data-leaves-within-bound
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json
@@ -285,6 +286,14 @@ jobs:
             rotation_purge_and_rewrite_survive_crashes a_purge_is_durable_before_the_segments \
             a_lagging_follower_catches_up disk_tests poison_marker --nocapture
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-raft snapshot_metadata_ -- --nocapture
+
+      # Deleted data (#669): an operator's snapshot waits for a purge through
+      # a covering snapshot the leader defers, and the #647 recovery plans
+      # hold with the production snapshot driver on every node.
+      - name: Run deleted-data scenarios
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            scrub_ --nocapture
 
       # Strict replay: madsim's check_determinism runs a three-node cluster on
       # the per-core journal twice per seed and fails at the first scheduling
