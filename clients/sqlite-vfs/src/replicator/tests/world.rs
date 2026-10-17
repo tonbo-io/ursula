@@ -31,8 +31,7 @@
 //!    other bytes diverge unless the later one was made after catching the earlier one up);
 //! 9. `Synced` never fires while a pre-call foreign frame sits past the acknowledged offset, nor
 //!    for a target later discarded (a claim is the owner's own only when its log holds that epoch
-//!    and activation, or an explicit open made it under the activation the owner runs under, so
-//!    another copy's continuation claim under a shared activation is foreign);
+//!    and activation, so another copy's claim under a shared activation is foreign);
 //! 10. the bytes between an owner's consecutive acknowledged offsets are its own frames (a claim
 //!     of an activation its log holds or it runs under, as its reconcile reads it, design: Claims),
 //!     frames it caught up, or foreign claims in a takeover's reconcile or followed by a claim of
@@ -1848,19 +1847,6 @@ impl World {
         });
     }
 
-    /// Whether the claim frame `(epoch, activation)` is `owner`'s own (property 9): its log holds
-    /// that claim, so another copy's claim under an activation they share is not (a probe never
-    /// reads past one; a `synced()` past it would be another copy's state). An
-    /// explicit open's claim under the activation the instance runs under counts too: a claim
-    /// frame of its activation is the replicator's (design: Claims), so a second open under one
-    /// activation (a platform's constant `activation`, or a clone and its original reopened under
-    /// the one they share) is the residual case of a shared activation.
-    fn owns_claim(&self, owner: &Owner, epoch: Epoch, activation: Activation) -> bool {
-        let current = owner.inst.replicator.ctx().map(|ctx| ctx.activation);
-        owner.log.claims.contains(&(epoch, activation))
-            || (current == Some(activation) && self.explicit.contains(&(epoch, activation)))
-    }
-
     /// Property 10: what lies between the previous acknowledged offset and `offset`.
     fn between_acks(&mut self, index: usize, offset: Offset, takeover: bool) {
         let owner = &mut self.owners[index];
@@ -1946,7 +1932,10 @@ impl World {
                 let bytes = past.get(start..start + len).unwrap_or_default();
                 let own = match frame {
                     Some(Frame::Claim { epoch, activation }) => {
-                        self.owns_claim(&owner, epoch, activation)
+                        // Its own only when its log holds that claim: another copy's claim under
+                        // an activation they share is not (a probe never reads past one, so a
+                        // `synced()` past it would be another copy's state).
+                        owner.log.claims.contains(&(epoch, activation))
                     }
                     Some(Frame::Commit { .. }) => own_frames.contains(&bytes),
                     _ => false,
@@ -4667,8 +4656,8 @@ fn a_clone_reopened_under_the_shared_activation_is_one_owner_to_the_other() {
 /// Found at a million cases: owner 0 restarts provisionally, is cloned, and a restore empties the
 /// stream; owner 0 reopens under the activation it shares with the clone and takes over afresh.
 /// The clone's re-keyed pre-check reads that takeover's claim as its own (design: Claims) and binds
-/// past it: the residual case of a shared activation, an explicit open's claim under the
-/// activation the clone runs under (properties 9 and 10).
+/// past it: the residual case of a shared activation, a claim under the activation the clone runs
+/// under (property 10).
 #[test]
 fn a_clone_binds_past_its_originals_takeover_under_the_shared_activation() {
     use Op::Commit;
