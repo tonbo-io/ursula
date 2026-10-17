@@ -4626,11 +4626,12 @@ async fn a_leader_sweeps_expired_streams_with_the_0_8_0_touch_only() {
         .client_write(create_command(bsid("live")))
         .await
         .expect("create a live stream");
-    let before = engine
-        .snapshot(placement())
-        .await
-        .expect("snapshot")
-        .group_commit_index;
+    let applied = |engine: &RaftGroupEngine| {
+        openraft::rt::WatchReceiver::borrow_watched(&engine.raft.metrics())
+            .last_applied
+            .map_or(0, |log_id| log_id.index)
+    };
+    let before = applied(&engine);
 
     let report = engine
         .tidy_streams(
@@ -4646,13 +4647,13 @@ async fn a_leader_sweeps_expired_streams_with_the_0_8_0_touch_only() {
     // 257 streams, then the other 43.
     assert_eq!(report.expiry_sweeps, 2, "{report:?}");
     assert_eq!(report.expiry_due_groups, 0, "{report:?}");
-    let snapshot = engine.snapshot(placement()).await.expect("snapshot");
-    assert_eq!(snapshot.group_commit_index, before.saturating_add(2));
+    let after = applied(&engine);
+    assert_eq!(after, before.saturating_add(2));
 
     let mut store = log_store.clone();
     let mut reader = store.get_log_reader().await;
     let entries = reader
-        .try_get_log_entries(before.saturating_add(1)..=snapshot.group_commit_index)
+        .try_get_log_entries(before.saturating_add(1)..=after)
         .await
         .expect("read the sweep's entries");
     assert_eq!(entries.len(), 2);
