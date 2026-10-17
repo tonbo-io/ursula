@@ -1961,14 +1961,11 @@ async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
         .and_then(serde_json::Value::as_u64)
         .expect("snapshot index");
 
-    let purge = admin_test_post(
+    let purge = admin_purge(
         &client,
         format!("{node1_admin}/__ursula/raft/0/purge?upto={snapshot_index}"),
     )
-    .await
-    .send()
-    .await
-    .expect("trigger leader purge");
+    .await;
     assert_eq!(purge.status(), reqwest::StatusCode::OK);
 
     children.push(spawn_node_with_cluster_config(binary, &node3_config));
@@ -2552,11 +2549,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
             assert_eq!(response.status(), reqwest::StatusCode::OK);
             let result: ursula_proto::admin::SnapshotResponse = response.json().await.unwrap();
             let index = result.snapshot_index.unwrap();
-            let response = admin_test_post(&client, format!("{root}/purge?upto={index}"))
-                .await
-                .send()
-                .await
-                .unwrap();
+            let response = admin_purge(&client, format!("{root}/purge?upto={index}")).await;
             assert_eq!(response.status(), reqwest::StatusCode::OK);
         }
     }
@@ -4377,6 +4370,24 @@ async fn admin_test_post(client: &reqwest::Client, url: String) -> reqwest::Requ
         ursula_proto::admin::PROCESS_INCARNATION_HEADER,
         metrics["process_incarnation"].as_str().expect("identity"),
     )
+}
+
+/// Asks for an admin purge, again while the group's snapshot work is not
+/// idle: the route answers 503 with `Retry-After` then, as when the snapshot
+/// driver builds the group (#669).
+async fn admin_purge(client: &reqwest::Client, url: String) -> reqwest::Response {
+    for _ in 0..100 {
+        let response = admin_test_post(client, url.clone())
+            .await
+            .send()
+            .await
+            .expect("send an admin purge");
+        if response.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            return response;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("the admin purge at {url} stayed unavailable");
 }
 
 /// Remove a temporary test file or directory, tolerating its absence.

@@ -28,7 +28,7 @@
 //! - [`Controls::HOLD_OFF`]: the operator's build ends under the deferred
 //!   purge and schedules a lower one, which OpenRaft's debug assertion
 //!   reports.
-//! - [`Controls::RESTORE_OFF`]: a replica that lost power between the
+//! - [`Controls::RESTORE_OFF`]: a replica that restarts between the
 //!   snapshot that dropped the stream and the purge through it does not
 //!   purge through the snapshot it restores, so its log keeps the records.
 //!   With the purge on ([`Controls::CRASH_BEFORE_PURGE`]) the bound holds.
@@ -617,10 +617,19 @@ pub(super) async fn run_deleted_data_inner(
                 madsim::time::sleep(POLL).await;
             };
             cluster.stop_node(covered).await;
-            cluster.wals[&covered].power_loss_losing_unsynced().await;
-            trace.push(SimEvent::FaultApplied {
-                phase: "power_lost_after_covering_snapshot".to_owned(),
-            });
+            if controls.purge_after_restart {
+                // A process restart: the replica restores its snapshot and
+                // keeps its log as it was, which a power loss's recovery
+                // gate may replace with the leader's snapshot.
+                trace.push(SimEvent::FaultApplied {
+                    phase: "process_restarted_after_covering_snapshot".to_owned(),
+                });
+            } else {
+                cluster.wals[&covered].power_loss_losing_unsynced().await;
+                trace.push(SimEvent::FaultApplied {
+                    phase: "power_lost_after_covering_snapshot".to_owned(),
+                });
+            }
             cluster.start_node(covered).await;
             if controls.purge_after_restart {
                 ursula_stream::sim_controls::set_off(
@@ -880,8 +889,8 @@ mod tests {
         assert!(message.contains("holds the marker"), "{message}");
     }
 
-    /// A replica that loses power between the snapshot that dropped the
-    /// stream and the purge through it restores that snapshot and purges
+    /// A replica that restarts between the snapshot that dropped the stream
+    /// and the purge through it restores that snapshot and purges
     /// its log through it within the bound.
     #[test]
     fn scrub_a_restored_snapshot_purges_what_a_crash_left() {
