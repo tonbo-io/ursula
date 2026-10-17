@@ -46,14 +46,16 @@
 //! * `ursula_status(path)`, `ursula_stats(path)`, `ursula_cancel(request)`,
 //!   `ursula_set_token(path, token)`.
 //!
-//! A write refused at admission (`backlog_full`) or one the extension does not capture
-//! (`unsupported`) fails its transaction alone with `SQLITE_IOERR_AUTH`. A reset (another owner,
+//! A write refused at admission (`backlog_full`), one the extension does not capture
+//! (`unsupported`) or a commit above the commit limit (`too_large`) fails its transaction alone with
+//! `SQLITE_IOERR_AUTH`. A reset (another owner,
 //! an unconfirmed commit, a failed fsync) fails every later statement of the database:
 //! `SQLITE_IOERR_READ` for a read, `SQLITE_IOERR_WRITE` for a write. Every SQL function's error
 //! reads `<function>: <kind>: <message>`.
 //!
 //! Settings: `URSULA_VFS_TOKEN_FILE`, `URSULA_VFS_CA_FILE`, `URSULA_VFS_IDLE_MS`,
-//! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`. Test hooks:
+//! `URSULA_VFS_MIN_UPLOAD_KBPS`, `URSULA_VFS_MAX_REQUEST_BYTES`, `URSULA_VFS_MAX_COMMIT_BYTES`. Test
+//! hooks:
 //! `URSULA_VFS_ABORT_AT=<step>[:<n>]` (`config::Step`), `URSULA_VFS_PANIC_IN=<entry>`,
 //! `URSULA_VFS_FAIL_SYNC=<path suffix>`, `URSULA_VFS_SNAPSHOT_DUE_BYTES=<bytes>`,
 //! `URSULA_VFS_SNAPSHOT_HOLD=<dir>`.

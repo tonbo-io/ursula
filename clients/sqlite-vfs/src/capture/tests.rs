@@ -7,6 +7,7 @@ use super::CaptureError;
 use super::CommitPoint;
 use super::FIRST_PAGE;
 use super::FRAME;
+use super::TooLarge;
 use super::WAL_HDR;
 use super::WalWrite;
 use super::WriteTxn;
@@ -37,7 +38,8 @@ impl Wal {
         self.bytes[at..at + data.len()].copy_from_slice(data);
     }
 
-    /// Writes `data` at `off`; at the commit point returns the captured record.
+    /// Writes `data` at `off`; at the commit point returns the captured record, whose page count
+    /// the commit limit's check counted without reading anything back.
     fn write(
         &mut self,
         off: i64,
@@ -45,11 +47,15 @@ impl Wal {
     ) -> Result<Option<crate::codec::frame::CommitRecord>, CaptureError> {
         let point = self.txn.on_write(&classify(off, data))?;
         let record = match point {
-            Some(point) => Some(self.txn.capture(point, data, |at, buf| {
-                let at = usize::try_from(at).unwrap();
-                buf.copy_from_slice(&self.bytes[at..at + PAGE]);
-                Ok(())
-            })?),
+            Some(point) => {
+                let record = self.txn.capture(point, data, |at, buf| {
+                    let at = usize::try_from(at).unwrap();
+                    buf.copy_from_slice(&self.bytes[at..at + PAGE]);
+                    Ok(())
+                })?;
+                assert_eq!(self.txn.pages(point), record.pages.len());
+                Some(record)
+            }
             None => None,
         };
         self.put(off, data);
@@ -327,4 +333,34 @@ fn a_commit_leaving_wal_mode_or_4096_byte_pages_is_refused() {
         Err(CaptureError::Page1Size { found: 65536 })
     ));
     check_page1(&page1(0)).unwrap();
+}
+
+// The commit limit counts the record's pages (a later frame of a page wins, pages above the
+// commit size are dropped) before anything is read back: a commit of exactly the limit passes,
+// one page more is refused.
+#[test]
+fn a_commit_above_the_limit_is_refused_before_any_page_is_read_back() {
+    let mut txn = WriteTxn::new();
+    let mut put = |n: i64, pgno: u32, commit_size: u32| {
+        let off = WAL_HDR + n * FRAME;
+        let mut h = [0u8; 24];
+        h[0..4].copy_from_slice(&pgno.to_be_bytes());
+        h[4..8].copy_from_slice(&commit_size.to_be_bytes());
+        assert_eq!(txn.on_write(&classify(off, &h)).unwrap(), None);
+        txn.on_write(&classify(off + 24, &page(1))).unwrap()
+    };
+    put(0, 2, 0);
+    put(1, 2, 0);
+    put(2, 9, 0);
+    let point = put(3, 3, 3).unwrap();
+    // Pages 2 and 3: page 2's later frame wins, page 9 is above the commit size.
+    assert_eq!(txn.pages(point), 2);
+    txn.check_size(point, 2 * PAGE as u64).unwrap();
+    assert_eq!(
+        txn.check_size(point, 2 * PAGE as u64 - 1),
+        Err(TooLarge {
+            bytes: 2 * PAGE as u64,
+            max: 2 * PAGE as u64 - 1,
+        })
+    );
 }

@@ -154,6 +154,8 @@ pub(crate) struct OpenSpec {
     pub(crate) max_pending_bytes: u64,
     /// `URSULA_VFS_MAX_REQUEST_BYTES`.
     pub(crate) max_request_bytes: Option<u64>,
+    /// `URSULA_VFS_MAX_COMMIT_BYTES`: the most bytes of pages one commit may hold.
+    pub(crate) max_commit_bytes: u64,
     /// How long the open may take, from its start.
     pub(crate) timeout_ms: u64,
     /// An owner's open (with `recreate` or not) or a reader's.

@@ -81,20 +81,30 @@ writes, its page number and offset. The commit point is the write of the page da
 whose header carries a non-zero database size. There:
 
 1. Admission ([Backpressure](#backpressure)) already ran at the transaction's first WAL write.
-2. The commit waits while another connection's logged commit is undecided
+2. The commit limit: a commit whose pages take more than `URSULA_VFS_MAX_COMMIT_BYTES` (128 MiB
+   by default, clamped to 4096 bytes through 1 GiB) fails alone as `too_large`
+   (`SQLITE_IOERR_AUTH`, action `fix`). The page count comes from the frames the VFS recorded, so
+   nothing is waited for, read back or encoded first: a later frame of a page counts once, frames
+   a savepoint rollback undid are gone, and pages above the commit's size are dropped.
+3. The commit waits while another connection's logged commit is undecided
    ([Publication](#publication)) or the snapshot window is open, at most 1 s for each.
-3. The VFS reads the final image of every page the transaction wrote back from the WAL file and
+4. The VFS reads the final image of every page the transaction wrote back from the WAL file and
    checks each against the crc32c of what this process wrote. It takes the commit frame's own page
    from the buffer and drops pages above the commit's size. A commit that leaves WAL mode or
    4096-byte pages fails alone as `unsupported`.
-4. It encodes one `USQ2` COMMIT frame ([Frames](#frames)), zstd-compressed.
-5. It appends a COMMIT record to the log ([Log](#log)): one positioned write, no fsync. The
+5. It encodes one `USQ2` COMMIT frame ([Frames](#frames)), zstd-compressed, into one buffer, and
+   drops the pages.
+6. It appends a COMMIT record to the log ([Log](#log)): one positioned write, no fsync. The
    position becomes `logged`.
-6. It forwards the commit frame's page data and returns. SQLite publishes and releases the lock.
+7. It forwards the commit frame's page data and returns. SQLite publishes and releases the lock.
 
 The log write precedes the commit frame's page data, so every commit SQLite could recover is in
 the log (L2). A failed log write fails the write before that page exists, so the frame's checksum
-cannot match, and the partial record is cut. Failures before step 5 roll back with nothing logged.
+cannot match, and the partial record is cut. Failures before step 6 roll back with nothing logged.
+A commit refused by the limit never reaches the log, so the replicator, `synced()` and
+`pending_bytes` never see it, and SQLite rolls the whole transaction back with the database
+usable. A commit's pages are in memory at once. At its peak the writer holds about the pages plus
+twice the compressed record, and the replicator keeps the frame until the stream acknowledges it.
 WAL writes go straight to the WAL file. A WAL write without the WRITE shm lock (EXCLUSIVE locking
 mode) is refused as `unsupported`.
 
@@ -107,6 +117,13 @@ Tests:
   `a_savepoint_rollback_that_rewrites_a_frame_drops_what_it_undid`,
   `a_commit_leaving_wal_mode_or_4096_byte_pages_is_refused`, and `test/core.e2e.ts` "captures a
   spilled transaction rolled back to a savepoint: only what it committed reaches the stream".
+- The commit limit: `capture/tests.rs`
+  `a_commit_above_the_limit_is_refused_before_any_page_is_read_back` (every shape test also checks
+  the count against the record), `vfs/tests.rs`
+  `a_commit_above_the_limit_fails_alone_with_nothing_logged`, `config.rs`
+  `the_commit_limit_is_clamped_to_one_page_through_one_gib`, `driver/tests.rs`
+  `a_logged_commit_above_the_limit_still_replicates`, and `test/limits.e2e.ts` "refuses a
+  transaction above the commit limit alone, as too_large, and commits the next".
 - Read-backs: `capture/tests.rs` `a_read_back_that_differs_is_a_lost_write`, `vfs/tests.rs`
   `pages_read_back_are_checked_against_what_was_written`.
 - A failed log write: `replog/tests.rs` `an_injected_write_failure_cuts_the_segment_back`.
@@ -173,8 +190,9 @@ and `trim_unlinked` (F3). Claims: `driver/tests.rs` `a_failed_claim_write_sends_
 
 `pending_bytes` counts compressed frame bytes logged and not acknowledged. At `maxPendingBytes`
 (64 MiB by default) a write transaction fails at its first WAL write with `backlog_full`
-(`SQLITE_IOERR_AUTH`, action `retry` after `synced()`), nothing written, the database usable. Any
-commit is admitted while nothing is pending, whatever its size. This is the only admission rule: a
+(`SQLITE_IOERR_AUTH`, action `retry` after `synced()`), nothing written, the database usable. A
+transaction is admitted while nothing is pending, and its commit is at most the commit limit
+([Capture](#capture)). This is the only admission rule: a
 `402`, an authorizer's `403` or a refused token is a replication condition in status, and commits
 continue until the backlog fills. The bound also caps what a reset discards.
 
@@ -209,11 +227,15 @@ record = u32 db_pages_after | u32 n | n x (u32 pgno | [4096] image)      (pgno a
   consecutive slices of the COMMIT body's compressed record (`count >= 2`), one append each.
 - Readers apply a COMMIT, and a complete PART run `0..count-1` as one COMMIT. Any other frame
   inside a run voids it: its owner resends the commit whole after a claim.
+- Readers join a run in memory. A run longer than any COMMIT frame holds (every part but the last
+  as long as part 0, against a body of at most 2^32 - 1 bytes) is undecodable at its first part,
+  before anything is joined. Readers apply every commit a frame holds, whatever the commit limit.
 
 Tests: `codec/frame/tests.rs` `frames_round_trip`, `every_strict_prefix_is_partial`,
 `a_flipped_bit_is_never_another_frame`, `a_complete_run_is_the_commit`,
 `a_foreign_frame_voids_the_run`, `a_part_of_the_same_commit_out_of_turn_voids_the_run`,
 `a_run_restarted_whole_completes`, `part_frames_cut_a_commit_and_join_back_to_it`,
+`a_run_no_commit_frame_holds_is_refused_at_its_first_part`,
 `a_huge_declared_size_fails_fast_with_bounded_memory`, `a_frame_with_a_larger_window_is_refused`.
 Frozen bytes: `codec/vectors/mod.rs` `the_claim_frame_is_frozen`, `the_commit_frame_is_frozen`,
 `the_part_frames_are_frozen`.
@@ -1123,7 +1145,7 @@ mapped by one function (`errors.ts` `classify`). Callers branch on `action`.
 
 | class | thrown by | kinds |
 | --- | --- | --- |
-| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`) |
+| `UrsulaWriteRefusedError` | a write or COMMIT, nothing committed | `backlog_full` (`retry` after `synced()`), `unsupported` (`fix`), `too_large` (`fix`: split the transaction or raise the commit limit) |
 | `UrsulaResetError` | statements after a reset, `synced()`, `reset` listeners | the kinds of [Resets](#resets) |
 | `UrsulaUnavailableError` | `open()` when its signal fires, and `importSqlite()` when it cannot finish (action `fix`, since a failed import leaves the stream refusing opens) | the last condition: `unreachable`, `unavailable`, `rate_limited`, `unauthorized`, `payment_required`, `forbidden`, or `cancelled` when none was met |
 | `UrsulaSetupError` | `open()`, `importSqlite()`, and `synced()` or `status()` of a retired database | `invalid_url`, `invalid_argument`, `not_found`, `in_use`, `bound_elsewhere`, `local_setup`, `stream_format`, `server_too_old`, `wrong_cluster`, `stream_state`, `claim_races`, `not_bound`, `internal` |
@@ -1135,7 +1157,8 @@ with `SQLITE_IOERR_WRITE` (778). Other errors stay SQLite's own. Every SQL funct
 
 Tests: `error.rs` `write_refusals_say_what_to_do`, `resets_say_what_to_do`, `test/open.e2e.ts`
 "refuses a URL it cannot take, as a setup error to fix", "reports the last condition the open met
-when its signal fires", "refuses an unsupported write alone, and leaves SQLite".
+when its signal fires", "refuses an unsupported write alone, and leaves SQLite", `test/limits.e2e.ts`
+"refuses a transaction above the commit limit alone, as too_large, and commits the next".
 
 ### Pi
 
@@ -1355,8 +1378,12 @@ Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process 
 
 ## Limits
 
-- **Commit size is bounded by memory.** Capture holds the whole transaction, and a build holds a
-  joined PART run twice. A commit frame above 4 GiB is `unsupported`.
+- **Commit size is bounded by the commit limit.** A commit holds at most
+  `URSULA_VFS_MAX_COMMIT_BYTES` of pages (128 MiB by default, at most 1 GiB), or it fails as
+  `too_large`. The writer holds about the pages plus twice the compressed record, so about three
+  times the limit for pages that do not compress. A reader joining a PART run holds about four to
+  five times the compressed record. Readers apply every commit a frame holds, whatever their own
+  limit, so a host needs memory for the largest limit any owner of the database runs with.
 - **Two history events and a crash.** Two history events with no write between them, plus a crash,
   a clean close or a reset between a re-key's log roll and its claim, salvage a generation that
   lost nothing.

@@ -64,6 +64,8 @@ const ID: usize = 24;
 const PART_HEAD: usize = 32;
 /// The bytes of a PART frame beside its chunk: the frame header and the PART head.
 pub const PART_OVERHEAD: usize = HEADER + PART_HEAD;
+/// The longest compressed record a COMMIT frame holds: its body length is a u32.
+const MAX_COMPRESSED: u64 = (u32::MAX as u64).saturating_sub(ID as u64);
 /// A commit record before its pages: the db size after the commit and the page count.
 const RECORD_HEAD: usize = 8;
 /// A commit record's page entry: the page number and the image.
@@ -131,6 +133,11 @@ pub enum FrameError {
     PartChunk { len: u64, count: u32, chunk: u64 },
     #[error("a frame body or commit record of {len} bytes is too large")]
     TooLarge { len: u64 },
+    #[error(
+        "a run of {count} parts of {len} bytes or more, longer than the {max} bytes of compressed \
+         record a COMMIT frame holds"
+    )]
+    RunTooLong { count: u32, len: u64, max: u64 },
     #[error("a commit record of {pages} pages, above the 2^32 - 1 a record holds")]
     TooManyPages { pages: u64 },
     #[error("a frame body of {len} bytes, above the limit of {max}")]
@@ -614,7 +621,9 @@ pub fn decompress(compressed: &[u8]) -> Result<CommitRecord, FrameError> {
 
 /// Puts PART runs back together. Every frame read from the stream goes through [`PartRun::push`]
 /// in stream order: a complete run `0..count` of one commit comes out as that COMMIT, and any
-/// other frame inside a run voids it (its owner died mid-commit and resends the commit whole).
+/// other frame inside a run voids it (its owner died mid-commit and resends the commit whole). A
+/// run longer than any COMMIT frame holds is refused at its first part, where every part but the
+/// last is as long as part 0, before anything is joined.
 #[derive(Debug, Clone, Default)]
 pub struct PartRun {
     run: Option<Run>,
@@ -650,14 +659,26 @@ impl PartRun {
             .is_some_and(|r| r.id == id && r.count == count && r.next == index);
         let mut run = match self.run.take() {
             Some(run) if continues => run,
-            _ if index == 0 => Run {
-                id,
-                count,
-                next: 0,
-                compressed: Vec::new(),
-            },
+            _ if index == 0 => {
+                run_fits(count, chunk.len())?;
+                Run {
+                    id,
+                    count,
+                    next: 0,
+                    compressed: Vec::new(),
+                }
+            }
             _ => return Ok(None),
         };
+        // The bytes joined so far with this part's.
+        let joined = run.compressed.len().saturating_add(chunk.len());
+        if joined as u64 > MAX_COMPRESSED {
+            return Err(FrameError::RunTooLong {
+                count,
+                len: joined as u64,
+                max: MAX_COMPRESSED,
+            });
+        }
         run.compressed
             .try_reserve(chunk.len())
             .map_err(|source| FrameError::Alloc {
@@ -676,6 +697,21 @@ impl PartRun {
             compressed: run.compressed,
         }))
     }
+}
+
+/// Refuses a run of `count` parts whose part 0 is `len` bytes when no COMMIT frame holds its
+/// shortest record: every part but the last as long as part 0, the last a byte.
+fn run_fits(count: u32, len: usize) -> Result<(), FrameError> {
+    let full = u64::from(count.saturating_sub(1));
+    let least = (len as u64).saturating_mul(full).saturating_add(1);
+    if least > MAX_COMPRESSED {
+        return Err(FrameError::RunTooLong {
+            count,
+            len: least,
+            max: MAX_COMPRESSED,
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

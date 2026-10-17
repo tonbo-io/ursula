@@ -3,13 +3,14 @@
 //!
 //! WAL writes go straight to the WAL file. Each write transaction is admitted at its first WAL
 //! write (`backlog_full` fails it with `SQLITE_IOERR_AUTH`, nothing written), and every WAL write
-//! is fed to its [`WriteTxn`]. At the commit point, the write of the commit frame's page, the
-//! commit waits while another connection's logged commit is undecided (at most 1 s, then the
-//! binding resets `local_damage`), reads the transaction's final frames back from the WAL and
-//! checks their crc32c, encodes one `USQ2` COMMIT frame, appends it to the log (one write, no
-//! fsync), hands it to the driver and only then forwards the commit page. A failure before the log
-//! write fails the transaction alone. Before all that, a commit point waits while the snapshot
-//! thread's window is open, and at most a second for a wanted one (design: Snapshots).
+//! is fed to its [`WriteTxn`]. At the commit point, the write of the commit frame's page, a commit
+//! of more bytes of pages than the commit limit (`URSULA_VFS_MAX_COMMIT_BYTES`) fails first, alone,
+//! as `too_large` with `SQLITE_IOERR_AUTH`. Then the commit waits while the snapshot thread's
+//! window is open, and at most a second for a wanted one (design: Snapshots), waits while another
+//! connection's logged commit is undecided (at most 1 s, then the binding resets `local_damage`),
+//! reads the transaction's final frames back from the WAL and checks their crc32c, encodes one
+//! `USQ2` COMMIT frame, appends it to the log (one write, no fsync), hands it to the driver and
+//! only then forwards the commit page. A failure before the log write fails the transaction alone.
 //!
 //! The snapshot thread's private connection opens through this VFS too (`opening_private`), so its
 //! checkpoints take F1; it counts as a connection of the binding only beside one of the host's.
@@ -79,7 +80,6 @@ use crate::capture::WriteTxn;
 use crate::capture::classify;
 use crate::capture::page_at;
 use crate::codec::PAGE;
-use crate::codec::frame::FrameError;
 use crate::codec::frame::encode_commit;
 use crate::codec::marker;
 use crate::codec::segment::RecordBody;
@@ -840,7 +840,8 @@ fn commit_log(b: &Binding) -> Result<MutexGuard<'_, Log>, c_int> {
     })
 }
 
-/// The commit point (design: Capture): capture, encode, log, hand to the driver, forward.
+/// The commit point (design: Capture): the commit limit, capture, encode, log, hand to the driver,
+/// forward.
 ///
 /// # Safety
 ///
@@ -854,6 +855,18 @@ unsafe fn commit(
     off: i64,
 ) -> c_int {
     let started = Instant::now();
+    // The commit limit, before anything is waited for, read back or logged: a commit above it
+    // fails alone and the replicator never sees it.
+    let size = c
+        .txn
+        .as_ref()
+        .map(|txn| txn.check_size(point, b.handle.max_commit_bytes));
+    if let Some(Err(e)) = size {
+        return refuse(b, &mut c, WriteRefusal::TooLarge {
+            bytes: e.bytes,
+            max: e.max,
+        });
+    }
     // A snapshot's window (design: Snapshots): the commit waits while it is open, so the snapshot's
     // read sees exactly its `k`, and at most a second for a wanted one to open, so a writer
     // committing back to back cannot starve it.
@@ -920,10 +933,6 @@ unsafe fn commit(
     };
     let frame = match encode_commit(id, &record) {
         Ok(frame) => frame,
-        Err(e @ (FrameError::TooLarge { .. } | FrameError::TooManyPages { .. })) => {
-            drop(log);
-            return refuse(b, &mut c, WriteRefusal::Unsupported(e.to_string()));
-        }
         Err(e) => {
             drop(log);
             b.reset(ResetKind::Internal, &format_args!("encoding a commit: {e}"));

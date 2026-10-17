@@ -50,8 +50,10 @@ pub(crate) enum ErrorKind {
     /// A write refused at admission (design: Backpressure).
     BacklogFull,
     /// A write the extension does not capture: EXCLUSIVE locking mode, a commit leaving WAL mode
-    /// or 4 KiB pages, a commit frame above the 4 GiB a frame holds.
+    /// or 4 KiB pages.
     Unsupported,
+    /// A commit of more bytes of pages than the commit limit (design: Capture).
+    TooLarge,
     Reset(ResetKind),
     InvalidArgument,
     InvalidUrl,
@@ -83,6 +85,7 @@ impl ErrorKind {
         match self {
             ErrorKind::BacklogFull => "backlog_full",
             ErrorKind::Unsupported => "unsupported",
+            ErrorKind::TooLarge => "too_large",
             ErrorKind::Reset(kind) => kind.kind(),
             ErrorKind::InvalidArgument => "invalid_argument",
             ErrorKind::InvalidUrl => "invalid_url",
@@ -120,6 +123,7 @@ impl ErrorKind {
             ErrorKind::Reset(kind) => reset_action(kind),
             ErrorKind::Internal => Action::Reopen,
             ErrorKind::Unsupported
+            | ErrorKind::TooLarge
             | ErrorKind::InvalidArgument
             | ErrorKind::InvalidUrl
             | ErrorKind::NotFound
@@ -252,6 +256,8 @@ pub(crate) enum WriteRefusal {
     BacklogFull { pending: u64, max: u64 },
     #[error("unsupported: {0}")]
     Unsupported(String),
+    #[error("too_large: a commit of {bytes} bytes of pages, at most {max}")]
+    TooLarge { bytes: u64, max: u64 },
 }
 
 impl WriteRefusal {
@@ -259,6 +265,7 @@ impl WriteRefusal {
         match self {
             WriteRefusal::BacklogFull { .. } => ErrorKind::BacklogFull,
             WriteRefusal::Unsupported(_) => ErrorKind::Unsupported,
+            WriteRefusal::TooLarge { .. } => ErrorKind::TooLarge,
         }
     }
 }
@@ -319,6 +326,7 @@ impl From<SyncError> for Error {
 mod tests {
     use super::Action;
     use super::ErrorKind;
+    use super::WriteRefusal;
     use super::reset_action;
     use crate::replicator::ResetKind;
 
@@ -342,12 +350,23 @@ mod tests {
     }
 
     // The write refusals (design: Errors): `backlog_full` is retried after `synced()`, an
-    // unsupported write is fixed.
+    // unsupported write and a commit above the limit are fixed.
     #[test]
     fn write_refusals_say_what_to_do() {
         assert_eq!(ErrorKind::BacklogFull.as_str(), "backlog_full");
         assert_eq!(ErrorKind::BacklogFull.action(), Action::Retry);
         assert_eq!(ErrorKind::Unsupported.as_str(), "unsupported");
         assert_eq!(ErrorKind::Unsupported.action(), Action::Fix);
+        assert_eq!(ErrorKind::TooLarge.as_str(), "too_large");
+        assert_eq!(ErrorKind::TooLarge.action(), Action::Fix);
+        let refusal = WriteRefusal::TooLarge {
+            bytes: 12_288,
+            max: 8192,
+        };
+        assert_eq!(refusal.kind(), ErrorKind::TooLarge);
+        assert_eq!(
+            refusal.to_string(),
+            "too_large: a commit of 12288 bytes of pages, at most 8192"
+        );
     }
 }

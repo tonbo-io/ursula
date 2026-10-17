@@ -10,7 +10,7 @@ export const SQLITE_IOERR = 10;
 export const SQLITE_IOERR_READ = 266;
 /** SQLITE_IOERR_WRITE: a statement of a database that was reset, which writes. */
 export const SQLITE_IOERR_WRITE = 778;
-/** SQLITE_IOERR_AUTH: a write refused with nothing committed (`backlog_full`, `unsupported`). */
+/** SQLITE_IOERR_AUTH: a write refused with nothing committed (`backlog_full`, `unsupported`, `too_large`). */
 export const SQLITE_IOERR_AUTH = 7178;
 
 /** The SQLite result code of an error node:sqlite threw (`errcode`), if it is one. */
@@ -32,7 +32,7 @@ export function errcode(error: unknown): number | undefined {
 export type UrsulaErrorAction = "retry" | "reopen" | "stop" | "fix";
 
 /** The kinds of an {@link UrsulaWriteRefusedError}. */
-export type WriteRefusedKind = "backlog_full" | "unsupported";
+export type WriteRefusedKind = "backlog_full" | "unsupported" | "too_large";
 /** The kinds of an {@link UrsulaResetError} (design: Resets). */
 export type ResetKind = "fenced" | "stale" | "rewound" | "deleted" | "local_damage" | "stream_state" | "internal";
 /** The kinds of an {@link UrsulaUnavailableError}: the last condition the open met, or `cancelled` when its signal fired first. */
@@ -56,6 +56,7 @@ export type SetupKind =
 
 export type UrsulaErrorKind = WriteRefusedKind | ResetKind | UnavailableKind | SetupKind;
 
+const WRITE_REFUSED_KINDS: ReadonlySet<string> = new Set<WriteRefusedKind>(["backlog_full", "unsupported", "too_large"]);
 const RESET_KINDS: ReadonlySet<string> = new Set<ResetKind>(["fenced", "stale", "rewound", "deleted", "local_damage", "stream_state", "internal"]);
 const UNAVAILABLE_KINDS: ReadonlySet<string> = new Set<UnavailableKind>(["unreachable", "unavailable", "rate_limited", "unauthorized", "payment_required", "forbidden", "cancelled"]);
 
@@ -63,6 +64,7 @@ const UNAVAILABLE_KINDS: ReadonlySet<string> = new Set<UnavailableKind>(["unreac
 const ACTIONS: ReadonlyMap<string, UrsulaErrorAction> = new Map<string, UrsulaErrorAction>([
 	["backlog_full", "retry"],
 	["unsupported", "fix"],
+	["too_large", "fix"],
 	["fenced", "stop"],
 	["stale", "reopen"],
 	["rewound", "reopen"],
@@ -128,7 +130,9 @@ export class UrsulaError extends Error {
  * transaction back, and the database stays usable. `backlog_full` (`retry`): more than
  * `maxPendingBytes` of commits wait for the stream, so await `synced()` and run the transaction
  * again. `unsupported` (`fix`): a write the extension does not capture, such as one in EXCLUSIVE
- * locking mode.
+ * locking mode. `too_large` (`fix`): the transaction's commit holds more bytes of pages than the
+ * commit limit (`URSULA_VFS_MAX_COMMIT_BYTES`, 128 MiB by default), so split the transaction or
+ * raise the limit.
  */
 export class UrsulaWriteRefusedError extends UrsulaError {
 	declare readonly kind: WriteRefusedKind;
@@ -179,7 +183,7 @@ export class UrsulaSetupError extends UrsulaError {
  * where `stream_state` and `internal` are resets; for `open()` they are setup errors.
  */
 export function errorOf(kind: string, message: string, cause: unknown, fromSync: boolean): UrsulaError {
-	if (kind === "backlog_full" || kind === "unsupported") return new UrsulaWriteRefusedError(message, kind, cause);
+	if (WRITE_REFUSED_KINDS.has(kind)) return new UrsulaWriteRefusedError(message, kind as WriteRefusedKind, cause);
 	if (RESET_KINDS.has(kind) && (fromSync || (kind !== "stream_state" && kind !== "internal"))) return new UrsulaResetError(message, kind as ResetKind, cause);
 	if (UNAVAILABLE_KINDS.has(kind)) return new UrsulaUnavailableError(message, kind as UnavailableKind, cause);
 	return new UrsulaSetupError(message, kind as SetupKind, cause);
@@ -235,9 +239,21 @@ export function classify(error: unknown, status?: () => FailureStatus): unknown 
 	}
 	if (code === SQLITE_IOERR_AUTH && s.refused !== null) {
 		const kind = s.refused.kind;
-		return errorOf(kind, `${s.refused.message}. ${kind === "backlog_full" ? "Nothing was committed: await synced(), then run the transaction again." : "Nothing was committed."}`, error, true);
+		return errorOf(kind, `${s.refused.message}. ${refusedAdvice(kind)}`, error, true);
 	}
 	return error;
+}
+
+/** What to do, in words, about a refused write. */
+function refusedAdvice(kind: string): string {
+	switch (kind) {
+		case "backlog_full":
+			return "Nothing was committed: await synced(), then run the transaction again.";
+		case "too_large":
+			return "Nothing was committed: split the transaction, or raise URSULA_VFS_MAX_COMMIT_BYTES.";
+		default:
+			return "Nothing was committed.";
+	}
 }
 
 /** What to do, in words, for an error whose own message (SQLite's) says nothing. */
