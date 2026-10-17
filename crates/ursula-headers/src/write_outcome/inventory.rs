@@ -364,10 +364,10 @@ pub const INVENTORY: &[Row] = {
         "create-matching", Node, Create, 200, S::Created, None, Applied;
         "snapshot-published", Node, SnapshotPublish, 204, S::SnapshotPublished, None, Applied;
         "part-staged", Node, PartStage, 201, S::PartStaged, None, Applied;
-    "parts-discarded", Node, PartsDiscard, 204, S::Created, None, Applied;
-    "retention-advanced", Node, Retention, 204, S::Retained, None, Applied;
-    "stream-deleted", Node, DeleteStream, 204, S::Plain, None, Applied;
-    "bucket-created", Node, CreateBucket, 201, S::Plain, None, Applied;
+        "parts-discarded", Node, PartsDiscard, 204, S::Created, None, Applied;
+        "retention-advanced", Node, Retention, 204, S::Retained, None, Applied;
+        "stream-deleted", Node, DeleteStream, 204, S::Plain, None, Applied;
+        "bucket-created", Node, CreateBucket, 201, S::Plain, None, Applied;
         "parts-commit-published", Node, PartsCommit, 204, S::SnapshotPublished, None, Applied;
         "redirect", Node, ProducerAppend, 307, S::Redirect, None, Redirected;
         "producer-epoch-closed", Node, ProducerAppend, 403, S::Producer(P::EpochClosed), Some(C::ProducerEpochClosed), Refused(C::ProducerEpochClosed);
@@ -386,7 +386,7 @@ pub const INVENTORY: &[Row] = {
         "incarnation-mismatch", Node, ProducerAppend, 412, S::IncarnationMismatch, Some(C::IncarnationMismatch), Refused(C::IncarnationMismatch);
         "too-large", Node, Append, 413, S::SizeLimit, Some(C::RequestTooLarge), Refused(C::RequestTooLarge);
         "producer-limit", Node, ProducerAppend, 429, S::Plain, Some(C::ProducerLimit), Refused(C::ProducerLimit);
-    "staged-parts-limit", Node, PartStage, 429, S::StagedPartsLimit, Some(C::StagedPartsLimit), Refused(C::StagedPartsLimit);
+        "staged-parts-limit", Node, PartStage, 429, S::StagedPartsLimit, Some(C::StagedPartsLimit), Refused(C::StagedPartsLimit);
         "no-cold-store", Node, PartStage, 501, S::Plain, Some(C::NoColdStore), Refused(C::NoColdStore);
         "no-leader-before-body", Node, ProducerAppend, 503, S::NoLeader, Some(C::NoLeader), Refused(C::NoLeader);
         "no-leader-before-proposal", Node, ProducerAppend, 503, S::NoLeader, Some(C::NoLeader), Refused(C::NoLeader);
@@ -428,7 +428,7 @@ pub const INVENTORY: &[Row] = {
         "foreign-408", Foreign, ProducerAppend, 408, S::Plain, None, Unknown;
         "foreign-5xx", Foreign, ProducerAppend, 503, S::Plain, None, Unknown;
         "keyed-2xx-without-receipt", Foreign, ProducerAppend, 200, S::Plain, None, Unknown;
-    "keyless-2xx-untyped", Foreign, Create, 201, S::Plain, None, Unknown;
+        "keyless-2xx-untyped", Foreign, Create, 201, S::Plain, None, Unknown;
         "transport-failure", Foreign, ProducerAppend, 0, S::Plain, None, Unknown;
     }
 };

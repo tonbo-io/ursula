@@ -149,10 +149,12 @@ Each hop sends the request again. Only stream requests are redirected. A
 node redirects a write only when it refused the write before proposing it,
 so no hop's copy meets a write that an earlier hop applied. A node routes a
 create, an append or close, and a snapshot publish before it reads the body.
-A node that loses the leadership while it reads the body answers `503` with
-`Retry-After`, which the gateway passes on: `NO_LEADER` when it refused the
-write before proposing it, and `OUTCOME_UNKNOWN` when it may have proposed
-it. The same holds for a bodiless write, a delete or a retention move.
+A node that loses the leadership before it proposes a write, while it reads
+the body or after, answers `503 NO_LEADER` with `Retry-After`: nothing
+applied. A node that loses it after it proposed the write and before it saw
+the apply answers `503 OUTCOME_UNKNOWN` with `Retry-After`: the write may
+have applied. The gateway passes both on. The same holds for a write
+without a body, a delete or a retention move.
 
 Other `307` responses remain visible to the client. Their `Location` header is
 reduced to the path and query so redirect-following clients such as `curl -L`
