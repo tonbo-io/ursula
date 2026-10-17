@@ -4755,3 +4755,187 @@ async fn a_follower_proposes_no_expiry_sweep() {
     }
     shutdown_all(&engines).await;
 }
+
+/// OpenRaft runs a snapshot build in a task of its own that its shutdown
+/// neither stops nor waits for. A build still running when its group engine
+/// shuts down publishes no snapshot metadata afterwards, so nothing writes
+/// the WAL directory once the WAL closes, and a restarted replica of the
+/// group owns its metadata file alone (#489).
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_build_that_outlives_its_engine_publishes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metadata_path = wal.snapshot_metadata_path(placement());
+    let store = wal
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .unwrap();
+    let engine = RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config("build-outlives-engine", 30, 60),
+        store,
+        RaftGroupEngineOptions {
+            snapshot_metadata_path: Some(metadata_path.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    // Stand in for the build OpenRaft detached: its builder, taken while the
+    // group runs, builds only after the engine shut down.
+    let mut builder = engine
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.get_snapshot_builder().await })
+        })
+        .await
+        .unwrap();
+    engine.shutdown().await.unwrap();
+    wal.shutdown().await.unwrap();
+
+    let error = builder.build_snapshot().await.unwrap_err();
+    assert!(matches!(
+        error.get_ref().and_then(
+            |source| source.downcast_ref::<crate::state_machine::SnapshotMetadataStopped>()
+        ),
+        Some(crate::state_machine::SnapshotMetadataStopped::EngineShutDown)
+    ));
+    assert!(
+        !metadata_path.exists() && !metadata_path.with_extension("json.tmp").exists(),
+        "a build published snapshot metadata after its engine shut down"
+    );
+    drop(builder);
+    fs::remove_dir_all(root.path()).expect("nothing writes the closed WAL directory");
+}
+
+/// A single-node engine of `placement()` over `wal` whose snapshot metadata
+/// lives at the WAL's own path, as the factory builds it. The previous
+/// engine's store and its core journal may still be open for a moment after
+/// its shutdown: the OpenRaft state-machine worker it leaves running holds
+/// the store until it exits, and dropping the last store stops the core
+/// writer, which then releases the journal lock (#709).
+#[cfg(not(madsim))]
+async fn reopen_journal_engine(wal: &RaftWal, cluster_name: &str) -> RaftGroupEngine {
+    let store = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match wal.open(
+                placement(),
+                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+            ) {
+                Ok(store) => break store,
+                // Still registered in the core writer, or the writer whose
+                // last handle the worker dropped still holds the journal lock.
+                Err(
+                    crate::log_store::RaftWalError::OpenGroup {
+                        source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
+                        ..
+                    }
+                    | crate::log_store::RaftWalError::OpenCore {
+                        source: crate::log_store::CoreJournalError::Locked { .. },
+                        ..
+                    },
+                ) => tokio::time::sleep(Duration::from_millis(10)).await,
+                Err(err) => panic!("open the group's log store: {err}"),
+            }
+        }
+    })
+    .await
+    .expect("the stopped engine's log store closes");
+    RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config(cluster_name, 30, 60),
+        store,
+        RaftGroupEngineOptions {
+            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+/// A stream created through `engine`, which returns once the group applied
+/// it, then a builder of the group, taken as OpenRaft's state-machine worker
+/// takes one before it spawns the build.
+#[cfg(not(madsim))]
+async fn snapshot_builder_after_write(
+    engine: &mut RaftGroupEngine,
+    stream: &str,
+) -> crate::state_machine::RaftGroupSnapshotBuilder {
+    engine
+        .create_stream(
+            create_req(bsid(stream)),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .unwrap();
+    engine
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.get_snapshot_builder().await })
+        })
+        .await
+        .unwrap()
+}
+
+/// The restart of a recovery plan's cut (#489): engine A of a group stops
+/// with a snapshot build still running, and engine B of the same group opens
+/// on the same WAL and metadata path and publishes its own snapshot. A's
+/// build, ending only then, publishes nothing over B's pointer, and B, whose
+/// publication is its own, builds and publishes again.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metadata_path = wal.snapshot_metadata_path(placement());
+
+    let mut engine_a = reopen_journal_engine(&wal, "restart-overlap-a").await;
+    let mut stale = snapshot_builder_after_write(&mut engine_a, "written-by-a").await;
+    engine_a.shutdown().await.unwrap();
+    drop(engine_a);
+
+    let mut engine_b = reopen_journal_engine(&wal, "restart-overlap-b").await;
+    let mut first = snapshot_builder_after_write(&mut engine_b, "written-by-b").await;
+    let first_built = first.build_snapshot().await.expect("B publishes");
+    drop(first);
+    let published = fs::read(&metadata_path).expect("B's pointer");
+    assert!(
+        stale.meta.last_log_id < first_built.meta.last_log_id,
+        "the restarted replica applied past the stopped engine"
+    );
+
+    let error = stale.build_snapshot().await.unwrap_err();
+    assert!(matches!(
+        error.get_ref().and_then(
+            |source| source.downcast_ref::<crate::state_machine::SnapshotMetadataStopped>()
+        ),
+        Some(crate::state_machine::SnapshotMetadataStopped::EngineShutDown)
+    ));
+    drop(stale);
+    assert_eq!(
+        fs::read(&metadata_path).expect("B's pointer"),
+        published,
+        "a build of the stopped engine replaced the restarted replica's pointer"
+    );
+
+    let mut second = snapshot_builder_after_write(&mut engine_b, "written-by-b-again").await;
+    let second_built = second.build_snapshot().await.expect("B publishes again");
+    drop(second);
+    assert!(second_built.meta.last_log_id > first_built.meta.last_log_id);
+    assert_ne!(
+        fs::read(&metadata_path).expect("B's pointer"),
+        published,
+        "B's second snapshot is its current pointer"
+    );
+
+    engine_b.shutdown().await.unwrap();
+    drop(engine_b);
+    wal.shutdown().await.unwrap();
+}

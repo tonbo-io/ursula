@@ -626,9 +626,12 @@ impl RaftGroupEngine {
             .await
             .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")));
         self.snapshot_installs.drain().await;
-        // Cancellation cannot stop an admitted blocking fsync; wait for its
-        // publication before releasing/reopening the group's durable store.
-        let _published = self.metadata_serial.lock().await;
+        // OpenRaft's shutdown leaves a snapshot build it spawned running, so
+        // the publication closes here: a publication already running ends
+        // first, since cancellation cannot stop an admitted blocking fsync,
+        // and none runs after. Only then may the WAL close or a restarted
+        // replica of the group open the same metadata file (#489).
+        crate::state_machine::close_snapshot_metadata(&self.metadata_serial).await;
         result
     }
 
