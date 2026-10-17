@@ -636,6 +636,12 @@ pub(super) async fn run_deleted_data_inner(
                     ursula_stream::sim_controls::Defence::ScrubPurge,
                     false,
                 );
+                trace.push(SimEvent::FaultApplied {
+                    phase: format!(
+                        "node {covered} restarted: {}",
+                        replica_state(&cluster, covered)
+                    ),
+                });
             }
         }
     }
@@ -853,7 +859,15 @@ mod tests {
             ThreeNodeRaftSim::run_deleted_data_with_controls_report(config(seed), controls)
         });
         std::panic::set_hook(previous_hook);
-        assert!(result.is_err(), "{controls:?} left seed {seed} passing");
+        assert!(
+            result.is_err(),
+            "{controls:?} left seed {seed} passing: {:?}",
+            SimTrace::last_recorded()
+                .events
+                .iter()
+                .filter(|event| matches!(event, SimEvent::FaultApplied { .. }))
+                .collect::<Vec<_>>()
+        );
         let trace = SimTrace::last_recorded();
         assert!(
             invariant_failed(&trace, invariant),
