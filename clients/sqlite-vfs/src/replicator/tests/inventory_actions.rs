@@ -536,6 +536,34 @@ fn a_3xx_but_307_or_308_redirects_and_a_1xx_is_rejected() {
     }
 }
 
+/// An untyped `429`, an intermediary's rate limit without an error body, is sent again by every
+/// snapshot write: each repeats safely by its offset and digest, whether `classify` reads the
+/// `429` as `Refused` (as it does) or `Unknown`.
+#[test]
+fn the_snapshotter_resends_an_untyped_429() {
+    for write in [
+        Write::SnapshotPublish,
+        Write::PartsCommit,
+        Write::PartStage,
+        Write::PartsDiscard,
+        Write::Retention,
+    ] {
+        let answer = parse_answer(&request_of(write, 4), 429, [], Vec::new());
+        assert!(
+            matches!(answer.outcome, Some(WriteOutcome::Refused(_))),
+            "{write:?}: {:?}",
+            answer.outcome
+        );
+        assert!(transient(&answer), "{write:?}");
+        assert!(transient_part(&answer), "{write:?}");
+        let unknown = Answer {
+            outcome: Some(WriteOutcome::Unknown),
+            ..answer
+        };
+        assert!(transient(&unknown), "{write:?} read as unknown");
+    }
+}
+
 /// The VFS's blocked reasons for the gateway's and an embedder's refusals that it shows its host.
 #[test]
 fn the_vfs_names_the_authorizer_refusals() {

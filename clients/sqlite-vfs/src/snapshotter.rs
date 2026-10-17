@@ -914,9 +914,11 @@ const COMMIT_RESTAGES: u32 = 1;
 /// Whether an answer decides nothing, so the request goes out again. A write's answer goes by
 /// what `ursula_headers::classify` read from it ([`Answer::outcome`]):
 ///
-/// - `Unknown` at a `408` or a `5xx` is sent again, but at a `501`, which no repeat changes. An
-///   unknown `1xx`, `2xx` or `3xx` is no answer of Ursula's, and the snapshotter decides on it: a
-///   success never counts as published without the typed snapshot.
+/// - `Unknown` at a `408`, a `429` or a `5xx` is sent again, but at a `501`, which no repeat
+///   changes. `classify` reads every `429` as `Refused` today. The `429` here keeps an untyped
+///   rate limit transient whatever it reads, since a snapshot write repeats safely by its offset
+///   and digest. An unknown `1xx`, `2xx` or `3xx` is no answer of Ursula's, and the snapshotter
+///   decides on it: a success never counts as published without the typed snapshot.
 /// - `Refused` for load or routing is sent again: a `408` cut before any of the body was
 ///   forwarded, a `429`, and a `5xx` whose code proves nothing applied (`NO_LEADER` and the
 ///   pressure codes), but `NO_COLD_STORE`, which no repeat changes. Every other refusal decides.
@@ -925,7 +927,7 @@ const COMMIT_RESTAGES: u32 = 1;
 /// A HEAD's answer, which is no write's, goes by the same statuses alone.
 pub(crate) fn transient(answer: &Answer) -> bool {
     match &answer.outcome {
-        Some(WriteOutcome::Unknown) => matches!(answer.status, 408 | 500 | 502..=599),
+        Some(WriteOutcome::Unknown) => matches!(answer.status, 408 | 429 | 500 | 502..=599),
         Some(WriteOutcome::Refused(code)) => match answer.status {
             408 | 429 => true,
             500..=599 => code != &ErrorCode::NoColdStore,
