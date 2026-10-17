@@ -1,6 +1,6 @@
 apiVersion: v2
 name: ursula
-description: Ursula Durable Streams cluster with an optional S3 event-time indexer (experimental)
+description: Ursula Durable Streams cluster
 type: application
 version: 0.8.0
 appVersion: "0.8.0"

@@ -547,7 +547,7 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 **0.8.0 is a breaking release.** It changes the storage and protocol format to format epoch 4. A 0.8 node refuses epoch-3 Raft WAL directories and object-storage prefixes at startup, refuses 0.7 peers, snapshots and backups, and `ursulactl restore` refuses 0.7 backups. There is no migration, no in-place upgrade, no rolling upgrade and no rollback. If you cannot move your data yet, stay on 0.7.6.
 
-1. **Install fresh.** Use empty PVCs and never-used prefixes for the cold store, S3 snapshots and the event-time indexer. Never reuse a prefix that 0.7, or a failed upgrade attempt, wrote to.
+1. **Install fresh.** Use empty PVCs and never-used prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.7, or a failed upgrade attempt, wrote to.
 2. **Set the cluster id.** Set `server.cluster_id` on every node of a multi-node cluster, the same on every node and different for every deployment a client can reach. The chart requires `server.clusterId` for every install, a single replica included.
 3. **Choose the network planes before the first install.** The chart serves Raft on `server.ports.cluster` (`4439`) by default. Do not change `server.clusterListen` or `server.ports.cluster` on an initialized cluster. Outside the chart, set `server.cluster_listen` and `client_url` together on every node.
 4. **Check the inflight body budget.** A node with a cold backend needs `server.http_inflight_body_size` of at least 64 MiB, or it refuses to start with `InflightBodyBudgetTooSmall`.
@@ -584,7 +584,7 @@ Every behavior change is listed in the [0.7.0 release notes](/docs/release-notes
 
 To install 0.7:
 
-1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`. With the event-time indexer, use a new or emptied `indexer.s3.prefix` and register the indexes again.
+1. **Install fresh.** Install with a new `s3.prefix` and empty PVCs. With cold storage off and S3 snapshots, also use a new `snapshotStore.prefix`.
 2. **Never reuse a prefix** that an earlier release, or a failed upgrade attempt, wrote to.
 3. **Update the configuration.**
    - Remove `raft.wal.backend`, `raft.wal.allow_volatile_multi_peer`, `raft.memory_bootstrap_marker_dir` and `raft.rejoin_probe`. A config file that still sets one fails to load.

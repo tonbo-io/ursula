@@ -9,14 +9,11 @@ The chart uses a fixed configured voter set. Its optional graceful-rollout hook 
 - Run three Ursula voter pods across three availability zones for the normal production profile; use five voters only when tolerating two simultaneous voter failures is worth the additional write quorum cost.
 - Every voter gets its own zonal persistent volume for the Raft log, and the cluster uses shared S3 for cold chunks and externalized snapshots.
 - Run at least two stateless gateway replicas behind an authenticated TLS ingress or load balancer. Keep the server and peer Services private.
-- Optionally run a fixed event-time indexer worker pool (experimental). Users register JSON or NDJSON streams dynamically over HTTP after stream creation; adding a stream never requires a Helm upgrade.
-- Keep S3 authoritative and treat indexer `emptyDir` volumes as disposable caches. Each source gets a logical S3 namespace, and workers claim streams across namespaces so small streams can share pods.
-- Run two or more indexer workers across zones when event-time query availability or ingestion capacity matters. Claims reduce duplicate work; immutable parts and manifest CAS remain the correctness boundary.
-- Give Ursula and the indexer pool separate workload identities with least-privilege access to non-overlapping S3 prefixes. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for indexer readiness, blocked streams, source lag, task backlog, S3 errors, storage growth, and pod restarts.
+- Give Ursula a workload identity with least-privilege access to its S3 prefix. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for S3 errors, storage growth, and pod restarts.
 
 This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods. `server.updateStrategy=OnDelete` stages new pod templates without letting Kubernetes restart voters automatically, and `server.gracefulRollout.enabled=true` supplies the sequence it leaves undone: a post-upgrade job that drains one voter, replaces it, waits for it to rejoin and catch up, verifies the cluster, and only then moves to the next. Enable both together, or the upgrade stages a template that nothing ever applies. A Helm pre-upgrade hook removes stale `rollingUpdate` state before switching an existing StatefulSet to `OnDelete`; GitOps users that already provide an equivalent PreSync migration can disable it with `server.onDeleteMigration.enabled=false`.
 
-[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, separate workload identities, and a two-replica indexer worker pool. It needs the AWS resources listed under [Prerequisites](#prerequisites).
+[`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, and an IRSA workload identity. It needs the AWS resources listed under [Prerequisites](#prerequisites).
 
 [`examples/tls-ingress.yaml`](examples/tls-ingress.yaml) is the exposure half: one HTTPS domain terminating at the ingress, with voters and the admin plane private. Layer it on top of a sizing example. Ursula never terminates TLS itself — see the security guide for why, and for the ingress settings that live tails and leader redirects depend on.
 
@@ -35,10 +32,9 @@ On AWS, [`examples/production-eks.yaml`](examples/production-eks.yaml) expects:
   `volumeBindingMode: WaitForFirstConsumer` and `reclaimPolicy: Retain`.
 - An S3 bucket in the cluster's region with versioning, default encryption and
   blocked public access. Set `s3.bucket`, `s3.region` and `s3.prefix`.
-- IAM roles for the Ursula and indexer service accounts, through IRSA (the
-  `eks.amazonaws.com/role-arn` annotations in the example) or EKS Pod Identity.
-  Limit each role to its own prefix: `s3.prefix` for Ursula and
-  `indexer.s3.prefix` for the indexer. Each needs `s3:ListBucket`,
+- An IAM role for the Ursula service account, through IRSA (the
+  `eks.amazonaws.com/role-arn` annotation in the example) or EKS Pod Identity.
+  Limit the role to `s3.prefix`. It needs `s3:ListBucket`,
   `s3:GetBucketLocation` and `s3:ListBucketMultipartUploads` on the bucket for
   its prefix, and `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`,
   `s3:AbortMultipartUpload` and `s3:ListMultipartUploadParts` on the objects
@@ -197,8 +193,8 @@ server:
 ```
 
 The policy admits only this release's server pods to the cluster port. The
-client port admits `clientIngressFrom`, plus this release's gateway, indexer
-and Helm test pods. List every other client there, including metrics pollers
+client port admits `clientIngressFrom`, plus this release's gateway and Helm
+test pods. List every other client there, including metrics pollers
 and an `ipBlock` for traffic through a `LoadBalancer` or `NodePort` Service.
 The chart refuses to render the policy while `server.adminListen` is off
 loopback, since the policy would cut that admin plane off. It selects only
@@ -330,41 +326,6 @@ The default cold-read cache is installed by the runtime when no
 `coldStorage.cache.*` values are set. Set `coldStorage.cache.maxSizeBytes=0` to
 disable the cache explicitly.
 
-## Event-Time Indexer
-
-**Experimental.** The indexer's HTTP API and S3 format may change in a minor release, which then needs a new or emptied `indexer.s3.prefix` and re-registration.
-
-The optional `ursula-indexer` runs as a fixed, cluster-level worker Deployment because it is a rebuildable projection, not part of the Raft write path. Pod count is independent of stream count. Registrations are stored in one conditionally updated S3 catalog object, and each registered source receives its own manifest, base and retained floor, indexed offset, parts, claim, skip counts, and status below the pool prefix.
-
-On EKS, prefer a separate IRSA or Pod Identity role for the indexer:
-
-```yaml
-s3:
-  bucket: my-ursula-index
-  region: us-east-1
-
-indexer:
-  enabled: true
-  replicaCount: 2
-  s3:
-    prefix: indexes
-  serviceAccount:
-    annotations:
-      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
-```
-
-After a user creates an `application/json` or `application/x-ndjson` stream, register it through the internal indexer Service:
-
-```bash
-curl -X PUT http://ursula-indexer:4493/v1/indexes/browser-session-42 \
-  -H 'Content-Type: application/json' \
-  -d '{"stream_url":"http://ursula-gateway:4437/sessions/browser-session-42","extract":{"time":["/captured_at"]}}'
-```
-
-Registration performs a HEAD preflight, rejects sources of any other content type, and records the stream's `Stream-Incarnation`. Each stream has one claim at a time, which starts at the first unindexed byte; a worker reads up to `indexer.workers.segmentBytes` with ordinary offset reads and commits the messages it framed. Claims are expiring efficiency hints rather than locks, so worker death cannot strand correctness: overlapping commits must produce identical entries, and duplicate work converges through immutable content-addressed parts plus S3 manifest CAS. Messages without a usable event time are skipped and counted, retention is followed with a floor, and a deleted and recreated stream restarts its registration. See the [indexer README](https://github.com/tonbo-io/ursula/blob/main/crates/ursula-index/README.md) for the extractor, query, and status formats.
-
-Query one registration at `/v1/indexes/{id}/events`; inspect or resume it at `/v1/indexes/{id}/status` and `/v1/indexes/{id}/status/resume`. `GET /v1/indexes` lists registrations and `DELETE /v1/indexes/{id}` stops scheduling and retires its namespace; maintenance deletes the registration's index objects after `indexer.garbageCollection.graceSeconds`, and a re-registration with the same id, stream, incarnation and extractor (whatever its `start`) is refused until then. Do not expose the Service directly to the internet: registration, deletion, and resume are administrative operations. Put authentication and path-aware authorization in a separate ingress or API gateway if applications need remote query access.
-
 ## Snapshot Store
 
 The default snapshot backend is `auto`, Ursula's own default: the chart renders
@@ -466,7 +427,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.service.annotations` | `{}` | Client Service annotations. |
 | `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and, with `server.clusterListen=true`, `server.ports.cluster`. It uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
 | `server.networkPolicy.enabled` | `false` | Render an ingress NetworkPolicy for the server pods. The cluster port admits only this release's server pods. The admin plane stays on loopback and needs no rule, and rendering fails when `server.adminListen` is off loopback. Needs a CNI that enforces NetworkPolicy. |
-| `server.networkPolicy.clientIngressFrom` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector`, `ipBlock`) admitted to the client port. Empty admits every source. This release's gateway, indexer and Helm test pods are always admitted when enabled. List every other client, including metrics pollers and an `ipBlock` for `LoadBalancer` or `NodePort` traffic. |
+| `server.networkPolicy.clientIngressFrom` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector`, `ipBlock`) admitted to the client port. Empty admits every source. This release's gateway and Helm test pods are always admitted when enabled. List every other client, including metrics pollers and an `ipBlock` for `LoadBalancer` or `NodePort` traffic. |
 | `server.podAnnotations` | `{}` | Extra annotations applied to Ursula server pods. |
 | `server.podLabels` | `{}` | Extra labels applied to Ursula server pods. Must not set selector labels `app.kubernetes.io/name` or `app.kubernetes.io/instance`; the chart fails rendering if those keys are used. |
 | `server.rustLog` | `ursula=info,ursula_runtime=info,ursula_raft=info` | `RUST_LOG` tracing filter. |
@@ -625,35 +586,6 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `gateway.scheduling.affinity` | `{}` | Affinity rules for gateway pods. |
 | `gateway.scheduling.topologySpreadConstraints` | `[]` | Topology spread constraints for gateway pods. |
 | `gateway.initContainers` | `[]` | Init containers to run before the gateway container. |
-
-### Event-Time Indexer
-
-| Value | Default | Description |
-| --- | --- | --- |
-| `indexer.enabled` | `false` | Deploy the dynamic event-time indexer worker pool. |
-| `indexer.replicaCount` | `2` | Shared worker count; independent of registered stream count. |
-| `indexer.s3.bucket` | `""` | Pool S3 bucket override; empty inherits `s3.bucket`. |
-| `indexer.s3.region` | `""` | Pool S3 region override; empty inherits `s3.region`. |
-| `indexer.s3.endpoint` | `""` | Pool S3-compatible endpoint override; empty inherits `s3.endpoint`. |
-| `indexer.s3.prefix` | `event-index` | Authoritative catalog root containing per-stream namespaces. |
-| `indexer.serviceAccount.annotations` | `{}` | Workload identity annotations such as an EKS IRSA role ARN. |
-| `indexer.cache.servingMaxBytes` | `1073741824` | Shared serving-cache budget across every registration in one worker pod. |
-| `indexer.cache.maintenanceMaxBytes` | `268435456` | Shared compaction/GC cache budget across every registration in one worker pod. |
-| `indexer.cache.emptyDir.sizeLimit` | `2Gi` | Disposable local cache volume limit; durable index state remains in S3. |
-| `indexer.ingest.flushEntries` | `65536` | Maximum messages (entries plus skips) in one committed segment, and so entries in one uncompacted part. |
-| `indexer.ingest.rowGroupEntries` | `16384` | Entries per Parquet row group in a written part. |
-| `indexer.ingest.pollIntervalMs` | `250` | Interval between source polls in each worker. |
-| `indexer.ingest.tailFlushIntervalMs` | `5000` | Maximum delay before a tail segment shorter than `indexer.workers.segmentBytes` is committed. |
-| `indexer.workers.concurrency` | `4` | Concurrent stream tasks per worker pod. |
-| `indexer.workers.segmentBytes` | `33554432` | Source bytes read before a segment is committed; a shorter segment waits for `indexer.ingest.tailFlushIntervalMs` unless it follows one that stopped at `indexer.ingest.flushEntries`. |
-| `indexer.workers.leaseMs` | `60000` | Claim duration used to reduce duplicate processing; not a correctness boundary. |
-| `indexer.compaction.fanIn` | `8` | Number of same-partition parts selected for bounded compaction. |
-| `indexer.compaction.maxEntries` | `1000000` | Maximum entries loaded by one compaction; must cover one configured fan-in. |
-| `indexer.garbageCollection.graceSeconds` | `86400` | Minimum age before unreferenced objects are eligible for deletion; values below 300 are rejected. |
-| `indexer.garbageCollection.retainGenerations` | `8` | Recent manifest generations retained by GC. |
-| `indexer.podDisruptionBudget.enabled` | `true` | Protect multi-worker query and ingestion availability; rejected for one replica. |
-| `indexer.networkPolicy.enabled` | `true` | Limit indexer HTTP ingress to pods in the release namespace; egress stays open for DNS, source reads, and S3. |
-| `indexer.resources` | production defaults | Per worker: requests 250m CPU, 512Mi memory, and 2Gi ephemeral storage; limits 2 CPU, 2Gi memory, and 3Gi ephemeral storage. |
 
 ### Helm Test
 

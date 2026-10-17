@@ -36,7 +36,7 @@ Prod(s) ≤ 0.4 KiB · P(s) + 56 KiB     (0 for streams without Producer-* heade
 
 **I4. Per node.** No structure keyed by something ever seen (streams, pages, lookups) grows without a cap. Caches are bounded by bytes or entries (F13). Per-request memory is at most the 8 MiB response cap or one record (at most 32 MiB), and no write copies group state (F9, F11). The TTL heap holds at most two entries per live TTL stream (F8). Hot payload across the node stays near `flush_pressure_hot_size` (128 MiB) while S3 is healthy (F10), and the per-group admission cap is the hard bound. Unpurged Raft log stays near the node log-byte budget and never passes twice the budget, where admission refuses client writes (F12e).
 
-**I5. Independence.** No bound depends on `AdvanceRetention`, a visible snapshot, TTL, a client, or a sidecar such as an indexer. The constants 64 (F2) and 16 (F5) for state-held references depend only on Ursula's own leader-side drivers. A stalled driver shows in the gauges (§7.4, Gauges), and nothing else grows while it is stalled.
+**I5. Independence.** No bound depends on `AdvanceRetention`, a visible snapshot, TTL, a client, or an external consumer. The constants 64 (F2) and 16 (F5) for state-held references depend only on Ursula's own leader-side drivers. A stalled driver shows in the gauges (§7.4, Gauges), and nothing else grows while it is stalled.
 
 ## 3. Definitions
 
@@ -264,7 +264,7 @@ The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.r
 
 ## 8. Design rationale
 
-- **Retention is not required.** Requiring it would discard the history these streams exist for (#41) and make Raft memory depend on an application or indexer staying healthy. It would also leave producer state and the TTL heap unbounded.
+- **Retention is not required.** Requiring it would discard the history these streams exist for (#41) and make Raft memory depend on an application or consumer staying healthy. It would also leave producer state and the TTL heap unbounded.
 - **No local KV store.** Persisting the state machine in RocksDB or similar is a non-goal. Nodes stay close to stateless, and S3 cold-index pages are the sanctioned offload (F5, F14).
 - **Coverage from the hot buffer.** Keeping a scalar cold frontier and raising it with `max` would fix D1's reads but accept intra-message offsets below an external append. The complement of the hot buffer is exact and needs no field (F18).
 - **Incarnation names over a recreate ban.** Rejecting a recreate while stream GC is pending would couple create availability to GC health, and the new stream would still share the old one's page keys during a sweep (F14g).

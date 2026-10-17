@@ -13,8 +13,6 @@ target:
   clientPort: 4437
   replicaCount: 3
   clusterDomain: cluster.local
-  indexerUrl: http://ursula-indexer:4493
-  indexSourceBaseUrl: http://ursula:4437
 
 serviceAccount:
   create: true

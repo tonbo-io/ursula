@@ -3,6 +3,17 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.8.2
+
+0.8.2 removes the experimental event-time indexer. Server nodes, the gateway and every storage and protocol format are unaffected by this change.
+
+### Indexer
+
+- **The `indexer` role is gone.** The `ursula` binary no longer has an `indexer` subcommand, so `ursula indexer ...` now fails at argument parsing. The `ursula-index` crate is no longer built or published. Nothing in the server or the gateway depended on it: offsets, `Stream-Incarnation` and leader reads behave as before.
+- **The Helm chart drops it.** The `indexer` values block, the `deploymentContract.indexerServiceAccountName`, `indexerRoleArn` and `indexerS3Prefix` keys, and the indexer's Deployment, Service, PodDisruptionBudget, NetworkPolicy and ServiceAccount are removed. The values schema refuses unknown keys, so a values file that still sets any of them, `indexer.enabled: false` included, fails `helm install` and `helm upgrade` with `additional properties 'indexer' not allowed` (or `'indexerRoleArn'` at `/deploymentContract`). The `ursula-chaos` chart drops `target.indexerUrl` and `target.indexSourceBaseUrl` the same way, and its agent no longer registers its record streams with an indexer.
+- **Event-time queries have no replacement.** Read a stream by offset, and keep an index in your application if you need lookups by event time, for example a SQLite database replicated through Ursula with `@tonbo/sqlite-ursula`.
+- **Upgrading:** if you run the indexer, turn it off on 0.8.1 or earlier first. Set `indexer.enabled: false` and roll that out, then delete the `indexer` block and the `deploymentContract.indexer*` keys from your values, and only then upgrade to 0.8.2. Outside Helm, remove every process or manifest that runs `ursula indexer` before you deploy the 0.8.2 image, which cannot start one. Afterwards the indexer's S3 prefix and its IAM role are unused and nothing in Ursula reads them, so you can delete both. Rolling back to 0.8.1 is safe: the indexer stays off until you enable it again, and it rebuilds an index from the stream's retained history.
+
 ## 0.8.1
 
 0.8.1 is a drop-in patch for 0.8.0: format epoch 4, the server's storage and protocol formats and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged. 0.8.0 and 0.8.1 nodes run in one cluster during a rolling upgrade, 0.8.0 and 0.8.1 owners and readers of one stream work side by side, and owners upgrade one at a time.

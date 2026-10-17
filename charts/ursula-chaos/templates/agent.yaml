@@ -4,9 +4,6 @@
 {{- if gt (.Values.recordStreamCount | int) (.Values.streamCount | int) -}}
 {{- fail "recordStreamCount must not exceed streamCount" -}}
 {{- end -}}
-{{- if and (gt (.Values.recordStreamCount | int) 0) (eq (.Values.target.indexerUrl | trim) "") -}}
-{{- fail "recordStreamCount requires target.indexerUrl" -}}
-{{- end -}}
 {{- $name := include "ursula-chaos.fullname" . -}}
 {{- $targetNamespace := include "ursula-chaos.targetNamespace" . -}}
 {{- if .Values.serviceAccount.create }}
@@ -110,9 +107,6 @@ spec:
             - --workload-stream-ttl-secs={{ .Values.streamTtlSeconds }}
             - --workload-run-secs={{ .Values.workloadRunSeconds }}
             - --status-file=/var/lib/ursula-chaos/status.json
-            - --indexer-url={{ .Values.target.indexerUrl }}
-            - --index-registration-prefix={{ $name }}
-            - --index-source-base-url={{ .Values.target.indexSourceBaseUrl }}
             {{- if .Values.statusS3Uri }}
             - --status-s3-uri={{ .Values.statusS3Uri }}
             {{- end }}
