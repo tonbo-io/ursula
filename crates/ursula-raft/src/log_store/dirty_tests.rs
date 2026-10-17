@@ -508,21 +508,30 @@ fn dead_frames_age_from_the_simulated_modification_time() {
     });
 }
 
-/// A power loss in the middle of a rewrite loses no live entry and brings
-/// back no purged one: copies that were not durable yet are lost with the
-/// power and the originals stay, copies that were durable stand in for
-/// originals that were not deleted yet or whose deletion was, and a deletion
-/// whose directory `fsync` failed comes back with the purge that freed it.
-/// In every case the next passes free the dead frames.
+/// A power loss in the middle of a rewrite loses no live entry and leaves
+/// no hole, under either fsync policy: copies that were not durable yet are
+/// lost with the power and the originals stay, copies that were durable
+/// stand in for originals that were not deleted yet or whose deletion was,
+/// and a deletion whose directory `fsync` failed comes back with the purge
+/// that freed it. Under `always` no purged entry comes back. Under `never` a
+/// purge that was not synced may be lost, and then the entries it purged
+/// come back whole, never with a hole. In every case the next passes free
+/// the dead frames.
 #[cfg(madsim)]
 #[test]
 fn a_power_loss_mid_rewrite_loses_no_live_entry() {
     crate::tests::check_madsim_determinism(671, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(671, async {
-            power_loss_mid_rewrite(RewriteCut::BeforeCopiesSync).await;
-            power_loss_mid_rewrite(RewriteCut::BeforeOriginalsDeleted).await;
-            power_loss_mid_rewrite(RewriteCut::AfterOriginalsDeleted).await;
-            power_loss_mid_rewrite(RewriteCut::DeletionNotDurable).await;
+            for fsync in [WalFsync::Always, WalFsync::Never] {
+                for cut in [
+                    RewriteCut::BeforeCopiesSync,
+                    RewriteCut::BeforeOriginalsDeleted,
+                    RewriteCut::AfterOriginalsDeleted,
+                    RewriteCut::DeletionNotDurable,
+                ] {
+                    power_loss_mid_rewrite(cut, fsync).await;
+                }
+            }
         })
         .await;
     });
@@ -548,11 +557,12 @@ enum RewriteCut {
 }
 
 #[cfg(madsim)]
-async fn power_loss_mid_rewrite(cut: RewriteCut) {
+async fn power_loss_mid_rewrite(cut: RewriteCut, fsync: WalFsync) {
     use super::SimDisk;
     use super::SimDiskFault;
 
-    let journal = Journal::new(&format!("power-loss-mid-rewrite-{cut:?}"), WalFsync::Always);
+    let context = format!("{cut:?} under {fsync:?}");
+    let journal = Journal::new(&format!("power-loss-mid-rewrite-{cut:?}-{fsync:?}"), fsync);
     let root = journal.dir.parent().expect("a WAL root").to_path_buf();
     let writer = journal.writer();
     let start = Instant::now();
@@ -568,7 +578,7 @@ async fn power_loss_mid_rewrite(cut: RewriteCut) {
                     .maintain(later(start, MAX_AGE), MAX_AGE)
                     .await
                     .is_err(),
-                "the failed fsync of the copies stops the writer"
+                "{context}: the failed fsync of the copies stops the writer"
             );
         }
         RewriteCut::BeforeOriginalsDeleted => {
@@ -578,7 +588,7 @@ async fn power_loss_mid_rewrite(cut: RewriteCut) {
                 .expect("a pass");
             assert!(
                 journal.metrics.snapshot().wal_rewritten_bytes > 0,
-                "the pass made copies"
+                "{context}: the pass made copies"
             );
             writer.abort_simulated();
         }
@@ -594,12 +604,12 @@ async fn power_loss_mid_rewrite(cut: RewriteCut) {
             let deleted = writer.maintain(later(start, MAX_AGE), MAX_AGE).await;
             assert!(
                 !Disk::exists(&first),
-                "{cut:?}: the pass deleted the originals"
+                "{context}: the pass deleted the originals"
             );
             assert_eq!(
                 deleted.is_err(),
                 cut == RewriteCut::DeletionNotDurable,
-                "{cut:?}: {deleted:?}"
+                "{context}: {deleted:?}"
             );
             writer.abort_simulated();
         }
@@ -618,16 +628,106 @@ async fn power_loss_mid_rewrite(cut: RewriteCut) {
     }
     age_the_journal(&journal, MAX_AGE.saturating_mul(2)).await;
 
+    // The journal opens: a hole in any group's log would refuse it.
     let writer = journal.writer();
     let quiet = journal.store(&writer, QUIET);
-    let removed = journal.store(&writer, REMOVED);
-    assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{cut:?}");
-    assert_eq!(
-        log_ids(&removed).await,
-        Vec::<u64>::new(),
-        "{cut:?}: no purged entry comes back"
-    );
+    let mut removed = journal.store(&writer, REMOVED);
+    assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{context}");
+    let resurfaced = log_ids(&removed).await;
+    match fsync {
+        WalFsync::Always => assert_eq!(
+            resurfaced,
+            Vec::<u64>::new(),
+            "{context}: no purged entry comes back"
+        ),
+        // A lost purge brings its entries back whole: purge them again.
+        WalFsync::Never => {
+            if let Some(last) = resurfaced.last() {
+                removed.purge(log_id(*last)).await.expect("purge again");
+            }
+        }
+    }
     journal.maintain_until_clean(&writer, Instant::now()).await;
-    assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{cut:?}");
-    assert_eq!(log_ids(&removed).await, Vec::<u64>::new(), "{cut:?}");
+    assert_eq!(log_ids(&quiet).await, [1, 2, 3], "{context}");
+    assert_eq!(log_ids(&removed).await, Vec::<u64>::new(), "{context}");
+}
+
+/// A group whose entries were too many to copy purges them after the pass
+/// that copied the others' out of their segment, and its purge frees the
+/// segment. Under `never` nothing else syncs that purge before the segment
+/// is deleted: the deletion must not outlive it, or a power loss would keep
+/// the deletion, lose the purge and leave the group's log with a hole.
+#[cfg(madsim)]
+#[test]
+fn a_deletion_never_outlives_the_purge_that_freed_its_segment() {
+    crate::tests::check_madsim_determinism(673, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(673, async {
+            for fsync in [WalFsync::Never, WalFsync::Always] {
+                purge_after_the_copies(fsync).await;
+            }
+        })
+        .await;
+    });
+}
+
+/// The group that holds more than a rewrite copies.
+#[cfg(madsim)]
+const LAGGARD: u32 = 3;
+
+#[cfg(madsim)]
+async fn purge_after_the_copies(fsync: WalFsync) {
+    use super::SimDisk;
+
+    let journal = Journal::new(&format!("purge-after-the-copies-{fsync:?}"), fsync);
+    let root = journal.dir.parent().expect("a WAL root").to_path_buf();
+    let writer = journal.writer();
+    let start = Instant::now();
+    let mut laggard = journal.store(&writer, LAGGARD);
+    // More than a quarter of a segment in the first one.
+    append(
+        &mut laggard,
+        (1..=6).map(|index| entry(index, &[b'l'; 300])),
+    )
+    .await;
+    let (quiet, removed) = write_and_remove(&journal, &writer, start).await;
+    let first = journal.segments().first().cloned().expect("a segment");
+    writer
+        .maintain(later(start, MAX_AGE), MAX_AGE)
+        .await
+        .expect("the pass that copies");
+    assert!(journal.metrics.snapshot().wal_rewritten_bytes > 0);
+    assert_eq!(
+        journal.lagging.groups().into_iter().collect::<Vec<_>>(),
+        [RaftGroupId(LAGGARD)],
+        "{fsync:?}: the laggard keeps the first segment"
+    );
+    assert!(Disk::exists(&first));
+    // The purge's own pass deletes the segment it freed.
+    laggard.purge(log_id(6)).await.expect("purge");
+    writer
+        .maintain(later(start, MAX_AGE), MAX_AGE)
+        .await
+        .expect("a pass");
+    assert!(
+        !Disk::exists(&first),
+        "{fsync:?}: the purge freed the segment"
+    );
+    writer.abort_simulated();
+    drop((quiet, removed, laggard));
+    drop(writer);
+    SimDisk::power_loss_losing_unsynced(&root).expect("cut the power");
+
+    let writer = journal.writer();
+    let mut laggard = journal.store(&writer, LAGGARD);
+    let purged = laggard
+        .get_log_state()
+        .await
+        .expect("log state")
+        .last_purged_log_id
+        .map_or(0, |log_id| log_id.index);
+    let held = log_ids(&laggard).await;
+    assert!(
+        purged >= 6 || (1..=6).all(|index| held.contains(&index)),
+        "{fsync:?}: the deletion outlived the purge: purged {purged}, entries {held:?}"
+    );
 }

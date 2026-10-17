@@ -333,8 +333,9 @@ snapshot driver sends each core writer a maintenance pass with the driver's time
 and the age A, a quarter of `raft.deleted_data_max_age`. The driver runs the
 passes in a task of its own and starts the next only once the last one ended,
 so a slow writer holds up no snapshot build. The pass stamps the deaths since
-the last pass with that time, counting how long the writer waited for it. It seals the active segment once its dead entries are A
-old, so that a quiet core frees it like any other. Then, even when the journal
+the last pass with that time, counting how long the writer waited for it. It
+seals the active segment once its dead entries are A old, so that a quiet core
+frees it like any other. Then, even when the journal
 is within its budget, a kept segment that held dead entries for A frees the
 oldest kept segment as step 2 does, under the same quarter-segment rule and
 pass budget. A journal gives back only its oldest segment, so the segments

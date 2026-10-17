@@ -35,12 +35,13 @@
 //! which the snapshot driver reads.
 //!
 //! The writer also tracks which segments hold dead frames, those of entries
-//! purged, truncated, written again or copied away by a rewrite (#669). The
-//! snapshot driver's tick sends each writer a [`CoreWriteOp::Maintain`]: the
-//! writer stamps the deaths it learned of since the last one with the tick's
-//! time, seals its active segment once that segment has held dead frames for
-//! the tick's maximum age, and frees segments that held them that long,
-//! copying at most a pass's budget per tick. The writer has no timer of its
+//! purged, truncated, written again or copied away by a rewrite (#669). At
+//! most once per drive interval the snapshot driver sends each writer a
+//! [`CoreWriteOp::Maintain`]: the writer stamps the deaths it learned of
+//! since the last one with the driver's time, seals its active segment once
+//! that segment has held dead frames for the given maximum age, and frees
+//! segments that held them that long, copying at most a pass's budget per
+//! maintenance pass. The writer has no timer of its
 //! own. At open, replay finds the dead frames again, a segment's age comes
 //! from its modification time, and a dirty newest segment is sealed.
 //!
@@ -927,14 +928,34 @@ impl CoreFileLogWriter {
 
     /// Runs a maintenance pass as of `now` on the snapshot driver's clock
     /// ([`CoreWriteOp::Maintain`]), after everything sent before.
+    #[cfg(test)]
     pub(crate) async fn maintain(
         &self,
         now: Instant,
         max_dirty_age: Duration,
     ) -> Result<(), CoreJournalError> {
-        self.write(CoreWriteOp::Maintain { now, max_dirty_age })
-            .await
-            .map(drop)
+        self.send_maintenance(now, max_dirty_age)?.ran().await
+    }
+
+    /// Asks for a maintenance pass as of `now` on the snapshot driver's
+    /// clock ([`CoreWriteOp::Maintain`]), after everything sent before. The
+    /// answer holds no handle on the writer, so a caller that waits for it
+    /// never keeps the writer, and with it the journal's lock, past its
+    /// last store.
+    pub(crate) fn send_maintenance(
+        &self,
+        now: Instant,
+        max_dirty_age: Duration,
+    ) -> Result<MaintenanceAnswer, CoreJournalError> {
+        let (reply, response) = oneshot::channel();
+        self.send(CoreWriterRequest::Write(CoreFileLogWrite {
+            op: CoreWriteOp::Maintain { now, max_dirty_age },
+            reply: WriteReply::Wait(reply),
+        }))?;
+        Ok(MaintenanceAnswer {
+            journal: self.dir.clone(),
+            response,
+        })
     }
 
     /// Writes and `fsync`s everything sent before, then stops the writer.
@@ -943,6 +964,26 @@ impl CoreFileLogWriter {
         let (reply, response) = oneshot::channel();
         self.send(CoreWriterRequest::Close(reply))?;
         response.await.map_err(|_dropped| self.stopped())?
+    }
+}
+
+/// The answer to a maintenance pass ([`CoreFileLogWriter::send_maintenance`]).
+#[derive(Debug)]
+pub(crate) struct MaintenanceAnswer {
+    journal: PathBuf,
+    response: oneshot::Receiver<WriteResult>,
+}
+
+impl MaintenanceAnswer {
+    /// Waits until the pass ran. A writer that stopped before it did
+    /// answers [`CoreJournalError::WriterStopped`].
+    pub(crate) async fn ran(self) -> Result<(), CoreJournalError> {
+        match self.response.await {
+            Ok(result) => result.map(drop),
+            Err(_dropped) => Err(CoreJournalError::WriterStopped {
+                journal: self.journal,
+            }),
+        }
     }
 }
 
@@ -1497,9 +1538,9 @@ impl CoreJournal {
         self.context.lagging.set(self.context.core, &plan.lagging);
         self.lagging_groups = u64::try_from(plan.lagging.len()).unwrap_or(u64::MAX);
         self.pinned_segments = plan.pinned_segments;
-        // Rewrites for the age of dead frames run only on the driver's tick,
-        // so they copy at most a pass's budget per tick however busy the
-        // core is.
+        // Rewrites for the age of dead frames run only in the driver's
+        // maintenance passes, at most one per drive interval, so they copy
+        // at most a pass's budget per interval however busy the core is.
         let rewrite = plan.rewrite.filter(|rewrite| match rewrite.cause {
             FreeCause::OverBudget => true,
             FreeCause::DirtyAge => pass == Pass::Maintenance,

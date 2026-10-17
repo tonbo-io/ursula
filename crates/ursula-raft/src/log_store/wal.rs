@@ -325,7 +325,11 @@ impl WalMaintenance {
             CoreWriterSlots::ShutDown => return Ok(()),
         };
         drop(core_writers);
-        let mut writers = Vec::with_capacity(slots.len());
+        // Each pass is asked for while the writer's handle is held, and
+        // the handle goes before the wait: holding the last one there would
+        // make its drop wait for the writer and keep the journal locked
+        // against a group that reopens meanwhile.
+        let mut answers = Vec::with_capacity(slots.len());
         for (core, slot) in slots {
             // Opening a journal holds its slot through the replay, so a busy
             // slot is skipped rather than waited on.
@@ -336,15 +340,20 @@ impl WalMaintenance {
                     return Err(RaftWalError::LockPoisoned);
                 }
             };
-            writers.extend(slot.writer.upgrade().map(|writer| (CoreId(core), writer)));
+            let Some(writer) = slot.writer.upgrade() else {
+                continue;
+            };
+            drop(slot);
+            let answer = writer.send_maintenance(now, max_dirty_age);
+            drop(writer);
+            answers.push((CoreId(core), answer));
         }
-        let passes = join_all(writers.iter().map(|(core, writer)| async move {
-            writer.maintain(now, max_dirty_age).await.map_err(|source| {
-                RaftWalError::MaintainJournal {
-                    core: *core,
-                    source,
-                }
-            })
+        let passes = join_all(answers.into_iter().map(|(core, answer)| async move {
+            match answer {
+                Ok(answer) => answer.ran().await,
+                Err(source) => Err(source),
+            }
+            .map_err(|source| RaftWalError::MaintainJournal { core, source })
         }))
         .await;
         passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
@@ -479,6 +488,60 @@ mod tests {
             Err(RaftWalError::ShutDown { .. })
         ));
         drop(store);
+    }
+
+    /// A maintenance pass that is still answering holds no handle on the
+    /// core's writer (#669): once the group's last store goes, the writer
+    /// goes too, and the group opens again at once instead of finding its
+    /// journal locked.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_waiting_maintenance_pass_keeps_no_writer() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = RaftWal::start(root.path(), WalFsync::Never, &topology).unwrap();
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let store = wal.open(placement, metrics.clone()).unwrap();
+        let maintenance = wal.maintenance();
+        let mut pass =
+            std::pin::pin!(maintenance.maintain(Instant::now(), Duration::from_secs(60)));
+        // One poll asks for the pass and leaves it waiting, or done.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let polled = pass.as_mut().poll(&mut cx);
+        drop(store);
+        let writer_gone = {
+            let core_writers = wal.core_writers.lock().unwrap();
+            let CoreWriterSlots::Running(slots) = &*core_writers else {
+                panic!("a started WAL is running");
+            };
+            slots[&0].lock().unwrap().writer.upgrade().is_none()
+        };
+        assert!(
+            writer_gone,
+            "the pass kept the writer after its last store went ({polled:?})"
+        );
+        let reopened = wal.open(placement, metrics).expect("the group opens again");
+        if polled.is_pending() {
+            let ran = pass.await;
+            assert!(
+                matches!(
+                    ran,
+                    Ok(())
+                        | Err(RaftWalError::MaintainJournal {
+                            source: crate::log_store::CoreJournalError::WriterStopped { .. },
+                            ..
+                        })
+                ),
+                "{ran:?}"
+            );
+        }
+        drop(reopened);
+        wal.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]
