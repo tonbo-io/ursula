@@ -8179,7 +8179,7 @@ mod snapshot_driver {
         /// The uploaded objects the store still holds that hold the marker.
         async fn objects_with_marker(&self) -> usize {
             let uploaded = self.uploaded.lock().expect("uploads mutex").clone();
-            let mut found = 0;
+            let mut found = 0_usize;
             for location in &uploaded {
                 match self.inner.download(location).await {
                     Ok(bytes) => {
