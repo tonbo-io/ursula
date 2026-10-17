@@ -764,6 +764,8 @@ mod tests {
     async fn failed_gc_passes_back_off_until_one_succeeds() {
         let failing: SharedSnapshotStore = Arc::new(UnpublishableStore);
         let references = SnapshotReferences::new(GRACE);
+        // A known current, so that each pass publishes it, and fails.
+        references.commit_current(&s3("current"));
         for (failures, delay) in [(1_u32, 30_u64), (2, 60), (3, 120)] {
             let now = Instant::now();
             references
