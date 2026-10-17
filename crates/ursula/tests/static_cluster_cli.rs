@@ -3412,12 +3412,15 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         .expect("fresh proof after all executors retired");
     assert!(proof.maintenance_executor_retired_certified);
     assert!(!proof.maintenance_executor_certified);
+    // The observation's completion time is read before the request's now, so
+    // it can never be in the request's future.
+    let retired = observation(started_ms, proof);
     reservation = reservation
         .progress(
             ursula_ctl::reservation::ProgressRequest::CompletePodReplacement {
                 fence: executor,
                 now_ms: now_ms(),
-                observation: observation(started_ms, proof),
+                observation: retired,
             },
         )
         .expect("live all-retired prefixes release only the bound replacement");
