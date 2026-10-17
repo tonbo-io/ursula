@@ -21,7 +21,6 @@ class ChaosHelmTemplateTest(unittest.TestCase):
         self.assertIn("verbs: [\"get\", \"delete\"]", rendered)
         self.assertIn("- --fault-backend=kubernetes", rendered)
         self.assertIn("- --record-stream-count=8", rendered)
-        self.assertIn("- --indexer-url=http://ursula-indexer:4493", rendered)
         self.assertIn(
             "- --node=ursula-0=ursula-0=http://ursula-0.ursula-headless.default.svc.cluster.local:4437",
             rendered,
@@ -38,24 +37,6 @@ class ChaosHelmTemplateTest(unittest.TestCase):
         self.assertIn("kind: Role\nmetadata:\n  name: test-ursula-chaos\n  namespace: ursula", rendered)
         self.assertIn("namespace: chaos-system\nroleRef:", rendered)
         self.assertIn("ursula-headless.ursula.svc.cluster.local", rendered)
-
-    def test_record_workload_requires_indexer_url(self) -> None:
-        result = subprocess.run(
-            [
-                "helm",
-                "template",
-                "test",
-                "charts/ursula-chaos",
-                "--set",
-                "target.indexerUrl=",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("recordStreamCount requires target.indexerUrl", result.stderr)
 
 
 if __name__ == "__main__":

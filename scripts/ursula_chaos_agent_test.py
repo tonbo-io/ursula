@@ -654,12 +654,10 @@ class ChaosAgentStateTest(unittest.TestCase):
         agent.global_unresolved_append = False
         events: list[tuple[str, str]] = []
         created: list[str] = []
-        unregistered: list[str] = []
         agent.event = lambda level, message: events.append((level, message))
         agent.create_workload_run_streams = (
             lambda run_id, streams, probe: created.append(run_id)
         )
-        agent.unregister_index_stream = lambda stream: unregistered.append(stream.name)
 
         with patch(
             "ursula_chaos_agent.time.monotonic",
@@ -692,7 +690,6 @@ class ChaosAgentStateTest(unittest.TestCase):
         self.assertEqual(agent.run_generation, 5)
         self.assertEqual(agent.run_id, "run-test-r0005")
         self.assertEqual(created, ["run-test-r0005"])
-        self.assertEqual(unregistered, ["run-test-r0004-record-0000"])
         self.assertEqual(agent.lane_unresolved_appends, [False, False])
         self.assertFalse(agent.global_unresolved_append)
         self.assertTrue(any("forcing workload rollover" in message for _, message in events))

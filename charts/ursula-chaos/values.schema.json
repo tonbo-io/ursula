@@ -25,11 +25,9 @@
         "headlessService": { "type": "string", "minLength": 1 },
         "clientPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "replicaCount": { "type": "integer", "const": 3 },
-        "clusterDomain": { "type": "string", "minLength": 1 },
-        "indexerUrl": { "type": "string" },
-        "indexSourceBaseUrl": { "type": "string", "minLength": 1 }
+        "clusterDomain": { "type": "string", "minLength": 1 }
       },
-      "required": ["namespace", "serverFullname", "headlessService", "clientPort", "replicaCount", "clusterDomain", "indexerUrl", "indexSourceBaseUrl"]
+      "required": ["namespace", "serverFullname", "headlessService", "clientPort", "replicaCount", "clusterDomain"]
     },
     "serviceAccount": {
       "type": "object",

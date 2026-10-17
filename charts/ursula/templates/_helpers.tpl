@@ -114,81 +114,6 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- printf "%s:%s" $repository $tag -}}
 {{- end -}}
 
-{{- define "ursula.indexerServiceAccountName" -}}
-{{- if .Values.indexer.serviceAccount.create -}}
-{{- default (printf "%s-indexer" (include "ursula.fullname" .) | trunc 63 | trimSuffix "-") .Values.indexer.serviceAccount.name -}}
-{{- else -}}
-{{- default "default" .Values.indexer.serviceAccount.name -}}
-{{- end -}}
-{{- end -}}
-
-{{- define "ursula.indexerImage" -}}
-{{- $repository := default .Values.global.image.repository .Values.indexer.image.repository -}}
-{{- $tag := default (default .Chart.AppVersion .Values.global.image.tag) .Values.indexer.image.tag -}}
-{{- printf "%s:%s" $repository $tag -}}
-{{- end -}}
-
-{{- define "ursula.indexerFullname" -}}
-{{- printf "%s-indexer" (include "ursula.fullname" .) | trunc 63 | trimSuffix "-" -}}
-{{- end -}}
-
-{{- define "ursula.indexerSelectorLabels" -}}
-app.kubernetes.io/name: {{ include "ursula.name" . }}-indexer
-app.kubernetes.io/instance: {{ .Release.Name }}
-app.kubernetes.io/component: indexer
-{{- end -}}
-
-{{- define "ursula.indexerLabels" -}}
-helm.sh/chart: {{ include "ursula.chart" . }}
-{{ include "ursula.indexerSelectorLabels" . }}
-app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
-app.kubernetes.io/managed-by: {{ .Release.Service }}
-{{- end -}}
-
-{{- define "ursula.validateIndexerConfig" -}}
-{{- if .Values.indexer.enabled -}}
-{{- $replicas := .Values.indexer.replicaCount | int -}}
-{{- if lt $replicas 1 -}}
-{{- fail "indexer.replicaCount must be at least 1" -}}
-{{- end -}}
-{{- if and .Values.indexer.podDisruptionBudget.enabled (lt $replicas 2) -}}
-{{- fail "indexer.podDisruptionBudget.enabled requires indexer.replicaCount greater than 1" -}}
-{{- end -}}
-{{- $port := .Values.indexer.ports.http | int -}}
-{{- if or (lt $port 1) (gt $port 65535) -}}
-{{- fail "indexer.ports.http must be between 1 and 65535" -}}
-{{- end -}}
-{{- $flushEntries := .Values.indexer.ingest.flushEntries | int64 -}}
-{{- $fanIn := .Values.indexer.compaction.fanIn | int64 -}}
-{{- $maxEntries := .Values.indexer.compaction.maxEntries | int64 -}}
-{{- if gt (mul $flushEntries $fanIn) $maxEntries -}}
-{{- fail "indexer.compaction.maxEntries must cover ingest.flushEntries times compaction.fanIn" -}}
-{{- end -}}
-{{- if lt (.Values.indexer.compaction.maintenanceLeaseMs | int64) (.Values.indexer.compaction.maintenanceIntervalMs | int64) -}}
-{{- fail "indexer.compaction.maintenanceLeaseMs must cover maintenanceIntervalMs" -}}
-{{- end -}}
-{{- if lt (.Values.indexer.garbageCollection.graceSeconds | int) 300 -}}
-{{- fail "indexer.garbageCollection.graceSeconds must be at least 300" -}}
-{{- end -}}
-{{- if or (lt (.Values.indexer.workers.concurrency | int64) 1) (lt (.Values.indexer.workers.segmentBytes | int64) 1) (lt (.Values.indexer.workers.leaseMs | int64) 1) -}}
-{{- fail "indexer worker concurrency, segmentBytes, and leaseMs must be positive" -}}
-{{- end -}}
-{{- $bucket := default .Values.s3.bucket .Values.indexer.s3.bucket | toString | trim -}}
-{{- if eq $bucket "" -}}
-{{- fail "indexer requires s3.bucket or indexer.s3.bucket" -}}
-{{- end -}}
-{{- $prefix := .Values.indexer.s3.prefix | toString | trimAll "/" -}}
-{{- if eq $prefix "" -}}
-{{- fail "indexer.s3.prefix must be non-empty" -}}
-{{- end -}}
-{{- range $label := list "app.kubernetes.io/name" "app.kubernetes.io/instance" "app.kubernetes.io/component" -}}
-{{- if hasKey $.Values.indexer.podLabels $label -}}
-{{- fail (printf "indexer.podLabels must not set reserved selector label %q" $label) -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-{{- end -}}
-
 {{/*
 Validate a DNS-1123 label that is rendered into pod names or peer DNS.
 */}}
@@ -258,8 +183,6 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- $contract := .Values.deploymentContract -}}
 {{- $serverServiceAccountName := include "ursula.serviceAccountName" . -}}
 {{- $serverRoleArn := index .Values.serviceAccount.annotations "eks.amazonaws.com/role-arn" | default "" | toString -}}
-{{- $indexerServiceAccountName := include "ursula.indexerServiceAccountName" . -}}
-{{- $indexerRoleArn := index .Values.indexer.serviceAccount.annotations "eks.amazonaws.com/role-arn" | default "" | toString -}}
 {{- $replicaCount := .Values.server.replicaCount | int -}}
 {{- $coreCount := .Values.server.coreCount | int -}}
 {{- $clientPort := .Values.server.ports.client | int -}}
@@ -281,15 +204,6 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- end -}}
 {{- if and $contract.serverS3Prefix (ne ($contract.serverS3Prefix | toString) (.Values.s3.prefix | toString)) -}}
 {{- fail (printf "deploymentContract expected server S3 prefix %q, but s3.prefix is %q" $contract.serverS3Prefix .Values.s3.prefix) -}}
-{{- end -}}
-{{- if and .Values.indexer.enabled $contract.indexerServiceAccountName (ne ($contract.indexerServiceAccountName | toString) $indexerServiceAccountName) -}}
-{{- fail (printf "deploymentContract expected indexer ServiceAccount %q, but chart resolves %q" $contract.indexerServiceAccountName $indexerServiceAccountName) -}}
-{{- end -}}
-{{- if and .Values.indexer.enabled $contract.indexerRoleArn (ne ($contract.indexerRoleArn | toString) $indexerRoleArn) -}}
-{{- fail "deploymentContract indexerRoleArn does not match indexer.serviceAccount.annotations[eks.amazonaws.com/role-arn]" -}}
-{{- end -}}
-{{- if and .Values.indexer.enabled $contract.indexerS3Prefix (ne ($contract.indexerS3Prefix | toString) (.Values.indexer.s3.prefix | toString)) -}}
-{{- fail (printf "deploymentContract expected indexer S3 prefix %q, but indexer.s3.prefix is %q" $contract.indexerS3Prefix .Values.indexer.s3.prefix) -}}
 {{- end -}}
 {{- range $i := until $replicaCount -}}
 {{- $podName := printf "%s-%d" $fullname $i -}}
@@ -340,9 +254,8 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- fail "raft.resumeAvailableBytes must exceed raft.minAvailableBytes when disk-pressure admission is enabled" -}}
 {{- end -}}
 {{- $serverUsesS3 := or .Values.coldStorage.enabled (.Values.snapshotStore.backend | eq "s3") -}}
-{{- $usesS3 := or $serverUsesS3 .Values.indexer.enabled -}}
-{{- if $usesS3 -}}
-{{- if and $serverUsesS3 (eq (.Values.s3.bucket | toString | trim) "") -}}
+{{- if $serverUsesS3 -}}
+{{- if eq (.Values.s3.bucket | toString | trim) "" -}}
 {{- fail "s3.bucket must be set when coldStorage.enabled=true or snapshotStore.backend=s3" -}}
 {{- end -}}
 {{- if and .Values.s3.credentials.existingSecret (include "ursula.hasInlineS3Credentials" .) -}}

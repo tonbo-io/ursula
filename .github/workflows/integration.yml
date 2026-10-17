@@ -49,9 +49,9 @@ jobs:
         with:
           rustflags: ""
 
-      # Integration test targets only (`tests/*.rs` of every crate, including ursula-index's,
-      # which the main CI does not run); lib and bin unit tests run in ci.yml. ursula-sim runs
-      # under madsim in ci.yml's DST job. Built before any AWS credential exists.
+      # Integration test targets only (`tests/*.rs` of every crate); lib and bin unit tests run
+      # in ci.yml. ursula-sim runs under madsim in ci.yml's DST job. Built before any AWS
+      # credential exists.
       - name: Build all integration targets
         run: $NO_OIDC cargo test --workspace --exclude ursula-sim --test '*' --no-run
 
@@ -73,25 +73,22 @@ jobs:
           AWS_DEFAULT_REGION: us-east-1
         run: aws --endpoint-url http://127.0.0.1:9000 s3 mb s3://ursula-ci
 
-      # The S3 tests (the runtime's cold path, the CLI cold-manifest restart, which exercises the
-      # format-epoch marker against real S3 listing, and ursula-index's conditional publish) each
-      # use their own root under URSULA_S3_PREFIX. On AWS the TOML names no endpoint and no keys:
+      # The S3 tests (the runtime's cold path and the CLI cold-manifest restart, which exercises
+      # the format-epoch marker against real S3 listing) each use their own root under
+      # URSULA_S3_PREFIX. On AWS the TOML names no endpoint and no keys:
       # the AWS_* session credentials and SSE-S3 apply, as in production. Inside the 3600 s session.
       - name: Test all integration targets
         timeout-minutes: 55
         env:
           MODE: ${{ steps.s3.outputs.mode }}
         run: |
-          export URSULA_COLD_S3_INTEGRATION=1 URSULA_EVENT_INDEX_S3_INTEGRATION=1
+          export URSULA_COLD_S3_INTEGRATION=1
           if [ "$MODE" = aws ]; then
             export URSULA_COLD_S3_BUCKET="$URSULA_S3_BUCKET" URSULA_COLD_S3_REGION="$URSULA_S3_REGION"
-            export URSULA_EVENT_INDEX_S3_BUCKET="$URSULA_S3_BUCKET" URSULA_EVENT_INDEX_S3_REGION="$URSULA_S3_REGION"
           else
             export URSULA_COLD_S3_BUCKET=ursula-ci URSULA_COLD_S3_REGION=us-east-1
             export URSULA_COLD_S3_ENDPOINT=http://127.0.0.1:9000 URSULA_COLD_S3_SSE=none
             export URSULA_COLD_S3_ACCESS_KEY_ID=minioadmin URSULA_COLD_S3_SECRET_ACCESS_KEY=minioadmin
-            export URSULA_EVENT_INDEX_S3_BUCKET=ursula-ci URSULA_EVENT_INDEX_S3_REGION=us-east-1
-            export URSULA_EVENT_INDEX_S3_ENDPOINT=http://127.0.0.1:9000
             export AWS_ACCESS_KEY_ID=minioadmin AWS_SECRET_ACCESS_KEY=minioadmin AWS_REGION=us-east-1
           fi
           $NO_OIDC cargo test --workspace --exclude ursula-sim --test '*'

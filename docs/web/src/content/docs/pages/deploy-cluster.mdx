@@ -43,14 +43,14 @@ For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload i
 
 ### On AWS (EKS)
 
-The chart's [`examples/production-eks.yaml`](https://github.com/tonbo-io/ursula/blob/main/charts/ursula/examples/production-eks.yaml) is a three-zone starting point: three voters on `gp3` volumes, S3 cold storage and snapshots, three gateways, and a two-replica indexer pool with its own workload identity. It needs:
+The chart's [`examples/production-eks.yaml`](https://github.com/tonbo-io/ursula/blob/main/charts/ursula/examples/production-eks.yaml) is a three-zone starting point: three voters on `gp3` volumes, S3 cold storage and snapshots, and three gateways. It needs:
 
 - an EKS cluster with nodes in three availability zones,
 - the EBS CSI driver and a StorageClass named `gp3`,
 - an S3 bucket,
-- IAM roles for the Ursula and indexer service accounts (IRSA or EKS Pod Identity), each limited to its own S3 prefix.
+- an IAM role for the Ursula service account (IRSA or EKS Pod Identity), limited to its S3 prefix.
 
-The [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#prerequisites) lists the details. Replace the bucket and the role ARNs in the example, then install it:
+The [chart README](https://github.com/tonbo-io/ursula/tree/main/charts/ursula#prerequisites) lists the details. Replace the bucket and the role ARN in the example, then install it:
 
 ```bash
 helm install ursula oci://ghcr.io/tonbo-io/charts/ursula --version 0.8.1 \
@@ -78,7 +78,7 @@ curl http://127.0.0.1:4437/__ursula/metrics
 - Add an `AbortIncompleteMultipartUpload` lifecycle rule to every cold bucket, for example after 1 day. Ursula never aborts the multipart upload of a cold write that a crash or shutdown interrupted, and S3 bills its parts until they are aborted. See [Incomplete multipart uploads](/docs/operations#incomplete-multipart-uploads).
 - Set `server.clusterId`, which the chart renders as `server.cluster_id`, the id every `HEAD` answer carries as `Ursula-Cluster-Id`. The chart refuses to render without it, for any replica count. Name the environment and the region, such as `prod-us-east-1`, and give every deployment one client can reach its own id, since two Kubernetes clusters can run the same namespace and release name. Keep the id when a restore replaces a deployment. Each node's WAL records the id, and a node whose configured id differs refuses to start.
 - Put stateless gateway replicas behind authenticated TLS ingress and keep voter and peer Services private. Ursula itself has no TLS or auth (see [Security](/docs/security)).
-- Set `server.networkPolicy.enabled=true` on a CNI that enforces NetworkPolicy. The policy admits only the release's voters to the cluster port, and the sources in `server.networkPolicy.clientIngressFrom` to the client port (every source when the list is empty) plus the release's gateway, indexer and Helm test pods. See [Kubernetes NetworkPolicy](/docs/security#kubernetes-networkpolicy).
+- Set `server.networkPolicy.enabled=true` on a CNI that enforces NetworkPolicy. The policy admits only the release's voters to the cluster port, and the sources in `server.networkPolicy.clientIngressFrom` to the client port (every source when the list is empty) plus the release's gateway and Helm test pods. See [Kubernetes NetworkPolicy](/docs/security#kubernetes-networkpolicy).
 - Kubernetes rolling updates do not transfer Raft leaders on their own. For an operationally safe restart, wrap the platform's restart in [ursulactl's maintenance verbs](/docs/cli): `ursulactl drain` the node, let Kubernetes restart the pod, then `ursulactl wait --node N` and `undrain` before moving to the next one. See [Operations](/docs/operations) for day-2 work.
 - The StatefulSet readiness probe calls `GET /__ursula/ready` and removes a pod
   from service during WAL disk pressure. Cluster-wide Raft readiness still
@@ -87,23 +87,6 @@ curl http://127.0.0.1:4437/__ursula/metrics
   `kubectl port-forward`.
 - `helm uninstall` leaves the graceful-rollout state ConfigMap (`<statefulset>-rollout-state`, for example `ursula-rollout-state`) behind. Delete it before you install again under the same name, so the rollout hook does not resume a rollout of the old release.
 - Clusters that serve the [SQLite VFS](/docs/examples/sqlite-vfs) take its appends of at most 4 MiB at any preset. Its snapshots of up to 32 MiB go in one request, so keep per-group admission caps of at least 64 MiB (`standard` or `large` preset) for them to be admitted. Larger snapshots go up in parts and need a cold backend.
-
-## Optional: event-time indexer (experimental)
-
-`ursula-indexer` is an optional worker pool that builds queryable event-time indexes from `application/json` and `application/x-ndjson` streams, kept outside the voter processes so query and compaction work never touches commit latency. It is experimental: its API and S3 format may change in a minor release, which then needs a new or emptied `indexer.s3.prefix` and re-registration.
-
-```yaml
-indexer:
-  enabled: true
-  replicaCount: 2
-  s3:
-    prefix: indexes
-  serviceAccount:
-    annotations:
-      eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/ursula-index
-```
-
-Register streams dynamically with `PUT /v1/indexes/{id}` on the internal indexer Service; see [Browser Telemetry](/docs/examples/browser-telemetry#event-time-queries-experimental). No Helm upgrade is needed. The Service is an internal ClusterIP. If remote applications need read access, front it with an authenticated, path-aware proxy and never expose the registration or administration routes.
 
 ## Without Kubernetes (bare metal / VMs)
 

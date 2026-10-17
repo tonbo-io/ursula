@@ -70,32 +70,11 @@ def deployment_contract_values() -> tuple[str, ...]:
         "--set",
         "deploymentContract.serverS3Prefix=server-data",
         "--set",
-        "deploymentContract.indexerServiceAccountName=ursula-indexer",
-        "--set",
-        "deploymentContract.indexerRoleArn=arn:aws:iam::123456789012:role/indexer",
-        "--set",
-        "deploymentContract.indexerS3Prefix=index-data",
-        "--set",
         "serviceAccount.name=ursula-storage",
         "--set",
         "serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/server",
         "--set",
         "s3.prefix=server-data",
-        "--set",
-        "indexer.serviceAccount.name=ursula-indexer",
-        "--set",
-        "indexer.serviceAccount.annotations.eks\\.amazonaws\\.com/role-arn=arn:aws:iam::123456789012:role/indexer",
-        "--set",
-        "indexer.s3.prefix=index-data",
-    )
-
-
-def indexer_values() -> tuple[str, ...]:
-    return (
-        "--set",
-        "s3.bucket=index-bucket",
-        "--set",
-        "indexer.enabled=true",
     )
 
 
@@ -378,15 +357,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(*NAMED, 
-            *indexer_values(),
+            "--set",
+            "s3.bucket=bkt",
             "--set",
             "gateway.enabled=true",
         )
 
         self.assertNotIn("/usr/local/bin/ursulagw", rendered)
-        self.assertNotIn("/usr/local/bin/ursula-indexer", rendered)
         self.assertIn("- /usr/local/bin/ursula\n          args:\n            - gateway", rendered)
-        self.assertIn("- /usr/local/bin/ursula\n          args:\n            - indexer", rendered)
         self.assertIn(
             'exec /usr/local/bin/ursula server --config "${config_path}"',
             rendered,
@@ -624,7 +602,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
             "              app.kubernetes.io/component: helm-test\n",
             policy,
         )
-        self.assertNotIn("ursula-indexer", policy)
         # The test pod's own labels match that selector, and not the
         # server Services' selector.
         test_pod = documents(rendered, "Pod")["test-ursula-wait-ready"]
@@ -641,26 +618,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
         ), "NetworkPolicy")["test-ursula"]
         self.assertNotIn("ursula-gateway", bare)
         self.assertNotIn("helm-test", bare)
-
-    def test_network_policy_admits_the_release_indexer_to_the_client_port(self) -> None:
-        rendered = render_chart(
-            *NAMED, *indexer_values(), "--set", "server.networkPolicy.enabled=true",
-            "--set", "server.networkPolicy.clientIngressFrom[0].namespaceSelector.matchLabels.team=streams",
-        )
-        policy = documents(rendered, "NetworkPolicy")["test-ursula"]
-
-        self.assertIn(
-            "        - podSelector:\n            matchLabels:\n"
-            "              app.kubernetes.io/name: ursula-indexer\n              app.kubernetes.io/instance: test\n"
-            "              app.kubernetes.io/component: indexer\n",
-            policy,
-        )
-        # The indexer pods carry the labels the rule selects.
-        self.assertIn(
-            "app.kubernetes.io/name: ursula-indexer\n        app.kubernetes.io/instance: test\n"
-            "        app.kubernetes.io/component: indexer\n",
-            documents(rendered, "Deployment")["test-ursula-indexer"],
-        )
 
     def test_network_policy_refuses_an_admin_plane_off_loopback(self) -> None:
         result = subprocess.run(
@@ -1024,61 +981,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
         parsed = tomllib.loads(config)
 
         self.assertNotIn("cache", parsed["storage"]["cold"])
-
-    def test_indexer_renders_inherited_s3_and_health_probes(self) -> None:
-        rendered = render_chart(*NAMED, *indexer_values())
-
-        self.assertIn("- --s3-bucket\n            - \"index-bucket\"", rendered)
-        self.assertIn("- --s3-prefix\n            - \"event-index\"", rendered)
-        self.assertIn("- --segment-bytes\n            - \"33554432\"", rendered)
-        self.assertIn("- --worker-id\n            - $(POD_NAME)", rendered)
-        self.assertIn("path: /livez", rendered)
-        self.assertIn("path: /readyz", rendered)
-        self.assertIn("name: test-ursula-indexer\n", rendered)
-
-    def test_indexer_multiple_replicas_render_one_shared_worker_pool(self) -> None:
-        rendered = render_chart(*NAMED, 
-            *indexer_values(),
-            "--set",
-            "indexer.replicaCount=3",
-        )
-
-        self.assertIn("replicas: 3", rendered)
-        self.assertEqual(rendered.count("kind: Deployment\nmetadata:\n  name: test-ursula-indexer"), 1)
-
-    def test_indexer_worker_pool_renders_pdb_and_spread(self) -> None:
-        rendered = render_chart(*NAMED, 
-            *indexer_values(),
-            "--set",
-            "indexer.replicaCount=2",
-        )
-
-        self.assertIn("type: RollingUpdate", rendered)
-        self.assertIn("topologyKey: topology.kubernetes.io/zone", rendered)
-        self.assertIn("name: test-ursula-indexer\n", rendered)
-
-    def test_indexer_rejects_invalid_worker_lease(self) -> None:
-        result = subprocess.run(
-            [
-                "helm",
-                "template",
-                "test",
-                "charts/ursula",
-                *indexer_values(),
-                "--set",
-                "indexer.workers.leaseMs=0",
-            ],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertRegex(
-            result.stderr,
-            r"(?:/indexer/workers/leaseMs|indexer\.workers\.leaseMs)",
-        )
-
 
     def test_defaults_enable_compaction_and_follow_the_runtime_snapshot_default(self) -> None:
         parsed = tomllib.loads(render_config(*NAMED, "--set", "coldStorage.enabled=true", "--set", "s3.bucket=bkt"))
