@@ -2128,6 +2128,13 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         self.apply_health
             .check(self.placement.raft_group_id)
             .map_err(group_engine_io_error)?;
+        // A build of an engine that already shut down would be refused at its
+        // publication anyway. Refusing it here skips its upload and its pin,
+        // and hands the node-wide build permit back sooner. The check under
+        // the publication's lock stays the one that counts.
+        if snapshot_metadata_closed(&self.metadata_serial) {
+            return Err(SnapshotMetadataStopped::EngineShutDown.into_io());
+        }
         let snapshot = self
             .snapshot
             .as_ref()
@@ -2218,18 +2225,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         };
         let pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
         let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
-        let inline_fallback = !external_upload;
-        if let Some(metrics) = &self.metrics {
-            metrics.record_raft_snapshot_build(
-                self.placement,
-                stream_count,
-                usize::try_from(pointer.location.size_hint()).unwrap_or(usize::MAX),
-                pointer_bytes.len(),
-                elapsed_ns(started_at),
-                external_upload,
-                inline_fallback,
-            );
-        }
+        let snapshot_bytes = usize::try_from(pointer.location.size_hint()).unwrap_or(usize::MAX);
+        let pointer_len = pointer_bytes.len();
         let current_snapshot = self.current_snapshot.clone();
         let metadata_path = self.snapshot_metadata_path.clone();
         let meta = self.meta.clone();
@@ -2268,6 +2265,18 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             }
         })
         .await?;
+        // Only a build whose publication ran counts as built.
+        if let Some(metrics) = &self.metrics {
+            metrics.record_raft_snapshot_build(
+                self.placement,
+                stream_count,
+                snapshot_bytes,
+                pointer_len,
+                elapsed_ns(started_at),
+                external_upload,
+                !external_upload,
+            );
+        }
         // The snapshot is durable now: its body uploaded and verified (or
         // inline), its reference pinned and its metadata persisted, and it is
         // the group's current snapshot. Nothing below fails the build: the
@@ -2346,6 +2355,22 @@ pub(crate) enum SnapshotMetadataStopped {
     EngineShutDown,
 }
 
+impl SnapshotMetadataStopped {
+    /// The refusal as the io::Error OpenRaft's snapshot storage API requires.
+    fn into_io(self) -> io::Error {
+        io::Error::new(io::ErrorKind::BrokenPipe, self)
+    }
+}
+
+/// Whether the group engine closed its snapshot metadata publication. A
+/// publication running now holds the lock and counts as open: the check
+/// under the lock in [`snapshot_metadata_work`] decides.
+fn snapshot_metadata_closed(serial: &crate::rt::sync::Mutex<MetadataPublicationState>) -> bool {
+    serial
+        .try_lock()
+        .is_ok_and(|state| matches!(*state, MetadataPublicationState::ShutDown))
+}
+
 /// Ends a group's snapshot metadata publication for good, once a publication
 /// that is running finished: a blocking fsync cannot be cancelled. Every
 /// later publication is refused with [`SnapshotMetadataStopped::EngineShutDown`].
@@ -2368,8 +2393,7 @@ pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
             MetadataPublicationState::ShutDown => Some(SnapshotMetadataStopped::EngineShutDown),
         };
         if let Some(refused) = refused {
-            // OpenRaft's snapshot storage API requires an io::Error here.
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, refused));
+            return Err(refused.into_io());
         }
         let result = work();
         if result.is_err() {

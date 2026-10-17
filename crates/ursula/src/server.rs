@@ -571,8 +571,12 @@ pub(crate) async fn shutdown_raft_wal(
     let Some(raft_wal) = raft_wal else {
         return WalShutdown::NoWal;
     };
-    // A group that failed to stop can write no more once its core writer
-    // has closed, so the WAL still shuts down cleanly.
+    // A group that failed to stop writes no more journal records once its
+    // core writer has closed, so the WAL still shuts down. Its snapshot
+    // pointer (`group-N.snapshot.json`) bypasses the core writer: while that
+    // group's engine is still inside its shutdown, a snapshot build can
+    // write the pointer until the engine closes its snapshot publication
+    // (#489).
     if let Err(err) = runtime.shutdown_group_engines().await {
         tracing::warn!(%err, "failed to stop every Raft group before closing the WAL");
     }

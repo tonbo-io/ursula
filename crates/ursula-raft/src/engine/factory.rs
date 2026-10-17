@@ -588,7 +588,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     );
                 }
             })?;
-            engine.recovery_tasks.attach(
+            let attached = engine.recovery_tasks.attach(
                 &engine,
                 rejoin,
                 &self.registry,
@@ -606,7 +606,20 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     bootstrap_interval: self.engine_config.bootstrap_peer_probe_interval,
                     bootstrap_warn_after: self.engine_config.bootstrap_peer_probe,
                 },
-            )?;
+            );
+            if let Err(err) = attached {
+                // The engine never serves. Stop it as any engine stops, so its
+                // snapshot publication closes before the group can reopen
+                // (#489).
+                if let Err(shutdown) = engine.shutdown().await {
+                    tracing::warn!(
+                        raft_group_id = placement.raft_group_id.0,
+                        error = %shutdown,
+                        "failed to stop a group engine whose recovery could not attach"
+                    );
+                }
+                return Err(err);
+            }
             let engine: Box<dyn GroupEngine> = Box::new(engine);
             Ok(engine)
         })
