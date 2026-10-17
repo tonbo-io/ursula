@@ -8,7 +8,7 @@
 //! nothing went out (the resolver or the connector failed, `net::NotSent`): decided by where it
 //! failed, never by its kind. Any other failure is [`NoAnswer::Lost`].
 //!
-//! Each attempt's time limits scale with its size (design: Transport, #566): connecting 5 s,
+//! Each attempt's time limits scale with its size (design: Transport): connecting 5 s,
 //! sending the request head 5 s, sending the body `5 s + n / rate` (`URSULA_VFS_MIN_UPLOAD_KBPS`,
 //! 256 KiB/s by default), the answer's head 15 s (plus `t / 16 MiB/s` for a parts commit of `t`
 //! bytes, which the server copies before it answers), and its body `10 s + m / 256 KiB/s` for the

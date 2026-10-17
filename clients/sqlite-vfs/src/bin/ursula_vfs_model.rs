@@ -1,4 +1,4 @@
-//! `ursula-vfs-model`: the model of the Ursula 0.8 server (#581) over HTTP/1.1, for the e2e
+//! `ursula-vfs-model`: the model of the Ursula 0.8 server over HTTP/1.1, for the e2e
 //! suites. It listens on loopback, prints `{"port": <n>}` on one line of stdout once it accepts
 //! connections, and serves until it is killed.
 //!

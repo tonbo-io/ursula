@@ -10,11 +10,11 @@
 //! before the answer goes out and the connection closes; a client that sent
 //! `Expect: 100-continue` sends no body. Otherwise `Expect: 100-continue` gets `100 Continue`,
 //! then the body is read: the model
-//! answers every write after its body, in the order of #581 addendum 4, which an early answer
-//! follows too, so the answer is the same.
+//! answers every write after its body, in the order of the extensions' Producer Write Answers,
+//! which an early answer follows too, so the answer is the same.
 //!
-//! Every refusal carries the server's error body (extensions §11), but those of a head the model
-//! cannot read (`400`, `431`), which hyper sends bare before the server's handlers run.
+//! Every refusal carries the server's error body (extensions: Error Bodies), but those of a head
+//! the model cannot read (`400`, `431`), which hyper sends bare before the server's handlers run.
 //!
 //! Control routes, under `/__model/` (query values are taken verbatim, not percent-decoded):
 //!

@@ -536,11 +536,11 @@ pub(crate) struct Knobs {
     pub(crate) misroute_as_deleted: bool,
     /// Take a HEAD of another cluster's stream for a history that inherits the generation.
     pub(crate) misroute_as_rekey: bool,
-    /// Re-key a takeover whose log holds commits after its latest ACK: the #611 history gate
-    /// (design: History) undone.
+    /// Re-key a takeover whose log holds commits after its latest ACK: the history gate (design:
+    /// History) undone.
     pub(crate) rekey_with_pending: bool,
-    /// Settle `synced()` tickets while activating too, as before #604: a claim's reconcile
-    /// acknowledges records before it announces them.
+    /// Settle `synced()` tickets while activating too, without waiting for the bind (design:
+    /// Synced): a claim's reconcile acknowledges records before it announces them.
     pub(crate) settle_while_activating: bool,
     /// Reset `stream_state` on a repeat receipt for a claim sent again whenever it starts below
     /// the acknowledged offset, before the follow-up claim: a provisional open of an owner that
@@ -2217,7 +2217,7 @@ fn rekeys_with_pending(_ctx: &Ctx) -> bool {
     false
 }
 
-/// The negative control that settles tickets in every state, as before #604.
+/// The negative control that settles tickets in every state, without waiting for the bind.
 #[cfg(test)]
 fn settle_while_activating(ctx: &mut Ctx, actions: &mut Vec<Action>) {
     if ctx.knobs.settle_while_activating {

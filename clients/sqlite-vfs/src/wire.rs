@@ -1,8 +1,8 @@
-//! The protocol's requests and answers as values (#581 revision 2), shared by the transports and
-//! the model server, so both sides of the protocol build and read the same structs.
+//! The protocol's requests and answers as values (base protocol and extensions), shared by the
+//! transports and the model server, so both sides of the protocol build and read the same structs.
 //!
-//! Every header #581 types goes through `ursula_headers`, never a local parser: producer keys and
-//! answers, HEAD metadata, snapshot answers, the typed `413`, the `412` of the incarnation
+//! Every header the extensions type goes through `ursula_headers`, never a local parser: producer
+//! keys and answers, HEAD metadata, snapshot answers, the typed `413`, the `412` of the incarnation
 //! precondition, the `409` of a closed stream and routing answers. Four answers the crate does
 //! not type yet (a read's `Stream-Next-Offset`, a create's `Stream-Incarnation`, the
 //! `Stream-Incarnation` of a read's refusal, retention's `Stream-Retained-Offset`) are picked out
@@ -56,8 +56,8 @@ pub(crate) const RETRY_AFTER: &str = "retry-after";
 /// `Location` header name.
 pub(crate) const LOCATION: &str = "location";
 
-/// The headers of a `429` to a part past the stream's limit of staged parts (#622), naming the
-/// limit it met: its unused parts, or their bytes.
+/// The headers of a `429` to a part past the stream's limit of staged parts (extensions: Publish
+/// Snapshot), naming the limit it met: its unused parts, or their bytes.
 pub(crate) const MAX_STAGED_PARTS: &str = "ursula-max-staged-parts";
 pub(crate) const MAX_STAGED_BYTES: &str = "ursula-max-staged-bytes";
 

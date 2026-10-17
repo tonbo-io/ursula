@@ -350,7 +350,7 @@ fn idle_expiry_raises_the_floor() {
 
 #[test]
 fn floor_decision_the_floor_binds_only_tokened_writes() {
-    // The floor decision on #592: a tokened write never opens an epoch at or below the floor,
+    // The epoch floor: a tokened write never opens an epoch at or below the floor,
     // and an untokened writer keeps the base rule that a forgotten producer is new.
     let world = World::new();
     let token = world.create();
@@ -408,8 +408,8 @@ fn floor_decision_the_floor_binds_only_tokened_writes() {
 
 #[test]
 fn a_below_floor_claim_closes_no_epoch() {
-    // #592: the claim that lifts a record opened below the floor names no closed epoch, and a
-    // resend in the replaced epoch answers stale-epoch, never epoch-closed.
+    // Epoch Floor: the claim that lifts a record opened below the floor names no closed epoch,
+    // and a resend in the replaced epoch answers stale-epoch, never epoch-closed.
     let world = World::new();
     let token = world.create();
     world.producer(&write(tokened(token), 5, 0, b"claim"));
@@ -748,7 +748,8 @@ fn addendum_4_a_body_that_does_not_match_its_digest_on_a_write_that_would_apply_
 
 #[test]
 fn addendum_4_an_empty_write_that_would_apply_is_400_whatever_its_content_type() {
-    // Base protocol §5.2: a write without a body is never refused for its content type.
+    // Base protocol, Append to Stream: a write without a body is never refused for its content
+    // type.
     for content_type in [None, Some("text/plain"), Some(CONTENT_TYPE)] {
         let answer = content_refusal(|request| {
             request.body = Arc::from(&b""[..]);
@@ -764,7 +765,7 @@ fn addendum_4_an_empty_write_that_would_apply_is_400_whatever_its_content_type()
 
 #[test]
 fn an_unkeyed_close_only_write_closes_and_its_repeat_gets_204() {
-    // Base protocol §5.2: close-only writes are idempotent.
+    // Base protocol, Append to Stream: close-only writes are idempotent.
     let world = World::new();
     world.create();
     world.server().foreign_append(PATH, b"frame").unwrap();
@@ -1080,7 +1081,8 @@ fn retention_is_monotonic() {
             offset: Offset::from_u64(offset),
         })
     };
-    // Without a snapshot, and past the latest one, a boundary is refused (extensions §2.2).
+    // Without a snapshot, and past the latest one, a boundary is refused (extensions: Publish
+    // Snapshot).
     assert_eq!(retain(60).status, 409);
     assert_eq!(world.send(&publish(token, 70, b"image").0).status, 204);
     assert_eq!(retain(71).status, 409);
@@ -1493,7 +1495,7 @@ fn discard(token: Option<Incarnation>) -> Request {
     }
 }
 
-/// The code of an answer's error body, as the server renders it (extensions §11).
+/// The code of an answer's error body, as the server renders it (extensions: Error Bodies).
 fn error_code(answer: &Answer) -> ErrorCode {
     assert_eq!(
         answer.content_type.as_deref(),
@@ -1608,7 +1610,7 @@ fn a_commit_checks_its_key_before_its_parts() {
     );
 }
 
-// A stream holds at most so many unused parts, and bytes of them (#622): a part past either is
+// A stream holds at most so many unused parts, and bytes of them: a part past either is
 // 429 naming the limit, with the token. `DELETE {stream}/snapshot/parts` under the token discards
 // them (204), under another is 412, and staging goes on after it.
 #[test]
@@ -1665,7 +1667,7 @@ fn staged_parts_are_bounded_and_discarded_together() {
     );
 }
 
-// The server's 429 (#622): `Ursula-Max-Staged-Parts` or `-Bytes` set to the bound, the stream's
+// The server's 429: `Ursula-Max-Staged-Parts` or `-Bytes` set to the bound, the stream's
 // current token, the code STAGED_PARTS_LIMIT and no `Retry-After`. The bound is per stream id:
 // a part of an earlier incarnation counts until a part or a discard deletes it, which it does
 // once that part was staged more than a minute before.
@@ -1751,7 +1753,7 @@ fn a_part_past_the_staged_bound_is_429_staged_parts_limit_per_stream_id() {
     );
 }
 
-// `DELETE {stream}/snapshot/parts` as the server answers it (#622): 501 NO_COLD_STORE without a
+// `DELETE {stream}/snapshot/parts` as the server answers it: 501 NO_COLD_STORE without a
 // cold store, before the stream; 404 without the stream; 412 naming the current token under
 // another; 204 with the token, discarding the current incarnation's parts and an earlier one's
 // staged more than a minute before; and a commit or discard of the incarnation that runs
@@ -1879,7 +1881,7 @@ fn a_commit_refuses_its_parts_as_the_server_does() {
 
 // Without a cold store a part and a commit are 501; parts no commit used are swept after a day
 // on the model's clock; Busy and InProgress are scripted 503s with `Retry-After` and the server's
-// codes: one commit or discard of a stream incarnation runs at a time (#622).
+// codes: one commit or discard of a stream incarnation runs at a time.
 #[test]
 fn parts_need_a_cold_store_and_are_swept_after_a_day() {
     let world = World::new();
@@ -2037,7 +2039,7 @@ fn refusal<'a>(
 }
 
 /// Every refusal the model answers in process, as a client reads it: the server's error body
-/// (extensions §11) with the code the server gives the same case, the JSON content type,
+/// (extensions: Error Bodies) with the code the server gives the same case, the JSON content type,
 /// `Cache-Control: no-store` and the headers the refusal names. A write's answer reads through
 /// `ursula_headers::classify` as the server's does, and where the write-outcome inventory has the
 /// case's row its status, code and outcome are the model's. The refusals of the HTTP front are in
