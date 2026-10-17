@@ -251,7 +251,7 @@ pub(crate) fn snapshot_due_bytes() -> Option<u64> {
 
 /// `URSULA_VFS_MIN_UPLOAD_KBPS`: the slowest upload, in KiB/s, an attempt's body time limit allows
 /// for (256 by default, at least 1): a body of `n` bytes may take `5 s + n / rate` to send (design:
-/// Transport, #566).
+/// Transport).
 pub(crate) fn min_upload_kbps() -> u64 {
     static V: OnceLock<u64> = OnceLock::new();
     *V.get_or_init(|| {

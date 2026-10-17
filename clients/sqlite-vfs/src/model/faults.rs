@@ -36,12 +36,13 @@ pub(crate) enum Fault {
     CommitRefused(CommitRefusal),
 }
 
-/// Why a node refuses a parts commit for now (extensions §2.2): the client repeats it as is.
+/// Why a node refuses a parts commit for now (extensions: Publish Snapshot): the client repeats it
+/// as is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommitRefusal {
     /// Every copy slot is taken: `SNAPSHOT_COMMITS_BUSY`.
     Busy,
-    /// The node runs a commit or a discard of this stream incarnation now (#622): one at a time,
+    /// The node runs a commit or a discard of this stream incarnation now: one at a time,
     /// `SNAPSHOT_COMMIT_IN_PROGRESS`. Scripted on a `PUT` for a commit, on a `DELETE` for a
     /// discard.
     InProgress,

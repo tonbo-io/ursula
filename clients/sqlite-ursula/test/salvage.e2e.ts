@@ -182,7 +182,7 @@ describe("salvage", () => {
 		expect(await child.send({ synced: 10_000 })).toMatchObject({ ok: true, synced: { synced: true } });
 		const saved = await checkpoint();
 		// Killed right after the acknowledgement: an ACK record names it only when the ACK interval
-		// since the last one had passed. Without one (the #611 history gate, design: History) the log
+		// since the last one had passed. Without one (the history gate, design: History) the log
 		// holds an acknowledged commit after its latest ACK, and the restore inherits the log by that
 		// ACK. Either way the reopen never re-keys: it salvages the commit.
 		await child.exec("INSERT INTO t VALUES (1)");

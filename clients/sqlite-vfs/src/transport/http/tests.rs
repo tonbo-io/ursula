@@ -486,8 +486,8 @@ fn a_fault_is_consumed_alike_before_a_too_large_body() {
     assert_eq!(statuses, [503, 413]);
 }
 
-// #581 addendum 4: one order on every path, so the model answers each rule alike over HTTP and
-// in process.
+// The extensions evaluate a write in one order on every path (Producer Write Answers), so the
+// model answers each rule alike over HTTP and in process.
 #[test]
 fn addendum_4_the_order_is_the_same_over_http_and_in_process() {
     let (over_http, url) = served();

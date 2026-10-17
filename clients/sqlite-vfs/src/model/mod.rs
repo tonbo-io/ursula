@@ -1,7 +1,7 @@
-//! A model of the Ursula 0.8 server, written from the text of #581 revision 2 and its addenda: an
-//! oracle for the client, independent of the server's code. It shares only `ursula_headers`, so
-//! header syntax cannot drift between the two, while the evaluation of every row is this model's
-//! own reading of the contract.
+//! A model of the Ursula 0.8 server, written from the text of the base protocol and the Ursula
+//! extensions: an oracle for the client, independent of the server's code. It shares only
+//! `ursula_headers`, so header syntax cannot drift between the two, while the evaluation of every
+//! row is this model's own reading of the contract.
 //!
 //! It models one Raft group: one history id, one clock, any number of streams. In scope: the
 //! producer rules (extensions: Producer Write Answers) with the epoch floor and idle retirement,
@@ -10,13 +10,13 @@
 //! Stream Incarnation), HEAD metadata on every answer (extensions: Server Metadata), the typed and
 //! untyped `413`, create keyed by configuration, reads with the incarnation precondition (`412`,
 //! `410`), snapshots keyed by offset and digest, snapshot reads in one byte range (`206`, `416`),
-//! snapshots uploaded in parts (#618: minted part ids, the commit's key checked first, the parts a
-//! final answer consumes, the one-day sweep on the model's clock; #622: the `429` bound per stream
-//! id, `DELETE {stream}/snapshot/parts`, and the `503` of a second commit or discard of one stream
-//! incarnation, scripted), monotonic retention, every refusal with the server's error body and
-//! its code (extensions §11), and scripted faults, which answer as the layer they stand for. Out
-//! of scope: immutable reads, the timing of answers before the body, the producer cap, SSE and
-//! JSON streams.
+//! snapshots uploaded in parts (extensions: Publish Snapshot: minted part ids, the commit's key
+//! checked first, the parts a final answer consumes, the one-day sweep on the model's clock, the
+//! `429` bound per stream id, `DELETE {stream}/snapshot/parts`, and the `503` of a second commit or
+//! discard of one stream incarnation, scripted), monotonic retention, every refusal with the
+//! server's error body and its code (extensions: Error Bodies), and scripted faults, which answer
+//! as the layer they stand for. Out of scope: immutable reads, the timing of answers before the
+//! body, the producer cap, SSE and JSON streams.
 //!
 //! Requests come in through [`ModelServer::exchange`] (with faults) or [`ModelServer::handle`]
 //! (without), in process ([`crate::transport::model::ModelTransport`]) or over HTTP/1.1
@@ -101,15 +101,17 @@ pub(crate) const MAX_REQUEST_BYTES: u64 = ursula_headers::MAX_REQUEST_BYTES;
 /// The largest snapshot accepted in parts, with a cold store (extensions: Server Metadata).
 pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 1 << 30;
 
-/// How long a staged part waits for a commit before the sweep reclaims it (extensions §2.2).
+/// How long a staged part waits for a commit before the sweep reclaims it (extensions: Publish
+/// Snapshot).
 const PART_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 
-/// The most unused parts a stream holds staged, and their most bytes (#622).
+/// The most unused parts a stream holds staged, and their most bytes (extensions: Publish
+/// Snapshot).
 pub(crate) const MAX_STAGED_PARTS: u64 = 8192;
 pub(crate) const MAX_STAGED_BYTES: u64 = 2 << 30;
 
 /// How long before a part's or a discard's `HEAD` a part of an earlier incarnation of the stream
-/// was staged for that request to delete it (#622).
+/// was staged for that request to delete it: a margin for the nodes' clocks.
 const RETIRED_MIN_AGE_MS: u64 = 60 * 1000;
 
 /// `Cache-Control` header name. Only the model sends it, so it lives here rather than in `wire`.
@@ -472,7 +474,7 @@ impl ModelServer {
     }
 
     /// Deletes the stream. A create at its path later starts a new incarnation.
-    /// Its staged parts go with it: the model knows every incarnation it staged parts for (#622).
+    /// Its staged parts go with it: the model knows every incarnation it staged parts for.
     pub(crate) fn delete(&mut self, path: &str) -> Result<(), ModelError> {
         self.streams
             .remove(path)
@@ -651,7 +653,8 @@ impl ModelServer {
         answer
     }
 
-    /// `POST {stream}`, in #581 addendum 4's order, the same on every path:
+    /// `POST {stream}`, in the order of the extensions' Producer Write Answers, the same on every
+    /// path:
     ///
     /// 1. Header shape (`400`): [`Request`] is typed, so a malformed header never reaches here.
     /// 2. The stream (`404`), the precondition (`412`), then idle retirement of the producer.
@@ -663,7 +666,7 @@ impl ModelServer {
     ///    matching `Producer-Digest` (`400`).
     ///
     /// A close-only write applies, keyed or not, and an unkeyed one is idempotent on a closed
-    /// stream (base protocol §5.2). An append that also closes is not modeled
+    /// stream (base protocol: Append to Stream). An append that also closes is not modeled
     /// (`501`): the VFS never closes its stream.
     fn append(&mut self, path: &str, request: &Request) -> RawAnswer {
         let (history, now_ms) = (self.history, self.clock_ms);
@@ -696,7 +699,7 @@ impl ModelServer {
         };
         let close_only = request.closes && request.body.is_empty();
         if stream.closed {
-            // Base protocol §5.2: an unkeyed close-only write is idempotent.
+            // Base protocol, Append to Stream: an unkeyed close-only write is idempotent.
             if close_only && applying.is_none() {
                 return closed_append(stream.tail());
             }
@@ -752,9 +755,9 @@ impl ModelServer {
         })
     }
 
-    /// `GET {stream}?offset=`: up to a chunk of bytes from `from`, its refusals in #581's order:
-    /// `404`, `410` below retention, `416` past the tail, then the precondition (`412`). The `410`
-    /// and `416` name the stream's token.
+    /// `GET {stream}?offset=`: up to a chunk of bytes from `from`, its refusals in the
+    /// specification's order: `404`, `410` below retention, `416` past the tail, then the
+    /// precondition (`412`). The `410` and `416` name the stream's token.
     fn read(&mut self, path: &str, request: &Request, from: Option<Offset>) -> RawAnswer {
         let chunk = self.limits.read_chunk;
         let Some(stream) = self.streams.get(path) else {
@@ -849,12 +852,12 @@ impl ModelServer {
         publish_answer(&answer)
     }
 
-    /// `POST {stream}/snapshot/{offset}/parts` (extensions §2.2): `201` naming a part id minted
-    /// for this request alone, bound to the stream and its token, never to the offset. Not
-    /// idempotent: a repeat stages another part. `501` without a cold store. The bound is per
-    /// stream id (#622): the parts of earlier incarnations count until they are deleted, and a
-    /// part deletes those staged more than [`RETIRED_MIN_AGE_MS`] ago. A part past either bound is
-    /// `429 STAGED_PARTS_LIMIT` naming it, with the stream's token and no `Retry-After`.
+    /// `POST {stream}/snapshot/{offset}/parts` (extensions: Publish Snapshot): `201` naming a part
+    /// id minted for this request alone, bound to the stream and its token, never to the offset.
+    /// Not idempotent: a repeat stages another part. `501` without a cold store. The bound is per
+    /// stream id: the parts of earlier incarnations count until they are deleted, and a part
+    /// deletes those staged more than [`RETIRED_MIN_AGE_MS`] ago. A part past either bound is `429
+    /// STAGED_PARTS_LIMIT` naming it, with the stream's token and no `Retry-After`.
     fn stage_part(&mut self, path: &str, request: &Request) -> RawAnswer {
         if self.limits.max_snapshot_bytes.is_none() {
             return no_cold_store();
@@ -901,7 +904,7 @@ impl ModelServer {
         answer
     }
 
-    /// `DELETE {stream}/snapshot/parts` (#622): `501` without a cold store, before the stream;
+    /// `DELETE {stream}/snapshot/parts`: `501` without a cold store, before the stream;
     /// then the precondition (`404`, `412`); then discards every part staged under the stream's
     /// current token and the parts of its earlier incarnations staged more than
     /// [`RETIRED_MIN_AGE_MS`] ago, `204` with the token whether any was staged or not. A commit or
@@ -941,14 +944,14 @@ impl ModelServer {
             .retain(|_, part| now_ms.saturating_sub(part.staged_ms) < PART_GRACE_MS);
     }
 
-    /// `PUT {stream}/snapshot/{offset}` with `Stream-Snapshot-Parts` (extensions §2.2), in the
-    /// server's order: `501` without a cold store; the stream (`404`, `412`); the key, before the
-    /// body, so a repeat is answered even after its parts are gone: `204` for the latest
-    /// snapshot, `409` naming the latest when another one is at or after the offset, `410` below
-    /// retention, `409` beyond the tail. Then the manifest and its parts: `400` for a malformed
-    /// manifest or a part not staged for this incarnation of this stream (the parts stay), `413`
-    /// naming the snapshot limit (they stay), and `400` for a digest that differs (the copy used
-    /// them up). A publish deletes them.
+    /// `PUT {stream}/snapshot/{offset}` with `Stream-Snapshot-Parts` (extensions: Publish
+    /// Snapshot), in the server's order: `501` without a cold store; the stream (`404`, `412`); the
+    /// key, before the body, so a repeat is answered even after its parts are gone: `204` for the
+    /// latest snapshot, `409` naming the latest when another one is at or after the offset, `410`
+    /// below retention, `409` beyond the tail. Then the manifest and its parts: `400` for a
+    /// malformed manifest or a part not staged for this incarnation of this stream (the parts
+    /// stay), `413` naming the snapshot limit (they stay), and `400` for a digest that differs (the
+    /// copy used them up). A publish deletes them.
     fn commit_parts(
         &mut self,
         path: &str,
@@ -1036,7 +1039,8 @@ impl ModelServer {
     }
 
     /// `GET {stream}/snapshot/{offset}`: the latest snapshot when it is at `offset`. A single
-    /// `Range` is answered `206` with its bytes, or `416` when it selects none (extensions §2.5).
+    /// `Range` is answered `206` with its bytes, or `416` when it selects none (extensions: Read
+    /// Snapshot).
     /// Its refusals come in the specification's order (extensions: Snapshot Metadata on HEAD and
     /// Stream Incarnation, and Immutable Resources): `404` without the stream, `404` when the
     /// snapshot is not the latest, `416`, then the precondition (`412`). The `404` of an existing
@@ -1108,9 +1112,9 @@ impl ModelServer {
             Ok(stream) => stream,
             Err(answer) => return answer,
         };
-        // Extensions §2.2: a boundary newer than the latest published snapshot is refused, so is
-        // any boundary of a stream without one; one at or below the retained one is a repeat, as
-        // the server answers it.
+        // Extensions, Publish Snapshot: a boundary newer than the latest published snapshot is
+        // refused, so is any boundary of a stream without one; one at or below the retained one is
+        // a repeat, as the server answers it.
         if offset > stream.retained
             && stream
                 .snapshot
@@ -1132,11 +1136,11 @@ impl ModelServer {
     }
 }
 
-/// The content checks of a write that would apply (#581 addendum 4, step 5): a body unless the
-/// write only closes the stream (`400`), then `Content-Type` present (`400`) and the stream's
-/// (`409`, the base protocol's mismatch, with the tail), then the body matching its
+/// The content checks of a write that would apply (extensions: Producer Write Answers, step 5): a
+/// body unless the write only closes the stream (`400`), then `Content-Type` present (`400`) and
+/// the stream's (`409`, the base protocol's mismatch, with the tail), then the body matching its
 /// `Producer-Digest` (`400`). A write without a body is never refused for its content type (base
-/// protocol §5.2).
+/// protocol: Append to Stream).
 fn content_refusal(stream: &Stream, request: &Request, close_only: bool) -> Option<RawAnswer> {
     if close_only {
         // Its body is empty, so its digest is checked alike below.

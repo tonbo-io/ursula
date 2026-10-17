@@ -74,13 +74,13 @@
 //! without `Producer-Digest`), a replicator that re-seals its in-flight batch on resend, one that
 //! re-keys on any other token, one that binds on a repeat receipt for a claim sent again after a
 //! re-key, one that takes another cluster's HEAD for a deleted stream, one that re-keys a log
-//! holding commits after its latest ACK (the #611 history gate undone, design: History), one that
-//! settles `synced()` tickets while activating (as before #604), one that resets `stream_state` on a
-//! repeat receipt for a claim sent again that ends at or below the acknowledged offset, a
-//! provisional open that claims at once, above its log's highest CLAIM record, with no pre-check,
-//! one that trusts a clone's snapshot of our lineage above the acknowledged position, one that
-//! matches a reconcile's commits by commit id alone, and a `synced()` probe that skips claims of an
-//! activation in its log.
+//! holding commits after its latest ACK (the history gate undone, design: History), one that
+//! settles `synced()` tickets while activating (without waiting for the bind), one that resets
+//! `stream_state` on a repeat receipt for a claim sent again that ends at or below the acknowledged
+//! offset, a provisional open that claims at once, above its log's highest CLAIM record, with no
+//! pre-check, one that trusts a clone's snapshot of our lineage above the acknowledged position,
+//! one that matches a reconcile's commits by commit id alone, and a `synced()` probe that skips
+//! claims of an activation in its log.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -155,6 +155,7 @@ use crate::replicator::Step;
 use crate::replicator::Work;
 use crate::replicator::answer::Unacked;
 use crate::replicator::answer::inherits;
+use crate::replicator::backoff::Hit;
 use crate::wire::Exchange;
 use crate::wire::Method;
 use crate::wire::NoAnswer;
@@ -2214,17 +2215,19 @@ impl World {
         if let Some(index) = self.owners.iter().position(|o| o.inst.uid == to) {
             let watch = self.watch(index, &exchange, first_claim);
             let inst = &mut self.owners[index].inst;
-            // Only an expiry naming the claim a provisional instance sent again after its
-            // pre-check (property 13).
+            // Only an expiry that answers the claim a provisional instance sent again after its
+            // pre-check, naming its epoch (property 13): never a late answer to another request,
+            // and never an ordinary idle-expiry continuation of a bound owner.
             if let Exchange::Answered(answer) = &exchange
                 && let Ok(Typed::Producer(ProducerAnswer::ProducerExpired { epoch: named })) =
                     &answer.typed
                 && inst.provisional
                 && let Replicator::Activating {
                     kind: ClaimKind::Continuation { resent: true, .. },
-                    step: Step::Claim { epoch, .. },
+                    step: Step::Claim { epoch, link },
                     ..
                 } = &inst.replicator
+                && link.hit(id) == Hit::Main
                 && named == epoch
             {
                 inst.expired = true;
@@ -3229,7 +3232,7 @@ fn history_events_re_key_or_reset_rewound() {
 /// Owner 0 acknowledges a commit after a checkpoint (its ACK record not durable), the stream is
 /// restored to that checkpoint and another writer commits, and owner 0 restarts with the lagging
 /// ACK, under which the history inherits its log, and restarts again before its takeover binds.
-/// With the #611 history gate (design: History) the first restart salvages the log; undone, it
+/// With the history gate (design: History) the first restart salvages the log; undone, it
 /// re-keys the log with the acknowledged commit pending, the second restart resumes the re-keyed
 /// log, and its takeover discards the commit with no salvage.
 fn crash_after_a_rekey_at_open() -> Vec<Op> {
@@ -3797,7 +3800,8 @@ fn a_rekey_after_a_claim_applied_inherits_only_from_the_current_token() {
 /// proving the tail for a ticket on record 2. The batch of records 2 and 3 applies with its answer
 /// lost, idle expiry passes, and its resend meets `producer-expired`: the continuation claim's
 /// reconcile acknowledges record 2 in its first read (48 bytes on seed 0), and a `synced()` call
-/// lands before the next read. The ticket must wait for the bind, after the `Wake` (#604).
+/// lands before the next read. The ticket must wait for the bind, after the `Wake` (design:
+/// Synced).
 fn settle_while_activating_script() -> Vec<Op> {
     use Op::Advance;
     use Op::Commit;
@@ -4034,10 +4038,10 @@ fn a_provisional_restart_after_a_power_loss_of_acknowledged_commits_goes_stale()
     assert_eq!(world.violations, Vec::<String>::new());
 }
 
-/// Probe D of #615's review: owner 0 goes offline, a new owner takes the stream over by an
-/// explicit open, and owner 0 restarts three times while offline. Once it reaches the stream, its
-/// pre-check finds the new owner's claim and it resets `fenced` with nothing sent, and the new
-/// owner goes on. Claiming at once, above its log's highest CLAIM record, would fence it.
+/// Owner 0 goes offline, a new owner takes the stream over by an explicit open, and owner 0
+/// restarts three times while offline. Once it reaches the stream, its pre-check finds the new
+/// owner's claim and it resets `fenced` with nothing sent, and the new owner goes on. Claiming at
+/// once, above its log's highest CLAIM record, would fence it.
 fn offline_restarts_after_a_takeover() -> Vec<Op> {
     vec![
         Op::Flush,
@@ -4107,9 +4111,9 @@ fn offline_restarts_never_fence_an_owner_an_explicit_open_installed() {
     );
 }
 
-/// Probe C of #615's review: owner 0's continuation claim after idle expiry is lost and its host
-/// loses power, then a new owner takes over. Owner 0 restarts cut off, its log's latest CLAIM
-/// record never applied. Once healed, its pre-check finds the new owner's claim.
+/// Owner 0's continuation claim after idle expiry is lost and its host loses power, then a new
+/// owner takes over. Owner 0 restarts cut off, its log's latest CLAIM record never applied. Once
+/// healed, its pre-check finds the new owner's claim.
 #[test]
 fn an_unapplied_claim_in_the_log_never_fences_an_explicit_owner() {
     let ops = vec![
@@ -4153,8 +4157,8 @@ fn an_unapplied_claim_in_the_log_never_fences_an_explicit_owner() {
     assert_eq!(world.violations, Vec::<String>::new());
 }
 
-/// Probe B of #615's review: clones, a provisional restart and a foreign claim, with the
-/// provisional owner cut off. Once healed it resets, and the owner that bound goes on.
+/// Clones, a provisional restart and a foreign claim, with the provisional owner cut off. Once
+/// healed it resets, and the owner that bound goes on.
 fn a_provisional_clone_beside_the_owner_that_bound() -> Vec<Op> {
     use Op::Clone;
     use Op::Commit;
@@ -4228,11 +4232,10 @@ fn a_provisional_clone_never_fences_the_owner_that_bound() {
     );
 }
 
-/// Probe F of #615's review (design: Claims): a takeover's claim applied after a foreign one, and
-/// the process crashed before the bind, so the log's acknowledged offset lies before both. The
-/// provisional reopen's pre-check finds the foreign claim followed by its own: superseded, and it
-/// goes live. With a foreign commit there instead, which the generation never caught up, it resets
-/// `stale`.
+/// A takeover's claim applied after a foreign one (design: Claims), and the process crashed before
+/// the bind, so the log's acknowledged offset lies before both. The provisional reopen's pre-check
+/// finds the foreign claim followed by its own: superseded, and it goes live. With a foreign commit
+/// there instead, which the generation never caught up, it resets `stale`.
 #[test]
 fn a_crash_before_the_bind_supersedes_a_foreign_claim_and_goes_stale_on_a_foreign_commit() {
     for (foreign, stale) in [(2, false), (1, true)] {

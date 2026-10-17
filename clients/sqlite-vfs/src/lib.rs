@@ -91,8 +91,8 @@
 //! - `log`: log lines (logfmt) on the host's stderr.
 //! - `materialize`: brings a generation's db file to the end of its log, and catches it up with
 //!   frames from the stream.
-//! - [`model`]: a model of the 0.8 server written from #581, in process and over HTTP (tests and
-//!   the `model` feature, which builds the `ursula-vfs-model` binary).
+//! - [`model`]: a model of the 0.8 server written from the protocol's specifications, in process
+//!   and over HTTP (tests and the `model` feature, which builds the `ursula-vfs-model` binary).
 //! - `net`: the HTTP agents' DNS cache, and the failures that prove a request never went out.
 //! - `open`: opening a stream (design: Open) up to its takeover, or a reader's bind, run by the
 //!   driver.

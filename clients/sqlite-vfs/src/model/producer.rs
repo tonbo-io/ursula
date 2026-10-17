@@ -36,7 +36,7 @@ pub(crate) struct ProducerRecord {
     pub(crate) history: u64,
     /// Whether the record was opened at or below the stream's floor, which only an untokened claim
     /// can do, and no claim above the floor has applied since: tokened writes on such a record are
-    /// refused (the floor decision on #592).
+    /// refused (extensions: Epoch Floor).
     pub(crate) below_floor: bool,
     pub(crate) last_seen_ms: u64,
 }
@@ -139,14 +139,14 @@ impl Evaluation {
 /// whether the write carries the stream's token, and `incarnation` is that token, which receipts
 /// carry. Rows match in order.
 ///
-/// The floor decision on #592 (superseding addendum 3 item 2) scopes row 1 to tokened writes. A
-/// tokened write is refused `producer-expired` when it has no record and its epoch is at or below
-/// the floor, or when its record was claimed at or below the floor, unless it claims above the
-/// floor. An untokened writer keeps the base protocol's rule that a forgotten producer is new, so
-/// its claim may open a record at or below the floor, marked as such. A record opened above the
-/// floor stays so: its claims of later epochs are not checked against the floor (row 6 or 7). A
-/// marked record is cleared only by a claim above the floor, tokened or not, and a claim on a
-/// marked record closes no epoch.
+/// The epoch floor (extensions: Epoch Floor) scopes row 1 to tokened writes. A tokened write is
+/// refused `producer-expired` when it has no record and its epoch is at or below the floor, or when
+/// its record was claimed at or below the floor, unless it claims above the floor. An untokened
+/// writer keeps the base protocol's rule that a forgotten producer is new, so its claim may open a
+/// record at or below the floor, marked as such. A record opened above the floor stays so: its
+/// claims of later epochs are not checked against the floor (row 6 or 7). A marked record is
+/// cleared only by a claim above the floor, tokened or not, and a claim on a marked record closes
+/// no epoch.
 pub(crate) fn evaluate(
     record: Option<&ProducerRecord>,
     watermark: Option<Epoch>,
@@ -188,7 +188,8 @@ pub(crate) fn evaluate(
     if e > current {
         if n == Seq::ZERO {
             // A claim on a record opened below the floor closes nothing: the epoch it would close
-            // may be one the stream forgot, so no answer reports it as closed (#592).
+            // may be one the stream forgot, so no answer reports it as closed (extensions: Epoch
+            // Floor).
             let closes = (!r.below_floor).then_some(ClosedEpoch {
                 epoch: current,
                 seq: r.last,
@@ -411,8 +412,9 @@ mod tests {
 
     #[test]
     fn a_below_floor_claim_closes_no_epoch() {
-        // #592: tokened or not, a claim on a record opened below the floor closes nothing, so the
-        // record it leaves names no closed epoch and a resend in the replaced epoch is stale.
+        // Epoch Floor: tokened or not, a claim on a record opened below the floor closes nothing,
+        // so the record it leaves names no closed epoch and a resend in the replaced epoch is
+        // stale.
         let mut below = record(2);
         below.below_floor = true;
         for evaluation in [
