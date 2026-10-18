@@ -490,6 +490,8 @@ impl JournalCluster {
     pub(super) async fn stop_replica(&mut self, group: u32, node_id: u64) {
         self.registries[&group].unregister(node_id);
         self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
+        // The counts stay, the stopped engine's resources go.
+        self.recovery_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
         self.rejoins.remove(&(group, node_id));
         if let Some(engine) = self.engines.remove(&(group, node_id)) {
             engine.shutdown().await.expect("stop the replica");
@@ -522,6 +524,8 @@ impl JournalCluster {
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
             self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
+            // The counts stay, the stopped engine's resources go.
+            self.recovery_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
             match self.engines.remove(&(group, node_id)) {
                 Some(engine) => engine.shutdown().await.expect("stop the replica"),
                 None => {
