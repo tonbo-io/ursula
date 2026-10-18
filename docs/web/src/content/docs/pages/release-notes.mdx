@@ -3,6 +3,19 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.8.3
+
+0.8.3 is a drop-in patch for 0.8.2: format epoch 4, the server's storage and protocol formats and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged. 0.8.2 and 0.8.3 nodes run in one cluster during a rolling upgrade, and 0.8.2 and 0.8.3 owners and readers of one stream work side by side. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move. Rolling back to 0.8.2 is safe.
+
+### Server
+
+- **Snapshot GC no longer deletes the object of a new snapshot ([#687](https://github.com/tonbo-io/ursula/issues/687)).** With an S3 snapshot store, a build named its object by the object's bytes. A build whose bytes matched an old object that no replica named reused that object, and a GC pass could delete it before the build pinned it. The new snapshot then named an object that was gone, and an install or a restore of it failed with `NotFound`. A build now pins its object before it writes it, under a fresh name, and a GC pass lists the group's objects before it reads the pins. So a pass that sees the object also sees its pin, and a pass that read the pins earlier never sees the object. Replicas that build identical bytes no longer share one object, so each voter's current snapshot is an object of its own unless it installed it from a peer. Objects written by 0.8.2 and earlier keep their names, and every 0.8.x node reads and prunes both kinds. A pin whose build never becomes current goes when the build ends, or at the node's next build or GC pass after a failed one, and a restart drops the pins of the builds it cut short.
+- **Upgrading:** from 0.8.1 or earlier, the upgrade notes of [0.8.2](#082) and [0.8.1](#081) apply as well. Until every node runs 0.8.3, the builds of the older nodes still pin after their write and can still lose their object this way. They never reuse a 0.8.3 object, whose name differs from every name they write.
+
+### Known issues
+
+[#687](https://github.com/tonbo-io/ursula/issues/687) is fixed. The other known issues of [0.8.1](#081) are unchanged.
+
 ## 0.8.2
 
 0.8.2 removes the experimental event-time indexer and changes nothing else: format epoch 4, the server's storage and protocol formats and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged. 0.8.1 and 0.8.2 nodes run in one cluster during a rolling upgrade, and 0.8.1 and 0.8.2 owners and readers of one stream work side by side. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move, once your values no longer set the indexer. Rolling back to 0.8.1 is safe.

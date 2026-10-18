@@ -280,6 +280,7 @@ pub use snapshot_store::SnapshotReferenceConfig;
 pub use snapshot_store::SnapshotStore;
 pub use snapshot_store::SnapshotStoreError;
 pub use snapshot_store::SnapshotStoreFuture;
+pub use snapshot_store::StagedSnapshot;
 pub use snapshot_store::decode_snapshot_envelope;
 pub use snapshot_store::default_snapshot_store;
 pub use snapshot_store::encode_binary_envelope;

@@ -494,6 +494,7 @@ mod tests {
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
+    use ursula_runtime::StagedSnapshot;
 
     use super::SNAPSHOT_GC_MAX_RETRY;
     use super::SNAPSHOT_GC_RETRY;
@@ -606,6 +607,25 @@ mod tests {
             .unwrap()
     }
 
+    async fn stage(store: &SharedSnapshotStore, body: &'static [u8]) -> StagedSnapshot {
+        store
+            .stage(
+                SnapshotKey {
+                    raft_group_id: 7,
+                    snapshot_id: "s".to_owned(),
+                },
+                Box::new(std::iter::once(Ok::<_, SnapshotStoreError>(
+                    Bytes::from_static(body),
+                ))),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn is_gone(result: Result<Vec<u8>, SnapshotStoreError>) -> bool {
+        matches!(result, Err(SnapshotStoreError::NotFound(_)))
+    }
+
     async fn switch_to(
         references: &Arc<SnapshotReferences>,
         store: &SharedSnapshotStore,
@@ -647,6 +667,75 @@ mod tests {
         ));
         assert_eq!(store.download(&new).await.unwrap(), b"new");
         assert!(!references.gc_due(later(now, GRACE.saturating_mul(10))));
+    }
+
+    /// #687: a build pins its object's name before it writes the object,
+    /// and the pin holds while the build runs. A build that a newer install
+    /// overtook ends without committing, and its pin goes at the next
+    /// reconcile, so the object goes at the next pass.
+    #[tokio::test]
+    async fn an_early_pin_whose_build_never_becomes_current_is_released() {
+        let store = store();
+        let references = Arc::new(SnapshotReferences::new(GRACE));
+        let current = upload(&store, b"current").await;
+        switch_to(&references, &store, &current).await;
+        let staged = stage(&store, b"overtaken").await;
+        let lease = references
+            .prepare(&store, 7, staged.location())
+            .await
+            .unwrap();
+        let overtaken = store.write_staged(staged).await.unwrap();
+        assert_eq!(
+            references.prune(&store, 7).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 0 }
+        );
+        assert_eq!(store.download(&overtaken).await.unwrap(), b"overtaken");
+
+        drop(lease);
+        references.publish_current(&store, 7).await.unwrap();
+        assert_eq!(
+            references.prune(&store, 7).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(is_gone(store.download(&overtaken).await));
+        assert_eq!(store.download(&current).await.unwrap(), b"current");
+    }
+
+    /// #687: a process that dies after a build pinned its name, before or
+    /// after its PUT, leaves the pin behind. Until the restart the pin
+    /// keeps the object. The restart's reconcile, which keeps only the
+    /// restored pointer, drops it, and so the object goes at the next pass,
+    /// a PUT the dead process sent that lands only after the restart too.
+    #[tokio::test]
+    async fn a_restart_releases_the_pins_of_the_builds_it_cut_short() {
+        let store = store();
+        let restored = upload(&store, b"restored").await;
+        let before = Arc::new(SnapshotReferences::new(GRACE));
+        switch_to(&before, &store, &restored).await;
+        let staged = stage(&store, b"written").await;
+        let lease = before.prepare(&store, 7, staged.location()).await.unwrap();
+        let written = store.write_staged(staged).await.unwrap();
+        let late = stage(&store, b"late").await;
+        let late_lease = before.prepare(&store, 7, late.location()).await.unwrap();
+        assert_eq!(
+            before.prune(&store, 7).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 0 }
+        );
+        // The process dies: its memory goes, its pins stay in the store.
+        drop((lease, late_lease, before));
+
+        let after = Arc::new(SnapshotReferences::new(GRACE));
+        let restore = after.prepare(&store, 7, &restored).await.unwrap();
+        after.commit_current(&restored);
+        drop(restore);
+        let late = store.write_staged(late).await.unwrap();
+        assert_eq!(
+            after.prune(&store, 7).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 2 }
+        );
+        assert!(is_gone(store.download(&written).await));
+        assert!(is_gone(store.download(&late).await));
+        assert_eq!(store.download(&restored).await.unwrap(), b"restored");
     }
 
     /// An upload owes a pass G later, so an upload that never becomes

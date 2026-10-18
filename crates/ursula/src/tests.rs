@@ -8696,13 +8696,20 @@ mod snapshot_driver {
             })
         }
 
-        fn upload_iter<'a>(
+        fn stage<'a>(
             &'a self,
             key: SnapshotKey,
             chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            self.inner.stage(key, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let location = self.inner.upload_iter(key, chunks).await?;
+                let location = self.inner.write_staged(staged).await?;
                 self.record(&location);
                 Ok(location)
             })

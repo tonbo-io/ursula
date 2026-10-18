@@ -31,6 +31,10 @@ ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }
 zstd = { workspace = true }
 
+[target.'cfg(not(madsim))'.dependencies]
+# Fresh S3 snapshot object names (#687). The S3 store is not built under madsim.
+rand = { workspace = true, features = ["thread_rng"] }
+
 [target.'cfg(madsim)'.dependencies]
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 

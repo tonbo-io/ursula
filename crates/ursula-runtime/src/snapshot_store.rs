@@ -73,9 +73,9 @@ pub enum SnapshotLocation {
         stored_size_bytes: u64,
         /// Compression applied to the S3 object body.
         compression: SnapshotCompression,
-        /// The object key is content-addressed and may be referenced by
-        /// several replicas or snapshot pointers. Shared objects must only be
-        /// removed by reference-aware pruning.
+        /// The object may be referenced by several replicas or snapshot
+        /// pointers, since an install shares the sender's object. Shared
+        /// objects must only be removed by reference-aware pruning.
         shared_object: bool,
     },
 }
@@ -111,6 +111,29 @@ impl SnapshotLocation {
         match self {
             Self::S3 { compression, .. } => *compression,
             Self::Inline { .. } | Self::Local { .. } => SnapshotCompression::None,
+        }
+    }
+}
+
+/// A snapshot that [`SnapshotStore::stage`] named and that
+/// [`SnapshotStore::write_staged`] writes (#687).
+#[derive(Debug)]
+pub enum StagedSnapshot {
+    /// Nothing is left to write: the location carries the bytes, or a store
+    /// without snapshot GC wrote them while staging.
+    Written(SnapshotLocation),
+    /// An object to write at `location`, under a name no object had before.
+    Object {
+        location: SnapshotLocation,
+        body: Vec<u8>,
+    },
+}
+
+impl StagedSnapshot {
+    /// Where the snapshot lives once it is written.
+    pub fn location(&self) -> &SnapshotLocation {
+        match self {
+            Self::Written(location) | Self::Object { location, .. } => location,
         }
     }
 }
@@ -260,18 +283,42 @@ pub trait SnapshotStore: Send + Sync + Debug {
         bytes: Bytes,
     ) -> SnapshotStoreFuture<'a, SnapshotLocation>;
 
-    /// Persist snapshot bytes from an incremental producer.
-    fn upload_iter<'a>(
+    /// Encodes the snapshot bytes of an incremental producer and names the
+    /// location [`Self::write_staged`] then writes (#687). A store with
+    /// snapshot GC writes nothing here, so that its caller can pin the
+    /// location before the object exists: no GC pass can then decide to
+    /// delete an object the caller depends on before it saw the pin. The
+    /// default writes the bytes at once through [`Self::upload`], for stores
+    /// without snapshot GC.
+    fn stage<'a>(
         &'a self,
         key: SnapshotKey,
         chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
         Box::pin(async move {
             let mut bytes = Vec::new();
             for chunk in chunks {
                 bytes.extend_from_slice(chunk?.as_ref());
             }
-            self.upload(key, Bytes::from(bytes)).await
+            Ok(StagedSnapshot::Written(
+                self.upload(key, Bytes::from(bytes)).await?,
+            ))
+        })
+    }
+
+    /// Writes a snapshot [`Self::stage`] named and returns its location.
+    /// The default writes nothing, for stores whose staging wrote it.
+    fn write_staged<'a>(
+        &'a self,
+        staged: StagedSnapshot,
+    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+        Box::pin(async move {
+            match staged {
+                StagedSnapshot::Written(location) => Ok(location),
+                StagedSnapshot::Object { location, .. } => Err(SnapshotStoreError::Backend(
+                    format!("{self:?} cannot write the staged object {location:?}"),
+                )),
+            }
         })
     }
 
@@ -309,7 +356,8 @@ pub trait SnapshotStore: Send + Sync + Debug {
     }
 
     /// Protect an incoming external pointer without replacing this node's
-    /// current reference. Complete before installing or publishing the pointer.
+    /// current reference. Complete before installing or publishing the pointer,
+    /// and before writing the object of a staged build (#687).
     /// Pins use the existing reference record format so older pruners retain them.
     /// A backend enabling external snapshot GC must implement this operation
     /// and pin reconciliation; the no-op default is for stores without GC.
@@ -383,14 +431,14 @@ impl SnapshotStore for InlineSnapshotStore {
         })
     }
 
-    fn upload_iter<'a>(
+    fn stage<'a>(
         &'a self,
         _key: SnapshotKey,
         chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
         Box::pin(async move {
             let bytes = collect_inline_snapshot(chunks).await?;
-            Ok(SnapshotLocation::Inline { bytes })
+            Ok(StagedSnapshot::Written(SnapshotLocation::Inline { bytes }))
         })
     }
 
@@ -441,6 +489,7 @@ fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, Sna
 #[cfg(not(madsim))]
 mod s3 {
     use std::collections::HashSet;
+    use std::future::Future;
     use std::io;
     use std::io::Write;
     use std::time::Duration;
@@ -460,6 +509,7 @@ mod s3 {
     use super::SnapshotStore;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
+    use super::StagedSnapshot;
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
     /// The GC grace of a store built without one ([`S3SnapshotStore::with_gc_grace`]).
@@ -520,9 +570,13 @@ mod s3 {
         /// then deleted once it is that old.
         ///
         /// An object's age is its store modification time against this
-        /// node's clock, and a build pins its upload only after the PUT
-        /// returns. Both assume that the nodes' clocks agree with the
-        /// store's, and that an upload completes, well within the grace.
+        /// node's clock. Only an object that nothing names or pins ages, and
+        /// a build pins its object before it writes it (#687), so the clocks
+        /// decide how soon an unused object goes, never whether an object in
+        /// use stays. A 0.8.0 to 0.8.2 build pins after its write, so during
+        /// a rolling upgrade its upload still needs the nodes' clocks to
+        /// agree with the store's, and the upload to complete, well within
+        /// the grace.
         pub fn with_gc_grace(mut self, gc_grace: Duration) -> Self {
             self.gc_grace = gc_grace;
             self
@@ -621,12 +675,16 @@ mod s3 {
             Ok(Self::new(operator, prefix))
         }
 
-        fn object_key(&self, key: &SnapshotKey, digest: blake3::Hash) -> String {
+        /// A fresh object name in the group's prefix: 32 random hex digits,
+        /// drawn per upload (#687). The name is not the content's digest, so
+        /// no build reuses an object that existed before it pinned the name,
+        /// and no GC pass can have listed the object before that pin. The
+        /// 64-digit digest names of 0.8.0 to 0.8.2 never collide with it.
+        fn object_key(&self, raft_group_id: u32) -> String {
             format!(
-                "{}/group-{}/objects/{}.snap",
+                "{}/group-{raft_group_id}/objects/{:032x}.snap",
                 self.prefix,
-                key.raft_group_id,
-                digest.to_hex(),
+                rand::random::<u128>(),
             )
         }
 
@@ -641,7 +699,10 @@ mod s3 {
             )
         }
 
-        async fn write_content_once(
+        /// Creates the object at a name [`Self::object_key`] drew. An object
+        /// already there is this write's own earlier attempt, which a retry
+        /// of the conditional PUT answers as existing.
+        async fn create_object(
             &self,
             object_key: &str,
             stored_bytes: Vec<u8>,
@@ -669,7 +730,7 @@ mod s3 {
                         let metadata =
                             self.operator.stat(object_key).await.map_err(|stat_error| {
                                 SnapshotStoreError::Backend(format!(
-                                    "stat shared s3 snapshot after create race: {stat_error}"
+                                    "stat s3 snapshot after a repeated create: {stat_error}"
                                 ))
                             })?;
                         if metadata.content_length() != stored_size_bytes {
@@ -708,9 +769,175 @@ mod s3 {
         }
     }
 
+    impl S3SnapshotStore {
+        /// One GC pass of the group ([`SnapshotStore::prune_retired`]).
+        ///
+        /// The pass lists the group's objects first and every reference and
+        /// pin after that listing returned (#687). A build pins its object's
+        /// name before it writes the object, under a name no object had
+        /// before ([`Self::object_key`]). So an object the first listing
+        /// holds was written after its pin, and the second listing, which
+        /// starts later, holds that pin. A pass whose listings both ran
+        /// before the pin never sees the object, and it deletes only what
+        /// it listed. A pin goes only once its node no longer uses the
+        /// object, so a pin that is gone by the time the pass reads it
+        /// protects nothing. No order of the pass and a build lets the pass
+        /// delete an object the build uses, whatever the clocks say.
+        ///
+        /// `before_deletes` runs once the pass read everything it decides
+        /// on, right before its first delete. A server passes a ready future.
+        pub(super) async fn prune_group(
+            &self,
+            raft_group_id: u32,
+            current: &SnapshotLocation,
+            before_deletes: impl Future<Output = ()>,
+        ) -> Result<SnapshotPrune, SnapshotStoreError> {
+            let Some(references) = &self.references else {
+                return Ok(SnapshotPrune::Unmanaged);
+            };
+            let expected_voters = references.voters_for(raft_group_id);
+            if expected_voters.is_empty() {
+                return Ok(SnapshotPrune::Unmanaged);
+            }
+            let group_prefix = self.group_prefix(raft_group_id);
+            let mut retained = HashSet::new();
+            if let SnapshotLocation::S3 { key, .. } = current {
+                retained.insert(key.clone());
+            }
+            for node_id in expected_voters {
+                let reference_key = self.reference_key(raft_group_id, *node_id);
+                let reference_bytes = match self.operator.read(&reference_key).await {
+                    Ok(bytes) => bytes,
+                    Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
+                        tracing::debug!(
+                            raft_group_id,
+                            node_id,
+                            "deferring S3 snapshot pruning until every voter publishes a reference"
+                        );
+                        return Ok(SnapshotPrune::VoterWithoutReference { node_id: *node_id });
+                    }
+                    Err(error) => {
+                        return Err(SnapshotStoreError::Backend(error.to_string()));
+                    }
+                };
+                let reference: SnapshotReference =
+                    serde_json::from_slice(&reference_bytes.to_vec())
+                        .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
+                if reference.version != SNAPSHOT_REFERENCE_VERSION
+                    || reference.node_id != *node_id
+                    || reference.raft_group_id != raft_group_id
+                {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "invalid S3 snapshot reference {reference_key}"
+                    )));
+                }
+                if let Some(key) = reference.snapshot_key {
+                    if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
+                        return Err(SnapshotStoreError::Integrity(format!(
+                            "S3 snapshot reference {reference_key} points outside group namespace"
+                        )));
+                    }
+                    retained.insert(key);
+                }
+            }
+            let cutoff = SystemTime::now()
+                .checked_sub(self.gc_grace)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            // The objects first, then the references and pins (#687).
+            let objects = self
+                .operator
+                .list_with(&group_prefix)
+                .recursive(true)
+                .await
+                .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+            let references_prefix = format!("{group_prefix}references/");
+            let records = self
+                .operator
+                .list_with(&references_prefix)
+                .recursive(true)
+                .await
+                .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+            for entry in &records {
+                if !entry.metadata().mode().is_file() || !entry.path().ends_with(".json") {
+                    continue;
+                }
+                let bytes = match self.operator.read(entry.path()).await {
+                    Ok(bytes) => bytes,
+                    // A pin its node released after the listing (#490):
+                    // it protects nothing any more.
+                    Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
+                        continue;
+                    }
+                    Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
+                };
+                let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
+                    .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
+                if reference.version != SNAPSHOT_REFERENCE_VERSION
+                    || reference.raft_group_id != raft_group_id
+                {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "invalid S3 snapshot reference {}",
+                        entry.path()
+                    )));
+                }
+                if let Some(key) = reference.snapshot_key {
+                    if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
+                        return Err(SnapshotStoreError::Integrity(format!(
+                            "S3 snapshot reference {} points outside group namespace",
+                            entry.path()
+                        )));
+                    }
+                    retained.insert(key);
+                }
+            }
+            before_deletes.await;
+            let mut deleted = 0_u64;
+            for entry in objects {
+                if !entry.metadata().mode().is_file()
+                    || !entry.path().ends_with(".snap")
+                    || retained.contains(entry.path())
+                {
+                    continue;
+                }
+                let modified = match entry.metadata().last_modified() {
+                    Some(modified) => Some(modified.into()),
+                    None => self
+                        .operator
+                        .stat(entry.path())
+                        .await
+                        .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?
+                        .last_modified()
+                        .map(Into::into)
+                        .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
+                };
+                if !modified.is_some_and(|modified: SystemTime| modified <= cutoff) {
+                    continue;
+                }
+                match self.operator.delete(entry.path()).await {
+                    Ok(()) => {}
+                    // Another replica's pass deleted it first.
+                    Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
+                        continue;
+                    }
+                    Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
+                }
+                deleted = deleted.saturating_add(1);
+            }
+            if deleted > 0 {
+                tracing::info!(
+                    raft_group_id,
+                    deleted,
+                    retained = retained.len(),
+                    "pruned unreachable S3 snapshot objects"
+                );
+            }
+            Ok(SnapshotPrune::Pruned { deleted })
+        }
+    }
+
     fn compress_snapshot_chunks(
         chunks: SnapshotBytesIterator,
-    ) -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
+    ) -> Result<(Vec<u8>, u64), SnapshotStoreError> {
         let mut size_bytes = 0u64;
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), S3_SNAPSHOT_ZSTD_LEVEL)
             .map_err(|err| SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}")))?;
@@ -726,8 +953,7 @@ mod s3 {
         let stored_bytes = encoder.finish().map_err(|err| {
             SnapshotStoreError::Backend(format!("finish s3 snapshot compression: {err}"))
         })?;
-        let digest = blake3::hash(&stored_bytes);
-        Ok((stored_bytes, size_bytes, digest))
+        Ok((stored_bytes, size_bytes))
     }
 
     impl SnapshotStore for S3SnapshotStore {
@@ -834,46 +1060,59 @@ mod s3 {
             bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let size_bytes = bytes.len() as u64;
-                let stored_bytes =
-                    zstd::bulk::compress(&bytes, S3_SNAPSHOT_ZSTD_LEVEL).map_err(|err| {
-                        SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}"))
-                    })?;
-                let object_key = self.object_key(&key, blake3::hash(&stored_bytes));
-                let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
-                Ok(SnapshotLocation::S3 {
-                    key: object_key,
-                    size_bytes,
-                    stored_size_bytes,
-                    compression: SnapshotCompression::Zstd,
-                    shared_object: true,
+                let staged = self
+                    .stage(
+                        key,
+                        Box::new(std::iter::once(Ok::<_, SnapshotStoreError>(bytes))),
+                    )
+                    .await?;
+                self.write_staged(staged).await
+            })
+        }
+
+        fn stage<'a>(
+            &'a self,
+            key: SnapshotKey,
+            chunks: SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+            Box::pin(async move {
+                let (body, size_bytes) =
+                    tokio::task::spawn_blocking(move || compress_snapshot_chunks(chunks))
+                        .await
+                        .map_err(|err| {
+                            SnapshotStoreError::Io(io::Error::other(format!(
+                                "join s3 snapshot encoder: {err}"
+                            )))
+                        })??;
+                Ok(StagedSnapshot::Object {
+                    location: SnapshotLocation::S3 {
+                        key: self.object_key(key.raft_group_id),
+                        size_bytes,
+                        stored_size_bytes: body.len() as u64,
+                        compression: SnapshotCompression::Zstd,
+                        shared_object: true,
+                    },
+                    body,
                 })
             })
         }
 
-        fn upload_iter<'a>(
+        fn write_staged<'a>(
             &'a self,
-            key: SnapshotKey,
-            chunks: SnapshotBytesIterator,
+            staged: StagedSnapshot,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let encoded = tokio::task::spawn_blocking(move || compress_snapshot_chunks(chunks))
-                    .await
-                    .map_err(|err| {
-                        SnapshotStoreError::Io(io::Error::other(format!(
-                            "join s3 snapshot encoder: {err}"
-                        )))
-                    })??;
-                let (stored_bytes, size_bytes, digest) = encoded;
-                let object_key = self.object_key(&key, digest);
-                let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
-                Ok(SnapshotLocation::S3 {
-                    key: object_key,
-                    size_bytes,
-                    stored_size_bytes,
-                    compression: SnapshotCompression::Zstd,
-                    shared_object: true,
-                })
+                let (location, body) = match staged {
+                    StagedSnapshot::Written(location) => return Ok(location),
+                    StagedSnapshot::Object { location, body } => (location, body),
+                };
+                let SnapshotLocation::S3 { key, .. } = &location else {
+                    return Err(SnapshotStoreError::Integrity(format!(
+                        "staged s3 snapshot has the location {location:?}"
+                    )));
+                };
+                self.create_object(key, body).await?;
+                Ok(location)
             })
         }
 
@@ -968,143 +1207,7 @@ mod s3 {
             raft_group_id: u32,
             current: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, SnapshotPrune> {
-            Box::pin(async move {
-                let Some(references) = &self.references else {
-                    return Ok(SnapshotPrune::Unmanaged);
-                };
-                let expected_voters = references.voters_for(raft_group_id);
-                if expected_voters.is_empty() {
-                    return Ok(SnapshotPrune::Unmanaged);
-                }
-                let group_prefix = self.group_prefix(raft_group_id);
-                let mut retained = HashSet::new();
-                if let SnapshotLocation::S3 { key, .. } = current {
-                    retained.insert(key.clone());
-                }
-                for node_id in expected_voters {
-                    let reference_key = self.reference_key(raft_group_id, *node_id);
-                    let reference_bytes = match self.operator.read(&reference_key).await {
-                        Ok(bytes) => bytes,
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
-                            tracing::debug!(
-                                raft_group_id,
-                                node_id,
-                                "deferring S3 snapshot pruning until every voter publishes a reference"
-                            );
-                            return Ok(SnapshotPrune::VoterWithoutReference { node_id: *node_id });
-                        }
-                        Err(error) => {
-                            return Err(SnapshotStoreError::Backend(error.to_string()));
-                        }
-                    };
-                    let reference: SnapshotReference =
-                        serde_json::from_slice(&reference_bytes.to_vec())
-                            .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.node_id != *node_id
-                        || reference.raft_group_id != raft_group_id
-                    {
-                        return Err(SnapshotStoreError::Integrity(format!(
-                            "invalid S3 snapshot reference {reference_key}"
-                        )));
-                    }
-                    if let Some(key) = reference.snapshot_key {
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot reference {reference_key} points outside group namespace"
-                            )));
-                        }
-                        retained.insert(key);
-                    }
-                }
-                let cutoff = SystemTime::now()
-                    .checked_sub(self.gc_grace)
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let entries = self
-                    .operator
-                    .list_with(&group_prefix)
-                    .recursive(true)
-                    .await
-                    .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
-                let references_prefix = format!("{group_prefix}references/");
-                for entry in &entries {
-                    if !entry.metadata().mode().is_file()
-                        || !entry.path().starts_with(&references_prefix)
-                        || !entry.path().ends_with(".json")
-                    {
-                        continue;
-                    }
-                    let bytes = match self.operator.read(entry.path()).await {
-                        Ok(bytes) => bytes,
-                        // A pin its node released after the listing (#490):
-                        // it protects nothing any more.
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
-                            continue;
-                        }
-                        Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
-                    };
-                    let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
-                        .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.raft_group_id != raft_group_id
-                    {
-                        return Err(SnapshotStoreError::Integrity(format!(
-                            "invalid S3 snapshot reference {}",
-                            entry.path()
-                        )));
-                    }
-                    if let Some(key) = reference.snapshot_key {
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot reference {} points outside group namespace",
-                                entry.path()
-                            )));
-                        }
-                        retained.insert(key);
-                    }
-                }
-                let mut deleted = 0_u64;
-                for entry in entries {
-                    if !entry.metadata().mode().is_file()
-                        || !entry.path().ends_with(".snap")
-                        || retained.contains(entry.path())
-                    {
-                        continue;
-                    }
-                    let modified = match entry.metadata().last_modified() {
-                        Some(modified) => Some(modified.into()),
-                        None => self
-                            .operator
-                            .stat(entry.path())
-                            .await
-                            .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?
-                            .last_modified()
-                            .map(Into::into)
-                            .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
-                    };
-                    if !modified.is_some_and(|modified: SystemTime| modified <= cutoff) {
-                        continue;
-                    }
-                    match self.operator.delete(entry.path()).await {
-                        Ok(()) => {}
-                        // Another replica's pass deleted it first.
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
-                            continue;
-                        }
-                        Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
-                    }
-                    deleted = deleted.saturating_add(1);
-                }
-                if deleted > 0 {
-                    tracing::info!(
-                        raft_group_id,
-                        deleted,
-                        retained = retained.len(),
-                        "pruned unreachable S3 snapshot objects"
-                    );
-                }
-                Ok(SnapshotPrune::Pruned { deleted })
-            })
+            Box::pin(self.prune_group(raft_group_id, current, std::future::ready(())))
         }
 
         fn publish_reference<'a>(
@@ -1301,12 +1404,11 @@ mod tests {
             Ok(Bytes::from_static(b"snapshot"))
         }));
 
-        let location = store
-            .upload_iter(test_key(0, "offloaded"), chunks)
-            .await
-            .unwrap();
+        let staged = store.stage(test_key(0, "offloaded"), chunks).await.unwrap();
 
         assert_ne!(thread_rx.recv().unwrap(), caller);
+        assert!(matches!(staged, StagedSnapshot::Written(_)), "{staged:?}");
+        let location = store.write_staged(staged).await.unwrap();
         assert_eq!(location, SnapshotLocation::Inline {
             bytes: b"snapshot".to_vec()
         });
@@ -1488,8 +1590,8 @@ mod tests {
         }
         let bytes = store.download(&loc).await.unwrap();
         assert_eq!(bytes, payload);
-        // A content-addressed object may already be referenced by another
-        // replica. Eager local cleanup must not remove it.
+        // A shared object may be referenced by another replica that
+        // installed it. Eager local cleanup must not remove it.
         store.delete(&loc).await.unwrap();
         assert_eq!(store.download(&loc).await.unwrap(), payload);
         store.delete(&loc).await.unwrap();
@@ -1573,12 +1675,18 @@ mod tests {
             Ok(Bytes::from(vec![b'x'; 64 * 1024]))
         }));
 
-        let location = store
-            .upload_iter(test_key(9, "group-9-T1-N1-1"), chunks)
+        let staged = store
+            .stage(test_key(9, "group-9-T1-N1-1"), chunks)
             .await
             .unwrap();
 
         assert_ne!(thread_rx.recv().unwrap(), caller);
+        // Staging writes nothing: the object exists once it is written.
+        assert!(matches!(
+            store.verify_uploaded(staged.location()).await,
+            Err(SnapshotStoreError::NotFound(_))
+        ));
+        let location = store.write_staged(staged).await.unwrap();
         assert_eq!(location.compression(), SnapshotCompression::Zstd);
         assert!(location.stored_size_hint() < location.size_hint());
         assert_eq!(store.download(&location).await.unwrap(), vec![
@@ -1587,32 +1695,39 @@ mod tests {
         ]);
     }
 
+    /// #687: every upload gets a fresh object name, identical bytes
+    /// included, and none is a 64-digit digest name of 0.8.0 to 0.8.2.
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn s3_snapshot_keys_are_content_addressed() {
+    async fn s3_every_upload_gets_a_fresh_object_name() {
         let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
-        let key1 = test_key(4, "group-4-T18-N3-264150");
-        let key2 = test_key(4, "group-4-T18-N3-264150");
-        let key3 = test_key(4, "group-4-T18-N3-264151");
-        let loc1 = store.upload(key1, b"body1".to_vec().into()).await.unwrap();
-        let loc2 = store.upload(key2, b"body2".to_vec().into()).await.unwrap();
-        let loc3 = store.upload(key3, b"body1".to_vec().into()).await.unwrap();
-        let (k1, k2, k3) = match (&loc1, &loc2, &loc3) {
-            (
-                SnapshotLocation::S3 { key: k1, .. },
-                SnapshotLocation::S3 { key: k2, .. },
-                SnapshotLocation::S3 { key: k3, .. },
-            ) => (k1.clone(), k2.clone(), k3.clone()),
-            _ => panic!("expected S3 locations"),
-        };
-        assert_ne!(k1, k2, "different bytes must never alias");
-        assert_eq!(k1, k3, "identical bytes in one group must share an object");
-        assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
-        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
-        assert_eq!(store.download(&loc3).await.unwrap(), b"body1");
-        store.delete(&loc1).await.unwrap();
-        assert_eq!(store.download(&loc3).await.unwrap(), b"body1");
-        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
+        let first = store
+            .upload(
+                test_key(4, "group-4-T18-N3-264150"),
+                b"body".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        let again = store
+            .upload(
+                test_key(4, "group-4-T18-N3-264150"),
+                b"body".to_vec().into(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(s3_key(&first), s3_key(&again));
+        for location in [&first, &again] {
+            let name = s3_key(location)
+                .strip_prefix("snapshots/group-4/objects/")
+                .and_then(|name| name.strip_suffix(".snap"))
+                .unwrap();
+            assert_eq!(name.len(), 32, "{name}");
+            assert!(
+                name.bytes().all(|digit| digit.is_ascii_hexdigit()),
+                "{name}"
+            );
+            assert_eq!(store.download(location).await.unwrap(), b"body");
+        }
     }
 
     #[cfg(not(madsim))]
@@ -1956,5 +2071,134 @@ mod tests {
             SnapshotPrune::Pruned { deleted: 0 }
         );
         assert_eq!(store.download(&young).await.unwrap(), b"young");
+    }
+
+    #[cfg(not(madsim))]
+    fn chunks(body: &'static [u8]) -> SnapshotBytesIterator {
+        Box::new(std::iter::once(Ok(Bytes::from_static(body))))
+    }
+
+    /// #687: a GC pass that listed the objects, the references and the
+    /// pins before a build pinned and wrote its object, and deletes after
+    /// that, keeps the build's object. The build's bytes match an old
+    /// object that nothing names or pins. 0.8.2 named the build's object by
+    /// its bytes, so the build reused the old object, and this pass deleted
+    /// it after the build's PUT had answered: the snapshot then named an
+    /// object that was gone.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_a_gc_pass_that_read_everything_before_a_build_keeps_its_object() {
+        let store = gc_store(&[1], std::time::Duration::ZERO);
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+        let old = store
+            .upload(test_key(7, "old"), b"unchanged".to_vec().into())
+            .await
+            .unwrap();
+
+        let mut built = None;
+        let prune = store
+            .prune_group(7, &current, async {
+                let staged = store
+                    .stage(test_key(7, "build"), chunks(b"unchanged"))
+                    .await
+                    .unwrap();
+                store.pin_reference(7, staged.location()).await.unwrap();
+                built = Some(store.write_staged(staged).await.unwrap());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(prune, SnapshotPrune::Pruned { deleted: 1 });
+        assert!(is_gone(store.download(&old).await));
+        let built = built.unwrap();
+        assert_ne!(s3_key(&built), s3_key(&old));
+        assert_eq!(store.download(&built).await.unwrap(), b"unchanged");
+        assert_eq!(store.download(&current).await.unwrap(), b"current");
+    }
+
+    /// #687: a pass that lists a build's object also lists its pin, since
+    /// the pin is written first and the pass lists the pins after the
+    /// objects. The negative control writes an object without that pin,
+    /// as a build that pins after its write leaves it, and the same pass
+    /// deletes it.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_a_pin_written_before_the_object_protects_it_from_every_later_pass() {
+        let store = gc_store(&[1], std::time::Duration::ZERO);
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+        let staged = store
+            .stage(test_key(7, "unpinned"), chunks(b"unpinned"))
+            .await
+            .unwrap();
+        let unpinned = store.write_staged(staged).await.unwrap();
+        let staged = store
+            .stage(test_key(7, "pinned"), chunks(b"pinned"))
+            .await
+            .unwrap();
+        store.pin_reference(7, staged.location()).await.unwrap();
+        let pinned = store.write_staged(staged).await.unwrap();
+
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(is_gone(store.download(&unpinned).await));
+        assert_eq!(store.download(&pinned).await.unwrap(), b"pinned");
+    }
+
+    /// #687 through the plain upload API, which 0.8.2 has too: a build
+    /// whose bytes match an object past the grace that nothing names, and
+    /// a GC pass between its upload and its pin. 0.8.2 reused the old
+    /// object, kept its old modification time, and the pass deleted it, so
+    /// the last download failed with `NotFound`. A fresh object is younger
+    /// than the grace. Its objects carry a modification time, so this runs
+    /// on a local directory.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_an_upload_with_the_bytes_of_an_old_object_outlives_a_pass_before_its_pin() {
+        let grace = std::time::Duration::from_secs(2);
+        let root = tempfile::tempdir().unwrap();
+        let operator = opendal::Operator::new(
+            opendal::services::Fs::default().root(root.path().to_str().unwrap()),
+        )
+        .unwrap()
+        .finish();
+        let store = S3SnapshotStore::new(operator, "snapshots")
+            .with_references(SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: BTreeSet::from([1]),
+                per_group_voters: BTreeMap::new(),
+            })
+            .with_gc_grace(grace);
+        let current = store
+            .upload(test_key(7, "current"), b"current".to_vec().into())
+            .await
+            .unwrap();
+        store.publish_reference(7, &current).await.unwrap();
+        let old = store
+            .upload(test_key(7, "old"), b"unchanged".to_vec().into())
+            .await
+            .unwrap();
+        tokio::time::sleep(grace.saturating_add(std::time::Duration::from_millis(500))).await;
+
+        let upload = store
+            .upload(test_key(7, "build"), b"unchanged".to_vec().into())
+            .await
+            .unwrap();
+        // Another node's GC pass, before the build pins its upload.
+        assert_eq!(
+            store.prune_retired(7, &current).await.unwrap(),
+            SnapshotPrune::Pruned { deleted: 1 }
+        );
+        assert!(is_gone(store.download(&old).await));
+        assert_eq!(store.download(&upload).await.unwrap(), b"unchanged");
     }
 }

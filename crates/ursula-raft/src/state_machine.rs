@@ -2123,6 +2123,96 @@ pub struct RaftGroupSnapshotBuilder {
     references: Arc<SnapshotReferences>,
 }
 
+impl RaftGroupSnapshotBuilder {
+    /// Uploads the group's snapshot under this node's pin, which lands
+    /// before the object does (#687). A GC pass that lists the object then
+    /// lists the pin too, and one that listed before the pin never sees the
+    /// object, whose name is fresh. Falls back to an inline snapshot when
+    /// the staging, the pin, the write or its verification fails. The lease
+    /// keeps the pin until the build ends. A pin whose object never becomes
+    /// current is dropped at the node's next reconcile, and a restart's
+    /// reconcile drops the pin of a build the restart cut short.
+    async fn upload_pinned(
+        &self,
+        key: SnapshotKey,
+        snapshot: &Arc<GroupSnapshot>,
+    ) -> Result<(SnapshotLocation, Option<SnapshotReferenceLease>), io::Error> {
+        let snapshot_id = key.snapshot_id.clone();
+        let group = self.placement.raft_group_id.0;
+        let staged = match self
+            .snapshot_store
+            .stage(key, group_snapshot_frames(Arc::clone(snapshot)))
+            .await
+        {
+            Ok(staged) => staged,
+            Err(err) => {
+                tracing::warn!(
+                    snapshot_id,
+                    error = %err,
+                    "falling back to inline OpenRaft snapshot after external snapshot upload failed"
+                );
+                return Ok((inline_snapshot_location(snapshot)?, None));
+            }
+        };
+        let reference = match self
+            .references
+            .prepare(&self.snapshot_store, group, staged.location())
+            .await
+        {
+            Ok(reference) => reference,
+            Err(err) => {
+                tracing::warn!(snapshot_id, %err, "falling back to inline snapshot after external pin failure");
+                return Ok((inline_snapshot_location(snapshot)?, None));
+            }
+        };
+        let written = self.snapshot_store.write_staged(staged).await;
+        // An upload that never becomes current, because a newer install
+        // overtakes this build or its write fails after it landed, has no
+        // retirement to delete it: a GC pass G later does (#669).
+        self.references.schedule_pass_after_upload();
+        let location = match written {
+            Ok(location) => location,
+            Err(err) => {
+                tracing::warn!(
+                    snapshot_id,
+                    error = %err,
+                    "falling back to inline OpenRaft snapshot after external snapshot upload failed"
+                );
+                return Ok((inline_snapshot_location(snapshot)?, None));
+            }
+        };
+        // Re-stat immediately so a silent partial-success (multipart
+        // Complete failing after the parts uploaded, opendal retry caching,
+        // etc.) is caught HERE rather than 10 minutes later as an
+        // install_snapshot NotFound on a follower. Cheap relative to the
+        // upload itself.
+        match self.snapshot_store.verify_uploaded(&location).await {
+            Ok(()) => Ok((location, reference)),
+            Err(err) => {
+                tracing::warn!(
+                    snapshot_id,
+                    error = %err,
+                    "falling back to inline OpenRaft snapshot after external snapshot verification failed"
+                );
+                Ok((inline_snapshot_location(snapshot)?, None))
+            }
+        }
+    }
+}
+
+/// The group's snapshot as an inline location, for a build whose external
+/// upload failed.
+fn inline_snapshot_location(snapshot: &Arc<GroupSnapshot>) -> Result<SnapshotLocation, io::Error> {
+    Ok(SnapshotLocation::Inline {
+        bytes: group_snapshot_frames(Arc::clone(snapshot))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| err.into_io())?
+            .into_iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect(),
+    })
+}
+
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
     async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
         self.apply_health
@@ -2146,82 +2236,10 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             raft_group_id: self.placement.raft_group_id.0,
             snapshot_id: snapshot_id.clone(),
         };
-        let location = match self
-            .snapshot_store
-            .upload_iter(key, group_snapshot_frames(Arc::clone(snapshot)))
-            .await
-        {
-            Ok(location) => {
-                // An upload that never becomes current, because a newer
-                // install overtakes this build or its pin fails, has no
-                // retirement to delete it: a GC pass G later does (#669).
-                self.references.schedule_pass_after_upload();
-                // Re-stat immediately so a silent partial-success (multipart
-                // Complete failing after the parts uploaded, opendal retry
-                // caching, etc.) is caught HERE rather than 10 minutes later
-                // as an install_snapshot NotFound on a follower. Cheap
-                // relative to the upload itself.
-                match self.snapshot_store.verify_uploaded(&location).await {
-                    Ok(()) => location,
-                    Err(err) => {
-                        tracing::warn!(
-                            snapshot_id,
-                            error = %err,
-                            "falling back to inline OpenRaft snapshot after external snapshot verification failed"
-                        );
-                        SnapshotLocation::Inline {
-                            bytes: group_snapshot_frames(Arc::clone(snapshot))
-                                .collect::<Result<Vec<_>, _>>()
-                                .map_err(|err| err.into_io())?
-                                .into_iter()
-                                .flat_map(|chunk| chunk.to_vec())
-                                .collect(),
-                        }
-                    }
-                }
-            }
-            Err(err) => {
-                tracing::warn!(
-                    snapshot_id,
-                    error = %err,
-                    "falling back to inline OpenRaft snapshot after external snapshot upload failed"
-                );
-                SnapshotLocation::Inline {
-                    bytes: group_snapshot_frames(Arc::clone(snapshot))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|err| err.into_io())?
-                        .into_iter()
-                        .flat_map(|chunk| chunk.to_vec())
-                        .collect(),
-                }
-            }
-        };
-        let mut pointer = SnapshotPointer {
+        let (location, reference) = self.upload_pinned(key, snapshot).await?;
+        let pointer = SnapshotPointer {
             snapshot_id: snapshot_id.clone(),
             location,
-        };
-        let reference = match self
-            .references
-            .prepare(
-                &self.snapshot_store,
-                self.placement.raft_group_id.0,
-                &pointer.location,
-            )
-            .await
-        {
-            Ok(reference) => reference,
-            Err(err) => {
-                tracing::warn!(snapshot_id, %err, "falling back to inline snapshot after external pin failure");
-                pointer.location = SnapshotLocation::Inline {
-                    bytes: group_snapshot_frames(Arc::clone(snapshot))
-                        .collect::<Result<Vec<_>, _>>()
-                        .map_err(|err| err.into_io())?
-                        .into_iter()
-                        .flat_map(|chunk| chunk.to_vec())
-                        .collect(),
-                };
-                None
-            }
         };
         let pointer_bytes = pointer.encode_binary().map_err(|err| err.into_io())?;
         let external_upload = !matches!(pointer.location, SnapshotLocation::Inline { .. });
