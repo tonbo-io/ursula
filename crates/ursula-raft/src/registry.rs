@@ -323,9 +323,9 @@ pub enum SnapshotInstallError {
     ShuttingDown { group: RaftGroupId },
     #[error(transparent)]
     Group(#[from] GroupEngineError),
-    #[error("publish installed snapshot reference: {0}")]
+    #[error("publish installed snapshot reference")]
     Publication(#[source] ursula_runtime::SnapshotStoreError),
-    #[error("snapshot install task failed: {0}")]
+    #[error("snapshot install task failed")]
     Task(#[source] crate::rt::task::JoinError),
     /// The node's snapshot install gate closed while the install waited for
     /// a permit.
@@ -1620,7 +1620,11 @@ impl RaftGroupHandleRegistry {
             .prepare(&snapshot_store, raft_group_id.0, &location)
             .await
             .map_err(|err| {
-                GroupEngineError::new(format!("pin incoming snapshot before install: {err}"))
+                // The pins go with P3's owned objects, and this site with them.
+                GroupEngineError::new(format!(
+                    "pin incoming snapshot before install: {}",
+                    ErrorChain(&err)
+                ))
             })?;
         let snapshot_bytes =
             snapshot_store

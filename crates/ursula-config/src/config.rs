@@ -690,11 +690,12 @@ impl RaftSnapshotConfig {
 }
 
 /// The prefix of a node's snapshot objects (`storage.snapshot.s3_prefix`),
-/// parsed once, where the config is read. It is one or more `/`-separated
-/// components of ASCII letters, digits, `-`, `_` and `.`, other than `.` and
-/// `..`, so no object store rewrites a key under it: no empty component, no
-/// whitespace, no leading or trailing `/`. A leading or trailing `/` in the
-/// config is trimmed.
+/// parsed once, where the config is read, whatever the snapshot backend.
+/// Every leading and trailing `/` of the configured text is trimmed. What
+/// is left must be one or more components separated by single `/`s, each
+/// of ASCII letters, digits, `-`, `_` and `.` and none of them `.` or `..`,
+/// so no object store rewrites a key under it. Any other character,
+/// whitespace included, is refused before the trimming.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct SnapshotPrefix(String);

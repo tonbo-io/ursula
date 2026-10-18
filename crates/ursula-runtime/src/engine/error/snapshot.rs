@@ -25,8 +25,9 @@ pub enum GroupSnapshotError {
     /// a store that holds no objects. `directory` is `None` in the last case.
     #[error(
         "raft group {raft_group_id:?}: the persisted snapshot names {key}, outside this node's \
-         snapshot directory {directory:?}. Start the node with its raft.wal.path directory \
-         emptied to rejoin as a wiped node"
+         snapshot directory {}. Start the node with its raft.wal.path directory emptied to \
+         rejoin as a wiped node",
+        .directory.as_deref().unwrap_or("none")
     )]
     ForeignKey {
         raft_group_id: RaftGroupId,

@@ -722,7 +722,7 @@ pub enum SnapshotStoreError {
     /// (`found: None`, Ursula 0.5.x and earlier).
     #[error("{}", group_snapshot_epoch_refusal(*.found))]
     UnsupportedVersion { found: Option<u32> },
-    #[error("snapshot io: {0}")]
+    #[error("snapshot io")]
     Io(#[from] io::Error),
 }
 

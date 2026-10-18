@@ -143,7 +143,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         config.raft.snapshot_gc_grace(),
     )
     .map_err(|err| RuntimeError::ColdStoreConfig {
-        message: err.to_string(),
+        message: ursula_runtime::ErrorChain(&err).to_string(),
     })?;
     let mut engine_config = RaftEngineConfig::from(&config.raft);
     let configured_snapshot_drive_interval_ms = config
