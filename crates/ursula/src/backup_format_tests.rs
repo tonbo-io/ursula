@@ -13,6 +13,14 @@
 //! `tenant-a/keyed` has a producer whose epoch 0 a claim of epoch 1 closed.
 //! `tenant-a/ttl` and `tenant-a/expiring` have a TTL and an expiry time.
 //! `tenant-c` was purged, and `tenant-a/gone` was deleted after a cold flush.
+//! The TTL (3,000,000,000 s) and the expiry time (2100-01-01) are deliberate:
+//! the two streams must stay live whenever this test runs, so do not shorten
+//! them.
+//!
+//! The fixture was generated at tag `v0.8.2` on CI by an ignored test in
+//! `crates/ursula/src/tests.rs`, commits `f9c3558d` and `789048bb` (kept on
+//! the branch `fixture-gen/backup-format-4`), in the runs `39096527009` and
+//! `39096752584` (the second wrote these files).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -343,10 +351,13 @@ async fn a_0_8_2_backup_restores_through_ursulactl() {
         Body::empty(),
     )
     .await;
-    assert!(
-        response.status().is_client_error(),
-        "an erased bucket refuses writes: {:?}",
-        response.status()
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        ursula_headers::ErrorBody::parse(&body_bytes(response).await)
+            .expect("an error body")
+            .code,
+        ursula_headers::ErrorCode::BucketErased,
+        "an erased bucket refuses writes"
     );
     let response = get(&app, "/tenant-a/gone?offset=0").await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);

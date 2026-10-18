@@ -293,8 +293,8 @@ impl PeerCluster {
                 tracing::error!(
                     peer_address = ?remote,
                     "refusing Raft traffic from a sender that names no cluster id (a node \
-                     before format epoch 4, or a stray client); check the peer lists of the \
-                     nodes at that address"
+                     before format epoch {CLUSTER_ID_EPOCH}, or a stray client); check the peer \
+                     lists of the nodes at that address"
                 );
             }
             return Err(PeerClusterError::MissingClusterId);

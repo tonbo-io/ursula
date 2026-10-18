@@ -396,16 +396,18 @@ mod tests {
         let err = classify_data_dir(&old).unwrap_err();
         assert!(err.to_string().contains("without a format marker"), "{err}");
 
-        // E2: another epoch.
-        let other = root.path().join("other");
-        fs::create_dir_all(&other).unwrap();
-        write_marker_file(&other, FORMAT_EPOCH + 1);
-        let err = classify_data_dir(&other).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains(&format!("is format epoch {}", FORMAT_EPOCH + 1)),
-            "{err}"
-        );
+        // E2: another epoch, such as epoch 4 (Ursula 0.8).
+        for epoch in [4, FORMAT_EPOCH + 1] {
+            let other = root.path().join(format!("other-{epoch}"));
+            fs::create_dir_all(&other).unwrap();
+            write_marker_file(&other, epoch);
+            let err = classify_data_dir(&other).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains(&format!("is format epoch {epoch}")),
+                "{err}"
+            );
+        }
     }
 
     fn memory_namespace(operator: &Operator, namespace: &str) -> FormatEpochNamespace {

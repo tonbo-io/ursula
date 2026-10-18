@@ -547,7 +547,7 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 
 **0.9.0 is a breaking release.** It changes the storage and protocol format to format epoch 5. A 0.9 node refuses epoch-4 Raft WAL directories and object-storage prefixes at startup and refuses 0.8 peers, and a 0.8 node refuses 0.9 peers. There is no in-place upgrade, no rolling upgrade and no rollback. Backups keep backup format 4, so `ursulactl restore` of 0.9 restores 0.8 backups into a fresh 0.9 cluster. If you cannot move your data yet, stay on 0.8.2.
 
-1. **Back up the 0.8 cluster** with the 0.8 `ursulactl`: run `backup-create`, then `backup-verify`. Once the backup verifies, stop the 0.8 nodes so that their cold objects stop changing.
+1. **Back up the 0.8 cluster** with the 0.8 `ursulactl`. First stop client writes, or accept that writes 0.8 acknowledges after a group's export are missing from 0.9. Then run `backup-create` and `backup-verify`. Once the backup verifies, stop the 0.8 nodes so that their cold objects stop changing.
 2. **Install 0.9 fresh.** Use empty PVCs and never-used prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.8, or a failed upgrade attempt, wrote to. Keep the 0.8 cluster's `server.cluster_id` (Helm `server.clusterId`) and `raft.group_count`.
 3. **Copy the cold objects** into the 0.9 cluster's cold root after the 0.9 nodes have written their `URSULA_FORMAT_EPOCH` marker. Skip the marker and `snapshots/` ([Copying cold objects](#copying-cold-objects)).
 4. **Restore with the 0.9 `ursulactl`.** `ursulactl restore` checks the copy against every group's references and then imports each group.

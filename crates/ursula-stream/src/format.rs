@@ -1,5 +1,6 @@
 //! Format epoch: the one version number for everything Ursula persists or
-//! sends between nodes, and the backup format, which follows it.
+//! sends between nodes, and the backup format, which moves only when what a
+//! backup holds changes.
 //!
 //! Epoch 1 is the format of Ursula 0.5.x and earlier, and of main builds
 //! before format epoch 2 landed. Epoch 2 is the format of Ursula 0.6. Epoch 3
