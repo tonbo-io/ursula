@@ -1,18 +1,26 @@
 //! The faulty in-memory snapshot store under madsim (#687, P4's store).
 //!
-//! Three nodes share one bucket with PUT faults at rates the seed picks and
-//! stale LISTs on. Each node builds snapshots one after another and runs
-//! an owner's GC pass after each: it lists its directory and deletes every
-//! listed key but the one it names. Its requests interleave with the other
-//! nodes' by the simulated delays. The run checks I1 and I2 at every step
-//! and, once the store settled and a strict pass ran on every node, I5.
+//! These cases exercise the store, the gates and the checkers. They barely
+//! exercise ownership itself, which needs P3's protocol and P4's
+//! scenarios:
 //!
-//! The gated case runs a build concurrently with a GC pass on one node
-//! through `GatedSnapshotStore`: the gates force the build's PUT before the
-//! pass's LIST and its commit between the pass's read of the holds and its
-//! DELETEs. With the lease taken before the PUT, I1 holds. Its negative
-//! control takes the lease after the PUT, and the pass deletes the key the
-//! node then names.
+//! - `run_nodes`: three nodes share one bucket with PUT faults at rates the
+//!   seed picks and stale LISTs on. Each node builds and then runs an
+//!   owner's pass, one after the other, so a node never races itself, and
+//!   every node deletes only through its own store, so I2 cannot fail. I1
+//!   and I2 are checked at every step and I5 once quiet, right after a
+//!   fault-free pass.
+//! - The gated case: a build against a pass on one node, in one order the
+//!   gates force. Its seeds change only the delays, so they explore no
+//!   other order.
+//! - The concurrent case: a build and a pass on one node with no gates,
+//!   so the seed picks the order. With the lease after the PUT, I1 breaks
+//!   on some seeds, one of them pinned.
+//!
+//! The negative controls switch the toy pass of this file, not a
+//! `sim_controls::Defence` of production code. P4 still owes the controls
+//! `LeaseAfterPut`, `HoldsBeforeList`, `NoInstallCopy`, `NoSendHold`,
+//! `SnapshotGcOff` and `PassBeforeRestore` on P3's protocol.
 //!
 //! Every seed runs twice and must log the same requests and gate events.
 
@@ -136,8 +144,9 @@ async fn run_nodes(seed: u64) -> (Vec<SnapshotStoreEvent>, BTreeMap<u64, Option<
         let (node_id, path) = task.await.expect("node task");
         named.insert(node_id, path);
     }
-    // Quiet: every late PUT landed, and a strict pass ran on every node.
-    bucket.settle();
+    // Quiet: simulated time passed every late PUT's landing, and a strict
+    // pass ran on every node.
+    bucket.wait_for_late_puts().await;
     bucket.set_faults(SnapshotStoreFaults::none());
     for (node_id, path) in &named {
         pass(&bucket.store(*node_id), path.as_ref()).await;
@@ -299,4 +308,117 @@ fn snapshot_store_harness_negative_control_lease_after_put_breaks_i1() {
             first.i1
         );
     }
+}
+
+/// The seeds of the concurrent case: wide, since only some seeds reach the
+/// order that breaks the control.
+const CONCURRENT_SEEDS: std::ops::RangeInclusive<u64> = 1..=32;
+/// Builds against passes per seed in the concurrent case.
+const ROUNDS: u64 = 8;
+
+/// What one concurrent run saw.
+#[derive(Debug, PartialEq, Eq)]
+struct ConcurrentRun {
+    bucket: Vec<SnapshotStoreEvent>,
+    /// The first round after which I1 failed, and how.
+    broken: Option<(u64, SnapshotInvariantViolation)>,
+}
+
+/// Rounds of a build and a pass on one node, run as concurrent tasks with
+/// no gates, so the seed's delays pick the order of the build's PUT, lease
+/// and commit against the pass's LIST, read of the holds and DELETEs.
+async fn run_concurrent_build_and_pass(seed: u64, lease_before_put: bool) -> ConcurrentRun {
+    let bucket = bucket(seed, SnapshotStoreFaults {
+        request_start_delay: DelayRange::between(Duration::ZERO, MAX_DELAY),
+        request_end_delay: DelayRange::between(Duration::ZERO, MAX_DELAY),
+        ..SnapshotStoreFaults::none()
+    });
+    let store = Arc::new(bucket.store(NODE));
+    let holds: Arc<Mutex<BTreeSet<String>>> = Arc::default();
+    let mut current: Option<String> = None;
+    let mut broken = None;
+    for round in 1..=ROUNDS {
+        let builder = {
+            let (store, holds, previous) =
+                (Arc::clone(&store), Arc::clone(&holds), current.clone());
+            madsim::task::spawn(async move {
+                let body = chunks(format!("round-{round}"));
+                let staged = store.stage(GROUP, round, body).await.expect("stage");
+                let path = staged_path(&staged);
+                if lease_before_put {
+                    holds.lock().expect("holds").insert(path.clone());
+                }
+                store.write_staged(staged).await.expect("put");
+                let mut held = holds.lock().expect("holds");
+                held.insert(path.clone());
+                // The commit: the new key is current, the old one released.
+                if let Some(previous) = previous {
+                    held.remove(&previous);
+                }
+                path
+            })
+        };
+        let gc = {
+            let (store, holds) = (Arc::clone(&store), Arc::clone(&holds));
+            madsim::task::spawn(async move {
+                let listing = store.list_own(GROUP).await.expect("list");
+                let held = holds.lock().expect("holds").clone();
+                for object in listing.owned {
+                    if !held.contains(object.path()) {
+                        store.delete_own(object).await.expect("delete");
+                    }
+                }
+            })
+        };
+        let path = builder.await.expect("build");
+        gc.await.expect("pass");
+        current = Some(path);
+        let names = NodeNames::new(NODE, current.clone());
+        if broken.is_none()
+            && let Err(violation) = check_named_keys_exist(&bucket.view(), [&names])
+        {
+            broken = Some((round, violation));
+        }
+    }
+    ConcurrentRun {
+        bucket: bucket.events(),
+        broken,
+    }
+}
+
+#[test]
+fn snapshot_store_harness_concurrent_build_and_pass_replays() {
+    let _guard = sim_test_guard();
+    for seed in CONCURRENT_SEEDS {
+        let first = run_with_madsim(seed, run_concurrent_build_and_pass(seed, true));
+        let second = run_with_madsim(seed, run_concurrent_build_and_pass(seed, true));
+        assert_eq!(first, second, "seed {seed} replays");
+        assert_eq!(
+            first.broken, None,
+            "seed {seed}: a key leased before its PUT stays"
+        );
+    }
+}
+
+#[test]
+fn snapshot_store_harness_negative_control_concurrent_lease_after_put_breaks_i1() {
+    let _guard = sim_test_guard();
+    let mut breaking = Vec::new();
+    for seed in CONCURRENT_SEEDS {
+        let first = run_with_madsim(seed, run_concurrent_build_and_pass(seed, false));
+        let second = run_with_madsim(seed, run_concurrent_build_and_pass(seed, false));
+        assert_eq!(first, second, "seed {seed} replays");
+        if let Some((round, violation)) = first.broken {
+            assert!(matches!(
+                violation,
+                SnapshotInvariantViolation::NamedKeyMissing { node_id: NODE, .. }
+            ));
+            breaking.push((seed, round));
+        }
+    }
+    println!("a lease after the PUT breaks I1 on (seed, round): {breaking:?}");
+    assert!(
+        !breaking.is_empty(),
+        "a lease after the PUT breaks I1 on some seed of {CONCURRENT_SEEDS:?}"
+    );
 }

@@ -215,6 +215,94 @@ async fn a_late_put_can_land_before_its_error_answers() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn a_retried_create_lands_its_bytes_and_answers_a_name_collision() {
+    let bucket = MemorySnapshotBucket::new(
+        7,
+        prefix(),
+        SnapshotStoreFaults::none().with_collided_retries(PerMille::ALWAYS),
+    );
+    let store = bucket.store(1);
+    let staged = store.stage(GROUP, 3, body(b"own bytes")).await.unwrap();
+    let location = staged.location();
+    let path = staged_path(&staged);
+    assert!(matches!(
+        store.write_staged(staged).await,
+        Err(SnapshotStoreError::NameCollision { ref key }) if *key == path
+    ));
+    assert_eq!(bucket.keys(), BTreeSet::from([path.clone()]));
+    assert_eq!(store.download(&location).await.unwrap(), b"own bytes");
+    assert!(bucket.events().contains(&SnapshotStoreEvent::Put {
+        node_id: 1,
+        path,
+        outcome: PutOutcome::CreatedThenCollided,
+    }));
+}
+
+#[tokio::test(start_paused = true)]
+async fn waiting_for_late_puts_advances_time_and_lands_nothing_early() {
+    let bucket = MemorySnapshotBucket::new(
+        7,
+        prefix(),
+        only(|faults| {
+            faults.late_put = PerMille::ALWAYS;
+            faults.late_put_delay = DelayRange::fixed(Duration::from_secs(30));
+        }),
+    );
+    let store = bucket.store(1);
+    let (first, _failed) = build(&store, 1, b"a").await;
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let (second, _failed) = build(&store, 2, b"b").await;
+    let started = tokio::time::Instant::now();
+    bucket.wait_for_late_puts().await;
+    // The second PUT's landing, 30 s after it acted, is the last.
+    assert_eq!(started.elapsed(), Duration::from_secs(30));
+    assert_eq!(bucket.pending_late_puts(), 0);
+    assert_eq!(
+        bucket.keys(),
+        BTreeSet::from([first.clone(), second.clone()])
+    );
+    let landed: Vec<SnapshotStoreEvent> = bucket
+        .events()
+        .into_iter()
+        .filter(|event| matches!(event, SnapshotStoreEvent::LatePutLanded { .. }))
+        .collect();
+    assert_eq!(landed, [
+        SnapshotStoreEvent::LatePutLanded { path: first },
+        SnapshotStoreEvent::LatePutLanded { path: second },
+    ]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_late_landing_takes_its_place_in_the_stale_list_history() {
+    let bucket = MemorySnapshotBucket::new(
+        7,
+        prefix(),
+        only(|faults| {
+            faults.late_put = PerMille::ALWAYS;
+            faults.late_put_delay = DelayRange::fixed(Duration::from_secs(10));
+        }),
+    );
+    let store = bucket.store(1);
+    let (late, _failed) = build(&store, 1, b"late").await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    // Written after the late PUT's landing time, before any request lands it.
+    let raw = "snapshots/node-1/group-0/00000000000000000002-0000000000000002.snap";
+    bucket.insert_raw(raw, b"raw".to_vec());
+    // A window of one: only the newest change, the raw write, is eligible,
+    // although the late PUT is recorded after it.
+    bucket.set_faults(SnapshotStoreFaults::none().with_stale_lists(PerMille::ALWAYS, 1, LONG_AGO));
+    let mut listed_late = 0;
+    for _ in 0..16 {
+        let listing = store.list_own(GROUP).await.unwrap();
+        let paths: BTreeSet<&str> = listing.owned.iter().map(|object| object.path()).collect();
+        if paths.contains(late.as_str()) {
+            listed_late += 1;
+        }
+    }
+    assert_eq!(listed_late, 16, "the late PUT is never misreported");
+}
+
+#[tokio::test(start_paused = true)]
 async fn settling_lands_every_late_put() {
     let bucket = MemorySnapshotBucket::new(
         7,

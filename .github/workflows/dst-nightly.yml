@@ -164,8 +164,6 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             external_locators_survive --nocapture
 
-      # Recovery-gate scenarios beyond the PR subset that ci.yml's DST job
-      # runs: same tests, larger seed ranges.
       # The snapshot store harness (#687) beyond the PR seeds.
       - name: Run snapshot store harness (nightly ranges)
         env:
@@ -174,6 +172,8 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             snapshot_store_harness --nocapture
 
+      # Recovery-gate scenarios beyond the PR subset that ci.yml's DST job
+      # runs: same tests, larger seed ranges.
       - name: Run recovery-gate scenarios (nightly ranges)
         env:
           RECOVERY_GATE_SEEDS: "1..=24"

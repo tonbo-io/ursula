@@ -9,6 +9,8 @@
 //!
 //! - a PUT that answers with an error and lands anyway, before or after
 //!   the answer, or that never lands
+//! - a PUT that lands its own bytes and then answers `NameCollision`, as a
+//!   retried create that finds its own first attempt
 //! - a LIST that omits recently created keys and repeats recently deleted
 //!   ones, for changes younger than a bound
 //! - a create that succeeds only if no object has the name (If-None-Match),
@@ -32,6 +34,14 @@
 //! nothing, so on the protocol before P3 its objects only accumulate. GC is
 //! the owner's pass over [`SnapshotStore::list_own`] and
 //! [`SnapshotStore::delete_own`] that P3 brings.
+//!
+//! Quiescence. [`MemorySnapshotBucket::settle`] lands every late PUT at
+//! once, pulling future landings forward. That hides the second GC pass P3
+//! owes one install timeout after a failed write, so a simulation reaches
+//! quiescence with [`MemorySnapshotBucket::wait_for_late_puts`] instead,
+//! which advances simulated time until the last late PUT landed. For that
+//! to model the protocol, `late_put_delay.max` must stay at or below the
+//! protocol's second-pass delay (`raft.install_snapshot_timeout`).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -175,6 +185,10 @@ pub struct SnapshotStoreFaults {
     pub late_put_delay: DelayRange,
     /// A PUT that answers with an error and never lands.
     pub lost_put: PerMille,
+    /// A PUT that creates its object and answers `NameCollision`, as the S3
+    /// store's retried create does when its first attempt landed but timed
+    /// out: the retry finds its own object. Opt in.
+    pub collided_retry: PerMille,
     /// A LIST that is stale: each eligible recent create in its directory
     /// is left out, and each eligible recent delete listed again, with even
     /// odds.
@@ -207,6 +221,7 @@ impl SnapshotStoreFaults {
             late_put: PerMille::NEVER,
             late_put_delay: DelayRange::ZERO,
             lost_put: PerMille::NEVER,
+            collided_retry: PerMille::NEVER,
             stale_list: PerMille::NEVER,
             stale_window: 0,
             stale_for: Duration::ZERO,
@@ -262,6 +277,14 @@ impl SnapshotStoreFaults {
         }
     }
 
+    /// PUTs that land and answer `NameCollision`, at `rate`.
+    pub fn with_collided_retries(self, rate: PerMille) -> Self {
+        Self {
+            collided_retry: rate,
+            ..self
+        }
+    }
+
     /// The opt-in failures: DELETEs that fail, DELETEs whose answer is lost
     /// and transient LIST, GET and HEAD errors.
     pub fn with_failed_requests(
@@ -291,6 +314,8 @@ pub enum PutOutcome {
     Late { after: Duration },
     /// The PUT answered an error, and nothing lands.
     Lost,
+    /// The object was created and the PUT answered `NameCollision`.
+    CreatedThenCollided,
 }
 
 /// How a DELETE answered.
@@ -447,8 +472,8 @@ impl MemorySnapshotBucket {
 
     /// An empty bucket that records a DELETE outside the deleting node's
     /// directory and lets it go ahead as S3 would, for a negative control
-    /// of I2. It panics when dropped unless [`Self::foreign_deletes`] or
-    /// [`Self::view`] took every recorded one.
+    /// of I2. It panics when dropped unless [`Self::foreign_deletes`] took
+    /// every recorded one.
     pub fn recording_foreign_deletes(
         seed: u64,
         prefix: SnapshotPrefix,
@@ -509,11 +534,25 @@ impl MemorySnapshotBucket {
         self.state().faults = faults;
     }
 
-    /// Lands every late PUT now, in the order they were due, as a quiet
-    /// store eventually does. Logged as each landing.
+    /// Lands every late PUT now, in the order they were due, logged as each
+    /// landing. It pulls future landings forward, which hides the second GC
+    /// pass a protocol owes after a failed write: a simulation uses
+    /// [`Self::wait_for_late_puts`] instead.
     pub fn settle(&self) {
         let now = Instant::now();
         self.state().land_all(now);
+    }
+
+    /// Advances time, simulated under madsim, until every late PUT pending
+    /// now landed, then lands them, logged as each landing. Nothing lands
+    /// before its time.
+    pub async fn wait_for_late_puts(&self) {
+        let last = self.state().pending.iter().map(|put| put.lands_at).max();
+        if let Some(last) = last {
+            wait(last.saturating_duration_since(Instant::now())).await;
+        }
+        let now = Instant::now();
+        self.state().land_due(now);
     }
 
     /// The late PUTs that have not landed by now.
@@ -575,11 +614,12 @@ impl MemorySnapshotBucket {
 
     /// What the invariant checkers read: every object with its logical
     /// bytes and age, late PUTs that are due included, and every DELETE
-    /// the bucket served or refused, which marks the foreign ones read.
-    /// It changes nothing in the bucket.
+    /// the bucket served or refused. It changes nothing in the bucket, and
+    /// does not take the recorded foreign deletes
+    /// ([`Self::foreign_deletes`]).
     pub fn view(&self) -> SnapshotStoreView {
         let now = Instant::now();
-        let mut state = self.state();
+        let state = self.state();
         let objects = state
             .current_objects(now)
             .into_iter()
@@ -590,26 +630,18 @@ impl MemorySnapshotBucket {
                 (path, ViewObject { bytes, age })
             })
             .collect();
-        let mut foreign = 0usize;
         let deletes = state
             .events
             .iter()
             .filter_map(|event| match event {
-                SnapshotStoreEvent::Delete { node_id, path, .. } => Some(StoreDelete {
+                SnapshotStoreEvent::Delete { node_id, path, .. }
+                | SnapshotStoreEvent::ForeignDelete { node_id, path } => Some(StoreDelete {
                     node_id: *node_id,
                     path: path.clone(),
                 }),
-                SnapshotStoreEvent::ForeignDelete { node_id, path } => {
-                    foreign = foreign.saturating_add(1);
-                    Some(StoreDelete {
-                        node_id: *node_id,
-                        path: path.clone(),
-                    })
-                }
                 _ => None,
             })
             .collect();
-        state.foreign_deletes_read = foreign;
         SnapshotStoreView {
             prefix: self.shared.prefix.clone(),
             objects,
@@ -659,8 +691,15 @@ fn later(now: Instant, delay: Duration) -> Instant {
 }
 
 impl BucketState {
+    /// Records a change in time order: a late PUT lands at its own time,
+    /// which may be before changes already recorded.
     fn record_change(&mut self, kind: ChangeKind, path: String, at: Instant) {
-        self.changes.push_back(Change { kind, path, at });
+        let position = self
+            .changes
+            .iter()
+            .rposition(|change| change.at <= at)
+            .map_or(0, |index| index.saturating_add(1));
+        self.changes.insert(position, Change { kind, path, at });
         while self.changes.len() > HISTORY_CAPACITY {
             self.changes.pop_front();
         }
@@ -778,7 +817,11 @@ impl BucketState {
                 ..object
             });
             self.record_change(ChangeKind::Created, path.clone(), now);
-            PutOutcome::Created
+            if faults.collided_retry.draw(&mut self.rng) {
+                PutOutcome::CreatedThenCollided
+            } else {
+                PutOutcome::Created
+            }
         };
         self.events.push(SnapshotStoreEvent::Put {
             node_id,
@@ -787,7 +830,9 @@ impl BucketState {
         });
         match outcome {
             PutOutcome::Created => Ok(()),
-            PutOutcome::NameCollision => Err(SnapshotStoreError::NameCollision { key: path }),
+            PutOutcome::NameCollision | PutOutcome::CreatedThenCollided => {
+                Err(SnapshotStoreError::NameCollision { key: path })
+            }
             PutOutcome::Late { .. } | PutOutcome::Lost => Err(injected(
                 SnapshotStoreOperation::Put,
                 path,
@@ -956,7 +1001,10 @@ fn compress(chunks: SnapshotBytesIterator) -> Result<(Vec<u8>, u64), SnapshotSto
 
 /// The log index a snapshot id ends with (`group-{gid}-{leader}-{index}`).
 /// An id without one, as `group-{gid}-empty`, is refused: an owned key
-/// needs the index, and no index is made up for it.
+/// needs the index, and no index is made up for it. Only the legacy
+/// `upload` path names a snapshot by id. OpenRaft alpha.37 leaves the id
+/// empty, so after the bump that path is always refused, and P3, which
+/// stages builds and copies by their log index, removes it.
 fn snapshot_index(snapshot_id: &str) -> Result<u64, SnapshotStoreError> {
     snapshot_id
         .rsplit_once('-')

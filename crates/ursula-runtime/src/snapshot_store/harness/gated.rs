@@ -18,6 +18,12 @@
 //! LIST and its DELETEs, hold `After(ListOwn)`, start the pass, wait for its
 //! arrival, run the build's lease, `write_staged` and commit, then release.
 //!
+//! The wrapper builds the wrapped store's future before the operation
+//! reaches its first gate, and awaits it only after that gate. A store
+//! whose method does work outside its future, before the future is first
+//! polled, does that work before the gate. Every method of the stores in
+//! this crate does its work inside the future.
+//!
 //! The order of passes comes from the tickets, never from the order in
 //! which [`Notify`] wakes the waiters, and the gates draw nothing at
 //! random. Under madsim the wake-ups are scheduled from the seed, so a
