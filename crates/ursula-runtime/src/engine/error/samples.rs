@@ -30,6 +30,8 @@ use super::LeadershipRefusal;
 use super::MembershipInitRefusal;
 use super::Proposal;
 use super::ResponseKind;
+use super::SnapshotObjectCheck;
+use super::SnapshotStoreOperation;
 use super::StaticMembershipProblem;
 use super::StreamRefusal;
 use super::UnproposableCommand;
@@ -604,11 +606,74 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
             StreamSnapshotError::ColdGcWithoutGeneration { seq: 6 }
         },
     });
+    let key = || "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.snap".to_owned();
     let mut errors = every!(GroupSnapshotError {
         GroupSnapshotError::InvalidContent(_) => GroupSnapshotError::InvalidContent(
             StreamSnapshotError::DuplicateBucket("first".to_owned()),
         ),
+        GroupSnapshotError::ForeignKey { .. } => GroupSnapshotError::ForeignKey {
+            raft_group_id: GROUP,
+            key: "snapshots/node-10/group-7/00000000000000000042-00000000000000ab.snap"
+                .to_owned(),
+            prefix: "snapshots/node-1/group-7/".to_owned(),
+        },
+        GroupSnapshotError::ObjectMissing { .. } => GroupSnapshotError::ObjectMissing {
+            raft_group_id: GROUP,
+            key: key(),
+        },
+        GroupSnapshotError::ObjectCorrupt { .. } => GroupSnapshotError::ObjectCorrupt {
+            raft_group_id: GROUP,
+            key: key(),
+            check: SnapshotObjectCheck::Decompress,
+        },
+        GroupSnapshotError::PointerUnreadable { .. } => {
+            GroupSnapshotError::PointerUnreadable { raft_group_id: GROUP }
+        },
+        GroupSnapshotError::StoreUnavailable { .. } => GroupSnapshotError::StoreUnavailable {
+            raft_group_id: GROUP,
+            key: key(),
+            operation: SnapshotStoreOperation::Get,
+        },
     });
     errors.extend(contents.into_iter().map(GroupSnapshotError::InvalidContent));
+    errors.extend(
+        every!(SnapshotObjectCheck {
+            SnapshotObjectCheck::StoredSize { .. } => SnapshotObjectCheck::StoredSize {
+                expected: 10,
+                actual: 9,
+            },
+            SnapshotObjectCheck::LogicalSize { .. } => SnapshotObjectCheck::LogicalSize {
+                expected: 20,
+                actual: 19,
+            },
+            SnapshotObjectCheck::Decompress => SnapshotObjectCheck::Decompress,
+            SnapshotObjectCheck::Decode => SnapshotObjectCheck::Decode,
+        })
+        .into_iter()
+        // The sample above carries this check.
+        .filter(|check| *check != SnapshotObjectCheck::Decompress)
+        .map(|check| GroupSnapshotError::ObjectCorrupt {
+            raft_group_id: GROUP,
+            key: key(),
+            check,
+        }),
+    );
+    errors.extend(
+        every_unit!(SnapshotStoreOperation {
+            Get,
+            Head,
+            Put,
+            List,
+            Delete
+        })
+        .into_iter()
+        // The sample above carries this operation.
+        .filter(|operation| *operation != SnapshotStoreOperation::Get)
+        .map(|operation| GroupSnapshotError::StoreUnavailable {
+            raft_group_id: GROUP,
+            key: key(),
+            operation,
+        }),
+    );
     errors
 }

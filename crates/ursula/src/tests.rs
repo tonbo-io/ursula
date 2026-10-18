@@ -8020,8 +8020,9 @@ mod snapshot_driver {
                 self.uploads.send_modify(|uploads| {
                     uploads.running = uploads.running.saturating_sub(1);
                 });
-                released
-                    .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))?;
+                released.map_err(|_closed| {
+                    SnapshotStoreError::Io(std::io::Error::other("the gate is gone"))
+                })?;
                 Ok(SnapshotLocation::Inline {
                     bytes: bytes.to_vec(),
                 })
@@ -8032,7 +8033,7 @@ mod snapshot_driver {
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("inline only".into())) })
+            Box::pin(async { Err(SnapshotStoreError::Io(std::io::Error::other("inline only"))) })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -8052,7 +8053,9 @@ mod snapshot_driver {
                     .wait_for(|held| !*held)
                     .await
                     .map(|_released| ursula_runtime::SnapshotPrune::Unmanaged)
-                    .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))
+                    .map_err(|_closed| {
+                        SnapshotStoreError::Io(std::io::Error::other("the gate is gone"))
+                    })
             })
         }
     }
@@ -8223,7 +8226,7 @@ mod snapshot_driver {
             .await
             .expect("read the current snapshot")
             .expect("a current snapshot");
-        let pointer = ursula_runtime::SnapshotPointer::decode(snapshot.snapshot.get_ref())
+        let pointer = ursula_runtime::SnapshotPointer::decode(snapshot.snapshot.pointer_bytes())
             .expect("decode the snapshot pointer");
         let SnapshotLocation::Inline { bytes } = &pointer.location else {
             panic!("an inline snapshot: {:?}", pointer.location);
@@ -8776,7 +8779,7 @@ mod snapshot_driver {
                             found = found.saturating_add(1);
                         }
                     }
-                    Err(SnapshotStoreError::NotFound(_)) => {}
+                    Err(SnapshotStoreError::NotFound { .. }) => {}
                     Err(err) => panic!("read {location:?}: {err}"),
                 }
             }
@@ -10487,14 +10490,22 @@ mod leadership_shed {
             _key: SnapshotKey,
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(SnapshotStoreError::Io(std::io::Error::other(
+                    "probe-only store",
+                )))
+            })
         }
 
         fn download<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(SnapshotStoreError::Io(std::io::Error::other(
+                    "probe-only store",
+                )))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -10509,7 +10520,11 @@ mod leadership_shed {
             let led = led_by(&self.registry, 1);
             self.probes
                 .send_modify(|probes| probes.push((led, shedding)));
-            Box::pin(async { Err(SnapshotStoreError::Backend("the store is down".into())) })
+            Box::pin(async {
+                Err(SnapshotStoreError::Io(std::io::Error::other(
+                    "the store is down",
+                )))
+            })
         }
     }
 

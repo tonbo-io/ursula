@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -65,6 +64,7 @@ use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::PeerIdentity;
 use crate::raft_internal_proto;
 use crate::rejoin::GroupRejoin;
+use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -833,7 +833,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             decode_rpc_payload(&request.snapshot_meta, "full snapshot meta")?;
         let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
             meta,
-            snapshot: Cursor::new(request.snapshot_payload.to_vec()),
+            snapshot: SnapshotData::new(request.snapshot_payload.to_vec()),
         };
         let response = self
             .registry
@@ -1982,7 +1982,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
             vote: encode_wire(&vote),
             snapshot_meta: encode_wire(&snapshot.meta),
-            snapshot_payload: snapshot.snapshot.into_inner().into(),
+            snapshot_payload: snapshot.snapshot.into_pointer_bytes().into(),
         };
         GRPC_SNAPSHOT_REQUESTS.fetch_add(1, Ordering::Relaxed);
         GRPC_SNAPSHOT_REQUEST_BYTES.fetch_add(request.encoded_len() as u64, Ordering::Relaxed);
@@ -2899,7 +2899,14 @@ mod group_rpc_status_tests {
                 | GroupInfraError::RecoveryPlanFenced { .. }
                 | GroupInfraError::OwnerStopped
                 | GroupInfraError::ApplyStopped { .. }
-                | GroupInfraError::OutcomeUnknown => Code::Unavailable,
+                | GroupInfraError::OutcomeUnknown
+                | GroupInfraError::Snapshot(
+                    GroupSnapshotError::ForeignKey { .. }
+                    | GroupSnapshotError::ObjectMissing { .. }
+                    | GroupSnapshotError::ObjectCorrupt { .. }
+                    | GroupSnapshotError::PointerUnreadable { .. }
+                    | GroupSnapshotError::StoreUnavailable { .. },
+                ) => Code::Unavailable,
                 GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(_))
                 | GroupInfraError::RecoveryNodeMismatch { .. }
                 | GroupInfraError::RecoveryAlreadyBound { .. }

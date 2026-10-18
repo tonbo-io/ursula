@@ -690,7 +690,14 @@ fn every_group_engine_error_answers_its_table_row() {
                 GroupInfraError::ColdStore { .. } => {
                     (StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
                 }
-                GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(_))
+                GroupInfraError::Snapshot(
+                    GroupSnapshotError::InvalidContent(_)
+                    | GroupSnapshotError::ForeignKey { .. }
+                    | GroupSnapshotError::ObjectMissing { .. }
+                    | GroupSnapshotError::ObjectCorrupt { .. }
+                    | GroupSnapshotError::PointerUnreadable { .. }
+                    | GroupSnapshotError::StoreUnavailable { .. },
+                )
                 | GroupInfraError::RecoveryNodeMismatch { .. }
                 | GroupInfraError::RaftGroupNotRegistered { .. }
                 | GroupInfraError::RecoveryAlreadyBound { .. }

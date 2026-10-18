@@ -1568,13 +1568,13 @@ async fn a_lost_vote_refuses_heartbeat_ack_until_the_proven_floor_is_durable() {
     let proven = UrsulaVote::new_committed(4, 2);
     let snapshot = || openraft::Snapshot {
         meta: Default::default(),
-        snapshot: std::io::Cursor::new(Vec::new()),
+        snapshot: crate::types::SnapshotData::new(Vec::new()),
     };
     // Another install holds the node's only install permit. A refused
     // install answers without queueing for it.
     let busy = registry
         .snapshot_install_coordinator()
-        .acquire()
+        .acquire(placement().raft_group_id)
         .await
         .unwrap();
     assert!(matches!(

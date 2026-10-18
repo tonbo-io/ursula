@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
-use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -62,8 +61,10 @@ use crate::snapshot_codec::decode_group_snapshot;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
+use crate::state_machine::location_key;
 use crate::types::RaftGroupMetricsSnapshot;
 use crate::types::RaftLogProgressSnapshot;
+use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -303,7 +304,11 @@ pub struct SnapshotGcPass {
     pub left: usize,
 }
 
-/// Failure of snapshot admission, owned installation, or reference publication.
+/// Failure of snapshot admission, of the prefetch and copy of an incoming
+/// snapshot, of its installation, or of reference publication. It never
+/// leaves this crate as a value: each transport converts it once, the gRPC
+/// plane by [`From`] into `tonic::Status` and the in-process network by
+/// [`SnapshotInstallError::peer_backs_off`].
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotInstallError {
     #[error("snapshot group {group:?} is not registered")]
@@ -316,17 +321,129 @@ pub enum SnapshotInstallError {
     Publication(#[source] ursula_runtime::SnapshotStoreError),
     #[error("snapshot install task failed: {0}")]
     Task(#[source] crate::rt::task::JoinError),
+    /// The node's snapshot install gate closed while the install waited for
+    /// a permit.
+    #[error("snapshot group {group:?}: the snapshot install gate is closed")]
+    GateClosed { group: RaftGroupId },
+    /// The incoming snapshot data is no snapshot pointer.
+    #[error("snapshot group {group:?}: the incoming snapshot pointer does not decode")]
+    PointerUndecodable {
+        group: RaftGroupId,
+        #[source]
+        source: ursula_runtime::SnapshotStoreError,
+    },
+    /// The object the incoming pointer names is gone. The sender sends its
+    /// current pointer on the next attempt.
+    #[error("snapshot group {group:?}: the incoming snapshot object {source_key} is missing")]
+    SourceMissing {
+        group: RaftGroupId,
+        source_key: String,
+    },
+    /// The object the incoming pointer names did not read.
+    #[error("snapshot group {group:?}: read the incoming snapshot object {source_key}")]
+    SourceRead {
+        group: RaftGroupId,
+        source_key: String,
+        #[source]
+        source: ursula_runtime::SnapshotStoreError,
+    },
+    /// The incoming snapshot's group state does not decode.
+    #[error("snapshot group {group:?}: incoming snapshot {snapshot_id} does not decode")]
+    Undecodable {
+        group: RaftGroupId,
+        snapshot_id: String,
+        #[source]
+        source: ursula_runtime::SnapshotStoreError,
+    },
+    /// Writing this node's copy of the incoming snapshot failed.
+    #[error("snapshot group {group:?}: write the snapshot copy {own_key}")]
+    CopyWrite {
+        group: RaftGroupId,
+        own_key: String,
+        #[source]
+        source: ursula_runtime::SnapshotStoreError,
+    },
+    /// This node's copy of the incoming snapshot stores other bytes than the
+    /// source.
+    #[error(
+        "snapshot group {group:?}: the snapshot copy {own_key} stores {actual} bytes, expected \
+         {expected}"
+    )]
+    CopyVerify {
+        group: RaftGroupId,
+        own_key: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// The name drawn for this node's copy was taken, also on the retry.
+    #[error("snapshot group {group:?}: the snapshot copy name {own_key} is taken")]
+    NameCollision { group: RaftGroupId, own_key: String },
+    /// The prefetched pointer handed to OpenRaft did not encode.
+    #[error("snapshot group {group:?}: encode the prefetched snapshot pointer")]
+    PointerEncode {
+        group: RaftGroupId,
+        #[source]
+        source: ursula_runtime::SnapshotStoreError,
+    },
+}
+
+impl SnapshotInstallError {
+    /// The gRPC code the sender gets for every refusal but
+    /// [`Self::Group`], which [`crate::grpc::group_rpc_status`] classifies.
+    /// No refusal is `FAILED_PRECONDITION` (#539).
+    fn code(&self) -> tonic::Code {
+        match self {
+            Self::NotRegistered { .. } => tonic::Code::NotFound,
+            Self::PointerUndecodable { .. } => tonic::Code::InvalidArgument,
+            Self::Undecodable { .. } => tonic::Code::DataLoss,
+            Self::PointerEncode { .. } => tonic::Code::Internal,
+            Self::Group(error) => {
+                if error.peer_backs_off() {
+                    tonic::Code::Unavailable
+                } else {
+                    tonic::Code::Internal
+                }
+            }
+            Self::ShuttingDown { .. }
+            | Self::Publication(_)
+            | Self::Task(_)
+            | Self::GateClosed { .. }
+            | Self::SourceMissing { .. }
+            | Self::SourceRead { .. }
+            | Self::CopyWrite { .. }
+            | Self::CopyVerify { .. }
+            | Self::NameCollision { .. } => tonic::Code::Unavailable,
+        }
+    }
+
+    /// Whether the sender should back off before it sends again: the
+    /// refusals the gRPC plane answers `UNAVAILABLE`.
+    pub fn peer_backs_off(&self) -> bool {
+        self.code() == tonic::Code::Unavailable
+    }
 }
 
 impl From<SnapshotInstallError> for tonic::Status {
     fn from(error: SnapshotInstallError) -> Self {
         match error {
-            SnapshotInstallError::NotRegistered { .. } => Self::not_found(error.to_string()),
-            SnapshotInstallError::ShuttingDown { .. } => Self::unavailable(error.to_string()),
             SnapshotInstallError::Group(error) => crate::grpc::group_rpc_status(error),
-            error => Self::unavailable(error.to_string()),
+            error => Self::new(error.code(), error.to_string()),
         }
     }
+}
+
+/// Why a snapshot built outside OpenRaft's own build path failed
+/// ([`RaftGroupHandleRegistry::build_snapshot_for_transfer`], tests and
+/// fault injection only).
+#[cfg(any(test, feature = "fault-injection"))]
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotBuildError {
+    /// The group is not registered, or its Raft stopped.
+    #[error(transparent)]
+    Group(#[from] GroupEngineError),
+    /// The state machine's build failed.
+    #[error("build the group's snapshot")]
+    Build(#[source] std::io::Error),
 }
 
 #[derive(Debug)]
@@ -1341,7 +1458,7 @@ impl RaftGroupHandleRegistry {
         // only after both resources are available; shutdown rejects stale waiters.
         let lock = self.snapshot_install.install_lock(raft_group_id.0);
         let serial = lock.lock_owned().await;
-        let permit = self.snapshot_install.acquire().await?;
+        let permit = self.snapshot_install.acquire(raft_group_id).await?;
         let raft = entry.raft().clone();
         let rejoin = entry.recovery.clone();
         let history = entry.history.clone();
@@ -1365,7 +1482,7 @@ impl RaftGroupHandleRegistry {
                 .map_err(crate::owner::owner_stopped)?;
             let already_current = current.as_ref().is_some_and(|current| {
                 current.meta == snapshot.meta
-                    && current.snapshot.get_ref() == snapshot.snapshot.get_ref()
+                    && current.snapshot.pointer_bytes() == snapshot.snapshot.pointer_bytes()
             });
             let prefetched = if already_current {
                 PrefetchedInstallSnapshot {
@@ -1466,28 +1583,28 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
-    ) -> Result<PrefetchedInstallSnapshot, GroupEngineError> {
-        let pointer_bytes = snapshot.snapshot.into_inner();
-        let pointer = SnapshotPointer::decode(&pointer_bytes).map_err(|err| {
-            GroupEngineError::new(format!("decode OpenRaft snapshot pointer: {err}"))
-        })?;
+    ) -> Result<PrefetchedInstallSnapshot, SnapshotInstallError> {
+        let group = raft_group_id;
+        let pointer_bytes = snapshot.snapshot.into_pointer_bytes();
+        let pointer = SnapshotPointer::decode(&pointer_bytes)
+            .map_err(|source| SnapshotInstallError::PointerUndecodable { group, source })?;
         let SnapshotPointer {
             snapshot_id,
             location,
         } = pointer;
         if let SnapshotLocation::Inline { bytes } = &location {
             let history = decode_group_snapshot(bytes)
-                .map_err(|err| {
-                    GroupEngineError::new(format!(
-                        "decode inline OpenRaft snapshot {snapshot_id}: {err}"
-                    ))
+                .map_err(|source| SnapshotInstallError::Undecodable {
+                    group,
+                    snapshot_id: snapshot_id.clone(),
+                    source,
                 })?
                 .stream_snapshot
                 .history;
             return Ok(PrefetchedInstallSnapshot {
                 snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
                     meta: snapshot.meta,
-                    snapshot: Cursor::new(pointer_bytes),
+                    snapshot: SnapshotData::new(pointer_bytes),
                 },
                 guard: None,
                 history: Some(history),
@@ -1503,15 +1620,29 @@ impl RaftGroupHandleRegistry {
             .map_err(|err| {
                 GroupEngineError::new(format!("pin incoming snapshot before install: {err}"))
             })?;
-        let snapshot_bytes = snapshot_store.download(&location).await.map_err(|err| {
-            GroupEngineError::new(format!(
-                "prefetch OpenRaft snapshot {snapshot_id} before install: {err}"
-            ))
-        })?;
-        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| {
-            GroupEngineError::new(format!(
-                "decode prefetched OpenRaft snapshot {snapshot_id}: {err}"
-            ))
+        let snapshot_bytes =
+            snapshot_store
+                .download(&location)
+                .await
+                .map_err(|source| match source {
+                    ursula_runtime::SnapshotStoreError::NotFound { key } => {
+                        SnapshotInstallError::SourceMissing {
+                            group,
+                            source_key: key,
+                        }
+                    }
+                    source => SnapshotInstallError::SourceRead {
+                        group,
+                        source_key: location_key(&location),
+                        source,
+                    },
+                })?;
+        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|source| {
+            SnapshotInstallError::Undecodable {
+                group,
+                snapshot_id: snapshot_id.clone(),
+                source,
+            }
         })?;
         drop(snapshot_bytes);
         let history = group_snapshot.stream_snapshot.history;
@@ -1530,15 +1661,13 @@ impl RaftGroupHandleRegistry {
             snapshot_install: self.snapshot_install.clone(),
             cache_key,
         };
-        let pointer_bytes = pointer.encode_binary().map_err(|err| {
-            GroupEngineError::new(format!(
-                "encode prefetched OpenRaft snapshot pointer: {err}"
-            ))
-        })?;
+        let pointer_bytes = pointer
+            .encode_binary()
+            .map_err(|source| SnapshotInstallError::PointerEncode { group, source })?;
         Ok(PrefetchedInstallSnapshot {
             snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
                 meta: snapshot.meta,
-                snapshot: Cursor::new(pointer_bytes),
+                snapshot: SnapshotData::new(pointer_bytes),
             },
             guard: Some(guard),
             history: Some(history),
@@ -1625,7 +1754,7 @@ impl RaftGroupHandleRegistry {
     pub async fn build_snapshot_for_transfer(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, GroupEngineError> {
+    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, SnapshotBuildError> {
         let raft = self.require_group(raft_group_id)?;
         let snapshot = raft
             .with_state_machine(|state_machine| {
@@ -1635,8 +1764,8 @@ impl RaftGroupHandleRegistry {
                 })
             })
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft build snapshot: {err}")))?
-            .map_err(|err| GroupEngineError::new(format!("build OpenRaft snapshot: {err}")))?;
+            .map_err(crate::owner::owner_stopped)?
+            .map_err(SnapshotBuildError::Build)?;
         Ok(snapshot)
     }
 
@@ -1749,9 +1878,9 @@ mod tests {
         ) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
                 if self.fail_pin.load(Ordering::SeqCst) {
-                    return Err(SnapshotStoreError::Backend(
-                        "temporary pin PUT outage".to_owned(),
-                    ));
+                    return Err(SnapshotStoreError::Io(std::io::Error::other(
+                        "temporary pin PUT outage",
+                    )));
                 }
                 if let SnapshotLocation::S3 { key, .. } = location {
                     self.pins.lock().unwrap().insert(key.clone());
@@ -1766,9 +1895,9 @@ mod tests {
         ) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
                 if self.fail_current.load(Ordering::SeqCst) {
-                    return Err(SnapshotStoreError::Backend(
-                        "temporary current-reference PUT outage".to_owned(),
-                    ));
+                    return Err(SnapshotStoreError::Io(std::io::Error::other(
+                        "temporary current-reference PUT outage",
+                    )));
                 }
                 if self.pause_current.load(Ordering::SeqCst) {
                     self.entered_current.notify_one();
@@ -2083,11 +2212,11 @@ mod tests {
                 assert_eq!(metrics.last_applied.unwrap().index(), 1);
                 assert!(store.pins.lock().unwrap().contains("reference-fault.snap"));
                 let snapshot = raft.get_snapshot().await.unwrap().unwrap();
-                let pointer = SnapshotPointer::decode(snapshot.snapshot.get_ref()).unwrap();
+                let pointer = SnapshotPointer::decode(snapshot.snapshot.pointer_bytes()).unwrap();
                 assert_eq!(pointer.snapshot_id, "reference-fault");
                 assert_eq!(
-                    snapshot.snapshot.get_ref(),
-                    reference_failure_snapshot().snapshot.get_ref()
+                    snapshot.snapshot.pointer_bytes(),
+                    reference_failure_snapshot().snapshot.pointer_bytes()
                 );
                 assert!(
                     matches!(pointer.location, SnapshotLocation::S3 { .. }),
@@ -2197,7 +2326,7 @@ mod tests {
             .flat_map(|chunk| chunk.to_vec())
             .collect();
         let mut snapshot = reference_failure_snapshot();
-        snapshot.snapshot = Cursor::new(
+        snapshot.snapshot = SnapshotData::new(
             SnapshotPointer {
                 snapshot_id: snapshot.meta.snapshot_id.clone(),
                 location: SnapshotLocation::Inline { bytes },
@@ -2318,8 +2447,10 @@ mod tests {
             .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("same"))
             .await
             .unwrap();
-        let first_pointer = SnapshotPointer::decode(first.snapshot.snapshot.get_ref()).unwrap();
-        let second_pointer = SnapshotPointer::decode(second.snapshot.snapshot.get_ref()).unwrap();
+        let first_pointer =
+            SnapshotPointer::decode(first.snapshot.snapshot.pointer_bytes()).unwrap();
+        let second_pointer =
+            SnapshotPointer::decode(second.snapshot.snapshot.pointer_bytes()).unwrap();
         assert_ne!(first_pointer.snapshot_id, second_pointer.snapshot_id);
         drop(first);
         assert!(
@@ -2451,7 +2582,7 @@ mod tests {
             std::time::Duration::from_secs(60),
         ));
         let location = |id: &str| {
-            SnapshotPointer::decode(external_snapshot(id).snapshot.get_ref())
+            SnapshotPointer::decode(external_snapshot(id).snapshot.pointer_bytes())
                 .unwrap()
                 .location
         };
@@ -2528,11 +2659,13 @@ mod tests {
 
         fn download<'a>(
             &'a self,
-            _location: &'a SnapshotLocation,
+            location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
             let bytes = self.bytes.clone();
             Box::pin(async move {
-                bytes.ok_or_else(|| SnapshotStoreError::NotFound("test snapshot missing".into()))
+                bytes.ok_or_else(|| SnapshotStoreError::NotFound {
+                    key: location_key(location),
+                })
             })
         }
 
@@ -2580,7 +2713,7 @@ mod tests {
         };
         TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
             meta: snapshot_meta(snapshot_id),
-            snapshot: Cursor::new(pointer.encode_binary().expect("encode test pointer")),
+            snapshot: SnapshotData::new(pointer.encode_binary().expect("encode test pointer")),
         }
     }
 
@@ -2596,7 +2729,8 @@ mod tests {
             .await
             .expect("prefetch external snapshot");
 
-        let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
+        let pointer =
+            SnapshotPointer::decode(prefetched.snapshot.snapshot.pointer_bytes()).unwrap();
         assert_ne!(
             pointer.snapshot_id, "snapshot-a",
             "each admitted handoff has its own transient token"
@@ -2663,7 +2797,8 @@ mod tests {
             .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-unconsumed"))
             .await
             .expect("prefetch external snapshot");
-        let pointer = SnapshotPointer::decode(prefetched.snapshot.snapshot.get_ref()).unwrap();
+        let pointer =
+            SnapshotPointer::decode(prefetched.snapshot.snapshot.pointer_bytes()).unwrap();
         drop(prefetched);
 
         assert!(
@@ -2685,8 +2820,20 @@ mod tests {
             .await
             .expect_err("missing snapshot should fail before OpenRaft install");
 
-        assert!(err.message().contains("prefetch OpenRaft snapshot missing"));
-        assert!(err.message().contains("snapshot not found"));
+        assert!(
+            matches!(
+                &err,
+                SnapshotInstallError::SourceMissing { group, source_key }
+                    if *group == RaftGroupId(7)
+                        && source_key == "missing.snap"
+            ),
+            "{err:?}"
+        );
+        assert!(
+            err.peer_backs_off(),
+            "the sender retries with its current pointer"
+        );
+        assert_eq!(tonic::Status::from(err).code(), tonic::Code::Unavailable);
     }
 
     #[tokio::test]
@@ -2701,14 +2848,15 @@ mod tests {
         };
         let snapshot = TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
             meta: snapshot_meta("inline"),
-            snapshot: Cursor::new(pointer.encode_binary().expect("encode test pointer")),
+            snapshot: SnapshotData::new(pointer.encode_binary().expect("encode test pointer")),
         };
 
         let prefetched = registry
             .prefetch_snapshot_for_install(RaftGroupId(7), snapshot)
             .await
             .expect("inline snapshot does not touch snapshot store");
-        let pointer = SnapshotPointer::decode(&prefetched.snapshot.snapshot.into_inner()).unwrap();
+        let pointer =
+            SnapshotPointer::decode(&prefetched.snapshot.snapshot.into_pointer_bytes()).unwrap();
         assert!(matches!(pointer.location, SnapshotLocation::Inline { .. }));
     }
 

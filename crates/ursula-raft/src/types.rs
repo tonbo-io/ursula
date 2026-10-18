@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::io::Cursor;
 use std::time::Duration;
 
 use openraft::alias::VoteOf;
@@ -13,6 +12,8 @@ use serde::Serialize;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
+use ursula_runtime::KeyHold;
+use ursula_runtime::SnapshotLocation;
 use ursula_shard::RaftGroupId;
 
 /// Under `fsync = always`, how long the per-core journal writer waits for the
@@ -35,9 +36,44 @@ openraft::declare_raft_types!(
         D = GroupWriteCommand,
         R = RaftGroupResponse,
         Node = openraft::BasicNode,
-        SnapshotData = Cursor<Vec<u8>>,
+        SnapshotData = crate::types::SnapshotData,
         AsyncRuntime = OpenRaftRuntime,
 );
+
+/// What a group snapshot carries through OpenRaft: the encoded
+/// [`ursula_runtime::SnapshotPointer`], and a hold on the object it names
+/// for as long as OpenRaft keeps the snapshot, as during a send. No snapshot
+/// takes a hold yet, so the lease is `None` everywhere.
+#[derive(Debug, Clone)]
+pub struct SnapshotData {
+    pointer_bytes: Vec<u8>,
+    lease: Option<KeyHold<SnapshotLocation>>,
+}
+
+impl SnapshotData {
+    /// The snapshot data of `pointer_bytes`, holding nothing.
+    pub fn new(pointer_bytes: Vec<u8>) -> Self {
+        Self {
+            pointer_bytes,
+            lease: None,
+        }
+    }
+
+    /// The encoded snapshot pointer.
+    pub fn pointer_bytes(&self) -> &[u8] {
+        &self.pointer_bytes
+    }
+
+    /// The encoded snapshot pointer, ending the hold.
+    pub fn into_pointer_bytes(self) -> Vec<u8> {
+        self.pointer_bytes
+    }
+
+    /// The hold on the object the pointer names, if the data holds one.
+    pub fn lease(&self) -> Option<&KeyHold<SnapshotLocation>> {
+        self.lease.as_ref()
+    }
+}
 
 /// The Raft log bytes an entry is counted as: what the snapshot cadence
 /// adds when the entry is applied, what it weighs in the WAL's entry cache,

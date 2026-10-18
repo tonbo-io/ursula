@@ -1042,14 +1042,22 @@ mod tests {
             _key: SnapshotKey,
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(SnapshotStoreError::Io(std::io::Error::other(
+                    "probe-only store",
+                )))
+            })
         }
 
         fn download<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(SnapshotStoreError::Io(std::io::Error::other(
+                    "probe-only store",
+                )))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -1077,7 +1085,9 @@ mod tests {
                 }
                 tokio::time::sleep(latency).await;
                 if fails {
-                    Err(SnapshotStoreError::Backend("scripted probe failure".into()))
+                    Err(SnapshotStoreError::Io(std::io::Error::other(
+                        "scripted probe failure",
+                    )))
                 } else {
                     Ok(())
                 }

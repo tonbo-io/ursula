@@ -33,6 +33,8 @@
 //!   expiry sweep and `TidyStream`.
 //! - [`expiry_sweep`]: the leader's background sweep of expired streams
 //!   through the dedicated `ExpireStreams` command (F0, #669).
+//! - [`key_holds`]: in-memory holds on object keys, which a deleter that
+//!   lists the store leaves alone, with a drop behaviour per set.
 
 mod admission;
 pub mod cold_index;
@@ -48,6 +50,7 @@ mod error;
 pub mod expiry_sweep;
 pub mod format_marker;
 mod group_actor;
+pub mod key_holds;
 mod metrics;
 mod ops;
 mod read_index;
@@ -192,6 +195,8 @@ pub use engine::LeadershipRefusal;
 pub use engine::MembershipInitRefusal;
 pub use engine::Proposal;
 pub use engine::ResponseKind;
+pub use engine::SnapshotObjectCheck;
+pub use engine::SnapshotStoreOperation;
 pub use engine::StaticMembershipProblem;
 pub use engine::StreamRefusal;
 pub use engine::UnproposableCommand;
@@ -206,6 +211,9 @@ pub use engine::in_memory::next_repair_cursor;
 pub use engine::in_memory::repair_cold_index_response;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
+pub use key_holds::HoldDrop;
+pub use key_holds::KeyHold;
+pub use key_holds::KeyHolds;
 pub use metrics::RaftDeletedDataSample;
 pub use metrics::RaftLogPressureSample;
 pub use metrics::RuntimeMailboxSnapshot;
@@ -287,19 +295,32 @@ pub use runtime::SweptPart;
 pub use runtime::SweptPartsObserver;
 pub use runtime::unix_time_ms;
 pub use snapshot_store::InlineSnapshotStore;
+pub use snapshot_store::NotOwned;
+pub use snapshot_store::OwnListing;
+pub use snapshot_store::OwnedKey;
+pub use snapshot_store::OwnedKeyError;
+pub use snapshot_store::OwnedKeyProblem;
+pub use snapshot_store::OwnedNamespace;
+pub use snapshot_store::OwnedPointer;
 #[cfg(not(madsim))]
 pub use snapshot_store::S3SnapshotStore;
 pub use snapshot_store::SharedSnapshotStore;
+pub use snapshot_store::SnapshotBackend;
 pub use snapshot_store::SnapshotBytesIterator;
 pub use snapshot_store::SnapshotCompression;
 pub use snapshot_store::SnapshotKey;
 pub use snapshot_store::SnapshotLocation;
+pub use snapshot_store::SnapshotLocationKind;
+pub use snapshot_store::SnapshotOwner;
 pub use snapshot_store::SnapshotPointer;
 pub use snapshot_store::SnapshotPrune;
 pub use snapshot_store::SnapshotReferenceConfig;
 pub use snapshot_store::SnapshotStore;
+pub use snapshot_store::SnapshotStoreConfigProblem;
 pub use snapshot_store::SnapshotStoreError;
 pub use snapshot_store::SnapshotStoreFuture;
+pub use snapshot_store::StagedObject;
+pub use snapshot_store::StagedSnapshot;
 pub use snapshot_store::decode_snapshot_envelope;
 pub use snapshot_store::default_snapshot_store;
 pub use snapshot_store::encode_binary_envelope;

@@ -456,7 +456,7 @@ impl RaftGroupEngine {
         state_machine
             .restore_persisted_snapshot()
             .await
-            .map_err(|err| GroupEngineError::new(format!("restore OpenRaft snapshot: {err}")))?;
+            .map_err(GroupEngineError::from)?;
         // One page cache per group, shared by the read path and the state
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.

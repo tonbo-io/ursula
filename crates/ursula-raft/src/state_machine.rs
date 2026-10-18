@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::io;
-use std::io::Cursor;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,7 +38,9 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupSnapshot;
+use ursula_runtime::GroupSnapshotError;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::InMemoryGroupEngine;
@@ -52,11 +53,15 @@ use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotKey;
 use ursula_runtime::SnapshotLocation;
+use ursula_runtime::SnapshotObjectCheck;
 use ursula_runtime::SnapshotPointer;
+use ursula_runtime::SnapshotStoreError;
+use ursula_runtime::SnapshotStoreOperation;
 use ursula_runtime::decode_snapshot_envelope;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::encode_binary_envelope;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use crate::engine::group_engine_io_error;
@@ -67,6 +72,7 @@ use crate::log_store::disk::JournalFile;
 use crate::log_store::disk::create_dir_all_durable;
 use crate::log_store::elapsed_ns;
 use crate::log_store::replace_file;
+use crate::registry::SnapshotInstallError;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::watch;
@@ -79,6 +85,7 @@ use crate::snapshot_codec::group_snapshot_frames;
 use crate::snapshot_references::SnapshotReferenceLease;
 use crate::snapshot_references::SnapshotReferences;
 use crate::types::RaftGroupResponse;
+use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
 #[derive(Debug, Clone)]
@@ -1359,13 +1366,16 @@ impl SnapshotInstallCoordinator {
             .collect()
     }
 
-    pub async fn acquire(&self) -> Result<OwnedSemaphorePermit, GroupEngineError> {
+    pub async fn acquire(
+        &self,
+        group: RaftGroupId,
+    ) -> Result<OwnedSemaphorePermit, SnapshotInstallError> {
         self.inner
             .semaphore
             .clone()
             .acquire_owned()
             .await
-            .map_err(|err| GroupEngineError::new(format!("snapshot install gate closed: {err}")))
+            .map_err(|_closed| SnapshotInstallError::GateClosed { group })
     }
 
     pub(crate) fn install_lock(&self, group: u32) -> Arc<crate::rt::sync::Mutex<()>> {
@@ -1451,6 +1461,165 @@ impl SnapshotInstallCoordinator {
     #[cfg(test)]
     fn available_permits(&self) -> usize {
         self.inner.semaphore.available_permits()
+    }
+}
+
+/// Why this node's persisted snapshot did not restore when its group's
+/// engine opened. It keeps every source, and converts once, into the
+/// group's error, at the engine boundary.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SnapshotRestoreError {
+    /// The snapshot metadata file did not read or become durable.
+    #[error("raft group {raft_group_id:?}: read the persisted snapshot metadata")]
+    Metadata {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: io::Error,
+    },
+    /// The snapshot metadata file holds no snapshot pointer.
+    #[error("raft group {raft_group_id:?}: decode the persisted snapshot pointer")]
+    Pointer {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: SnapshotStoreError,
+    },
+    /// Protecting or reading the object the pointer names failed.
+    #[error("raft group {raft_group_id:?}: restore snapshot object {key}")]
+    Object {
+        raft_group_id: RaftGroupId,
+        key: String,
+        #[source]
+        source: SnapshotStoreError,
+    },
+    /// The object's body does not decode as a group snapshot.
+    #[error("raft group {raft_group_id:?}: decode snapshot object {key}")]
+    Content {
+        raft_group_id: RaftGroupId,
+        key: String,
+        #[source]
+        source: SnapshotStoreError,
+    },
+    /// The engine refused the restored snapshot.
+    #[error(transparent)]
+    Engine(GroupEngineError),
+}
+
+impl From<SnapshotRestoreError> for GroupEngineError {
+    fn from(error: SnapshotRestoreError) -> Self {
+        let refusal = match error {
+            SnapshotRestoreError::Engine(error) => return error,
+            SnapshotRestoreError::Metadata {
+                raft_group_id,
+                source,
+            } => {
+                tracing::error!(?raft_group_id, error = %source, "the persisted snapshot metadata does not read");
+                GroupSnapshotError::PointerUnreadable { raft_group_id }
+            }
+            SnapshotRestoreError::Pointer {
+                raft_group_id,
+                source,
+            } => {
+                tracing::error!(?raft_group_id, error = %source, "the persisted snapshot pointer does not decode");
+                GroupSnapshotError::PointerUnreadable { raft_group_id }
+            }
+            SnapshotRestoreError::Content {
+                raft_group_id,
+                key,
+                source,
+            } => {
+                tracing::error!(?raft_group_id, %key, error = %source, "the persisted snapshot does not decode");
+                GroupSnapshotError::ObjectCorrupt {
+                    raft_group_id,
+                    key,
+                    check: SnapshotObjectCheck::Decode,
+                }
+            }
+            SnapshotRestoreError::Object {
+                raft_group_id,
+                key,
+                source,
+            } => {
+                tracing::error!(?raft_group_id, %key, error = %source, "the persisted snapshot object does not restore");
+                object_refusal(raft_group_id, key, source)
+            }
+        };
+        GroupEngineError::Infra(GroupInfraError::Snapshot(refusal))
+    }
+}
+
+/// The restore refusal for a store failure on the object `key` names.
+fn object_refusal(
+    raft_group_id: RaftGroupId,
+    key: String,
+    error: SnapshotStoreError,
+) -> GroupSnapshotError {
+    let corrupt = |key, check| GroupSnapshotError::ObjectCorrupt {
+        raft_group_id,
+        key,
+        check,
+    };
+    match error {
+        SnapshotStoreError::NotFound { key } => {
+            GroupSnapshotError::ObjectMissing { raft_group_id, key }
+        }
+        SnapshotStoreError::SizeMismatch {
+            key,
+            expected,
+            actual,
+        } => corrupt(key, SnapshotObjectCheck::StoredSize { expected, actual }),
+        SnapshotStoreError::LogicalSizeMismatch {
+            key,
+            expected,
+            actual,
+        } => corrupt(key, SnapshotObjectCheck::LogicalSize { expected, actual }),
+        SnapshotStoreError::Decompress { key, .. } => corrupt(key, SnapshotObjectCheck::Decompress),
+        SnapshotStoreError::Backend { operation, key, .. } => {
+            GroupSnapshotError::StoreUnavailable {
+                raft_group_id,
+                key,
+                operation,
+            }
+        }
+        // An I/O failure inside the store, as of the task that runs its
+        // codec, may pass on a retry.
+        SnapshotStoreError::Io(_) => GroupSnapshotError::StoreUnavailable {
+            raft_group_id,
+            key,
+            operation: SnapshotStoreOperation::Get,
+        },
+        // The pointer names what this store does not hold, or the records
+        // that protect it do not read: no retry reads it.
+        SnapshotStoreError::NameCollision { .. }
+        | SnapshotStoreError::Compress(_)
+        | SnapshotStoreError::BodyTooLarge
+        | SnapshotStoreError::UnsupportedLocation { .. }
+        | SnapshotStoreError::ConditionalCreateUnsupported { .. }
+        | SnapshotStoreError::Config { .. }
+        | SnapshotStoreError::Open(_)
+        | SnapshotStoreError::Encryption(_)
+        | SnapshotStoreError::OutsideGroup { .. }
+        | SnapshotStoreError::InvalidReference { .. }
+        | SnapshotStoreError::ReferenceEncode(_)
+        | SnapshotStoreError::ReferenceDecode { .. }
+        | SnapshotStoreError::Serialize(_)
+        | SnapshotStoreError::Deserialize(_)
+        | SnapshotStoreError::MissingField { .. }
+        | SnapshotStoreError::ProducerFieldMissing { .. }
+        | SnapshotStoreError::ProducerDigestLength { .. }
+        | SnapshotStoreError::HistoryIdZero
+        | SnapshotStoreError::BackupDigestLength { .. }
+        | SnapshotStoreError::UnsupportedVersion { .. } => {
+            GroupSnapshotError::PointerUnreadable { raft_group_id }
+        }
+    }
+}
+
+/// The key or path of a snapshot location, for a refusal that names it.
+pub(crate) fn location_key(location: &SnapshotLocation) -> String {
+    match location {
+        SnapshotLocation::S3 { key, .. } => key.clone(),
+        SnapshotLocation::Local { path, .. } => path.display().to_string(),
+        SnapshotLocation::Inline { .. } => "inline".to_owned(),
     }
 }
 
@@ -1583,7 +1752,8 @@ impl RaftGroupStateMachine {
         }
     }
 
-    pub(crate) async fn restore_persisted_snapshot(&mut self) -> Result<(), io::Error> {
+    pub(crate) async fn restore_persisted_snapshot(&mut self) -> Result<(), SnapshotRestoreError> {
+        let raft_group_id = self.placement.raft_group_id;
         let Some(path) = &self.snapshot_metadata_path else {
             return Ok(());
         };
@@ -1591,45 +1761,59 @@ impl RaftGroupStateMachine {
             return Ok(());
         }
 
-        let mut file = Disk::open_read(path)?;
-        let length = usize::try_from(file.file_len()?)
-            .map_err(|source| io::Error::new(io::ErrorKind::InvalidData, source))?;
+        let metadata = |source| SnapshotRestoreError::Metadata {
+            raft_group_id,
+            source,
+        };
+        let mut file = Disk::open_read(path).map_err(metadata)?;
+        let length = usize::try_from(file.file_len().map_err(metadata)?)
+            .map_err(|source| metadata(io::Error::new(io::ErrorKind::InvalidData, source)))?;
         let mut bytes = vec![0; length];
-        file.read_exact(&mut bytes)?;
-        let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&bytes)
-            .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
-        let pointer = SnapshotPointer::decode(&persisted.pointer_bytes)
-            .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
+        file.read_exact(&mut bytes).map_err(metadata)?;
+        let pointer_unreadable = |source| SnapshotRestoreError::Pointer {
+            raft_group_id,
+            source,
+        };
+        let persisted =
+            decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(pointer_unreadable)?;
+        let pointer =
+            SnapshotPointer::decode(&persisted.pointer_bytes).map_err(pointer_unreadable)?;
         // A preceding process may have exited after rename but before its
         // directory fsync. Establish this visible pointer's durability before
         // reconciling away pins for the previously durable pointer.
         if let Some(parent) = path.parent() {
-            Disk::sync_dir(parent)?;
+            Disk::sync_dir(parent).map_err(metadata)?;
         }
-        let references = self
-            .snapshot_install
-            .references(self.placement.raft_group_id.0);
+        let key = location_key(&pointer.location);
+        let object = |source| SnapshotRestoreError::Object {
+            raft_group_id,
+            key: key.clone(),
+            source,
+        };
+        let references = self.snapshot_install.references(raft_group_id.0);
         let reference = references
-            .prepare(
-                &self.snapshot_store,
-                self.placement.raft_group_id.0,
-                &pointer.location,
-            )
+            .prepare(&self.snapshot_store, raft_group_id.0, &pointer.location)
             .await
-            .map_err(|err| err.into_io())?;
+            .map_err(object)?;
         let snapshot_bytes = match &pointer.location {
             SnapshotLocation::Inline { bytes } => bytes.clone(),
             location => self
                 .snapshot_store
                 .download(location)
                 .await
-                .map_err(|err| err.into_io())?,
+                .map_err(object)?,
         };
-        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|err| err.into_io())?;
+        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|source| {
+            SnapshotRestoreError::Content {
+                raft_group_id,
+                key: key.clone(),
+                source,
+            }
+        })?;
         self.engine
             .install_snapshot(group_snapshot)
             .await
-            .map_err(group_engine_io_error)?;
+            .map_err(SnapshotRestoreError::Engine)?;
         self.last_applied_log_id = persisted.meta.last_log_id;
         self.last_membership = persisted.meta.last_membership.clone();
         self.log_gauge.record_membership(&self.last_membership);
@@ -1998,7 +2182,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
     async fn begin_receiving_snapshot(
         &mut self,
     ) -> Result<SnapshotDataOf<UrsulaRaftTypeConfig>, io::Error> {
-        Ok(Cursor::new(Vec::new()))
+        Ok(SnapshotData::new(Vec::new()))
     }
 
     async fn install_snapshot(
@@ -2006,7 +2190,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
         snapshot: SnapshotDataOf<UrsulaRaftTypeConfig>,
     ) -> Result<(), io::Error> {
-        let mut pointer_bytes = snapshot.into_inner();
+        let mut pointer_bytes = snapshot.into_pointer_bytes();
         // A publication retry still passes through Raft's vote checks, but the
         // already durable snapshot needs neither download nor installation.
         if self
@@ -2098,7 +2282,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .as_ref()
             .map(|snapshot| SnapshotOf::<UrsulaRaftTypeConfig> {
                 meta: snapshot.meta.clone(),
-                snapshot: Cursor::new(snapshot.pointer_bytes.clone()),
+                snapshot: SnapshotData::new(snapshot.pointer_bytes.clone()),
             }))
     }
 }
@@ -2324,7 +2508,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         }
         Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
             meta: chosen.meta,
-            snapshot: Cursor::new(chosen.pointer_bytes),
+            snapshot: SnapshotData::new(chosen.pointer_bytes),
         })
     }
 }
@@ -2812,14 +2996,14 @@ mod tests {
         state
             .install_snapshot(
                 &test_snapshot_meta(2),
-                Cursor::new(pointer.encode_binary().unwrap()),
+                SnapshotData::new(pointer.encode_binary().unwrap()),
             )
             .await
             .unwrap();
         // Complete the upload captured at index 1 only after installing index 2.
         let returned = old_builder.build_snapshot().await.unwrap();
         assert_eq!(returned.meta.last_log_id, Some(test_log_id(2)));
-        let pointer = SnapshotPointer::decode(returned.snapshot.get_ref()).unwrap();
+        let pointer = SnapshotPointer::decode(returned.snapshot.pointer_bytes()).unwrap();
         assert_eq!(pointer.snapshot_id, "newer-install");
         // The overtaken build's upload never became current: a GC pass G
         // later deletes it (#669).
@@ -2891,8 +3075,8 @@ mod tests {
             snapshot_metadata_path: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
-        let first_pointer =
-            SnapshotPointer::decode(&first_snapshot.snapshot.into_inner()).expect("first pointer");
+        let first_pointer = SnapshotPointer::decode(&first_snapshot.snapshot.into_pointer_bytes())
+            .expect("first pointer");
 
         let mut second = RaftGroupSnapshotBuilder {
             apply_health: Default::default(),
@@ -2910,8 +3094,9 @@ mod tests {
             snapshot_metadata_path: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
-        let second_pointer = SnapshotPointer::decode(&second_snapshot.snapshot.into_inner())
-            .expect("second pointer");
+        let second_pointer =
+            SnapshotPointer::decode(&second_snapshot.snapshot.into_pointer_bytes())
+                .expect("second pointer");
 
         let first_bytes = raw_store
             .download(&first_pointer.location)
@@ -2946,8 +3131,8 @@ mod tests {
             snapshot_metadata_path: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
-        let third_pointer =
-            SnapshotPointer::decode(&third_snapshot.snapshot.into_inner()).expect("third pointer");
+        let third_pointer = SnapshotPointer::decode(&third_snapshot.snapshot.into_pointer_bytes())
+            .expect("third pointer");
 
         raw_store
             .download(&first_pointer.location)
@@ -2983,9 +3168,9 @@ mod tests {
                 _bytes: Bytes,
             ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
                 Box::pin(async move {
-                    Err(SnapshotStoreError::Backend(
-                        "seeded upload failure".to_owned(),
-                    ))
+                    Err(SnapshotStoreError::Io(std::io::Error::other(
+                        "seeded upload failure",
+                    )))
                 })
             }
 
@@ -2994,9 +3179,9 @@ mod tests {
                 _location: &'a SnapshotLocation,
             ) -> SnapshotStoreFuture<'a, Vec<u8>> {
                 Box::pin(async move {
-                    Err(SnapshotStoreError::Backend(
-                        "download should not be used".to_owned(),
-                    ))
+                    Err(SnapshotStoreError::Io(std::io::Error::other(
+                        "download should not be used",
+                    )))
                 })
             }
 
@@ -3031,8 +3216,8 @@ mod tests {
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
-        let pointer =
-            SnapshotPointer::decode(&snapshot.snapshot.into_inner()).expect("snapshot pointer");
+        let pointer = SnapshotPointer::decode(&snapshot.snapshot.into_pointer_bytes())
+            .expect("snapshot pointer");
         let SnapshotLocation::Inline { bytes } = pointer.location else {
             panic!("expected inline fallback");
         };
@@ -3048,7 +3233,10 @@ mod tests {
     async fn snapshot_install_coordinator_defaults_to_single_permit() {
         let coordinator = SnapshotInstallCoordinator::default();
 
-        let permit = coordinator.acquire().await.expect("acquire install permit");
+        let permit = coordinator
+            .acquire(ursula_shard::RaftGroupId(7))
+            .await
+            .expect("acquire install permit");
         assert_eq!(coordinator.available_permits(), 0);
 
         drop(permit);
@@ -3059,7 +3247,10 @@ mod tests {
     async fn snapshot_install_coordinator_clamps_zero_to_one_permit() {
         let coordinator = SnapshotInstallCoordinator::new(0);
 
-        let permit = coordinator.acquire().await.expect("acquire install permit");
+        let permit = coordinator
+            .acquire(ursula_shard::RaftGroupId(7))
+            .await
+            .expect("acquire install permit");
         assert_eq!(coordinator.available_permits(), 0);
 
         drop(permit);
@@ -4429,7 +4620,7 @@ mod tests {
         state_machine
             .install_snapshot(
                 &meta,
-                Cursor::new(pointer.encode_binary().expect("pointer")),
+                SnapshotData::new(pointer.encode_binary().expect("pointer")),
             )
             .await
             .expect("install inline snapshot");

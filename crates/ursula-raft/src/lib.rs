@@ -187,6 +187,8 @@ pub use registry::RaftGroupHandleRegistry;
 pub use registry::SelfElectionError;
 pub use registry::SingleNodeRaftNetwork;
 pub use registry::SingleNodeRaftNetworkFactory;
+#[cfg(any(test, feature = "fault-injection"))]
+pub use registry::SnapshotBuildError;
 pub use registry::SnapshotGcPass;
 pub use registry::SnapshotInstallError;
 pub use rejoin::GroupBootstrap;
@@ -228,6 +230,7 @@ pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;
 pub use types::RaftLogProgressSnapshot;
+pub use types::SnapshotData;
 pub use types::StaticGrpcRaftMembershipConfig;
 pub use types::UrsulaAppendEntriesRequest;
 pub use types::UrsulaAppendEntriesResponse;

@@ -1,6 +1,5 @@
 //! Snapshot pointer publication through the production state-machine entry points.
 
-use std::io::Cursor;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,6 +18,7 @@ use super::RaftGroupStateMachine;
 use super::SnapshotBuildCoordinator;
 use super::SnapshotInstallCoordinator;
 use super::SnapshotMetaOf;
+use super::SnapshotRestoreError;
 use super::UrsulaRaftTypeConfig;
 use super::default_snapshot_store;
 use super::group_snapshot_frames;
@@ -27,6 +27,7 @@ use crate::log_store::JournalOp;
 use crate::log_store::SimDisk;
 use crate::log_store::SimDiskError;
 use crate::log_store::SimDiskFault;
+use crate::types::SnapshotData;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PublicationFailure {
@@ -78,7 +79,7 @@ async fn install(machine: &mut RaftGroupStateMachine, index: u64) -> std::io::Re
         snapshot_id: pointer.snapshot_id.clone(),
     };
     machine
-        .install_snapshot(&meta, Cursor::new(pointer.encode_binary().unwrap()))
+        .install_snapshot(&meta, SnapshotData::new(pointer.encode_binary().unwrap()))
         .await
 }
 
@@ -259,9 +260,9 @@ impl ursula_runtime::SnapshotStore for PinnedObjects {
                 .get(key)
                 .cloned()
                 .ok_or_else(|| {
-                    ursula_runtime::SnapshotStoreError::Backend(format!(
+                    ursula_runtime::SnapshotStoreError::Io(std::io::Error::other(format!(
                         "object {key} was collected"
-                    ))
+                    )))
                 })
         })
     }
@@ -376,8 +377,8 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
                 );
                 let current = state.get_current_snapshot().await.unwrap().unwrap();
                 assert_eq!(
-                    *current.snapshot.get_ref(),
-                    durable.encode_binary().unwrap()
+                    current.snapshot.pointer_bytes(),
+                    durable.encode_binary().unwrap().as_slice()
                 );
                 let expected = [durable.location.clone(), candidate.location.clone()]
                     .into_iter()
@@ -426,8 +427,11 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
                 if restore_sync_fails {
                     SimDisk::inject_fault(&root, SimDiskFault::Sync).unwrap();
                     let error = restored.restore_persisted_snapshot().await.unwrap_err();
+                    let SnapshotRestoreError::Metadata { source, .. } = &error else {
+                        panic!("a failed fsync is a metadata failure: {error:?}");
+                    };
                     assert!(
-                        matches!(error.get_ref().and_then(|error| error.downcast_ref::<SimDiskError>()),
+                        matches!(source.get_ref().and_then(|error| error.downcast_ref::<SimDiskError>()),
                         Some(SimDiskError::Injected { path, fault: SimDiskFault::Sync }) if path == &root)
                     );
                     assert_eq!(
@@ -455,8 +459,8 @@ fn failed_snapshot_pointer_keeps_pins_until_restart_resolves_rename() {
                     candidate
                 };
                 assert_eq!(
-                    *current.snapshot.get_ref(),
-                    expected_pointer.encode_binary().unwrap()
+                    current.snapshot.pointer_bytes(),
+                    expected_pointer.encode_binary().unwrap().as_slice()
                 );
             });
         }

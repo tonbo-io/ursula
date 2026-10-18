@@ -9,9 +9,18 @@
 //! Default backend [`InlineSnapshotStore`] keeps bytes inside the pointer
 //! itself, preserving today's "snapshot rides through openraft" behavior.
 //! The S3 backend reuses the cold-store opendal client.
+//!
+//! Owned objects (#687). A node writes the objects it may commit under
+//! `{prefix}/node-{node}/group-{gid}/` ([`OwnedKey`]), each under a fresh
+//! name, and only that node deletes them. [`SnapshotStore::stage`] draws the
+//! name without I/O, [`SnapshotStore::write_staged`] creates the object only
+//! if no object has the name, and [`SnapshotStore::list_own`] and
+//! [`SnapshotStore::delete_own`] serve the owner's GC. [`OwnedPointer`] is a
+//! pointer this node may commit.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
 use std::io;
@@ -22,6 +31,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde::Serialize;
+
+use crate::SnapshotStoreOperation;
 
 /// Node identities that may persist an external snapshot pointer for each
 /// group. S3 pruning is enabled only after every expected voter has published
@@ -80,6 +91,24 @@ pub enum SnapshotLocation {
     },
 }
 
+/// The kind of a [`SnapshotLocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotLocationKind {
+    Inline,
+    Local,
+    S3,
+}
+
+impl fmt::Display for SnapshotLocationKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Inline => "inline",
+            Self::Local => "local",
+            Self::S3 => "S3",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotCompression {
@@ -111,6 +140,14 @@ impl SnapshotLocation {
         match self {
             Self::S3 { compression, .. } => *compression,
             Self::Inline { .. } | Self::Local { .. } => SnapshotCompression::None,
+        }
+    }
+
+    pub fn kind(&self) -> SnapshotLocationKind {
+        match self {
+            Self::Inline { .. } => SnapshotLocationKind::Inline,
+            Self::Local { .. } => SnapshotLocationKind::Local,
+            Self::S3 { .. } => SnapshotLocationKind::S3,
         }
     }
 }
@@ -157,14 +194,385 @@ impl SnapshotPointer {
     }
 }
 
+/// The node that owns a group's snapshot objects: the only node that writes
+/// or deletes them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SnapshotOwner {
+    pub node_id: u64,
+    pub raft_group_id: u32,
+}
+
+impl SnapshotOwner {
+    /// The directory of the owner's objects under `prefix`:
+    /// `{prefix}/node-{node}/group-{gid}/`.
+    pub fn directory(&self, prefix: &str) -> String {
+        format!(
+            "{prefix}/node-{}/group-{}/",
+            self.node_id, self.raft_group_id
+        )
+    }
+}
+
+/// The key of an owned snapshot object,
+/// `{prefix}/node-{node}/group-{gid}/{index:020}-{nonce:016x}.snap`. `index`
+/// is the snapshot's last log index, so a group's objects list in log
+/// order, and `nonce` is drawn at random for every write, so no two writes
+/// share a name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OwnedKey {
+    pub owner: SnapshotOwner,
+    pub index: u64,
+    pub nonce: u64,
+}
+
+/// Why a key is not an [`OwnedKey`] under a prefix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedKeyProblem {
+    /// The key does not start with the prefix as a whole path component.
+    OutsidePrefix,
+    /// The key does not have the three components `node-{node}`,
+    /// `group-{gid}` and the object name below the prefix.
+    Shape,
+    /// The node component is not `node-{node}` with a canonical decimal id.
+    Node,
+    /// The group component is not `group-{gid}` with a canonical decimal id.
+    Group,
+    /// The object name is not `{index:020}-{nonce:016x}.snap`.
+    Name,
+}
+
+/// A key that is not an owned object key under `prefix`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{key} is not an owned snapshot object key under {prefix}: {problem:?}")]
+pub struct OwnedKeyError {
+    pub key: String,
+    pub prefix: String,
+    pub problem: OwnedKeyProblem,
+}
+
+impl OwnedKey {
+    /// The full object key under `prefix`.
+    pub fn render(&self, prefix: &str) -> String {
+        format!(
+            "{}{:020}-{:016x}.snap",
+            self.owner.directory(prefix),
+            self.index,
+            self.nonce
+        )
+    }
+
+    /// Parses `key` under `prefix` component by component: the prefix must
+    /// end at a `/`, and every number must be in the form [`Self::render`]
+    /// writes, so `node-1` never matches `node-10` and a parsed key renders
+    /// back to the same text.
+    pub fn parse(prefix: &str, key: &str) -> Result<Self, OwnedKeyError> {
+        let refuse = |problem| OwnedKeyError {
+            key: key.to_owned(),
+            prefix: prefix.to_owned(),
+            problem,
+        };
+        let rest = key
+            .strip_prefix(prefix)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .ok_or_else(|| refuse(OwnedKeyProblem::OutsidePrefix))?;
+        let mut components = rest.split('/');
+        let (Some(node), Some(group), Some(name), None) = (
+            components.next(),
+            components.next(),
+            components.next(),
+            components.next(),
+        ) else {
+            return Err(refuse(OwnedKeyProblem::Shape));
+        };
+        let node_id = node
+            .strip_prefix("node-")
+            .and_then(canonical_decimal::<u64>)
+            .ok_or_else(|| refuse(OwnedKeyProblem::Node))?;
+        let raft_group_id = group
+            .strip_prefix("group-")
+            .and_then(canonical_decimal::<u32>)
+            .ok_or_else(|| refuse(OwnedKeyProblem::Group))?;
+        let (index, nonce) = name
+            .strip_suffix(".snap")
+            .and_then(|stem| stem.split_once('-'))
+            .and_then(|(index, nonce)| Some((padded_index(index)?, padded_nonce(nonce)?)))
+            .ok_or_else(|| refuse(OwnedKeyProblem::Name))?;
+        Ok(Self {
+            owner: SnapshotOwner {
+                node_id,
+                raft_group_id,
+            },
+            index,
+            nonce,
+        })
+    }
+}
+
+/// `text` as a decimal number written without sign or leading zeros.
+fn canonical_decimal<T: std::str::FromStr + fmt::Display>(text: &str) -> Option<T> {
+    let value = text.parse::<T>().ok()?;
+    (value.to_string() == text).then_some(value)
+}
+
+/// `text` as the 20-digit zero-padded index of an object name.
+fn padded_index(text: &str) -> Option<u64> {
+    if text.len() != 20 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let index = text.parse::<u64>().ok()?;
+    (format!("{index:020}") == text).then_some(index)
+}
+
+/// `text` as the 16-digit lowercase hexadecimal nonce of an object name.
+fn padded_nonce(text: &str) -> Option<u64> {
+    if text.len() != 16
+        || !text
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    u64::from_str_radix(text, 16).ok()
+}
+
+/// The keys a node may commit for one group: inline pointers, and S3 keys
+/// under its own directory of the store's prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedNamespace {
+    pub prefix: String,
+    pub owner: SnapshotOwner,
+}
+
+/// Why a pointer is not an [`OwnedPointer`].
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum NotOwned {
+    /// The pointer names an S3 key outside the node's own directory.
+    #[error("snapshot key {key} lies outside the owned directory {directory}")]
+    ForeignKey { key: String, directory: String },
+    /// The pointer names a local file, which no node owns in a store.
+    #[error("snapshot pointer names the local file {path:?}")]
+    LocalPath { path: PathBuf },
+}
+
+/// A snapshot pointer this node may commit: inline, or an S3 key that
+/// parses as an [`OwnedKey`] of this node and group. It is built only by
+/// [`TryFrom`], which refuses every other pointer.
+#[derive(Debug, Clone)]
+pub struct OwnedPointer(SnapshotPointer);
+
+impl OwnedPointer {
+    pub fn pointer(&self) -> &SnapshotPointer {
+        &self.0
+    }
+
+    pub fn into_pointer(self) -> SnapshotPointer {
+        self.0
+    }
+}
+
+impl TryFrom<(SnapshotPointer, &OwnedNamespace)> for OwnedPointer {
+    type Error = NotOwned;
+
+    fn try_from(
+        (pointer, namespace): (SnapshotPointer, &OwnedNamespace),
+    ) -> Result<Self, Self::Error> {
+        match &pointer.location {
+            SnapshotLocation::Inline { .. } => Ok(Self(pointer)),
+            SnapshotLocation::Local { path } => Err(NotOwned::LocalPath { path: path.clone() }),
+            SnapshotLocation::S3 { key, .. } => match OwnedKey::parse(&namespace.prefix, key) {
+                Ok(owned) if owned.owner == namespace.owner => Ok(Self(pointer)),
+                Ok(_) | Err(_) => Err(NotOwned::ForeignKey {
+                    key: key.clone(),
+                    directory: namespace.owner.directory(&namespace.prefix),
+                }),
+            },
+        }
+    }
+}
+
+/// A snapshot body made ready for its store with no I/O
+/// ([`SnapshotStore::stage`]): inline, or compressed under a freshly drawn
+/// [`OwnedKey`]. Its [`StagedSnapshot::location`] is known before the write.
+pub enum StagedSnapshot {
+    Inline { bytes: Vec<u8> },
+    Object(StagedObject),
+}
+
+/// The object of a [`StagedSnapshot`].
+pub struct StagedObject {
+    pub key: OwnedKey,
+    /// The location the write creates: an S3 key that no reference shares.
+    pub location: SnapshotLocation,
+    stored: Vec<u8>,
+}
+
+impl StagedSnapshot {
+    /// Where the snapshot lives once written.
+    pub fn location(&self) -> SnapshotLocation {
+        match self {
+            Self::Inline { bytes } => SnapshotLocation::Inline {
+                bytes: bytes.clone(),
+            },
+            Self::Object(object) => object.location.clone(),
+        }
+    }
+
+    /// The owned key of a staged object.
+    pub fn key(&self) -> Option<&OwnedKey> {
+        match self {
+            Self::Inline { .. } => None,
+            Self::Object(object) => Some(&object.key),
+        }
+    }
+}
+
+impl Debug for StagedSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inline { bytes } => f
+                .debug_struct("Inline")
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Object(object) => f
+                .debug_struct("Object")
+                .field("key", &object.key)
+                .field("location", &object.location)
+                .field("stored", &object.stored.len())
+                .finish(),
+        }
+    }
+}
+
+/// What a listing of an owner's directory holds ([`SnapshotStore::list_own`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OwnListing {
+    /// The objects that parse as the owner's keys, in key order.
+    pub owned: Vec<OwnedKey>,
+    /// Every other file in the directory.
+    pub foreign: Vec<String>,
+}
+
+/// The backend of a [`SnapshotStore`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotBackend {
+    Inline,
+    S3,
+}
+
+impl fmt::Display for SnapshotBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Inline => "inline",
+            Self::S3 => "S3",
+        })
+    }
+}
+
+/// What is missing from the config of an S3 snapshot store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotStoreConfigProblem {
+    /// The cold store has no S3 section.
+    NoS3Config,
+    /// The S3 section names no bucket.
+    NoBucket,
+    /// The S3 bucket is empty.
+    EmptyBucket,
+    /// The S3 backend was chosen in a simulation, which has no S3 I/O.
+    NoS3UnderSimulation,
+}
+
+impl fmt::Display for SnapshotStoreConfigProblem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NoS3Config => "S3 config is required for the snapshot S3 backend",
+            Self::NoBucket => "an S3 bucket is required for the snapshot S3 backend",
+            Self::EmptyBucket => "the snapshot S3 bucket must not be empty",
+            Self::NoS3UnderSimulation => {
+                "the snapshot S3 backend has no I/O under madsim; use 'inline'"
+            }
+        })
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotStoreError {
-    #[error("snapshot store backend: {0}")]
-    Backend(String),
-    #[error("snapshot not found: {0}")]
-    NotFound(String),
-    #[error("snapshot integrity: {0}")]
-    Integrity(String),
+    /// The object is not in the store.
+    #[error("snapshot object {key} not found")]
+    NotFound { key: String },
+    /// A write that creates an object only if none has its name found one.
+    #[error("snapshot object {key} already exists")]
+    NameCollision { key: String },
+    /// The stored object's size is not the pointer's.
+    #[error("snapshot object {key} stores {actual} bytes, expected {expected}")]
+    SizeMismatch {
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// The backend failed `operation` on `key`.
+    #[error("snapshot store {operation} of {key} failed")]
+    Backend {
+        operation: SnapshotStoreOperation,
+        key: String,
+        #[source]
+        source: Box<opendal::Error>,
+    },
+    /// The decompressed object's size is not the pointer's.
+    #[error("snapshot object {key} decompresses to {actual} bytes, expected {expected}")]
+    LogicalSizeMismatch {
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
+    /// The stored object does not decompress, or its logical size does not
+    /// fit in memory.
+    #[error("snapshot object {key} does not decompress")]
+    Decompress {
+        key: String,
+        #[source]
+        source: io::Error,
+    },
+    /// Compressing a snapshot body failed.
+    #[error("compress a snapshot body")]
+    Compress(#[source] io::Error),
+    /// A snapshot body has more bytes than a `u64` counts.
+    #[error("a snapshot body is larger than u64::MAX bytes")]
+    BodyTooLarge,
+    /// The store does not hold snapshots at such a location.
+    #[error("the {store} snapshot store holds no {location} snapshot")]
+    UnsupportedLocation {
+        store: SnapshotBackend,
+        location: SnapshotLocationKind,
+    },
+    /// The backend cannot create an object only if none has its name, so
+    /// the store refuses to write `key` rather than overwrite an object.
+    #[error("the snapshot store cannot create {key} only if it is absent")]
+    ConditionalCreateUnsupported { key: String },
+    /// The S3 snapshot store's config is incomplete.
+    #[error("snapshot store config: {problem}")]
+    Config { problem: SnapshotStoreConfigProblem },
+    /// The S3 operator did not build.
+    #[error("build the S3 snapshot store")]
+    Open(#[source] Box<opendal::Error>),
+    /// The cold tier's S3 encryption did not apply to the snapshot store.
+    #[error("apply the cold tier's S3 encryption to the snapshot store")]
+    Encryption(#[source] io::Error),
+    /// A key lies outside the group's namespace of the store.
+    #[error("snapshot key {key} lies outside the namespace of group {raft_group_id}")]
+    OutsideGroup { raft_group_id: u32, key: String },
+    /// A reference record names another version, node or group.
+    #[error("snapshot reference record {record} is not this group's or node's")]
+    InvalidReference { record: String },
+    /// A reference record did not encode.
+    #[error("encode a snapshot reference record")]
+    ReferenceEncode(#[source] serde_json::Error),
+    /// A reference record did not decode.
+    #[error("decode snapshot reference record {record}")]
+    ReferenceDecode {
+        record: String,
+        #[source]
+        source: serde_json::Error,
+    },
     #[error("snapshot serialize: {0}")]
     Serialize(String),
     #[error("snapshot deserialize: {0}")]
@@ -210,10 +618,26 @@ fn group_snapshot_epoch_refusal(found: Option<u32>) -> String {
 }
 
 impl SnapshotStoreError {
+    /// A backend failure of `operation` on `key`.
+    pub fn backend(
+        operation: SnapshotStoreOperation,
+        key: impl Into<String>,
+        source: opendal::Error,
+    ) -> Self {
+        Self::Backend {
+            operation,
+            key: key.into(),
+            source: Box::new(source),
+        }
+    }
+
+    /// The I/O error for a caller that speaks `io::Error`. It carries this
+    /// error itself as its source, so the caller can still tell its variant
+    /// apart by downcasting.
     pub fn into_io(self) -> io::Error {
         match self {
             Self::Io(err) => err,
-            other => io::Error::other(other.to_string()),
+            other => io::Error::other(other),
         }
     }
 }
@@ -273,6 +697,54 @@ pub trait SnapshotStore: Send + Sync + Debug {
             }
             self.upload(key, Bytes::from(bytes)).await
         })
+    }
+
+    /// Makes the snapshot of `owner`'s group at log index `index` ready to
+    /// write, with no I/O: an external store compresses it and draws a fresh
+    /// [`OwnedKey`] for it, so the caller can hold the key before the write.
+    /// The default keeps the bytes inline.
+    fn stage<'a>(
+        &'a self,
+        _owner: SnapshotOwner,
+        _index: u64,
+        chunks: SnapshotBytesIterator,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        Box::pin(async move {
+            Ok(StagedSnapshot::Inline {
+                bytes: collect_inline_snapshot(chunks).await?,
+            })
+        })
+    }
+
+    /// Writes a staged snapshot and returns its location. An object is
+    /// created only if no object has its name
+    /// ([`SnapshotStoreError::NameCollision`] otherwise), and never
+    /// overwrites one. The default holds inline snapshots only.
+    fn write_staged<'a>(
+        &'a self,
+        staged: StagedSnapshot,
+    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+        Box::pin(async move {
+            match staged {
+                StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
+                StagedSnapshot::Object(object) => Err(SnapshotStoreError::UnsupportedLocation {
+                    store: SnapshotBackend::Inline,
+                    location: object.location.kind(),
+                }),
+            }
+        })
+    }
+
+    /// Lists `owner`'s directory of the store. A store without external
+    /// objects has none.
+    fn list_own<'a>(&'a self, _owner: SnapshotOwner) -> SnapshotStoreFuture<'a, OwnListing> {
+        Box::pin(async move { Ok(OwnListing::default()) })
+    }
+
+    /// Deletes an owned object; a missing one is not an error. A store
+    /// without external objects has nothing to delete.
+    fn delete_own<'a>(&'a self, _key: OwnedKey) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Ok(()) })
     }
 
     /// Retrieve a snapshot blob given its location.
@@ -398,9 +870,10 @@ impl SnapshotStore for InlineSnapshotStore {
         Box::pin(async move {
             match location {
                 SnapshotLocation::Inline { bytes } => Ok(bytes.clone()),
-                other => Err(SnapshotStoreError::Backend(format!(
-                    "inline snapshot store cannot download {other:?}"
-                ))),
+                other => Err(SnapshotStoreError::UnsupportedLocation {
+                    store: SnapshotBackend::Inline,
+                    location: other.kind(),
+                }),
             }
         })
     }
@@ -451,15 +924,24 @@ mod s3 {
     use opendal::Operator;
     use opendal::Scheme;
 
+    use super::OwnListing;
+    use super::OwnedKey;
+    use super::OwnedNamespace;
+    use super::SnapshotBackend;
     use super::SnapshotBytesIterator;
     use super::SnapshotCompression;
     use super::SnapshotKey;
     use super::SnapshotLocation;
+    use super::SnapshotOwner;
     use super::SnapshotPrune;
     use super::SnapshotReferenceConfig;
     use super::SnapshotStore;
+    use super::SnapshotStoreConfigProblem;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
+    use super::StagedObject;
+    use super::StagedSnapshot;
+    use crate::SnapshotStoreOperation;
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
     /// The GC grace of a store built without one ([`S3SnapshotStore::with_gc_grace`]).
@@ -474,12 +956,23 @@ mod s3 {
         snapshot_key: Option<String>,
     }
 
+    /// How a store creates an object only if no object has its name.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum ConditionalCreate {
+        /// The backend must support it, or the write is refused.
+        Required,
+        /// A HEAD before the write stands in for it, on an in-memory
+        /// operator of a test that has no concurrent writer of the name.
+        EmulatedForTests,
+    }
+
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
     pub struct S3SnapshotStore {
         operator: Operator,
         prefix: String,
         references: Option<SnapshotReferenceConfig>,
         gc_grace: Duration,
+        conditional_create: ConditionalCreate,
     }
 
     impl std::fmt::Debug for S3SnapshotStore {
@@ -488,6 +981,7 @@ mod s3 {
                 .field("prefix", &self.prefix)
                 .field("references", &self.references)
                 .field("gc_grace", &self.gc_grace)
+                .field("conditional_create", &self.conditional_create)
                 .finish_non_exhaustive()
         }
     }
@@ -503,6 +997,7 @@ mod s3 {
                 prefix,
                 references: None,
                 gc_grace: S3_SNAPSHOT_GC_GRACE,
+                conditional_create: ConditionalCreate::Required,
             }
         }
 
@@ -528,11 +1023,24 @@ mod s3 {
             self
         }
 
-        /// In-memory opendal operator under `prefix`, for tests.
+        /// In-memory opendal operator under `prefix`, for tests. The
+        /// in-memory operator cannot create an object only if it is absent,
+        /// so [`SnapshotStore::write_staged`] checks for the name first,
+        /// which no concurrent writer of a test races.
         pub fn memory_for_tests(prefix: impl Into<String>) -> Result<Self, SnapshotStoreError> {
             let operator = Operator::via_iter(Scheme::Memory, [])
-                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
-            Ok(Self::new(operator, prefix))
+                .map_err(|err| SnapshotStoreError::Open(Box::new(err)))?;
+            let mut store = Self::new(operator, prefix);
+            store.conditional_create = ConditionalCreate::EmulatedForTests;
+            Ok(store)
+        }
+
+        /// The keys this store lets `owner` commit.
+        pub fn namespace(&self, owner: SnapshotOwner) -> OwnedNamespace {
+            OwnedNamespace {
+                prefix: self.prefix.clone(),
+                owner,
+            }
         }
 
         #[cfg(test)]
@@ -544,7 +1052,7 @@ mod s3 {
             self.operator
                 .write(key, bytes)
                 .await
-                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
+                .map_err(|err| SnapshotStoreError::backend(SnapshotStoreOperation::Put, key, err))
         }
 
         #[cfg(test)]
@@ -552,10 +1060,9 @@ mod s3 {
             &self,
             key: &str,
         ) -> Result<(), SnapshotStoreError> {
-            self.operator
-                .delete(key)
-                .await
-                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
+            self.operator.delete(key).await.map_err(|err| {
+                SnapshotStoreError::backend(SnapshotStoreOperation::Delete, key, err)
+            })
         }
 
         /// Build an S3 snapshot store from a [`ColdConfig`].
@@ -565,16 +1072,17 @@ mod s3 {
             config: &crate::ColdConfig,
             prefix: impl Into<String>,
         ) -> Result<Self, SnapshotStoreError> {
-            let s3 = config.s3.as_ref().ok_or_else(|| {
-                SnapshotStoreError::Backend("S3 config is required for snapshot s3 backend".into())
-            })?;
-            let bucket = s3.bucket.as_deref().ok_or_else(|| {
-                SnapshotStoreError::Backend("S3 bucket is required for snapshot s3 backend".into())
-            })?;
+            let config_problem = |problem| SnapshotStoreError::Config { problem };
+            let s3 = config
+                .s3
+                .as_ref()
+                .ok_or_else(|| config_problem(SnapshotStoreConfigProblem::NoS3Config))?;
+            let bucket = s3
+                .bucket
+                .as_deref()
+                .ok_or_else(|| config_problem(SnapshotStoreConfigProblem::NoBucket))?;
             if bucket.trim().is_empty() {
-                return Err(SnapshotStoreError::Backend(
-                    "snapshot s3 bucket must not be empty".into(),
-                ));
+                return Err(config_problem(SnapshotStoreConfigProblem::EmptyBucket));
             }
             let mut builder = opendal::services::S3::default().bucket(bucket);
             if let Some(root) = config.root.as_deref()
@@ -610,10 +1118,10 @@ mod s3 {
             // Backup/snapshot objects inherit the cold tier's encryption
             // posture (#149).
             let (builder, _encryption) = crate::cold_store::apply_s3_encryption(builder, s3)
-                .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                .map_err(SnapshotStoreError::Encryption)?;
             let operator = crate::cold_store::with_s3_resilience(
                 Operator::new(builder)
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?
+                    .map_err(|err| SnapshotStoreError::Open(Box::new(err)))?
                     .finish(),
                 s3.timeout.as_duration(),
                 s3.max_retries,
@@ -641,6 +1149,8 @@ mod s3 {
             )
         }
 
+        /// Writes a content-addressed object, or keeps the object already
+        /// under its name when its size matches.
         async fn write_content_once(
             &self,
             object_key: &str,
@@ -668,18 +1178,27 @@ mod s3 {
                     {
                         let metadata =
                             self.operator.stat(object_key).await.map_err(|stat_error| {
-                                SnapshotStoreError::Backend(format!(
-                                    "stat shared s3 snapshot after create race: {stat_error}"
-                                ))
+                                SnapshotStoreError::backend(
+                                    SnapshotStoreOperation::Head,
+                                    object_key,
+                                    stat_error,
+                                )
                             })?;
                         if metadata.content_length() != stored_size_bytes {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "shared s3 snapshot {object_key} size {} != expected {stored_size_bytes}",
-                                metadata.content_length()
-                            )));
+                            return Err(SnapshotStoreError::SizeMismatch {
+                                key: object_key.to_owned(),
+                                expected: stored_size_bytes,
+                                actual: metadata.content_length(),
+                            });
                         }
                     }
-                    Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
+                    Err(err) => {
+                        return Err(SnapshotStoreError::backend(
+                            SnapshotStoreOperation::Put,
+                            object_key,
+                            err,
+                        ));
+                    }
                 }
             } else {
                 // The production S3 backend supports conditional creation. This
@@ -687,10 +1206,11 @@ mod s3 {
                 match self.operator.stat(object_key).await {
                     Ok(metadata) => {
                         if metadata.content_length() != stored_size_bytes {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "shared snapshot {object_key} size {} != expected {stored_size_bytes}",
-                                metadata.content_length()
-                            )));
+                            return Err(SnapshotStoreError::SizeMismatch {
+                                key: object_key.to_owned(),
+                                expected: stored_size_bytes,
+                                actual: metadata.content_length(),
+                            });
                         }
                     }
                     Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
@@ -698,36 +1218,134 @@ mod s3 {
                             .write(object_key, stored_bytes)
                             .await
                             .map_err(|write_error| {
-                                SnapshotStoreError::Backend(write_error.to_string())
+                                SnapshotStoreError::backend(
+                                    SnapshotStoreOperation::Put,
+                                    object_key,
+                                    write_error,
+                                )
                             })?;
                     }
-                    Err(err) => return Err(SnapshotStoreError::Backend(err.to_string())),
+                    Err(err) => {
+                        return Err(SnapshotStoreError::backend(
+                            SnapshotStoreOperation::Head,
+                            object_key,
+                            err,
+                        ));
+                    }
                 }
             }
             Ok(stored_size_bytes)
+        }
+
+        /// Creates `key` only if no object has the name: a found object is
+        /// a [`SnapshotStoreError::NameCollision`], never reused or
+        /// overwritten. A backend that cannot create conditionally is
+        /// refused, but for the emulation of a test store.
+        async fn create_object(
+            &self,
+            key: &str,
+            stored_bytes: Vec<u8>,
+        ) -> Result<(), SnapshotStoreError> {
+            if self
+                .operator
+                .info()
+                .full_capability()
+                .write_with_if_not_exists
+            {
+                return match self
+                    .operator
+                    .write_with(key, stored_bytes)
+                    .if_not_exists(true)
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
+                        ) =>
+                    {
+                        Err(SnapshotStoreError::NameCollision {
+                            key: key.to_owned(),
+                        })
+                    }
+                    Err(err) => Err(SnapshotStoreError::backend(
+                        SnapshotStoreOperation::Put,
+                        key,
+                        err,
+                    )),
+                };
+            }
+            match self.conditional_create {
+                ConditionalCreate::Required => {
+                    Err(SnapshotStoreError::ConditionalCreateUnsupported {
+                        key: key.to_owned(),
+                    })
+                }
+                ConditionalCreate::EmulatedForTests => match self.operator.stat(key).await {
+                    Ok(_) => Err(SnapshotStoreError::NameCollision {
+                        key: key.to_owned(),
+                    }),
+                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
+                        self.operator.write(key, stored_bytes).await.map_err(|err| {
+                            SnapshotStoreError::backend(SnapshotStoreOperation::Put, key, err)
+                        })
+                    }
+                    Err(err) => Err(SnapshotStoreError::backend(
+                        SnapshotStoreOperation::Head,
+                        key,
+                        err,
+                    )),
+                },
+            }
+        }
+
+        /// `key` checked against group `raft_group_id`'s namespace of the
+        /// reference protocol.
+        fn group_object<'k>(
+            &self,
+            raft_group_id: u32,
+            key: &'k str,
+        ) -> Result<&'k str, SnapshotStoreError> {
+            if key.starts_with(&self.group_prefix(raft_group_id)) && key.ends_with(".snap") {
+                Ok(key)
+            } else {
+                Err(SnapshotStoreError::OutsideGroup {
+                    raft_group_id,
+                    key: key.to_owned(),
+                })
+            }
         }
     }
 
     fn compress_snapshot_chunks(
         chunks: SnapshotBytesIterator,
-    ) -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
+    ) -> Result<(Vec<u8>, u64), SnapshotStoreError> {
         let mut size_bytes = 0u64;
         let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), S3_SNAPSHOT_ZSTD_LEVEL)
-            .map_err(|err| SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}")))?;
+            .map_err(SnapshotStoreError::Compress)?;
         for chunk in chunks {
             let chunk = chunk?;
-            size_bytes = size_bytes.checked_add(chunk.len() as u64).ok_or_else(|| {
-                SnapshotStoreError::Integrity("s3 snapshot size overflows u64".to_owned())
-            })?;
-            encoder.write_all(&chunk).map_err(|err| {
-                SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}"))
-            })?;
+            size_bytes = size_bytes
+                .checked_add(chunk.len() as u64)
+                .ok_or(SnapshotStoreError::BodyTooLarge)?;
+            encoder
+                .write_all(&chunk)
+                .map_err(SnapshotStoreError::Compress)?;
         }
-        let stored_bytes = encoder.finish().map_err(|err| {
-            SnapshotStoreError::Backend(format!("finish s3 snapshot compression: {err}"))
-        })?;
-        let digest = blake3::hash(&stored_bytes);
-        Ok((stored_bytes, size_bytes, digest))
+        let stored_bytes = encoder.finish().map_err(SnapshotStoreError::Compress)?;
+        Ok((stored_bytes, size_bytes))
+    }
+
+    /// Compresses `chunks` off the async worker.
+    async fn compress_off_worker(
+        chunks: SnapshotBytesIterator,
+    ) -> Result<(Vec<u8>, u64), SnapshotStoreError> {
+        tokio::task::spawn_blocking(move || compress_snapshot_chunks(chunks))
+            .await
+            .map_err(|err| {
+                SnapshotStoreError::Io(io::Error::other(format!("join s3 snapshot encoder: {err}")))
+            })?
     }
 
     impl SnapshotStore for S3SnapshotStore {
@@ -742,11 +1360,7 @@ mod s3 {
                 else {
                     return Ok(());
                 };
-                if !key.starts_with(&self.group_prefix(raft_group_id)) || !key.ends_with(".snap") {
-                    return Err(SnapshotStoreError::Integrity(
-                        "snapshot pin points outside group namespace".to_owned(),
-                    ));
-                }
+                self.group_object(raft_group_id, key)?;
                 let pin_key = format!(
                     "{}references/pins/{}/{}.json",
                     self.group_prefix(raft_group_id),
@@ -759,11 +1373,10 @@ mod s3 {
                     raft_group_id,
                     snapshot_key: Some(key.clone()),
                 })
-                .map_err(|err| SnapshotStoreError::Serialize(err.to_string()))?;
-                self.operator
-                    .write(&pin_key, record)
-                    .await
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))
+                .map_err(SnapshotStoreError::ReferenceEncode)?;
+                self.operator.write(&pin_key, record).await.map_err(|err| {
+                    SnapshotStoreError::backend(SnapshotStoreOperation::Put, &pin_key, err)
+                })
             })
         }
 
@@ -793,35 +1406,41 @@ mod s3 {
                     .list_with(&prefix)
                     .recursive(true)
                     .await
-                    .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                    .map_err(|err| {
+                        SnapshotStoreError::backend(SnapshotStoreOperation::List, &prefix, err)
+                    })?;
                 for entry in entries {
                     if !entry.metadata().mode().is_file() || !entry.path().ends_with(".json") {
                         continue;
                     }
-                    let bytes = self
-                        .operator
-                        .read(entry.path())
-                        .await
-                        .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                    let bytes = self.operator.read(entry.path()).await.map_err(|err| {
+                        SnapshotStoreError::backend(SnapshotStoreOperation::Get, entry.path(), err)
+                    })?;
                     let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
-                        .map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))?;
+                        .map_err(|source| SnapshotStoreError::ReferenceDecode {
+                            record: entry.path().to_owned(),
+                            source,
+                        })?;
                     if reference.version != SNAPSHOT_REFERENCE_VERSION
                         || reference.node_id != references.node_id
                         || reference.raft_group_id != raft_group_id
                     {
-                        return Err(SnapshotStoreError::Integrity(
-                            "invalid snapshot pin".to_owned(),
-                        ));
+                        return Err(SnapshotStoreError::InvalidReference {
+                            record: entry.path().to_owned(),
+                        });
                     }
                     if reference
                         .snapshot_key
                         .as_deref()
                         .is_none_or(|key| !retained.contains(key))
                     {
-                        self.operator
-                            .delete(entry.path())
-                            .await
-                            .map_err(|err| SnapshotStoreError::Backend(err.to_string()))?;
+                        self.operator.delete(entry.path()).await.map_err(|err| {
+                            SnapshotStoreError::backend(
+                                SnapshotStoreOperation::Delete,
+                                entry.path(),
+                                err,
+                            )
+                        })?;
                     }
                 }
                 Ok(())
@@ -835,10 +1454,8 @@ mod s3 {
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
                 let size_bytes = bytes.len() as u64;
-                let stored_bytes =
-                    zstd::bulk::compress(&bytes, S3_SNAPSHOT_ZSTD_LEVEL).map_err(|err| {
-                        SnapshotStoreError::Backend(format!("compress s3 snapshot: {err}"))
-                    })?;
+                let stored_bytes = zstd::bulk::compress(&bytes, S3_SNAPSHOT_ZSTD_LEVEL)
+                    .map_err(SnapshotStoreError::Compress)?;
                 let object_key = self.object_key(&key, blake3::hash(&stored_bytes));
                 let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
                 Ok(SnapshotLocation::S3 {
@@ -857,15 +1474,8 @@ mod s3 {
             chunks: SnapshotBytesIterator,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let encoded = tokio::task::spawn_blocking(move || compress_snapshot_chunks(chunks))
-                    .await
-                    .map_err(|err| {
-                        SnapshotStoreError::Io(io::Error::other(format!(
-                            "join s3 snapshot encoder: {err}"
-                        )))
-                    })??;
-                let (stored_bytes, size_bytes, digest) = encoded;
-                let object_key = self.object_key(&key, digest);
+                let (stored_bytes, size_bytes) = compress_off_worker(chunks).await?;
+                let object_key = self.object_key(&key, blake3::hash(&stored_bytes));
                 let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
@@ -874,6 +1484,96 @@ mod s3 {
                     compression: SnapshotCompression::Zstd,
                     shared_object: true,
                 })
+            })
+        }
+
+        fn stage<'a>(
+            &'a self,
+            owner: SnapshotOwner,
+            index: u64,
+            chunks: SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+            Box::pin(async move {
+                let (stored, size_bytes) = compress_off_worker(chunks).await?;
+                let key = OwnedKey {
+                    owner,
+                    index,
+                    nonce: rand::random(),
+                };
+                let location = SnapshotLocation::S3 {
+                    key: key.render(&self.prefix),
+                    size_bytes,
+                    stored_size_bytes: stored.len() as u64,
+                    compression: SnapshotCompression::Zstd,
+                    shared_object: false,
+                };
+                Ok(StagedSnapshot::Object(StagedObject {
+                    key,
+                    location,
+                    stored,
+                }))
+            })
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: StagedSnapshot,
+        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            Box::pin(async move {
+                match staged {
+                    StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
+                    StagedSnapshot::Object(StagedObject {
+                        key,
+                        location,
+                        stored,
+                    }) => {
+                        self.create_object(&key.render(&self.prefix), stored)
+                            .await?;
+                        Ok(location)
+                    }
+                }
+            })
+        }
+
+        fn list_own<'a>(&'a self, owner: SnapshotOwner) -> SnapshotStoreFuture<'a, OwnListing> {
+            Box::pin(async move {
+                let directory = owner.directory(&self.prefix);
+                let entries = self
+                    .operator
+                    .list_with(&directory)
+                    .recursive(true)
+                    .await
+                    .map_err(|err| {
+                        SnapshotStoreError::backend(SnapshotStoreOperation::List, &directory, err)
+                    })?;
+                let mut listing = OwnListing::default();
+                for entry in entries {
+                    if !entry.metadata().mode().is_file() {
+                        continue;
+                    }
+                    match OwnedKey::parse(&self.prefix, entry.path()) {
+                        Ok(key) if key.owner == owner => listing.owned.push(key),
+                        Ok(_) | Err(_) => listing.foreign.push(entry.path().to_owned()),
+                    }
+                }
+                listing.owned.sort_unstable();
+                listing.foreign.sort_unstable();
+                Ok(listing)
+            })
+        }
+
+        fn delete_own<'a>(&'a self, key: OwnedKey) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                let key = key.render(&self.prefix);
+                match self.operator.delete(&key).await {
+                    Ok(()) => Ok(()),
+                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
+                    Err(err) => Err(SnapshotStoreError::backend(
+                        SnapshotStoreOperation::Delete,
+                        key,
+                        err,
+                    )),
+                }
             })
         }
 
@@ -886,48 +1586,49 @@ mod s3 {
                     key, size_bytes, ..
                 } = location
                 else {
-                    return Err(SnapshotStoreError::Backend(format!(
-                        "s3 snapshot store cannot download {location:?}"
-                    )));
+                    return Err(SnapshotStoreError::UnsupportedLocation {
+                        store: SnapshotBackend::S3,
+                        location: location.kind(),
+                    });
                 };
                 let buf = self.operator.read(key).await.map_err(|err| {
-                    if matches!(err.kind(), opendal::ErrorKind::NotFound) {
-                        SnapshotStoreError::NotFound(format!("s3 snapshot missing at {key}"))
+                    if matches!(err.kind(), ErrorKind::NotFound) {
+                        SnapshotStoreError::NotFound { key: key.clone() }
                     } else {
-                        SnapshotStoreError::Backend(err.to_string())
+                        SnapshotStoreError::backend(SnapshotStoreOperation::Get, key, err)
                     }
                 })?;
                 let stored_bytes = buf.to_vec();
                 let expected_stored_size = location.stored_size_hint();
                 if stored_bytes.len() as u64 != expected_stored_size {
-                    return Err(SnapshotStoreError::Integrity(format!(
-                        "s3 snapshot {key} stored size {} != expected {}",
-                        stored_bytes.len(),
-                        expected_stored_size
-                    )));
+                    return Err(SnapshotStoreError::SizeMismatch {
+                        key: key.clone(),
+                        expected: expected_stored_size,
+                        actual: stored_bytes.len() as u64,
+                    });
                 }
                 let bytes = match location.compression() {
                     SnapshotCompression::None => stored_bytes,
                     SnapshotCompression::Zstd => zstd::bulk::decompress(
                         &stored_bytes,
-                        usize::try_from(*size_bytes).map_err(|_overflow| {
-                            SnapshotStoreError::Integrity(format!(
-                                "s3 snapshot {key} logical size {size_bytes} does not fit usize"
-                            ))
+                        usize::try_from(*size_bytes).map_err(|source| {
+                            SnapshotStoreError::Decompress {
+                                key: key.clone(),
+                                source: io::Error::new(io::ErrorKind::InvalidData, source),
+                            }
                         })?,
                     )
-                    .map_err(|err| {
-                        SnapshotStoreError::Integrity(format!(
-                            "decompress s3 snapshot {key}: {err}"
-                        ))
+                    .map_err(|source| SnapshotStoreError::Decompress {
+                        key: key.clone(),
+                        source,
                     })?,
                 };
                 if bytes.len() as u64 != *size_bytes {
-                    return Err(SnapshotStoreError::Integrity(format!(
-                        "s3 snapshot {key} logical size {} != expected {}",
-                        bytes.len(),
-                        size_bytes
-                    )));
+                    return Err(SnapshotStoreError::LogicalSizeMismatch {
+                        key: key.clone(),
+                        expected: *size_bytes,
+                        actual: bytes.len() as u64,
+                    });
                 }
                 Ok(bytes)
             })
@@ -946,8 +1647,12 @@ mod s3 {
                 }
                 match self.operator.delete(key).await {
                     Ok(()) => Ok(()),
-                    Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
-                    Err(err) => Err(SnapshotStoreError::Backend(err.to_string())),
+                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
+                    Err(err) => Err(SnapshotStoreError::backend(
+                        SnapshotStoreOperation::Delete,
+                        key,
+                        err,
+                    )),
                 }
             })
         }
@@ -985,7 +1690,7 @@ mod s3 {
                     let reference_key = self.reference_key(raft_group_id, *node_id);
                     let reference_bytes = match self.operator.read(&reference_key).await {
                         Ok(bytes) => bytes,
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
+                        Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
                             tracing::debug!(
                                 raft_group_id,
                                 node_id,
@@ -994,26 +1699,30 @@ mod s3 {
                             return Ok(SnapshotPrune::VoterWithoutReference { node_id: *node_id });
                         }
                         Err(error) => {
-                            return Err(SnapshotStoreError::Backend(error.to_string()));
+                            return Err(SnapshotStoreError::backend(
+                                SnapshotStoreOperation::Get,
+                                reference_key,
+                                error,
+                            ));
                         }
                     };
                     let reference: SnapshotReference =
-                        serde_json::from_slice(&reference_bytes.to_vec())
-                            .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
+                        serde_json::from_slice(&reference_bytes.to_vec()).map_err(|source| {
+                            SnapshotStoreError::ReferenceDecode {
+                                record: reference_key.clone(),
+                                source,
+                            }
+                        })?;
                     if reference.version != SNAPSHOT_REFERENCE_VERSION
                         || reference.node_id != *node_id
                         || reference.raft_group_id != raft_group_id
                     {
-                        return Err(SnapshotStoreError::Integrity(format!(
-                            "invalid S3 snapshot reference {reference_key}"
-                        )));
+                        return Err(SnapshotStoreError::InvalidReference {
+                            record: reference_key,
+                        });
                     }
                     if let Some(key) = reference.snapshot_key {
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot reference {reference_key} points outside group namespace"
-                            )));
-                        }
+                        self.group_object(raft_group_id, &key)?;
                         retained.insert(key);
                     }
                 }
@@ -1025,7 +1734,13 @@ mod s3 {
                     .list_with(&group_prefix)
                     .recursive(true)
                     .await
-                    .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?;
+                    .map_err(|error| {
+                        SnapshotStoreError::backend(
+                            SnapshotStoreOperation::List,
+                            &group_prefix,
+                            error,
+                        )
+                    })?;
                 let references_prefix = format!("{group_prefix}references/");
                 for entry in &entries {
                     if !entry.metadata().mode().is_file()
@@ -1038,28 +1753,31 @@ mod s3 {
                         Ok(bytes) => bytes,
                         // A pin its node released after the listing (#490):
                         // it protects nothing any more.
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
+                        Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
                             continue;
                         }
-                        Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
+                        Err(error) => {
+                            return Err(SnapshotStoreError::backend(
+                                SnapshotStoreOperation::Get,
+                                entry.path(),
+                                error,
+                            ));
+                        }
                     };
                     let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
-                        .map_err(|error| SnapshotStoreError::Deserialize(error.to_string()))?;
+                        .map_err(|source| SnapshotStoreError::ReferenceDecode {
+                            record: entry.path().to_owned(),
+                            source,
+                        })?;
                     if reference.version != SNAPSHOT_REFERENCE_VERSION
                         || reference.raft_group_id != raft_group_id
                     {
-                        return Err(SnapshotStoreError::Integrity(format!(
-                            "invalid S3 snapshot reference {}",
-                            entry.path()
-                        )));
+                        return Err(SnapshotStoreError::InvalidReference {
+                            record: entry.path().to_owned(),
+                        });
                     }
                     if let Some(key) = reference.snapshot_key {
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot reference {} points outside group namespace",
-                                entry.path()
-                            )));
-                        }
+                        self.group_object(raft_group_id, &key)?;
                         retained.insert(key);
                     }
                 }
@@ -1077,7 +1795,13 @@ mod s3 {
                             .operator
                             .stat(entry.path())
                             .await
-                            .map_err(|error| SnapshotStoreError::Backend(error.to_string()))?
+                            .map_err(|error| {
+                                SnapshotStoreError::backend(
+                                    SnapshotStoreOperation::Head,
+                                    entry.path(),
+                                    error,
+                                )
+                            })?
                             .last_modified()
                             .map(Into::into)
                             .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
@@ -1088,10 +1812,16 @@ mod s3 {
                     match self.operator.delete(entry.path()).await {
                         Ok(()) => {}
                         // Another replica's pass deleted it first.
-                        Err(error) if matches!(error.kind(), opendal::ErrorKind::NotFound) => {
+                        Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
                             continue;
                         }
-                        Err(error) => return Err(SnapshotStoreError::Backend(error.to_string())),
+                        Err(error) => {
+                            return Err(SnapshotStoreError::backend(
+                                SnapshotStoreOperation::Delete,
+                                entry.path(),
+                                error,
+                            ));
+                        }
                     }
                     deleted = deleted.saturating_add(1);
                 }
@@ -1118,13 +1848,7 @@ mod s3 {
                 };
                 let snapshot_key = match location {
                     SnapshotLocation::S3 { key, .. } => {
-                        let group_prefix = self.group_prefix(raft_group_id);
-                        if !key.starts_with(&group_prefix) || !key.ends_with(".snap") {
-                            return Err(SnapshotStoreError::Integrity(format!(
-                                "S3 snapshot key {key} is outside group {raft_group_id} namespace"
-                            )));
-                        }
-                        Some(key.clone())
+                        Some(self.group_object(raft_group_id, key)?.to_owned())
                     }
                     SnapshotLocation::Inline { .. } | SnapshotLocation::Local { .. } => None,
                 };
@@ -1134,14 +1858,18 @@ mod s3 {
                     raft_group_id,
                     snapshot_key,
                 })
-                .map_err(|error| SnapshotStoreError::Serialize(error.to_string()))?;
+                .map_err(SnapshotStoreError::ReferenceEncode)?;
+                let reference_key = self.reference_key(raft_group_id, references.node_id);
                 self.operator
-                    .write(
-                        &self.reference_key(raft_group_id, references.node_id),
-                        reference,
-                    )
+                    .write(&reference_key, reference)
                     .await
-                    .map_err(|error| SnapshotStoreError::Backend(error.to_string()))
+                    .map_err(|error| {
+                        SnapshotStoreError::backend(
+                            SnapshotStoreOperation::Put,
+                            reference_key,
+                            error,
+                        )
+                    })
             })
         }
 
@@ -1154,20 +1882,20 @@ mod s3 {
                     return Ok(());
                 };
                 let meta = self.operator.stat(key).await.map_err(|err| {
-                    if matches!(err.kind(), opendal::ErrorKind::NotFound) {
-                        SnapshotStoreError::NotFound(format!(
-                            "s3 snapshot upload verification failed: {key} not present after upload"
-                        ))
+                    if matches!(err.kind(), ErrorKind::NotFound) {
+                        SnapshotStoreError::NotFound { key: key.clone() }
                     } else {
-                        SnapshotStoreError::Backend(err.to_string())
+                        SnapshotStoreError::backend(SnapshotStoreOperation::Head, key, err)
                     }
                 })?;
                 let actual = meta.content_length();
                 let expected = location.stored_size_hint();
                 if actual != expected {
-                    return Err(SnapshotStoreError::Integrity(format!(
-                        "s3 snapshot {key} stored size mismatch post-upload: stat={actual} expected={expected}"
-                    )));
+                    return Err(SnapshotStoreError::SizeMismatch {
+                        key: key.clone(),
+                        expected,
+                        actual,
+                    });
                 }
                 Ok(())
             })
@@ -1182,8 +1910,12 @@ mod s3 {
                 let probe = format!("{}/.health-probe", self.prefix);
                 match self.operator.stat(&probe).await {
                     Ok(_) => Ok(()),
-                    Err(err) if matches!(err.kind(), opendal::ErrorKind::NotFound) => Ok(()),
-                    Err(err) => Err(SnapshotStoreError::Backend(err.to_string())),
+                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
+                    Err(err) => Err(SnapshotStoreError::backend(
+                        SnapshotStoreOperation::Head,
+                        probe,
+                        err,
+                    )),
                 }
             })
         }
@@ -1221,12 +1953,11 @@ pub fn snapshot_store_from_config(
         }
         #[cfg(madsim)]
         ursula_config::RaftSnapshotBackend::S3 => {
-            // No S3 store under madsim, so no grace to apply.
-            let _no_store = gc_grace;
-            Err(SnapshotStoreError::Backend(format!(
-                "snapshot backend {:?} has no I/O under madsim; use 'inline'",
-                cfg.backend
-            )))
+            // No S3 store under madsim, so no references or grace to apply.
+            let _no_store = (references, gc_grace);
+            Err(SnapshotStoreError::Config {
+                problem: SnapshotStoreConfigProblem::NoS3UnderSimulation,
+            })
         }
     }
 }
@@ -1321,7 +2052,10 @@ mod tests {
         };
         assert!(matches!(
             store.download(&loc).await,
-            Err(SnapshotStoreError::Backend(_))
+            Err(SnapshotStoreError::UnsupportedLocation {
+                store: SnapshotBackend::Inline,
+                location: SnapshotLocationKind::Local,
+            })
         ));
     }
 
@@ -1548,7 +2282,7 @@ mod tests {
         store.prune_retired(7, &old).await.unwrap();
         assert!(matches!(
             store.download(&abandoned).await,
-            Err(SnapshotStoreError::NotFound(_))
+            Err(SnapshotStoreError::NotFound { .. })
         ));
         assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
         assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
@@ -1556,7 +2290,7 @@ mod tests {
         store.prune_retired(7, &incoming).await.unwrap();
         assert!(matches!(
             store.download(&old).await,
-            Err(SnapshotStoreError::NotFound(_))
+            Err(SnapshotStoreError::NotFound { .. })
         ));
         assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
         assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
@@ -1632,7 +2366,7 @@ mod tests {
         store.delete_raw_for_tests(key).await.unwrap();
         let err = store.verify_uploaded(&loc).await.unwrap_err();
         assert!(
-            matches!(err, SnapshotStoreError::NotFound(_)),
+            matches!(err, SnapshotStoreError::NotFound { .. }),
             "expected NotFound after delete, got {err:?}"
         );
     }
@@ -1702,7 +2436,7 @@ mod tests {
         );
         assert!(matches!(
             store.download(&retired).await,
-            Err(SnapshotStoreError::NotFound(_))
+            Err(SnapshotStoreError::NotFound { .. })
         ));
         assert_eq!(store.download(&node_two).await.unwrap(), b"node-two");
         assert_eq!(store.download(&node_three).await.unwrap(), b"node-three");
@@ -1748,7 +2482,7 @@ mod tests {
 
     #[cfg(not(madsim))]
     fn is_gone(result: Result<Vec<u8>, SnapshotStoreError>) -> bool {
-        matches!(result, Err(SnapshotStoreError::NotFound(_)))
+        matches!(result, Err(SnapshotStoreError::NotFound { .. }))
     }
 
     /// #669: no count of retired objects is kept. Every object past the
@@ -1956,5 +2690,383 @@ mod tests {
             SnapshotPrune::Pruned { deleted: 0 }
         );
         assert_eq!(store.download(&young).await.unwrap(), b"young");
+    }
+
+    fn owner(node_id: u64, raft_group_id: u32) -> SnapshotOwner {
+        SnapshotOwner {
+            node_id,
+            raft_group_id,
+        }
+    }
+
+    fn body(bytes: &'static [u8]) -> SnapshotBytesIterator {
+        Box::new(std::iter::once(Ok(Bytes::from_static(bytes))))
+    }
+
+    /// An owned key renders as `{prefix}/node-{node}/group-{gid}/{index:020}-{nonce:016x}.snap`
+    /// and parses back to itself.
+    #[test]
+    fn an_owned_key_renders_and_parses_back() {
+        let key = OwnedKey {
+            owner: owner(1, 7),
+            index: 42,
+            nonce: 0xab,
+        };
+        let rendered = key.render("snapshots");
+        assert_eq!(
+            rendered,
+            "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.snap"
+        );
+        assert_eq!(OwnedKey::parse("snapshots", &rendered), Ok(key));
+        let largest = OwnedKey {
+            owner: owner(u64::MAX, u32::MAX),
+            index: u64::MAX,
+            nonce: u64::MAX,
+        };
+        assert_eq!(
+            OwnedKey::parse("p", &largest.render("p")),
+            Ok(largest),
+            "every field round-trips at its maximum"
+        );
+    }
+
+    /// The parser compares components, never text prefixes: `node-1` never
+    /// matches `node-10`, a prefix must end at a `/`, and every number must
+    /// be in the form a render writes.
+    #[test]
+    fn the_owned_key_parser_compares_components() {
+        let problem =
+            |prefix: &str, key: &str| OwnedKey::parse(prefix, key).expect_err(key).problem;
+        let name = "00000000000000000042-00000000000000ab.snap";
+        let node_ten = OwnedKey::parse("snapshots", &format!("snapshots/node-10/group-7/{name}"))
+            .expect("node 10's key parses");
+        assert_eq!(node_ten.owner, owner(10, 7));
+        assert_ne!(node_ten.owner, owner(1, 7));
+        for (prefix, key, expected) in [
+            (
+                "snap",
+                format!("snapshots/node-1/group-7/{name}"),
+                OwnedKeyProblem::OutsidePrefix,
+            ),
+            (
+                "snapshots",
+                format!("other/node-1/group-7/{name}"),
+                OwnedKeyProblem::OutsidePrefix,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/node-1/{name}"),
+                OwnedKeyProblem::Shape,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/node-1/group-7/x/{name}"),
+                OwnedKeyProblem::Shape,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/node-01/group-7/{name}"),
+                OwnedKeyProblem::Node,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/node-+1/group-7/{name}"),
+                OwnedKeyProblem::Node,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/nodes-1/group-7/{name}"),
+                OwnedKeyProblem::Node,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/node-1/group-07/{name}"),
+                OwnedKeyProblem::Group,
+            ),
+            (
+                "snapshots",
+                format!("snapshots/node-1/group-4294967296/{name}"),
+                OwnedKeyProblem::Group,
+            ),
+            (
+                "snapshots",
+                "snapshots/node-1/group-7/42-00000000000000ab.snap".to_owned(),
+                OwnedKeyProblem::Name,
+            ),
+            (
+                "snapshots",
+                "snapshots/node-1/group-7/00000000000000000042-00000000000000AB.snap".to_owned(),
+                OwnedKeyProblem::Name,
+            ),
+            (
+                "snapshots",
+                "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.json".to_owned(),
+                OwnedKeyProblem::Name,
+            ),
+            (
+                "snapshots",
+                "snapshots/node-1/group-7/99999999999999999999-00000000000000ab.snap".to_owned(),
+                OwnedKeyProblem::Name,
+            ),
+            (
+                "snapshots",
+                "snapshots/group-7/objects/abc.snap".to_owned(),
+                OwnedKeyProblem::Node,
+            ),
+        ] {
+            assert_eq!(problem(prefix, &key), expected, "{key}");
+        }
+    }
+
+    /// A pointer is owned when it is inline or names a key of this node and
+    /// group, and refused otherwise.
+    #[test]
+    fn an_owned_pointer_is_inline_or_under_its_own_directory() {
+        let namespace = OwnedNamespace {
+            prefix: "snapshots".to_owned(),
+            owner: owner(1, 7),
+        };
+        let s3 = |key: String| SnapshotPointer {
+            snapshot_id: "s".to_owned(),
+            location: SnapshotLocation::S3 {
+                key,
+                size_bytes: 1,
+                stored_size_bytes: 1,
+                compression: SnapshotCompression::Zstd,
+                shared_object: false,
+            },
+        };
+        let own = OwnedKey {
+            owner: owner(1, 7),
+            index: 3,
+            nonce: 4,
+        }
+        .render("snapshots");
+        let owned = OwnedPointer::try_from((s3(own.clone()), &namespace)).expect("own key");
+        assert_eq!(owned.pointer().location, s3(own).location);
+        OwnedPointer::try_from((
+            SnapshotPointer {
+                snapshot_id: "s".to_owned(),
+                location: SnapshotLocation::Inline { bytes: vec![1] },
+            },
+            &namespace,
+        ))
+        .expect("an inline pointer is owned");
+        for foreign in [
+            OwnedKey {
+                owner: owner(10, 7),
+                index: 3,
+                nonce: 4,
+            }
+            .render("snapshots"),
+            OwnedKey {
+                owner: owner(1, 8),
+                index: 3,
+                nonce: 4,
+            }
+            .render("snapshots"),
+            "snapshots/group-7/objects/abc.snap".to_owned(),
+        ] {
+            let refused = OwnedPointer::try_from((s3(foreign.clone()), &namespace))
+                .expect_err("a foreign key");
+            assert_eq!(refused, NotOwned::ForeignKey {
+                key: foreign,
+                directory: "snapshots/node-1/group-7/".to_owned(),
+            });
+        }
+        let local = OwnedPointer::try_from((
+            SnapshotPointer {
+                snapshot_id: "s".to_owned(),
+                location: SnapshotLocation::Local {
+                    path: PathBuf::from("/tmp/s.snap"),
+                    size_bytes: 1,
+                },
+            },
+            &namespace,
+        ));
+        assert!(matches!(local, Err(NotOwned::LocalPath { .. })));
+    }
+
+    /// `into_io` keeps the store error as the I/O error's source, so the
+    /// caller can still tell the variant apart.
+    #[test]
+    fn into_io_keeps_the_typed_store_error() {
+        let io = SnapshotStoreError::NotFound {
+            key: "snapshots/k.snap".to_owned(),
+        }
+        .into_io();
+        assert!(matches!(
+            io.get_ref()
+                .and_then(|source| source.downcast_ref::<SnapshotStoreError>()),
+            Some(SnapshotStoreError::NotFound { key }) if key == "snapshots/k.snap"
+        ));
+        let raw = io::Error::new(io::ErrorKind::PermissionDenied, "raw");
+        assert_eq!(
+            SnapshotStoreError::Io(raw).into_io().kind(),
+            io::ErrorKind::PermissionDenied,
+            "an I/O error passes through"
+        );
+    }
+
+    /// The inline store stages and writes inline, lists nothing and deletes
+    /// nothing.
+    #[tokio::test]
+    async fn the_inline_store_stages_inline() {
+        let store = InlineSnapshotStore;
+        let staged = store.stage(owner(1, 7), 3, body(b"inline")).await.unwrap();
+        assert!(staged.key().is_none());
+        assert_eq!(
+            store.write_staged(staged).await.unwrap(),
+            SnapshotLocation::Inline {
+                bytes: b"inline".to_vec()
+            }
+        );
+        assert_eq!(
+            store.list_own(owner(1, 7)).await.unwrap(),
+            OwnListing::default()
+        );
+    }
+
+    /// `stage` draws a fresh owned key and does no I/O. `write_staged`
+    /// creates the object, and the location it returns is the one the stage
+    /// named before the write.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_stage_names_a_fresh_owned_key_and_write_staged_creates_it() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let payload = b"owned snapshot body".repeat(64);
+        let chunks: SnapshotBytesIterator =
+            Box::new(std::iter::once(Ok(Bytes::from(payload.clone()))));
+        let staged = store.stage(owner(1, 7), 42, chunks).await.unwrap();
+        let key = *staged.key().expect("an S3 stage names an object");
+        assert_eq!((key.owner, key.index), (owner(1, 7), 42));
+        let location = staged.location();
+        let SnapshotLocation::S3 {
+            key: rendered,
+            size_bytes,
+            stored_size_bytes,
+            compression,
+            shared_object,
+        } = &location
+        else {
+            panic!("expected an S3 location, got {location:?}");
+        };
+        assert_eq!(rendered, &key.render("snapshots"));
+        assert_eq!(*size_bytes, payload.len() as u64);
+        assert!(*stored_size_bytes < *size_bytes);
+        assert_eq!(*compression, SnapshotCompression::Zstd);
+        assert!(!*shared_object, "an owned object is never shared");
+        assert!(
+            matches!(
+                store.download(&location).await,
+                Err(SnapshotStoreError::NotFound { .. })
+            ),
+            "the stage wrote nothing"
+        );
+        assert_eq!(store.write_staged(staged).await.unwrap(), location);
+        assert_eq!(store.download(&location).await.unwrap(), payload);
+        store.verify_uploaded(&location).await.unwrap();
+
+        let other = store.stage(owner(1, 7), 42, body(b"x")).await.unwrap();
+        assert_ne!(
+            other.key().map(|other| other.nonce),
+            Some(key.nonce),
+            "every stage draws its own name"
+        );
+    }
+
+    /// `write_staged` never reuses or overwrites an object: a name that
+    /// exists is a collision, and the object keeps its bytes.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_write_staged_refuses_a_name_that_exists() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let staged = store.stage(owner(1, 7), 1, body(b"first")).await.unwrap();
+        let location = staged.location();
+        let SnapshotLocation::S3 { key, .. } = &location else {
+            panic!("expected an S3 location");
+        };
+        store
+            .write_raw_for_tests(key, b"squatter".to_vec())
+            .await
+            .unwrap();
+        let refused = store.write_staged(staged).await.unwrap_err();
+        assert!(
+            matches!(&refused, SnapshotStoreError::NameCollision { key: collided } if collided == key),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            store.download(&location).await,
+            Err(SnapshotStoreError::SizeMismatch { .. })
+        ));
+    }
+
+    /// Outside the test store, a backend that cannot create an object only
+    /// if it is absent is refused rather than overwritten blindly.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_write_staged_refuses_a_backend_without_conditional_create() {
+        let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, []).unwrap();
+        let store = S3SnapshotStore::new(operator, "snapshots");
+        let staged = store.stage(owner(1, 7), 1, body(b"body")).await.unwrap();
+        let location = staged.location();
+        let refused = store.write_staged(staged).await.unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                SnapshotStoreError::ConditionalCreateUnsupported { .. }
+            ),
+            "{refused:?}"
+        );
+        assert!(matches!(
+            store.download(&location).await,
+            Err(SnapshotStoreError::NotFound { .. })
+        ));
+    }
+
+    /// `list_own` lists only the owner's directory, never node 10's for
+    /// node 1, and reports a file there that is no owned key apart.
+    /// `delete_own` deletes an owned object and takes a missing one.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_list_own_and_delete_own_stay_in_the_owners_directory() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let mut written = Vec::new();
+        for (node_id, index) in [(1, 5), (1, 3), (10, 4)] {
+            let staged = store
+                .stage(owner(node_id, 7), index, body(b"body"))
+                .await
+                .unwrap();
+            written.push(*staged.key().unwrap());
+            store.write_staged(staged).await.unwrap();
+        }
+        let other_group = store.stage(owner(1, 8), 9, body(b"body")).await.unwrap();
+        store.write_staged(other_group).await.unwrap();
+        store
+            .write_raw_for_tests("snapshots/node-1/group-7/stray.json", b"{}".to_vec())
+            .await
+            .unwrap();
+
+        let listing = store.list_own(owner(1, 7)).await.unwrap();
+        let mut own = vec![written[1], written[0]];
+        own.sort_unstable();
+        assert_eq!(listing.owned, own);
+        assert_eq!(listing.foreign, vec![
+            "snapshots/node-1/group-7/stray.json".to_owned()
+        ]);
+        assert_eq!(store.list_own(owner(10, 7)).await.unwrap().owned, vec![
+            written[2]
+        ]);
+
+        store.delete_own(written[0]).await.unwrap();
+        store.delete_own(written[0]).await.unwrap();
+        assert_eq!(store.list_own(owner(1, 7)).await.unwrap().owned, vec![
+            written[1]
+        ]);
+        assert_eq!(
+            store.list_own(owner(10, 7)).await.unwrap().owned,
+            vec![written[2]],
+            "node 1's delete leaves node 10's object"
+        );
     }
 }

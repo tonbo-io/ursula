@@ -28,6 +28,7 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 
+use crate::registry::SnapshotInstallError;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateStatus;
 use crate::state_machine::RaftGroupStateMachine;
@@ -711,13 +712,30 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             .await
             .map_err(|err| {
                 let message = format!("remote full snapshot on node {}: {err}", self.target);
-                match &err {
-                    crate::registry::SnapshotInstallError::Group(group)
-                        if refuses_overwrite(group) =>
-                    {
-                        StreamingError::Unreachable(Unreachable::from_string(message))
-                    }
-                    _ => StreamingError::Network(NetworkError::from_string(message)),
+                // A refused overwrite backs the sender off, as does every
+                // typed refusal of the prefetch that the gRPC plane answers
+                // `UNAVAILABLE`. Admission and publication failures stay
+                // network errors, as on this network before.
+                let backs_off = match &err {
+                    SnapshotInstallError::Group(group) => refuses_overwrite(group),
+                    SnapshotInstallError::NotRegistered { .. }
+                    | SnapshotInstallError::ShuttingDown { .. }
+                    | SnapshotInstallError::Publication(_)
+                    | SnapshotInstallError::Task(_) => false,
+                    SnapshotInstallError::GateClosed { .. }
+                    | SnapshotInstallError::PointerUndecodable { .. }
+                    | SnapshotInstallError::SourceMissing { .. }
+                    | SnapshotInstallError::SourceRead { .. }
+                    | SnapshotInstallError::Undecodable { .. }
+                    | SnapshotInstallError::CopyWrite { .. }
+                    | SnapshotInstallError::CopyVerify { .. }
+                    | SnapshotInstallError::NameCollision { .. }
+                    | SnapshotInstallError::PointerEncode { .. } => err.peer_backs_off(),
+                };
+                if backs_off {
+                    StreamingError::Unreachable(Unreachable::from_string(message))
+                } else {
+                    StreamingError::Network(NetworkError::from_string(message))
                 }
             })
     }
