@@ -35,6 +35,9 @@
 //!   through the dedicated `ExpireStreams` command (F0, #669).
 //! - [`key_holds`]: in-memory holds on object keys, which a deleter that
 //!   lists the store leaves alone, with a drop behaviour per set.
+//! - `snapshot_harness` (madsim, tests and `test-support` only): a faulty
+//!   in-memory snapshot store, a store wrapper with named gates, and the
+//!   checkers of the snapshot ownership invariants I1 to I5 (#687).
 
 mod admission;
 pub mod cold_index;
@@ -329,6 +332,8 @@ pub use snapshot_store::StagedSnapshot;
 pub use snapshot_store::decode_snapshot_envelope;
 pub use snapshot_store::default_snapshot_store;
 pub use snapshot_store::encode_binary_envelope;
+#[cfg(any(madsim, test, feature = "test-support"))]
+pub use snapshot_store::harness as snapshot_harness;
 pub use snapshot_store::resolved_snapshot_backend;
 pub use snapshot_store::snapshot_store_from_config;
 pub use ursula_config::config::ColdConfig;

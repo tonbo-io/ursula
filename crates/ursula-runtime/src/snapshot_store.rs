@@ -35,6 +35,9 @@ use ursula_shard::RaftGroupId;
 
 use crate::SnapshotStoreOperation;
 
+#[cfg(any(madsim, test, feature = "test-support"))]
+pub mod harness;
+
 /// Node identities that may persist an external snapshot pointer for each
 /// group. S3 pruning is enabled only after every expected voter has published
 /// its current reference, so pruning fails closed while any voter has not.

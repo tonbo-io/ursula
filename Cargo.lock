@@ -4335,6 +4335,7 @@ version = "0.8.2"
 dependencies = [
  "axum 0.8.9",
  "blake3",
+ "bytes",
  "futures-util",
  "madsim",
  "openraft",

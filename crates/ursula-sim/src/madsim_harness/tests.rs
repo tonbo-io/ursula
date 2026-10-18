@@ -13,6 +13,8 @@ use super::*;
 mod disk_tests;
 #[path = "recovery_tests.rs"]
 mod recovery_tests;
+#[path = "snapshot_store_harness.rs"]
+mod snapshot_store_harness;
 #[path = "strict_replay_tests.rs"]
 mod strict_replay_tests;
 #[path = "thread_isolation_tests.rs"]

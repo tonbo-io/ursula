@@ -298,6 +298,15 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             scrub_ --nocapture
 
+      # Snapshot object ownership (#687): the faulty in-memory snapshot
+      # store (late PUTs, stale LISTs, If-None-Match, seeded nonces, the I2
+      # assertion) under madsim, with the I1, I2 and I5 checkers. Each seed
+      # runs twice and must log the same requests.
+      - name: Run snapshot store harness
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            snapshot_store_harness --nocapture
+
       # Strict replay: madsim's check_determinism runs a three-node cluster on
       # the per-core journal twice per seed and fails at the first scheduling
       # difference, which the outcome-level replays cannot see.
