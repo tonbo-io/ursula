@@ -1101,7 +1101,6 @@ fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, Sna
 #[cfg(not(madsim))]
 mod s3 {
     use std::collections::HashSet;
-    use std::io;
     use std::io::Write;
     use std::time::Duration;
     use std::time::SystemTime;
