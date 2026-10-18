@@ -376,7 +376,7 @@ async fn retention_reclaims_external_payloads_still_held_in_state() {
                     payload_len: 3,
                     object_size: 3,
                 },
-                record_ends: Vec::new(),
+                message_count: 0,
                 close_after: false,
                 stream_seq: None,
                 producer: None,

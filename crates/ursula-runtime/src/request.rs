@@ -42,7 +42,9 @@ pub struct CreateStreamExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
     pub initial_payload: ExternalPayloadRef,
-    pub record_ends: Vec<u64>,
+    /// JSON messages in the staged payload, counted over the normalized
+    /// body while staging. Zero on any other content type.
+    pub message_count: u64,
     pub close_after: bool,
     pub stream_seq: Option<String>,
     pub stream_ttl_seconds: Option<u64>,
@@ -57,13 +59,13 @@ impl CreateStreamExternalRequest {
     pub fn from_create_request(
         request: CreateStreamRequest,
         initial_payload: ExternalPayloadRef,
-        record_ends: Vec<u64>,
+        message_count: u64,
     ) -> Self {
         Self {
             stream_id: request.stream_id,
             content_type: request.content_type,
             initial_payload,
-            record_ends,
+            message_count,
             close_after: request.close_after,
             stream_seq: request.stream_seq,
             stream_ttl_seconds: request.stream_ttl_seconds,
@@ -75,8 +77,11 @@ impl CreateStreamExternalRequest {
 }
 
 impl CreateStreamRequest {
-    pub fn canonical_record_ends(&self) -> Vec<u64> {
-        ursula_stream::canonical_json_record_ends(&self.content_type, &self.initial_payload)
+    /// The canonical JSON messages of the initial payload, zero for any
+    /// other content type. A payload that is not canonical counts zero, which
+    /// apply refuses on a JSON stream.
+    pub fn canonical_message_count(&self) -> u64 {
+        ursula_stream::canonical_json_message_count(&self.content_type, &self.initial_payload)
             .unwrap_or_default()
     }
 
@@ -903,7 +908,9 @@ pub struct AppendExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
     pub payload: ExternalPayloadRef,
-    pub record_ends: Vec<u64>,
+    /// JSON messages in the staged payload, counted over the normalized
+    /// body while staging. Zero on any other content type.
+    pub message_count: u64,
     pub close_after: bool,
     pub stream_seq: Option<String>,
     pub producer: Option<ProducerRequest>,
@@ -917,13 +924,13 @@ impl AppendExternalRequest {
     pub fn from_append_request(
         request: AppendRequest,
         payload: ExternalPayloadRef,
-        record_ends: Vec<u64>,
+        message_count: u64,
     ) -> Self {
         Self {
             stream_id: request.stream_id,
             content_type: request.content_type,
             payload,
-            record_ends,
+            message_count,
             close_after: request.close_after,
             stream_seq: request.stream_seq,
             producer: request.producer,
@@ -934,8 +941,10 @@ impl AppendExternalRequest {
 }
 
 impl AppendRequest {
-    pub fn canonical_record_ends(&self) -> Vec<u64> {
-        ursula_stream::canonical_json_record_ends(&self.content_type, &self.payload)
+    /// The canonical JSON messages of the payload, as
+    /// [`CreateStreamRequest::canonical_message_count`].
+    pub fn canonical_message_count(&self) -> u64 {
+        ursula_stream::canonical_json_message_count(&self.content_type, &self.payload)
             .unwrap_or_default()
     }
 

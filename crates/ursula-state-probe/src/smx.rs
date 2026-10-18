@@ -83,12 +83,12 @@ pub fn append(
 }
 
 /// What the HTTP layer submits for a body of 1 MiB or more once it has staged
-/// the bytes at `new_external_payload_path` (record ends computed over the body).
+/// the bytes at `new_external_payload_path` (messages counted over the body).
 pub fn append_external(
     m: &mut StreamStateMachine,
     id: &BucketStreamId,
     payload_len: u64,
-    record_ends: Vec<u64>,
+    message_count: u64,
     now_ms: u64,
 ) -> StreamResponse {
     m.apply(StreamCommand::AppendExternal {
@@ -99,7 +99,7 @@ pub fn append_external(
             payload_len,
             object_size: payload_len,
         },
-        record_ends,
+        message_count,
         close_after: false,
         stream_seq: None,
         producer: None,

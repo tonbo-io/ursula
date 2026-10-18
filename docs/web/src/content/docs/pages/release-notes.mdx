@@ -23,6 +23,8 @@ See [Upgrading to 0.9](/docs/operations#upgrading-to-09).
 ### Server
 
 - **A cold flush or compaction refused while a group's history is pending cleans up after itself.** A leader whose history event has not applied refuses such a publish before proposing it. The flush or compaction now deletes its upload and keeps the old index, instead of leaving them for the orphan sweep, and a compaction pass goes on with the next stream.
+- **JSON writes staged in object storage make small Raft entries.** With a cold store, the Raft entry of a JSON create or append whose body was staged in object storage held the end offset of every message. A 32 MiB body of 2-byte messages made an entry of about 80 MiB that weighed 128 MiB against `raft.snapshot_log_budget`, and a staged body of 1.6 MiB of such messages already made an entry larger than a replication read. The entry now holds the number of messages, which `committed_records` in `/__ursula/usage` counts as before, so it stays at about 2 KiB plus its Content-Type whatever the body holds. With a cold store at the default `runtime.external_payload_min_size`, only a restore now makes an entry larger than a replication read ([#518](https://github.com/tonbo-io/ursula/issues/518)).
+- **A body sent to a stream of another content type answers `409` whatever its size.** A body staged in object storage, a JSON body to a byte stream or a byte body to a JSON stream, answered `400` with `INVALID_RECORD_BOUNDARIES`. It now answers `409` with `CONTENT_TYPE_MISMATCH`, as a smaller body does.
 
 ### Rust library APIs
 

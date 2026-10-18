@@ -44,9 +44,10 @@ use self::ttl::TtlIndex;
 use crate::command::StreamCommand;
 use crate::history::HistoryEvent;
 use crate::history::InheritedHistory;
-use crate::json_records::canonical_json_record_ends;
+use crate::json_records::NonCanonicalJsonPayload;
+use crate::json_records::canonical_json_message_count;
 use crate::json_records::is_json_record_content_type;
-use crate::json_records::record_ends_valid;
+use crate::json_records::message_count_valid;
 use crate::model::AppendExternalInput;
 use crate::model::AppendStreamInput;
 use crate::model::BOOTSTRAP_MAX_UPDATE_BYTES;
@@ -329,12 +330,12 @@ impl StreamStateMachine {
         self.hot_payload_bytes = self.hot_payload_bytes.saturating_sub(bytes);
     }
 
-    /// Records committed by one accepted append. JSON streams provide exact
-    /// canonical boundaries; a byte stream counts one message record per
-    /// non-empty append.
-    fn appended_record_count(record_ends: &[u64], payload_len: u64) -> u64 {
-        if !record_ends.is_empty() {
-            record_ends.len() as u64
+    /// Records committed by one accepted append. JSON streams provide the
+    /// exact count of canonical messages; a byte stream counts one message
+    /// record per non-empty append.
+    fn appended_record_count(json_messages: u64, payload_len: u64) -> u64 {
+        if json_messages > 0 {
+            json_messages
         } else if payload_len > 0 {
             1
         } else {
@@ -475,19 +476,19 @@ impl StreamStateMachine {
                 stream_expires_at_ms,
                 now_ms,
             } => {
-                let response = match canonical_json_record_ends(&content_type, &initial_payload) {
-                    Ok(record_ends) => self.create_stream(CreateStreamInput {
+                let response = match canonical_json_message_count(&content_type, &initial_payload) {
+                    Ok(message_count) => self.create_stream(CreateStreamInput {
                         stream_id,
                         content_type,
                         initial_payload: initial_payload.into(),
-                        record_ends,
+                        message_count,
                         close_after,
                         stream_seq,
                         stream_ttl_seconds,
                         stream_expires_at_ms,
                         now_ms,
                     }),
-                    Err(_) => StreamResponse::error(
+                    Err(NonCanonicalJsonPayload) => StreamResponse::error(
                         StreamErrorCode::InvalidRecordBoundaries,
                         "application/json initial payload must use canonical newline boundaries",
                     ),
@@ -499,7 +500,7 @@ impl StreamStateMachine {
                 stream_id,
                 content_type,
                 initial_payload,
-                record_ends,
+                message_count,
                 close_after,
                 stream_seq,
                 stream_ttl_seconds,
@@ -510,7 +511,7 @@ impl StreamStateMachine {
                     stream_id,
                     content_type,
                     initial_payload,
-                    record_ends,
+                    message_count,
                     close_after,
                     stream_seq,
                     stream_ttl_seconds,
@@ -547,7 +548,7 @@ impl StreamStateMachine {
                 stream_id,
                 content_type,
                 payload,
-                record_ends,
+                message_count,
                 close_after,
                 stream_seq,
                 producer,
@@ -557,7 +558,7 @@ impl StreamStateMachine {
                     stream_id,
                     content_type: content_type.as_deref(),
                     payload,
-                    record_ends,
+                    message_count,
                     close_after,
                     stream_seq,
                     producer,
@@ -690,7 +691,7 @@ struct CreateStreamInput {
     stream_id: BucketStreamId,
     content_type: String,
     initial_payload: Vec<u8>,
-    record_ends: Vec<u64>,
+    message_count: u64,
     close_after: bool,
     stream_seq: Option<String>,
     stream_ttl_seconds: Option<u64>,
@@ -703,7 +704,7 @@ struct CreateExternalStreamInput {
     stream_id: BucketStreamId,
     content_type: String,
     initial_payload: ExternalPayloadRef,
-    record_ends: Vec<u64>,
+    message_count: u64,
     close_after: bool,
     stream_seq: Option<String>,
     stream_ttl_seconds: Option<u64>,
@@ -864,24 +865,24 @@ fn validate_external_payload_ref(payload: &ExternalPayloadRef) -> Result<(), Str
     Ok(())
 }
 
-/// Checks the message ends of an external create or append (computed by
-/// the proposer from the staged payload): canonical JSON ends for a JSON
-/// stream, none for any other.
-fn validate_record_ends(
+/// Checks the message count of an external create or append (counted by
+/// the proposer over the staged payload): at least one and at most one per
+/// two payload bytes for a JSON stream, none for any other.
+fn validate_message_count(
     content_type: &str,
     payload_len: u64,
-    record_ends: &[u64],
+    message_count: u64,
 ) -> Result<(), StreamResponse> {
-    if record_ends_valid(
+    if message_count_valid(
         is_json_record_content_type(content_type),
         payload_len,
-        record_ends,
+        message_count,
     ) {
         return Ok(());
     }
     Err(StreamResponse::error(
         StreamErrorCode::InvalidRecordBoundaries,
-        "message ends do not match the canonical JSON payload",
+        "message count does not match the canonical JSON payload",
     ))
 }
 

@@ -2080,7 +2080,7 @@ fn external_append_request(stream: &BucketStreamId, path: &str, len: u64) -> App
             payload_len: len,
             object_size: len,
         },
-        record_ends: Vec::new(),
+        message_count: 0,
         close_after: false,
         stream_seq: None,
         producer: None,

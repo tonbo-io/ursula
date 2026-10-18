@@ -24,7 +24,7 @@ use super::renew_stream_ttl;
 use super::stream_is_expired;
 use super::validate_bucket_id;
 use super::validate_external_payload_ref;
-use super::validate_record_ends;
+use super::validate_message_count;
 use super::validate_stream_id;
 
 impl StreamStateMachine {
@@ -160,7 +160,7 @@ impl StreamStateMachine {
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,
-            Self::appended_record_count(&input.record_ends, initial_len),
+            Self::appended_record_count(input.message_count, initial_len),
         );
         StreamResponse::Created {
             stream_id: input.stream_id,
@@ -184,10 +184,10 @@ impl StreamStateMachine {
         {
             return response;
         }
-        if let Err(response) = validate_record_ends(
+        if let Err(response) = validate_message_count(
             &input.content_type,
             input.initial_payload.payload_len,
-            &input.record_ends,
+            input.message_count,
         ) {
             return response;
         }
@@ -275,7 +275,7 @@ impl StreamStateMachine {
         self.usage_on_stream_created(
             &stream_id.bucket_id,
             initial_len,
-            Self::appended_record_count(&input.record_ends, initial_len),
+            Self::appended_record_count(input.message_count, initial_len),
         );
         StreamResponse::Created {
             stream_id: input.stream_id,

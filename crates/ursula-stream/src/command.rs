@@ -34,7 +34,11 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         content_type: String,
         initial_payload: ExternalPayloadRef,
-        record_ends: Vec<u64>,
+        /// The JSON messages in the staged payload, one per LF, counted by
+        /// the proposer while staging. Zero on any other stream. The
+        /// payload's LF bytes are its boundaries, so the entry carries no
+        /// per-message data.
+        message_count: u64,
         close_after: bool,
         stream_seq: Option<String>,
         stream_ttl_seconds: Option<u64>,
@@ -54,7 +58,11 @@ pub enum StreamCommand {
         stream_id: BucketStreamId,
         content_type: Option<String>,
         payload: ExternalPayloadRef,
-        record_ends: Vec<u64>,
+        /// The JSON messages in the staged payload, one per LF, counted by
+        /// the proposer while staging. Zero on any other stream. The
+        /// payload's LF bytes are its boundaries, so the entry carries no
+        /// per-message data.
+        message_count: u64,
         close_after: bool,
         stream_seq: Option<String>,
         producer: Option<ProducerRequest>,
@@ -222,18 +230,19 @@ pub enum StreamCommand {
 /// Fixed per-command allowance of [`StreamCommand::log_bytes_estimate`]:
 /// ids, offsets, headers and framing.
 pub const COMMAND_LOG_OVERHEAD_BYTES: u64 = 128;
-/// Allowance per cold-chunk reference a command carries.
+/// Allowance per object reference (cold chunk or staged payload) a command
+/// carries.
 const CHUNK_REF_LOG_BYTES: u64 = 160;
 
-fn len_u64(len: usize) -> u64 {
+pub(crate) fn len_u64(len: usize) -> u64 {
     u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 impl StreamCommand {
     /// Approximate bytes this command occupies in the Raft log: its payload
-    /// bytes plus a fixed allowance per command, message end and chunk
-    /// reference. Snapshot cadence (bounded-state F12e) counts log bytes
-    /// with it, so it needs to track payload volume, not exact encodings.
+    /// bytes plus a fixed allowance per command and per object reference.
+    /// Snapshot cadence (bounded-state F12e) counts log bytes with it, so it
+    /// needs to track payload volume, not exact encodings.
     /// A log read also weighs entries with it to bound each Append call to a
     /// follower (#507).
     pub fn log_bytes_estimate(&self) -> u64 {
@@ -241,13 +250,13 @@ impl StreamCommand {
             Self::CreateStream {
                 initial_payload, ..
             } => len_u64(initial_payload.len()),
-            Self::CreateExternal { record_ends, .. } | Self::AppendExternal { record_ends, .. } => {
-                len_u64(record_ends.len()).saturating_mul(8)
-            }
+            Self::CreateExternal { .. }
+            | Self::AppendExternal { .. }
+            | Self::PublishSnapshotExternal { .. }
+            | Self::FlushCold { .. } => CHUNK_REF_LOG_BYTES,
             Self::Append { payload, .. } | Self::PublishSnapshot { payload, .. } => {
                 len_u64(payload.len())
             }
-            Self::FlushCold { .. } => CHUNK_REF_LOG_BYTES,
             Self::CompactCold { old_chunks, .. } => len_u64(old_chunks.len())
                 .saturating_add(1)
                 .saturating_mul(CHUNK_REF_LOG_BYTES),

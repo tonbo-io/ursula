@@ -89,7 +89,7 @@ async fn append_external(
                 payload_len: len,
                 object_size: len,
             },
-            record_ends: Vec::new(),
+            message_count: 0,
             close_after: false,
             stream_seq: stream_seq.map(str::to_owned),
             producer: None,
