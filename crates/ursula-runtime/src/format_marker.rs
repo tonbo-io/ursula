@@ -444,7 +444,7 @@ mod tests {
                 OBJECT_MARKER,
                 serde_json::to_vec(&FormatEpochMarker {
                     format_epoch: FORMAT_EPOCH - 1,
-                    written_by: "ursula 0.5.1".to_owned(),
+                    written_by: "ursula 0.8.2".to_owned(),
                 })
                 .unwrap(),
             )

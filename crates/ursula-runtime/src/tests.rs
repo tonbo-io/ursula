@@ -1473,7 +1473,7 @@ async fn install_group_snapshot_rejects_mismatched_placement_before_routing() {
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
             history: None,
-            format_epoch: ursula_stream::FORMAT_EPOCH,
+            format_version: ursula_stream::BACKUP_FORMAT_VERSION,
         },
         stream_append_counts: Vec::new(),
     };
@@ -3984,7 +3984,7 @@ impl GroupEngine for BlockingReadEngine {
                     bucket_usage: Vec::new(),
                     last_created_at_ms: 0,
                     history: None,
-                    format_epoch: ursula_stream::FORMAT_EPOCH,
+                    format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 },
                 stream_append_counts: Vec::new(),
             })
@@ -4190,7 +4190,7 @@ impl GroupEngine for RecordingEngine {
                     bucket_usage: Vec::new(),
                     last_created_at_ms: 0,
                     history: None,
-                    format_epoch: ursula_stream::FORMAT_EPOCH,
+                    format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 },
                 stream_append_counts: Vec::new(),
             })

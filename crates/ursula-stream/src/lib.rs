@@ -7,7 +7,7 @@
 //!   `Stream-Incarnation` token derived from it, and what a stream inherited
 //!   from the history before (#581 section 4).
 //! - [`format`]: the format epoch every persisted format and the Raft RPC
-//!   protocol share, and its policy.
+//!   protocol share, the backup format, and their policy.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`json_records`]: canonical JSON message text: LF-terminated messages,
@@ -37,7 +37,9 @@ mod validate;
 
 pub use command::COMMAND_LOG_OVERHEAD_BYTES;
 pub use command::StreamCommand;
+pub use format::BACKUP_FORMAT_VERSION;
 pub use format::FORMAT_EPOCH;
+pub use format::backup_format_refusal;
 pub use format::format_epoch_refusal;
 pub use history::BackupDigest;
 pub use history::HistoryEvent;

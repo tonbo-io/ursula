@@ -2484,10 +2484,6 @@ pub(crate) async fn flush_cold_stream(
     }
 }
 
-/// The backup format is the format epoch: an ursulactl of another epoch
-/// refuses this version with its own check, and this server refuses groups of
-/// another epoch (E10).
-pub(crate) const BACKUP_FORMAT_VERSION: u32 = ursula_runtime::FORMAT_EPOCH;
 pub(crate) const HEADER_BACKUP_FORMAT: &str = "x-ursula-backup-format";
 pub(crate) const HEADER_BACKUP_BLAKE3: &str = "x-ursula-backup-blake3";
 pub(crate) const HEADER_BACKUP_COMMIT_INDEX: &str = "x-ursula-backup-commit-index";
@@ -2497,7 +2493,7 @@ pub(crate) async fn backup_info(State(state): State<HttpState>) -> Response {
     (
         StatusCode::OK,
         axum::Json(ursula_proto::admin::BackupInfo {
-            format_version: BACKUP_FORMAT_VERSION,
+            format_version: ursula_runtime::BACKUP_FORMAT_VERSION,
             raft_group_count: state.runtime.raft_group_count(),
         }),
     )
@@ -2547,7 +2543,7 @@ pub(crate) async fn export_backup_group(
     let headers = response.headers_mut();
     headers.insert(
         HEADER_BACKUP_FORMAT,
-        HeaderValue::from(BACKUP_FORMAT_VERSION),
+        HeaderValue::from(ursula_runtime::BACKUP_FORMAT_VERSION),
     );
     if let Ok(value) = HeaderValue::from_str(&checksum) {
         headers.insert(HEADER_BACKUP_BLAKE3, value);
@@ -2564,14 +2560,14 @@ pub(crate) async fn export_backup_group(
 
 /// The only field an import reads before it trusts the payload (E10).
 #[derive(serde::Deserialize)]
-struct BackupEpochProbe {
-    #[serde(default)]
-    format_epoch: Option<u32>,
+struct BackupFormatProbe {
+    #[serde(default, rename = "format_epoch")]
+    format_version: Option<u32>,
 }
 
 /// Reads one backup group object addressed to group `raft_group_id`: the
 /// group must exist here and the body must be a stream snapshot of this
-/// server's format epoch (E10). A refusal is the `400` to answer.
+/// server's backup format (E10). A refusal is the `400` to answer.
 fn decode_backup_group(
     state: &HttpState,
     raft_group_id: u64,
@@ -2588,24 +2584,12 @@ fn decode_backup_group(
     let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
         return Err(bad_request("invalid raft group id".to_owned()));
     };
-    // E10: read only the epoch first, so a group of another epoch answers
-    // 400 instead of being decoded under this epoch's rules.
-    match rmp_serde::from_slice::<BackupEpochProbe>(body) {
-        Ok(BackupEpochProbe {
-            format_epoch: Some(epoch),
-        }) if epoch == ursula_runtime::FORMAT_EPOCH => {}
-        Ok(BackupEpochProbe { format_epoch }) => {
-            let found = format_epoch.map_or_else(
-                || "no format_epoch".to_owned(),
-                |epoch| format!("an unsupported format_epoch ({epoch})"),
-            );
-            return Err(bad_request(format!(
-                "backup group has {found}; this server imports format epoch {} only",
-                ursula_runtime::FORMAT_EPOCH
-            )));
-        }
-        Err(err) => return Err(bad_request(format!("decode backup snapshot: {err}"))),
-    }
+    // E10: read only the backup format first, so a group of another format
+    // answers 400 instead of being decoded under this format's rules.
+    let probe = rmp_serde::from_slice::<BackupFormatProbe>(body)
+        .map_err(|err| bad_request(format!("decode backup snapshot: {err}")))?;
+    ursula_runtime::StreamSnapshot::check_format(probe.format_version)
+        .map_err(|err| bad_request(err.to_string()))?;
     let snapshot = rmp_serde::from_slice(body)
         .map_err(|err| bad_request(format!("decode backup snapshot: {err}")))?;
     Ok((raft_group_id, snapshot))
@@ -5523,6 +5507,8 @@ fn request_target(uri: &Uri) -> String {
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+mod backup_format_tests;
 #[cfg(test)]
 mod base_contract_tests;
 #[cfg(test)]

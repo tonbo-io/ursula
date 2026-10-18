@@ -286,6 +286,7 @@ pub use snapshot_store::encode_binary_envelope;
 pub use snapshot_store::resolved_snapshot_backend;
 pub use snapshot_store::snapshot_store_from_config;
 pub use ursula_config::config::ColdConfig;
+pub use ursula_stream::BACKUP_FORMAT_VERSION;
 pub use ursula_stream::BackupDigest;
 pub use ursula_stream::COMMITTED_WRITE_UNIT_BYTES;
 pub use ursula_stream::ClosedBy;

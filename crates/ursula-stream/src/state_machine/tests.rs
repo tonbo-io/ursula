@@ -2483,7 +2483,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
             history: None,
-            format_epoch: crate::FORMAT_EPOCH,
+            format_version: crate::BACKUP_FORMAT_VERSION,
         })
         .expect_err("duplicate bucket"),
         StreamSnapshotError::DuplicateBucket("benchcmp".to_owned())
@@ -2499,7 +2499,7 @@ fn snapshot_restore_rejects_invalid_entries() {
             bucket_usage: Vec::new(),
             last_created_at_ms: 0,
             history: None,
-            format_epoch: crate::FORMAT_EPOCH,
+            format_version: crate::BACKUP_FORMAT_VERSION,
         })
     };
 
@@ -4027,27 +4027,30 @@ fn purge_bucket_removes_streams_but_preserves_accounting_idempotently() {
 }
 
 #[test]
-fn restore_refuses_another_format_epoch() {
-    let mut snapshot = machine().snapshot();
-    snapshot.format_epoch = crate::FORMAT_EPOCH - 1;
-    assert_eq!(
-        StreamStateMachine::restore(snapshot.clone()).expect_err("other epoch"),
-        StreamSnapshotError::FormatEpoch {
-            found: crate::FORMAT_EPOCH - 1,
-        }
-    );
-    assert!(matches!(
-        StreamStateMachine::new().apply(StreamCommand::ImportSnapshot {
-            snapshot: Box::new(snapshot),
-            history: std::num::NonZeroU64::MIN,
-            backup_digest: [0; 32],
-            now_ms: 0,
-        }),
-        StreamResponse::Error {
-            code: StreamErrorCode::ImportInvalid,
-            ..
-        }
-    ));
+fn restore_refuses_another_backup_format() {
+    for found in [
+        crate::BACKUP_FORMAT_VERSION - 1,
+        crate::BACKUP_FORMAT_VERSION + 1,
+    ] {
+        let mut snapshot = machine().snapshot();
+        snapshot.format_version = found;
+        assert_eq!(
+            StreamStateMachine::restore(snapshot.clone()).expect_err("other backup format"),
+            StreamSnapshotError::BackupFormat { found: Some(found) }
+        );
+        assert!(matches!(
+            StreamStateMachine::new().apply(StreamCommand::ImportSnapshot {
+                snapshot: Box::new(snapshot),
+                history: std::num::NonZeroU64::MIN,
+                backup_digest: [0; 32],
+                now_ms: 0,
+            }),
+            StreamResponse::Error {
+                code: StreamErrorCode::ImportInvalid,
+                ..
+            }
+        ));
+    }
 }
 
 #[test]

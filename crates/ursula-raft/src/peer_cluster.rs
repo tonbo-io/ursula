@@ -45,6 +45,10 @@ use ursula_headers::ClusterId;
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
 use crate::rt::time::Instant;
 
+/// The format epoch that introduced cluster ids on Raft RPCs: a sender that
+/// names none is a node of an earlier epoch.
+const CLUSTER_ID_EPOCH: u32 = 4;
+
 /// Request metadata naming the sender's cluster id; on a refusal, the
 /// refusing node's.
 pub const CLUSTER_ID_METADATA: &str = "ursula-cluster-id";
@@ -137,8 +141,7 @@ pub enum PeerClusterError {
     /// reads as a format-epoch refusal (E8).
     #[error(
         "{PROTOCOL_MISMATCH_TEXT}: the sender named no cluster id (a node before format epoch \
-         {epoch}; a node joins only a cluster of its own format epoch)",
-        epoch = ursula_stream::FORMAT_EPOCH
+         {CLUSTER_ID_EPOCH}; a node joins only a cluster of its own format epoch)"
     )]
     MissingClusterId,
     #[error("the sender's {header} request metadata is malformed")]
@@ -762,6 +765,10 @@ mod tests {
         let status = refusal(&server, tonic::Request::new(())).expect("refused");
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(is_protocol_mismatch(&status), "{status:?}");
+        assert!(
+            status.message().contains("before format epoch 4"),
+            "{status:?}"
+        );
         assert_eq!(server.refusals(), 0);
         assert_eq!(server.unidentified_refusals(), 1);
         assert!(server.mismatches_at(Instant::now()).is_empty());

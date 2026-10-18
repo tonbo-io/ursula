@@ -97,7 +97,7 @@ A group leaves `empty` in the batch that persists its first entry or purge and
 never returns to it. That write records `recovering` instead of `initialized`
 when the group's gate is closed and the replica holds nothing of it.
 
-The journal and state-file version is the format epoch, 3. There is no
+The journal and state-file version is the format epoch, 5. There is no
 migration: other epochs and files without the Ursula magic are refused, and the
 `FORMAT_EPOCH` marker refuses a directory of another epoch before any journal
 opens. The decoder bounds a frame payload at 512 MiB and a state file at 64 MiB

@@ -149,7 +149,7 @@ pub fn decode_group_snapshot(bytes: &[u8]) -> Result<GroupSnapshot, SnapshotStor
         placement: placement_from_proto(required(header.placement, "snapshot header placement")?),
         group_commit_index: header.group_commit_index,
         stream_snapshot: StreamSnapshot {
-            format_epoch: ursula_stream::FORMAT_EPOCH,
+            format_version: ursula_stream::BACKUP_FORMAT_VERSION,
             buckets: header.buckets,
             erased_buckets: header.erased_buckets,
             streams,
@@ -668,7 +668,7 @@ mod tests {
 
     use super::*;
 
-    /// The history event in a snapshot's header frame, as format epoch 4
+    /// The history event in a snapshot's header frame, as format epoch 5
     /// writes it (#613): a recovery's event, with the history it replaced,
     /// the index it kept and its leader. A frame without any of them is
     /// refused.
@@ -730,7 +730,7 @@ mod tests {
             },
             group_commit_index: 42,
             stream_snapshot: StreamSnapshot {
-                format_epoch: ursula_stream::FORMAT_EPOCH,
+                format_version: ursula_stream::BACKUP_FORMAT_VERSION,
                 buckets: vec!["bucket".to_owned()],
                 erased_buckets: vec!["erased-bucket".to_owned()],
                 streams: Vec::new(),

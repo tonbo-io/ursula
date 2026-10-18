@@ -60,7 +60,7 @@ impl StreamStateMachine {
         });
 
         StreamSnapshot {
-            format_epoch: crate::FORMAT_EPOCH,
+            format_version: crate::BACKUP_FORMAT_VERSION,
             buckets,
             erased_buckets,
             streams,
@@ -120,17 +120,6 @@ impl StreamStateMachine {
                 ),
             );
         }
-        if snapshot.format_epoch != crate::FORMAT_EPOCH {
-            return StreamResponse::error(
-                StreamErrorCode::ImportInvalid,
-                format!(
-                    "snapshot import failed validation: {}",
-                    StreamSnapshotError::FormatEpoch {
-                        found: snapshot.format_epoch,
-                    }
-                ),
-            );
-        }
         let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
         let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
         // Each stream keeps the history it was last written in. One written
@@ -183,11 +172,7 @@ impl StreamStateMachine {
     }
 
     pub fn restore(snapshot: StreamSnapshot) -> Result<Self, StreamSnapshotError> {
-        if snapshot.format_epoch != crate::FORMAT_EPOCH {
-            return Err(StreamSnapshotError::FormatEpoch {
-                found: snapshot.format_epoch,
-            });
-        }
+        StreamSnapshot::check_format(Some(snapshot.format_version))?;
         let mut machine = Self {
             last_created_at_ms: snapshot.last_created_at_ms,
             history: snapshot.history,

@@ -3,8 +3,9 @@
 //! A backup is a directory (local filesystem or `s3://bucket/prefix`) holding
 //! one MessagePack `group-NNNN.snapshot` object per raft group plus a JSON
 //! `manifest.json`. The manifest carries the backup format version
-//! ([`BACKUP_FORMAT_VERSION`], the format epoch), per-object byte sizes and
-//! BLAKE3 checksums, and the group commit index each export observed.
+//! ([`BACKUP_FORMAT_VERSION`], which moves only when what a backup holds
+//! changes), per-object byte sizes and BLAKE3 checksums, and the group commit
+//! index each export observed.
 //!
 //! Recovery contract (also documented on the docs site):
 //!
@@ -31,6 +32,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_proto::admin::BackupColdCheck;
 use ursula_proto::admin::BackupInfo;
+use ursula_stream::BACKUP_FORMAT_VERSION;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamSnapshotError;
 use ursula_stream::StreamStateMachine;
@@ -38,9 +40,6 @@ use ursula_stream::StreamStateMachine;
 use crate::MetricsClient;
 use crate::NodeInfo;
 
-/// The backup format is the format epoch. This tool reads and writes only
-/// its own epoch's backups and requires it of a target cluster (E9).
-pub const BACKUP_FORMAT_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const MANIFEST_OBJECT: &str = "manifest.json";
 /// The procedure that copies a source cluster's cold objects into the target.
 const COLD_COPY_GUIDE_URL: &str = "https://ursula.tonbo.io/docs/operations#copying-cold-objects";
@@ -74,17 +73,17 @@ pub enum BackupError {
     DecodeManifest(#[source] serde_json::Error),
     #[error("encode backup manifest")]
     EncodeManifest(#[source] serde_json::Error),
-    /// E9: a manifest of another format epoch.
+    /// E9: a manifest of another backup format.
     #[error(
-        "backup manifest format_version {found}; this ursulactl reads and writes format epoch \
+        "backup manifest format_version {found}; this ursulactl reads and writes backup format \
          {BACKUP_FORMAT_VERSION} only"
     )]
     UnsupportedManifest { found: u32 },
-    /// E9: a target cluster of another format epoch, checked before the first
-    /// export or import.
+    /// E9: a target cluster of another backup format, checked before the
+    /// first export or import.
     #[error(
-        "target cluster speaks backup format {found}; this ursulactl reads and writes format \
-         epoch {BACKUP_FORMAT_VERSION} only"
+        "target cluster speaks backup format {found}; this ursulactl reads and writes backup \
+         format {BACKUP_FORMAT_VERSION} only"
     )]
     UnsupportedCluster { found: u32 },
     #[error("manifest lists {listed} group objects but declares {declared} raft groups")]
@@ -808,7 +807,7 @@ mod tests {
             "{err}"
         );
 
-        // E9: a manifest of another format epoch.
+        // E9: a manifest of another backup format.
         for found in [BACKUP_FORMAT_VERSION - 1, BACKUP_FORMAT_VERSION + 1] {
             let mut manifest = manifest_for(&[(0, &body)]);
             manifest.format_version = found;
@@ -826,9 +825,9 @@ mod tests {
             );
         }
 
-        // A group snapshot of another format epoch.
+        // A group snapshot of another backup format.
         let body = rmp_serde::to_vec_named(&StreamSnapshot {
-            format_epoch: ursula_stream::FORMAT_EPOCH - 1,
+            format_version: BACKUP_FORMAT_VERSION + 1,
             buckets: vec!["tenant-a".to_owned()],
             ..StreamSnapshot::default()
         })
@@ -844,19 +843,21 @@ mod tests {
             )
             .await
             .expect("write manifest");
-        let err = verify(&store).await.expect_err("other epoch rejected");
+        let err = verify(&store)
+            .await
+            .expect_err("other backup format rejected");
         assert!(
             matches!(err, BackupError::InvalidSnapshot {
                 raft_group_id: 0,
-                source: StreamSnapshotError::FormatEpoch { .. },
+                source: StreamSnapshotError::BackupFormat { .. },
             }),
             "{err}"
         );
     }
 
     /// E9: restore checks the target's format before the first import, so
-    /// this ursulactl never pushes snapshots into a cluster of another format
-    /// epoch.
+    /// this ursulactl never pushes snapshots into a cluster of another backup
+    /// format.
     #[tokio::test]
     async fn restore_refuses_a_cluster_of_another_format_before_any_import() {
         use std::sync::Arc;

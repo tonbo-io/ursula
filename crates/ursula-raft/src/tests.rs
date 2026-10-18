@@ -4600,11 +4600,10 @@ fn expiring_create(
 /// #669: a group's leader sweeps the streams that expired in it in its
 /// tidy pass, and the only entries the sweep appends are
 /// `TouchStreamAccess { renew_ttl: false }` at its clock less the grace:
-/// the command a read of an expired stream already proposed in 0.8.0, which
-/// a 0.8.0 replica applies the same way.
+/// the command a read of an expired stream proposes.
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn a_leader_sweeps_expired_streams_with_the_0_8_0_touch_only() {
+async fn a_leader_sweeps_expired_streams_with_touch_only() {
     let (_wal_root, log_store) = fresh_journal_store();
     let mut engine =
         RaftGroupEngine::new_single_node_on_log_store(placement(), log_store.clone(), None)

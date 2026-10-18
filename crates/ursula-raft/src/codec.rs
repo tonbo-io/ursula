@@ -87,9 +87,9 @@ mod tests {
     }
 
     #[test]
-    fn epoch4_persisted_envelopes_are_stable() {
+    fn epoch5_persisted_envelopes_are_stable() {
         // Named MessagePack (rmp_serde::to_vec_named) of the OpenRaft types
-        // that format epoch 4 writes to disk and sends to peers: Vote, LogId,
+        // that format epoch 5 writes to disk and sends to peers: Vote, LogId,
         // a joint StoredMembership with a learner and node addresses, a
         // membership Entry, and SnapshotMeta (snapshot record and transfer).
         // The SnapshotMeta bytes are the map {last_log_id, last_membership,
@@ -97,7 +97,7 @@ mod tests {
         // snapshot id in the state machine's format. Decoding and re-encoding
         // must reproduce each value byte for byte.
         let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch4.json")).unwrap();
+            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch5.json")).unwrap();
         fn check<T: serde::de::DeserializeOwned + serde::Serialize>(
             fixtures: &serde_json::Value,
             name: &str,
@@ -187,8 +187,7 @@ mod tests {
         ));
         // #669: the leader's background expiry sweep writes the
         // `TouchStreamAccess { renew_ttl: false }` a read of an expired
-        // stream wrote in 0.8.0. These bytes were encoded at `v0.8.0`, so a
-        // 0.8.0 replica decodes every sweep entry.
+        // stream writes.
         let touch: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "touch_stream_access_entry");
         assert_eq!(touch.log_id, log);
         assert!(matches!(
