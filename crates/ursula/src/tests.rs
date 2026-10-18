@@ -6403,10 +6403,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         ),
         ursula_raft::SingleNodeRaftNetworkFactory,
         store,
-        ursula_raft::RaftGroupEngineOptions {
-            recovery: Some(gate.clone()),
-            ..Default::default()
-        },
+        gated_engine_options(&gate),
     )
     .await
     .expect("recovering engine");
@@ -6522,10 +6519,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             ),
             ursula_raft::SingleNodeRaftNetworkFactory,
             store.clone(),
-            ursula_raft::RaftGroupEngineOptions {
-                recovery: Some(gate.clone()),
-                ..Default::default()
-            },
+            gated_engine_options(&gate),
         )
         .await
         .expect("recovering group");
@@ -13806,4 +13800,14 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
         Reason::RecoveryGateClosed,
         Reason::RaftReplicaUnready,
     ]);
+}
+
+/// Engine options with the recovery gate `gate`, as a node's engine factory
+/// starts a gated replica.
+fn gated_engine_options(
+    gate: &Arc<ursula_raft::GroupRejoin>,
+) -> ursula_raft::RaftGroupEngineOptions {
+    let mut options = ursula_raft::RaftGroupEngineOptions::default();
+    options.recovery = Some(gate.clone());
+    options
 }
