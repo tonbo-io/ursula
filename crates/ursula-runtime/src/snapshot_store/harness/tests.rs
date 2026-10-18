@@ -203,7 +203,8 @@ async fn a_lost_put_never_lands() {
 
 #[tokio::test(start_paused = true)]
 async fn a_stale_list_omits_new_keys_and_repeats_deleted_ones() {
-    let bucket = MemorySnapshotBucket::new(11, prefix(), SnapshotStoreFaults::none());
+    // The bucket remembers its recent creates and deletes from the start.
+    let bucket = MemorySnapshotBucket::new(11, prefix(), only(|faults| faults.stale_window = 64));
     let store = bucket.store(1);
     let mut written = Vec::new();
     for index in 1..=6 {
@@ -486,7 +487,9 @@ async fn gates_pause_and_release_in_arrival_order() {
         write.await.unwrap().unwrap();
     }
     assert_eq!(gates.passed_subjects(put), paths);
-    assert_eq!(gates.passed_subjects(answered), paths);
+    // The ungated answers come back in whatever order the writes finish.
+    let answers: BTreeSet<String> = gates.passed_subjects(answered).into_iter().collect();
+    assert_eq!(answers, paths.iter().cloned().collect());
     let tickets: Vec<usize> = gates
         .log()
         .iter()
