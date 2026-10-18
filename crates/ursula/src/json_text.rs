@@ -453,6 +453,14 @@ mod tests {
                 let stored = result.clone().unwrap();
                 prop_assert_eq!(stored.iter().filter(|byte| **byte == b'\n').count(), messages);
                 prop_assert!(stored.is_empty() || stored.ends_with(b"\n"));
+                // The count an external write proposes is this one, and
+                // apply's bound (one message per two bytes at most) accepts it.
+                let messages = u64::try_from(messages).unwrap();
+                prop_assert_eq!(
+                    ursula_stream::canonical_json_message_count("application/json", &stored),
+                    Ok(messages)
+                );
+                prop_assert!(messages.saturating_mul(2) <= u64::try_from(stored.len()).unwrap());
                 // Every stored line is itself valid JSON text.
                 for line in result.unwrap().split(|byte| *byte == b'\n').filter(|line| !line.is_empty()) {
                     let text = std::str::from_utf8(line).unwrap();

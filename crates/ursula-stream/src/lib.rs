@@ -11,7 +11,7 @@
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
 //! - [`json_records`]: canonical JSON message text: LF-terminated messages,
-//!   whose ends feed the `committed_records` usage counter.
+//!   whose count feeds the `committed_records` usage counter.
 //! - [`sim_controls`]: defences a simulation's negative control turns off
 //!   (`cfg(madsim)` only; constant in every other build).
 //! - [`snapshot`]: snapshot wire format and restoration errors.
@@ -52,7 +52,7 @@ pub use history::draw_history_id;
 pub use history::history_key;
 pub use history::incarnation_token;
 pub use json_records::NonCanonicalJsonPayload;
-pub use json_records::canonical_json_record_ends;
+pub use json_records::canonical_json_message_count;
 pub use model::AppendStreamInput;
 pub use model::BOOTSTRAP_MAX_UPDATE_BYTES;
 pub use model::BucketUsage;

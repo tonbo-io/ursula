@@ -86,13 +86,6 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
     if points.last() != Some(&args.appends) {
         points.push(args.appends);
     }
-    let ends: Vec<u64> = (1..=recs)
-        .map(|k| {
-            k.saturating_mul(payload_bytes)
-                .checked_div(recs)
-                .unwrap_or(0)
-        })
-        .collect();
     let mut rng = payload::Rng::new(5);
     // Allocated before the heap baseline, so it does not count as state.
     let mut starts = smx::RecordStarts::new(if args.retain_every > 0 {
@@ -121,7 +114,7 @@ pub fn run(args: &W3Args, sink: &mut Sink) -> Result<Outcome> {
             let now = smx::T0.saturating_add(n.saturating_mul(1000));
             starts.push(records, smx::tail(&m, &id));
             smx::ok(
-                smx::append_external(&mut m, &id, payload_bytes, ends.clone(), now),
+                smx::append_external(&mut m, &id, payload_bytes, recs, now),
                 "append external",
             )?;
             for object in m.external_segments(&id) {

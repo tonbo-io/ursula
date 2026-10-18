@@ -72,7 +72,7 @@ fn append_external(machine: &mut StreamStateMachine, id: &str, path: &str, len: 
             payload_len: len,
             object_size: len,
         },
-        record_ends: Vec::new(),
+        message_count: 0,
         close_after: false,
         stream_seq: None,
         producer: None,

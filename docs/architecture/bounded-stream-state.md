@@ -85,7 +85,7 @@ The spec pages state the answers: `extensions.mdx` §5, write keys and typed ans
 
 ### F4b: no per-message state
 
-Replicated state keeps nothing per message. There are no message records and no record index, and the snapshot fields that held them are reserved. JSON boundaries are LF boundaries (§3). `/bootstrap` follows the honest-partial rule: it answers from the hot range `[S, tail)` when `S` is at or above max(seal point, retained) and every byte of the range is hot, and with the snapshot alone otherwise. A non-JSON stream gets the range as one part when it is at most 8 MiB. A JSON stream gets one part per message, split on LF, up to the last LF within 8 MiB.
+Replicated state keeps nothing per message. There are no message records and no record index, and the snapshot fields that held them are reserved. Log entries carry nothing per message either. An external create or append carries the number of messages in its staged payload, which `committed_records` counts, so its entry does not grow with its body. JSON boundaries are LF boundaries (§3). `/bootstrap` follows the honest-partial rule: it answers from the hot range `[S, tail)` when `S` is at or above max(seal point, retained) and every byte of the range is hot, and with the snapshot alone otherwise. A non-JSON stream gets the range as one part when it is at most 8 MiB. A JSON stream gets one part per message, split on LF, up to the last LF within 8 MiB.
 
 ### F5: external payload locators
 
@@ -186,7 +186,7 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 |---|---|---|---|
 | Stream metadata, counters, visible snapshot | replicated | C0 (inline body ≤ 32 MiB, or a reference) | F16 |
 | Hot window | replicated | payload plus one header per 64 KiB block, ≤ 64 MiB per group | F6a, F6b, F6c, F10 |
-| Per-message boundaries | replicated | none kept | F4b |
+| Per-message boundaries | replicated | none kept, in state or in log entries | F4b |
 | Shared pack refs and group pack maps | replicated | ≤ 64 + one interval per stream, ≤ live packs per group | F2 |
 | Staged external refs | replicated | ≤ 16 + in flight per stream | F5 |
 | Producer map and epoch floor | replicated | ≤ 4,096 producers, one receipt each | F0, F3 |

@@ -225,7 +225,7 @@ async fn openraft_snapshot_with_regressed_frontier_builds_and_installs() {
             stream_id: stream_id.clone(),
             content_type: Some(OCTET.to_owned()),
             payload: external_payload("external/xyz.bin", 3),
-            record_ends: Vec::new(),
+            message_count: 0,
             close_after: false,
             stream_seq: None,
             producer: None,

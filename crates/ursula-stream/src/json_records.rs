@@ -2,9 +2,11 @@
 //!
 //! An `application/json` stream stores each message as one compact JSON
 //! value followed by one LF, with no other LF. Create and append validate
-//! that shape, and the message ends feed the usage counter
+//! that shape, and the message count feeds the usage counter
 //! `committed_records`. Messages carry no ordinals: a JSON message
 //! boundary is an offset whose preceding byte is LF.
+
+use crate::command::len_u64;
 
 /// Whether `content_type` is `application/json` (parameters ignored).
 pub fn is_json_record_content_type(content_type: &str) -> bool {
@@ -18,65 +20,69 @@ pub fn is_json_record_content_type(content_type: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NonCanonicalJsonPayload;
 
-/// The relative end offsets of the canonical messages in `payload`: one
-/// per LF. Empty for any other content type and for an empty payload.
-pub fn canonical_json_record_ends(
+/// The number of canonical messages in `payload`: one per LF. Zero for any
+/// other content type and for an empty payload. The LF bytes are the
+/// message boundaries, so a count is all a log entry needs to carry.
+pub fn canonical_json_message_count(
     content_type: &str,
     payload: &[u8],
-) -> Result<Vec<u64>, NonCanonicalJsonPayload> {
+) -> Result<u64, NonCanonicalJsonPayload> {
     if !is_json_record_content_type(content_type) || payload.is_empty() {
-        return Ok(Vec::new());
+        return Ok(0);
     }
     if payload.last() != Some(&b'\n') {
         return Err(NonCanonicalJsonPayload);
     }
-    Ok(memchr::memchr_iter(b'\n', payload)
-        .map(|index| u64::try_from(index.saturating_add(1)).expect("payload offset fits u64"))
-        .collect())
+    Ok(len_u64(memchr::memchr_iter(b'\n', payload).count()))
 }
 
-/// Whether `record_ends` (from the HTTP layer, for an external payload) are
-/// valid message ends of a `payload_len`-byte payload: none for a non-JSON
-/// stream, and for a JSON stream strictly increasing, non-zero and ending
-/// exactly at `payload_len`.
-pub(crate) fn record_ends_valid(json: bool, payload_len: u64, record_ends: &[u64]) -> bool {
-    if !json {
-        return record_ends.is_empty();
+/// Whether `message_count` (from the HTTP layer, for an external payload)
+/// can be the message count of a `payload_len`-byte canonical payload: zero
+/// for a non-JSON stream or an empty payload, and for a JSON stream at least
+/// one and at most `payload_len / 2`, since a canonical message is at least
+/// one value byte plus its LF.
+pub(crate) fn message_count_valid(json: bool, payload_len: u64, message_count: u64) -> bool {
+    if !json || payload_len == 0 {
+        return message_count == 0;
     }
-    if payload_len == 0 {
-        return record_ends.is_empty();
-    }
-    record_ends.last() == Some(&payload_len)
-        && record_ends.first().is_some_and(|first| *first > 0)
-        && record_ends
-            .windows(2)
-            .all(|pair| matches!(pair, [earlier, later] if earlier < later))
+    (1..=payload_len / 2).contains(&message_count)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::NonCanonicalJsonPayload;
+    use super::canonical_json_message_count;
+    use super::message_count_valid;
 
     #[test]
-    fn canonical_ends_follow_each_lf() {
+    fn canonical_messages_count_each_lf() {
         assert_eq!(
-            canonical_json_record_ends(
+            canonical_json_message_count(
                 "application/json; charset=utf-8",
                 b"{\"a\":1}\n{\"b\":2}\n"
             ),
-            Ok(vec![8, 16])
+            Ok(2)
         );
         assert_eq!(
-            canonical_json_record_ends("application/octet-stream", b"x"),
-            Ok(Vec::new())
+            canonical_json_message_count("application/octet-stream", b"x"),
+            Ok(0)
         );
+        assert_eq!(canonical_json_message_count("application/json", b""), Ok(0));
         assert_eq!(
-            canonical_json_record_ends("application/json", b"{}"),
+            canonical_json_message_count("application/json", b"{}"),
             Err(NonCanonicalJsonPayload)
         );
-        assert!(record_ends_valid(true, 16, &[8, 16]));
-        assert!(!record_ends_valid(true, 16, &[8]));
-        assert!(!record_ends_valid(true, 16, &[8, 8, 16]));
-        assert!(!record_ends_valid(false, 16, &[16]));
+    }
+
+    #[test]
+    fn message_counts_are_bounded_by_the_payload() {
+        assert!(message_count_valid(true, 16, 8));
+        assert!(message_count_valid(true, 16, 1));
+        assert!(!message_count_valid(true, 16, 9));
+        assert!(!message_count_valid(true, 16, 0));
+        assert!(!message_count_valid(false, 16, 1));
+        assert!(message_count_valid(false, 16, 0));
+        assert!(message_count_valid(true, 0, 0));
+        assert!(!message_count_valid(true, 0, 1));
     }
 }

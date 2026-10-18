@@ -342,4 +342,178 @@ mod tests {
             }
         }
     }
+
+    mod external_entries {
+        use openraft::type_config::alias::EntryOf;
+        use openraft::vote::RaftLeaderId;
+        use proptest::prelude::*;
+        use ursula_runtime::AppendExternalRequest;
+        use ursula_runtime::CreateStreamExternalRequest;
+        use ursula_runtime::GroupWriteCommand;
+        use ursula_shard::BucketStreamId;
+        use ursula_stream::ExternalPayloadRef;
+        use ursula_stream::ProducerRequest;
+        use ursula_stream::StreamCommand;
+
+        use crate::UrsulaRaftTypeConfig;
+        use crate::codec::decode_wire;
+        use crate::codec::encode_wire;
+
+        /// Upper bound of an external write's entry apart from its
+        /// Content-Type, which no limit of Ursula's own bounds yet.
+        const EXTERNAL_ENTRY_BOUND_BYTES: usize = 2048;
+
+        type CommittedLeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+
+        #[derive(Debug, Clone)]
+        struct External {
+            stream_id: BucketStreamId,
+            content_type: String,
+            payload_len: u64,
+            object_slack: u64,
+            message_count: u64,
+            stream_seq: Option<String>,
+            producer: Option<ProducerRequest>,
+            close_after: bool,
+            now_ms: u64,
+            stream_expires_at_ms: Option<u64>,
+            if_incarnation: Option<u64>,
+        }
+
+        fn producer() -> impl Strategy<Value = ProducerRequest> {
+            (
+                "[ -~]{1,256}",
+                any::<u64>(),
+                any::<u64>(),
+                proptest::option::of(proptest::collection::vec(0x80_u8..=0xff, 32)),
+            )
+                .prop_map(|(producer_id, producer_epoch, producer_seq, digest)| {
+                    ProducerRequest {
+                        producer_id,
+                        producer_epoch,
+                        producer_seq,
+                        digest: digest.map(bytes::Bytes::from),
+                        ..Default::default()
+                    }
+                })
+        }
+
+        fn external() -> impl Strategy<Value = External> {
+            (
+                ("[a-z0-9_-]{4,64}", "[a-z0-9._-]{1,57}"),
+                "[ -~]{1,256}",
+                (1_u64..=u64::MAX, any::<u64>(), any::<u64>()),
+                proptest::option::of("[ -~]{1,256}"),
+                proptest::option::of(producer()),
+                (
+                    any::<bool>(),
+                    any::<u64>(),
+                    proptest::option::of(any::<u64>()),
+                    proptest::option::of(any::<u64>()),
+                ),
+            )
+                .prop_map(
+                    |(
+                        (bucket, stream),
+                        content_type,
+                        (payload_len, object_slack, message_count),
+                        stream_seq,
+                        producer,
+                        (close_after, now_ms, stream_expires_at_ms, if_incarnation),
+                    )| External {
+                        stream_id: BucketStreamId::new(bucket, stream),
+                        content_type,
+                        payload_len,
+                        object_slack,
+                        message_count,
+                        stream_seq,
+                        producer,
+                        close_after,
+                        now_ms,
+                        stream_expires_at_ms,
+                        if_incarnation,
+                    },
+                )
+        }
+
+        fn staged(input: &External) -> ExternalPayloadRef {
+            ExternalPayloadRef {
+                s3_path: ursula_runtime::new_external_payload_path(&input.stream_id),
+                payload_len: input.payload_len,
+                object_size: input.payload_len.saturating_add(input.object_slack),
+            }
+        }
+
+        fn append(input: &External) -> StreamCommand {
+            AppendExternalRequest {
+                stream_id: input.stream_id.clone(),
+                content_type: input.content_type.clone(),
+                payload: staged(input),
+                message_count: input.message_count,
+                close_after: input.close_after,
+                stream_seq: input.stream_seq.clone(),
+                producer: input.producer.clone(),
+                now_ms: input.now_ms,
+                if_incarnation: input.if_incarnation,
+            }
+            .into()
+        }
+
+        fn create(input: &External) -> StreamCommand {
+            CreateStreamExternalRequest {
+                stream_id: input.stream_id.clone(),
+                content_type: input.content_type.clone(),
+                initial_payload: staged(input),
+                message_count: input.message_count,
+                close_after: input.close_after,
+                stream_seq: input.stream_seq.clone(),
+                stream_ttl_seconds: input.now_ms.checked_rem(86_400),
+                stream_expires_at_ms: input.stream_expires_at_ms,
+                now_ms: input.now_ms,
+                if_incarnation: input.if_incarnation,
+            }
+            .into()
+        }
+
+        fn entry(
+            term: u64,
+            node: u64,
+            index: u64,
+            command: StreamCommand,
+        ) -> EntryOf<UrsulaRaftTypeConfig> {
+            EntryOf::<UrsulaRaftTypeConfig> {
+                log_id: openraft::LogId {
+                    leader_id: CommittedLeaderId::new(term, node),
+                    index,
+                },
+                payload: openraft::EntryPayload::Normal(GroupWriteCommand::Stream(command)),
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            /// An external create or append makes an entry of at most 2 KiB
+            /// plus its Content-Type whatever its body held, and round trips
+            /// through the wire codec.
+            #[test]
+            fn external_write_entries_are_bounded_and_round_trip(
+                input in external(),
+                create_stream in any::<bool>(),
+                (term, node, index) in (any::<u64>(), any::<u64>(), any::<u64>()),
+            ) {
+                let command = if create_stream { create(&input) } else { append(&input) };
+                let entry = entry(term, node, index, command);
+                let bytes = encode_wire(&entry);
+                prop_assert!(
+                    bytes.len() <= EXTERNAL_ENTRY_BOUND_BYTES.saturating_add(input.content_type.len()),
+                    "{} bytes for {:?}",
+                    bytes.len(),
+                    input
+                );
+                let decoded: EntryOf<UrsulaRaftTypeConfig> = decode_wire(&bytes, "entry").unwrap();
+                prop_assert_eq!(decoded, entry);
+            }
+        }
+    }
 }

@@ -712,7 +712,7 @@ fn json_append_of_k_messages_adds_k_committed_records() {
             payload_len: 4,
             object_size: 4,
         },
-        record_ends: vec![2, 4],
+        message_count: 2,
         close_after: false,
         stream_seq: None,
         producer: None,
@@ -764,9 +764,9 @@ fn inline_json_create_rejects_noncanonical_initial_payload() {
 }
 
 #[test]
-fn legacy_external_json_append_without_boundaries_is_rejected_atomically() {
+fn external_json_append_without_messages_is_rejected_atomically() {
     let mut machine = machine();
-    let stream_id = stream("legacy-external-json");
+    let stream_id = stream("external-json-no-messages");
     assert!(matches!(
         machine.apply(create_cmd(stream_id.clone(), Create {
             content_type: "application/json",
@@ -786,7 +786,7 @@ fn legacy_external_json_append_without_boundaries_is_rejected_atomically() {
                 payload_len: 9,
                 object_size: 9,
             },
-            record_ends: Vec::new(),
+            message_count: 0,
             close_after: false,
             stream_seq: None,
             producer: None,
@@ -4196,7 +4196,7 @@ fn f14g_external_create_keeps_its_payload_in_state_for_gc() {
             stream_id: stream("ext"),
             content_type: OCTET.to_owned(),
             initial_payload: external.clone(),
-            record_ends: Vec::new(),
+            message_count: 0,
             close_after: false,
             stream_seq: None,
             stream_ttl_seconds: None,
@@ -4305,7 +4305,7 @@ fn append_external_cmd(stream_id: BucketStreamId, s3_path: &str, len: u64) -> St
             payload_len: len,
             object_size: len,
         },
-        record_ends: Vec::new(),
+        message_count: 0,
         close_after: false,
         stream_seq: None,
         producer: None,
@@ -4737,5 +4737,251 @@ proptest! {
 
         let restored = StreamStateMachine::restore(machine.snapshot()).expect("restore snapshot");
         prop_assert_eq!(restored.removed_state(), RemovedState::default());
+    }
+}
+
+const JSON: &str = "application/json";
+/// A 32 MiB request body `[0,0,...,0]` normalizes to this many bytes of
+/// `0\n` messages.
+const REQUEST_LIMIT_JSON_PAYLOAD_LEN: u64 = 33_554_430;
+const REQUEST_LIMIT_JSON_MESSAGES: u64 = 16_777_215;
+
+fn staged_payload(s3_path: &str, payload_len: u64) -> ExternalPayloadRef {
+    ExternalPayloadRef {
+        s3_path: s3_path.to_owned(),
+        payload_len,
+        object_size: payload_len,
+    }
+}
+
+fn create_external_cmd(
+    stream_id: BucketStreamId,
+    content_type: &str,
+    payload_len: u64,
+    message_count: u64,
+) -> StreamCommand {
+    StreamCommand::CreateExternal {
+        stream_id,
+        content_type: content_type.to_owned(),
+        initial_payload: staged_payload("benchcmp/staged/external/create.bin", payload_len),
+        message_count,
+        close_after: false,
+        stream_seq: None,
+        stream_ttl_seconds: None,
+        stream_expires_at_ms: None,
+        now_ms: 0,
+    }
+}
+
+fn append_external_counted_cmd(
+    stream_id: BucketStreamId,
+    content_type: &str,
+    payload_len: u64,
+    message_count: u64,
+) -> StreamCommand {
+    StreamCommand::AppendExternal {
+        stream_id,
+        content_type: Some(content_type.to_owned()),
+        payload: staged_payload("benchcmp/staged/external/append.bin", payload_len),
+        message_count,
+        close_after: false,
+        stream_seq: None,
+        producer: None,
+        now_ms: 0,
+    }
+}
+
+#[test]
+fn an_external_json_append_at_the_request_limit_counts_every_message() {
+    let mut machine = machine();
+    let stream_id = stream("limit-append");
+    assert!(matches!(
+        machine.apply(create_cmd(stream_id.clone(), Create {
+            content_type: JSON,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let before = bucket_usage(&machine, "benchcmp").committed_records;
+    assert_eq!(
+        machine.apply(append_external_counted_cmd(
+            stream_id,
+            JSON,
+            REQUEST_LIMIT_JSON_PAYLOAD_LEN,
+            REQUEST_LIMIT_JSON_MESSAGES,
+        )),
+        appended(0, REQUEST_LIMIT_JSON_PAYLOAD_LEN)
+    );
+    assert_eq!(
+        bucket_usage(&machine, "benchcmp")
+            .committed_records
+            .checked_sub(before),
+        Some(REQUEST_LIMIT_JSON_MESSAGES)
+    );
+}
+
+#[test]
+fn an_external_json_create_at_the_request_limit_counts_every_message() {
+    let mut machine = machine();
+    let stream_id = stream("limit-create");
+    let before = bucket_usage(&machine, "benchcmp").committed_records;
+    assert!(matches!(
+        machine.apply(create_external_cmd(
+            stream_id,
+            JSON,
+            REQUEST_LIMIT_JSON_PAYLOAD_LEN,
+            REQUEST_LIMIT_JSON_MESSAGES,
+        )),
+        StreamResponse::Created { next_offset, .. } if next_offset == REQUEST_LIMIT_JSON_PAYLOAD_LEN
+    ));
+    assert_eq!(
+        bucket_usage(&machine, "benchcmp")
+            .committed_records
+            .checked_sub(before),
+        Some(REQUEST_LIMIT_JSON_MESSAGES)
+    );
+}
+
+/// A body sent to a stream of another content type gets the same answer
+/// whether it was staged or inline: the content type is checked before the
+/// message count, a JSON body to a byte stream and a byte body to a JSON
+/// stream alike.
+#[test]
+fn staged_and_inline_appends_answer_a_content_type_mismatch_alike() {
+    let mut machine = machine();
+    create_stream(&mut machine, "mismatch");
+    let before = machine.snapshot();
+    assert_error_at(
+        machine.apply(append_cmd(stream("mismatch"), b"0\n0\n", Append {
+            content_type: Some(JSON),
+            ..Append::default()
+        })),
+        StreamErrorCode::ContentTypeMismatch,
+        0,
+    );
+    assert_error_at(
+        machine.apply(append_external_counted_cmd(stream("mismatch"), JSON, 4, 2)),
+        StreamErrorCode::ContentTypeMismatch,
+        0,
+    );
+    assert_eq!(machine.snapshot(), before);
+
+    let json_stream = stream("json-mismatch");
+    assert!(matches!(
+        machine.apply(create_cmd(json_stream.clone(), Create {
+            content_type: JSON,
+            ..Create::default()
+        })),
+        StreamResponse::Created { .. }
+    ));
+    let before = machine.snapshot();
+    assert_error_at(
+        machine.apply(append_cmd(json_stream.clone(), b"bytes", Append::default())),
+        StreamErrorCode::ContentTypeMismatch,
+        0,
+    );
+    assert_error_at(
+        machine.apply(append_external_counted_cmd(json_stream, OCTET, 5, 0)),
+        StreamErrorCode::ContentTypeMismatch,
+        0,
+    );
+    assert_eq!(machine.snapshot(), before);
+}
+
+/// Where a generated message count falls relative to apply's bound.
+#[derive(Debug, Clone, Copy)]
+enum CountPick {
+    Zero,
+    One,
+    Half,
+    AboveHalf,
+    Any(u64),
+}
+
+fn count_pick_strategy() -> impl Strategy<Value = CountPick> {
+    prop_oneof![
+        Just(CountPick::Zero),
+        Just(CountPick::One),
+        Just(CountPick::Half),
+        Just(CountPick::AboveHalf),
+        any::<u64>().prop_map(CountPick::Any),
+    ]
+}
+
+fn picked_count(pick: CountPick, payload_len: u64) -> u64 {
+    match pick {
+        CountPick::Zero => 0,
+        CountPick::One => 1,
+        CountPick::Half => payload_len / 2,
+        CountPick::AboveHalf => (payload_len / 2).saturating_add(1),
+        CountPick::Any(seed) => seed.checked_rem(payload_len.saturating_add(3)).unwrap_or(0),
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// An external create or append either feeds its message count to
+    /// `committed_records` (one record for a non-JSON write) or is refused
+    /// with no state change, for any count the proposer could send.
+    #[test]
+    fn external_message_counts_feed_usage_or_refuse_atomically(
+        json in any::<bool>(),
+        create in any::<bool>(),
+        payload_len in 1_u64..=64 * 1024 * 1024,
+        pick in count_pick_strategy(),
+    ) {
+        let message_count = picked_count(pick, payload_len);
+        let content_type = if json { JSON } else { OCTET };
+        let valid = if json {
+            (1..=payload_len / 2).contains(&message_count)
+        } else {
+            message_count == 0
+        };
+        let mut machine = machine();
+        let stream_id = stream("counted");
+        if !create {
+            let created = machine.apply(create_cmd(stream_id.clone(), Create {
+                content_type,
+                ..Create::default()
+            }));
+            prop_assert!(matches!(created, StreamResponse::Created { .. }), "{:?}", created);
+        }
+        let before = machine.snapshot();
+        let records_before = bucket_usage(&machine, "benchcmp").committed_records;
+        let response = if create {
+            machine.apply(create_external_cmd(stream_id, content_type, payload_len, message_count))
+        } else {
+            machine.apply(append_external_counted_cmd(
+                stream_id,
+                content_type,
+                payload_len,
+                message_count,
+            ))
+        };
+        if valid {
+            prop_assert!(
+                matches!(response, StreamResponse::Created { .. } | StreamResponse::Appended { .. }),
+                "{:?}",
+                response
+            );
+            let expected = if json { message_count } else { 1 };
+            prop_assert_eq!(
+                bucket_usage(&machine, "benchcmp")
+                    .committed_records
+                    .checked_sub(records_before),
+                Some(expected)
+            );
+        } else {
+            prop_assert!(
+                matches!(
+                    response,
+                    StreamResponse::Error { code: StreamErrorCode::InvalidRecordBoundaries, .. }
+                ),
+                "{:?}",
+                response
+            );
+            prop_assert_eq!(machine.snapshot(), before);
+        }
     }
 }

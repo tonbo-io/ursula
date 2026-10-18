@@ -5,6 +5,7 @@ use super::AppendStreamInput;
 use super::BucketStreamId;
 use super::ClosedEpoch;
 use super::IncarnationCheck;
+use super::NonCanonicalJsonPayload;
 use super::ObjectPayloadRef;
 use super::Opened;
 use super::ProducerAck;
@@ -21,7 +22,7 @@ use super::StreamStateMachine;
 use super::StreamStatus;
 use super::WriteKind;
 use super::WriteReceipt;
-use super::canonical_json_record_ends;
+use super::canonical_json_message_count;
 use super::content_fault_response;
 use super::producer_content_fault;
 use super::producer_record::Evaluation;
@@ -31,7 +32,7 @@ use super::producer_record::evaluate;
 use super::producer_write_key;
 use super::renew_stream_ttl;
 use super::validate_external_payload_ref;
-use super::validate_record_ends;
+use super::validate_message_count;
 
 impl StreamStateMachine {
     /// Applies one append, then enforces the F3 producer cap once.
@@ -143,17 +144,17 @@ impl StreamStateMachine {
                 }
             }
 
-            let record_ends = match content_type {
-                Some(value) => match canonical_json_record_ends(value, payload) {
-                    Ok(record_ends) => record_ends,
-                    Err(_) => {
+            let message_count = match content_type {
+                Some(value) => match canonical_json_message_count(value, payload) {
+                    Ok(message_count) => message_count,
+                    Err(NonCanonicalJsonPayload) => {
                         break 'append StreamResponse::error(
                             StreamErrorCode::InvalidRecordBoundaries,
                             "application/json append payload must use canonical newline boundaries",
                         );
                     }
                 },
-                None => Vec::new(),
+                None => 0,
             };
 
             if let Err(response) = check_stream_seq(stream, stream_seq.as_deref()) {
@@ -209,7 +210,7 @@ impl StreamStateMachine {
                 self.usage_on_append(
                     &stream_id.bucket_id,
                     payload_len,
-                    Self::appended_record_count(&record_ends, payload_len),
+                    Self::appended_record_count(message_count, payload_len),
                 );
                 StreamResponse::Appended {
                     offset,
@@ -240,7 +241,7 @@ impl StreamStateMachine {
             stream_id,
             content_type,
             payload,
-            record_ends,
+            message_count,
             close_after,
             stream_seq,
             producer,
@@ -295,11 +296,6 @@ impl StreamStateMachine {
         if let Some(fault) = fault {
             return content_fault_response(fault);
         }
-        if let Err(response) =
-            validate_record_ends(&stream.content_type, payload.payload_len, &record_ends)
-        {
-            return response;
-        }
         let Some(content_type) = content_type else {
             return StreamResponse::error(
                 StreamErrorCode::MissingContentType,
@@ -315,6 +311,11 @@ impl StreamStateMachine {
                 ),
                 stream.tail_offset,
             );
+        }
+        if let Err(response) =
+            validate_message_count(&stream.content_type, payload.payload_len, message_count)
+        {
+            return response;
         }
         if let Err(response) = check_stream_seq(stream, stream_seq.as_deref()) {
             return response;
@@ -369,7 +370,7 @@ impl StreamStateMachine {
         self.usage_on_append(
             &stream_id.bucket_id,
             appended_bytes,
-            Self::appended_record_count(&record_ends, appended_bytes),
+            Self::appended_record_count(message_count, appended_bytes),
         );
         StreamResponse::Appended {
             offset,

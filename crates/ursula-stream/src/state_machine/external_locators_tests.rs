@@ -35,11 +35,11 @@ fn fresh_machine() -> StreamStateMachine {
     machine
 }
 
-fn append_external_with_ends(
+fn append_external_with_count(
     machine: &mut StreamStateMachine,
     path: &str,
     len: u64,
-    record_ends: Vec<u64>,
+    message_count: u64,
 ) -> StreamResponse {
     machine.apply(StreamCommand::AppendExternal {
         stream_id: stream("s"),
@@ -49,7 +49,7 @@ fn append_external_with_ends(
             payload_len: len,
             object_size: len,
         },
-        record_ends,
+        message_count,
         close_after: false,
         stream_seq: None,
         producer: None,
@@ -58,7 +58,7 @@ fn append_external_with_ends(
 }
 
 fn append_external(machine: &mut StreamStateMachine, path: &str, len: u64) {
-    let response = append_external_with_ends(machine, path, len, Vec::new());
+    let response = append_external_with_count(machine, path, len, 0);
     assert!(
         matches!(response, StreamResponse::Appended { .. }),
         "{response:?}"
@@ -119,8 +119,8 @@ fn external_append_keeps_its_locator_in_state() {
 #[test]
 fn rejected_external_append_leaves_no_locator() {
     let mut machine = fresh_machine();
-    // Message ends on a non-JSON stream reject the append on every replica.
-    let response = append_external_with_ends(&mut machine, "s/external/lost.bin", 10, vec![10]);
+    // A message count on a non-JSON stream rejects the append on every replica.
+    let response = append_external_with_count(&mut machine, "s/external/lost.bin", 10, 1);
     assert!(
         matches!(response, StreamResponse::Error {
             code: StreamErrorCode::InvalidRecordBoundaries,
