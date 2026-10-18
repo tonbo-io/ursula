@@ -527,9 +527,9 @@ pub(crate) enum CoreWriteOp {
     DropPlan { group_id: u32 },
     /// Writes nothing: answered once every record written before it is
     /// durable, as the journal is synced for a `Recovery` record. A group's
-    /// snapshot record is published only after one ([`SnapshotJournal`]).
+    /// snapshot record is published only after one ([`SnapshotRecord`]).
     ///
-    /// [`SnapshotJournal`]: super::SnapshotJournal
+    /// [`SnapshotRecord`]: super::SnapshotRecord
     Sync,
     /// The snapshot driver's tick (#669): a maintenance pass as of `now` on
     /// the driver's clock, which frees segments that have held dead frames

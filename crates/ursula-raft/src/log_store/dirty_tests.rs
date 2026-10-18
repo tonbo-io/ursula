@@ -738,48 +738,76 @@ async fn purge_after_the_copies(fsync: WalFsync) {
     );
 }
 
+/// How [`a_snapshot_record_is_published_after_the_journal_syncs`] makes
+/// its snapshot.
+#[cfg(madsim)]
+#[derive(Debug, Clone, Copy)]
+enum Publication {
+    /// A snapshot a leader sent is installed.
+    Install,
+    /// The replica builds one from its applied state.
+    Build,
+}
+
 /// A snapshot record is published only after the core journal synced (R1).
 /// Under `fsync = never` a group's entries are durable, its log is truncated
-/// after entry 2 without a sync, and a snapshot through entry 2 is installed
-/// with its record. A power loss that drops every unsynced page keeps the
-/// record, so it must keep the truncate too: the log reopens ending at 2,
-/// not with the truncated tail behind the snapshot.
+/// after entry 2 without a sync, and a snapshot through entry 2 is
+/// installed, or built, with its record. A power loss that drops every
+/// unsynced page keeps the record, so it must keep the truncate too: the
+/// log reopens ending at 2, not with the truncated tail behind the
+/// snapshot.
 #[cfg(madsim)]
 #[test]
 fn a_snapshot_record_is_published_after_the_journal_syncs() {
     crate::tests::check_madsim_determinism(723, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(723, async {
-            use openraft::storage::RaftStateMachine;
+            for publication in [Publication::Install, Publication::Build] {
+                snapshot_record_after_a_journal_sync(publication).await;
+            }
+        })
+        .await;
+    });
+}
 
-            use super::SimDisk;
+#[cfg(madsim)]
+async fn snapshot_record_after_a_journal_sync(publication: Publication) {
+    use openraft::storage::RaftSnapshotBuilder;
+    use openraft::storage::RaftStateMachine;
 
-            let journal = Journal::new("snapshot-record-after-sync", WalFsync::Never);
-            let root = journal.dir.parent().expect("a WAL root").to_path_buf();
-            let writer = journal.writer();
-            let mut store = journal.store(&writer, QUIET);
-            append(&mut store, (1..=5).map(|index| entry(index, b"tail"))).await;
-            store
-                .snapshot_journal()
-                .sync()
-                .await
-                .expect("make the entries durable");
-            store
-                .truncate_after(Some(log_id(2)))
-                .await
-                .expect("truncate the tail");
+    use super::SimDisk;
 
-            let metadata_path = root.join("group-2.snapshot.json");
-            let mut machine =
-                crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-                    placement(QUIET),
-                    None,
-                    None,
-                    ursula_runtime::default_snapshot_store(),
-                    crate::state_machine::SnapshotBuildCoordinator::default(),
-                    crate::state_machine::SnapshotInstallCoordinator::default(),
-                    Some(metadata_path.clone()),
-                );
-            machine.snapshot_journal = Some(store.snapshot_journal());
+    let journal = Journal::new(
+        &format!("snapshot-record-after-sync-{publication:?}"),
+        WalFsync::Never,
+    );
+    let root = journal.dir.parent().expect("a WAL root").to_path_buf();
+    let writer = journal.writer();
+    let mut store = journal.store(&writer, QUIET);
+    let record = store.snapshot_record();
+    append(&mut store, (1..=5).map(|index| entry(index, b"tail"))).await;
+    record.sync().await.expect("make the entries durable");
+    store
+        .truncate_after(Some(log_id(2)))
+        .await
+        .expect("truncate the tail");
+
+    let machine = || {
+        let mut machine =
+            crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+                placement(QUIET),
+                None,
+                None,
+                ursula_runtime::default_snapshot_store(),
+                crate::state_machine::SnapshotBuildCoordinator::default(),
+                crate::state_machine::SnapshotInstallCoordinator::default(),
+                Some(record.path().to_path_buf()),
+            );
+        machine.snapshot_record = Some(record.clone());
+        machine
+    };
+    let mut published = machine();
+    match publication {
+        Publication::Install => {
             let snapshot = ursula_runtime::GroupSnapshot {
                 placement: placement(QUIET),
                 group_commit_index: 2,
@@ -801,7 +829,7 @@ fn a_snapshot_record_is_published_after_the_journal_syncs() {
                 last_membership: Default::default(),
                 snapshot_id: pointer.snapshot_id.clone(),
             };
-            machine
+            published
                 .install_snapshot(
                     &meta,
                     crate::types::SnapshotData::new(
@@ -810,35 +838,40 @@ fn a_snapshot_record_is_published_after_the_journal_syncs() {
                 )
                 .await
                 .expect("install the snapshot");
-            drop(machine);
-            drop(store);
-            writer.abort_simulated();
-            drop(writer);
-            SimDisk::power_loss_losing_unsynced(&root).expect("cut the power");
-
-            let writer = journal.writer();
-            let store = journal.store(&writer, QUIET);
-            assert_eq!(
-                log_ids(&store).await,
-                [1, 2],
-                "the truncate is as durable as the snapshot record"
-            );
-            let mut restored =
-                crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-                    placement(QUIET),
-                    None,
-                    None,
-                    ursula_runtime::default_snapshot_store(),
-                    crate::state_machine::SnapshotBuildCoordinator::default(),
-                    crate::state_machine::SnapshotInstallCoordinator::default(),
-                    Some(metadata_path),
-                );
-            restored
-                .restore_persisted_snapshot()
+        }
+        Publication::Build => {
+            published
+                .apply(futures_util::stream::iter((1..=2).map(|index| {
+                    Ok((Entry::new(log_id(index), EntryPayload::Blank), None))
+                })))
                 .await
-                .expect("restore the record");
-            assert_eq!(restored.last_applied_log_id, Some(log_id(2)));
-        })
-        .await;
-    });
+                .expect("apply the committed entries");
+            let mut builder = published.get_snapshot_builder().await;
+            builder.build_snapshot().await.expect("build the snapshot");
+        }
+    }
+    drop(published);
+    drop(store);
+    writer.abort_simulated();
+    drop(writer);
+    SimDisk::power_loss_losing_unsynced(&root).expect("cut the power");
+
+    let writer = journal.writer();
+    let store = journal.store(&writer, QUIET);
+    assert_eq!(
+        log_ids(&store).await,
+        [1, 2],
+        "{publication:?}: the truncate is as durable as the snapshot record"
+    );
+    let mut restored = machine();
+    restored.snapshot_record = None;
+    restored
+        .restore_persisted_snapshot()
+        .await
+        .expect("restore the record");
+    assert_eq!(
+        restored.last_applied_log_id,
+        Some(log_id(2)),
+        "{publication:?}"
+    );
 }

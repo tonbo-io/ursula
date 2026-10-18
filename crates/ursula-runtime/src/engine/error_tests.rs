@@ -65,6 +65,7 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             | GroupInfraError::RecoveryGroupMismatch { .. }
             | GroupInfraError::InvalidRaftCommand { .. }
             | GroupInfraError::WalOpen { .. }
+            | GroupInfraError::LogBelowSnapshot { .. }
             | GroupInfraError::ColdStore { .. }
             | GroupInfraError::Internal { .. }
             | GroupInfraError::ProtoDecode { .. }

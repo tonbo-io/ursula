@@ -159,9 +159,15 @@ pub enum WalOpenFailureKind {
     InvalidConfiguration,
     InvalidRecord,
     Poisoned,
-    /// The log holds an entry, or a commit marker, at or after the restored
-    /// snapshot's index but below the snapshot in log-id order.
-    LogBelowSnapshot,
+}
+
+/// A Raft log id as a replica's log store holds it: the term and node of
+/// the leader that wrote the entry, and its index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogPosition {
+    pub term: u64,
+    pub node_id: u64,
+    pub index: u64,
 }
 
 /// The kind of an engine response: what a caller expected, and what it got
@@ -432,6 +438,21 @@ pub enum GroupInfraError {
         committed: u64,
         held: Option<u64>,
     },
+    /// At or after its restored snapshot's index, this replica's log holds
+    /// an entry, or its commit marker names one, `held`, that is below the
+    /// snapshot in log-id order (R1). Such an entry cannot be committed. The
+    /// replica refuses to open the group, which stays closed on it until it
+    /// rejoins as a wiped node.
+    #[error(
+        "raft group {raft_group_id:?} on core {core_id:?}: its log holds {held:?} below its \
+         restored snapshot {snapshot:?}"
+    )]
+    LogBelowSnapshot {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+        snapshot: LogPosition,
+        held: LogPosition,
+    },
     /// A snapshot of history `history`, which replaced history `replaced`,
     /// while this replica's commit marker lies in history `local` (`None`
     /// when its log could not be read): nothing shows that the snapshot
@@ -666,6 +687,7 @@ impl GroupInfraError {
             | Self::ApplyStopped { .. }
             | Self::InvalidRaftCommand { .. }
             | Self::WalOpen { .. }
+            | Self::LogBelowSnapshot { .. }
             | Self::RecoveryVoteFloor { .. }
             | Self::RecoveryCutting { .. }
             | Self::CommittedOverwrite { .. }
@@ -714,6 +736,7 @@ impl GroupInfraError {
             | Self::ApplyStopped { .. }
             | Self::InvalidRaftCommand { .. }
             | Self::WalOpen { .. }
+            | Self::LogBelowSnapshot { .. }
             | Self::RecoveryVoteFloor { .. }
             | Self::RecoveryCutting { .. }
             | Self::CommittedOverwrite { .. }
@@ -759,6 +782,7 @@ impl GroupInfraError {
             | Self::RecoveryGroupMismatch { .. }
             | Self::InvalidRaftCommand { .. }
             | Self::WalOpen { .. }
+            | Self::LogBelowSnapshot { .. }
             | Self::RecoveryPending { .. }
             | Self::ColdStore { .. }
             | Self::Internal { .. }

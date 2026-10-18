@@ -45,6 +45,7 @@ use ursula_runtime::GroupSnapshotError;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::InMemoryGroupEngine;
+use ursula_runtime::LogPosition;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::ReadSnapshotRequest;
@@ -62,11 +63,13 @@ use ursula_runtime::decode_snapshot_envelope;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::encode_binary_envelope;
 use ursula_shard::BucketStreamId;
+use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use crate::engine::group_engine_io_error;
 use crate::engine::invalid_data;
+use crate::log_store::SnapshotOrderError;
 use crate::log_store::disk::Disk;
 use crate::log_store::disk::JournalDisk;
 use crate::log_store::disk::JournalFile;
@@ -1451,12 +1454,40 @@ pub(crate) enum SnapshotRestoreError {
     /// The engine refused the restored snapshot.
     #[error(transparent)]
     Engine(GroupEngineError),
+    /// The group's log contradicts the restored snapshot record (R1).
+    #[error("raft group {raft_group_id:?}: the log contradicts the restored snapshot record")]
+    LogBelowSnapshot {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: SnapshotOrderError,
+    },
 }
 
 impl From<SnapshotRestoreError> for GroupEngineError {
     fn from(error: SnapshotRestoreError) -> Self {
         let refusal = match error {
             SnapshotRestoreError::Engine(error) => return error,
+            SnapshotRestoreError::LogBelowSnapshot {
+                core_id,
+                raft_group_id,
+                source,
+            } => {
+                tracing::error!(?raft_group_id, error = %ErrorChain(&source), "the group's log contradicts its restored snapshot record; the replica refuses to open the group");
+                let (snapshot, held) = match source {
+                    SnapshotOrderError::HeldBelow { snapshot, held } => (snapshot, held),
+                    SnapshotOrderError::CommittedBelow {
+                        snapshot,
+                        committed,
+                    } => (snapshot, committed),
+                };
+                return GroupEngineError::Infra(GroupInfraError::LogBelowSnapshot {
+                    core_id,
+                    raft_group_id,
+                    snapshot: log_position(snapshot),
+                    held: log_position(held),
+                });
+            }
             SnapshotRestoreError::Metadata {
                 raft_group_id,
                 source,
@@ -1502,6 +1533,15 @@ impl From<SnapshotRestoreError> for GroupEngineError {
             }
         };
         GroupEngineError::Infra(GroupInfraError::Snapshot(refusal))
+    }
+}
+
+/// `log_id` as a replica's log store holds it, in an engine error.
+fn log_position(log_id: LogIdOf<UrsulaRaftTypeConfig>) -> LogPosition {
+    LogPosition {
+        term: log_id.leader_id.term,
+        node_id: log_id.leader_id.node_id,
+        index: log_id.index,
     }
 }
 
@@ -1625,9 +1665,10 @@ pub struct RaftGroupStateMachine {
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
     snapshot_metadata_path: Option<PathBuf>,
-    /// The core journal holding the group's log: a snapshot record is
-    /// published only after it synced ([`crate::SnapshotJournal`]).
-    pub(crate) snapshot_journal: Option<crate::SnapshotJournal>,
+    /// The record site and core journal of the group's log store: a
+    /// snapshot record is published only after the journal synced, and a
+    /// restored one is checked against the log ([`crate::SnapshotRecord`]).
+    pub(crate) snapshot_record: Option<crate::SnapshotRecord>,
     /// Log applied since the last snapshot (F12e), read by the driver.
     log_gauge: Arc<GroupLogGauge>,
     /// The engine's token: OpenRaft's state-machine worker owns this state
@@ -1731,7 +1772,7 @@ impl RaftGroupStateMachine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
-            snapshot_journal: None,
+            snapshot_record: None,
             log_gauge,
             work: WorkToken::detached(),
         }
@@ -1763,6 +1804,19 @@ impl RaftGroupStateMachine {
             decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(pointer_unreadable)?;
         let pointer =
             SnapshotPointer::decode(&persisted.pointer_bytes).map_err(pointer_unreadable)?;
+        // Before anything is downloaded: a log the record contradicts
+        // keeps the group closed (R1).
+        if let Some(record) = &self.snapshot_record
+            && let Some(snapshot) = persisted.meta.last_log_id
+        {
+            record.check_restored(snapshot).map_err(|source| {
+                SnapshotRestoreError::LogBelowSnapshot {
+                    core_id: self.placement.core_id,
+                    raft_group_id,
+                    source,
+                }
+            })?;
+        }
         // A preceding process may have exited after rename but before its
         // directory fsync. Establish this visible pointer's durability before
         // reconciling away pins for the previously durable pointer.
@@ -1974,7 +2028,7 @@ impl RaftGroupStateMachine {
             metrics: self.metrics.clone(),
             build,
             snapshot_metadata_path: self.snapshot_metadata_path.clone(),
-            snapshot_journal: self.snapshot_journal.clone(),
+            snapshot_record: self.snapshot_record.clone(),
             log_gauge: Arc::clone(&self.log_gauge),
             log_mark: self.log_gauge.mark(),
             references: self
@@ -2250,8 +2304,8 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let meta = meta.clone();
         // The truncate of a conflicting tail this install replaced must be
         // durable before the record is (R1).
-        if let Some(journal) = &self.snapshot_journal {
-            journal.sync().await.map_err(io::Error::from)?;
+        if let Some(record) = &self.snapshot_record {
+            record.sync().await.map_err(io::Error::from)?;
         }
         snapshot_metadata_work(self.metadata_serial.clone(), move || {
             let _reference = reference;
@@ -2305,7 +2359,7 @@ pub struct RaftGroupSnapshotBuilder {
     /// The build's permit, counted in flight until the builder is dropped.
     build: SnapshotBuildLease,
     snapshot_metadata_path: Option<PathBuf>,
-    snapshot_journal: Option<crate::SnapshotJournal>,
+    snapshot_record: Option<crate::SnapshotRecord>,
     log_gauge: Arc<GroupLogGauge>,
     /// The applied log this snapshot covers (F12e).
     log_mark: GroupLogMark,
@@ -2470,8 +2524,8 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         let log_mark = self.log_mark;
         let snapshot_index = meta.last_log_id.map_or(0, |log_id| log_id.index());
         // As for an install: the journal before the record (R1).
-        if let Some(journal) = &self.snapshot_journal {
-            journal.sync().await.map_err(io::Error::from)?;
+        if let Some(record) = &self.snapshot_record {
+            record.sync().await.map_err(io::Error::from)?;
         }
         let chosen = snapshot_metadata_work(self.metadata_serial.clone(), move || {
             let _reference = reference;
@@ -2921,7 +2975,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_journal: None,
+            snapshot_record: None,
         };
         builder.build_snapshot().await.expect("persist snapshot");
         // #561: the build records what it covers while it holds its permit.
@@ -2993,7 +3047,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_journal: None,
+            snapshot_record: None,
         };
         builder.build_snapshot().await.expect("persist snapshot");
 
@@ -3147,7 +3201,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_journal: None,
+            snapshot_record: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
         let first_pointer = SnapshotPointer::decode(first_snapshot.snapshot.pointer_bytes())
@@ -3168,7 +3222,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_journal: None,
+            snapshot_record: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(second_snapshot.snapshot.pointer_bytes())
@@ -3206,7 +3260,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_journal: None,
+            snapshot_record: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
         let third_pointer = SnapshotPointer::decode(third_snapshot.snapshot.pointer_bytes())
@@ -3303,7 +3357,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_journal: None,
+            snapshot_record: None,
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
@@ -4086,7 +4140,7 @@ mod tests {
                 references: Arc::default(),
                 snapshot_metadata_path: None,
                 work: crate::openraft_work::WorkToken::detached(),
-                snapshot_journal: None,
+                snapshot_record: None,
             };
             let coordinator = builder.build.coordinator.clone();
             {
@@ -4228,7 +4282,7 @@ mod tests {
                 log_mark: GroupLogMark::default(),
                 references: Arc::clone(&references),
                 snapshot_metadata_path: None,
-                snapshot_journal: None,
+                snapshot_record: None,
                 work: token,
             };
             let error = {

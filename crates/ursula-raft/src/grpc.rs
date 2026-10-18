@@ -2921,6 +2921,7 @@ mod group_rpc_status_tests {
                 | GroupInfraError::RecoveryGroupMismatch { .. }
                 | GroupInfraError::InvalidRaftCommand { .. }
                 | GroupInfraError::WalOpen { .. }
+                | GroupInfraError::LogBelowSnapshot { .. }
                 | GroupInfraError::RecoveryPending { .. }
                 | GroupInfraError::ColdStore { .. }
                 | GroupInfraError::Internal { .. }

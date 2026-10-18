@@ -160,10 +160,14 @@ impl RaftWal {
         self.snapshot_metadata_path(placement)
     }
 
+    /// The path [`RaftGroupFileLogStore::snapshot_record`] names for the
+    /// group of `placement`.
+    ///
+    /// [`RaftGroupFileLogStore::snapshot_record`]: super::RaftGroupFileLogStore::snapshot_record
+    #[cfg(any(test, madsim))]
     pub(crate) fn snapshot_metadata_path(&self, placement: ShardPlacement) -> PathBuf {
-        self.root()
-            .join(format!("core-{}", placement.core_id.0))
-            .join(format!("group-{}.snapshot.json", placement.raft_group_id.0))
+        self.core_dir(placement.core_id)
+            .join(super::file::snapshot_record_file(placement.raft_group_id.0))
     }
 
     fn core_writer(

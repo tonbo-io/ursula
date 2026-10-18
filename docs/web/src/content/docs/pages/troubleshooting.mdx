@@ -241,6 +241,10 @@ it: a replica with a plan votes only for the plan's leader. If that leader
 lost entries it had replicated, the members refuse it and the group stalls
 again: plan again with the replicas' current metrics.
 
+### `LogBelowSnapshot`: a group's log contradicts its restored snapshot record
+
+The replica found an entry, or a commit marker, at or after its snapshot record's index from an older term, and keeps the group closed. The group's other replicas keep serving it. Rejoin the node as a wiped node after checking its other groups. See [A log below its snapshot record](/docs/operations#a-log-below-its-snapshot-record).
+
 ### I/O error on `raft.wal.path`
 
 The directory must be writable and owned by exactly one Ursula process. Each

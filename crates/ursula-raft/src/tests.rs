@@ -3566,14 +3566,16 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
     let release = Arc::new(crate::rt::sync::Notify::new());
+    let store = wal.open(placement(), metrics()).unwrap();
+    let record = store.snapshot_record();
     let started = RaftGroupEngine::new_single_node(
         placement(),
         1,
         BasicNode::new("local"),
         raft_config("failed-start", 30, 60),
-        wal.open(placement(), metrics()).unwrap(),
+        store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            snapshot_record: Some(record),
             engine_work: Some(wal.engine_work_ledger()),
             startup_fault: Some(StartupFault {
                 release: Arc::clone(&release),
@@ -3614,14 +3616,16 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+    let store = wal.open(placement(), metrics()).unwrap();
+    let record = store.snapshot_record();
     let engine = RaftGroupEngine::new_single_node(
         placement(),
         1,
         BasicNode::new("local"),
         raft_config("dropped-engine", 30, 60),
-        wal.open(placement(), metrics()).unwrap(),
+        store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            snapshot_record: Some(record),
             engine_work: Some(wal.engine_work_ledger()),
             ..Default::default()
         },
@@ -4710,6 +4714,37 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
     ));
 }
 
+/// The engine factory hands each group its snapshot record from the
+/// group's log store, so a record it publishes follows a journal sync (R1).
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_engine_factory_wires_the_snapshot_record_to_the_log_store() {
+    let wal_root = tempfile::tempdir().unwrap();
+    let wal = start_wal(wal_root.path(), 1, 1);
+    let expected = wal.snapshot_metadata_path(placement());
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let path = registry
+        .get(RaftGroupId(0))
+        .unwrap()
+        .with_state_machine(|state_machine| {
+            Box::pin(async move {
+                state_machine
+                    .snapshot_record
+                    .as_ref()
+                    .map(|record| record.path().to_path_buf())
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(path, Some(expected));
+}
+
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
@@ -5181,7 +5216,7 @@ async fn reopen_journal_engine_with(
     options: RaftGroupEngineOptions,
 ) -> RaftGroupEngine {
     let store = reopen_journal_store(wal);
-    let snapshot_journal = store.snapshot_journal();
+    let snapshot_record = store.snapshot_record();
     RaftGroupEngine::new_single_node(
         placement(),
         1,
@@ -5189,8 +5224,7 @@ async fn reopen_journal_engine_with(
         raft_config(cluster_name, 30, 60),
         store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
-            snapshot_journal: Some(snapshot_journal),
+            snapshot_record: Some(snapshot_record),
             ..options
         },
     )
@@ -5293,7 +5327,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
     }
 
     let store = reopen_journal_store(&wal);
-    let snapshot_journal = store.snapshot_journal();
+    let snapshot_record = store.snapshot_record();
     let opened = RaftGroupEngine::new_node(
         placement(),
         1,
@@ -5301,19 +5335,34 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
         InProcessRaftNetworkFactory::new(InProcessRaftRegistry::default()).with_source(1),
         store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(metadata_path),
-            snapshot_journal: Some(snapshot_journal),
+            snapshot_record: Some(snapshot_record),
             peer_cluster: Some(crate::peer_cluster::test_peer_cluster(1)),
             ..Default::default()
         },
     )
     .await;
     match opened {
-        Err(GroupEngineError::Infra(GroupInfraError::WalOpen {
+        Err(GroupEngineError::Infra(GroupInfraError::LogBelowSnapshot {
+            core_id,
             raft_group_id,
-            failure: ursula_runtime::WalOpenFailureKind::LogBelowSnapshot,
-            ..
-        })) => assert_eq!(raft_group_id, placement().raft_group_id),
+            snapshot,
+            held,
+        })) => {
+            assert_eq!(
+                (core_id, raft_group_id),
+                (placement().core_id, placement().raft_group_id)
+            );
+            assert_eq!(snapshot, ursula_runtime::LogPosition {
+                term: 2,
+                node_id: 2,
+                index: 3,
+            });
+            assert_eq!(held, ursula_runtime::LogPosition {
+                term: 1,
+                node_id: 1,
+                index: 5,
+            });
+        }
         Err(other) => panic!("expected the log-below-snapshot refusal, got {other:?}"),
         Ok(_) => panic!("a replica opened a log that holds term 1's tail after its snapshot"),
     }
@@ -5338,28 +5387,36 @@ async fn the_restored_snapshot_check_keeps_a_log_that_continues_the_snapshot() {
     };
     let blank = |log_id| Entry::new(log_id, EntryPayload::Blank);
 
-    // Purged through the snapshot, then term 2's next entries.
+    // A follower that held term 1's committed entries 1 and 2 installed
+    // term 2's snapshot through 3, purged through it, and took term 2's
+    // next entries.
     let (_purged_root, mut purged) = fresh_journal_store();
     purged
-        .append(
-            vec![blank(log_id(1)), blank(log_id(2)), blank(log_id(3))],
-            IOFlushed::noop(),
-        )
+        .save_vote(&openraft::Vote::new_committed(2, 2))
         .await
         .unwrap();
+    purged
+        .append(vec![blank(log_id(1)), blank(log_id(2))], IOFlushed::noop())
+        .await
+        .unwrap();
+    purged.save_committed(Some(snapshot)).await.unwrap();
     purged.purge(snapshot).await.unwrap();
     purged
         .append(vec![blank(term_2(4)), blank(term_2(5))], IOFlushed::noop())
         .await
         .unwrap();
-    purged.snapshot_journal().sync().await.unwrap();
+    purged.snapshot_record().sync().await.unwrap();
     purged
-        .snapshot_journal()
+        .snapshot_record()
         .check_restored(snapshot)
         .expect("a log that continues a purged snapshot");
 
-    // The snapshot's own entry, and later ones.
+    // A replica that took term 2's entries 3 and 4 and built a snapshot
+    // through 3: the snapshot's own entry, and a later one.
     let (_held_root, mut held) = fresh_journal_store();
+    held.save_vote(&openraft::Vote::new_committed(2, 2))
+        .await
+        .unwrap();
     held.append(
         vec![
             blank(log_id(1)),
@@ -5372,8 +5429,8 @@ async fn the_restored_snapshot_check_keeps_a_log_that_continues_the_snapshot() {
     .await
     .unwrap();
     held.save_committed(Some(term_2(4))).await.unwrap();
-    held.snapshot_journal().sync().await.unwrap();
-    held.snapshot_journal()
+    held.snapshot_record().sync().await.unwrap();
+    held.snapshot_record()
         .check_restored(snapshot)
         .expect("a log that holds the snapshot's entry");
 
@@ -5388,9 +5445,9 @@ async fn the_restored_snapshot_check_keeps_a_log_that_continues_the_snapshot() {
         )
         .await
         .unwrap();
-    stale.snapshot_journal().sync().await.unwrap();
+    stale.snapshot_record().sync().await.unwrap();
     assert!(matches!(
-        stale.snapshot_journal().check_restored(snapshot),
+        stale.snapshot_record().check_restored(snapshot),
         Err(SnapshotOrderError::HeldBelow { held, .. }) if held == log_id(5)
     ));
 
@@ -5401,9 +5458,9 @@ async fn the_restored_snapshot_check_keeps_a_log_that_continues_the_snapshot() {
         .await
         .unwrap();
     committed.save_committed(Some(log_id(4))).await.unwrap();
-    committed.snapshot_journal().sync().await.unwrap();
+    committed.snapshot_record().sync().await.unwrap();
     assert!(matches!(
-        committed.snapshot_journal().check_restored(snapshot),
+        committed.snapshot_record().check_restored(snapshot),
         Err(SnapshotOrderError::CommittedBelow { committed, .. }) if committed == log_id(4)
     ));
 }
@@ -5723,6 +5780,7 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("the stopped engine released the group's log store");
+    let reopened_record = reopened.snapshot_record();
 
     // The queued work ran before the shutdown returned: the applies
     // answered, a build started, and the refused install left the gauge
@@ -5759,7 +5817,7 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
         reopened,
         RaftGroupEngineOptions {
             snapshot_build: Some(queued.builds.clone()),
-            snapshot_metadata_path: Some(metadata_path.clone()),
+            snapshot_record: Some(reopened_record),
             ..Default::default()
         },
     )

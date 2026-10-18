@@ -707,6 +707,7 @@ fn every_group_engine_error_answers_its_table_row() {
                 | GroupInfraError::RecoveryAlreadyBound { .. }
                 | GroupInfraError::RecoveryGroupMismatch { .. }
                 | GroupInfraError::WalOpen { .. }
+                | GroupInfraError::LogBelowSnapshot { .. }
                 | GroupInfraError::RecoveryVoteFloor { .. }
                 | GroupInfraError::RecoveryCutting { .. }
                 | GroupInfraError::CommittedOverwrite { .. }

@@ -142,6 +142,7 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::RecoveryAlreadyBound { .. }
         | GroupInfraError::RecoveryGroupMismatch { .. }
         | GroupInfraError::WalOpen { .. }
+        | GroupInfraError::LogBelowSnapshot { .. }
         | GroupInfraError::RecoveryVoteFloor { .. }
         | GroupInfraError::RecoveryCutting { .. }
         | GroupInfraError::CommittedOverwrite { .. }

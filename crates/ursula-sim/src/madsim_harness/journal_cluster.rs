@@ -396,9 +396,7 @@ impl JournalCluster {
             options.snapshot_build = Some(self.coordinator(node_id));
             // A node whose driver purges its log through snapshots restores
             // them at startup, as in production.
-            options.snapshot_metadata_path =
-                Some(self.wals[&node_id].snapshot_metadata_path(placement));
-            options.snapshot_journal = Some(store.snapshot_journal());
+            options.snapshot_record = Some(store.snapshot_record());
         }
         options.apply_fault = self
             .faulty
