@@ -4140,7 +4140,7 @@ pub(crate) fn remove_test_path(path: impl AsRef<std::path::Path>) {
 
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_voter() {
+async fn registry_handoff_rejects_invalid_targets_and_transfers_to_a_healthy_voter() {
     use openraft::rt::WatchReceiver;
     let (_network, engines, leader, _roots) =
         build_three_node_cluster("handoff-policy", None).await;
@@ -4172,19 +4172,6 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
             .expect("open the gate"),
     );
     engine.publish_recovery(gate.clone(), &registry).unwrap();
-    let metrics = raft.metrics().borrow_watched().clone();
-    let matched = metrics.replication.as_ref().unwrap()[&target];
-    assert!(gate.follower_lost_log(
-        target,
-        &metrics.vote,
-        matched.as_ref(),
-        None,
-        &UrsulaAppendEntriesResponse::Conflict
-    ));
-    assert!(
-        matches!(registry.transfer_leader(placement().raft_group_id, target).await,
-        Err(LeadershipTransferError::RecoveringTarget { target: rejected, .. }) if rejected == target)
-    );
     assert!(matches!(
         registry
             .transfer_leader(placement().raft_group_id, leader)
@@ -4213,6 +4200,46 @@ async fn registry_handoff_rejects_reverted_follower_and_transfers_to_healthy_vot
         .await
         .unwrap();
     shutdown_all(&engines).await;
+}
+
+/// A group with a recovery gate runs with OpenRaft's log reversion allowed,
+/// so its leader rewinds a follower that lost entries in place. A group
+/// without one keeps OpenRaft's default, which refuses it.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn only_a_gated_group_allows_follower_log_reversion() {
+    let config = raft_config("log-reversion", 30, 60);
+    for gated in [true, false] {
+        let (_root, store) = fresh_journal_store();
+        let mut options = RaftGroupEngineOptions::default();
+        if gated {
+            options.recovery = Some(Arc::new(
+                GroupRejoin::durable(1, placement().raft_group_id, &store)
+                    .await
+                    .expect("open the gate"),
+            ));
+        }
+        let engine = RaftGroupEngine::new_node(
+            placement(),
+            1,
+            config.clone(),
+            SingleNodeRaftNetworkFactory,
+            store,
+            options,
+        )
+        .await
+        .expect("start the replica");
+        assert_eq!(
+            engine.raft_handle().config().allow_log_reversion,
+            gated.then_some(true),
+            "gated: {gated}"
+        );
+        engine.shutdown().await.expect("stop the replica");
+    }
+    assert_eq!(
+        config.allow_log_reversion, None,
+        "the shared config is unchanged"
+    );
 }
 
 /// Waits until the leader's replication metrics show `target` holding every

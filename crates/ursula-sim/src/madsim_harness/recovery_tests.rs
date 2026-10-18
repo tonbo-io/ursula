@@ -36,6 +36,7 @@ use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::RaftGroupId;
+use ursula_stream::sim_controls::Defence;
 
 use super::seeds_from_env;
 use super::sim_test_guard;
@@ -80,30 +81,75 @@ fn assert_gated(cluster: &JournalCluster, node_id: u64, context: &str) {
     }
 }
 
-/// Waits until every group has a leader and every replica's gate is open,
-/// it is a voter of the leader's membership and it applied what the leader
+/// Whether every group has a leader and every replica's gate is open, it is
+/// a voter of the leader's membership and it applied what the leader
 /// committed.
+fn healed(cluster: &JournalCluster) -> bool {
+    JOURNAL_GROUPS.into_iter().all(|group| {
+        let Some(leader) = leader_by_state(cluster, group) else {
+            return false;
+        };
+        let leader_metrics = metrics(cluster, group, leader);
+        let committed = leader_metrics.local_committed.map(|log_id| log_id.index);
+        NODES.into_iter().all(|node_id| {
+            let replica = metrics(cluster, group, node_id);
+            cluster.rejoins[&(group, node_id)].vote_gate_open()
+                && leader_metrics
+                    .membership_config
+                    .voter_ids()
+                    .any(|voter| voter == node_id)
+                && committed.is_some()
+                && replica.last_applied.map(|log_id| log_id.index) >= committed
+        })
+    })
+}
+
+/// Waits until the cluster [`healed`].
 async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration) {
+    wait_healed_checking(cluster, context, timeout, |_| {}).await;
+}
+
+/// Waits until the cluster [`healed`] while every leader keeps every node a
+/// voter of a single config: a follower that lost entries is rewound in
+/// place, and nothing removes it or proposes a joint config.
+async fn wait_healed_as_voters(cluster: &JournalCluster, context: &str, timeout: Duration) {
+    wait_healed_checking(cluster, context, timeout, |cluster| {
+        assert_every_node_a_voter(cluster, context);
+    })
+    .await;
+}
+
+/// Every running leader's membership is a single config whose voters are
+/// every node.
+fn assert_every_node_a_voter(cluster: &JournalCluster, context: &str) {
+    for group in JOURNAL_GROUPS {
+        let Some(leader) = leader_by_state(cluster, group) else {
+            continue;
+        };
+        let membership = metrics(cluster, group, leader).membership_config;
+        let configs = membership.membership().get_joint_config().clone();
+        assert_eq!(
+            configs,
+            vec![NODES.into_iter().collect::<std::collections::BTreeSet<_>>()],
+            "{context}: group {group}: leader {leader} changed the voters"
+        );
+    }
+}
+
+/// Waits until the cluster [`healed`], running `check` on every poll. A
+/// conflict below a matched index from a replica whose gate was open fails
+/// it ([`assert_no_unaccounted_reversion`]).
+async fn wait_healed_checking(
+    cluster: &JournalCluster,
+    context: &str,
+    timeout: Duration,
+    check: impl Fn(&JournalCluster),
+) {
     let deadline = madsim::time::Instant::now() + timeout;
     loop {
-        let healed = JOURNAL_GROUPS.into_iter().all(|group| {
-            let Some(leader) = leader_by_state(cluster, group) else {
-                return false;
-            };
-            let leader_metrics = metrics(cluster, group, leader);
-            let committed = leader_metrics.local_committed.map(|log_id| log_id.index);
-            NODES.into_iter().all(|node_id| {
-                let replica = metrics(cluster, group, node_id);
-                cluster.rejoins[&(group, node_id)].vote_gate_open()
-                    && leader_metrics
-                        .membership_config
-                        .voter_ids()
-                        .any(|voter| voter == node_id)
-                    && committed.is_some()
-                    && replica.last_applied.map(|log_id| log_id.index) >= committed
-            })
-        });
-        if healed {
+        check(cluster);
+        if healed(cluster) {
+            assert_no_unaccounted_reversion(cluster, context);
             return;
         }
         assert!(
@@ -125,8 +171,21 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
     }
 }
 
-/// No vote was granted by a replica whose gate was closed.
+/// Every conflict below a matched index came from a replica whose recovery
+/// gate was not open: only a replica that may have lost acknowledged entries
+/// starts gated, so a leader rewinds no replica the gate does not hold.
+fn assert_no_unaccounted_reversion(cluster: &JournalCluster, context: &str) {
+    let unaccounted = cluster.reversions.unaccounted();
+    assert!(
+        unaccounted.is_empty(),
+        "{context}: replicas with an open gate lost acknowledged entries: {unaccounted:?}"
+    );
+}
+
+/// No vote was granted by a replica whose gate was closed, and no replica
+/// whose gate was open lost acknowledged entries.
 fn assert_no_vote_while_gated(cluster: &JournalCluster, context: &str) {
+    assert_no_unaccounted_reversion(cluster, context);
     // A planned replica votes for its plan's leader (#581 section 4.5).
     let granted = cluster
         .votes
@@ -232,8 +291,8 @@ fn assert_host_crash_opening(cluster: &JournalCluster, node_id: u64, context: &s
 /// (a) A follower loses power under `never` and comes back with a verified
 /// prefix of its log. Every group it held is gated: while it is cut off from
 /// the leader, a healthy follower campaigns and the gated replica refuses
-/// its vote. Once it can reach the leader, the leader rebuilds it, it
-/// applies a fresh barrier, its gate opens and records the group
+/// its vote. Once it can reach the leader, the leader rewinds it in place,
+/// it applies a fresh barrier, its gate opens and records the group
 /// initialized again. No acknowledged write is lost and no gated replica
 /// ever grants a vote.
 #[test]
@@ -307,11 +366,11 @@ fn a_follower_power_loss_rejoins_through_the_recovery_gate() {
 /// both groups hold entries, so it refuses every vote. As the initializer of
 /// a group it holds nothing of, it probes the other voters and does not
 /// initialize the group again. Writes keep flowing while the leaders see it
-/// lost the entries it had acknowledged and rebuild it through remove,
-/// learner, catch-up and promote, with no operator. Its gates open once it
-/// has applied a fresh barrier, and no acknowledged write is lost.
+/// lost the entries it had acknowledged and rewind it in place, with no
+/// operator: it stays a voter throughout. Its gates open once it has applied
+/// a fresh barrier, and no acknowledged write is lost.
 #[test]
-fn a_follower_that_lost_its_disk_is_rebuilt_while_writes_continue() {
+fn a_follower_that_lost_its_disk_is_rewound_in_place_while_writes_continue() {
     let _guard = sim_test_guard();
     for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
         run_with_madsim(seed, async move {
@@ -350,11 +409,12 @@ fn a_follower_that_lost_its_disk_is_rebuilt_while_writes_continue() {
                 );
             }
 
-            // Writes keep flowing while the emptied replica is rebuilt.
+            // Writes keep flowing while the emptied replica is rewound.
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 12).await;
+                assert_every_node_a_voter(&cluster, &context);
             }
-            wait_healed(&cluster, &context, Duration::from_secs(20)).await;
+            wait_healed_as_voters(&cluster, &context, Duration::from_secs(20)).await;
             for group in JOURNAL_GROUPS {
                 assert_eq!(
                     log_state(&cluster, group, victim),
@@ -409,10 +469,10 @@ fn a_leader_power_loss_never_elects_from_the_lost_log() {
 }
 
 /// Both followers of every group lose power at once under `never` while the
-/// leader survives. They are a majority, so the leader cannot remove them;
-/// it holds every committed entry, so it rewinds their replication and sends
-/// them its log again. No operator is needed, writes resume, and every
-/// acknowledged write is on every replica.
+/// leader survives. It holds every committed entry, so it rewinds their
+/// replication and sends them its log again, and both stay voters. No
+/// operator is needed, writes resume, and every acknowledged write is on
+/// every replica.
 #[test]
 fn a_surviving_leader_rewinds_a_majority_of_followers_that_lost_their_tail() {
     let _guard = sim_test_guard();
@@ -445,7 +505,7 @@ fn a_surviving_leader_rewinds_a_majority_of_followers_that_lost_their_tail() {
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 6).await;
             }
-            wait_healed(&cluster, &context, Duration::from_secs(15)).await;
+            wait_healed_as_voters(&cluster, &context, Duration::from_secs(15)).await;
             assert_no_vote_while_gated(&cluster, &context);
             cluster.verify_reads().await;
         });
@@ -795,12 +855,17 @@ async fn followers_lose_a_committed_tail(
 
 /// Restarts the followers of [`followers_lose_a_committed_tail`]: they come
 /// back gated, each with a shorter log than the survivor in every group.
+/// They are cut off from the survivor until both were checked, since it
+/// rewinds and catches up each one on its first conflict.
 async fn restart_shorter_followers(
     cluster: &mut JournalCluster,
     survivor: u64,
     followers: &[u64],
     context: &str,
 ) {
+    for node_id in followers {
+        cluster.policy.partition_bidirectional(survivor, *node_id);
+    }
     for node_id in followers {
         cluster.start_node(*node_id).await;
         assert_gated(cluster, *node_id, context);
@@ -818,37 +883,220 @@ async fn restart_shorter_followers(
             );
         }
     }
+    for node_id in followers {
+        cluster.policy.heal_bidirectional(survivor, *node_id);
+    }
+}
+
+/// How long ago a quorum last acknowledged `node_id` as the leader of
+/// `group`, if it leads it and a quorum ever did.
+fn quorum_ack_age(cluster: &JournalCluster, group: u32, node_id: u64) -> Option<Duration> {
+    let replica = metrics(cluster, group, node_id);
+    if replica.state != openraft::ServerState::Leader {
+        return None;
+    }
+    replica
+        .last_quorum_acked
+        .as_ref()
+        .map(|acked| openraft::Instant::elapsed(&**acked))
+}
+
+/// Waits at most `within` for a quorum to acknowledge `leader` as the leader
+/// of every group within the last maximum election timeout: OpenRaft's
+/// leader lease, which ReadIndex, leader reads and `leads_live` rely on. A
+/// follower's conflict is such an acknowledgement, as a vote it accepted.
+async fn wait_lease_renewed(
+    cluster: &JournalCluster,
+    leader: u64,
+    within: Duration,
+) -> Result<(), String> {
+    let lease = cluster.election_timeout_max();
+    let deadline = madsim::time::Instant::now() + within;
+    loop {
+        let ages = JOURNAL_GROUPS
+            .into_iter()
+            .map(|group| (group, quorum_ack_age(cluster, group, leader)))
+            .collect::<Vec<_>>();
+        if ages
+            .iter()
+            .all(|(_, age)| age.is_some_and(|age| age < lease))
+        {
+            return Ok(());
+        }
+        if madsim::time::Instant::now() >= deadline {
+            return Err(format!(
+                "node {leader}'s lease was not renewed within {within:?}: quorum ack ages {ages:?}"
+            ));
+        }
+        madsim::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until the cluster [`healed`] while `leader` leads every group with
+/// its lease renewed and every node stays a voter.
+async fn wait_healed_holding_lease(
+    cluster: &JournalCluster,
+    leader: u64,
+    context: &str,
+    timeout: Duration,
+) {
+    let lease = cluster.election_timeout_max();
+    wait_healed_checking(cluster, context, timeout, |cluster| {
+        assert_every_node_a_voter(cluster, context);
+        for group in JOURNAL_GROUPS {
+            let age = quorum_ack_age(cluster, group, leader);
+            assert!(
+                age.is_some_and(|age| age < lease),
+                "{context}: group {group}: node {leader}'s lease lapsed while it healed its \
+                 followers (quorum ack age {age:?})"
+            );
+        }
+    })
+    .await;
 }
 
 /// (e2) Both followers of every idle group lose a tail of committed entries
 /// at once while the leader survives, and nothing is written afterwards.
-/// They are a majority, so the leader cannot remove them: it rewinds their
-/// replication and sends them its log again, with an unchanged membership
-/// entry to carry the rewind. The first conflict to arrive must not make the
-/// leader remove that follower while the other one has not answered yet: a
-/// joint config that only the other follower could commit would wedge the
-/// group until the heal step times out. Every group heals before a gated
-/// replica reports it stalled, without an operator, and keeps every
-/// acknowledged write.
+/// The leader rewinds each follower in place on its first conflict, a
+/// heartbeat's included, and replicates its log to it again: no proposal is
+/// needed, so every group's membership entry stays the one before the loss.
+/// Each conflict also counts as the follower's acknowledgement, so the
+/// leader's lease is renewed within a second of the followers coming back
+/// and holds until they healed. Every group heals before a gated replica
+/// reports it stalled, without an operator, keeps every acknowledged write,
+/// and both followers stay voters.
 #[test]
 fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
     let _guard = sim_test_guard();
+    let mut observed = 0_u64;
     for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
-        run_with_madsim(seed, async move {
+        observed = observed.saturating_add(run_with_madsim(seed, async move {
             let context = format!("seed {seed}");
             let (mut cluster, survivor, followers) =
                 followers_lose_a_committed_tail("gate-idle-majority", &context).await;
+            let memberships = JOURNAL_GROUPS.map(|group| {
+                *metrics(&cluster, group, survivor)
+                    .membership_config
+                    .log_id()
+            });
             restart_shorter_followers(&mut cluster, survivor, &followers, &context).await;
+            wait_lease_renewed(&cluster, survivor, Duration::from_secs(1))
+                .await
+                .unwrap_or_else(|error| panic!("{context}: {error}"));
             // Healed before any gated replica reports its group stalled:
             // nothing here needs an operator.
-            wait_healed(&cluster, &context, RECOVERY_STALL_AFTER).await;
+            wait_healed_holding_lease(&cluster, survivor, &context, RECOVERY_STALL_AFTER).await;
+            for (group, membership) in JOURNAL_GROUPS.into_iter().zip(memberships) {
+                assert_eq!(
+                    *metrics(&cluster, group, survivor)
+                        .membership_config
+                        .log_id(),
+                    membership,
+                    "{context}: group {group} proposed a membership entry to heal"
+                );
+            }
+            assert!(
+                followers
+                    .iter()
+                    .any(|node_id| cluster.reversions.from(*node_id) > 0),
+                "{context}: no follower answered a conflict below its matched index"
+            );
             assert_no_vote_while_gated(&cluster, &context);
+            let reported = JOURNAL_GROUPS
+                .into_iter()
+                .flat_map(|group| {
+                    cluster.rejoins[&(group, survivor)]
+                        .log_reversions()
+                        .into_values()
+                })
+                .sum::<u64>();
             for group in JOURNAL_GROUPS {
                 wait_writable(&mut cluster, group, &context).await;
             }
             cluster.verify_reads().await;
-        });
+            reported
+        }));
     }
+    assert!(
+        observed > 0,
+        "the survivor's heal driver must observe the followers' log reversions"
+    );
+}
+
+/// Without log reversion, the survivor's OpenRaft takes the first conflict
+/// below a follower's matched index for a bug, and its debug assertion
+/// reports it: the global allowance is what lets it rewind the followers.
+#[test]
+fn negative_control_a_reverted_majority_without_log_reversion_trips_openraft() {
+    let _guard = sim_test_guard();
+    let seed = JOURNAL_POWER_LOSS_SEEDS[0];
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let result = std::panic::catch_unwind(|| {
+        run_with_madsim(seed, async move {
+            // Every engine reads the switch as it starts, on this thread.
+            ursula_stream::sim_controls::set_off(Defence::FollowerRewind, true);
+            let context = format!("seed {seed}");
+            let (mut cluster, survivor, followers) =
+                followers_lose_a_committed_tail("gate-no-follower-rewind", &context).await;
+            restart_shorter_followers(&mut cluster, survivor, &followers, &context).await;
+            wait_healed(&cluster, &context, RECOVERY_STALL_AFTER).await;
+        });
+    });
+    std::panic::set_hook(previous_hook);
+    let payload = result.expect_err("the run panicked");
+    let message = payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_owned())
+        })
+        .unwrap_or_default();
+    assert!(
+        message.contains("follower log reversion is not allowed"),
+        "{message}"
+    );
+}
+
+/// A network that hides each follower's conflict from its leader, as an
+/// unreachable follower, takes away the acknowledgement the conflict is:
+/// the survivor's lease is never renewed while the followers are behind it,
+/// and it lapses. This is what the old path that reported such a conflict
+/// as an error cost an idle group.
+#[test]
+fn negative_control_hidden_conflicts_let_the_survivors_lease_lapse() {
+    let _guard = sim_test_guard();
+    let seed = JOURNAL_POWER_LOSS_SEEDS[0];
+    run_with_madsim(seed, async move {
+        let context = format!("seed {seed}");
+        let (mut cluster, survivor, followers) =
+            followers_lose_a_committed_tail("gate-hidden-conflicts", &context).await;
+        for node_id in &followers {
+            cluster.policy.hide_conflicts(*node_id, true);
+        }
+        restart_shorter_followers(&mut cluster, survivor, &followers, &context).await;
+        let renewed = wait_lease_renewed(&cluster, survivor, Duration::from_secs(1)).await;
+        assert!(
+            renewed.is_err(),
+            "{context}: the lease was renewed without the followers' conflicts"
+        );
+        let lease = cluster.election_timeout_max();
+        for group in JOURNAL_GROUPS {
+            let age = quorum_ack_age(&cluster, group, survivor);
+            assert!(
+                age.is_some_and(|age| age > lease),
+                "{context}: group {group}: quorum ack age {age:?}"
+            );
+        }
+        assert!(
+            followers
+                .iter()
+                .any(|node_id| cluster.reversions.from(*node_id) > 0),
+            "{context}: no follower answered a conflict below its matched index"
+        );
+    });
 }
 
 /// (e3) Both followers of every group lose power at once while the leader
@@ -1153,73 +1401,91 @@ fn a_genesis_vote_floor_survives_a_restart_before_the_first_election() {
     }
 }
 
+/// A follower A loses its unsynced tail while the other follower B is cut
+/// off, and the leader rewinds A in place. B then loses its own tail before
+/// A caught up, so for a while each follower lacks entries the leader
+/// committed. Both stay voters: no joint config ever appears, every group
+/// heals without an operator and keeps every acknowledged write.
 #[test]
-fn another_power_loss_during_remove_voter_finishes_the_joint_without_losing_acks() {
+fn another_power_loss_during_a_rewind_keeps_every_voter_without_losing_acks() {
     let _guard = sim_test_guard();
     // Both power losses drop every unsynced page, so every seed loses both
     // tails, whatever the schedule before them.
     for seed in seeds_from_env("JOINT_LOSS_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
         run_with_madsim(seed, async move {
             let mut cluster =
-                JournalCluster::start_with_fsync("joint-second-loss", WalFsync::Never).await;
-            let context = format!("joint second loss seed {seed}");
+                JournalCluster::start_with_fsync("rewind-second-loss", WalFsync::Never).await;
+            let context = format!("rewind second loss seed {seed}");
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 6).await;
             }
             let leader = wait_leader(&cluster, 0, &context).await;
-            for group in JOURNAL_GROUPS {
-                let current = wait_leader(&cluster, group, &context).await;
-                if current != leader {
-                    cluster.engines[&(group, current)]
-                        .raft_handle()
-                        .trigger()
-                        .transfer_leader(leader)
-                        .await
-                        .unwrap();
-                }
-                cluster.engines[&(group, leader)]
-                    .raft_handle()
-                    .wait(Some(Duration::from_secs(5)))
-                    .current_leader(leader, "align leaders")
-                    .await
-                    .unwrap();
-            }
+            lead_every_group(&cluster, leader, &context).await;
             let followers: Vec<_> = NODES.into_iter().filter(|id| *id != leader).collect();
             let (a, b) = (followers[0], followers[1]);
-            // Keep B alive, but prevent it from acknowledging RemoveVoter(A).
+            // Keep B alive, but out of reach while A is rewound.
             cluster.policy.partition_bidirectional(leader, b);
             cluster.policy.partition_bidirectional(a, b);
             assert!(unsynced_loss_and_restart(&mut cluster, a).await > 0);
             let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
-            let joint_group = loop {
-                if let Some(group) = JOURNAL_GROUPS.into_iter().find(|group| {
-                    metrics(&cluster, *group, leader)
-                        .membership_config
-                        .membership()
-                        .get_joint_config()
-                        .len()
-                        > 1
-                }) {
-                    break group;
-                }
+            while cluster.reversions.from(a) == 0 {
+                assert_every_node_a_voter(&cluster, &context);
                 assert!(
                     madsim::time::Instant::now() < deadline,
-                    "{context}: no joint configuration"
+                    "{context}: the leader never saw node {a} lose entries"
                 );
                 madsim::time::sleep(Duration::from_millis(1)).await;
-            };
-            let joint = metrics(&cluster, joint_group, leader);
-            assert!(joint.local_committed < *joint.membership_config.log_id());
-            // B loses its tail only after A's removal is pending.
-            let before_loss = metrics(&cluster, joint_group, b).last_log_index;
+            }
+            // B loses its tail while A's rewind runs.
+            let before_loss = metrics(&cluster, 0, b).last_log_index;
             assert!(unsynced_loss_and_restart(&mut cluster, b).await > 0);
-            assert!(metrics(&cluster, joint_group, b).last_log_index < before_loss);
+            assert!(metrics(&cluster, 0, b).last_log_index < before_loss);
             cluster.policy.clear();
-            wait_healed(&cluster, &context, Duration::from_secs(15)).await;
+            wait_healed_as_voters(&cluster, &context, Duration::from_secs(15)).await;
             assert_no_vote_while_gated(&cluster, &context);
             cluster.verify_reads().await;
         });
     }
+}
+
+/// A recovery barrier is the leader's last log index when that is above the
+/// read index. The dead process of a gated replica may still have an
+/// acknowledgement of such an entry on its way, which would count the
+/// replica's copy toward its commit: its gate opens only once the replica
+/// holds the entry again (`confirm_recovery_barrier`).
+#[test]
+fn a_recovery_barrier_covers_the_leaders_uncommitted_entries() {
+    let _guard = sim_test_guard();
+    let seed = JOURNAL_POWER_LOSS_SEEDS[0];
+    run_with_madsim(seed, async move {
+        let context = format!("seed {seed}");
+        let mut cluster = JournalCluster::start("barrier-last-log").await;
+        let group = JOURNAL_GROUPS[0];
+        let leader = wait_leader(&cluster, group, &context).await;
+        // Heartbeats still pass, so the ReadIndex round reaches a quorum.
+        for node_id in NODES.into_iter().filter(|node_id| *node_id != leader) {
+            cluster
+                .policy
+                .set_entries_delay(leader, node_id, Some(Duration::from_secs(10)));
+        }
+        assert_eq!(
+            attempt_append(&mut cluster, group, leader, b"uncommitted;").await,
+            Attempt::TimedOut,
+            "{context}"
+        );
+        let before = metrics(&cluster, group, leader);
+        let committed = before.local_committed.map(|log_id| log_id.index);
+        assert!(
+            before.last_log_index > committed,
+            "{context}: the append stays uncommitted"
+        );
+        let (_, index) = cluster
+            .confirm_recovery_barrier(group, leader)
+            .await
+            .unwrap_or_else(|error| panic!("{context}: a fresh barrier: {error}"));
+        assert_eq!(Some(index), before.last_log_index, "{context}");
+        cluster.policy.clear();
+    });
 }
 
 /// A process crash loses a leader's enqueued (not yet written) suffix even

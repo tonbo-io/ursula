@@ -323,9 +323,9 @@ replacement_attempt_was_superseded() {
 }
 
 # The replacement starts maintenance-drained: the entrypoint reads the
-# restarting state. A replica that lost Raft log entries is gated and rebuilt
-# by its group leaders, so the rollout only waits until the node is a
-# caught-up voter in every group before it clears the drain.
+# restarting state. A replica that lost Raft log entries is gated, stays a
+# voter and is caught up by its group leaders, so the rollout only waits until
+# the node is a caught-up voter in every group before it clears the drain.
 rejoin_node() {
   ordinal=$1
   node_id=$2

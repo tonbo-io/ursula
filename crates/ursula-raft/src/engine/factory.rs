@@ -558,8 +558,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 })
                 .clone();
             let network = GrpcRaftNetworkFactory::new(transport.clone(), placement.raft_group_id)
-                .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
-                .with_rejoin(Some(rejoin.clone()));
+                .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures);
             let apply_stop_signal = store.apply_stop_signal();
             let snapshot_record = store.snapshot_record();
             let health = crate::apply_failure::ApplyHealth::default();

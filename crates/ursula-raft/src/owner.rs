@@ -485,16 +485,6 @@ impl OwnerTrigger {
     trigger!(heartbeat());
     trigger!(purge_log(upto: u64));
     trigger!(transfer_leader(to: u64));
-    pub async fn allow_next_revert(
-        &self,
-        target: &u64,
-        allow: bool,
-    ) -> Result<Result<(), openraft::error::AllowNextRevertError<C>>, Fatal<C>> {
-        let target = *target;
-        self.0
-            .call(move |raft| async move { raft.trigger().allow_next_revert(&target, allow).await })
-            .await?
-    }
 }
 
 /// Keep the transport classification structured while recording the original fatal cause.

@@ -1171,7 +1171,6 @@ mod tests {
 
         for (reason, retryable) in [
             (TransferRejection::NotLeader, true),
-            (TransferRejection::RecoveringTarget, true),
             (TransferRejection::UnreadyTarget, true),
             (TransferRejection::InvalidTarget, false),
         ] {

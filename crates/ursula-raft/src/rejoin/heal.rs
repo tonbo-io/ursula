@@ -1,4 +1,4 @@
-//! Leader-side repair planning and driver.
+//! Leader-side membership repair and the follower log reversion observer.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -18,6 +18,7 @@ use super::attach::wait_recovery_change;
 use super::log_index;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaVote;
 
 /// The leader's view of one group, as the heal driver reads it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -30,34 +31,19 @@ pub(crate) struct HealView {
     pub stale_joint: bool,
     pub voters: BTreeSet<u64>,
     pub learners: BTreeSet<u64>,
-    /// This leader and the followers that answered it within a minimum
-    /// election timeout. A follower that has not answered since it
-    /// restarted may have lost entries this leader does not know of yet.
-    pub answering: BTreeSet<u64>,
-    pub reverted: BTreeSet<u64>,
-    /// Voters whose rewind this leader allowed but OpenRaft has not done yet:
-    /// their progress still shows the index they had matched.
-    pub awaiting_rewind: BTreeSet<u64>,
     pub matched: BTreeMap<u64, Option<u64>>,
     pub committed: Option<u64>,
     /// The group's configured (static) voters.
     pub configured: BTreeSet<u64>,
 }
 
-/// One step of the heal driver.
+/// One step of the heal driver. A follower that lost entries stays a
+/// member: OpenRaft rewinds it in place (log reversion is allowed in every
+/// gated group), so the driver only brings the membership back to the
+/// configured voters: after an operator removed one, or a recovery plan
+/// kept a membership that lacks one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HealStep {
-    /// Remove a voter that lost its log; `voters` is the new voter set.
-    RemoveVoter { target: u64, voters: BTreeSet<u64> },
-    /// The voters that lost entries are a majority, so no removal can
-    /// commit: rewind their replication and send them this leader's log.
-    RewindVoters { targets: BTreeSet<u64> },
-    /// OpenRaft rewinds a follower only on the conflict of a request that
-    /// carries entries, and an idle group sends none: propose an unchanged
-    /// membership so replication carries one.
-    ReplicateRewound,
-    /// Remove a learner that lost its log, so it is added back fresh.
-    RemoveLearner { target: u64 },
     /// Add a configured voter that is missing as a learner.
     AddLearner { target: u64 },
     /// Promote a caught-up learner: `voters` is the current voters plus it.
@@ -67,60 +53,13 @@ pub(crate) enum HealStep {
     FinishJoint,
 }
 
-fn quorum(voter_count: usize) -> usize {
-    (voter_count / 2).saturating_add(1)
-}
-
 /// The next heal step for a group this node leads, if any.
 pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
     if !view.is_leader {
         return None;
     }
-    let reverted_voters = view
-        .voters
-        .intersection(&view.reverted)
-        .copied()
-        .collect::<BTreeSet<_>>();
     if !view.uniform {
-        // A second lost voter can be discovered after RemoveVoter already
-        // proposed a joint configuration. Restore replication first: another
-        // membership proposal cannot commit the pending joint entry.
-        if !reverted_voters.is_empty() {
-            return Some(HealStep::RewindVoters {
-                targets: reverted_voters,
-            });
-        }
         return view.stale_joint.then_some(HealStep::FinishJoint);
-    }
-    if let Some(target) = reverted_voters.first() {
-        // The removal commits only with a quorum of the current voters that
-        // still hold their log. Without one, this leader rewinds them: it
-        // holds every committed entry and they cannot vote meanwhile. Only a
-        // voter that answered recently is known to hold its log: one that is
-        // still silent after a restart may have lost entries too, and a
-        // removal that needs it would wedge the group in a joint config.
-        let healthy_voters = view
-            .voters
-            .iter()
-            .filter(|voter| !view.reverted.contains(*voter) && view.answering.contains(*voter))
-            .count();
-        if healthy_voters < quorum(view.voters.len()) {
-            return Some(HealStep::RewindVoters {
-                targets: reverted_voters,
-            });
-        }
-        let mut voters = view.voters.clone();
-        voters.remove(target);
-        return Some(HealStep::RemoveVoter {
-            target: *target,
-            voters,
-        });
-    }
-    if !view.awaiting_rewind.is_empty() {
-        return Some(HealStep::ReplicateRewound);
-    }
-    if let Some(target) = view.learners.intersection(&view.reverted).next() {
-        return Some(HealStep::RemoveLearner { target: *target });
     }
     if !view.voters.is_subset(&view.configured) {
         return None;
@@ -147,14 +86,8 @@ pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
         .map(|target| HealStep::AddLearner { target: *target })
 }
 
-fn heal_view(
-    metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
-    rejoin: &GroupRejoin,
-    configured: &BTreeSet<u64>,
-    answer_window: Duration,
-) -> HealView {
-    let membership = metrics.membership_config.membership();
-    let matched = metrics
+fn matched_indexes(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> BTreeMap<u64, Option<u64>> {
+    metrics
         .replication
         .as_ref()
         .map(|replication| {
@@ -163,50 +96,93 @@ fn heal_view(
                 .map(|(node_id, matched)| (*node_id, log_index(matched.as_ref())))
                 .collect::<BTreeMap<_, _>>()
         })
-        .unwrap_or_default();
-    let voters = membership.voter_ids().collect::<BTreeSet<_>>();
-    let mut answering = metrics
-        .heartbeat
-        .as_ref()
-        .map(|acks| {
-            acks.iter()
-                .filter(|(_, acked)| {
-                    acked
-                        .as_ref()
-                        .is_some_and(|acked| openraft::Instant::elapsed(&**acked) <= answer_window)
-                })
-                .map(|(node_id, _)| *node_id)
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    answering.insert(metrics.id);
-    let awaiting_rewind = rejoin
-        .allowed_rewinds(&metrics.vote)
-        .into_iter()
-        .filter(|(target, previous)| {
-            voters.contains(target) && matched.get(target).copied().flatten() == Some(*previous)
-        })
-        .map(|(target, _)| target)
-        .collect();
+        .unwrap_or_default()
+}
+
+fn heal_view(metrics: &RaftMetrics<UrsulaRaftTypeConfig>, configured: &BTreeSet<u64>) -> HealView {
+    let membership = metrics.membership_config.membership();
     HealView {
         is_leader: metrics.state == ServerState::Leader,
         uniform: membership.get_joint_config().len() == 1,
         stale_joint: false,
-        voters,
+        voters: membership.voter_ids().collect(),
         learners: membership.learner_ids().collect(),
-        answering,
-        reverted: rejoin.reverted_followers(&metrics.vote),
-        awaiting_rewind,
-        matched,
+        matched: matched_indexes(metrics),
         committed: log_index(metrics.local_committed.as_ref()),
         configured: configured.clone(),
     }
 }
 
-/// Leader-side heal driver for one group: rebuilds a voter that lost
-/// entries through remove / learner / catch-up / promote, rewinds voters
-/// that lost entries when they are a majority, and finishes a rebuild
-/// another leader started. Returns once the Raft stops.
+/// A follower whose matched index went down within one leadership: OpenRaft
+/// rewound it because it answered a conflict below what it had matched, so
+/// it lost entries it had acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LogReversion {
+    pub target: u64,
+    pub matched: u64,
+    pub now: Option<u64>,
+}
+
+/// What this leader saw each follower match in its current leadership: the
+/// passive observer of follower log reversions. It reads the replication
+/// metrics only, and changes nothing OpenRaft does.
+#[derive(Debug, Default)]
+pub(crate) struct ReversionWatch {
+    leader: Option<UrsulaVote>,
+    matched: BTreeMap<u64, u64>,
+}
+
+impl ReversionWatch {
+    /// The followers whose matched index went down since the previous
+    /// observation under the same leadership `vote`. A new leadership starts
+    /// afresh, since a new leader learns what each follower holds.
+    pub(crate) fn observe(
+        &mut self,
+        vote: &UrsulaVote,
+        is_leader: bool,
+        matched: &BTreeMap<u64, Option<u64>>,
+    ) -> Vec<LogReversion> {
+        if !is_leader || self.leader.as_ref() != Some(vote) {
+            self.leader = is_leader.then_some(*vote);
+            self.matched.clear();
+        }
+        if !is_leader {
+            return Vec::new();
+        }
+        let mut reversions = Vec::new();
+        // A follower leaving the membership leaves the replication metrics:
+        // that is no reversion.
+        self.matched
+            .retain(|target, _| matched.contains_key(target));
+        for (target, now) in matched {
+            let previous = self.matched.get(target).copied();
+            if let Some(previous) = previous
+                && now.is_none_or(|now| now < previous)
+            {
+                reversions.push(LogReversion {
+                    target: *target,
+                    matched: previous,
+                    now: *now,
+                });
+            }
+            match now {
+                Some(now) => {
+                    self.matched.insert(*target, *now);
+                }
+                None => {
+                    self.matched.remove(target);
+                }
+            }
+        }
+        reversions
+    }
+}
+
+/// Leader-side heal driver for one group. It observes follower log
+/// reversions, which OpenRaft repairs in place, and counts and reports each
+/// one. It also brings the membership back to the configured voters (add a
+/// missing one as a learner, promote it once caught up, flatten a stale
+/// joint config). Returns once the Raft stops.
 pub async fn run_rejoin_heal(
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
@@ -214,31 +190,37 @@ pub async fn run_rejoin_heal(
     interval: Duration,
 ) {
     let configured_ids = configured.keys().copied().collect::<BTreeSet<_>>();
-    let answer_window = Duration::from_millis(raft.config().election_timeout_min);
     // The log id of the joint config seen on the previous tick, if any.
     let mut last_joint = None;
     let mut last_attempt = None;
     let mut joint_since = crate::rt::time::Instant::now();
-    let mut observed = raft.server_metrics();
+    let mut reversions = ReversionWatch::default();
+    // Every metrics change wakes the driver, replication progress included,
+    // so the observer sees a rewound follower before it matches again.
+    let mut observed = raft.metrics();
     let mut changes = rejoin.changes.subscribe();
     loop {
         if !wait_recovery_change(&mut observed, &mut changes, interval).await {
             return;
         }
-        let step = {
-            let metrics = raft.metrics().borrow_watched().clone();
+        let (step, reverted) = {
+            let metrics = observed.borrow_watched();
             if metrics.running_state.is_err() {
                 return;
             }
-            let mut view = heal_view(&metrics, &rejoin, &configured_ids, answer_window);
+            let mut view = heal_view(&metrics, &configured_ids);
+            let reverted = reversions.observe(&metrics.vote, view.is_leader, &view.matched);
             let joint = (!view.uniform).then(|| *metrics.membership_config.log_id());
             if joint != last_joint {
                 joint_since = crate::rt::time::Instant::now();
             }
             view.stale_joint = joint.is_some() && joint_since.elapsed() >= interval;
             last_joint = joint;
-            plan_heal_step(&view)
+            (plan_heal_step(&view), reverted)
         };
+        for reversion in reverted {
+            rejoin.record_log_reversion(reversion);
+        }
         let Some(step) = step else {
             continue;
         };
@@ -258,31 +240,9 @@ pub async fn run_rejoin_heal(
             node_id,
             raft_group_id = group,
             step = ?step,
-            "recovery: healing a replica that lost Raft log entries"
+            "recovery: restoring the group's configured voters"
         );
         let result = match &step {
-            HealStep::RemoveVoter { voters, .. } => crate::rt::time::timeout(
-                REJOIN_HEAL_STEP_TIMEOUT,
-                raft.change_membership(voters.clone(), false),
-            )
-            .await
-            .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
-            HealStep::RewindVoters { targets } => {
-                crate::rt::time::timeout(
-                    REJOIN_HEAL_STEP_TIMEOUT,
-                    rejoin.rewind_followers(&raft, targets),
-                )
-                .await
-            }
-            HealStep::RemoveLearner { target } => crate::rt::time::timeout(
-                REJOIN_HEAL_STEP_TIMEOUT,
-                raft.change_membership(
-                    ChangeMembers::RemoveNodes(BTreeSet::from([*target])),
-                    false,
-                ),
-            )
-            .await
-            .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
             HealStep::AddLearner { target } => {
                 let Some(node) = configured.get(target).cloned() else {
                     continue;
@@ -301,9 +261,8 @@ pub async fn run_rejoin_heal(
             .await
             .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
             // A no-op change on a joint config is OpenRaft's own second step:
-            // it commits the new config alone; on a uniform config it only
-            // proposes the same config again.
-            HealStep::ReplicateRewound | HealStep::FinishJoint => crate::rt::time::timeout(
+            // it commits the new config alone.
+            HealStep::FinishJoint => crate::rt::time::timeout(
                 REJOIN_HEAL_STEP_TIMEOUT,
                 raft.change_membership(ChangeMembers::AddVoterIds(BTreeSet::new()), false),
             )
@@ -312,19 +271,7 @@ pub async fn run_rejoin_heal(
         };
         match result {
             Ok(Ok(())) => match &step {
-                HealStep::RemoveVoter { target, .. } | HealStep::RemoveLearner { target } => {
-                    rejoin.clear_reverted(*target);
-                }
-                HealStep::RewindVoters { targets } => tracing::warn!(
-                    node_id,
-                    raft_group_id = group,
-                    followers = ?targets,
-                    "recovery: a majority of voters lost entries; replicating this leader's log \
-                     to them again"
-                ),
-                HealStep::AddLearner { .. }
-                | HealStep::ReplicateRewound
-                | HealStep::FinishJoint => {}
+                HealStep::AddLearner { .. } | HealStep::FinishJoint => {}
                 HealStep::Promote { target, .. } => tracing::info!(
                     node_id,
                     raft_group_id = group,

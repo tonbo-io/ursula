@@ -82,8 +82,27 @@ pub(crate) fn register_wal_recovery(recovery: ursula_raft::RecoveryState) {
 
 /// Register `ursula.raft.recovery_gates`: the groups whose recovery gate on
 /// this node is closed, by status. `stalled` groups see no leader that could
-/// confirm a barrier and wait for an operator.
+/// confirm a barrier and wait for an operator. Also register
+/// `ursula.raft.follower_log_reversions`: by follower, how often one lost
+/// entries it had acknowledged to a leader on this node.
 pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegistry) {
+    let reversion_registry = registry.clone();
+    let _ = global::meter("ursula-raft")
+        .u64_observable_counter("ursula.raft.follower_log_reversions")
+        .with_description(
+            "Times a follower lost Raft log entries it had acknowledged to a leader on this node, \
+             by follower; the leader rewinds it in place. Expected after a host crash under \
+             raft.wal.fsync = never or a lost disk, otherwise check the follower's disk",
+        )
+        .with_callback(move |observer| {
+            for (target, count) in reversion_registry.follower_log_reversions() {
+                observer.observe(count, &[KeyValue::new(
+                    "target",
+                    i64::try_from(target).unwrap_or(i64::MAX),
+                )]);
+            }
+        })
+        .build();
     let apply_registry = registry.clone();
     let _ = global::meter("ursula-raft")
         .u64_observable_gauge("ursula.raft.apply_stopped")

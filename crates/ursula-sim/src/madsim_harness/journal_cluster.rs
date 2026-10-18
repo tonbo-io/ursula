@@ -57,6 +57,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
 use super::recovery_wiring;
+use super::recovery_wiring::ReversionLog;
 use super::recovery_wiring::VoteLog;
 use super::sim_wal::SimNodeWal;
 
@@ -174,6 +175,8 @@ pub(super) struct JournalCluster {
     pub(super) policy: InProcessRaftNetworkPolicy,
     /// Every vote answer the network delivered.
     pub(super) votes: VoteLog,
+    /// Every conflict below a matched index the network delivered.
+    pub(super) reversions: ReversionLog,
     pub(super) wals: BTreeMap<u64, SimNodeWal>,
     registries: BTreeMap<u32, InProcessRaftRegistry>,
     pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
@@ -287,11 +290,12 @@ impl JournalCluster {
             config.purge_batch_size = 1;
         }
         let config = Arc::new(config.validate().expect("valid raft config"));
-        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
+        let (policy, votes, reversions) = recovery_wiring::vote_recording_network_policy();
         Self {
             config,
             policy,
             votes,
+            reversions,
             wals: (1..=nodes)
                 .map(|node_id| {
                     (
@@ -322,6 +326,26 @@ impl JournalCluster {
                 .collect(),
             driver_tasks: BTreeMap::new(),
         }
+    }
+
+    /// The maximum election timeout every replica runs with: OpenRaft's
+    /// leader lease.
+    #[cfg(test)]
+    pub(super) fn election_timeout_max(&self) -> Duration {
+        Duration::from_millis(self.config.election_timeout_max)
+    }
+
+    /// The recovery barrier `leader`'s replica of `group` confirms, through
+    /// the node's production registry, as the barrier RPC serves it.
+    #[cfg(test)]
+    pub(super) async fn confirm_recovery_barrier(
+        &self,
+        group: u32,
+        leader: u64,
+    ) -> Result<(ursula_raft::UrsulaVote, u64), ursula_raft::QuorumProofError> {
+        self.registries[&group]
+            .confirm_recovery_barrier(leader, RaftGroupId(group))
+            .await
     }
 
     /// Every node, the spares included.
@@ -410,8 +434,7 @@ impl JournalCluster {
             Arc::new(config),
             InProcessRaftNetworkFactory::new(registry.clone())
                 .with_source(node_id)
-                .with_policy(self.policy.clone())
-                .with_rejoin(rejoin.clone()),
+                .with_policy(self.policy.clone()),
             store,
             options,
         )

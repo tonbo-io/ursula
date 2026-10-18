@@ -36,18 +36,19 @@
 //!   replication alone never opens it: it may have been delayed across the
 //!   restart. The replica records the open gate (`Initialized`) before it
 //!   votes again. Then the node's election policy is refreshed.
-//! - **Self-heal** ([`run_rejoin_heal`]): a leader whose follower answers
-//!   `Conflict` at or below the index that follower had already matched in
-//!   this leadership knows the follower lost entries. OpenRaft never rewinds
-//!   that progress, so the network layer hands OpenRaft an error instead of
-//!   the conflict, and the leader rebuilds the follower: remove the voter,
-//!   add it back as a learner, wait for catch-up, promote. Every step is
-//!   read off the current membership, so a leader change or a second restart
-//!   in the middle converges. When the followers that lost entries are a
-//!   majority, no removal can commit; the leader holds every committed
-//!   entry, so it rewinds their replication instead and sends them its log
-//!   again (an idle group gets an unchanged membership entry to carry the
-//!   rewind).
+//! - **Rewind in place**: a follower that lost entries answers `Conflict`
+//!   at or below the index its leader saw it match in this leadership. A
+//!   gated group runs OpenRaft with log reversion allowed
+//!   (`engine::config_for_recovery`), so the leader resets its progress for
+//!   that follower on the first such conflict, a heartbeat's included, and
+//!   replicates its log to it again. The follower stays a voter throughout,
+//!   and the conflict still counts as its acknowledgement of the leader, so
+//!   the leader keeps its quorum. That is safe because the leader holds
+//!   every committed entry and the follower votes for no one until its gate
+//!   opens. The heal driver ([`run_rejoin_heal`]) observes each reversion
+//!   in the replication metrics, counts it per follower and logs it, and
+//!   brings the membership back to the configured voters when an operator
+//!   or a recovery plan left one out.
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   configured voter answers a probe `Vote` with an empty log and no
@@ -80,7 +81,6 @@
 //! satisfied plan closes its gate until a leader's barrier opens it.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -115,7 +115,6 @@ use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RecoveryRecord;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaAppendEntriesRequest;
-use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
@@ -564,58 +563,6 @@ impl VoteGate {
     }
 }
 
-/// Followers that answered a conflict below what they had matched, per
-/// leadership.
-#[derive(Debug, Default)]
-struct RevertedFollowers {
-    leader: Option<UrsulaVote>,
-    targets: BTreeSet<u64>,
-    /// Rewinds this leader allowed, until Raft replication metrics show the
-    /// old matched point was reset. ReadIndex also sends Append RPCs; its
-    /// Conflict confirms leadership but does not reset replication progress.
-    /// Consuming the allowance on that response would strand the rewind.
-    allowed_reverts: BTreeMap<u64, u64>,
-}
-
-impl RevertedFollowers {
-    /// The rewinds `leader` allowed, by target, with the index each target
-    /// had matched.
-    fn allowed(&self, leader: &UrsulaVote) -> BTreeMap<u64, u64> {
-        if self.leader.as_ref() == Some(leader) {
-            self.allowed_reverts.clone()
-        } else {
-            BTreeMap::new()
-        }
-    }
-
-    fn rewind_pending(
-        &mut self,
-        target: u64,
-        leader: &UrsulaVote,
-        matched: Option<u64>,
-        confirmed: Option<u64>,
-    ) -> bool {
-        if self.leader.as_ref() != Some(leader) {
-            self.allowed_reverts.clear();
-            return false;
-        }
-        let Some(previous) = self.allowed_reverts.get(&target).copied() else {
-            return false;
-        };
-        // A fast rebuild can reset and advance metrics between our samples.
-        // A successful RPC through the former matched point also ends the
-        // allowance, so a second loss never inherits it.
-        if matched.is_none_or(|matched| matched < previous)
-            || confirmed.is_some_and(|confirmed| confirmed >= previous)
-        {
-            self.allowed_reverts.remove(&target);
-            false
-        } else {
-            true
-        }
-    }
-}
-
 /// Why a gate opened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateOpening {
@@ -1044,14 +991,16 @@ pub(crate) enum PlanTaken {
 }
 
 /// One replica's recovery state for one group: the inbound vote gate and,
-/// while it leads, the followers it saw lose entries.
+/// while it leads, how often each follower lost entries.
 pub struct GroupRejoin {
     node_id: u64,
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
     vote_floor: Mutex<Option<UrsulaVote>>,
-    reverted: Mutex<RevertedFollowers>,
+    /// How many times each follower lost entries it had acknowledged to
+    /// this replica as its leader ([`Self::record_log_reversion`]).
+    log_reversions: Mutex<BTreeMap<u64, u64>>,
     /// The group's log store, which keeps its log state and where the gate
     /// records that it opened. Weak, so a stopped group's store closes even
     /// while its gate is still registered.
@@ -1270,7 +1219,7 @@ impl GroupRejoin {
             // granting a vote or acknowledging a leader persists a higher
             // vote first, so a durable `(0, 0)` proves neither happened.
             vote_floor: Mutex::new(store.vote()),
-            reverted: Mutex::new(RevertedFollowers::default()),
+            log_reversions: Mutex::new(BTreeMap::new()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
             last_leader_append: Mutex::new(None),
@@ -2479,140 +2428,36 @@ impl GroupRejoin {
         }
     }
 
-    /// Leader side: whether `response` from `target` shows that the target
-    /// lost entries it had acknowledged in this leadership (a conflict at or
-    /// below its matched index). The caller then hands OpenRaft a network
-    /// error instead of the conflict, which OpenRaft cannot act on.
-    pub fn follower_lost_log(
-        &self,
-        target: u64,
-        leader: &UrsulaVote,
-        prev_log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>,
-        sent_last_log_id: Option<&LogIdOf<UrsulaRaftTypeConfig>>,
-        response: &UrsulaAppendEntriesResponse,
-    ) -> bool {
-        let Some(metrics) = self.metrics() else {
-            return false;
-        };
-        if &metrics.vote != leader {
-            return false;
+    /// Leader side: count and report that a follower lost entries it had
+    /// acknowledged, as the heal driver observed it. OpenRaft already
+    /// rewound the follower and replicates its log to it again.
+    pub(crate) fn record_log_reversion(&self, reversion: heal::LogReversion) {
+        {
+            let mut counts = self
+                .log_reversions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let count = counts.entry(reversion.target).or_insert(0);
+            *count = count.saturating_add(1);
         }
-        let matched = metrics
-            .replication
-            .as_ref()
-            .and_then(|replication| replication.get(&target))
-            .and_then(|matched| log_index(matched.as_ref()));
-        let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
-        let confirmed = match response {
-            UrsulaAppendEntriesResponse::Success => log_index(sent_last_log_id.or(prev_log_id)),
-            UrsulaAppendEntriesResponse::PartialSuccess(matching) => log_index(matching.as_ref()),
-            UrsulaAppendEntriesResponse::Conflict | UrsulaAppendEntriesResponse::HigherVote(_) => {
-                None
-            }
-        };
-        let rewind_pending = reverted.rewind_pending(target, leader, matched, confirmed);
-        if !matches!(response, UrsulaAppendEntriesResponse::Conflict) {
-            return false;
-        }
-        let Some(prev) = log_index(prev_log_id) else {
-            return false;
-        };
-        if !matched.is_some_and(|matched| prev <= matched) {
-            return false;
-        }
-        // A rewind is handed to OpenRaft only through the conflict of a request
-        // that carried entries, so it ends the replication stream it belongs
-        // to. A heartbeat's conflict would reset the progress under a stream
-        // whose acknowledgements are still on their way, which OpenRaft does
-        // not survive; it stays an error until then.
-        if rewind_pending {
-            return sent_last_log_id.is_none();
-        }
-        if reverted.leader.as_ref() != Some(leader) {
-            reverted.leader = Some(*leader);
-            reverted.targets.clear();
-        }
-        if reverted.targets.insert(target) {
-            self.changes.send_if_modified(|()| true);
-            tracing::warn!(
-                node_id = self.node_id,
-                raft_group_id = self.raft_group_id.0,
-                target,
-                conflict_index = prev,
-                matched_index = ?matched,
-                "recovery: follower lost Raft log entries it had acknowledged; rebuilding it"
-            );
-        }
-        true
+        tracing::warn!(
+            node_id = self.node_id,
+            raft_group_id = self.raft_group_id.0,
+            target = reversion.target,
+            matched_index = reversion.matched,
+            now_matched_index = ?reversion.now,
+            "recovery: follower lost Raft log entries it had acknowledged; replicating this \
+             leader's log to it again"
+        );
     }
 
-    /// The followers that lost their log under `leader`.
-    pub fn reverted_followers(&self, leader: &UrsulaVote) -> BTreeSet<u64> {
-        let reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
-        if reverted.leader.as_ref() == Some(leader) {
-            reverted.targets.clone()
-        } else {
-            BTreeSet::new()
-        }
-    }
-
-    /// The rewinds this replica allowed under `leader`, by target, with the
-    /// index each target had matched.
-    fn allowed_rewinds(&self, leader: &UrsulaVote) -> BTreeMap<u64, u64> {
-        self.reverted
+    /// How many times each follower lost entries it had acknowledged to
+    /// this replica as its leader, since the replica started.
+    pub fn log_reversions(&self) -> BTreeMap<u64, u64> {
+        self.log_reversions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .allowed(leader)
-    }
-
-    /// Whether `target` lost its log under this replica's current leadership.
-    pub fn is_reverted_follower(&self, target: u64) -> bool {
-        self.metrics()
-            .is_some_and(|metrics| self.reverted_followers(&metrics.vote).contains(&target))
-    }
-
-    fn clear_reverted(&self, target: u64) {
-        self.reverted
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .targets
-            .remove(&target);
-    }
-
-    /// Leader side: let OpenRaft rewind its progress for `targets`, so it
-    /// replicates them from where their logs really end. OpenRaft's one-shot
-    /// permission goes in first; only then do their conflicts reach it.
-    async fn rewind_followers(
-        &self,
-        raft: &RaftGroupHandle,
-        targets: &BTreeSet<u64>,
-    ) -> Result<(), String> {
-        let metrics = raft.metrics().borrow_watched().clone();
-        for target in targets {
-            raft.trigger()
-                .allow_next_revert(target, true)
-                .await
-                .map_err(|err| format!("allow next revert for node {target}: {err}"))?
-                .map_err(|err| format!("allow next revert for node {target}: {err}"))?;
-        }
-        let mut reverted = self.reverted.lock().unwrap_or_else(PoisonError::into_inner);
-        if reverted.leader.as_ref() != Some(&metrics.vote) {
-            reverted.leader = Some(metrics.vote);
-            reverted.targets.clear();
-            reverted.allowed_reverts.clear();
-        }
-        for target in targets {
-            reverted.targets.remove(target);
-            if let Some(matched) = metrics
-                .replication
-                .as_ref()
-                .and_then(|replication| replication.get(target))
-                .and_then(|matched| log_index(matched.as_ref()))
-            {
-                reverted.allowed_reverts.insert(*target, matched);
-            }
-        }
-        Ok(())
+            .clone()
     }
 }
 
@@ -2670,9 +2515,10 @@ mod tests {
     use super::HealStep;
     use super::HealView;
     use super::LocalReplica;
+    use super::LogReversion;
     use super::PeerGroupLog;
     use super::RecoveryGateStatus;
-    use super::RevertedFollowers;
+    use super::ReversionWatch;
     use super::VoteGate;
     use super::VoteScreen;
     use super::bootstrap_decision;
@@ -2696,39 +2542,6 @@ mod tests {
 
     fn follower(last_applied: Option<u64>) -> LocalReplica {
         LocalReplica { last_applied }
-    }
-
-    #[test]
-    fn a_rewind_survives_read_index_conflicts_but_ends_after_repair() {
-        let leader = leader(3, 1);
-        let mut reverted = RevertedFollowers {
-            leader: Some(leader),
-            allowed_reverts: BTreeMap::from([(2, 20), (3, 20)]),
-            ..Default::default()
-        };
-        // ReadIndex conflicts leave Raft's replication progress untouched.
-        assert!(reverted.rewind_pending(2, &leader, Some(20), None));
-        assert!(reverted.rewind_pending(2, &leader, Some(20), None));
-        // A real rewind resets the progress; the allowance cannot cover
-        // another loss even after this follower has caught up again.
-        assert!(!reverted.rewind_pending(2, &leader, None, None));
-        assert!(!reverted.rewind_pending(2, &leader, Some(30), None));
-        // A fast catch-up can happen between metrics samples. Its successful
-        // Append still proves that the prior prefix has been restored.
-        assert!(reverted.rewind_pending(3, &leader, Some(20), Some(19)));
-        assert!(!reverted.rewind_pending(3, &leader, Some(30), Some(20)));
-        assert!(!reverted.rewind_pending(3, &leader, Some(30), None));
-    }
-
-    #[test]
-    fn a_rewind_allowance_does_not_cross_a_leader_change() {
-        let mut reverted = RevertedFollowers {
-            leader: Some(leader(3, 1)),
-            allowed_reverts: BTreeMap::from([(2, 20)]),
-            ..Default::default()
-        };
-        assert!(!reverted.rewind_pending(2, &leader(4, 3), Some(20), None));
-        assert!(reverted.allowed_reverts.is_empty());
     }
 
     #[test]
@@ -2996,16 +2809,13 @@ mod tests {
         );
     }
 
-    fn view(voters: &[u64], learners: &[u64], reverted: &[u64]) -> HealView {
+    fn view(voters: &[u64], learners: &[u64]) -> HealView {
         HealView {
             is_leader: true,
             uniform: true,
             stale_joint: false,
             voters: voters.iter().copied().collect(),
             learners: learners.iter().copied().collect(),
-            answering: voters.iter().copied().collect(),
-            reverted: reverted.iter().copied().collect(),
-            awaiting_rewind: BTreeSet::new(),
             matched: BTreeMap::new(),
             committed: Some(10),
             configured: BTreeSet::from([1, 2, 3]),
@@ -3013,19 +2823,12 @@ mod tests {
     }
 
     #[test]
-    fn the_heal_driver_walks_remove_learner_catch_up_promote() {
+    fn the_heal_driver_adds_back_a_missing_voter_and_promotes_it_once_caught_up() {
         assert_eq!(
-            plan_heal_step(&view(&[1, 2, 3], &[], &[3])),
-            Some(HealStep::RemoveVoter {
-                target: 3,
-                voters: BTreeSet::from([1, 2]),
-            })
-        );
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2], &[], &[])),
+            plan_heal_step(&view(&[1, 2], &[])),
             Some(HealStep::AddLearner { target: 3 })
         );
-        let mut catching_up = view(&[1, 2], &[3], &[]);
+        let mut catching_up = view(&[1, 2], &[3]);
         catching_up.matched.insert(3, Some(9));
         assert_eq!(plan_heal_step(&catching_up), None);
         catching_up.matched.insert(3, Some(10));
@@ -3036,83 +2839,29 @@ mod tests {
                 voters: BTreeSet::from([1, 2, 3]),
             })
         );
-        // A learner that restarted again mid-heal is dropped and re-added.
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2], &[3], &[3])),
-            Some(HealStep::RemoveLearner { target: 3 })
-        );
-        assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[], &[])), None);
-    }
-
-    #[test]
-    fn the_heal_driver_removes_a_voter_only_with_a_quorum_that_answered() {
-        // 3 lost entries and 2 has not answered since it restarted: 2 may
-        // have lost entries too, so a removal could need it and never
-        // commit. Rewind 3 instead.
-        let mut silent = view(&[1, 2, 3], &[], &[3]);
-        silent.answering = BTreeSet::from([1]);
-        assert_eq!(
-            plan_heal_step(&silent),
-            Some(HealStep::RewindVoters {
-                targets: BTreeSet::from([3]),
-            })
-        );
-        // Once 2 answers, it holds its log and the removal can commit.
-        silent.answering.insert(2);
-        assert_eq!(
-            plan_heal_step(&silent),
-            Some(HealStep::RemoveVoter {
-                target: 3,
-                voters: BTreeSet::from([1, 2]),
-            })
-        );
-    }
-
-    #[test]
-    fn the_heal_driver_rewinds_a_majority_that_lost_entries_and_needs_leadership() {
-        // A majority lost entries: no removal could commit, so this leader
-        // replicates its log to them again.
-        assert_eq!(
-            plan_heal_step(&view(&[1, 2, 3], &[], &[2, 3])),
-            Some(HealStep::RewindVoters {
-                targets: BTreeSet::from([2, 3]),
-            })
-        );
-        // Until OpenRaft rewinds them, an idle group is given an entry to
-        // replicate.
-        let mut rewinding = view(&[1, 2, 3], &[], &[]);
-        rewinding.awaiting_rewind = BTreeSet::from([2, 3]);
-        assert_eq!(plan_heal_step(&rewinding), Some(HealStep::ReplicateRewound));
-        let mut follower_view = view(&[1, 2, 3], &[], &[3]);
+        // The configured voters, all present: nothing to do. A follower that
+        // lost entries stays a voter, and OpenRaft rewinds it in place.
+        assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[])), None);
+        let mut follower_view = view(&[1, 2], &[]);
         follower_view.is_leader = false;
         assert_eq!(plan_heal_step(&follower_view), None);
         // A voter outside the static config: not a restart repair, leave it
         // to the operator.
-        assert_eq!(plan_heal_step(&view(&[1, 2, 4], &[], &[])), None);
+        assert_eq!(plan_heal_step(&view(&[1, 2, 4], &[])), None);
     }
 
     #[test]
-    fn the_heal_driver_rebuilds_two_overlapping_restarts_in_a_group_of_five() {
-        let five = |voters: &[u64], learners: &[u64], reverted: &[u64]| HealView {
+    fn the_heal_driver_restores_two_missing_voters_in_a_group_of_five() {
+        let five = |voters: &[u64], learners: &[u64]| HealView {
             configured: BTreeSet::from([1, 2, 3, 4, 5]),
-            ..view(voters, learners, reverted)
+            ..view(voters, learners)
         };
-        // 4 and 5 restarted: both are removed while three healthy voters
-        // remain a quorum.
-        assert!(matches!(
-            plan_heal_step(&five(&[1, 2, 3, 4, 5], &[], &[4, 5])),
-            Some(HealStep::RemoveVoter { .. })
-        ));
-        assert!(matches!(
-            plan_heal_step(&five(&[1, 2, 3, 4], &[], &[4])),
-            Some(HealStep::RemoveVoter { target: 4, .. })
-        ));
         assert_eq!(
-            plan_heal_step(&five(&[1, 2, 3], &[], &[])),
+            plan_heal_step(&five(&[1, 2, 3], &[])),
             Some(HealStep::AddLearner { target: 4 })
         );
         // 4 caught up while 5 is not back yet: promote 4 alone.
-        let mut partly = five(&[1, 2, 3], &[4], &[]);
+        let mut partly = five(&[1, 2, 3], &[4]);
         partly.matched.insert(4, Some(10));
         assert_eq!(
             plan_heal_step(&partly),
@@ -3126,7 +2875,7 @@ mod tests {
             plan_heal_step(&partly),
             Some(HealStep::AddLearner { target: 5 })
         );
-        let mut last = five(&[1, 2, 3, 4], &[5], &[]);
+        let mut last = five(&[1, 2, 3, 4], &[5]);
         last.matched.insert(5, Some(10));
         assert_eq!(
             plan_heal_step(&last),
@@ -3135,12 +2884,80 @@ mod tests {
                 voters: BTreeSet::from([1, 2, 3, 4, 5]),
             })
         );
-        // Three of five lost entries: rewind all three.
+    }
+
+    /// The observer reports a follower whose matched index went down within
+    /// one leadership, once per drop, and nothing across a leader change or
+    /// a membership change.
+    #[test]
+    fn the_reversion_observer_reports_a_matched_index_that_went_down() {
+        let matched = |entries: &[(u64, Option<u64>)]| entries.iter().copied().collect();
+        let vote = leader(3, 1);
+        let mut watch = ReversionWatch::default();
+        assert!(
+            watch
+                .observe(&vote, true, &matched(&[(2, Some(10)), (3, Some(10))]))
+                .is_empty()
+        );
+        // Matching goes up: nothing.
+        assert!(
+            watch
+                .observe(&vote, true, &matched(&[(2, Some(12)), (3, Some(12))]))
+                .is_empty()
+        );
+        // OpenRaft rewound 3: its matched index is reset.
         assert_eq!(
-            plan_heal_step(&five(&[1, 2, 3, 4, 5], &[], &[3, 4, 5])),
-            Some(HealStep::RewindVoters {
-                targets: BTreeSet::from([3, 4, 5]),
-            })
+            watch.observe(&vote, true, &matched(&[(2, Some(12)), (3, None)])),
+            vec![LogReversion {
+                target: 3,
+                matched: 12,
+                now: None,
+            }]
+        );
+        // It matches again from below, and catches up: one report only.
+        assert!(
+            watch
+                .observe(&vote, true, &matched(&[(2, Some(12)), (3, Some(4))]))
+                .is_empty()
+        );
+        assert!(
+            watch
+                .observe(&vote, true, &matched(&[(2, Some(12)), (3, Some(12))]))
+                .is_empty()
+        );
+        // A drop seen without the reset in between is reported too.
+        assert_eq!(
+            watch.observe(&vote, true, &matched(&[(2, Some(7)), (3, Some(12))])),
+            vec![LogReversion {
+                target: 2,
+                matched: 12,
+                now: Some(7),
+            }]
+        );
+        // A new leader learns afresh what each follower holds.
+        let next = leader(4, 1);
+        assert!(
+            watch
+                .observe(&next, true, &matched(&[(2, Some(1)), (3, Some(1))]))
+                .is_empty()
+        );
+        // A follower that left the membership and came back is no reversion.
+        assert!(
+            watch
+                .observe(&next, true, &matched(&[(2, Some(1))]))
+                .is_empty()
+        );
+        assert!(
+            watch
+                .observe(&next, true, &matched(&[(2, Some(1)), (3, None)]))
+                .is_empty()
+        );
+        // A replica that stopped leading observes nothing.
+        assert!(watch.observe(&next, false, &matched(&[])).is_empty());
+        assert!(
+            watch
+                .observe(&next, true, &matched(&[(2, None)]))
+                .is_empty()
         );
     }
 
@@ -3541,25 +3358,8 @@ mod tests {
     }
 
     #[test]
-    fn the_heal_driver_restores_lost_voters_before_finishing_a_joint_config() {
-        let mut joint = view(&[1, 2, 3], &[], &[2, 3]);
-        joint.uniform = false;
-        for stale in [false, true] {
-            joint.stale_joint = stale;
-            assert_eq!(
-                plan_heal_step(&joint),
-                Some(HealStep::RewindVoters {
-                    targets: BTreeSet::from([2, 3]),
-                })
-            );
-        }
-        joint.reverted.clear();
-        assert_eq!(plan_heal_step(&joint), Some(HealStep::FinishJoint));
-    }
-
-    #[test]
     fn the_heal_driver_flattens_only_a_joint_config_nothing_else_finishes() {
-        let mut joint = view(&[1, 2, 3], &[], &[]);
+        let mut joint = view(&[1, 2, 3], &[]);
         joint.uniform = false;
         // Just entered: OpenRaft's own second step is still on its way.
         assert_eq!(plan_heal_step(&joint), None);
@@ -3590,6 +3390,10 @@ pub use bootstrap::run_group_bootstrap;
 use heal::HealStep;
 #[cfg(test)]
 use heal::HealView;
+#[cfg(test)]
+use heal::LogReversion;
+#[cfg(test)]
+use heal::ReversionWatch;
 #[cfg(test)]
 use heal::plan_heal_step;
 pub use heal::run_rejoin_heal;

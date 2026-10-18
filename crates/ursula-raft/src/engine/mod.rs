@@ -411,6 +411,27 @@ pub(crate) fn may_hold_only_for_a_lagging_state(error: &GroupEngineError) -> boo
     )
 }
 
+/// The OpenRaft config a group runs with. A group with a recovery gate
+/// (`gated`) allows log reversion: a follower that lost entries it had
+/// acknowledged answers a conflict below the index its leader saw it match,
+/// and the leader rewinds its progress for that follower and replicates its
+/// log to it again, in place. The gate is what makes that safe. A replica
+/// that may have lost acknowledged entries starts gated, votes for no
+/// candidate until it applied a fresh leader barrier, and the leader holds
+/// every committed entry. Without a gate OpenRaft keeps its default, under
+/// which such a conflict is a bug its debug assertion reports.
+pub(crate) fn config_for_recovery(config: Arc<Config>, gated: bool) -> Arc<Config> {
+    if !gated {
+        return config;
+    }
+    let rewind =
+        !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::FollowerRewind);
+    Arc::new(Config {
+        allow_log_reversion: Some(rewind),
+        ..(*config).clone()
+    })
+}
+
 impl RaftGroupEngine {
     /// A single-node group over `log_store`, with the timeouts of a
     /// single-node runtime.
@@ -802,6 +823,7 @@ impl RaftGroupEngine {
             work.as_kind(crate::openraft_work::WorkKind::Reader),
         );
         state_machine.work = work;
+        let config = config_for_recovery(config, recovery.is_some());
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,

@@ -13747,11 +13747,6 @@ async fn leadership_transfer_http_errors_have_precise_status_and_typed_rejection
             TransferRejection::InvalidTarget,
         ),
         (
-            LeadershipTransferError::RecoveringTarget { group, target: 2 },
-            StatusCode::CONFLICT,
-            TransferRejection::RecoveringTarget,
-        ),
-        (
             LeadershipTransferError::UnreachableTarget {
                 group,
                 target: 2,

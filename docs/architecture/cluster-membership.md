@@ -22,7 +22,7 @@ reservation accepts only that voter set (`Reservation::validate` in
 
 There is no runtime membership authority. No meta Raft group runs, and the
 server never moves a group to another node or changes its voter count. The
-configured voter set is the target that the self-heal driver restores
+configured voter set is the target that the heal driver restores
 (section 2). The admin routes (section 3) can change a group's OpenRaft
 membership directly, and the heal driver adds a configured voter that is
 missing back as a learner and promotes it.
@@ -43,23 +43,28 @@ vote is not lower than its persisted vote. It opens the gate after it applies a
 fresh ReadIndex barrier from the current leader, and it records the open gate
 before it votes again.
 
-The leader repairs the log (`crates/ursula-raft/src/rejoin/heal.rs`). When a
-follower answers `Conflict` at or below an index it had already matched in this
-leadership, the follower lost entries. OpenRaft never rewinds that progress, so
-the network layer reports an error instead, and the leader rebuilds the
-follower one membership step at a time: remove the voter, add it back as a
-learner, wait for catch-up, promote it. Each step is read off the current membership, so a leader change or a second
-restart in the middle converges. The same driver adds a configured voter that
-is missing as a learner, removes a learner that lost its log, and flattens a
-joint configuration whose second step never committed. When the voters that
-lost entries are a majority, no removal can commit. The leader holds every
-committed entry, so it rewinds their replication instead and sends them its
-log. An idle group proposes an unchanged membership entry to carry the rewind.
+The leader repairs the log in place. When a follower answers `Conflict` at or
+below an index it had already matched in this leadership, the follower lost
+entries. Every group with a recovery gate runs OpenRaft with log reversion
+allowed, so the leader rewinds its progress for that follower on the first
+such conflict and replicates its log to it again
+([Raft WAL](raft-wal.md#recovery-gate)). The follower stays a voter and no
+membership changes. Its conflict counts as its acknowledgement of the leader,
+so the leader keeps its quorum, and this holds when the followers that lost
+entries are a majority too. The heal driver
+(`crates/ursula-raft/src/rejoin/heal.rs`) observes and counts each reversion.
+It also adds a configured voter that is missing as a learner, promotes it once
+it caught up, and flattens a joint configuration whose second step never
+committed.
 
-If a majority of a group's voters are gated, no leader can confirm a barrier.
-The group refuses writes and readiness reports `recovery_stalled`. An operator
-who accepts the loss of the unsynced tail calls `accept-unsynced-loss` on the
-gated replicas with the longest logs until a leader is elected.
+A replica that lost its vote history, such as one on a wiped disk, answers
+errors until a quorum without it proves a vote. Two such replicas of three
+therefore never heal on their own. If the leader is among the replicas that
+lost entries and a majority of a group's voters are gated, no leader can be
+elected. The group refuses writes and readiness reports `recovery_stalled`. An
+operator who accepts the loss of the unsynced tail calls
+`accept-unsynced-loss` on the gated replicas with the longest logs until a
+leader is elected.
 
 A group's initializer runs `Initialize` only when every configured voter
 reports an empty log, no leader and a persisted genesis floor. A replica that
@@ -102,7 +107,7 @@ report compares local replicas against the configured inventory and lists
 issues per group, such as `incomplete_voter_set`, `joint_membership`,
 `apply_lag` or `apply_stopped`. `GET /__ursula/ready` uses `serving_ready()`,
 which ignores incomplete voter sets, joint membership and stopped apply, so
-healthy survivors keep serving while a peer rebuilds. Maintenance tooling uses
+healthy survivors keep serving while a peer catches up. Maintenance tooling uses
 `ready()`, which requires no issue at all, so a second disruption waits for
 full redundancy. The readiness body includes the full report.
 
@@ -243,12 +248,11 @@ label. An idle launch must match the catalogued Pod and host. During an
 operation an unbound replacement binds its fresh boot through the same CAS
 before it opens any listener, and a later restart of a bound boot is refused.
 
-An interrupted bound host replacement has no automatic recovery. When the
-replacement voter dies after its group leaders started rebuilding it, they keep
-it as a learner in those groups. `verify-survivors` requires no learners, so it
-refuses, and the host restaging cannot proceed. No acknowledged write is at
-risk. Nothing drives host recovery automatically, and `startupOwnership` stays
-off by default.
+An interrupted bound host replacement has no automatic recovery. A replacement
+voter that dies, before or after its group leaders reached it, stays a voter of
+every group, so `verify-survivors` proves its loss and the operator restages
+the host. Nothing drives host recovery automatically, and `startupOwnership`
+stays off by default.
 
 ## 7. Library-only components
 

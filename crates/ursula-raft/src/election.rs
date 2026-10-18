@@ -163,13 +163,14 @@ impl ElectionPolicy {
     /// leadership of `group` now. OpenRaft parks a leader whose transfer
     /// cannot complete, so the target must be another voter that answered
     /// this leader within `ack_window` (`target_ack_age` is how long ago it
-    /// last did), holds every committed entry, and did not lose its log.
+    /// last did), and holds every committed entry. A follower that lost
+    /// entries holds fewer than this leader committed once OpenRaft rewound
+    /// it, so it is lagging.
     pub(crate) fn validate_handoff(
         &self,
         group: RaftGroupId,
         target: u64,
         metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>,
-        gate: Option<&GroupRejoin>,
         target_ack_age: Option<Duration>,
         ack_window: Duration,
     ) -> Result<(), LeadershipTransferError> {
@@ -178,9 +179,6 @@ impl ElectionPolicy {
         }
         if target == metrics.id || !metrics.membership_config.voter_ids().any(|id| id == target) {
             return Err(LeadershipTransferError::InvalidTarget { group, target });
-        }
-        if gate.is_some_and(|gate| gate.is_reverted_follower(target)) {
-            return Err(LeadershipTransferError::RecoveringTarget { group, target });
         }
         if target_ack_age.is_none_or(|age| age > ack_window) {
             return Err(LeadershipTransferError::UnreachableTarget {
@@ -278,8 +276,6 @@ pub enum LeadershipTransferError {
     NotLeader { group: RaftGroupId },
     #[error("node {target} is not another voter of Raft group {group:?}")]
     InvalidTarget { group: RaftGroupId, target: u64 },
-    #[error("node {target} lost its log in Raft group {group:?}")]
-    RecoveringTarget { group: RaftGroupId, target: u64 },
     #[error(
         "node {target} has not answered the leader of Raft group {group:?} recently (last answer \
          {ack_age:?} ago)"
