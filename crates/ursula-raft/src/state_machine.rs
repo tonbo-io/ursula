@@ -15,9 +15,7 @@ use futures_util::TryStreamExt;
 use openraft::EntryPayload;
 use openraft::RaftMetrics;
 use openraft::alias::LogIdOf;
-use openraft::alias::SnapshotDataOf;
 use openraft::alias::SnapshotMetaOf;
-use openraft::alias::SnapshotOf;
 use openraft::alias::StoredMembershipOf;
 use openraft::rt::WatchReceiver;
 use openraft::storage::EntryResponder;
@@ -92,6 +90,7 @@ use crate::snapshot_references::SnapshotReferences;
 use crate::types::RaftGroupResponse;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaSnapshot;
 
 #[derive(Debug, Clone)]
 pub struct SnapshotBuildCoordinator {
@@ -2021,6 +2020,7 @@ impl RaftGroupStateMachine {
             apply_health: self.apply_health.clone(),
             placement: self.placement,
             snapshot,
+            snapshot_id: group_snapshot_id(self.placement.raft_group_id, self.last_applied_log_id),
             meta: self.snapshot_meta(),
             current_snapshot: self.current_snapshot.clone(),
             metadata_serial: self.metadata_serial.clone(),
@@ -2042,22 +2042,32 @@ impl RaftGroupStateMachine {
         SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: self.last_applied_log_id,
             last_membership: self.last_membership.clone(),
-            snapshot_id: self
-                .last_applied_log_id
-                .map(|log_id| {
-                    format!(
-                        "group-{}-{}-{}",
-                        self.placement.raft_group_id.0,
-                        log_id.committed_leader_id(),
-                        log_id.index()
-                    )
-                })
-                .unwrap_or_else(|| format!("group-{}-empty", self.placement.raft_group_id.0)),
         }
     }
 }
 
+/// The id Ursula gives the snapshot of `raft_group_id` that covers the log
+/// through `last_log_id`: `group-{g}-{T-N}-{idx}`, or `group-{g}-empty`
+/// before the first entry applied. OpenRaft treats two snapshots with one
+/// last log id as the same state, so the pair names one snapshot. It keys the
+/// snapshot's object in the store and rides in its pointer.
+pub(crate) fn group_snapshot_id(
+    raft_group_id: RaftGroupId,
+    last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+) -> String {
+    match last_log_id {
+        Some(log_id) => format!(
+            "group-{}-{}-{}",
+            raft_group_id.0,
+            log_id.committed_leader_id(),
+            log_id.index()
+        ),
+        None => format!("group-{}-empty", raft_group_id.0),
+    }
+}
+
 impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
+    type SnapshotData = SnapshotData;
     type SnapshotBuilder = RaftGroupSnapshotBuilder;
 
     async fn applied_state(
@@ -2222,16 +2232,10 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         self.snapshot_builder_with_lease(build).await
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<SnapshotDataOf<UrsulaRaftTypeConfig>, io::Error> {
-        Ok(SnapshotData::new(Vec::new()))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
-        snapshot: SnapshotDataOf<UrsulaRaftTypeConfig>,
+        snapshot: SnapshotData,
     ) -> Result<(), io::Error> {
         // A received snapshot holds nothing on this node, so the lease is
         // `None`, and it is kept to the end of the install all the same.
@@ -2330,15 +2334,13 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<SnapshotOf<UrsulaRaftTypeConfig>>, io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<UrsulaSnapshot>, io::Error> {
         Ok(self
             .current_snapshot
             .lock()
             .expect("snapshot mutex")
             .as_ref()
-            .map(|snapshot| SnapshotOf::<UrsulaRaftTypeConfig> {
+            .map(|snapshot| UrsulaSnapshot {
                 meta: snapshot.meta.clone(),
                 snapshot: SnapshotData::new(snapshot.pointer_bytes.clone()),
             }))
@@ -2351,6 +2353,8 @@ pub struct RaftGroupSnapshotBuilder {
     /// Shared with the frame iterators, so an upload and any inline fallback
     /// encode the same group without deep-cloning it (F12c).
     snapshot: Result<Arc<GroupSnapshot>, GroupEngineError>,
+    /// The snapshot's id ([`group_snapshot_id`]), which keys its object.
+    snapshot_id: String,
     pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     current_snapshot: Arc<Mutex<Option<CurrentSnapshot>>>,
     metadata_serial: Arc<crate::rt::sync::Mutex<MetadataPublicationState>>,
@@ -2380,7 +2384,9 @@ impl RaftGroupSnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<SnapshotOf<UrsulaRaftTypeConfig>, io::Error> {
+    type SnapshotData = SnapshotData;
+
+    async fn build_snapshot(&mut self) -> Result<UrsulaSnapshot, io::Error> {
         self.apply_health
             .check(self.placement.raft_group_id)
             .map_err(group_engine_io_error)?;
@@ -2397,7 +2403,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             .map_err(|error| group_engine_io_error(error.clone()))?;
         let started_at = Instant::now();
         let stream_count = snapshot.stream_snapshot.streams.len();
-        let snapshot_id = self.meta.snapshot_id.clone();
+        let snapshot_id = self.snapshot_id.clone();
         let key = SnapshotKey {
             raft_group_id: self.placement.raft_group_id.0,
             snapshot_id: snapshot_id.clone(),
@@ -2628,7 +2634,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 );
             }
         }
-        Ok(SnapshotOf::<UrsulaRaftTypeConfig> {
+        Ok(UrsulaSnapshot {
             meta: chosen.meta,
             snapshot: SnapshotData::new(chosen.pointer_bytes),
         })
@@ -2771,7 +2777,6 @@ mod tests {
         let meta = SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: None,
             last_membership: Default::default(),
-            snapshot_id: "directory-sync-failure".to_owned(),
         };
         // Write/search permits file creation and rename; lack of read permission
         // prevents opening the directory for fsync after the rename succeeds.
@@ -2916,11 +2921,6 @@ mod tests {
         SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: Some(log_id),
             last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
-            snapshot_id: format!(
-                "group-7-{}-{}",
-                log_id.committed_leader_id(),
-                log_id.index()
-            ),
         }
     }
 
@@ -2965,6 +2965,7 @@ mod tests {
             placement,
             snapshot: Ok(Arc::new(test_group_snapshot(placement, 42))),
             meta: test_snapshot_meta(42),
+            snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(42))),
             current_snapshot,
             metadata_serial: Arc::default(),
             snapshot_store: default_snapshot_store(),
@@ -3037,6 +3038,7 @@ mod tests {
             placement,
             snapshot: Ok(Arc::new(test_group_snapshot(placement, 42))),
             meta: test_snapshot_meta(42),
+            snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(42))),
             current_snapshot: Arc::new(Mutex::new(None)),
             metadata_serial: Arc::default(),
             snapshot_store: default_snapshot_store(),
@@ -3191,6 +3193,7 @@ mod tests {
             placement,
             snapshot: Ok(Arc::new(test_group_snapshot(placement, 1))),
             meta: test_snapshot_meta(1),
+            snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(1))),
             current_snapshot: current_snapshot.clone(),
             metadata_serial: Arc::default(),
             snapshot_store: snapshot_store.clone(),
@@ -3212,6 +3215,7 @@ mod tests {
             placement,
             snapshot: Ok(Arc::new(test_group_snapshot(placement, 2))),
             meta: test_snapshot_meta(2),
+            snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(2))),
             current_snapshot: current_snapshot.clone(),
             metadata_serial: Arc::default(),
             snapshot_store: snapshot_store.clone(),
@@ -3250,6 +3254,7 @@ mod tests {
             placement,
             snapshot: Ok(Arc::new(test_group_snapshot(placement, 3))),
             meta: test_snapshot_meta(3),
+            snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(3))),
             current_snapshot,
             metadata_serial: Arc::default(),
             snapshot_store,
@@ -3347,6 +3352,7 @@ mod tests {
             placement,
             snapshot: Ok(Arc::new(test_group_snapshot(placement, 3))),
             meta: test_snapshot_meta(3),
+            snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(3))),
             current_snapshot: current_snapshot.clone(),
             metadata_serial: Arc::default(),
             snapshot_store: Arc::new(FailingSnapshotStore),
@@ -4126,6 +4132,7 @@ mod tests {
                 placement,
                 snapshot: Ok(Arc::new(test_group_snapshot(placement, 9))),
                 meta: test_snapshot_meta(9),
+                snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(9))),
                 current_snapshot: Arc::new(Mutex::new(None)),
                 metadata_serial: Arc::default(),
                 snapshot_store: Arc::new(StuckHousekeepingStore {
@@ -4273,6 +4280,7 @@ mod tests {
                 placement,
                 snapshot: Ok(Arc::new(test_group_snapshot(placement, 9))),
                 meta: test_snapshot_meta(9),
+                snapshot_id: group_snapshot_id(placement.raft_group_id, Some(test_log_id(9))),
                 current_snapshot: Arc::clone(&current_snapshot),
                 metadata_serial: Arc::default(),
                 snapshot_store: store.clone(),
@@ -5110,7 +5118,7 @@ mod tests {
             .concat();
         let meta = test_snapshot_meta(9);
         let pointer = SnapshotPointer {
-            snapshot_id: meta.snapshot_id.clone(),
+            snapshot_id: group_snapshot_id(RaftGroupId(7), meta.last_log_id),
             location: SnapshotLocation::Inline { bytes },
         };
         let before = decode_calls_on_this_thread();

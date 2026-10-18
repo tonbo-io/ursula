@@ -47,6 +47,7 @@ use ursula_ctl::recovery::send_plan;
 use ursula_proto::admin::PlanStep;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
+use ursula_raft::RaftGroupEngine;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::FollowerRead;
@@ -503,9 +504,15 @@ pub(super) async fn try_append(
     node_id: u64,
     payload: &[u8],
 ) -> bool {
-    let Some(engine) = cluster.engines.get_mut(&(group, node_id)) else {
-        return false;
-    };
+    match cluster.engines.get_mut(&(group, node_id)) {
+        Some(engine) => append_on(engine, group, payload).await,
+        None => false,
+    }
+}
+
+/// Appends `payload` on `engine`, the replica of `group`, and gives up after
+/// a moment: whether it was acknowledged.
+async fn append_on(engine: &mut RaftGroupEngine, group: u32, payload: &[u8]) -> bool {
     let append = engine.append(
         AppendRequest::from_bytes(group_stream(group), payload.to_vec()),
         group_placement(group),
@@ -515,6 +522,56 @@ pub(super) async fn try_append(
         madsim::time::timeout(Duration::from_secs(1), append).await,
         Ok(Ok(_))
     )
+}
+
+/// Appends `payload` to every group on `node_id`, a leader just cut off, at
+/// once, and returns the groups whose write committed. A leader proposes
+/// only while a quorum acknowledged it within its lease
+/// (`election_timeout_max`), so the writes go out together, not one append
+/// timeout after another, and each group's log must grow: a write that
+/// missed the lease fails here, not as a scenario that quietly changed shape.
+pub(super) async fn try_append_every_group(
+    cluster: &mut JournalCluster,
+    node_id: u64,
+    payload: &[u8],
+) -> Vec<u32> {
+    let before = cluster
+        .engines
+        .iter()
+        .filter(|((_, node), _)| *node == node_id)
+        .map(|(&(group, _), engine)| (group, last_log_index(engine)))
+        .collect::<Vec<_>>();
+    let appends = cluster
+        .engines
+        .iter_mut()
+        .filter(|((_, node), _)| *node == node_id)
+        .map(|(&(group, _), engine)| async move {
+            append_on(engine, group, payload).await.then_some(group)
+        })
+        .collect::<Vec<_>>();
+    let committed = futures_util::future::join_all(appends)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    for (group, before) in before {
+        let after = last_log_index(&cluster.engines[&(group, node_id)]);
+        assert!(
+            after > before,
+            "node {node_id} group {group}: the leader's log did not grow ({before:?} to \
+             {after:?}); its write missed the lease"
+        );
+    }
+    committed
+}
+
+fn last_log_index(engine: &RaftGroupEngine) -> Option<u64> {
+    use openraft::rt::WatchReceiver;
+    engine
+        .raft_handle()
+        .metrics()
+        .borrow_watched()
+        .last_log_index
 }
 
 /// What `node_id`'s replica of `group` holds in its applied state, read past
@@ -595,12 +652,9 @@ pub(super) async fn run_recovery_plan_inner(
     trace.push(SimEvent::FaultApplied {
         phase: "leader_cut_off".to_owned(),
     });
-    let mut stale_writes = 0_u64;
-    for group in JOURNAL_GROUPS {
-        if !try_append(&mut cluster, group, a, STALE).await {
-            stale_writes = stale_writes.saturating_add(1);
-        }
-    }
+    let committed = try_append_every_group(&mut cluster, a, STALE).await;
+    let stale_writes = u64::try_from(JOURNAL_GROUPS.len().saturating_sub(committed.len()))
+        .expect("group count fits u64");
 
     // The others elect a new leader, which acknowledges writes.
     let others = NODES

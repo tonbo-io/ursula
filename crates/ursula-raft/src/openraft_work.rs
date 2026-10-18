@@ -479,6 +479,22 @@ where
             work: self.work.clone(),
         }
     }
+
+    // The heartbeat and snapshot clients go through the inner factory too,
+    // so an override of its own is kept, and each holds the token.
+    async fn new_heartbeat_client(&mut self, target: NodeIdOf, node: &NodeOf) -> Self::Network {
+        TrackedNetwork {
+            network: self.factory.new_heartbeat_client(target, node).await,
+            work: self.work.clone(),
+        }
+    }
+
+    async fn new_snapshot_client(&mut self, target: NodeIdOf, node: &NodeOf) -> Self::Network {
+        TrackedNetwork {
+            network: self.factory.new_snapshot_client(target, node).await,
+            work: self.work.clone(),
+        }
+    }
 }
 
 fn engine_stopped() -> RPCError<UrsulaRaftTypeConfig> {
@@ -488,6 +504,8 @@ fn engine_stopped() -> RPCError<UrsulaRaftTypeConfig> {
 impl<N> RaftNetworkV2<UrsulaRaftTypeConfig> for TrackedNetwork<N>
 where N: RaftNetworkV2<UrsulaRaftTypeConfig>
 {
+    type SnapshotData = N::SnapshotData;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
@@ -553,7 +571,7 @@ where N: RaftNetworkV2<UrsulaRaftTypeConfig>
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<UrsulaRaftTypeConfig>,
-        snapshot: SnapshotOf<UrsulaRaftTypeConfig>,
+        snapshot: SnapshotOf<UrsulaRaftTypeConfig, N::SnapshotData>,
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {

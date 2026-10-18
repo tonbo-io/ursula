@@ -1075,11 +1075,15 @@ pub(super) async fn lead_every_group(cluster: &JournalCluster, leader: u64, cont
                 .await
                 .expect("transfer the leadership");
         }
+        // A leader proposes only while a quorum acknowledged it within its
+        // lease, so a caller that cuts it off next must find it acknowledged.
         let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
-        while leader_by_state(cluster, group) != Some(leader) {
+        while leader_by_state(cluster, group) != Some(leader)
+            || metrics(cluster, group, leader).last_quorum_acked.is_none()
+        {
             assert!(
                 madsim::time::Instant::now() < deadline,
-                "{context}: group {group} never moved to node {leader}"
+                "{context}: group {group} never moved to node {leader} with a quorum acknowledging it"
             );
             madsim::time::sleep(Duration::from_millis(25)).await;
         }

@@ -76,7 +76,6 @@ async fn install(machine: &mut RaftGroupStateMachine, index: u64) -> std::io::Re
             index,
         }),
         last_membership: Default::default(),
-        snapshot_id: pointer.snapshot_id.clone(),
     };
     machine
         .install_snapshot(&meta, SnapshotData::new(pointer.encode_binary().unwrap()))

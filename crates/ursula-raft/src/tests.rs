@@ -1664,6 +1664,112 @@ async fn three_node_openraft_group_replicates_group_writes() {
     shutdown_all(&engines).await;
 }
 
+/// A write that reaches a new leader before its first follower answered is
+/// not refused: OpenRaft refuses proposals until a quorum acknowledged the
+/// leader, and the engine waits for that acknowledgement before it proposes.
+/// Every RPC is held, so the write lands inside that window.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_write_right_after_an_election_is_not_refused() {
+    use openraft::rt::WatchReceiver;
+
+    let policy = InProcessRaftNetworkPolicy::default();
+    let (_registry, engines, old_leader, _wal_roots) =
+        build_three_node_cluster("ursula-write-after-election-test", Some(policy.clone())).await;
+    let old_index = usize::try_from(old_leader - 1).expect("leader id fits usize");
+    let stream_id = bsid("write-after-election");
+    create_stream_via_raft(&engines[old_index], stream_id.clone()).await;
+    // Shorter than the wait (election_timeout_min, 500 ms) and the vote
+    // deadline, longer than it takes to observe the election.
+    policy.set_delay(Some(Duration::from_millis(300)));
+    for node_id in (1..=3).filter(|node_id| *node_id != old_leader) {
+        policy.partition_bidirectional(old_leader, node_id);
+    }
+    // Each survivor's own metrics: the leader sees its leadership before
+    // its first append reaches a follower.
+    let new_index = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(index) = (0..3).filter(|index| *index != old_index).find(|index| {
+                engines[*index].raft.metrics().borrow_watched().state
+                    == openraft::ServerState::Leader
+            }) {
+                break index;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the survivors elect a new leader");
+    assert!(
+        engines[new_index]
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_quorum_acked
+            .is_none(),
+        "the write lands before the new leader's first quorum acknowledgement"
+    );
+    let written = engines[new_index]
+        .write(append_command(stream_id, b"after-election"))
+        .await;
+    assert!(
+        matches!(written, Ok(GroupWriteResponse::Append(_))),
+        "a write right after the election: {written:?}"
+    );
+    policy.set_delay(None);
+    shutdown_all(&engines).await;
+}
+
+/// A leader that no quorum acknowledged within its lease refuses a write
+/// before it appends it: the answer is `NotProposed`, and the leader's log
+/// does not grow. Staging cleanup and the cold-page release delete objects on
+/// that answer, so an entry appended behind it would lose data.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_leader_past_its_lease_refuses_a_write_before_appending_it() {
+    use openraft::rt::WatchReceiver;
+
+    let policy = InProcessRaftNetworkPolicy::default();
+    let (_registry, engines, leader, _wal_roots) =
+        build_three_node_cluster("ursula-past-lease-write-test", Some(policy.clone())).await;
+    let index = usize::try_from(leader - 1).expect("leader id fits usize");
+    let engine = &engines[index];
+    let stream_id = bsid("past-lease-write");
+    create_stream_via_raft(engine, stream_id.clone()).await;
+    for node_id in (1..=3).filter(|node_id| *node_id != leader) {
+        policy.partition_bidirectional(leader, node_id);
+    }
+    let lease = Duration::from_millis(engine.raft.config().election_timeout_max);
+    tokio::time::sleep(lease + Duration::from_millis(200)).await;
+    let before = engine.raft.metrics().borrow_watched().clone();
+    assert_eq!(
+        before.state,
+        openraft::ServerState::Leader,
+        "the cut-off leader still believes it leads"
+    );
+    let refused = engine
+        .write(append_command(stream_id, b"past-lease"))
+        .await
+        .expect_err("a leader past its lease refuses the write");
+    assert!(
+        matches!(
+            refused.not_leader(),
+            Some(ursula_runtime::LeadershipRefusal {
+                proposal: ursula_runtime::Proposal::NotProposed,
+                reason: LeadershipReason::QuorumUnconfirmed,
+                ..
+            })
+        ),
+        "{refused:?}"
+    );
+    let after = engine.raft.metrics().borrow_watched().clone();
+    assert_eq!(
+        after.last_log_index, before.last_log_index,
+        "nothing was appended"
+    );
+    shutdown_all(&engines).await;
+}
+
 /// D10: a leader cut off from the quorum keeps believing it leads, but it
 /// must not answer a `consistency=leader` read, HEAD, bootstrap, snapshot
 /// read or live-read registration from its own state: a new leader has
@@ -1713,6 +1819,13 @@ async fn deposed_leader_refuses_linearizable_reads() {
         .current_leader
         .expect("new leader id");
     let new_index = usize::try_from(new_leader - 1).expect("leader id fits usize");
+    // A new leader proposes only once a quorum acknowledged it.
+    engines[new_index]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .leader_with_quorum_acked(None, "the new leader's first quorum acknowledgement")
+        .await
+        .expect("the new leader holds a quorum acknowledgement");
     let acked = engines[new_index]
         .raft
         .client_write(append_command(stream_id.clone(), b"after"))
@@ -1939,10 +2052,10 @@ async fn a_read_index_round_needs_a_quorum_after_the_read_arrives() {
 
 /// The engine's one leadership check, which runs right before commands go to
 /// OpenRaft, reports its forward as raised before proposal: on its own,
-/// inside `write`, and inside a batch, for every entry. A forward that
-/// OpenRaft reports for a write handed to it stays ambiguous, since OpenRaft
-/// also reports one when it drops an entry it appended before it lost
-/// leadership, which may still commit
+/// inside `write`, and inside a batch, for every entry. OpenRaft's own
+/// forward of a write is raised before it appends too, and only an entry it
+/// appended and then discarded on losing leadership stays ambiguous, since it
+/// may still commit
 /// (`a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_down`).
 /// The HTTP layer answers the first kind `NO_LEADER` and the second
 /// `OUTCOME_UNKNOWN`.
@@ -4446,9 +4559,11 @@ async fn registry_handoff_abandons_a_transfer_nobody_takes_over() {
     ));
     raft.wait(Some(Duration::from_secs(10)))
         .metrics(
+            // A new leader proposes only once a quorum acknowledged it.
             |metrics| {
                 metrics.state == openraft::ServerState::Leader
                     && metrics.vote.leader_id().term() > vote.leader_id().term()
+                    && metrics.last_quorum_acked.is_some()
             },
             "the leader abandons the parked transfer",
         )
@@ -5392,7 +5507,6 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
                 Some(log_id(1)),
                 membership,
             ),
-            snapshot_id: pointer.snapshot_id.clone(),
         };
         machine
             .install_snapshot(
@@ -5766,7 +5880,7 @@ async fn queue_state_machine_work(
         snapshot_id: "queued-install".to_owned(),
         location: ursula_runtime::SnapshotLocation::Inline { bytes },
     };
-    let snapshot = openraft::alias::SnapshotOf::<UrsulaRaftTypeConfig> {
+    let snapshot = crate::types::UrsulaSnapshot {
         meta: openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: Some(installed_id),
             last_membership: openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
@@ -5777,7 +5891,6 @@ async fn queue_state_machine_work(
                 )
                 .unwrap(),
             ),
-            snapshot_id: "queued-install".to_owned(),
         },
         snapshot: crate::types::SnapshotData::new(pointer.encode_binary().unwrap()),
     };

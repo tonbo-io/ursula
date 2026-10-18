@@ -16,7 +16,6 @@ use openraft::OptionalSend;
 use openraft::RaftNetworkFactory;
 use openraft::RaftNetworkV2;
 use openraft::alias::SnapshotMetaOf;
-use openraft::alias::SnapshotOf;
 use openraft::alias::VoteOf;
 use openraft::error::NetworkError;
 use openraft::error::RPCError;
@@ -65,6 +64,7 @@ use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaSnapshot;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
@@ -834,7 +834,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             decode_rpc_payload(&request.vote, "full snapshot vote")?;
         let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.snapshot_meta, "full snapshot meta")?;
-        let snapshot = SnapshotOf::<UrsulaRaftTypeConfig> {
+        let snapshot = UrsulaSnapshot {
             meta,
             snapshot: SnapshotData::new(request.snapshot_payload.to_vec()),
         };
@@ -1911,6 +1911,8 @@ pub(crate) fn raft_rpc_network_error(message: impl ToString) -> RPCError<UrsulaR
 }
 
 impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
+    type SnapshotData = SnapshotData;
+
     async fn append_entries(
         &mut self,
         rpc: UrsulaAppendEntriesRequest,
@@ -1943,7 +1945,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<UrsulaRaftTypeConfig>,
-        snapshot: SnapshotOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {

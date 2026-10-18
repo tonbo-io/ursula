@@ -30,7 +30,6 @@ use openraft::rt::WatchReceiver;
 use openraft::storage::RaftSnapshotBuilder;
 #[cfg(any(test, feature = "fault-injection"))]
 use openraft::storage::RaftStateMachine;
-use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 use openraft::vote::RaftLeaderId;
 use tokio::sync::watch;
 use ursula_proto::admin::RecoveryPlanReport;
@@ -53,6 +52,8 @@ pub use crate::election::LeadershipShedReason;
 pub use crate::election::LeadershipShedState;
 use crate::log_store::WalOpening;
 use crate::meta::MetaRaftTypeConfig;
+use crate::meta::MetaSnapshot;
+use crate::meta::MetaSnapshotData;
 use crate::owner::OwnerRaftHandle;
 use crate::read_index::ReadIndexBarrier;
 use crate::rejoin::GroupRejoin;
@@ -66,6 +67,7 @@ use crate::types::RaftGroupMetricsSnapshot;
 use crate::types::RaftLogProgressSnapshot;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaSnapshot;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SingleNodeRaftNetworkFactory;
@@ -82,6 +84,8 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for SingleNodeRaftNetworkFactory {
 }
 
 impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
+    type SnapshotData = SnapshotData;
+
     async fn append_entries(
         &mut self,
         _rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
@@ -101,7 +105,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
     async fn full_snapshot(
         &mut self,
         _vote: VoteOf<UrsulaRaftTypeConfig>,
-        _snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
+        _snapshot: UrsulaSnapshot,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
@@ -129,6 +133,8 @@ impl RaftNetworkFactory<MetaRaftTypeConfig> for SingleNodeRaftNetworkFactory {
 }
 
 impl RaftNetworkV2<MetaRaftTypeConfig> for SingleNodeRaftNetwork {
+    type SnapshotData = MetaSnapshotData;
+
     async fn append_entries(
         &mut self,
         _rpc: AppendEntriesRequest<MetaRaftTypeConfig>,
@@ -148,7 +154,7 @@ impl RaftNetworkV2<MetaRaftTypeConfig> for SingleNodeRaftNetwork {
     async fn full_snapshot(
         &mut self,
         _vote: VoteOf<MetaRaftTypeConfig>,
-        _snapshot: TypeConfigSnapshotOf<MetaRaftTypeConfig>,
+        _snapshot: MetaSnapshot,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<MetaRaftTypeConfig>, StreamingError<MetaRaftTypeConfig>> {
@@ -449,7 +455,7 @@ pub enum SnapshotBuildError {
 
 #[derive(Debug)]
 struct PrefetchedInstallSnapshot {
-    snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
+    snapshot: UrsulaSnapshot,
     guard: Option<PrefetchedSnapshotGuard>,
     /// The history event the snapshot's state holds, for the commit screen
     /// (#613); `None` when it is the snapshot this replica already holds.
@@ -1468,7 +1474,7 @@ impl RaftGroupHandleRegistry {
         &self,
         raft_group_id: RaftGroupId,
         vote: VoteOf<UrsulaRaftTypeConfig>,
-        snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError> {
         // A refused install must not queue for the group's lock or the
         // node's permit. The floor only rises and the Raft core's vote never
@@ -1481,7 +1487,7 @@ impl RaftGroupHandleRegistry {
         if let Some(refusal) = entry
             .recovery
             .as_ref()
-            .and_then(|rejoin| rejoin.refused_snapshot(&snapshot.meta.snapshot_id))
+            .and_then(|rejoin| rejoin.refused_snapshot(snapshot.meta.last_log_id))
         {
             return Err(SnapshotInstallError::Group(GroupEngineError::Infra(
                 refusal,
@@ -1590,7 +1596,7 @@ impl RaftGroupHandleRegistry {
                                 "recovery: refused a snapshot install that would replace \
                                  committed entries"
                             );
-                            rejoin.record_refused_snapshot(&snapshot.meta.snapshot_id, &refusal);
+                            rejoin.record_refused_snapshot(snapshot.meta.last_log_id, &refusal);
                             return Err(refusal);
                         }
                     }
@@ -1634,7 +1640,7 @@ impl RaftGroupHandleRegistry {
     async fn prefetch_snapshot_for_install(
         &self,
         raft_group_id: RaftGroupId,
-        snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
     ) -> Result<PrefetchedInstallSnapshot, SnapshotInstallError> {
         let group = raft_group_id;
         // Kept until the prefetch returns.
@@ -1658,7 +1664,7 @@ impl RaftGroupHandleRegistry {
                     .stream_snapshot
                     .history;
                 return Ok(PrefetchedInstallSnapshot {
-                    snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+                    snapshot: UrsulaSnapshot {
                         meta: snapshot.meta,
                         snapshot: SnapshotData::new(pointer_bytes),
                     },
@@ -1726,7 +1732,7 @@ impl RaftGroupHandleRegistry {
             .encode_binary()
             .map_err(|source| SnapshotInstallError::PointerEncode { group, source })?;
         Ok(PrefetchedInstallSnapshot {
-            snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+            snapshot: UrsulaSnapshot {
                 meta: snapshot.meta,
                 snapshot: SnapshotData::new(pointer_bytes),
             },
@@ -1815,7 +1821,7 @@ impl RaftGroupHandleRegistry {
     pub async fn build_snapshot_for_transfer(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<TypeConfigSnapshotOf<UrsulaRaftTypeConfig>, SnapshotBuildError> {
+    ) -> Result<UrsulaSnapshot, SnapshotBuildError> {
         let raft = self.require_group(raft_group_id)?;
         let snapshot = raft
             .with_state_machine(|state_machine| {
@@ -2123,7 +2129,7 @@ mod tests {
         (registry, engine, wal_root)
     }
 
-    fn reference_failure_snapshot() -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
+    fn reference_failure_snapshot() -> UrsulaSnapshot {
         let mut snapshot = external_snapshot("reference-fault");
         let id = openraft::LogId::new(openraft::vote::RaftLeaderId::new(1, 2), 1);
         snapshot.meta.last_log_id = Some(id);
@@ -2425,7 +2431,7 @@ mod tests {
         let mut snapshot = reference_failure_snapshot();
         snapshot.snapshot = SnapshotData::new(
             SnapshotPointer {
-                snapshot_id: snapshot.meta.snapshot_id.clone(),
+                snapshot_id: "reference-fault".to_owned(),
                 location: SnapshotLocation::Inline { bytes },
             }
             .encode_binary()
@@ -2774,11 +2780,10 @@ mod tests {
         ursula_runtime::inline_owned_snapshot_methods!();
     }
 
-    fn snapshot_meta(snapshot_id: &str) -> openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig> {
+    fn snapshot_meta() -> openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig> {
         openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: None,
             last_membership: openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::default(),
-            snapshot_id: snapshot_id.to_owned(),
         }
     }
 
@@ -2800,7 +2805,7 @@ mod tests {
         .collect()
     }
 
-    fn external_snapshot(snapshot_id: &str) -> TypeConfigSnapshotOf<UrsulaRaftTypeConfig> {
+    fn external_snapshot(snapshot_id: &str) -> UrsulaSnapshot {
         let pointer = SnapshotPointer {
             snapshot_id: snapshot_id.to_owned(),
             location: SnapshotLocation::S3 {
@@ -2811,8 +2816,8 @@ mod tests {
                 shared_object: false,
             },
         };
-        TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-            meta: snapshot_meta(snapshot_id),
+        UrsulaSnapshot {
+            meta: snapshot_meta(),
             snapshot: SnapshotData::new(pointer.encode_binary().expect("encode test pointer")),
         }
     }
@@ -3080,8 +3085,8 @@ mod tests {
                 bytes: group_snapshot_bytes(),
             },
         };
-        let snapshot = TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-            meta: snapshot_meta("inline"),
+        let snapshot = UrsulaSnapshot {
+            meta: snapshot_meta(),
             snapshot: SnapshotData::new(pointer.encode_binary().expect("encode test pointer")),
         };
 

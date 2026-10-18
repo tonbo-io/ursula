@@ -218,29 +218,21 @@ impl ElectionPolicy {
     /// vote the transfer carries, and compares the two in its core as it
     /// handles the transfer. A transfer to this node that carries its own
     /// committed vote can therefore act only while this node leads under
-    /// that vote. OpenRaft would then start an election that keeps the old
-    /// leader state, and a leader call before that election ends breaks
-    /// its invariant that the leader's vote is at least the node's vote
-    /// (an assertion that stops the core thread in debug builds).
+    /// that vote, where OpenRaft starts no election: it ignores a campaign
+    /// on a leader, from a transfer or from `trigger().elect()` alike. The
+    /// vote rule refuses such a transfer up front, so its sender learns why.
     ///
     /// The vote rule reads the vote in the request rather than this node's
     /// state, so nothing can change between that check and the core. The
     /// campaign policy reads the recovery gate and the leadership shed,
     /// which can change before the core acts on the transfer (while the
     /// log flushes, up to `election_timeout_min`): a shed that starts
-    /// meanwhile does not stop a transfer accepted before it. A transfer
-    /// the vote rule accepts acts only while this node holds another node's
-    /// vote or its own uncommitted vote. OpenRaft holds leader state under
-    /// such a vote only after an election started on a leader. A transfer
-    /// starts one only with the leader's committed vote, which is refused
-    /// here. `trigger().elect()` on a leader starts one too, so every caller
-    /// that may hit a leader goes through `owner::step_down_and_campaign`,
-    /// which steps the leader down first. So would a vote request
-    /// that names this node as its own candidate in a higher term: OpenRaft
-    /// accepts it at once when it is marked as a transfer's, and otherwise
-    /// once the leader's own vote lease (set once, when it became leader)
-    /// has expired. No peer sends one, and the vote handler does not refuse
-    /// it, whatever its transfer mark.
+    /// meanwhile does not stop a transfer accepted before it. A vote request
+    /// that names this node as its own candidate in a higher term could
+    /// still unseat it: OpenRaft accepts it at once when it is marked as a
+    /// transfer's, and otherwise once no quorum has acknowledged this
+    /// leader within its lease. No peer sends one, and the vote handler does
+    /// not refuse it, whatever its transfer mark.
     pub(crate) fn validate_incoming_transfer(
         &self,
         group: RaftGroupId,

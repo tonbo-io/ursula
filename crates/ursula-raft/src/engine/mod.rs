@@ -133,6 +133,7 @@ use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
+use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
 /// Optional capabilities of a group engine, independent of its transport and log store.
@@ -658,7 +659,7 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
-        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         Self::new_node_with_log_store_network_and_options(
@@ -689,7 +690,7 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
-        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         Self::new_node(
@@ -716,7 +717,7 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
-        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         Self::new_node_observed(
@@ -742,7 +743,7 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
-        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let RaftGroupEngineOptions {
@@ -1091,6 +1092,7 @@ impl RaftGroupEngine {
         self.apply_health.check(self.placement.raft_group_id)?;
         crate::forward::validate_proposal(&command)?;
         self.history.admit_proposal(&self.raft, &command).await?;
+        crate::forward::await_first_quorum_ack(&self.raft).await;
         crate::forward::refuse_unless_leader(&self.raft)?;
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
@@ -2572,8 +2574,8 @@ impl GroupEngine for RaftGroupEngine {
                 ),
                 Err(err) => {
                     // F14e: a refusal before proposal means the write was never
-                    // proposed (RT1: OpenRaft's own forward may follow a
-                    // committed entry), and a typed stream error means apply
+                    // proposed (RT1: only an entry OpenRaft appended and then
+                    // discarded may commit), and a typed stream error means apply
                     // rejected it (a stale flush), so the page entry is
                     // definitely unreferenced. Other failures are ambiguous:
                     // the flush may still commit, so the entry stays.

@@ -407,9 +407,9 @@ fn cleanup_rule_classifies_runtime_errors() {
             message: "write page".to_owned()
         }
     ));
-    // RT1: OpenRaft reports a forward from a dropped responder after
-    // step-down or log purge, when the entry may already have committed. Only
-    // the local pre-proposal leadership check is a definite rejection.
+    // RT1: an entry OpenRaft appended and then discarded on step-down may
+    // still commit through another leader. A refusal before proposal is a
+    // definite rejection.
     let not_leader = |proposal, reason| {
         engine(GroupEngineError::NotLeader(LeadershipRefusal {
             leader: None,

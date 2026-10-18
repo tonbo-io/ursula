@@ -23,7 +23,6 @@ use openraft::raft::ClientWriteResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::rt::WatchReceiver;
-use openraft::type_config::alias::SnapshotOf;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
@@ -36,6 +35,7 @@ use crate::state_machine::RaftGroupStateMachine;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig as C;
+use crate::types::UrsulaSnapshot;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
@@ -263,7 +263,7 @@ impl OwnerRaftHandle {
 
     pub fn wait(&self, timeout: Option<Duration>) -> openraft::metrics::Wait<C> {
         openraft::metrics::Wait {
-            timeout: timeout.unwrap_or(Duration::from_secs(86400)),
+            timeout,
             rx: self.metrics(),
         }
     }
@@ -313,7 +313,7 @@ impl OwnerRaftHandle {
     pub async fn install_full_snapshot(
         &self,
         vote: UrsulaVote,
-        snapshot: SnapshotOf<C>,
+        snapshot: UrsulaSnapshot,
     ) -> Result<SnapshotResponse<C>, Fatal<C>> {
         self.call(move |raft| async move { raft.install_full_snapshot(vote, snapshot).await })
             .await?
@@ -325,7 +325,7 @@ impl OwnerRaftHandle {
         self.call(move |raft| async move { raft.handle_transfer_leader(request).await })
             .await?
     }
-    pub async fn get_snapshot(&self) -> Result<Option<SnapshotOf<C>>, RaftError<C>> {
+    pub async fn get_snapshot(&self) -> Result<Option<UrsulaSnapshot>, RaftError<C>> {
         self.call(move |raft| async move { raft.get_snapshot().await })
             .await?
     }
@@ -335,6 +335,8 @@ impl OwnerRaftHandle {
         node: BasicNode,
         blocking: bool,
     ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
+        // A new leader proposes only once a quorum acknowledged it.
+        crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
         self.call(move |raft| async move { raft.add_learner(id, node, blocking).await })
             .await?
     }
@@ -343,6 +345,8 @@ impl OwnerRaftHandle {
         members: BTreeSet<u64>,
         retain: bool,
     ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
+        // A new leader proposes only once a quorum acknowledged it.
+        crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
         self.call(move |raft| async move { raft.change_membership(members, retain).await })
             .await?
     }
@@ -437,12 +441,9 @@ pub enum StepDownError {
 
 /// Steps the leader at `vote` down to `target`, then campaigns.
 ///
-/// OpenRaft's `elect` on a leader starts a candidacy at a higher vote but
-/// keeps the leader state, and a leader call before that election ends
-/// breaks its invariant that the leader's vote is at least the node's vote
-/// (#516, #721). So the leader first grants itself [`transfer_step_down`],
-/// which drops the leader state as for any follower, and campaigns only
-/// then. `target` must be another node
+/// OpenRaft ignores `elect` on a leader (#721). So the leader first grants
+/// itself [`transfer_step_down`], which drops the leader state as for any
+/// follower, and campaigns only then. `target` must be another node
 /// ([`StepDownError::TargetIsSelf`]).
 pub(crate) async fn step_down_and_campaign(
     raft: &RaftGroupHandle,

@@ -201,10 +201,7 @@ impl AsyncRuntime for MadsimRuntime {
     }
 
     fn block_on<F, T>(&mut self, future: F) -> T
-    where
-        F: Future<Output = T>,
-        T: OptionalSend,
-    {
+    where F: Future<Output = T> {
         madsim::runtime::Runtime::new().block_on(future)
     }
 

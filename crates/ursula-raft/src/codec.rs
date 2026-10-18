@@ -95,9 +95,10 @@ mod tests {
         // a joint StoredMembership with a learner and node addresses, a
         // membership Entry, and SnapshotMeta (snapshot record and transfer).
         // The SnapshotMeta bytes are the map {last_log_id, last_membership,
-        // snapshot_id} over the LogId and StoredMembership bytes, with a
-        // snapshot id in the state machine's format. Decoding and re-encoding
-        // must reproduce each value byte for byte.
+        // snapshot_id} over the LogId and StoredMembership bytes. OpenRaft
+        // writes snapshot_id empty and ignores it on read: Ursula names a
+        // snapshot by its group and last log id instead. Decoding and
+        // re-encoding must reproduce each value byte for byte.
         let fixtures: serde_json::Value =
             serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch5.json")).unwrap();
         fn check<T: serde::de::DeserializeOwned + serde::Serialize>(
@@ -131,7 +132,6 @@ mod tests {
         let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> = check(&fixtures, "snapshot_meta");
         assert_eq!(meta.last_log_id, Some(log));
         assert_eq!(meta.last_membership, membership);
-        assert_eq!(meta.snapshot_id, "group-7-T7-N2-19");
         // A history event (#581 section 4.3), the entry every group starts
         // with.
         let history: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "new_history_entry");

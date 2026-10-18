@@ -15,10 +15,10 @@ use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
 use openraft::alias::LogIdOf;
-use openraft::alias::SnapshotDataOf;
 use openraft::alias::SnapshotMetaOf;
 use openraft::alias::SnapshotOf;
 use openraft::alias::StoredMembershipOf;
+use openraft::network::NetSnapshot;
 use openraft::storage::EntryResponder;
 use openraft::storage::RaftLogStorage;
 use openraft::storage::RaftSnapshotBuilder;
@@ -40,9 +40,14 @@ openraft::declare_raft_types!(
         D = ControlCommand,
         R = ControlResponse,
         Node = openraft::BasicNode,
-        SnapshotData = Cursor<Vec<u8>>,
         AsyncRuntime = MetaOpenRaftRuntime,
 );
+
+/// What a meta snapshot carries through OpenRaft: the JSON of the control
+/// plane state.
+pub type MetaSnapshotData = Cursor<Vec<u8>>;
+/// A meta snapshot with its metadata.
+pub type MetaSnapshot = SnapshotOf<MetaRaftTypeConfig, MetaSnapshotData>;
 
 pub type MetaRaft = Raft<MetaRaftTypeConfig, MetaRaftStateMachine>;
 
@@ -141,6 +146,7 @@ impl MetaRaftHandle {
     ) -> Result<Self, MetaRaftError>
     where
         NF: RaftNetworkFactory<MetaRaftTypeConfig>,
+        NF::Network: NetSnapshot<MetaRaftTypeConfig, SnapshotData = MetaSnapshotData>,
         LS: RaftLogStorage<MetaRaftTypeConfig>,
     {
         let raft = MetaRaft::new(
@@ -334,15 +340,12 @@ impl MetaRaftStateMachine {
         SnapshotMetaOf::<MetaRaftTypeConfig> {
             last_log_id: self.last_applied_log_id,
             last_membership: self.last_membership.clone(),
-            snapshot_id: self
-                .last_applied_log_id
-                .map(|log_id| format!("meta-{}-{}", log_id.committed_leader_id(), log_id.index()))
-                .unwrap_or_else(|| "meta-empty".to_owned()),
         }
     }
 }
 
 impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
+    type SnapshotData = MetaSnapshotData;
     type SnapshotBuilder = MetaRaftSnapshotBuilder;
 
     async fn applied_state(
@@ -390,16 +393,10 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         }
     }
 
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> Result<SnapshotDataOf<MetaRaftTypeConfig>, io::Error> {
-        Ok(Cursor::new(Vec::new()))
-    }
-
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMetaOf<MetaRaftTypeConfig>,
-        snapshot: SnapshotDataOf<MetaRaftTypeConfig>,
+        snapshot: MetaSnapshotData,
     ) -> Result<(), io::Error> {
         let bytes = snapshot.into_inner();
         self.state = serde_json::from_slice(&bytes).map_err(invalid_snapshot)?;
@@ -412,15 +409,13 @@ impl RaftStateMachine<MetaRaftTypeConfig> for MetaRaftStateMachine {
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<SnapshotOf<MetaRaftTypeConfig>>, io::Error> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<MetaSnapshot>, io::Error> {
         Ok(self
             .current_snapshot
             .lock()
             .expect("snapshot mutex")
             .as_ref()
-            .map(|snapshot| SnapshotOf::<MetaRaftTypeConfig> {
+            .map(|snapshot| MetaSnapshot {
                 meta: snapshot.meta.clone(),
                 snapshot: Cursor::new(snapshot.bytes.clone()),
             }))
@@ -435,13 +430,15 @@ pub struct MetaRaftSnapshotBuilder {
 }
 
 impl RaftSnapshotBuilder<MetaRaftTypeConfig> for MetaRaftSnapshotBuilder {
-    async fn build_snapshot(&mut self) -> Result<SnapshotOf<MetaRaftTypeConfig>, io::Error> {
+    type SnapshotData = MetaSnapshotData;
+
+    async fn build_snapshot(&mut self) -> Result<MetaSnapshot, io::Error> {
         let bytes = serde_json::to_vec(&self.state).map_err(invalid_snapshot)?;
         *self.current_snapshot.lock().expect("snapshot mutex") = Some(MetaCurrentSnapshot {
             meta: self.meta.clone(),
             bytes: bytes.clone(),
         });
-        Ok(SnapshotOf::<MetaRaftTypeConfig> {
+        Ok(MetaSnapshot {
             meta: self.meta.clone(),
             snapshot: Cursor::new(bytes),
         })

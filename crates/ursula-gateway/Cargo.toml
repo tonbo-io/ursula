@@ -30,6 +30,9 @@ ursula-proto = { workspace = true }
 ursula-shard = { workspace = true }
 rand = { workspace = true, features = ["thread_rng"] }
 
+[target.'cfg(madsim)'.dependencies]
+madsim = { workspace = true }
+
 [dev-dependencies]
 http-body = "1"
 tempfile = { workspace = true }

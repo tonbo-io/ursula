@@ -31,8 +31,9 @@ implement the same seen-version semantics under the value lock.
 Official fix: databendlabs/openraft commit
 `cecb5de8d98f6c4acb15930c407bb6947fb16696`
 (`fix: reject stale replication acks after log reversion`). Alpha28 is the first
-published release containing it. The workspace pins that release exactly rather
-than allowing a prerelease range to select alpha36 or a later API.
+published release containing it. The workspace pins OpenRaft exactly, now at
+alpha37, which keeps both fixes, so that a prerelease range cannot select a
+later API.
 
 The other two cases deliver an ACK or conflict from a removed replication stream
 after the same peer has a replacement stream and newer matching progress.
@@ -54,6 +55,8 @@ MessagePack bytes of format epoch 5 in
 `crates/ursula-raft/src/fixtures/persisted-envelopes-epoch5.json`. It checks
 Vote, LogId, joint StoredMembership (including a learner and addresses), a
 membership Entry and SnapshotMeta, then requires byte-identical re-encoding.
-The first four were generated with published alpha21, and alpha28 encodes them
-identically. It does not assert that later OpenRaft releases or mixed-version
-cluster operation are compatible.
+The first four were generated with published alpha21, and alpha28 and alpha37
+encode them identically. Alpha37 writes SnapshotMeta's `snapshot_id` empty and
+ignores it on read, so the fixture's SnapshotMeta carries an empty id. It does
+not assert that later OpenRaft releases or mixed-version cluster operation are
+compatible.
