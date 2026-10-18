@@ -911,6 +911,12 @@ fn fsync_never_power_loss_is_detected_and_keeps_a_verified_prefix_and_the_vote()
                 cluster.append(group, 6).await;
             }
             let victim = cluster.follower_of_every_group(seed).await;
+            // Cut the victim off and let what is in flight land, so no
+            // append reaches its log between the read below and its stop.
+            for peer in cluster.nodes().filter(|peer| *peer != victim) {
+                cluster.policy.partition_bidirectional(victim, peer);
+            }
+            madsim::time::sleep(Duration::from_millis(200)).await;
             let before = cluster.durable_logs(victim).await;
             cluster.stop_node(victim).await;
             let report = cluster.wals[&victim].power_loss().await;
