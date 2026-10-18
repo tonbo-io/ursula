@@ -72,8 +72,8 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::RouteWriteRequest;
 use crate::request::RoutedWrite;
+use crate::request::TidyStreamsPass;
 use crate::request::TidyStreamsRequest;
-use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
@@ -1396,18 +1396,20 @@ impl CoreWorker {
         metrics: Arc<RuntimeMetricsInner>,
         request: TidyStreamsRequest,
         placement: ShardPlacement,
-    ) -> Result<TidyStreamsResponse, RuntimeError> {
+    ) -> Result<TidyStreamsPass<RuntimeError>, RuntimeError> {
         let exec_started_at = Instant::now();
-        let response = group
-            .tidy_streams(request, placement)
-            .await
-            .map_err(|err| RuntimeError::group_engine(placement, err));
+        let pass = group.tidy_streams(request, placement).await;
         metrics.record_group_engine_exec(
             placement.core_id,
             placement.raft_group_id,
             elapsed_ns(exec_started_at),
         );
-        response
+        Ok(TidyStreamsPass {
+            report: pass.report,
+            error: pass
+                .error
+                .map(|err| RuntimeError::group_engine(placement, err)),
+        })
     }
 
     pub(crate) async fn head_stream(

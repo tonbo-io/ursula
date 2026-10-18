@@ -67,6 +67,7 @@ fn owner_burst(c: &mut Criterion) {
                                     runtime
                                         .delete_stream(DeleteStreamRequest {
                                             stream_id: stream.clone(),
+                                            now_ms: 0,
                                             if_incarnation: None,
                                         })
                                         .await

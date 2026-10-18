@@ -1352,6 +1352,7 @@ async fn lagging_follower_forwards_a_gone_offset_of_a_recreated_stream() {
     for command in [
         GroupWriteCommand::from(ursula_runtime::DeleteStreamRequest {
             stream_id: stream_id.clone(),
+            now_ms: 0,
             if_incarnation: None,
         }),
         create_command(stream_id.clone()),

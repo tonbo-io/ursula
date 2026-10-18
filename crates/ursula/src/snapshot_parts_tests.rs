@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -1591,6 +1592,49 @@ async fn deleting_a_stream_deletes_its_staged_parts_after_the_answer() {
             .tracks(&BucketStreamId::new("parts", "plain"))
             .1
     );
+}
+
+/// The node's clock, which a test sets.
+struct SetClock(Arc<AtomicU64>);
+
+impl WallClock for SetClock {
+    fn unix_time_ms(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// A delete of a stream that expired answers `404`, as for a missing
+/// stream, but it removed the stream like any delete, so it deletes the
+/// stream's staged parts after the answer too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_an_expired_stream_deletes_its_staged_parts() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let (state, cold_store) = bounded_state(2, 1_000);
+    let state = state.with_wall_clock(SetClock(Arc::clone(&now_ms)));
+    let app = router_with_http_state(state.clone());
+    let mut cleaned = state.staged_parts.cleaned();
+    let response = send(
+        &app,
+        Request::put("/parts/s")
+            .header(CONTENT_TYPE, OCTET)
+            .header(HEADER_STREAM_TTL, "1")
+            .body(Body::from("abc"))
+            .expect("request"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    stage(&app, "/parts/s", b"first".to_vec()).await;
+    assert_eq!(part_names(&cold_store).await.len(), 1);
+
+    now_ms.store(2_000, Ordering::Relaxed);
+    let response = send(
+        &app,
+        Request::delete("/parts/s").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    cleaned.wait_for(|cleaned| *cleaned >= 1).await.unwrap();
+    assert!(part_names(&cold_store).await.is_empty());
 }
 
 /// M4 of the #622 re-review: a discard whose delete fails answers `502

@@ -463,10 +463,11 @@ runtime_metrics! {
     counter snapshot_gc_deleted_objects;
     counter snapshot_gc_skipped_unreferenced_voter;
     counter snapshot_gc_failed_passes;
-    // The leader's background expiry sweep (#669): the sweep commands its
-    // passes committed, and the groups the latest pass left with expired
-    // streams for the next one.
+    // The leader's background expiry sweep (#669): the `ExpireStreams`
+    // entries its passes committed, the expired streams they removed, and
+    // the groups the latest pass left with expired streams for the next one.
     counter ttl_expiry_sweeps;
+    counter ttl_expiry_swept_streams;
     counter ttl_expiry_sweep_due_groups;
     sum cold_hot_bytes: group per_group_cold_hot_bytes;
     // Current largest per-group backlog. Cold-health consumes this gauge and
@@ -823,8 +824,10 @@ impl RuntimeMetricsInner {
     }
 
     /// Records one expiry sweep pass over the node's groups (#669).
-    pub(crate) fn record_ttl_expiry_sweep(&self, sweeps: u64, due_groups: u64) {
+    pub(crate) fn record_ttl_expiry_sweep(&self, sweeps: u64, swept_streams: u64, due_groups: u64) {
         self.ttl_expiry_sweeps.fetch_add_relaxed(sweeps);
+        self.ttl_expiry_swept_streams
+            .fetch_add_relaxed(swept_streams);
         self.ttl_expiry_sweep_due_groups.store_relaxed(due_groups);
     }
 
@@ -1105,7 +1108,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 179] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 180] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1273,6 +1276,7 @@ mod metric_manifest_tests {
         "snapshot_gc_skipped_unreferenced_voter",
         "snapshot_gc_failed_passes",
         "ttl_expiry_sweeps",
+        "ttl_expiry_swept_streams",
         "ttl_expiry_sweep_due_groups",
         "cold_hot_bytes",
         "per_group_cold_hot_bytes",

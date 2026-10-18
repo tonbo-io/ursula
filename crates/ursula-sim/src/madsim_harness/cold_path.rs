@@ -589,6 +589,8 @@ pub(super) async fn run_cold_delete_fault_inner(
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: config.stream.clone(),
+            // The run's clock: every request of this run carries 0.
+            now_ms: 0,
             if_incarnation: None,
         })
         .await

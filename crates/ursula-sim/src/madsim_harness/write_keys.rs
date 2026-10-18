@@ -999,8 +999,14 @@ pub(super) async fn run_idle_expiry_cannot_reopen_an_epoch_inner(
     if plan.tidy {
         cluster
             .runtime
-            .tidy_streams_all_groups_once(16, 0, idle_now)
+            .tidy_streams_all_groups_once(ursula_runtime::TidyStreamsRequest {
+                max_streams: 16,
+                max_expiry_sweeps: 0,
+                expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
+                now_ms: idle_now,
+            })
             .await
+            .into_result()
             .expect("tidy pass");
         trace.push(SimEvent::FaultApplied {
             phase: "tidy_stream".to_owned(),

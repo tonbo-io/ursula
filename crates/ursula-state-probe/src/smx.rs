@@ -19,6 +19,15 @@ pub const T0: u64 = 1_759_300_000_000;
 pub const MIB: usize = 1 << 20;
 pub const JSON: &str = "application/json";
 
+/// One `ExpireStreams` entry at `now_ms`, as the leader's sweep proposes
+/// it ([`ursula_runtime::expiry_sweep::command`]).
+pub fn expire_streams(m: &mut StreamStateMachine, now_ms: u64) -> StreamResponse {
+    m.apply(StreamCommand::ExpireStreams {
+        now_ms,
+        limit: ursula_runtime::expiry_sweep::STREAMS_PER_COMMAND,
+    })
+}
+
 pub fn ok(response: StreamResponse, what: &str) -> Result<StreamResponse> {
     if let StreamResponse::Error { code, message, .. } = &response {
         bail!("{what}: {code:?}: {message}");

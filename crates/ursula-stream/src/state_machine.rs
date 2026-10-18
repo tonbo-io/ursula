@@ -131,7 +131,6 @@ mod query;
 mod registry;
 mod ttl;
 
-const TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE: usize = 256;
 /// Size of the self-described derived write unit exported by Ursula.
 ///
 /// Raw committed bytes and records remain available beside it. Keeping the
@@ -475,27 +474,23 @@ impl StreamStateMachine {
                 stream_ttl_seconds,
                 stream_expires_at_ms,
                 now_ms,
-            } => {
-                let response = match canonical_json_message_count(&content_type, &initial_payload) {
-                    Ok(message_count) => self.create_stream(CreateStreamInput {
-                        stream_id,
-                        content_type,
-                        initial_payload: initial_payload.into(),
-                        message_count,
-                        close_after,
-                        stream_seq,
-                        stream_ttl_seconds,
-                        stream_expires_at_ms,
-                        now_ms,
-                    }),
-                    Err(NonCanonicalJsonPayload) => StreamResponse::error(
-                        StreamErrorCode::InvalidRecordBoundaries,
-                        "application/json initial payload must use canonical newline boundaries",
-                    ),
-                };
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => match canonical_json_message_count(&content_type, &initial_payload) {
+                Ok(message_count) => self.create_stream(CreateStreamInput {
+                    stream_id,
+                    content_type,
+                    initial_payload: initial_payload.into(),
+                    message_count,
+                    close_after,
+                    stream_seq,
+                    stream_ttl_seconds,
+                    stream_expires_at_ms,
+                    now_ms,
+                }),
+                Err(NonCanonicalJsonPayload) => StreamResponse::error(
+                    StreamErrorCode::InvalidRecordBoundaries,
+                    "application/json initial payload must use canonical newline boundaries",
+                ),
+            },
             StreamCommand::CreateExternal {
                 stream_id,
                 content_type,
@@ -506,21 +501,17 @@ impl StreamStateMachine {
                 stream_ttl_seconds,
                 stream_expires_at_ms,
                 now_ms,
-            } => {
-                let response = self.create_external_stream(CreateExternalStreamInput {
-                    stream_id,
-                    content_type,
-                    initial_payload,
-                    message_count,
-                    close_after,
-                    stream_seq,
-                    stream_ttl_seconds,
-                    stream_expires_at_ms,
-                    now_ms,
-                });
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.create_external_stream(CreateExternalStreamInput {
+                stream_id,
+                content_type,
+                initial_payload,
+                message_count,
+                close_after,
+                stream_seq,
+                stream_ttl_seconds,
+                stream_expires_at_ms,
+                now_ms,
+            }),
             StreamCommand::Append {
                 stream_id,
                 content_type,
@@ -529,21 +520,17 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-            } => {
-                let response = self.append_borrowed(AppendStreamInput {
-                    stream_id,
-                    content_type: content_type.as_deref(),
-                    payload: &payload,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    now_ms,
-                    kind: WriteKind::Append,
-                    check,
-                });
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.append_borrowed(AppendStreamInput {
+                stream_id,
+                content_type: content_type.as_deref(),
+                payload: &payload,
+                close_after,
+                stream_seq,
+                producer,
+                now_ms,
+                kind: WriteKind::Append,
+                check,
+            }),
             StreamCommand::AppendExternal {
                 stream_id,
                 content_type,
@@ -553,21 +540,17 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-            } => {
-                let response = self.append_external(AppendExternalInput {
-                    stream_id,
-                    content_type: content_type.as_deref(),
-                    payload,
-                    message_count,
-                    close_after,
-                    stream_seq,
-                    producer,
-                    now_ms,
-                    check,
-                });
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.append_external(AppendExternalInput {
+                stream_id,
+                content_type: content_type.as_deref(),
+                payload,
+                message_count,
+                close_after,
+                stream_seq,
+                producer,
+                now_ms,
+                check,
+            }),
             StreamCommand::PublishSnapshot {
                 stream_id,
                 snapshot_offset,
@@ -575,18 +558,14 @@ impl StreamStateMachine {
                 payload,
                 now_ms,
                 expected_incarnation,
-            } => {
-                let response = self.publish_snapshot(
-                    stream_id,
-                    snapshot_offset,
-                    content_type,
-                    cold::SnapshotBody::Inline(payload.into()),
-                    now_ms,
-                    expected_incarnation,
-                );
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.publish_snapshot(
+                stream_id,
+                snapshot_offset,
+                content_type,
+                cold::SnapshotBody::Inline(payload.into()),
+                now_ms,
+                expected_incarnation,
+            ),
             StreamCommand::PublishSnapshotExternal {
                 stream_id,
                 snapshot_offset,
@@ -595,42 +574,25 @@ impl StreamStateMachine {
                 digest,
                 now_ms,
                 expected_incarnation,
-            } => {
-                let response = self.publish_snapshot(
-                    stream_id,
-                    snapshot_offset,
-                    content_type,
-                    cold::SnapshotBody::Object { object, digest },
-                    now_ms,
-                    expected_incarnation,
-                );
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.publish_snapshot(
+                stream_id,
+                snapshot_offset,
+                content_type,
+                cold::SnapshotBody::Object { object, digest },
+                now_ms,
+                expected_incarnation,
+            ),
             StreamCommand::AdvanceRetention {
                 stream_id,
                 retained_offset,
                 now_ms,
                 expected_incarnation,
-            } => {
-                let response = self.advance_retention(
-                    stream_id,
-                    retained_offset,
-                    now_ms,
-                    expected_incarnation,
-                );
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.advance_retention(stream_id, retained_offset, now_ms, expected_incarnation),
             StreamCommand::TouchStreamAccess {
                 stream_id,
                 now_ms,
                 renew_ttl,
-            } => {
-                let response = self.touch_stream_access(&stream_id, now_ms, renew_ttl);
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
-            }
+            } => self.touch_stream_access(&stream_id, now_ms, renew_ttl),
             StreamCommand::FlushCold {
                 stream_id,
                 chunk,
@@ -647,12 +609,10 @@ impl StreamStateMachine {
                 stream_seq,
                 producer,
                 now_ms,
-            } => {
-                let response = self.close(stream_id, stream_seq, producer, now_ms, check);
-                self.sweep_expired_streams(now_ms, TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-                response
+            } => self.close(stream_id, stream_seq, producer, now_ms, check),
+            StreamCommand::DeleteStream { stream_id, now_ms } => {
+                self.delete_stream(&stream_id, now_ms)
             }
-            StreamCommand::DeleteStream { stream_id } => self.delete_stream(&stream_id),
             StreamCommand::PurgeBucket { bucket_id } => self.purge_bucket(&bucket_id),
             StreamCommand::AckColdGc { up_to_seq } => self.ack_cold_gc(up_to_seq),
             StreamCommand::DeferColdGc { seq, not_before_ms } => {
@@ -672,6 +632,7 @@ impl StreamStateMachine {
                 leader,
             } => self.new_history(index, history, previous, kept, leader, now_ms),
             StreamCommand::TidyStream { stream_id, now_ms } => self.tidy_stream(&stream_id, now_ms),
+            StreamCommand::ExpireStreams { now_ms, limit } => self.expire_streams(now_ms, limit),
             StreamCommand::OffloadColdRefs { stream_id, refs } => {
                 self.offload_cold_refs(&stream_id, &refs)
             }
@@ -905,9 +866,7 @@ mod derived_boundaries_tests;
 #[cfg(test)]
 mod derived_cold_tests;
 #[cfg(test)]
-mod expiry_parity_tests;
-#[cfg(test)]
-mod expiry_sweep_tests;
+mod expire_streams_tests;
 #[cfg(test)]
 mod external_locators_tests;
 #[cfg(test)]

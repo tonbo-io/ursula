@@ -172,13 +172,8 @@ pub type GroupOffloadColdRefsFuture<'a> = Pin<
             + 'a,
     >,
 >;
-pub type GroupTidyStreamsFuture<'a> = Pin<
-    Box<
-        dyn Future<Output = Result<crate::request::TidyStreamsResponse, GroupEngineError>>
-            + Send
-            + 'a,
-    >,
->;
+pub type GroupTidyStreamsFuture<'a> =
+    Pin<Box<dyn Future<Output = crate::request::TidyStreamsPass<GroupEngineError>> + Send + 'a>>;
 pub type GroupStateGaugesFuture<'a> = Pin<
     Box<dyn Future<Output = Result<ursula_stream::GroupStateGauges, GroupEngineError>> + Send + 'a>,
 >;
@@ -256,6 +251,8 @@ pub enum GroupWriteResponse {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
+    /// An `ExpireStreams` entry of the leader's expiry sweep applied.
+    ExpireStreams(crate::request::ExpireStreamsResponse),
 }
 
 /// `GroupWriteResponse::kind` and one `TryFrom<GroupWriteResponse>` per
@@ -308,6 +305,7 @@ group_write_responses! {
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
     OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
+    ExpireStreams(crate::request::ExpireStreamsResponse),
 }
 
 pub trait GroupEngine: Send + 'static {
@@ -510,7 +508,7 @@ pub trait GroupEngine: Send + 'static {
 
     /// One leader-side tidy pass (bounded-state F0): first the expiry sweep
     /// ([`crate::expiry_sweep`]), at most `request.max_expiry_sweeps`
-    /// `TouchStreamAccess { renew_ttl: false }` commands, then `TidyStream`
+    /// `ExpireStreams` entries, then `TidyStream`
     /// for up to `request.max_streams` streams with debt. A follower or an
     /// engine without support proposes nothing.
     fn tidy_streams<'a>(
@@ -518,7 +516,7 @@ pub trait GroupEngine: Send + 'static {
         _request: crate::request::TidyStreamsRequest,
         _placement: ShardPlacement,
     ) -> GroupTidyStreamsFuture<'a> {
-        Box::pin(async move { Ok(crate::request::TidyStreamsResponse::default()) })
+        Box::pin(async move { crate::request::TidyStreamsPass::empty() })
     }
 
     /// One leader-side external-locator offload pass (bounded-state F5): for

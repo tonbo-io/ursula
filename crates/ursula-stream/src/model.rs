@@ -72,22 +72,22 @@ pub enum Opened {
 /// whose body the proposer found faulty is proposed without its bytes, so
 /// the payload's emptiness does not tell the two apart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteKind {
+pub(crate) enum WriteKind {
     Append,
     CloseOnly,
 }
 
 #[derive(Debug)]
-pub struct AppendStreamInput<'a> {
-    pub stream_id: BucketStreamId,
-    pub content_type: Option<&'a str>,
-    pub payload: &'a [u8],
-    pub close_after: bool,
-    pub stream_seq: Option<String>,
-    pub producer: Option<ProducerRequest>,
-    pub now_ms: u64,
-    pub kind: WriteKind,
-    pub check: IncarnationCheck,
+pub(crate) struct AppendStreamInput<'a> {
+    pub(crate) stream_id: BucketStreamId,
+    pub(crate) content_type: Option<&'a str>,
+    pub(crate) payload: &'a [u8],
+    pub(crate) close_after: bool,
+    pub(crate) stream_seq: Option<String>,
+    pub(crate) producer: Option<ProducerRequest>,
+    pub(crate) now_ms: u64,
+    pub(crate) kind: WriteKind,
+    pub(crate) check: IncarnationCheck,
 }
 
 #[derive(Debug)]

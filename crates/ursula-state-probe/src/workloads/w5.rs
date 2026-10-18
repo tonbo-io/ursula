@@ -2,8 +2,8 @@
 //!
 //! - `delete`: create N streams per cycle (appends + drain flush), delete all,
 //!   drain cold GC; repeated cycles.
-//! - `ttl-expire`: N streams with sliding TTL, then let them expire (sweeps run
-//!   on later writes).
+//! - `ttl-expire`: N streams with sliding TTL, then let them expire and remove
+//!   them with `ExpireStreams` entries, as the leader's sweep does.
 //! - `ttl-heap`: one long-lived stream, A appends, TTL none / sliding /
 //!   absolute: TTL heap growth per append.
 //! - `purge`: B buckets with one stream each, `PurgeBucket` each.
@@ -128,6 +128,7 @@ fn delete(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
             smx::ok(
                 m.apply(StreamCommand::DeleteStream {
                     stream_id: id.clone(),
+                    now_ms: now,
                 }),
                 "delete",
             )?;
@@ -192,15 +193,15 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         .saturating_add(args.appends_per_stream as u64)
         .saturating_add(ttl.saturating_mul(1000))
         .saturating_add(1);
-    let mut writes = 0u64;
-    let limit = (streams as u64 / 200).saturating_add(100).saturating_mul(2);
-    while writes <= limit && ids.iter().any(|id| m.head(id).is_some()) {
-        let record = payload::json_record(&mut rng, writes, 200);
-        smx::ok(
-            smx::append(&mut m, &keep, record, None, later.saturating_add(writes)),
-            "keepalive",
-        )?;
-        writes = writes.saturating_add(1);
+    let mut commands = 0u64;
+    let per_command = u64::from(ursula_runtime::expiry_sweep::STREAMS_PER_COMMAND.get());
+    let limit = (streams as u64)
+        .checked_div(per_command)
+        .unwrap_or(u64::MAX)
+        .saturating_add(2);
+    while commands <= limit && m.expiry_due(later) {
+        smx::ok(smx::expire_streams(&mut m, later), "expire streams")?;
+        commands = commands.saturating_add(1);
     }
     let left = ids.iter().filter(|id| m.head(id).is_some()).count();
     let pending = m.pending_cold_gc_len();
@@ -208,10 +209,10 @@ fn ttl_expire(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
     let after = measure_sm(&m, &base, Vec::new(), false)?;
     formula::per_stream_checks(&mut outcome, &after, 0);
     sink.row(
-        &json!({"phase": "after expiry sweeps and GC ack", "keepalive_writes_needed": writes,
+        &json!({"phase": "after expiry sweeps and GC ack", "expire_commands_needed": commands,
         "streams_left": left, "pending_cold_gc_before_ack": pending, "m": after.to_json()}),
     )?;
-    outcome.metric_u64("keepalive_writes_needed", writes);
+    outcome.metric_u64("expire_commands_needed", commands);
     outcome.metric_u64(
         "ttl_heap_entries_after_expiry",
         after.gauges.ttl_heap_entries,
@@ -304,6 +305,8 @@ fn ttl_heap(args: &W5Args, sink: &mut Sink) -> Result<Outcome> {
         smx::ok(
             m.apply(StreamCommand::DeleteStream {
                 stream_id: id.clone(),
+                // The last append's clock, at which the stream was live.
+                now_ms: smx::T0.saturating_add(n.saturating_sub(1).saturating_mul(10)),
             }),
             "delete",
         )?;

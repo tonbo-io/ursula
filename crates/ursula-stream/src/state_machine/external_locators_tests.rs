@@ -261,8 +261,12 @@ fn delete_queues_state_held_external_refs_for_gc() {
     append_external(&mut machine, "s/external/a.bin", 10);
     let response = machine.apply(StreamCommand::DeleteStream {
         stream_id: stream("s"),
+        now_ms: 0,
     });
-    assert!(matches!(response, StreamResponse::Deleted), "{response:?}");
+    assert!(
+        matches!(response, StreamResponse::Deleted { expired: false }),
+        "{response:?}"
+    );
     assert!(
         machine
             .pending_cold_gc_batch(16)

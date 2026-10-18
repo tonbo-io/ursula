@@ -352,7 +352,7 @@ macro_rules! runtime_operations {
             }
             op TidyStreams {
                 fields { request: TidyStreamsRequest }
-                reply { response_tx: TidyStreamsResponse }
+                reply { response_tx: TidyStreamsPass<RuntimeError> }
                 guard { none }
                 handle { call tidy_streams(engine, metrics, request, placement) }
                 client { pub group fn tidy_streams }

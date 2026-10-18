@@ -518,17 +518,50 @@ pub struct AdvanceRetentionResponse {
 }
 
 /// One leader-side tidy pass over a group (bounded-state F0). The engine
-/// first sweeps expired streams: it proposes at most `max_expiry_sweeps`
-/// `TouchStreamAccess { renew_ttl: false }` commands at
-/// [`crate::expiry_sweep::sweep_now_ms`] of `now_ms`, each naming the front
-/// of the group's TTL index ([`crate::expiry_sweep`]). It then proposes
-/// `TidyStream` for at most `max_streams` streams with normalization debt at
-/// `now_ms`. Followers propose nothing.
+/// first sweeps expired streams: while the group's TTL front is due at
+/// [`crate::expiry_sweep::sweep_now_ms`] of `now_ms`, it proposes
+/// `ExpireStreams`, at most `max_expiry_sweeps` entries, and on an engine
+/// with a log starts none after `expiry_sweep_budget`
+/// ([`crate::expiry_sweep`]). It then proposes `TidyStream` for at most
+/// `max_streams` streams with normalization debt at `now_ms`. Followers
+/// propose nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TidyStreamsRequest {
     pub max_streams: usize,
     pub max_expiry_sweeps: usize,
+    /// [`crate::expiry_sweep::GROUP_BUDGET`] for a scheduled sweep,
+    /// [`crate::expiry_sweep::RERUN_BUDGET`] for one that drains a capped
+    /// group.
+    pub expiry_sweep_budget: std::time::Duration,
     pub now_ms: u64,
+}
+
+/// One tidy pass (bounded-state F0) of a group, or the total over a node's
+/// groups: what it committed, and the first error that ended a group's pass
+/// early. The totals survive that error, so a sweep that stopped at its cap
+/// runs again soon even when another step of the pass failed.
+#[derive(Debug)]
+pub struct TidyStreamsPass<E> {
+    pub report: TidyStreamsResponse,
+    pub error: Option<E>,
+}
+
+impl<E> TidyStreamsPass<E> {
+    /// A pass that committed nothing and failed nowhere.
+    pub fn empty() -> Self {
+        Self {
+            report: TidyStreamsResponse::default(),
+            error: None,
+        }
+    }
+
+    /// The totals, or the first error.
+    pub fn into_result(self) -> Result<TidyStreamsResponse, E> {
+        match self.error {
+            Some(err) => Err(err),
+            None => Ok(self.report),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -537,11 +570,17 @@ pub struct TidyStreamsResponse {
     pub tidied: u64,
     /// Tidied streams that still report debt after their command.
     pub debt_remaining: u64,
-    /// Expiry sweep commands committed by this pass.
+    /// `ExpireStreams` entries committed by this pass.
     pub expiry_sweeps: u64,
-    /// Groups whose sweep stopped at its command cap, its time budget or an
+    /// Expired streams those entries removed.
+    pub expiry_swept_streams: u64,
+    /// Groups whose sweep stopped at its entry cap, its time budget or an
     /// error while expired streams remained (0 or 1 for one group).
     pub expiry_due_groups: u64,
+    /// Of those, the groups whose sweep stopped at its entry cap or its time
+    /// budget, not at an error: the tidy driver sweeps them again a second
+    /// later.
+    pub expiry_capped_groups: u64,
 }
 
 impl TidyStreamsResponse {
@@ -550,10 +589,25 @@ impl TidyStreamsResponse {
         self.tidied = self.tidied.saturating_add(other.tidied);
         self.debt_remaining = self.debt_remaining.saturating_add(other.debt_remaining);
         self.expiry_sweeps = self.expiry_sweeps.saturating_add(other.expiry_sweeps);
+        self.expiry_swept_streams = self
+            .expiry_swept_streams
+            .saturating_add(other.expiry_swept_streams);
         self.expiry_due_groups = self
             .expiry_due_groups
             .saturating_add(other.expiry_due_groups);
+        self.expiry_capped_groups = self
+            .expiry_capped_groups
+            .saturating_add(other.expiry_capped_groups);
     }
+}
+
+/// Result of one replicated `ExpireStreams` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpireStreamsResponse {
+    pub placement: ShardPlacement,
+    /// Expired streams the entry removed, at most its limit.
+    pub removed: u64,
+    pub group_commit_index: u64,
 }
 
 /// Result of one replicated `TidyStream` command.
@@ -691,6 +745,9 @@ impl CloseStreamResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeleteStreamRequest {
     pub stream_id: BucketStreamId,
+    /// The proposer's clock: a stream expired at it answers 404, as a
+    /// missing stream does.
+    pub now_ms: u64,
     /// `Stream-Incarnation` request precondition (D12): apply only to this
     /// incarnation of the stream. `None` for a request without the header.
     pub if_incarnation: Option<u64>,
@@ -700,6 +757,9 @@ pub struct DeleteStreamRequest {
 pub struct DeleteStreamResponse {
     pub placement: ShardPlacement,
     pub group_commit_index: u64,
+    /// The stream had expired at the delete's `now_ms`: the delete removed
+    /// it, and the request answers 404, as for a missing stream.
+    pub expired: bool,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
     /// trip.

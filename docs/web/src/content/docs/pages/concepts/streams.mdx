@@ -21,7 +21,7 @@ Every stream is in one of these states:
 
 - **Open.** Accepts appends. The default on creation.
 - **Closed.** Sealed by `Stream-Closed: true` on a POST. Readers receive an EOF signal. Further appends return `409`. Close is irreversible.
-- **Expired.** Past its `Stream-TTL` or `Stream-Expires-At` deadline. Reads and writes return `404`. The group's leader removes an expired stream within about a minute, and cold GC then deletes its cold objects.
+- **Expired.** Past its `Stream-TTL` or `Stream-Expires-At` deadline. Reads, writes and deletes return `404`. The group's leader removes an expired stream within about a minute, and cold GC then deletes its cold objects.
 - **Deleted.** Removed by `DELETE`. Reads return `404`.
 
 `Stream-TTL` (seconds, relative) and `Stream-Expires-At` (RFC 3339 absolute) are mutually exclusive. Sending both yields `400`.

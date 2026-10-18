@@ -2,13 +2,11 @@ use std::sync::Arc;
 
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
-use ursula_stream::AppendStreamInput;
 use ursula_stream::ColdFlushPassRequest;
 use ursula_stream::IncarnationCheck;
 use ursula_stream::ObjectPayloadRef;
 use ursula_stream::ProducerAck;
 use ursula_stream::ProducerEarlyAnswer;
-use ursula_stream::ProducerRequest;
 use ursula_stream::SharedRefCandidate;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::SharedRefIdleTracker;
@@ -21,7 +19,6 @@ use ursula_stream::StreamReadSegment;
 use ursula_stream::StreamResponse;
 use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
-use ursula_stream::WriteKind;
 
 use super::ColdOperation;
 use super::GroupAckColdGcFuture;
@@ -103,6 +100,7 @@ use crate::request::CreateStreamResponse;
 use crate::request::DeferColdGcResponse;
 use crate::request::DeleteStreamRequest;
 use crate::request::DeleteStreamResponse;
+use crate::request::ExpireStreamsResponse;
 use crate::request::FlushColdRequest;
 use crate::request::FlushColdResponse;
 use crate::request::GroupReadStreamParts;
@@ -121,6 +119,7 @@ use crate::request::ReadSnapshotResponse;
 use crate::request::ReadStreamRequest;
 use crate::request::RouteWriteRequest;
 use crate::request::StreamAppendCount;
+use crate::request::TidyStreamsPass;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::request::TouchStreamAccessResponse;
@@ -129,17 +128,6 @@ use crate::request::WriteRoute;
 use crate::retention_gc::RetentionGcTarget;
 use crate::retention_gc::RetentionGcTracker;
 use crate::retention_gc::collect_retained_cold_objects;
-
-pub(crate) struct AppendPayloadInput<'a> {
-    stream_id: BucketStreamId,
-    content_type: Option<&'a str>,
-    payload: &'a [u8],
-    close_after: bool,
-    stream_seq: Option<String>,
-    producer: Option<ProducerRequest>,
-    now_ms: u64,
-    check: IncarnationCheck,
-}
 
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryGroupEngine {
@@ -326,31 +314,6 @@ impl InMemoryGroupEngine {
                     IncarnationCheck::Matched,
                 )
             }
-            // Appends skip `StreamStateMachine::apply` to keep the exact
-            // borrowed fast path (no TTL sweep on the append hot path).
-            StreamCommand::Append {
-                stream_id,
-                content_type,
-                payload,
-                close_after,
-                stream_seq,
-                producer,
-                now_ms,
-            } => self
-                .append_payload(
-                    AppendPayloadInput {
-                        stream_id,
-                        content_type: content_type.as_deref(),
-                        payload: &payload,
-                        close_after,
-                        stream_seq,
-                        producer,
-                        now_ms,
-                        check,
-                    },
-                    placement,
-                )
-                .map(GroupWriteResponse::Append),
             command => {
                 let stream_id = command_stream_id(&command);
                 // Commands whose pages the leader rewrote before proposing:
@@ -597,18 +560,29 @@ impl InMemoryGroupEngine {
                     incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
                 }))
             }
-            StreamResponse::Deleted => {
+            StreamResponse::Deleted { expired } => {
                 let stream_id = require_response_stream_id(stream_id, "deleted")?;
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                     placement,
                     group_commit_index: self.commit_index,
+                    expired,
                     hot_backlog: Some(self.write_hot_backlog(Some(&stream_id))),
                 }))
             }
             StreamResponse::ColdGcAcked { removed } => {
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::AckColdGc(AckColdGcResponse {
+                    placement,
+                    removed,
+                    group_commit_index: self.commit_index,
+                }))
+            }
+            StreamResponse::StreamsExpired { removed } => {
+                if removed > 0 {
+                    self.advance_commit_index();
+                }
+                Ok(GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
                     placement,
                     removed,
                     group_commit_index: self.commit_index,
@@ -847,86 +821,6 @@ impl InMemoryGroupEngine {
         Ok(Some(response))
     }
 
-    pub(crate) fn append_payload(
-        &mut self,
-        input: AppendPayloadInput<'_>,
-        placement: ShardPlacement,
-    ) -> Result<AppendResponse, GroupEngineError> {
-        let AppendPayloadInput {
-            stream_id,
-            content_type,
-            payload,
-            close_after,
-            stream_seq,
-            producer,
-            now_ms,
-            check,
-        } = input;
-        let stream_count_key = stream_id.clone();
-        let response = self.state_machine.append_borrowed(AppendStreamInput {
-            stream_id,
-            content_type,
-            payload,
-            close_after,
-            stream_seq,
-            producer,
-            now_ms,
-            kind: WriteKind::Append,
-            check,
-        });
-        self.append_response_from_stream(stream_count_key, response, placement)
-    }
-
-    fn append_response_from_stream(
-        &mut self,
-        stream_id: BucketStreamId,
-        response: StreamResponse,
-        placement: ShardPlacement,
-    ) -> Result<AppendResponse, GroupEngineError> {
-        match response {
-            StreamResponse::Appended {
-                offset,
-                next_offset,
-                closed,
-                producer,
-            } => {
-                let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
-                let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
-                if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
-                    self.advance_commit_index();
-                    self.state_machine.add_stream_append_count(&stream_id, 1);
-                }
-                let stream_append_count = self.state_machine.stream_append_count(&stream_id);
-                Ok(AppendResponse {
-                    placement,
-                    start_offset: offset,
-                    next_offset,
-                    stream_append_count,
-                    group_commit_index: self.commit_index,
-                    closed,
-                    producer,
-                    stream_hot_bytes,
-                    group_hot_bytes,
-                    incarnation: response_incarnation(&self.state_machine, Some(&stream_id)),
-                })
-            }
-            StreamResponse::Error {
-                code,
-                message,
-                next_offset,
-                context,
-            } => Err(GroupEngineError::stream_with_context(
-                code,
-                message,
-                next_offset,
-                context,
-            )),
-            other => Err(GroupEngineError::new(format!(
-                "unexpected append response: {other:?}"
-            ))),
-        }
-    }
-
     pub fn read_stream_plan(
         &mut self,
         request: &ReadStreamRequest,
@@ -975,14 +869,15 @@ impl InMemoryGroupEngine {
         self.state_machine.tidy_candidates(now_ms, limit)
     }
 
-    /// The stream the leader's expiry sweep names next at `now_ms`
-    /// ([`crate::expiry_sweep`]), `None` once none expired.
-    pub fn expiry_sweep_target(&self, now_ms: u64) -> Option<BucketStreamId> {
-        self.state_machine.expiry_sweep_target(now_ms)
+    /// Whether a stream of the group may have expired at `now_ms`, so that
+    /// the leader's expiry sweep proposes `ExpireStreams`
+    /// ([`crate::expiry_sweep`]). `false` is exact.
+    pub fn expiry_due(&self, now_ms: u64) -> bool {
+        self.state_machine.expiry_due(now_ms)
     }
 
     pub fn head_stream_after_access(
-        &mut self,
+        &self,
         request: &HeadStreamRequest,
         placement: ShardPlacement,
     ) -> Result<HeadStreamResponse, GroupEngineError> {
@@ -1753,37 +1648,44 @@ impl GroupEngine for InMemoryGroupEngine {
             let mut report = TidyStreamsResponse::default();
             if request.max_expiry_sweeps > 0 && crate::expiry_sweep::enabled() {
                 let now_ms = crate::expiry_sweep::sweep_now_ms(request.now_ms);
-                while let Some(stream_id) = self.expiry_sweep_target(now_ms) {
-                    if report.expiry_sweeps
-                        >= u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX)
-                    {
-                        report.expiry_due_groups = 1;
+                let max = u64::try_from(request.max_expiry_sweeps).unwrap_or(u64::MAX);
+                while self.expiry_due(now_ms) {
+                    if report.expiry_sweeps >= max {
+                        crate::expiry_sweep::capped(&mut report);
                         break;
                     }
-                    if let Err(err) = crate::expiry_sweep::settle(self.apply_committed_write(
-                        crate::expiry_sweep::command(stream_id, now_ms),
-                        placement,
-                    )) {
-                        crate::expiry_sweep::interrupted(
-                            placement.raft_group_id,
-                            &err,
-                            &mut report,
-                        );
-                        break;
-                    }
-                    report.expiry_sweeps = report.expiry_sweeps.saturating_add(1);
+                    let removed = match crate::expiry_sweep::settle(
+                        self.apply_committed_write(crate::expiry_sweep::command(now_ms), placement),
+                    ) {
+                        Ok(removed) => removed,
+                        Err(err) => {
+                            crate::expiry_sweep::interrupted(
+                                placement.raft_group_id,
+                                &err,
+                                &mut report,
+                            );
+                            break;
+                        }
+                    };
+                    crate::expiry_sweep::applied(&mut report, removed);
                 }
             }
+            let mut error = None;
             for stream_id in self.tidy_candidates(request.now_ms, request.max_streams) {
-                let response = self
-                    .tidy_stream(stream_id, request.now_ms, placement)
-                    .await?;
-                report.tidied = report.tidied.saturating_add(1);
-                if response.debt_remaining {
-                    report.debt_remaining = report.debt_remaining.saturating_add(1);
+                match self.tidy_stream(stream_id, request.now_ms, placement).await {
+                    Ok(response) => {
+                        report.tidied = report.tidied.saturating_add(1);
+                        if response.debt_remaining {
+                            report.debt_remaining = report.debt_remaining.saturating_add(1);
+                        }
+                    }
+                    Err(err) => {
+                        error = Some(err);
+                        break;
+                    }
                 }
             }
-            Ok(report)
+            TidyStreamsPass { report, error }
         })
     }
 
@@ -2416,7 +2318,8 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::AckColdGc { .. }
         | StreamCommand::DeferColdGc { .. }
         | StreamCommand::ImportSnapshot { .. }
-        | StreamCommand::NewHistory { .. } => None,
+        | StreamCommand::NewHistory { .. }
+        | StreamCommand::ExpireStreams { .. } => None,
         StreamCommand::CreateStream { stream_id, .. }
         | StreamCommand::CreateExternal { stream_id, .. }
         | StreamCommand::Append { stream_id, .. }
@@ -2428,7 +2331,7 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::FlushCold { stream_id, .. }
         | StreamCommand::CompactCold { stream_id, .. }
         | StreamCommand::Close { stream_id, .. }
-        | StreamCommand::DeleteStream { stream_id }
+        | StreamCommand::DeleteStream { stream_id, .. }
         | StreamCommand::TidyStream { stream_id, .. }
         | StreamCommand::OffloadColdRefs { stream_id, .. } => Some(stream_id.clone()),
         StreamCommand::IfIncarnation { command, .. } => command_stream_id(command),

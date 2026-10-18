@@ -1,5 +1,7 @@
 //! Bucket/stream lifecycle: create, close, delete, and TTL expiry.
 
+use std::num::NonZeroU32;
+
 use super::AppendStreamInput;
 use super::BucketStreamId;
 use super::ColdGcTarget;
@@ -305,18 +307,28 @@ impl StreamStateMachine {
         })
     }
 
-    pub(super) fn delete_stream(&mut self, stream_id: &BucketStreamId) -> StreamResponse {
+    /// Deletes a stream. A stream expired at `now_ms` is already gone to
+    /// every reader: the delete removes it all the same and answers
+    /// `Deleted { expired: true }`, which a client sees as 404, as for a
+    /// missing stream, so the answer does not depend on whether the expiry
+    /// sweep removed it first.
+    pub(super) fn delete_stream(
+        &mut self,
+        stream_id: &BucketStreamId,
+        now_ms: u64,
+    ) -> StreamResponse {
         if let Err(response) = self.validate_stream_scope(stream_id) {
             return response;
         }
-        let Some(_) = self.stream_metadata(stream_id) else {
+        let Some(stream) = self.stream_metadata(stream_id) else {
             return StreamResponse::error(
                 StreamErrorCode::StreamNotFound,
                 format!("stream '{stream_id}' does not exist"),
             );
         };
+        let expired = stream_is_expired(stream, now_ms);
         self.remove_stream_state(stream_id);
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired }
     }
 
     pub(super) fn touch_stream_access(
@@ -372,12 +384,14 @@ impl StreamStateMachine {
         false
     }
 
-    pub(super) fn sweep_expired_streams(&mut self, now_ms: u64, max_streams: usize) -> usize {
-        if max_streams == 0 {
-            return 0;
-        }
-        let mut removed = 0;
-        while removed < max_streams {
+    /// Applies [`StreamCommand::ExpireStreams`]: removes up to `limit`
+    /// streams expired at `now_ms`, in the TTL index's (expiry, bucket,
+    /// stream) order. Every side effect of a removal (cold GC, usage, the
+    /// removal tally) happens here, as for any removal.
+    pub(super) fn expire_streams(&mut self, now_ms: u64, limit: NonZeroU32) -> StreamResponse {
+        let limit = u64::from(limit.get());
+        let mut removed = 0u64;
+        while removed < limit {
             let Some(stream_id) = self.registry.pop_expired(now_ms) else {
                 break;
             };
@@ -385,7 +399,7 @@ impl StreamStateMachine {
                 removed = removed.saturating_add(1);
             }
         }
-        removed
+        StreamResponse::StreamsExpired { removed }
     }
 
     pub(super) fn remove_stream_state(&mut self, stream_id: &BucketStreamId) -> bool {
@@ -497,7 +511,7 @@ impl StreamStateMachine {
             }
             | StreamCommand::CreateExternal {
                 stream_id, now_ms, ..
-            } => (stream_id, Some(*now_ms), true),
+            } => (stream_id, *now_ms, true),
             StreamCommand::Append {
                 stream_id, now_ms, ..
             }
@@ -515,14 +529,13 @@ impl StreamStateMachine {
             }
             | StreamCommand::Close {
                 stream_id, now_ms, ..
-            } => (stream_id, Some(*now_ms), false),
-            // A delete carries no clock: it removes an expired stream too.
-            StreamCommand::DeleteStream { stream_id } => (stream_id, None, false),
+            }
+            | StreamCommand::DeleteStream { stream_id, now_ms } => (stream_id, *now_ms, false),
             _ => return None,
         };
         let current = self
             .stream_metadata(stream_id)
-            .filter(|stream| now_ms.is_none_or(|now_ms| !stream_is_expired(stream, now_ms)))
+            .filter(|stream| !stream_is_expired(stream, now_ms))
             .map(|stream| self.token_of(stream));
         match current {
             Some(current) if current == expected => None,

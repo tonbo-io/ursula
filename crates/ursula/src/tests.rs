@@ -6209,6 +6209,92 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
     assert_eq!(header_str(&response, names::STREAM_INCARNATION), current);
 }
 
+/// A `DELETE` of a stream that expired but is still in its group answers
+/// `404`, as for a missing stream, with and without `Stream-Incarnation`,
+/// whether or not the expiry sweep ran. It removes the stream like any
+/// delete, so a long-poll on the stream ends at once.
+#[tokio::test]
+async fn delete_of_an_expired_stream_answers_404_and_ends_its_long_poll() {
+    let now_ms = Arc::new(AtomicU64::new(1_000));
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    )
+    .with_wall_clock(TestWallClock {
+        now_ms: Arc::clone(&now_ms),
+    });
+    let app = cluster_router_from_state(state.clone()).merge(client_router_with_admission(
+        state,
+        IngressAdmission::default(),
+    ));
+    let plain = "/benchcmp/expired-delete";
+    let tokened = "/benchcmp/expired-delete-tokened";
+    let mut tails = Vec::new();
+    let mut tokens = Vec::new();
+    for uri in [plain, tokened] {
+        let response = http_put(
+            &app,
+            uri,
+            &[
+                (CONTENT_TYPE.as_str(), "text/plain"),
+                (HEADER_STREAM_TTL, "1"),
+            ],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        tails.push(header_str(&response, names::STREAM_NEXT_OFFSET).to_owned());
+        tokens.push(header_str(&response, names::STREAM_INCARNATION).to_owned());
+    }
+
+    let poll = tokio::spawn({
+        let app = app.clone();
+        let tail = tails[0].clone();
+        async move {
+            send(
+                &app,
+                "GET",
+                &format!("{plain}?offset={tail}&live=long-poll&timeout_ms=30000"),
+                &[],
+                Body::empty(),
+            )
+            .await
+        }
+    });
+    // Let the poll park before the stream expires.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    now_ms.store(2_000, Ordering::Relaxed);
+
+    let response = send(&app, "DELETE", plain, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = tokio::time::timeout(Duration::from_secs(10), poll)
+        .await
+        .expect("the long-poll ends on the delete")
+        .expect("poll task");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = send(&app, "DELETE", plain, &[], Body::empty()).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    let response = send(
+        &app,
+        "DELETE",
+        tokened,
+        &[(names::STREAM_INCARNATION, tokens[1].as_str())],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let response = http_head(&app, tokened).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
 /// Ingress admission as the server builds it, with an in-flight body budget
 /// of `bytes`.
 fn admission_with_body_budget(bytes: u64) -> IngressAdmission {
@@ -8309,6 +8395,7 @@ mod snapshot_driver {
         runtime
             .delete_stream(ursula_runtime::DeleteStreamRequest {
                 stream_id: deleted.clone(),
+                now_ms: 0,
                 if_incarnation: None,
             })
             .await
@@ -8333,7 +8420,9 @@ mod snapshot_driver {
         let expired_index =
             wait_until_removed(&runtime, &expiring_raft, 1, expiring_group, until_swept).await;
         let expired_at = Instant::now();
-        assert!(runtime.metrics().snapshot().ttl_expiry_sweeps >= 1);
+        let metrics = runtime.metrics().snapshot();
+        assert!(metrics.ttl_expiry_sweeps >= 1);
+        assert!(metrics.ttl_expiry_swept_streams >= 1);
 
         for (raft, removal, removed_at) in [
             (&deleted_raft, deleted_index, deleted_at),
@@ -8597,6 +8686,7 @@ mod snapshot_driver {
         node.runtime
             .delete_stream(ursula_runtime::DeleteStreamRequest {
                 stream_id: stream_id.clone(),
+                now_ms: 0,
                 if_incarnation: None,
             })
             .await
@@ -8899,6 +8989,7 @@ mod snapshot_driver {
         node.runtime
             .delete_stream(ursula_runtime::DeleteStreamRequest {
                 stream_id: stream_id.clone(),
+                now_ms: 0,
                 if_incarnation: None,
             })
             .await

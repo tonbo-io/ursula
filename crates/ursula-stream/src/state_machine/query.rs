@@ -31,9 +31,12 @@ impl StreamStateMachine {
         self.stream_metadata(stream_id)
     }
 
-    pub fn head_at(&mut self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {
-        self.expire_stream_if_due(stream_id, now_ms);
+    /// The stream's metadata, `None` when it is missing or expired at
+    /// `now_ms`. It never removes the stream: an expired stream leaves state
+    /// only through a replicated command.
+    pub fn head_at(&self, stream_id: &BucketStreamId, now_ms: u64) -> Option<&StreamMetadata> {
         self.stream_metadata(stream_id)
+            .filter(|stream| !stream_is_expired(stream, now_ms))
     }
 
     pub fn access_requires_write(
@@ -55,14 +58,14 @@ impl StreamStateMachine {
         Ok(renew_ttl && stream_ttl_renewal_due(stream, now_ms))
     }
 
-    /// The stream a leader's background expiry sweep names in the
-    /// `TouchStreamAccess { renew_ttl: false }` it proposes at `now_ms`
-    /// (bounded-stream-state F0), or `None` once no stream has expired at
-    /// `now_ms`. O(1): the front of the TTL index. The name may be stale, of
-    /// a stream removed or renewed since its entry was armed. The command's
-    /// apply still sweeps at `now_ms`, which discards or re-arms that front,
-    /// so each command makes progress.
-    pub fn expiry_sweep_target(&self, now_ms: u64) -> Option<BucketStreamId> {
+    /// Whether a stream of the group may have expired at `now_ms`, so that
+    /// a leader's background sweep proposes
+    /// [`crate::StreamCommand::ExpireStreams`] (bounded-stream-state F0).
+    /// O(1): the front of the TTL index. `false` is exact. `true` may come
+    /// from a stale front, of a stream removed or renewed since its entry
+    /// was armed. The command still discards or re-arms that front, so each
+    /// command makes progress.
+    pub fn expiry_due(&self, now_ms: u64) -> bool {
         self.registry.ttl_front_due(now_ms)
     }
 

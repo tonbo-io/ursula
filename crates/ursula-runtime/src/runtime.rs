@@ -97,6 +97,7 @@ use crate::request::ReadStreamRequest;
 use crate::request::ReadStreamResponse;
 use crate::request::RouteWriteRequest;
 use crate::request::RoutedWrite;
+use crate::request::TidyStreamsPass;
 use crate::request::TidyStreamsRequest;
 use crate::request::TidyStreamsResponse;
 use crate::rt::sync::Semaphore;
@@ -995,43 +996,44 @@ impl ShardRuntime {
 
     /// One leader-side tidy pass over every Raft group (bounded-state F0):
     /// each group this node leads first sweeps expired streams with at most
-    /// `max_expiry_sweeps_per_group` commands ([`crate::expiry_sweep`]),
-    /// then proposes `TidyStream` for at most `max_streams_per_group`
-    /// streams with normalization debt. A failing group does not stop the
-    /// others; the first error is returned after every group had its pass.
+    /// `request.max_expiry_sweeps` `ExpireStreams` entries
+    /// ([`crate::expiry_sweep`]), then proposes `TidyStream` for at most
+    /// `request.max_streams` streams with normalization debt. A failing
+    /// group does not stop the others. The pass returns the totals of every
+    /// group, those whose pass failed included, with the first error.
     pub async fn tidy_streams_all_groups_once(
         &self,
-        max_streams_per_group: usize,
-        max_expiry_sweeps_per_group: usize,
-        now_ms: u64,
-    ) -> Result<TidyStreamsResponse, RuntimeError> {
+        request: TidyStreamsRequest,
+    ) -> TidyStreamsPass<RuntimeError> {
         let mut total = TidyStreamsResponse::default();
         let mut first_error = None;
         for group_id in 0..self.shard_map.raft_group_count() {
-            let request = TidyStreamsRequest {
-                max_streams: max_streams_per_group,
-                max_expiry_sweeps: max_expiry_sweeps_per_group,
-                now_ms,
-            };
-            match self.tidy_streams(RaftGroupId(group_id), request).await {
-                Ok(report) => total.add(&report),
-                Err(err) => {
-                    tracing::warn!(
-                        raft_group_id = group_id,
-                        error = %err,
-                        "tidy pass failed; continuing with remaining groups"
-                    );
-                    first_error.get_or_insert(err);
+            let error = match self.tidy_streams(RaftGroupId(group_id), request).await {
+                Ok(pass) => {
+                    total.add(&pass.report);
+                    pass.error
                 }
+                Err(err) => Some(err),
+            };
+            if let Some(err) = error {
+                tracing::warn!(
+                    raft_group_id = group_id,
+                    error = %err,
+                    "tidy pass failed; continuing with remaining groups"
+                );
+                first_error.get_or_insert(err);
             }
         }
-        if max_expiry_sweeps_per_group > 0 {
-            self.metrics
-                .record_ttl_expiry_sweep(total.expiry_sweeps, total.expiry_due_groups);
+        if request.max_expiry_sweeps > 0 {
+            self.metrics.record_ttl_expiry_sweep(
+                total.expiry_sweeps,
+                total.expiry_swept_streams,
+                total.expiry_due_groups,
+            );
         }
-        match first_error {
-            Some(err) => Err(err),
-            None => Ok(total),
+        TidyStreamsPass {
+            report: total,
+            error: first_error,
         }
     }
 

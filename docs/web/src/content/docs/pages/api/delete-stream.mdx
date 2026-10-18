@@ -20,7 +20,7 @@ api: "DELETE /{bucket}/{stream}"
 | Status | Meaning |
 | ------ | ----------------- |
 | `204` | Stream deleted. |
-| `404` | Stream not found. |
+| `404` | Stream not found or expired. |
 | `412` | `Stream-Incarnation` did not match: the stream is another incarnation, which was not deleted. The response's `Stream-Incarnation` is its token. |
 
 <RequestExample>
