@@ -1,0 +1,34 @@
+# Scratch run for the 0.9 epoch lane, never merged: on a push to scratch/**,
+# runs scripts/scratch.sh and uploads target/backup-format-4.
+name: Scratch
+
+on:
+  push:
+    branches: ["scratch/**"]
+
+permissions:
+  contents: read
+
+jobs:
+  x64:
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
+    timeout-minutes: 90
+    steps:
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+      - name: Scratch
+        run: bash scripts/scratch.sh
+      - name: Upload fixture
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: backup-format-4
+          path: target/backup-format-4/
+          if-no-files-found: ignore
+          retention-days: 3

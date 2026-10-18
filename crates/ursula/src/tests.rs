@@ -13642,3 +13642,331 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
         Reason::RaftReplicaUnready,
     ]);
 }
+
+/// Scratch only, never merged: writes the backup-format-4 fixture that 0.9
+/// restores. Run at v0.8.2 on CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "generates the backup-format-4 fixture"]
+async fn a0_09_generate_backup_format_4_fixture() {
+    use std::sync::Mutex;
+
+    async fn ok(response: Response, context: &str) -> Bytes {
+        let status = response.status();
+        let headers = format!("{:?}", response.headers());
+        let body = body_bytes(response).await;
+        assert!(
+            status.is_success(),
+            "{context}: {status} {headers} {}",
+            String::from_utf8_lossy(&body)
+        );
+        println!("{context}: {status} {headers}");
+        body
+    }
+    fn make(cold_store: &ColdStoreHandle) -> Router {
+        let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
+            RuntimeConfig::new(1, 1),
+            InMemoryGroupEngineFactory::with_cold_store(Some(cold_store.clone())),
+            Some(cold_store.clone()),
+        )
+        .expect("runtime");
+        router_with_http_state(HttpState::new(runtime).with_external_payload_min_bytes(16))
+    }
+
+    let out = PathBuf::from(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../target/backup-format-4"
+    ));
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).expect("output dir");
+
+    let cold_store: ColdStoreHandle = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let written = Arc::new(Mutex::new(BTreeSet::<String>::new()));
+    {
+        let written = written.clone();
+        cold_store.set_observer(move |event| {
+            if let ursula_runtime::ColdStoreEvent::WriteChunkComplete { path, .. } = event {
+                written.lock().unwrap().insert(path);
+            }
+        });
+    }
+    let a = make(&cold_store);
+    let json = [(CONTENT_TYPE.as_str(), "application/json")];
+    let text = [(CONTENT_TYPE.as_str(), "text/plain")];
+    let octets = [(CONTENT_TYPE.as_str(), "application/octet-stream")];
+
+    // tenant-a/orders: JSON messages, an app snapshot and a retention floor at 18.
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/orders",
+            &json,
+            Body::from(r#"[{"id":1},{"id":2}]"#),
+        )
+        .await,
+        "orders create",
+    )
+    .await;
+    ok(
+        http_post(&a, "/tenant-a/orders", &json, Body::from(r#"{"id":3}"#)).await,
+        "orders append",
+    )
+    .await;
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/orders/snapshot/00000000000000000018",
+            &json,
+            Body::from(r#"{"count":2}"#),
+        )
+        .await,
+        "orders snapshot",
+    )
+    .await;
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/orders/retention/00000000000000000018",
+            &[],
+            Body::empty(),
+        )
+        .await,
+        "orders retention",
+    )
+    .await;
+
+    // tenant-a/cold: flushed to a cold chunk and an index page.
+    ok(
+        http_put(&a, "/tenant-a/cold", &text, Body::from("abcdef")).await,
+        "cold create",
+    )
+    .await;
+    ok(
+        http_post(
+            &a,
+            "/__ursula/flush-cold/tenant-a/cold?min_hot_bytes=4&max_bytes=4",
+            &[],
+            Body::empty(),
+        )
+        .await,
+        "cold flush",
+    )
+    .await;
+
+    // tenant-a/external: an external payload and a snapshot body in the cold tier.
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/external",
+            &octets,
+            Body::from("external-payload-0123456789-abcdefghijkl"),
+        )
+        .await,
+        "external create",
+    )
+    .await;
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/external/snapshot/00000000000000000040",
+            &octets,
+            Body::from("snapshot-body-0123456789-abcdefg"),
+        )
+        .await,
+        "external snapshot",
+    )
+    .await;
+
+    // tenant-b/journal: a closed byte stream.
+    ok(
+        http_put(&a, "/tenant-b/journal", &text, Body::from("raw-payload")).await,
+        "journal create",
+    )
+    .await;
+    ok(
+        http_post(
+            &a,
+            "/tenant-b/journal",
+            &[("stream-closed", "true")],
+            Body::empty(),
+        )
+        .await,
+        "journal close",
+    )
+    .await;
+
+    // tenant-a/keyed: a producer with digests, and a claim that closes epoch 0.
+    ok(
+        http_put(&a, "/tenant-a/keyed", &text, Body::empty()).await,
+        "keyed create",
+    )
+    .await;
+    for (epoch, seq, body) in [("0", "0", "k0"), ("0", "1", "k1"), ("1", "0", "k2")] {
+        let digest = blake3::hash(body.as_bytes()).to_hex().to_string();
+        ok(
+            http_post(
+                &a,
+                "/tenant-a/keyed",
+                &[
+                    (CONTENT_TYPE.as_str(), "text/plain"),
+                    (ursula_headers::names::PRODUCER_ID, "writer"),
+                    (ursula_headers::names::PRODUCER_EPOCH, epoch),
+                    (ursula_headers::names::PRODUCER_SEQ, seq),
+                    (ursula_headers::names::PRODUCER_DIGEST, digest.as_str()),
+                ],
+                Body::from(body),
+            )
+            .await,
+            &format!("keyed epoch {epoch} seq {seq}"),
+        )
+        .await;
+    }
+
+    // tenant-a/ttl: a stream with a TTL.
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/ttl",
+            &[
+                (CONTENT_TYPE.as_str(), "text/plain"),
+                (HEADER_STREAM_TTL, "86400"),
+            ],
+            Body::from("ttl"),
+        )
+        .await,
+        "ttl create",
+    )
+    .await;
+
+    // tenant-c: purged, so the group keeps an erased bucket.
+    ok(
+        http_put(&a, "/tenant-c/doomed", &text, Body::from("doomed")).await,
+        "doomed create",
+    )
+    .await;
+    ok(http_delete(&a, "/__ursula/purge/tenant-c").await, "purge").await;
+
+    // tenant-a/gone: flushed to cold, then deleted, so a cold GC entry remains.
+    ok(
+        http_put(&a, "/tenant-a/gone", &text, Body::from("ghijkl")).await,
+        "gone create",
+    )
+    .await;
+    ok(
+        http_post(
+            &a,
+            "/__ursula/flush-cold/tenant-a/gone?min_hot_bytes=4&max_bytes=4",
+            &[],
+            Body::empty(),
+        )
+        .await,
+        "gone flush",
+    )
+    .await;
+    ok(http_delete(&a, "/tenant-a/gone").await, "gone delete").await;
+
+    // Import A's group into B, which shares the cold store, and grow orders.
+    let export = ok(http_get(&a, "/__ursula/backup/group/0").await, "export A").await;
+    std::fs::write(out.join("a-export.snapshot"), &export).expect("write A export");
+    let b = make(&cold_store);
+    let digest = blake3::hash(&export).to_hex().to_string();
+    ok(
+        http_post(
+            &b,
+            "/__ursula/backup/group/0/import",
+            &[
+                (CONTENT_TYPE.as_str(), "application/x-msgpack"),
+                ("x-ursula-backup-blake3", digest.as_str()),
+            ],
+            Body::from(export.clone()),
+        )
+        .await,
+        "import into B",
+    )
+    .await;
+    ok(
+        http_post(&b, "/tenant-a/orders", &json, Body::from(r#"{"id":4}"#)).await,
+        "orders append on B",
+    )
+    .await;
+
+    // ursulactl backup-create against B over TCP.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let served = b.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, served).await.expect("serve B");
+    });
+    let client = ursula_ctl::backup::BackupClient::new(
+        ursula_ctl::MetricsClient::new(Duration::from_secs(5)).unwrap(),
+        vec![ursula_ctl::NodeInfo {
+            id: 1,
+            host: addr.to_string(),
+            admin_url: format!("http://{addr}").parse().unwrap(),
+            http_url: None,
+            metrics_url: None,
+            client_url: None,
+            expected_process_incarnation: None,
+            expected_maintenance_fence: None,
+        }],
+    )
+    .unwrap();
+    let store = ursula_ctl::backup::BackupStore::open(out.to_str().unwrap()).unwrap();
+    let manifest = ursula_ctl::backup::create(&client, &store, 1_760_000_000_000)
+        .await
+        .expect("backup create");
+    println!("manifest: {manifest:?}");
+    let report = ursula_ctl::backup::verify(&store).await.expect("verify");
+    println!("verify: {report:?}");
+    server.abort();
+
+    // Every cold object that exists: what was written through write_chunk,
+    // the index pages, and the snapshot bodies the backup references.
+    let group = std::fs::read(out.join("group-0000.snapshot")).expect("group object");
+    let snapshot: ursula_runtime::StreamSnapshot =
+        rmp_serde::from_slice(&group).expect("decode group");
+    let mut candidates = written.lock().unwrap().clone();
+    for page in cold_store.list_cold_index_pages().await.expect("pages") {
+        candidates.insert(page.path());
+    }
+    for entry in &snapshot.streams {
+        if let Some(object) = entry
+            .visible_snapshot
+            .as_ref()
+            .and_then(|visible| visible.object.as_ref())
+        {
+            candidates.insert(object.s3_path.clone());
+        }
+        for chunk in &entry.cold_chunks {
+            candidates.insert(chunk.s3_path.clone());
+        }
+        for segment in &entry.external_segments {
+            candidates.insert(segment.s3_path.clone());
+        }
+    }
+    let mut objects = BTreeMap::<String, Vec<u8>>::new();
+    for key in candidates {
+        match cold_store.object_size(&key).await {
+            Ok(size) => {
+                let bytes = cold_store
+                    .read_whole_object_range(&key, size, 0, usize::try_from(size).unwrap())
+                    .await
+                    .expect("read cold object");
+                println!("cold object {key}: {size} bytes");
+                objects.insert(key, bytes);
+            }
+            Err(err) => println!("cold object {key}: absent ({err})"),
+        }
+    }
+    std::fs::write(
+        out.join("cold-objects.json"),
+        serde_json::to_vec(&objects).expect("encode cold objects"),
+    )
+    .expect("write cold objects");
+    let check = ursula_runtime::check_cold_references(Some(&cold_store), snapshot)
+        .await
+        .expect("cold check");
+    println!("cold check: {check:?}");
+    assert_eq!(check.missing, 0);
+}
