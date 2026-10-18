@@ -804,7 +804,9 @@ fn a_snapshot_record_is_published_after_the_journal_syncs() {
             machine
                 .install_snapshot(
                     &meta,
-                    std::io::Cursor::new(pointer.encode_binary().expect("encode the pointer")),
+                    crate::types::SnapshotData::new(
+                        pointer.encode_binary().expect("encode the pointer"),
+                    ),
                 )
                 .await
                 .expect("install the snapshot");

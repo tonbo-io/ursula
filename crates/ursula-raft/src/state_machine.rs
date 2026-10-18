@@ -4228,6 +4228,7 @@ mod tests {
                 log_mark: GroupLogMark::default(),
                 references: Arc::clone(&references),
                 snapshot_metadata_path: None,
+                snapshot_journal: None,
                 work: token,
             };
             let error = {

@@ -5286,7 +5286,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
         machine
             .install_snapshot(
                 &meta,
-                std::io::Cursor::new(pointer.encode_binary().unwrap()),
+                crate::types::SnapshotData::new(pointer.encode_binary().unwrap()),
             )
             .await
             .unwrap();
