@@ -466,6 +466,25 @@ pub enum GroupInfraError {
     RecoveryPending { raft_group_id: RaftGroupId },
     #[error("the Raft owner has stopped")]
     OwnerStopped,
+    /// A group engine's shutdown waited `waited_ms` for the work OpenRaft
+    /// runs for the engine on tasks of its own (its state-machine worker,
+    /// the snapshot builds it spawned, its network clients and log
+    /// readers), and some of it still runs (#709). The group does not open
+    /// again in this process until that work ended.
+    #[error(
+        "raft group {raft_group_id:?}: OpenRaft work of the stopped engine still runs after {waited_ms} ms"
+    )]
+    EngineWorkOutlivedShutdown {
+        raft_group_id: RaftGroupId,
+        waited_ms: u64,
+    },
+    /// The OpenRaft work of the group's previous engine on this node still
+    /// runs (#709): the group does not open while that work may still change
+    /// its state. Refused at once, before any engine starts. Retryable.
+    #[error(
+        "raft group {raft_group_id:?} does not open: OpenRaft work of its previous engine still runs"
+    )]
+    PreviousEngineWorkRunning { raft_group_id: RaftGroupId },
     #[error("write outcome is unknown; the proposal may have committed")]
     OutcomeUnknown,
     /// A read or write of the cold tier failed. The store's error is logged
@@ -633,7 +652,9 @@ impl GroupInfraError {
         match self {
             Self::ColdBackpressure { .. }
             | Self::RaftUncommittedBackpressure { .. }
-            | Self::RecoveryPending { .. } => ErrorStatus::Temporary,
+            | Self::RecoveryPending { .. }
+            | Self::EngineWorkOutlivedShutdown { .. }
+            | Self::PreviousEngineWorkRunning { .. } => ErrorStatus::Temporary,
             Self::Snapshot(error) => error.status(),
             Self::RecoveryNodeMismatch { .. }
             | Self::RaftGroupNotRegistered { .. }
@@ -678,7 +699,10 @@ impl GroupInfraError {
             | Self::RaftUncommittedBackpressure { .. }
             | Self::RecoveryPending { .. }
             | Self::Unsupported { .. }
-            | Self::ColdCompactionStale { .. } => WriteEffect::NotProposed,
+            | Self::ColdCompactionStale { .. }
+            // No engine of the group runs on the node.
+            | Self::EngineWorkOutlivedShutdown { .. }
+            | Self::PreviousEngineWorkRunning { .. } => WriteEffect::NotProposed,
             Self::Snapshot(error) => error.write_effect(),
             Self::RecoveryNodeMismatch { .. }
             | Self::RaftGroupNotRegistered { .. }
@@ -722,7 +746,9 @@ impl GroupInfraError {
             | Self::RecoveryPlanFenced { .. }
             | Self::OwnerStopped
             | Self::ApplyStopped { .. }
-            | Self::OutcomeUnknown => true,
+            | Self::OutcomeUnknown
+            | Self::EngineWorkOutlivedShutdown { .. }
+            | Self::PreviousEngineWorkRunning { .. } => true,
             Self::Snapshot(error) => error.peer_backs_off(),
             Self::RecoveryNodeMismatch { .. }
             | Self::RaftGroupNotRegistered { .. }

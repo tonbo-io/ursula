@@ -133,6 +133,7 @@ impl SimFaultPlan {
             SimScenario::MarkedChunksNeverContradict => Vec::new(),
             SimScenario::RecoveryPlanMembershipRollback => Vec::new(),
             SimScenario::DeletedDataLeavesWithinBound => Vec::new(),
+            SimScenario::EngineRestartLeavesNoWork => Vec::new(),
             SimScenario::HttpProtocolSurfaceRandomized => vec![SimFaultStep {
                 phase: "http_protocol_surface_workload".to_owned(),
                 action: SimFaultAction::RunHttpProtocolSurfaceWorkload {

@@ -304,6 +304,13 @@ fn infra_errors() -> Vec<GroupInfraError> {
             raft_group_id: GROUP,
         },
         GroupInfraError::OwnerStopped => GroupInfraError::OwnerStopped,
+        GroupInfraError::EngineWorkOutlivedShutdown { .. } => GroupInfraError::EngineWorkOutlivedShutdown {
+            raft_group_id: GROUP,
+            waited_ms: 30_000,
+        },
+        GroupInfraError::PreviousEngineWorkRunning { .. } => GroupInfraError::PreviousEngineWorkRunning {
+            raft_group_id: GROUP,
+        },
         GroupInfraError::OutcomeUnknown => GroupInfraError::OutcomeUnknown,
         GroupInfraError::ColdStore { .. } => GroupInfraError::ColdStore {
             operation: ColdOperation::RepairIndex,

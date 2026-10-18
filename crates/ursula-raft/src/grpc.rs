@@ -43,7 +43,6 @@ use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::FollowerRead;
-use ursula_runtime::GroupEngine;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::BucketStreamId;
@@ -53,7 +52,6 @@ use crate::codec::decode_wire;
 use crate::codec::encode_wire;
 use crate::codec::placement_from_parts;
 use crate::codec::required;
-use crate::engine::RaftGroupEngine;
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
 use crate::format_epoch::observe_outbound_status;
 use crate::format_epoch::record_format_epoch_mismatch;
@@ -1003,13 +1001,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let log_gauge = entry.log_gauge.clone();
             let result = raft
                 .call(move |raft| async move {
-                    let mut engine = RaftGroupEngine {
-                        rejoin: Default::default(),
+                    let engine = crate::engine::ForwardedReadEngine {
                         history,
                         apply_health,
-                        snapshot_installs: Arc::default(),
-                        metadata_serial: Arc::default(),
-                        recovery_tasks: crate::rejoin::RecoveryGate::default(),
                         raft,
                         placement,
                         read_barrier,
@@ -1979,7 +1973,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         &mut self,
         vote: VoteOf<UrsulaRaftTypeConfig>,
         snapshot: SnapshotOf<UrsulaRaftTypeConfig>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
+        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
         // The lease keeps the object the pointer names until the RPC returns.
@@ -1996,15 +1990,19 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         GRPC_SNAPSHOT_REQUEST_BYTES.fetch_add(request.encoded_len() as u64, Ordering::Relaxed);
         GRPC_SNAPSHOT_PAYLOAD_BYTES
             .fetch_add(request.snapshot_payload.len() as u64, Ordering::Relaxed);
-        let ack = self
-            .call(
-                "FullSnapshot",
-                request,
-                option,
-                |mut client, request| async move { client.full_snapshot(request).await },
-            )
-            .await
-            .map_err(StreamingError::from)?;
+        // RaftCore cancels a send it no longer wants, such as one to a
+        // follower that caught up, and every send once it stops (#709).
+        let sent = self.call(
+            "FullSnapshot",
+            request,
+            option,
+            |mut client, request| async move { client.full_snapshot(request).await },
+        );
+        let ack = crate::rt::select! {
+            biased;
+            closed = cancel => return Err(StreamingError::Closed(closed)),
+            ack = sent => ack.map_err(StreamingError::from)?,
+        };
         GRPC_SNAPSHOT_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
         self.decode_rpc_ack("FullSnapshot", &ack.response)
             .map_err(StreamingError::from)
@@ -2907,6 +2905,8 @@ mod group_rpc_status_tests {
                 | GroupInfraError::RecoveryPlanFenced { .. }
                 | GroupInfraError::OwnerStopped
                 | GroupInfraError::ApplyStopped { .. }
+                | GroupInfraError::EngineWorkOutlivedShutdown { .. }
+                | GroupInfraError::PreviousEngineWorkRunning { .. }
                 | GroupInfraError::OutcomeUnknown
                 | GroupInfraError::Snapshot(
                     GroupSnapshotError::ForeignKey { .. }

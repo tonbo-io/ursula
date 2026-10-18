@@ -33,6 +33,10 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             GroupInfraError::ColdBackpressure { .. }
             | GroupInfraError::RaftUncommittedBackpressure { .. }
             | GroupInfraError::RecoveryPending { .. } => (Temporary, NotProposed, false),
+            // No engine of the group runs on the node; a peer backs off
+            // until it does.
+            GroupInfraError::EngineWorkOutlivedShutdown { .. }
+            | GroupInfraError::PreviousEngineWorkRunning { .. } => (Temporary, NotProposed, true),
             GroupInfraError::Unsupported { .. } | GroupInfraError::ColdCompactionStale { .. } => {
                 (Persistent, NotProposed, false)
             }

@@ -399,6 +399,7 @@ pub const INVENTORY: &[Row] = {
         "raft-uncommitted-backpressure", Node, ProducerAppend, 503, S::Plain, Some(C::RaftUncommittedBackpressure), Refused(C::RaftUncommittedBackpressure);
         "history-pending", Node, ProducerAppend, 503, S::Plain, Some(C::HistoryPending), Refused(C::HistoryPending);
         "apply-stopped", Node, ProducerAppend, 503, S::Plain, Some(C::ApplyStopped), Refused(C::ApplyStopped);
+        "group-restarting", Node, ProducerAppend, 503, S::Plain, Some(C::GroupRestarting), Refused(C::GroupRestarting);
         "json-boundary-unverified", Node, SnapshotPublish, 503, S::Plain, Some(C::JsonBoundaryUnverified), Refused(C::JsonBoundaryUnverified);
         "snapshot-commits-busy", Node, PartsCommit, 503, S::Plain, Some(C::SnapshotCommitsBusy), Refused(C::SnapshotCommitsBusy);
         "snapshot-commit-in-progress", Node, PartsCommit, 503, S::Plain, Some(C::SnapshotCommitInProgress), Unknown;

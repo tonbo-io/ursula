@@ -125,6 +125,11 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         }
         GroupInfraError::RecoveryPending { .. } => unavailable(ErrorCode::HistoryPending),
         GroupInfraError::ApplyStopped { .. } => unavailable(ErrorCode::ApplyStopped),
+        // No engine of the group runs, so nothing was proposed.
+        GroupInfraError::EngineWorkOutlivedShutdown { .. }
+        | GroupInfraError::PreviousEngineWorkRunning { .. } => {
+            unavailable(ErrorCode::GroupRestarting)
+        }
         GroupInfraError::OutcomeUnknown => unavailable(ErrorCode::OutcomeUnknown),
         // Refused before proposal: nothing was written and a retry fails too.
         GroupInfraError::InvalidRaftCommand { .. } => {

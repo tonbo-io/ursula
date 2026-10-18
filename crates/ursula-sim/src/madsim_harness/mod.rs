@@ -164,6 +164,7 @@ pub enum SimScenario {
     MarkedChunksNeverContradict,
     RecoveryPlanMembershipRollback,
     DeletedDataLeavesWithinBound,
+    EngineRestartLeavesNoWork,
 }
 
 #[derive(Clone)]
@@ -215,6 +216,7 @@ impl SimScenario {
             Self::MarkedChunksNeverContradict => "marked-chunks-never-contradict",
             Self::RecoveryPlanMembershipRollback => "recovery-plan-membership-rollback",
             Self::DeletedDataLeavesWithinBound => "deleted-data-leaves-within-bound",
+            Self::EngineRestartLeavesNoWork => "engine-restart-leaves-no-work",
         }
     }
 }
@@ -558,6 +560,7 @@ use cold_path::run_cold_write_delay_inner;
 use cold_path::run_cold_write_fault_inner;
 mod accepted_loss;
 mod deleted_data;
+mod engine_restart;
 mod history;
 mod http;
 mod immutable_reads;
@@ -805,9 +808,12 @@ impl GroupEngineFactory for MadsimScopedRaftGroupEngineFactory {
         let wal = self.wal.clone();
         Box::pin(MadsimOpenRaftRuntime::scope(seed, async move {
             let log_store = wal.open(placement, metrics.clone()).await;
-            let inner =
-                RaftGroupEngine::new_single_node_on_log_store(placement, log_store, Some(metrics))
-                    .await?;
+            let inner = RaftGroupEngine::new_single_node_on_log_store_with_options(
+                placement,
+                log_store,
+                wal.recording_work(sim_wal::engine_options(Some(metrics), None)),
+            )
+            .await?;
             let engine: Box<dyn GroupEngine> = Box::new(MadsimScopedGroupEngine {
                 seed,
                 inner: Box::new(inner),

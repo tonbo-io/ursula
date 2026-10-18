@@ -558,11 +558,14 @@ impl InProcessRaftNetwork {
         Ok(())
     }
 
-    async fn before_streaming_rpc(
+    async fn before_streaming_rpc<F>(
         &self,
         kind: InProcessRaftRpcKind,
-        cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-    ) -> Result<(), StreamingError<UrsulaRaftTypeConfig>> {
+        cancel: std::pin::Pin<&mut F>,
+    ) -> Result<(), StreamingError<UrsulaRaftTypeConfig>>
+    where
+        F: Future<Output = ReplicationClosed> + OptionalSend,
+    {
         let decision = self.policy.decision(self.source, self.target, kind);
         self.policy.notify(InProcessRaftNetworkEvent::RpcDecision {
             source: decision.source,
@@ -579,7 +582,6 @@ impl InProcessRaftNetwork {
         if let Some(delay) = decision.delay {
             let sleep = sleep_in_process_raft_network(delay);
             futures_util::pin_mut!(sleep);
-            futures_util::pin_mut!(cancel);
             match futures_util::future::select(sleep, cancel).await {
                 futures_util::future::Either::Left((_done, _cancel)) => {}
                 futures_util::future::Either::Right((closed, _sleep)) => {
@@ -690,7 +692,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
-        self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel)
+        let mut cancel = std::pin::pin!(cancel);
+        self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel.as_mut())
             .await?;
         self.registry.record_full_snapshot(self.target);
         let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
@@ -707,22 +710,27 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::FullSnapshot,
         });
-        target
-            .install_full_snapshot(group, vote, snapshot)
-            .await
-            .map_err(|err| {
-                let message = format!(
-                    "remote full snapshot on node {}: {}",
-                    self.target,
-                    ursula_runtime::ErrorChain(&err)
-                );
-                let backs_off = install_error_backs_off(&err);
-                if backs_off {
-                    StreamingError::Unreachable(Unreachable::from_string(message))
-                } else {
-                    StreamingError::Network(NetworkError::from_string(message))
-                }
-            })
+        // RaftCore cancels a send it no longer wants, and every send once it
+        // stops, as the gRPC network honours it (#709).
+        let install = std::pin::pin!(target.install_full_snapshot(group, vote, snapshot));
+        let installed = match futures_util::future::select(install, cancel).await {
+            futures_util::future::Either::Left((installed, _cancel)) => installed,
+            futures_util::future::Either::Right((closed, _install)) => {
+                return Err(StreamingError::Closed(closed));
+            }
+        };
+        installed.map_err(|err| {
+            let message = format!(
+                "remote full snapshot on node {}: {}",
+                self.target,
+                ursula_runtime::ErrorChain(&err)
+            );
+            if install_error_backs_off(&err) {
+                StreamingError::Unreachable(Unreachable::from_string(message))
+            } else {
+                StreamingError::Network(NetworkError::from_string(message))
+            }
+        })
     }
 
     async fn transfer_leader(

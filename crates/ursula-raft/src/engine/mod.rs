@@ -158,6 +158,39 @@ pub struct RaftGroupEngineOptions {
     /// the reads and purges it forwards to a leader, and where a leader's
     /// refusal is recorded. `None` for a replica without a gRPC transport.
     pub peer_cluster: Option<crate::PeerCluster>,
+    /// How long the engine's shutdown waits for OpenRaft's work, for tests;
+    /// [`crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT`] otherwise.
+    #[cfg(test)]
+    pub(crate) work_stop_timeout: Option<Duration>,
+    /// The WAL's ledger of each group's latest engine (#709). The engine
+    /// records its OpenRaft work as soon as its Raft starts, so a start that
+    /// fails after that still keeps the group closed until the work ended.
+    pub(crate) engine_work: Option<crate::openraft_work::EngineWorkLedger>,
+    /// A failure injected once the Raft started, for tests.
+    #[cfg(test)]
+    pub(crate) startup_fault: Option<StartupFault>,
+}
+
+impl RaftGroupEngineOptions {
+    /// These options, with the engine recording its OpenRaft work in
+    /// `wal`'s ledger as the node's engine factories record theirs (#709),
+    /// for simulations that build their engines themselves.
+    #[cfg(madsim)]
+    pub fn recording_work_in(self, wal: &crate::RaftWal) -> Self {
+        Self {
+            engine_work: Some(wal.engine_work_ledger()),
+            ..self
+        }
+    }
+}
+
+/// A start of a single-node engine that fails once its Raft started, for
+/// tests: its state-machine worker runs an external function that waits
+/// for `release` first, so the failed engine's work outlives its start.
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct StartupFault {
+    pub(crate) release: Arc<crate::rt::sync::Notify>,
 }
 
 pub struct RaftGroupEngine {
@@ -166,7 +199,9 @@ pub struct RaftGroupEngine {
     /// is pending (#581 sections 4.3 and 4.5).
     pub(crate) history: Arc<crate::history::GroupHistory>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
-    pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
+    /// Admits the snapshot installs peers send, each holding the engine's
+    /// token until its publication ends (#709).
+    pub(crate) snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
     pub(crate) metadata_serial:
         Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
     pub(crate) recovery_tasks: crate::rejoin::RecoveryGate,
@@ -182,6 +217,175 @@ pub struct RaftGroupEngine {
     /// The state machine's log gauge, which also holds its applied
     /// membership (#613).
     pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
+    /// The work OpenRaft runs for this engine on tasks of its own, which
+    /// [`Self::shutdown`] waits for (#709).
+    pub(crate) openraft_work: crate::openraft_work::OpenRaftWork,
+    /// What dropping the engine stops, until its shutdown ran (#709).
+    pub(crate) drop_stop: std::sync::Mutex<DropStop>,
+    /// How long [`Self::shutdown`] waits for that work.
+    pub(crate) work_stop_timeout: Duration,
+}
+
+/// What dropping a group engine stops (#709).
+pub(crate) enum DropStop {
+    /// Nothing: the engine recorded no work, as a forwarded read's engine
+    /// value, or its shutdown already ran.
+    Nothing,
+    /// The engine's Raft and the work OpenRaft runs for it, in a shutdown
+    /// in the background whose task the ledger keeps. An engine dropped
+    /// before its shutdown, as one whose start failed or one a group actor
+    /// that panicked dropped, otherwise runs on, its Raft held by the
+    /// registry, and its group would never open again.
+    InBackground(crate::openraft_work::EngineWorkLedger),
+}
+
+/// What a group engine's shutdown stops, owning nothing of the engine, so
+/// that an engine dropped before its shutdown runs the same steps in the
+/// background.
+struct EngineStopper {
+    snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
+    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    metadata_serial: Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
+    openraft_work: crate::openraft_work::OpenRaftWork,
+    raft_group_id: ursula_shard::RaftGroupId,
+    work_stop_timeout: Duration,
+}
+
+impl EngineStopper {
+    async fn stop(
+        self,
+        recovery_tasks: &crate::rejoin::RecoveryGate,
+    ) -> Result<(), GroupEngineError> {
+        // No snapshot install is admitted any more. One already admitted
+        // holds the engine's token, so the wait below covers it.
+        self.snapshot_installs.close();
+        recovery_tasks.shutdown().await;
+        let result = self
+            .raft
+            .shutdown()
+            .await
+            .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")));
+        // OpenRaft's shutdown leaves its state-machine worker and the
+        // snapshot builds it spawned running, so the publication closes
+        // here: a publication already running ends first, since
+        // cancellation cannot stop an admitted blocking fsync, and none
+        // runs after (#489).
+        crate::state_machine::close_snapshot_metadata(&self.metadata_serial).await;
+        // Then the worker finishes what it already received, a build stops
+        // its upload and its housekeeping, network clients stop their RPCs,
+        // and an admitted install its publication. Only once all of it ended
+        // may the WAL close or the group open again: nothing of this engine
+        // changes the group's state, its gauges, its snapshot store or
+        // references after this, sends nothing, and holds nothing of its
+        // log store (#709). A simulation's negative control skips the wait.
+        if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::EngineWorkWait) {
+            return result;
+        }
+        self.openraft_work
+            .stop(self.raft_group_id, self.work_stop_timeout)
+            .await
+            .map_err(GroupEngineError::Infra)?;
+        result
+    }
+}
+
+impl Drop for RaftGroupEngine {
+    /// Stops an engine dropped before its shutdown ([`DropStop`]).
+    fn drop(&mut self) {
+        let drop_stop = std::mem::replace(
+            self.drop_stop
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            DropStop::Nothing,
+        );
+        let DropStop::InBackground(ledger) = drop_stop else {
+            return;
+        };
+        let raft_group_id = self.placement.raft_group_id;
+        let stopper = self.stopper();
+        let recovery_tasks = std::mem::take(&mut self.recovery_tasks);
+        let stopping = crate::rt::try_spawn(async move {
+            if let Err(error) = stopper.stop(&recovery_tasks).await {
+                tracing::warn!(
+                    raft_group_id = raft_group_id.0,
+                    %error,
+                    "failed to stop a group engine dropped before its shutdown"
+                );
+            }
+        });
+        match stopping {
+            Some(stopping) => {
+                tracing::info!(
+                    raft_group_id = raft_group_id.0,
+                    "stopping a group engine dropped before its shutdown"
+                );
+                ledger.keep_stopping(raft_group_id, stopping);
+            }
+            None => tracing::error!(
+                raft_group_id = raft_group_id.0,
+                "a group engine was dropped before its shutdown outside a runtime, so its group \
+                 stays closed until its process restarts"
+            ),
+        }
+    }
+}
+
+/// A request-scoped engine over a registered group's shared handles, for
+/// one read a follower forwarded (`group_read`). It is not the group's
+/// engine: it hands OpenRaft nothing and has no shutdown, so it reads and
+/// goes away with the request.
+pub(crate) struct ForwardedReadEngine {
+    pub(crate) history: Arc<crate::history::GroupHistory>,
+    pub(crate) apply_health: crate::apply_failure::ApplyHealth,
+    pub(crate) raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    pub(crate) placement: ShardPlacement,
+    pub(crate) read_barrier: Arc<ReadIndexBarrier>,
+    pub(crate) cold_store: Option<ColdStoreHandle>,
+    pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
+    pub(crate) peer_cluster: Option<crate::PeerCluster>,
+    pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
+}
+
+impl ForwardedReadEngine {
+    /// The engine value the read runs on. Its lifecycle parts own nothing.
+    fn reader(self) -> RaftGroupEngine {
+        RaftGroupEngine {
+            rejoin: Default::default(),
+            history: self.history,
+            apply_health: self.apply_health,
+            snapshot_installs: Arc::default(),
+            metadata_serial: Arc::default(),
+            recovery_tasks: crate::rejoin::RecoveryGate::default(),
+            raft: self.raft,
+            placement: self.placement,
+            cold_store: self.cold_store,
+            cold_index_cache: self.cold_index_cache,
+            read_barrier: self.read_barrier,
+            peer_cluster: self.peer_cluster,
+            log_gauge: self.log_gauge,
+            openraft_work: crate::openraft_work::OpenRaftWork::none(),
+            drop_stop: std::sync::Mutex::new(DropStop::Nothing),
+            work_stop_timeout: crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT,
+        }
+    }
+
+    pub(crate) async fn head_stream(
+        self,
+        request: HeadStreamRequest,
+        placement: ShardPlacement,
+    ) -> Result<ursula_runtime::HeadStreamResponse, GroupEngineError> {
+        let mut reader = self.reader();
+        GroupEngine::head_stream(&mut reader, request, placement).await
+    }
+
+    pub(crate) async fn read_stream(
+        self,
+        request: ReadStreamRequest,
+        placement: ShardPlacement,
+    ) -> Result<ursula_runtime::ReadStreamResponse, GroupEngineError> {
+        let mut reader = self.reader();
+        GroupEngine::read_stream(&mut reader, request, placement).await
+    }
 }
 
 /// Whether a read's error may hold only for a replica's lagging state: a
@@ -214,6 +418,27 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        Self::new_single_node_on_log_store_with_options(
+            placement,
+            log_store,
+            RaftGroupEngineOptions {
+                metrics,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::new_single_node_on_log_store`] with `options`.
+    #[cfg(any(test, madsim))]
+    pub async fn new_single_node_on_log_store_with_options<LS>(
+        placement: ShardPlacement,
+        log_store: LS,
+        options: RaftGroupEngineOptions,
+    ) -> Result<Self, GroupEngineError>
+    where
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
         let config = Arc::new(
             Config {
                 cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
@@ -225,14 +450,13 @@ impl RaftGroupEngine {
             .validate()
             .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
         );
-        Self::new_single_node_with_log_store_and_metrics(
+        Self::new_single_node(
             placement,
             1,
             BasicNode::new("local"),
             config,
             log_store,
-            metrics,
-            None,
+            options,
         )
         .await
     }
@@ -317,6 +541,10 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
+        #[cfg(test)]
+        let mut options = options;
+        #[cfg(test)]
+        let startup_fault = options.startup_fault.take();
         let engine = Self::new_node_observed(
             placement,
             node_id,
@@ -327,25 +555,61 @@ impl RaftGroupEngine {
             apply_health,
         )
         .await?;
+        #[cfg(test)]
+        let started = engine.start_single_node(node_id, node, startup_fault).await;
+        #[cfg(not(test))]
+        let started = engine.start_single_node(node_id, node).await;
+        match started {
+            Ok(()) => Ok(engine),
+            Err(error) => {
+                // The Raft runs: dropping the engine stops it as any engine
+                // stops, in a task the WAL's ledger keeps, and the group
+                // stays closed until the engine's work ended (#709).
+                drop(engine);
+                Err(error)
+            }
+        }
+    }
 
-        let initialized = engine.raft.is_initialized().await.map_err(|err| {
+    /// Initializes a single-node group and waits until it leads.
+    async fn start_single_node(
+        &self,
+        node_id: u64,
+        node: BasicNode,
+        #[cfg(test)] startup_fault: Option<StartupFault>,
+    ) -> Result<(), GroupEngineError> {
+        #[cfg(test)]
+        if let Some(fault) = startup_fault {
+            let release = fault.release;
+            self.raft
+                .external_state_machine_request(move |_state_machine| {
+                    Box::pin(async move { release.notified().await })
+                })
+                .await
+                .map_err(|err| GroupEngineError::new(format!("hold the worker: {err}")))?;
+            return Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::LeaderWaitTimedOut {
+                    raft_group_id: self.placement.raft_group_id,
+                    timeout_ms: 0,
+                },
+            ));
+        }
+        let initialized = self.raft.is_initialized().await.map_err(|err| {
             GroupEngineError::new(format!("check OpenRaft initialization: {err}"))
         })?;
         if !initialized {
             let mut nodes = BTreeMap::new();
             nodes.insert(node_id, node);
-            engine.raft.initialize(nodes).await.map_err(|err| {
+            self.raft.initialize(nodes).await.map_err(|err| {
                 GroupEngineError::new(format!("initialize OpenRaft group: {err}"))
             })?;
         }
-        engine
-            .raft
+        self.raft
             .wait(Some(Duration::from_secs(2)))
             .current_leader(node_id, "single-node OpenRaft group should elect itself")
             .await
             .map_err(|err| GroupEngineError::new(format!("wait for OpenRaft leadership: {err}")))?;
-
-        Ok(engine)
+        Ok(())
     }
 
     #[cfg(any(test, madsim))]
@@ -360,6 +624,38 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
+        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
+    {
+        Self::new_node_with_log_store_network_and_options(
+            placement,
+            node_id,
+            config,
+            network_factory,
+            log_store,
+            RaftGroupEngineOptions {
+                metrics,
+                cold_store,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// [`Self::new_node_with_log_store_and_network`] with `options`, on a
+    /// node of the test cluster.
+    #[cfg(any(test, madsim))]
+    pub async fn new_node_with_log_store_network_and_options<NF, LS>(
+        placement: ShardPlacement,
+        node_id: u64,
+        config: Arc<Config>,
+        network_factory: NF,
+        log_store: LS,
+        options: RaftGroupEngineOptions,
+    ) -> Result<Self, GroupEngineError>
+    where
+        NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         Self::new_node(
@@ -369,10 +665,8 @@ impl RaftGroupEngine {
             network_factory,
             log_store,
             RaftGroupEngineOptions {
-                metrics,
-                cold_store,
                 peer_cluster: Some(crate::peer_cluster::test_peer_cluster(node_id)),
-                ..Default::default()
+                ..options
             },
         )
         .await
@@ -388,6 +682,7 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         Self::new_node_observed(
@@ -413,6 +708,7 @@ impl RaftGroupEngine {
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
+        NF::Network: openraft::RaftNetworkV2<UrsulaRaftTypeConfig>,
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         let RaftGroupEngineOptions {
@@ -427,7 +723,17 @@ impl RaftGroupEngine {
             snapshot_metadata_path,
             recovery,
             peer_cluster,
+            #[cfg(test)]
+            work_stop_timeout,
+            engine_work,
+            #[cfg(test)]
+                startup_fault: _,
         } = options;
+        #[cfg(test)]
+        let work_stop_timeout =
+            work_stop_timeout.unwrap_or(crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT);
+        #[cfg(not(test))]
+        let work_stop_timeout = crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT;
         let snapshot_store = snapshot_store.unwrap_or_else(default_snapshot_store);
         let snapshot_build = snapshot_build.unwrap_or_default();
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
@@ -470,6 +776,24 @@ impl RaftGroupEngine {
         }
         let metadata_serial = state_machine.metadata_serial.clone();
         let apply_health = state_machine.apply_health.clone();
+        // Everything OpenRaft runs the engine's work with holds the
+        // engine's token: the state machine, with the snapshot builders it
+        // creates, the network factory, with the clients it creates, and the
+        // log store, with the readers it hands out. So do the snapshot
+        // installs the engine admits (#709).
+        let (openraft_work, work) = crate::openraft_work::OpenRaftWork::start();
+        let snapshot_installs = Arc::new(crate::openraft_work::WorkAdmission::new(
+            work.as_kind(crate::openraft_work::WorkKind::Install),
+        ));
+        let network_factory = crate::openraft_work::TrackedNetworkFactory::new(
+            network_factory,
+            work.as_kind(crate::openraft_work::WorkKind::Client),
+        );
+        let log_store = crate::openraft_work::TrackedLogStore::new(
+            log_store,
+            work.as_kind(crate::openraft_work::WorkKind::Reader),
+        );
+        state_machine.work = work;
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
@@ -485,6 +809,15 @@ impl RaftGroupEngine {
                 .err()
                 .unwrap_or_else(|| GroupEngineError::new(format!("create OpenRaft group: {err}")))
         })?;
+        // From here the Raft runs: the group opens again only once its work
+        // ended, whether this engine starts or not (#709).
+        let drop_stop = match engine_work {
+            Some(ledger) => {
+                ledger.record(placement.raft_group_id, openraft_work.ended());
+                DropStop::InBackground(ledger)
+            }
+            None => DropStop::Nothing,
+        };
         // `Raft::new` applied the log the restored snapshot does not cover:
         // a removal it applied again is due at once (#669).
         log_gauge.replay_ended();
@@ -501,7 +834,7 @@ impl RaftGroupEngine {
             history,
             apply_health,
             recovery_tasks,
-            snapshot_installs: Arc::default(),
+            snapshot_installs,
             metadata_serial,
             read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
             raft,
@@ -510,6 +843,9 @@ impl RaftGroupEngine {
             cold_index_cache,
             peer_cluster,
             log_gauge,
+            openraft_work,
+            drop_stop: std::sync::Mutex::new(drop_stop),
+            work_stop_timeout,
         })
     }
 
@@ -623,21 +959,27 @@ impl RaftGroupEngine {
     }
 
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {
-        self.snapshot_installs.close();
-        self.recovery_tasks.shutdown().await;
-        let result = self
-            .raft
-            .shutdown()
-            .await
-            .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")));
-        self.snapshot_installs.drain().await;
-        // OpenRaft's shutdown leaves a snapshot build it spawned running, so
-        // the publication closes here: a publication already running ends
-        // first, since cancellation cannot stop an admitted blocking fsync,
-        // and none runs after. Only then may the WAL close or a restarted
-        // replica of the group open the same metadata file (#489).
-        crate::state_machine::close_snapshot_metadata(&self.metadata_serial).await;
-        result
+        let stopped = self.stopper().stop(&self.recovery_tasks).await;
+        // Dropping the engine stops nothing more, whether the shutdown
+        // waited for all of its work or not: its Raft stopped, and the
+        // ledger keeps the group closed until the work ended (#709).
+        *self
+            .drop_stop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = DropStop::Nothing;
+        stopped
+    }
+
+    /// What the engine's shutdown stops ([`EngineStopper`]).
+    fn stopper(&self) -> EngineStopper {
+        EngineStopper {
+            snapshot_installs: Arc::clone(&self.snapshot_installs),
+            raft: self.raft.clone(),
+            metadata_serial: Arc::clone(&self.metadata_serial),
+            openraft_work: self.openraft_work.clone(),
+            raft_group_id: self.placement.raft_group_id,
+            work_stop_timeout: self.work_stop_timeout,
+        }
     }
 
     /// This replica's applied group state, leader or follower (simulation

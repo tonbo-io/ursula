@@ -430,6 +430,15 @@ pub enum RaftWalError {
     },
     #[error("Raft WAL state mutex poisoned")]
     LockPoisoned,
+    /// The OpenRaft work of the group's previous engine still runs (#709).
+    #[error(
+        "raft group {:?} on core {:?} does not open: OpenRaft work of its previous engine still runs",
+        .placement.raft_group_id,
+        .placement.core_id
+    )]
+    PreviousEngineRunning {
+        placement: ursula_shard::ShardPlacement,
+    },
 }
 
 /// The run-state file, and the run state this run writes to it.

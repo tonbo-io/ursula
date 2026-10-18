@@ -121,6 +121,9 @@ pub struct DurableRaftGroupEngineFactory {
     /// OpenRaft's own snapshot policy and a coordinator of its own, as the
     /// tests, benchmarks and probes that build this factory expect.
     engine_config: Option<RaftEngineConfig>,
+    /// How long an engine's shutdown waits for OpenRaft's work, for tests.
+    #[cfg(test)]
+    pub(crate) work_stop_timeout: Option<Duration>,
 }
 
 impl DurableRaftGroupEngineFactory {
@@ -136,6 +139,8 @@ impl DurableRaftGroupEngineFactory {
             cold_store,
             registry: None,
             engine_config: None,
+            #[cfg(test)]
+            work_stop_timeout: None,
         }
     }
 
@@ -260,6 +265,9 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                         .as_ref()
                         .filter(|_| self.engine_config.is_some())
                         .map(RaftGroupHandleRegistry::snapshot_install_coordinator),
+                    #[cfg(test)]
+                    work_stop_timeout: self.work_stop_timeout,
+                    engine_work: Some(self.log_stores.engine_work_ledger()),
                     ..Default::default()
                 },
                 health.clone(),
@@ -575,6 +583,11 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
                     recovery: Some(rejoin.clone()),
                     peer_cluster: Some(self.registry.peer_cluster().clone()),
+                    #[cfg(test)]
+                    work_stop_timeout: None,
+                    engine_work: Some(self.log_stores.engine_work_ledger()),
+                    #[cfg(test)]
+                    startup_fault: None,
                 },
                 health.clone(),
             )
@@ -608,16 +621,12 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 },
             );
             if let Err(err) = attached {
-                // The engine never serves. Stop it as any engine stops, so its
-                // snapshot publication closes before the group can reopen
-                // (#489).
-                if let Err(shutdown) = engine.shutdown().await {
-                    tracing::warn!(
-                        raft_group_id = placement.raft_group_id.0,
-                        error = %shutdown,
-                        "failed to stop a group engine whose recovery could not attach"
-                    );
-                }
+                // The engine never serves. Dropping it stops it as any engine
+                // stops, so its snapshot publication closes before the group
+                // can reopen (#489), in a task the WAL's ledger keeps: the
+                // core loop does not wait, and the group stays closed until
+                // the engine's work ended (#709).
+                drop(engine);
                 return Err(err);
             }
             let engine: Box<dyn GroupEngine> = Box::new(engine);

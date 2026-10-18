@@ -315,7 +315,7 @@ impl MadsimRuntimeRaftNetworkFactory {
             ))
         })?;
         let log_store = wal.open(control.placement, control.metrics.clone()).await;
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+        let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             control.placement,
             node_id,
             control.config,
@@ -323,8 +323,10 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .with_source(node_id)
                 .with_policy(self.policy.clone()),
             log_store,
-            Some(control.metrics),
-            self.cold_store.clone(),
+            wal.recording_work(super::sim_wal::engine_options(
+                Some(control.metrics),
+                self.cold_store.clone(),
+            )),
         )
         .await?;
         control.registry.register(node_id, &engine);
@@ -391,7 +393,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                     .clone();
                 let log_store = wal.open(placement, metrics.clone()).await;
                 wals.insert(node_id, wal);
-                let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+                let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
                     placement,
                     node_id,
                     config.clone(),
@@ -399,8 +401,10 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                         .with_source(node_id)
                         .with_policy(policy.clone()),
                     log_store,
-                    Some(metrics.clone()),
-                    cold_store.clone(),
+                    wals[&node_id].recording_work(super::sim_wal::engine_options(
+                        Some(metrics.clone()),
+                        cold_store.clone(),
+                    )),
                 )
                 .await?;
                 registry.register(node_id, &engine);

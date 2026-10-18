@@ -73,6 +73,7 @@ use crate::log_store::disk::JournalFile;
 use crate::log_store::disk::create_dir_all_durable;
 use crate::log_store::elapsed_ns;
 use crate::log_store::replace_file;
+use crate::openraft_work::WorkToken;
 use crate::registry::SnapshotInstallError;
 use crate::rt::sync::OwnedSemaphorePermit;
 use crate::rt::sync::Semaphore;
@@ -1241,64 +1242,6 @@ pub struct SnapshotInstallCoordinator {
     inner: Arc<SnapshotInstallCoordinatorInner>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct InstallActivity {
-    closed: bool,
-    active: usize,
-}
-
-/// Owned by one engine incarnation, including canceled RPCs' admitted work.
-#[derive(Debug)]
-pub(crate) struct SnapshotInstallLifecycle {
-    activity: crate::rt::sync::watch::Sender<InstallActivity>,
-}
-
-impl Default for SnapshotInstallLifecycle {
-    fn default() -> Self {
-        Self {
-            activity: crate::rt::sync::watch::channel(InstallActivity::default()).0,
-        }
-    }
-}
-
-impl SnapshotInstallLifecycle {
-    pub(crate) fn admit(self: &Arc<Self>) -> Option<SnapshotInstallLease> {
-        let mut admitted = false;
-        self.activity.send_if_modified(|state| {
-            if state.closed {
-                return false;
-            }
-            state.active = state.active.saturating_add(1);
-            admitted = true;
-            true
-        });
-        admitted.then(|| SnapshotInstallLease(self.clone()))
-    }
-
-    pub(crate) fn close(&self) {
-        self.activity.send_modify(|state| state.closed = true);
-    }
-
-    pub(crate) async fn drain(&self) {
-        let mut activity = self.activity.subscribe();
-        while activity.borrow_and_update().active != 0 {
-            if activity.changed().await.is_err() {
-                return;
-            }
-        }
-    }
-}
-
-pub(crate) struct SnapshotInstallLease(Arc<SnapshotInstallLifecycle>);
-
-impl Drop for SnapshotInstallLease {
-    fn drop(&mut self) {
-        self.0
-            .activity
-            .send_modify(|state| state.active = state.active.saturating_sub(1));
-    }
-}
-
 #[derive(Debug)]
 struct SnapshotInstallCoordinatorInner {
     semaphore: Arc<Semaphore>,
@@ -1684,6 +1627,9 @@ pub struct RaftGroupStateMachine {
     snapshot_metadata_path: Option<PathBuf>,
     /// Log applied since the last snapshot (F12e), read by the driver.
     log_gauge: Arc<GroupLogGauge>,
+    /// The engine's token: OpenRaft's state-machine worker owns this state
+    /// machine, and the engine's shutdown waits until it is dropped (#709).
+    pub(crate) work: WorkToken,
 }
 
 /// Node-local record of the current snapshot (`group-N.snapshot.json`),
@@ -1783,6 +1729,7 @@ impl RaftGroupStateMachine {
             snapshot_install,
             snapshot_metadata_path,
             log_gauge,
+            work: WorkToken::detached(),
         }
     }
 
@@ -2028,6 +1975,7 @@ impl RaftGroupStateMachine {
             references: self
                 .snapshot_install
                 .references(self.placement.raft_group_id.0),
+            work: self.work.as_kind(crate::openraft_work::WorkKind::Builder),
         }
     }
 
@@ -2240,6 +2188,12 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         {
             return Ok(());
         }
+        // An engine that is shutting down installs nothing: its publication
+        // would be refused, and the group's node-wide gauge would record a
+        // snapshot that never became current (#709).
+        if self.work.is_stopping() {
+            return Err(SnapshotMetadataStopped::EngineShutDown.into_io());
+        }
         let mut pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|err| invalid_data(io::Error::other(err.to_string())))?;
         // Decode exactly once (bounded-stream-state F12c): inline bytes are
@@ -2278,12 +2232,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .map_err(group_engine_io_error)?;
         self.last_applied_log_id = meta.last_log_id;
         self.last_membership = meta.last_membership.clone();
-        self.log_gauge.record_membership(&self.last_membership);
-        self.log_gauge.record_snapshot(
-            self.log_gauge.mark(),
-            pointer.location.size_hint(),
-            meta.last_log_id.map_or(0, |log_id| log_id.index()),
-        );
+        // The node-wide gauge, which the group's next engine shares, takes
+        // the snapshot only once its publication ran, as a build's does.
+        let log_gauge = Arc::clone(&self.log_gauge);
+        let log_mark = self.log_gauge.mark();
+        let membership = self.last_membership.clone();
         let current_snapshot = self.current_snapshot.clone();
         let metadata_path = self.snapshot_metadata_path.clone();
         let references = self
@@ -2299,11 +2252,14 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 &pointer.location,
                 &references,
             )?;
+            let snapshot_index = meta.last_log_id.map_or(0, |log_id| log_id.index());
             *current_snapshot.lock().expect("snapshot mutex") = Some(CurrentSnapshot {
                 meta,
                 pointer_bytes,
             });
             references.commit_current(&pointer.location);
+            log_gauge.record_membership(&membership);
+            log_gauge.record_snapshot(log_mark, pointer.location.size_hint(), snapshot_index);
             Ok(())
         })
         .await?;
@@ -2343,6 +2299,19 @@ pub struct RaftGroupSnapshotBuilder {
     /// The applied log this snapshot covers (F12e).
     log_mark: GroupLogMark,
     references: Arc<SnapshotReferences>,
+    /// The engine's token: OpenRaft runs the build in a task of its own,
+    /// and the engine's shutdown waits until the builder is dropped (#709).
+    pub(crate) work: WorkToken,
+}
+
+impl RaftGroupSnapshotBuilder {
+    /// The refusal of a build whose engine is shutting down. What it put in
+    /// the snapshot store never becomes current, so the pass G later
+    /// deletes it, as it deletes any upload that does not (#669).
+    fn stopped_build(&self) -> io::Error {
+        self.references.schedule_pass_after_upload();
+        SnapshotMetadataStopped::EngineShutDown.into_io()
+    }
 }
 
 impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
@@ -2368,11 +2337,25 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             raft_group_id: self.placement.raft_group_id.0,
             snapshot_id: snapshot_id.clone(),
         };
-        let location = match self
-            .snapshot_store
-            .upload_iter(key, group_snapshot_frames(Arc::clone(snapshot)))
+        // The engine's shutdown waits for this build and refuses its
+        // publication, so the upload stops at once instead (#709). What it
+        // put in the store never becomes current: the pass G later deletes
+        // it, as it deletes any upload that does not.
+        let Some(uploaded) = self
+            .work
+            .until_stopping(
+                self.snapshot_store
+                    .upload_iter(key, group_snapshot_frames(Arc::clone(snapshot))),
+            )
             .await
-        {
+        else {
+            return Err(self.stopped_build());
+        };
+        // Nor does an upload that ended as the shutdown began go further.
+        if self.work.is_stopping() {
+            return Err(self.stopped_build());
+        }
+        let location = match uploaded {
             Ok(location) => {
                 // An upload that never becomes current, because a newer
                 // install overtakes this build or its pin fails, has no
@@ -2383,7 +2366,14 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 // caching, etc.) is caught HERE rather than 10 minutes later
                 // as an install_snapshot NotFound on a follower. Cheap
                 // relative to the upload itself.
-                match self.snapshot_store.verify_uploaded(&location).await {
+                let Some(verified) = self
+                    .work
+                    .until_stopping(self.snapshot_store.verify_uploaded(&location))
+                    .await
+                else {
+                    return Err(self.stopped_build());
+                };
+                match verified {
                     Ok(()) => location,
                     Err(err) => {
                         tracing::warn!(
@@ -2418,19 +2408,31 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 }
             }
         };
+        // Nor does a build whose engine began to shut down meanwhile take a
+        // pin for it.
+        if self.work.is_stopping() {
+            return Err(self.stopped_build());
+        }
         let mut pointer = SnapshotPointer {
             snapshot_id: snapshot_id.clone(),
             location,
         };
-        let reference = match self
-            .references
-            .prepare(
+        // The pin takes the group's reference lock and reaches the store:
+        // it stops too once the engine is shutting down (#709). A pin it
+        // left behind is one no current pointer names, which the next
+        // reconcile drops.
+        let Some(prepared) = self
+            .work
+            .until_stopping(self.references.prepare(
                 &self.snapshot_store,
                 self.placement.raft_group_id.0,
                 &pointer.location,
-            )
+            ))
             .await
-        {
+        else {
+            return Err(self.stopped_build());
+        };
+        let reference = match prepared {
             Ok(reference) => reference,
             Err(err) => {
                 tracing::warn!(snapshot_id, error = %ErrorChain(&err), "falling back to inline snapshot after external pin failure");
@@ -2507,21 +2509,34 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         // permit goes back with the builder, and a snapshot start that waited
         // for this build sees what it covers (#561).
         self.build.record_built(chosen.meta.last_log_id);
-        if let Err(err) = self
-            .references
-            .publish_current(&self.snapshot_store, self.placement.raft_group_id.0)
-            .await
-        {
+        // The housekeeping of an engine that is shutting down stops: its
+        // shutdown waits for this build, and the next engine of the group
+        // publishes and prunes for itself (#709).
+        let published = self
+            .work
+            .until_stopping(
+                self.references
+                    .publish_current(&self.snapshot_store, self.placement.raft_group_id.0),
+            )
+            .await;
+        if let Some(Err(err)) = published {
             tracing::warn!(snapshot_id, error = %ErrorChain(&err), "snapshot remains pinned while current-reference publication is unavailable");
         }
         // The object this build replaced stays pinned for the GC grace, so
         // this pass deletes only what was retiring before (#669).
-        match self
-            .references
-            .prune(&self.snapshot_store, self.placement.raft_group_id.0)
-            .await
-        {
-            Ok(prune) => {
+        let pruned = if self.work.is_stopping() {
+            None
+        } else {
+            self.work
+                .until_stopping(
+                    self.references
+                        .prune(&self.snapshot_store, self.placement.raft_group_id.0),
+                )
+                .await
+        };
+        match pruned {
+            None => {}
+            Some(Ok(prune)) => {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_snapshot_gc(ursula_runtime::SnapshotGcSample {
                         deleted: prune.deleted(),
@@ -2530,7 +2545,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     });
                 }
             }
-            Err(err) => {
+            Some(Err(err)) => {
                 if let Some(metrics) = &self.metrics {
                     metrics.record_snapshot_gc(ursula_runtime::SnapshotGcSample {
                         failed: 1,
@@ -2554,10 +2569,11 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
 /// Where a group's snapshot metadata publication stands. Local snapshot
 /// metadata errors stop OpenRaft, and queued pointer operations must observe
 /// the same terminal boundary even before RaftCore sees the error. A group
-/// engine that shut down publishes nothing more: OpenRaft runs each snapshot
-/// build in a task that its shutdown neither stops nor waits for, so a build
-/// can reach its publication after the engine stopped, while the WAL closes
-/// or a restarted replica of the group owns the same metadata file (#489).
+/// engine that is shutting down publishes nothing more (#489): OpenRaft's
+/// state-machine worker and the snapshot builds it spawned outlive
+/// `Raft::shutdown`, and the engine's shutdown waits for them (#709), so a
+/// build or install that reaches its publication meanwhile is refused
+/// rather than published.
 #[derive(Debug, Default)]
 pub(crate) enum MetadataPublicationState {
     #[default]
@@ -2889,6 +2905,7 @@ mod tests {
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
+            work: crate::openraft_work::WorkToken::detached(),
         };
         builder.build_snapshot().await.expect("persist snapshot");
         // #561: the build records what it covers while it holds its permit.
@@ -2959,6 +2976,7 @@ mod tests {
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
+            work: crate::openraft_work::WorkToken::detached(),
         };
         builder.build_snapshot().await.expect("persist snapshot");
 
@@ -3111,6 +3129,7 @@ mod tests {
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
             snapshot_metadata_path: None,
+            work: crate::openraft_work::WorkToken::detached(),
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
         let first_pointer = SnapshotPointer::decode(first_snapshot.snapshot.pointer_bytes())
@@ -3130,6 +3149,7 @@ mod tests {
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
             snapshot_metadata_path: None,
+            work: crate::openraft_work::WorkToken::detached(),
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(second_snapshot.snapshot.pointer_bytes())
@@ -3166,6 +3186,7 @@ mod tests {
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
             snapshot_metadata_path: None,
+            work: crate::openraft_work::WorkToken::detached(),
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
         let third_pointer = SnapshotPointer::decode(third_snapshot.snapshot.pointer_bytes())
@@ -3261,6 +3282,7 @@ mod tests {
             log_mark: GroupLogMark::default(),
             references: Arc::default(),
             snapshot_metadata_path: None,
+            work: crate::openraft_work::WorkToken::detached(),
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
@@ -4042,6 +4064,7 @@ mod tests {
                 log_mark: GroupLogMark::default(),
                 references: Arc::default(),
                 snapshot_metadata_path: None,
+                work: crate::openraft_work::WorkToken::detached(),
             };
             let coordinator = builder.build.coordinator.clone();
             {
@@ -4065,6 +4088,171 @@ mod tests {
             assert!(coordinator.publishing(7, None), "{stuck:?}");
             assert!(coordinator.publishing(7, Some(8)), "{stuck:?}");
             assert!(!coordinator.publishing(7, Some(9)), "{stuck:?}");
+        }
+    }
+
+    /// A build whose engine begins to shut down stops (#709): one whose
+    /// upload stalls stops it at once, and one whose upload ends as the
+    /// shutdown begins goes no further. Neither publishes a snapshot or a
+    /// reference, each owes the GC pass that deletes what it put in the
+    /// store, and the engine's stop returns once the builder is gone.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_build_stops_when_its_engine_begins_to_shut_down() {
+        use ursula_runtime::SnapshotStore;
+        use ursula_runtime::SnapshotStoreFuture;
+        use ursula_shard::CoreId;
+        use ursula_shard::RaftGroupId;
+        use ursula_shard::ShardId;
+
+        use crate::openraft_work::OpenRaftWork;
+
+        /// What the store's upload does.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Upload {
+            /// Never ends.
+            Stalls,
+            /// Begins the engine's shutdown, then ends.
+            EndsAsTheShutdownBegins,
+        }
+
+        /// Inline snapshots whose upload does `upload`, counting the
+        /// references it publishes.
+        struct ShutdownUploadStore {
+            inline: SharedSnapshotStore,
+            upload: Upload,
+            entered: Arc<crate::rt::sync::Notify>,
+            work: Arc<OpenRaftWork>,
+            published: AtomicU64,
+        }
+
+        impl std::fmt::Debug for ShutdownUploadStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("ShutdownUploadStore")
+                    .field("upload", &self.upload)
+                    .finish_non_exhaustive()
+            }
+        }
+
+        impl SnapshotStore for ShutdownUploadStore {
+            fn upload<'a>(
+                &'a self,
+                key: SnapshotKey,
+                bytes: Bytes,
+            ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+                self.entered.notify_one();
+                match self.upload {
+                    Upload::Stalls => Box::pin(std::future::pending()),
+                    Upload::EndsAsTheShutdownBegins => {
+                        self.work.begin_stop();
+                        self.inline.upload(key, bytes)
+                    }
+                }
+            }
+
+            fn download<'a>(
+                &'a self,
+                location: &'a SnapshotLocation,
+            ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+                self.inline.download(location)
+            }
+
+            fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
+                self.inline.delete(location)
+            }
+
+            fn publish_reference<'a>(
+                &'a self,
+                _raft_group_id: u32,
+                _location: &'a SnapshotLocation,
+            ) -> SnapshotStoreFuture<'a, ()> {
+                self.published.fetch_add(1, Ordering::Relaxed);
+                Box::pin(async { Ok(()) })
+            }
+
+            ursula_runtime::inline_owned_snapshot_methods!();
+        }
+
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(7),
+        };
+        for upload in [Upload::Stalls, Upload::EndsAsTheShutdownBegins] {
+            let (work, token) = OpenRaftWork::start();
+            let work = Arc::new(work);
+            let entered = Arc::new(crate::rt::sync::Notify::new());
+            let store = Arc::new(ShutdownUploadStore {
+                inline: default_snapshot_store(),
+                upload,
+                entered: Arc::clone(&entered),
+                work: Arc::clone(&work),
+                published: AtomicU64::new(0),
+            });
+            // No grace: a pass owed after the upload is due at once.
+            let references = Arc::new(SnapshotReferences::new(Duration::ZERO));
+            let current_snapshot = Arc::new(Mutex::new(None));
+            let mut builder = RaftGroupSnapshotBuilder {
+                apply_health: Default::default(),
+                placement,
+                snapshot: Ok(Arc::new(test_group_snapshot(placement, 9))),
+                meta: test_snapshot_meta(9),
+                current_snapshot: Arc::clone(&current_snapshot),
+                metadata_serial: Arc::default(),
+                snapshot_store: store.clone(),
+                metrics: None,
+                build: test_build_lease().await,
+                log_gauge: Arc::default(),
+                log_mark: GroupLogMark::default(),
+                references: Arc::clone(&references),
+                snapshot_metadata_path: None,
+                work: token,
+            };
+            let error = {
+                let built = builder.build_snapshot();
+                tokio::pin!(built);
+                if upload == Upload::Stalls {
+                    tokio::select! {
+                        biased;
+                        _built = &mut built => panic!("{upload:?}: the upload never ends"),
+                        () = entered.notified() => {}
+                    }
+                    work.begin_stop();
+                }
+                built
+                    .await
+                    .expect_err("a build of a stopping engine is refused")
+            };
+            assert!(
+                matches!(
+                    error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<SnapshotMetadataStopped>()),
+                    Some(SnapshotMetadataStopped::EngineShutDown)
+                ),
+                "{upload:?}: {error}"
+            );
+            assert!(
+                current_snapshot.lock().expect("snapshot mutex").is_none(),
+                "{upload:?}"
+            );
+            assert_eq!(store.published.load(Ordering::Relaxed), 0, "{upload:?}");
+            assert!(
+                references.gc_due(crate::rt::time::Instant::now()),
+                "{upload:?}: the stopped build owes the pass that deletes its upload"
+            );
+            assert!(
+                matches!(
+                    work.stop(placement.raft_group_id, Duration::from_millis(10))
+                        .await,
+                    Err(ursula_runtime::GroupInfraError::EngineWorkOutlivedShutdown { .. })
+                ),
+                "{upload:?}: the builder still holds the engine's token"
+            );
+            drop(builder);
+            work.stop(placement.raft_group_id, Duration::from_secs(5))
+                .await
+                .expect("the engine's stop returns once the builder is gone");
         }
     }
 

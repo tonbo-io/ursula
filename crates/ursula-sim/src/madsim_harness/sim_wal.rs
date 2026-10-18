@@ -6,9 +6,11 @@
 //! runs as it does in a process: the first store a stopped node opens starts
 //! a run, which reads the run state the previous run left and decides how the
 //! journals open. Stopping the node (a power loss, a process crash or a clean
-//! shutdown) ends the run. Before it reopens a group, cuts power or simulates
-//! a process crash, it waits until the stopped engine has released the
-//! previous store, as a new process starts only after the old one has exited.
+//! shutdown) ends the run. A group reopens only once its stopped engine
+//! released the previous store, which an engine's shutdown does before it
+//! returns (#709). Before it cuts power or simulates a process crash, it
+//! waits until the node's stores are released, as a new process starts only
+//! after the old one has exited.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -20,6 +22,7 @@ use std::time::Duration;
 
 use ursula_config::WalFsync;
 use ursula_raft::JournalTuning;
+use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
 use ursula_raft::RaftWalError;
@@ -122,8 +125,9 @@ impl SimNodeWal {
             .opening()
     }
 
-    /// Opens `placement`'s log store from the node's journals, waiting first
-    /// until the store the group had before is released.
+    /// Opens `placement`'s log store from the node's journals. A group
+    /// whose previous engine's OpenRaft work still runs is refused, as the
+    /// production WAL refuses it (#709).
     pub(super) async fn open(
         &self,
         placement: ShardPlacement,
@@ -140,15 +144,18 @@ impl SimNodeWal {
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
-        if let Some(previous) = self.handed_out(placement.raft_group_id) {
-            wait_released(&previous).await;
-        }
         let store = self.run()?.open(placement, metrics)?;
         self.stores
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(placement.raft_group_id, Arc::downgrade(&store));
         Ok(store)
+    }
+
+    /// `options`, with the engine recording its OpenRaft work in the node's
+    /// current run as the production engine factories do (#709).
+    pub(super) fn recording_work(&self, options: RaftGroupEngineOptions) -> RaftGroupEngineOptions {
+        options.recording_work_in(&self.run().expect("start a simulated node's Raft WAL"))
     }
 
     /// Where `placement`'s record of its current snapshot lives in the
@@ -281,4 +288,16 @@ async fn wait_released(store: &Weak<RaftGroupFileLogStore>) {
         0,
         "a stopped simulated engine still holds its raft log store"
     );
+}
+
+/// The options of a simulated engine with `metrics` and `cold_store`, which
+/// [`SimNodeWal::recording_work`] then records in its node's ledger.
+pub(super) fn engine_options(
+    metrics: Option<GroupEngineMetrics>,
+    cold_store: Option<ursula_runtime::ColdStoreHandle>,
+) -> RaftGroupEngineOptions {
+    let mut options = RaftGroupEngineOptions::default();
+    options.metrics = metrics;
+    options.cold_store = cold_store;
+    options
 }
