@@ -20,7 +20,9 @@ use tonic::Response;
 use tonic::Status;
 use ursula_runtime::GroupEngineCreateFuture;
 use ursula_runtime::GroupEngineMetrics;
-use ursula_runtime::GroupLeaderHint;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::LeadershipRefusal;
+use ursula_runtime::Proposal;
 use ursula_runtime::RuntimeError;
 
 use super::*;
@@ -124,14 +126,14 @@ async fn wait_for_leader(engine: &RaftGroupEngine) {
 #[track_caller]
 fn assert_leader_unknown(what: &str, err: &GroupEngineError, url: &str) {
     assert!(
-        matches!(err, GroupEngineError::ForwardToLeader {
-            leader_hint: GroupLeaderHint {
-                node_id: None,
-                address: None,
-                term: None,
-            },
-            ..
-        }),
+        matches!(
+            err,
+            GroupEngineError::NotLeader(LeadershipRefusal {
+                leader: None,
+                reason: LeadershipReason::LeaderUnreachable,
+                ..
+            })
+        ),
         "{what}: expected the retryable leader-unknown answer, got {err:?}"
     );
     assert!(
@@ -199,7 +201,16 @@ async fn forwards_to_a_silent_leader_fail_within_the_transport_bound() {
     .expect_err("a silent leader answers nothing");
     assert_leader_unknown("forwarded purge", &purge, &peer.url);
     // The purge reached the leader's socket: it may have committed there.
-    assert!(!purge.is_forward_before_proposal());
+    assert!(
+        matches!(
+            purge.not_leader(),
+            Some(LeadershipRefusal {
+                proposal: Proposal::MayHaveCommitted,
+                ..
+            })
+        ),
+        "{purge:?}"
+    );
 
     shutdown_all(&engines).await;
 }
@@ -401,7 +412,7 @@ async fn a_forwarded_read_waiting_on_a_silent_leader_does_not_hold_the_group_act
     .expect("the append does not wait behind the forwarded read")
     .expect_err("a follower does not append");
     assert!(
-        append.leader_hint().is_some(),
+        append.not_leader().is_some(),
         "a follower redirects the append: {append:?}"
     );
     assert!(
@@ -468,13 +479,33 @@ async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
         )
         .await
         .expect_err("a leader of another cluster serves nothing");
-    assert!(read.is_forward_before_proposal(), "{read:?}");
+    assert!(
+        matches!(
+            read.not_leader(),
+            Some(LeadershipRefusal {
+                leader: None,
+                proposal: Proposal::NotProposed,
+                reason: LeadershipReason::LeaderInOtherCluster,
+            })
+        ),
+        "{read:?}"
+    );
     let purge = follower
         .purge_bucket(stream_id.bucket_id.clone(), placement())
         .await
         .expect_err("a leader of another cluster serves nothing");
     // Refused before the body: nothing was proposed there.
-    assert!(purge.is_forward_before_proposal(), "{purge:?}");
+    assert!(
+        matches!(
+            purge.not_leader(),
+            Some(LeadershipRefusal {
+                leader: None,
+                proposal: Proposal::NotProposed,
+                reason: LeadershipReason::LeaderInOtherCluster,
+            })
+        ),
+        "{purge:?}"
+    );
     let peer_cluster = follower.peer_cluster.as_ref().expect("a gRPC replica");
     assert_eq!(peer_cluster.mismatches(), vec![
         crate::peer_cluster::PeerClusterMismatch {

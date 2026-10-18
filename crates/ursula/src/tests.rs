@@ -26,7 +26,11 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::InMemoryGroupEngineFactory;
+use ursula_runtime::KnownLeader;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::Proposal;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::StreamErrorCode;
@@ -240,11 +244,9 @@ fn runtime_error_status_prefers_stream_error_code_over_message_text() {
     let err = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(0),
-        error: GroupEngineError::stream_from_replicated(
-            "misleading message says NotFound",
+        error: GroupEngineError::stream(
             StreamErrorCode::StreamGone,
-            None,
-            Vec::new(),
+            "misleading message says NotFound",
         ),
     };
 
@@ -269,21 +271,25 @@ fn runtime_error_status_does_not_parse_infra_message_as_stream_error() {
 }
 
 #[test]
-fn group_engine_leader_hint_is_detected_without_matching_message() {
+fn group_engine_leadership_refusal_is_detected_without_matching_message() {
     let err = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(0),
-        error: GroupEngineError::forward_to_leader("forward request", None, None),
+        error: GroupEngineError::NotLeader(LeadershipRefusal {
+            leader: None,
+            proposal: Proposal::MayHaveCommitted,
+            reason: LeadershipReason::SteppedDown,
+        }),
     };
 
     assert!(super::is_forward_to_leader(&err));
 }
 
-// A forward hinting this node (a read bounced back during a leadership
-// transfer) must not redirect the client to itself, and a hint without the
-// leader's term must not redirect half-typed: no 307, so the caller answers
-// the leader-unknown 503. A hint naming a peer in a known term redirects
-// there, typed.
+// A refusal naming this node (a read bounced back during a leadership
+// transfer) must not redirect the client to itself, and one naming no
+// leader must not redirect: no 307, so the caller answers the
+// leader-unknown 503. A refusal naming a peer in its term redirects there,
+// typed.
 #[test]
 fn leader_redirect_never_points_at_this_node() {
     let router = ClientWriteLeaderRouter::with_static_topology(
@@ -294,30 +300,32 @@ fn leader_redirect_never_points_at_this_node() {
         ],
         BTreeMap::new(),
     );
-    let forward = |leader, term| RuntimeError::GroupEngine {
+    let forward = |leader: Option<KnownLeader>| RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
-        error: GroupEngineError::forward_to_leader_before_proposal(
-            "not leader",
-            Some(leader),
-            None,
-        )
-        .with_leader_term(term),
+        error: GroupEngineError::NotLeader(LeadershipRefusal {
+            leader,
+            proposal: Proposal::NotProposed,
+            reason: LeadershipReason::Follower,
+        }),
+    };
+    let known = |node_id| {
+        Some(KnownLeader {
+            node_id,
+            term: 7,
+            address: None,
+        })
     };
 
     assert!(
         router
-            .redirect_response(&forward(2, Some(7)), "/b/s")
+            .redirect_response(&forward(known(2)), "/b/s")
             .is_none()
     );
-    assert!(
-        router
-            .redirect_response(&forward(1, None), "/b/s")
-            .is_none()
-    );
+    assert!(router.redirect_response(&forward(None), "/b/s").is_none());
     let redirect = router
-        .redirect_response(&forward(1, Some(7)), "/b/s")
-        .expect("a hint naming a peer in a known term redirects");
+        .redirect_response(&forward(known(1)), "/b/s")
+        .expect("a refusal naming a peer in its term redirects");
     assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(redirect.headers()[LOCATION], "http://node-1/b/s");
     assert_eq!(
@@ -331,7 +339,7 @@ fn leader_redirect_never_points_at_this_node() {
 }
 
 // A leader that `[[raft.peers]]` does not name has only its Raft address in
-// the hint. With split planes that address is a cluster listener, so no
+// the refusal. With split planes that address is a cluster listener, so no
 // redirect names it, and the leader-router and `leader_url` both give up.
 #[test]
 fn split_planes_never_redirect_to_a_raft_address() {
@@ -348,12 +356,15 @@ fn split_planes_never_redirect_to_a_raft_address() {
     let unlisted = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
-        error: GroupEngineError::forward_to_leader_before_proposal(
-            "not leader",
-            Some(9),
-            Some("http://node-9:4439".to_owned()),
-        )
-        .with_leader_term(Some(7)),
+        error: GroupEngineError::NotLeader(LeadershipRefusal {
+            leader: Some(KnownLeader {
+                node_id: 9,
+                term: 7,
+                address: Some("http://node-9:4439".to_owned()),
+            }),
+            proposal: Proposal::NotProposed,
+            reason: LeadershipReason::Follower,
+        }),
     };
 
     let shared = router()
@@ -372,8 +383,8 @@ fn split_planes_never_redirect_to_a_raft_address() {
         split.leader_url(1, Some("http://node-1:4439"), "/b/s"),
         Some("http://node-1:4437/b/s".to_owned())
     );
-    // Without a redirect the hint is a forward to an unknown leader, which
-    // the client plane answers with a retryable 503.
+    // Without a redirect the refusal is one of an unknown leader, which the
+    // client plane answers with a retryable 503.
     assert!(super::is_forward_to_leader(&unlisted));
 }
 

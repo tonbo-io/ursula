@@ -6,6 +6,8 @@ mod compact_tests;
 mod external_index_after_commit_tests;
 mod factory;
 #[cfg(all(test, not(madsim)))]
+mod history_pending_cold_tests;
+#[cfg(all(test, not(madsim)))]
 mod test_support;
 mod wal_error;
 
@@ -84,9 +86,11 @@ use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
+use ursula_runtime::LeadershipReason;
 use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
+use ursula_runtime::Proposal;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
@@ -122,7 +126,7 @@ use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::group_engine_client_write_error;
-use crate::forward::group_engine_forward_to_leader_error;
+use crate::forward::leadership_refusal;
 use crate::forward::write_result_from_raft_response;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
@@ -892,13 +896,14 @@ impl RaftGroupEngine {
     }
 
     async fn not_leader_for_read(&self, operation: &str) -> GroupEngineError {
+        tracing::debug!(operation, "OpenRaft read has to run on the leader");
         let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
-        group_engine_forward_to_leader_error(
-            format!("OpenRaft {operation} has to forward request to leader"),
+        leadership_refusal(
+            LeadershipReason::Follower,
+            Proposal::NotProposed,
             self.raft.current_leader().await,
             None,
             &leadership,
-            true,
         )
     }
 
@@ -1596,9 +1601,11 @@ impl GroupEngine for RaftGroupEngine {
             let candidates = self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {
-                        Ok(state_machine
-                            .engine
-                            .tidy_candidates(request.now_ms, request.max_streams))
+                        Ok::<_, GroupEngineError>(
+                            state_machine
+                                .engine
+                                .tidy_candidates(request.now_ms, request.max_streams),
+                        )
                     })
                 })
                 .await??;
@@ -1777,12 +1784,12 @@ impl GroupEngine for RaftGroupEngine {
                 let route = self.leader_route().await;
                 let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
                 let Some(route) = route else {
-                    return Err(group_engine_forward_to_leader_error(
-                        "OpenRaft bucket purge has no known group leader",
+                    return Err(leadership_refusal(
+                        LeadershipReason::Follower,
+                        Proposal::NotProposed,
                         leader_id,
                         None,
                         &leadership,
-                        true,
                     ));
                 };
                 return forward_purge_bucket_to_leader(&route, self.placement, bucket_id).await;
@@ -2150,13 +2157,13 @@ impl GroupEngine for RaftGroupEngine {
                     false,
                 ),
                 Err(err) => {
-                    // F14e: a pre-proposal redirect means the write was never
-                    // proposed (RT1: OpenRaft's own ForwardToLeader may follow
-                    // a committed entry), and a typed stream error means apply
+                    // F14e: a refusal before proposal means the write was never
+                    // proposed (RT1: OpenRaft's own forward may follow a
+                    // committed entry), and a typed stream error means apply
                     // rejected it (a stale flush), so the page entry is
                     // definitely unreferenced. Other failures are ambiguous:
                     // the flush may still commit, so the entry stays.
-                    let rollback_safe = err.is_forward_before_proposal() || err.code().is_some();
+                    let rollback_safe = err.applied_nothing();
                     (Err(err), rollback_safe)
                 }
             };
@@ -2228,13 +2235,13 @@ impl GroupEngine for RaftGroupEngine {
                     false,
                 ),
                 Err(err) => {
-                    // A pre-proposal redirect means the write was never
+                    // A refusal before proposal means the write was never
                     // proposed (RT1). A typed stream error was committed but the
                     // state machine rejected it without enqueueing GC. Other
                     // Raft failures have an ambiguous commit outcome, so keep
                     // the replacement index rather than risk restoring inputs
                     // that a committed GC command will later delete.
-                    let rollback_safe = err.is_forward_before_proposal() || err.code().is_some();
+                    let rollback_safe = err.applied_nothing();
                     (Err(err), rollback_safe)
                 }
             };

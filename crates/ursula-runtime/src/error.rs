@@ -6,7 +6,7 @@ use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 
 use crate::engine::GroupEngineError;
-use crate::engine::GroupLeaderHint;
+use crate::engine::LeadershipRefusal;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorStatus {
@@ -109,19 +109,20 @@ impl RuntimeError {
         }
     }
 
-    pub fn leader_hint(&self) -> Option<&GroupLeaderHint> {
+    /// The leadership refusal a group engine answered, if it did.
+    pub fn not_leader(&self) -> Option<&LeadershipRefusal> {
         match self {
-            Self::GroupEngine { error, .. } => error.leader_hint(),
+            Self::GroupEngine { error, .. } => error.not_leader(),
             _ => None,
         }
     }
 
-    /// True for a forward-to-leader error raised by a local leadership
-    /// check before anything was proposed (RT1): the command definitely did
-    /// not commit. A forward OpenRaft reports after `client_write` is not.
-    pub fn is_forward_before_proposal(&self) -> bool {
+    /// Whether nothing of a failed write applied
+    /// ([`GroupEngineError::applied_nothing`]). Only a group engine's error
+    /// tells: every other runtime error counts as an unknown outcome.
+    pub fn applied_nothing(&self) -> bool {
         match self {
-            Self::GroupEngine { error, .. } => error.is_forward_before_proposal(),
+            Self::GroupEngine { error, .. } => error.applied_nothing(),
             _ => false,
         }
     }
@@ -131,17 +132,17 @@ impl RuntimeError {
             Self::LiveReadBackpressure { .. } | Self::GroupNotHosted { .. } => {
                 ErrorStatus::Temporary
             }
-            Self::GroupEngine { error, .. } if error.leader_hint().is_some() => {
-                ErrorStatus::Temporary
-            }
-            Self::GroupEngine { error, .. }
-                if error.is_backpressure() || error.is_history_pending() =>
-            {
-                ErrorStatus::Temporary
-            }
-            Self::GroupEngine { error, .. } if error.code().is_some() => ErrorStatus::Permanent,
-            Self::GroupEngine { .. } => ErrorStatus::Persistent,
-            _ => ErrorStatus::Permanent,
+            Self::GroupEngine { error, .. } => error.status(),
+            Self::GroupRestartAborted { .. }
+            | Self::InvalidConfig(_)
+            | Self::InvalidRaftGroup { .. }
+            | Self::SnapshotPlacementMismatch { .. }
+            | Self::ColdStoreConfig { .. }
+            | Self::StaticMembershipConfig { .. }
+            | Self::ColdStoreIo { .. }
+            | Self::MailboxClosed { .. }
+            | Self::ResponseDropped { .. }
+            | Self::SpawnCoreThread { .. } => ErrorStatus::Permanent,
         }
     }
 }

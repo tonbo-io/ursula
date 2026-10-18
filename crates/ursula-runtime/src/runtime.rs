@@ -684,12 +684,12 @@ impl ShardRuntime {
                 Ok(response)
             }
             Err(err) => {
-                // F14e: a typed stream error (a stale candidate) or a
-                // redirect before proposal means the flush definitely did not
-                // commit, and the engine rolled back or never wrote its page
-                // entry, so nothing references the chunk. Any other failure
-                // is ambiguous and keeps the chunk.
-                if (err.stream_error_code().is_some() || err.is_forward_before_proposal())
+                // F14e: a flush that applied nothing (a typed stream error,
+                // such as a stale candidate, or a refusal before proposal)
+                // definitely did not commit, and the engine rolled back or
+                // never wrote its page entry, so nothing references the
+                // chunk. Any other failure is ambiguous and keeps the chunk.
+                if err.applied_nothing()
                     && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
                 {
                     tracing::warn!(
@@ -1260,9 +1260,7 @@ impl ShardRuntime {
                 })
                 .await;
             if let Err(err) = compact_result {
-                let rollback_safe =
-                    err.is_forward_before_proposal() || err.stream_error_code().is_some();
-                if !rollback_safe {
+                if !err.applied_nothing() {
                     return Err(err);
                 }
                 if let Err(cleanup_err) = cold_store.delete_chunk(&replacement_path).await {

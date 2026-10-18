@@ -23,6 +23,7 @@ use ursula_stream::StreamSnapshot;
 use ursula_stream::StreamStateMachine;
 use ursula_stream::WriteKind;
 
+use super::ColdOperation;
 use super::GroupAckColdGcFuture;
 use super::GroupAdvanceRetentionFuture;
 use super::GroupAppendFuture;
@@ -41,7 +42,6 @@ use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
 use super::GroupHeadStreamFuture;
-use super::GroupInfraError;
 use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
@@ -61,6 +61,7 @@ use super::GroupTidyStreamFuture;
 use super::GroupTidyStreamsFuture;
 use super::GroupTouchStreamAccessFuture;
 use super::GroupWriteResponse;
+use super::cold_store_failure;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdIndexPageKey;
 use crate::cold_index::ColdIndexRepairInput;
@@ -1104,13 +1105,27 @@ impl InMemoryGroupEngine {
                                         page_id: segment.page_id,
                                     })
                                     .await
-                                    .map_err(cold_store_error)?;
+                                    .map_err(|err| {
+                                        cold_store_failure(
+                                            ColdOperation::RefreshIndexPage {
+                                                stream_id: stream_id.clone(),
+                                            },
+                                            err,
+                                        )
+                                    })?;
                                 Self::read_cold_index_segment(cold_store, cache, stream_id, segment)
                                     .await
                             }
                             other => other,
                         }
-                        .map_err(cold_store_error)?;
+                        .map_err(|err| {
+                            cold_store_failure(
+                                ColdOperation::ReadPayload {
+                                    stream_id: stream_id.clone(),
+                                },
+                                err,
+                            )
+                        })?;
                     payload.extend_from_slice(&bytes);
                 }
                 StreamReadSegment::Object(segment) => {
@@ -1129,7 +1144,14 @@ impl InMemoryGroupEngine {
                             segment.len,
                         )
                         .await
-                        .map_err(cold_store_error)?;
+                        .map_err(|err| {
+                            cold_store_failure(
+                                ColdOperation::ReadPayload {
+                                    stream_id: stream_id.clone(),
+                                },
+                                err,
+                            )
+                        })?;
                     payload.extend_from_slice(&bytes);
                 }
             }
@@ -1683,7 +1705,14 @@ impl GroupEngine for InMemoryGroupEngine {
                         object,
                     )
                     .await
-                    .map_err(cold_store_error)?;
+                    .map_err(|err| {
+                        cold_store_failure(
+                            ColdOperation::IndexExternalObject {
+                                stream_id: candidate.stream_id.clone(),
+                            },
+                            err,
+                        )
+                    })?;
                     report.page_entries_clipped =
                         report.page_entries_clipped.saturating_add(clipped);
                 }
@@ -2022,7 +2051,7 @@ impl GroupEngine for InMemoryGroupEngine {
             let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
-                    .map_err(cold_store_error)?;
+                    .map_err(|err| cold_store_failure(ColdOperation::RepairIndex, err))?;
             if !retention_targets.is_empty() {
                 let (_, completed) = collect_retained_cold_objects(
                     &cold_store,
@@ -2107,7 +2136,14 @@ impl GroupEngine for InMemoryGroupEngine {
                     &request.chunk,
                 )
                 .await
-                .map_err(cold_store_error)?;
+                .map_err(|err| {
+                    cold_store_failure(
+                        ColdOperation::IndexFlushedChunk {
+                            stream_id: request.stream_id.clone(),
+                        },
+                        err,
+                    )
+                })?;
                 // The clip rule may have removed stale entries that a cached
                 // page still holds.
                 if clipped_entries(&rollback) > 0
@@ -2115,23 +2151,25 @@ impl GroupEngine for InMemoryGroupEngine {
                 {
                     cache.invalidate_stream(&request.stream_id);
                 }
-                index_rollback = Some((store, rollback));
+                index_rollback = Some((store, rollback, request.stream_id.clone()));
             }
             let command = GroupWriteCommand::from(request);
             match self.apply_committed_write(command, placement) {
                 Ok(GroupWriteResponse::FlushCold(response)) => Ok(response),
                 Ok(other) => {
-                    if let Some((store, rollback)) = index_rollback {
+                    if let Some((store, rollback, stream_id)) = index_rollback {
                         rollback_cold_index_pages(&store, rollback)
                             .await
-                            .map_err(cold_store_error)?;
+                            .map_err(|err| {
+                                cold_store_failure(ColdOperation::RollbackIndex { stream_id }, err)
+                            })?;
                     }
                     Err(GroupEngineError::new(format!(
                         "unexpected flush cold write response: {other:?}"
                     )))
                 }
                 Err(err) => {
-                    if let Some((store, rollback)) = index_rollback {
+                    if let Some((store, rollback, _stream_id)) = index_rollback {
                         rollback_cold_index_pages(&store, rollback).await.map_err(
                             |rollback_err| {
                                 GroupEngineError::new(format!(
@@ -2467,12 +2505,4 @@ pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineErro
         } => GroupEngineError::stream_with_context(code, message, next_offset, context),
         other => GroupEngineError::new(format!("unexpected stream response error: {other:?}")),
     }
-}
-
-/// A cold-tier failure as the group's error: the store's detail stays in
-/// the error, for the server's log only.
-fn cold_store_error(err: impl std::fmt::Display) -> GroupEngineError {
-    GroupEngineError::Infra(GroupInfraError::ColdStore {
-        detail: err.to_string(),
-    })
 }

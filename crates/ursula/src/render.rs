@@ -106,13 +106,10 @@ pub(crate) fn runtime_error_answer(err: &RuntimeError) -> (StatusCode, ErrorCode
             (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
         }
         RuntimeError::GroupEngine { error, .. } => match error {
-            GroupEngineError::Stream(_) => error.code().map_or(
-                (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
-                stream_error_answer,
-            ),
+            GroupEngineError::Stream(refusal) => stream_error_answer(refusal.code),
             GroupEngineError::Infra(infra) => infra_error_answer(infra),
-            // A forward the caller did not route answers `500`.
-            GroupEngineError::ForwardToLeader { .. } => {
+            // A leadership refusal the caller did not route answers `500`.
+            GroupEngineError::NotLeader(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
             }
         },
@@ -148,9 +145,20 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::RecoveryPlanFenced { .. }
         | GroupInfraError::OwnerStopped
         | GroupInfraError::Internal { .. }
-        | GroupInfraError::ProtoDecode { .. } => {
-            (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
-        }
+        | GroupInfraError::ProtoDecode { .. }
+        | GroupInfraError::UnexpectedResponse { .. }
+        | GroupInfraError::MissingStreamId { .. }
+        | GroupInfraError::Unsupported { .. }
+        | GroupInfraError::BootstrapWindowNotHot { .. }
+        | GroupInfraError::ColdCompactionStale { .. }
+        | GroupInfraError::ForwardFailed { .. }
+        | GroupInfraError::ForwardedAnswerInvalid { .. }
+        | GroupInfraError::InvalidRaftConfig { .. }
+        | GroupInfraError::StaticMembership { .. }
+        | GroupInfraError::RecoveryGateOpen { .. }
+        | GroupInfraError::MembershipInit { .. }
+        | GroupInfraError::LeaderWaitTimedOut { .. }
+        | GroupInfraError::Snapshot(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
     }
 }
 
@@ -261,7 +269,13 @@ pub(crate) fn runtime_error_message(err: &RuntimeError, code: &ErrorCode) -> Str
 pub(crate) fn runtime_error_body(err: &RuntimeError) -> (StatusCode, ErrorBody) {
     let (status, code) = runtime_error_answer(err);
     let message = runtime_error_message(err, &code);
-    if status.is_server_error() {
+    // A cold-tier failure was logged with its cause where it was converted
+    // (`ursula_runtime::cold_store_failure`).
+    let logged_at_conversion = matches!(err, RuntimeError::GroupEngine {
+        error: GroupEngineError::Infra(GroupInfraError::ColdStore { .. }),
+        ..
+    });
+    if status.is_server_error() && !logged_at_conversion {
         tracing::warn!(%status, error = %err, "runtime request failed");
     } else {
         tracing::debug!(%status, error = %err, "runtime request refused");

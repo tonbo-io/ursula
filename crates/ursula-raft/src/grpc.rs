@@ -638,24 +638,18 @@ where S: raft_internal_proto::raft_internal_server::RaftInternal {
     )
 }
 
+/// The gRPC status of a group engine's error, its one conversion on the Raft
+/// plane: `NOT_FOUND` for a group this node does not host, `UNAVAILABLE`
+/// when the peer should back off before it sends again
+/// ([`ursula_runtime::GroupEngineError::peer_backs_off`]), else `INTERNAL`.
 pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
-    match error.infra() {
-        Some(ursula_runtime::GroupInfraError::RaftGroupNotRegistered { .. }) => {
-            tonic::Status::not_found(error.to_string())
-        }
-        Some(
-            ursula_runtime::GroupInfraError::RecoveryVoteFloor { .. }
-            | ursula_runtime::GroupInfraError::RecoveryCutting { .. }
-            | ursula_runtime::GroupInfraError::CommittedOverwrite { .. }
-            | ursula_runtime::GroupInfraError::UnrelatedHistory { .. }
-            | ursula_runtime::GroupInfraError::LogBehindCommit { .. }
-            | ursula_runtime::GroupInfraError::RecoveryPlanFenced { .. }
-            | ursula_runtime::GroupInfraError::OwnerStopped
-            | ursula_runtime::GroupInfraError::ApplyStopped { .. }
-            | ursula_runtime::GroupInfraError::OutcomeUnknown,
-        ) => tonic::Status::unavailable(error.to_string()),
-        _ => tonic::Status::internal(error.to_string()),
+    if let Some(ursula_runtime::GroupInfraError::RaftGroupNotRegistered { .. }) = error.infra() {
+        return tonic::Status::not_found(error.to_string());
     }
+    if error.peer_backs_off() {
+        return tonic::Status::unavailable(error.to_string());
+    }
+    tonic::Status::internal(error.to_string())
 }
 
 async fn handle_append_envelope(
@@ -2881,3 +2875,64 @@ mod transfer_leader_codec_tests {
 #[cfg(all(test, not(madsim)))]
 #[path = "../benches/support/grpc_counters.rs"]
 mod counter_bench;
+
+#[cfg(test)]
+mod group_rpc_status_tests {
+    use tonic::Code;
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::GroupInfraError;
+    use ursula_runtime::GroupSnapshotError;
+
+    use super::group_rpc_status;
+
+    /// The gRPC code a peer gets for `error`: the table, an exhaustive match.
+    fn expected(error: &GroupEngineError) -> Code {
+        match error {
+            GroupEngineError::Stream(_) | GroupEngineError::NotLeader(_) => Code::Internal,
+            GroupEngineError::Infra(infra) => match infra {
+                GroupInfraError::RaftGroupNotRegistered { .. } => Code::NotFound,
+                GroupInfraError::RecoveryVoteFloor { .. }
+                | GroupInfraError::RecoveryCutting { .. }
+                | GroupInfraError::CommittedOverwrite { .. }
+                | GroupInfraError::UnrelatedHistory { .. }
+                | GroupInfraError::LogBehindCommit { .. }
+                | GroupInfraError::RecoveryPlanFenced { .. }
+                | GroupInfraError::OwnerStopped
+                | GroupInfraError::ApplyStopped { .. }
+                | GroupInfraError::OutcomeUnknown => Code::Unavailable,
+                GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(_))
+                | GroupInfraError::RecoveryNodeMismatch { .. }
+                | GroupInfraError::RecoveryAlreadyBound { .. }
+                | GroupInfraError::RecoveryGroupMismatch { .. }
+                | GroupInfraError::InvalidRaftCommand { .. }
+                | GroupInfraError::WalOpen { .. }
+                | GroupInfraError::RecoveryPending { .. }
+                | GroupInfraError::ColdStore { .. }
+                | GroupInfraError::Internal { .. }
+                | GroupInfraError::ProtoDecode { .. }
+                | GroupInfraError::ColdBackpressure { .. }
+                | GroupInfraError::RaftUncommittedBackpressure { .. }
+                | GroupInfraError::UnexpectedResponse { .. }
+                | GroupInfraError::MissingStreamId { .. }
+                | GroupInfraError::Unsupported { .. }
+                | GroupInfraError::BootstrapWindowNotHot { .. }
+                | GroupInfraError::ColdCompactionStale { .. }
+                | GroupInfraError::ForwardFailed { .. }
+                | GroupInfraError::ForwardedAnswerInvalid { .. }
+                | GroupInfraError::InvalidRaftConfig { .. }
+                | GroupInfraError::StaticMembership { .. }
+                | GroupInfraError::RecoveryGateOpen { .. }
+                | GroupInfraError::MembershipInit { .. }
+                | GroupInfraError::LeaderWaitTimedOut { .. } => Code::Internal,
+            },
+        }
+    }
+
+    #[test]
+    fn every_sample_answers_its_table_code() {
+        for error in ursula_runtime::group_engine_error_samples() {
+            let code = expected(&error);
+            assert_eq!(group_rpc_status(error.clone()).code(), code, "{error:?}");
+        }
+    }
+}

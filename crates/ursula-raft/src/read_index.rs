@@ -27,12 +27,14 @@ use openraft::rt::Instant;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::TypeConfigExt;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::LeadershipReason;
 use ursula_runtime::LinearizableReadBarrier;
+use ursula_runtime::Proposal;
 use ursula_runtime::ReadIndexFuture;
 
 use crate::GroupLeadership;
-use crate::forward::group_engine_leader_read_unavailable;
 use crate::forward::group_engine_linearizable_read_error;
+use crate::forward::unknown_leader;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -169,9 +171,10 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
             tracing::debug!(
                 "OpenRaft {OPERATION} timed out waiting to apply the read index: {state:?}"
             );
-            Err(group_engine_leader_read_unavailable(format!(
-                "OpenRaft {OPERATION} did not apply the read index in time"
-            )))
+            Err(unknown_leader(
+                LeadershipReason::ReadIndexBehind,
+                Proposal::NotProposed,
+            ))
         }
         Err(fatal) => Err(GroupEngineError::new(format!(
             "OpenRaft {OPERATION} could not apply the read index: {fatal}"

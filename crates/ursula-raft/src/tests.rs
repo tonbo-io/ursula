@@ -67,8 +67,14 @@ use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
+#[cfg(not(madsim))]
+use ursula_runtime::LeadershipReason;
+#[cfg(not(madsim))]
+use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::ProducerEarlyAnswer;
 use ursula_runtime::ProducerRequest;
+#[cfg(not(madsim))]
+use ursula_runtime::Proposal;
 #[cfg(not(madsim))]
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -1709,6 +1715,25 @@ async fn deposed_leader_refuses_linearizable_reads() {
     shutdown_all(&engines).await;
 }
 
+/// A leadership refusal raised before anything was proposed.
+#[cfg(not(madsim))]
+fn refused_before_proposal(error: &GroupEngineError) -> bool {
+    matches!(
+        error.not_leader(),
+        Some(LeadershipRefusal {
+            proposal: Proposal::NotProposed,
+            ..
+        })
+    )
+}
+
+/// The group's leader waits for its history event (#581 section 4.5).
+#[cfg(not(madsim))]
+fn is_history_pending(error: &GroupEngineError) -> bool {
+    matches!(error.infra(), Some(GroupInfraError::RecoveryPending { .. }))
+        || error.code() == Some(StreamErrorCode::HistoryPending)
+}
+
 #[track_caller]
 #[cfg(not(madsim))]
 fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
@@ -1716,7 +1741,7 @@ fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
         Ok(_) => panic!("{what}: the deposed leader served its stale view"),
         Err(err) => {
             assert!(
-                err.leader_hint().is_some(),
+                err.not_leader().is_some(),
                 "{what}: expected a forward or leader-unknown error, got {err:?}"
             );
             // openraft's quorum error lists every member's address; the client
@@ -1756,21 +1781,25 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
         .expect("the follower learns the leader");
     let stream_id = bsid("forward-before-proposal");
     let names_the_leader = |error: &GroupEngineError| {
-        error.leader_hint().and_then(|hint| hint.node_id) == Some(leader_id)
+        error
+            .not_leader()
+            .and_then(|refusal| refusal.leader.as_ref())
+            .map(|leader| leader.node_id)
+            == Some(leader_id)
     };
 
     let checked = follower
         .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"a"))
         .await
         .expect_err("the engine's check refuses a write on a follower");
-    assert!(checked.is_forward_before_proposal(), "{checked:?}");
+    assert!(refused_before_proposal(&checked), "{checked:?}");
     assert!(names_the_leader(&checked), "{checked:?}");
 
     let written = follower
         .write(append_command(stream_id.clone(), b"a"))
         .await
         .expect_err("the engine's check refuses a write on a follower");
-    assert!(written.is_forward_before_proposal(), "{written:?}");
+    assert!(refused_before_proposal(&written), "{written:?}");
     assert!(names_the_leader(&written), "{written:?}");
 
     let batch =
@@ -1783,7 +1812,7 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     assert_eq!(batch.len(), 2);
     for entry in batch {
         let error = entry.expect_err("the engine's check refuses each batch entry on a follower");
-        assert!(error.is_forward_before_proposal(), "{error:?}");
+        assert!(refused_before_proposal(&error), "{error:?}");
         assert!(names_the_leader(&error), "{error:?}");
     }
 
@@ -1937,7 +1966,7 @@ impl WriteToOpenRaft {
 /// again after the hand-off, or reporting OpenRaft's forward as raised
 /// before proposal, would treat a write that may have committed as never
 /// proposed. The HTTP layer deletes a staged external payload exactly after
-/// the engine's errors that [`GroupEngineError::is_refused_before_proposal`]
+/// the engine's errors that [`GroupEngineError::refused_before_proposal`]
 /// reports, so no answer here may report one.
 #[cfg(not(madsim))]
 #[tokio::test]
@@ -2027,12 +2056,23 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
             let Err(error) = outcome else {
                 panic!("{write:?}: an entry the new leader replaced was applied");
             };
-            assert!(!error.is_refused_before_proposal(), "{write:?}: {error:?}");
+            assert!(!error.refused_before_proposal(), "{write:?}: {error:?}");
+            let refusal = error
+                .not_leader()
+                .unwrap_or_else(|| panic!("{write:?}: expected a leadership refusal: {error:?}"));
+            assert_eq!(refusal.proposal, Proposal::MayHaveCommitted, "{write:?}");
             assert_eq!(
-                error.leader_hint().and_then(|hint| hint.node_id),
-                Some(new_leader),
+                refusal.reason,
+                LeadershipReason::SteppedDown,
                 "{write:?}: {error:?}"
             );
+            // OpenRaft names the new leader; the refusal carries it, with the
+            // term it leads in, once this node's view knows that term, and
+            // names no leader before.
+            if let Some(leader) = &refusal.leader {
+                assert_eq!(leader.node_id, new_leader, "{write:?}: {error:?}");
+                assert!(leader.term > 0, "{write:?}: {error:?}");
+            }
         }
         // The deposed node now follows, so its own check refuses before
         // proposal. Running it after the hand-off would misclassify the
@@ -2041,18 +2081,15 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
             .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"abc"))
             .await
             .expect_err("the deposed node follows the new leader");
-        assert!(
-            checked.is_forward_before_proposal(),
-            "{write:?}: {checked:?}"
-        );
-        // The hint names the new leader with the term this node knows it
+        assert!(refused_before_proposal(&checked), "{write:?}: {checked:?}");
+        // The refusal names the new leader with the term this node knows it
         // in, from one view, so the front door can redirect typed.
-        let hint = checked.leader_hint().expect("a leader hint");
-        assert_eq!(hint.node_id, Some(new_leader), "{write:?}: {checked:?}");
-        assert!(
-            hint.term.is_some_and(|term| term > 0),
-            "{write:?}: {checked:?}"
-        );
+        let leader = checked
+            .not_leader()
+            .and_then(|refusal| refusal.leader.as_ref())
+            .expect("a known leader");
+        assert_eq!(leader.node_id, new_leader, "{write:?}: {checked:?}");
+        assert!(leader.term > 0, "{write:?}: {checked:?}");
         leader_id = new_leader;
     }
 
@@ -3203,7 +3240,7 @@ async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
         }));
     let before = engine.snapshot(placement()).await;
     assert!(
-        matches!(&before, Err(error) if error.is_history_pending()),
+        matches!(&before, Err(error) if is_history_pending(error)),
         "{before:?}"
     );
     let write = engine
@@ -3214,13 +3251,13 @@ async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
         )
         .await
         .expect_err("a fenced leader admits no write");
-    assert!(write.is_history_pending(), "{write:?}");
-    assert!(write.is_refused_before_proposal());
+    assert!(is_history_pending(&write), "{write:?}");
+    assert!(write.refused_before_proposal());
     let read = engine
         .read_stream(read_req(stream_id.clone(), 16), placement())
         .await
         .expect_err("a fenced leader serves no read");
-    assert!(read.is_history_pending(), "{read:?}");
+    assert!(is_history_pending(&read), "{read:?}");
     // The plan is satisfied: the fence lifts, and the refused write never
     // applied.
     engine.history().set_plan(None);

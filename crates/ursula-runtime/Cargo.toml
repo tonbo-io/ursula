@@ -61,5 +61,11 @@ harness = false
 name = "atomic_padding"
 harness = false
 
+[features]
+# `group_engine_error_samples`: one sample of every variant of
+# `GroupEngineError` and of every type it carries, for the wire fixture and
+# the classification tables of dependent crates.
+test-support = []
+
 [lints]
 workspace = true

@@ -52,6 +52,7 @@ use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::ColdOperation;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamExternalRequest;
@@ -79,6 +80,10 @@ use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngine;
+use ursula_runtime::KnownLeader;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::LeadershipRefusal;
+use ursula_runtime::Proposal;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RouteWriteRequest;
@@ -1129,20 +1134,20 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
         }
         "no-leader-before-proposal" => {
             node.create(path, TEXT, b"").await;
-            node.fail_next_write(GroupEngineError::forward_to_leader_before_proposal(
-                "not the leader",
-                None,
-                None,
-            ));
+            node.fail_next_write(GroupEngineError::NotLeader(LeadershipRefusal {
+                leader: None,
+                proposal: Proposal::NotProposed,
+                reason: LeadershipReason::Follower,
+            }));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
         "leadership-lost-after-proposal" => {
             node.create(path, TEXT, b"").await;
-            node.fail_next_write(GroupEngineError::forward_to_leader(
-                "OpenRaft client_write forwarded to leader",
-                Some(2),
-                None,
-            ));
+            node.fail_next_write(GroupEngineError::NotLeader(LeadershipRefusal {
+                leader: None,
+                proposal: Proposal::MayHaveCommitted,
+                reason: LeadershipReason::SteppedDown,
+            }));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
         "outcome-unknown" => {
@@ -1269,7 +1274,7 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
         "cold-store-failed" => {
             node.create(path, TEXT, b"").await;
             node.fail_next_write(GroupEngineError::Infra(GroupInfraError::ColdStore {
-                detail: "injected".to_owned(),
+                operation: ColdOperation::RepairIndex,
             }));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
@@ -1521,14 +1526,15 @@ async fn a_parts_commit_never_redirects_after_its_body() {
         node.script
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .head_error = Some(
-            GroupEngineError::forward_to_leader_before_proposal(
-                "not the leader",
-                Some(2),
-                Some(node.url.clone()),
-            )
-            .with_leader_term(Some(7)),
-        );
+            .head_error = Some(GroupEngineError::NotLeader(LeadershipRefusal {
+            leader: Some(KnownLeader {
+                node_id: 2,
+                term: 7,
+                address: Some(node.url.clone()),
+            }),
+            proposal: Proposal::NotProposed,
+            reason: LeadershipReason::Follower,
+        }));
         let KeyCheck::Answered(response) = key_check(&target, &commit, body).await else {
             panic!("{body:?}: the key check answers a leadership refusal");
         };
@@ -1548,12 +1554,15 @@ async fn only_a_write_answers_outcome_unknown_for_a_forward() {
     let forward = |leader: Option<u64>| ursula_runtime::RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: ursula_shard::RaftGroupId(0),
-        error: GroupEngineError::forward_to_leader(
-            "OpenRaft client_write forwarded to leader",
-            leader,
-            leader.map(|_| node.url.clone()),
-        )
-        .with_leader_term(leader.map(|_| 7)),
+        error: GroupEngineError::NotLeader(LeadershipRefusal {
+            leader: leader.map(|node_id| KnownLeader {
+                node_id,
+                term: 7,
+                address: Some(node.url.clone()),
+            }),
+            proposal: Proposal::MayHaveCommitted,
+            reason: LeadershipReason::SteppedDown,
+        }),
     };
     let read = |leader| {
         crate::read_error_or_leader_redirect_async(&node.state, forward(leader), "/wout/s")

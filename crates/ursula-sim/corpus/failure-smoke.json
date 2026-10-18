@@ -147,7 +147,7 @@
     "panic_contains": [
       "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`",
       "runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-222-runtime-raft-network-cold-live-truncate-failure failed",
-      "returned 0 bytes for requested range [0..8)"
+      "cold tier payload read of stream benchcmp/ursula-sim-schedule-222-runtime-raft-network-cold-live-truncate-failure failed"
     ]
   },
   {
@@ -472,12 +472,12 @@
         ]
       }
     },
-    "panic": "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`: runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed: core 0 raft group 0 operation failed: cold object 'benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure/chunks/0000000000000000-0000000000000008-000000000000000016f50cf19da4f21c-000000000000010a.bin' returned 0 bytes for requested range [0..8)",
+    "panic": "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`: runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed: core 0 raft group 0 operation failed: cold tier payload read of stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed",
     "invariant": "runtime_raft_network_cold_live_read_integrity",
     "panic_contains": [
       "invariant `runtime_raft_network_cold_live_read_integrity` failed after `runtime_raft_network_read_verified`",
       "runtime raft network cold/live read for stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed",
-      "returned 0 bytes for requested range"
+      "cold tier payload read of stream benchcmp/ursula-sim-schedule-322-runtime-raft-network-randomized-cold-read-failure failed"
     ]
   },
   {

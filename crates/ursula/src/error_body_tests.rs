@@ -289,8 +289,13 @@ fn names_internals(message: &str) -> bool {
 /// `error` event alike. The full error stays in the server's log.
 #[tokio::test]
 async fn no_message_names_the_servers_internals() {
+    use ursula_runtime::ColdOperation;
     use ursula_runtime::GroupEngineError;
     use ursula_runtime::GroupInfraError;
+    use ursula_runtime::KnownLeader;
+    use ursula_runtime::LeadershipReason;
+    use ursula_runtime::LeadershipRefusal;
+    use ursula_runtime::Proposal;
     use ursula_runtime::RuntimeError;
     use ursula_runtime::StreamErrorCode;
     use ursula_shard::BucketStreamId;
@@ -307,32 +312,36 @@ async fn no_message_names_the_servers_internals() {
         // A leadership lost after the write was proposed: its outcome is
         // unknown.
         (
-            engine(GroupEngineError::forward_to_leader(
-                format!(
-                    "OpenRaft client_write forwarded to leader: has to forward request to: \
-                     Some(2), Some(BasicNode {{ addr: \"{leader}\" }})"
-                ),
-                Some(2),
-                Some(leader.to_owned()),
-            )),
+            engine(GroupEngineError::NotLeader(LeadershipRefusal {
+                leader: Some(KnownLeader {
+                    node_id: 2,
+                    term: 5,
+                    address: Some(leader.to_owned()),
+                }),
+                proposal: Proposal::MayHaveCommitted,
+                reason: LeadershipReason::SteppedDown,
+            })),
             ErrorCode::OutcomeUnknown,
         ),
         // A leadership check that failed before the proposal.
         (
-            engine(GroupEngineError::forward_to_leader_before_proposal(
-                format!("not the leader; the leader is {leader}"),
-                Some(2),
-                Some(leader.to_owned()),
-            )),
+            engine(GroupEngineError::NotLeader(LeadershipRefusal {
+                leader: Some(KnownLeader {
+                    node_id: 2,
+                    term: 5,
+                    address: Some(leader.to_owned()),
+                }),
+                proposal: Proposal::NotProposed,
+                reason: LeadershipReason::Follower,
+            })),
             ErrorCode::NoLeader,
         ),
         // A cold-tier read on GET or bootstrap.
         (
             engine(GroupEngineError::Infra(GroupInfraError::ColdStore {
-                detail: "cold object 'tenant/_packs/0/pack-7.bin': NotFound at \
-                         https://tenant-cold.s3.us-east-1.amazonaws.com, RequestId: ABC123, \
-                         x-amz-request-id: ABC123"
-                    .to_owned(),
+                operation: ColdOperation::ReadPayload {
+                    stream_id: BucketStreamId::new("tenant", "s"),
+                },
             })),
             ErrorCode::ColdStoreFailed,
         ),
@@ -378,7 +387,7 @@ async fn no_message_names_the_servers_internals() {
     for (err, code) in cases {
         let event = crate::render::sse_error_event(&crate::render::runtime_error_body(&err).1);
         assert!(!names_internals(&event), "{event}");
-        let answer = if err.leader_hint().is_some() {
+        let answer = if err.not_leader().is_some() {
             crate::leader_unknown_retry_response(err, crate::Access::Write)
         } else {
             crate::runtime_error_response(err)
@@ -645,5 +654,80 @@ async fn every_allowlisted_refusal_names_no_internals() {
     for code in crate::render::REFUSALS_WITH_TEXT {
         let (_, wire) = crate::render::stream_error_answer(*code);
         assert!(seen.contains(&wire), "no case sends {wire}; saw {seen:?}");
+    }
+}
+
+/// The status and code of every group engine error sample: the table, an
+/// exhaustive match. A new variant states its answer here.
+#[test]
+fn every_group_engine_error_answers_its_table_row() {
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::GroupInfraError;
+    use ursula_runtime::GroupSnapshotError;
+    use ursula_runtime::RuntimeError;
+    use ursula_shard::CoreId;
+    use ursula_shard::RaftGroupId;
+
+    fn expected(error: &GroupEngineError) -> (StatusCode, ErrorCode) {
+        let internal = (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal);
+        let unavailable = |code| (StatusCode::SERVICE_UNAVAILABLE, code);
+        match error {
+            GroupEngineError::Stream(refusal) => crate::render::stream_error_answer(refusal.code),
+            GroupEngineError::NotLeader(_) => internal,
+            GroupEngineError::Infra(infra) => match infra {
+                GroupInfraError::ColdBackpressure { .. } => {
+                    unavailable(ErrorCode::ColdBackpressure)
+                }
+                GroupInfraError::RaftUncommittedBackpressure { .. } => {
+                    unavailable(ErrorCode::RaftUncommittedBackpressure)
+                }
+                GroupInfraError::RecoveryPending { .. } => unavailable(ErrorCode::HistoryPending),
+                GroupInfraError::ApplyStopped { .. } => unavailable(ErrorCode::ApplyStopped),
+                GroupInfraError::OutcomeUnknown => unavailable(ErrorCode::OutcomeUnknown),
+                GroupInfraError::InvalidRaftCommand { .. } => {
+                    (StatusCode::BAD_REQUEST, ErrorCode::InvalidRequest)
+                }
+                GroupInfraError::ColdStore { .. } => {
+                    (StatusCode::BAD_GATEWAY, ErrorCode::ColdStoreFailed)
+                }
+                GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(_))
+                | GroupInfraError::RecoveryNodeMismatch { .. }
+                | GroupInfraError::RaftGroupNotRegistered { .. }
+                | GroupInfraError::RecoveryAlreadyBound { .. }
+                | GroupInfraError::RecoveryGroupMismatch { .. }
+                | GroupInfraError::WalOpen { .. }
+                | GroupInfraError::RecoveryVoteFloor { .. }
+                | GroupInfraError::RecoveryCutting { .. }
+                | GroupInfraError::CommittedOverwrite { .. }
+                | GroupInfraError::UnrelatedHistory { .. }
+                | GroupInfraError::LogBehindCommit { .. }
+                | GroupInfraError::RecoveryPlanFenced { .. }
+                | GroupInfraError::OwnerStopped
+                | GroupInfraError::Internal { .. }
+                | GroupInfraError::ProtoDecode { .. }
+                | GroupInfraError::UnexpectedResponse { .. }
+                | GroupInfraError::MissingStreamId { .. }
+                | GroupInfraError::Unsupported { .. }
+                | GroupInfraError::BootstrapWindowNotHot { .. }
+                | GroupInfraError::ColdCompactionStale { .. }
+                | GroupInfraError::ForwardFailed { .. }
+                | GroupInfraError::ForwardedAnswerInvalid { .. }
+                | GroupInfraError::InvalidRaftConfig { .. }
+                | GroupInfraError::StaticMembership { .. }
+                | GroupInfraError::RecoveryGateOpen { .. }
+                | GroupInfraError::MembershipInit { .. }
+                | GroupInfraError::LeaderWaitTimedOut { .. } => internal,
+            },
+        }
+    }
+
+    for error in ursula_runtime::group_engine_error_samples() {
+        let row = expected(&error);
+        let err = RuntimeError::GroupEngine {
+            core_id: CoreId(0),
+            raft_group_id: RaftGroupId(0),
+            error,
+        };
+        assert_eq!(crate::render::runtime_error_answer(&err), row, "{err:?}");
     }
 }

@@ -221,7 +221,7 @@ impl ShardRuntime {
                     bytes: total_bytes,
                 })
             }
-            Err(err) if err.stream_error_code().is_some() || err.is_forward_before_proposal() => {
+            Err(err) if err.applied_nothing() => {
                 // Definitely not committed: the engine rolled the page entry
                 // back, so nothing references the replacement.
                 if let Err(cleanup_err) = cold_store.delete_chunk(&path).await {

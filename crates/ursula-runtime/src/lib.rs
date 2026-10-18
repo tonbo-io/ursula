@@ -18,8 +18,9 @@
 //!   request values into that command.
 //! - [`error`]: runtime-level error type [`RuntimeError`].
 //! - [`engine`]: the `GroupEngine` trait, factory, metrics, and the boxed-future
-//!   type aliases that form the replaceable per-group engine boundary, plus the
-//!   in-memory implementation under [`engine::in_memory`].
+//!   type aliases that form the replaceable per-group engine boundary, its
+//!   serializable error [`GroupEngineError`] with its one classification, plus
+//!   the in-memory implementation under [`engine::in_memory`].
 //! - [`runtime`]: `ShardRuntime`, `RuntimeConfig`, and per-core worker spawn.
 //! - [`core_worker`]: single-thread actor that owns groups for one core.
 //! - [`group_actor`]: per-group mailbox actor running inside a core worker.
@@ -130,6 +131,11 @@ pub use cold_worker::spawn_cold_orphan_sweep_worker;
 pub use cold_worker::spawn_cold_ref_offload_worker;
 pub use command::GroupSnapshot;
 pub use command::GroupWriteCommand;
+pub use engine::AnswerProblem;
+pub use engine::ColdOperation;
+pub use engine::EngineOperation;
+pub use engine::ForwardFailure;
+pub use engine::ForwardedRpc;
 pub use engine::GroupAckColdGcFuture;
 pub use engine::GroupAdvanceRetentionFuture;
 pub use engine::GroupAppendBatchFuture;
@@ -152,7 +158,6 @@ pub use engine::GroupHeadStreamFuture;
 pub use engine::GroupImportGroupStateFuture;
 pub use engine::GroupInfraError;
 pub use engine::GroupInstallSnapshotFuture;
-pub use engine::GroupLeaderHint;
 pub use engine::GroupLeaderReadFuture;
 pub use engine::GroupOffloadColdRefsFuture;
 pub use engine::GroupOpenLiveReadFuture;
@@ -172,6 +177,7 @@ pub use engine::GroupRouteHeadStreamFuture;
 pub use engine::GroupRouteReadStreamFuture;
 pub use engine::GroupRouteWriteFuture;
 pub use engine::GroupShutdownFuture;
+pub use engine::GroupSnapshotError;
 pub use engine::GroupSnapshotFuture;
 pub use engine::GroupStateGaugesFuture;
 pub use engine::GroupTidyStreamFuture;
@@ -180,8 +186,20 @@ pub use engine::GroupTouchStreamAccessFuture;
 pub use engine::GroupWriteResponse;
 pub use engine::HistoryPublisher;
 pub use engine::HistoryWatch;
+pub use engine::KnownLeader;
+pub use engine::LeadershipReason;
+pub use engine::LeadershipRefusal;
+pub use engine::MembershipInitRefusal;
+pub use engine::Proposal;
+pub use engine::ResponseKind;
+pub use engine::StaticMembershipProblem;
+pub use engine::StreamRefusal;
 pub use engine::UnproposableCommand;
 pub use engine::WalOpenFailureKind;
+pub use engine::WriteEffect;
+pub use engine::cold_store_failure;
+#[cfg(any(test, feature = "test-support"))]
+pub use engine::group_engine_error_samples;
 pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;
 pub use engine::in_memory::next_repair_cursor;
