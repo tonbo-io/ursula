@@ -563,7 +563,7 @@ async fn snapshot_holds_marker(cluster: &JournalCluster, node_id: u64) -> Option
         .map(|entry| {
             format!(
                 "snapshot {} holds stream {} with {} hot bytes",
-                snapshot.meta.snapshot_id,
+                pointer.snapshot_id,
                 entry.metadata.stream_id,
                 entry.payload.len()
             )

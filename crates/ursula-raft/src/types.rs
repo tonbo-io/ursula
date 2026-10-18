@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use openraft::alias::SnapshotOf;
 use openraft::alias::VoteOf;
 use openraft::raft::AppendEntriesRequest;
 use openraft::raft::AppendEntriesResponse;
@@ -37,9 +38,12 @@ openraft::declare_raft_types!(
         D = GroupWriteCommand,
         R = RaftGroupResponse,
         Node = openraft::BasicNode,
-        SnapshotData = crate::types::SnapshotData,
         AsyncRuntime = OpenRaftRuntime,
 );
+
+/// A group snapshot with its metadata, as the state machine, its snapshot
+/// builder and the networks hand it to OpenRaft.
+pub type UrsulaSnapshot = SnapshotOf<UrsulaRaftTypeConfig, SnapshotData>;
 
 /// What a group snapshot carries through OpenRaft: the encoded
 /// [`ursula_runtime::SnapshotPointer`], and a hold on the object it names

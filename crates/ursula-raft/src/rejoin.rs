@@ -1004,11 +1004,17 @@ pub struct GroupRejoin {
     /// while its gate is still registered.
     store: Weak<RaftGroupFileLogStore>,
     changes: WatchSenderOf<UrsulaRaftTypeConfig, ()>,
-    /// The last snapshot the commit screen refused, by its id, and why (S2
-    /// of the fifth #613 review): a resend of it is refused before the
-    /// install queues for the group's lock, the node's permit or a download.
-    /// A refusal for a snapshot only grows firmer as the marker rises.
-    refused_snapshot: Mutex<Option<(String, ursula_runtime::GroupInfraError)>>,
+    /// The last snapshot the commit screen refused, by its last log id, and
+    /// why (S2 of the fifth #613 review): a resend of it is refused before
+    /// the install queues for the group's lock, the node's permit or a
+    /// download. OpenRaft treats snapshots with one last log id as one
+    /// state. A refusal for a snapshot only grows firmer as the marker rises.
+    refused_snapshot: Mutex<
+        Option<(
+            Option<LogIdOf<UrsulaRaftTypeConfig>>,
+            ursula_runtime::GroupInfraError,
+        )>,
+    >,
     /// The committed leader whose AppendEntries reached this replica last,
     /// and when.
     last_leader_append: Mutex<
@@ -1697,25 +1703,26 @@ impl GroupRejoin {
         Some(refusal)
     }
 
-    /// The refusal of the snapshot `snapshot_id`, when the commit screen
-    /// refused it before.
+    /// The refusal of the snapshot through `last_log_id`, when the commit
+    /// screen refused it before.
     pub(crate) fn refused_snapshot(
         &self,
-        snapshot_id: &str,
+        last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
     ) -> Option<ursula_runtime::GroupInfraError> {
         self.refused_snapshot
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .filter(|(refused, _)| refused == snapshot_id)
+            .filter(|(refused, _)| *refused == last_log_id)
             .map(|(_, refusal)| refusal.clone())
     }
 
-    /// Records that the commit screen refused the snapshot `snapshot_id`.
-    /// A refusal for a log it could not read may pass later: not recorded.
+    /// Records that the commit screen refused the snapshot through
+    /// `last_log_id`. A refusal for a log it could not read may pass later:
+    /// not recorded.
     pub(crate) fn record_refused_snapshot(
         &self,
-        snapshot_id: &str,
+        last_log_id: Option<LogIdOf<UrsulaRaftTypeConfig>>,
         refusal: &ursula_runtime::GroupInfraError,
     ) {
         if matches!(
@@ -1728,8 +1735,7 @@ impl GroupRejoin {
         *self
             .refused_snapshot
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) =
-            Some((snapshot_id.to_owned(), refusal.clone()));
+            .unwrap_or_else(PoisonError::into_inner) = Some((last_log_id, refusal.clone()));
     }
 
     /// The id of the history this replica's commit marker lies in (#613):

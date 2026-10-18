@@ -827,7 +827,6 @@ async fn snapshot_record_after_a_journal_sync(publication: Publication) {
             let meta = openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
                 last_log_id: Some(log_id(2)),
                 last_membership: Default::default(),
-                snapshot_id: pointer.snapshot_id.clone(),
             };
             published
                 .install_snapshot(

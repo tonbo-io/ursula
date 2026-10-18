@@ -34,6 +34,7 @@ use crate::madsim_harness::accepted_loss::Controls;
 use crate::madsim_harness::accepted_loss::Switched;
 use crate::madsim_harness::accepted_loss::read_local;
 use crate::madsim_harness::accepted_loss::try_append;
+use crate::madsim_harness::accepted_loss::try_append_every_group;
 use crate::madsim_harness::journal_cluster::JOURNAL_GROUPS;
 use crate::madsim_harness::journal_cluster::JOURNAL_POWER_LOSS_SEEDS;
 use crate::madsim_harness::journal_cluster::JournalCluster;
@@ -67,6 +68,9 @@ struct Outcome {
     /// Of those, groups whose plan was satisfied: the log guard did not
     /// stop P.
     shaped_satisfied: usize,
+    /// Of those, groups where X extended P's log and the plan was satisfied
+    /// all the same: the log guard did not stop P over X's entry.
+    extended_satisfied: usize,
     /// Groups whose plan was satisfied on every reached replica.
     satisfied: usize,
     /// A reached replica applied X's write.
@@ -169,12 +173,11 @@ fn run(seed: u64, controls: Controls) -> Outcome {
         for node_id in REST {
             cluster.policy.partition_bidirectional(X, node_id);
         }
-        for group in JOURNAL_GROUPS {
-            assert!(
-                !try_append(&mut cluster, group, X, FOREIGN).await,
-                "{context}: X's write committed without a quorum"
-            );
-        }
+        let committed = try_append_every_group(&mut cluster, X, FOREIGN).await;
+        assert!(
+            committed.is_empty(),
+            "{context}: X's write committed without a quorum in groups {committed:?}"
+        );
         // B, C and D elect a leader at a later term and commit writes.
         for group in JOURNAL_GROUPS {
             let deadline = madsim::time::Instant::now() + Duration::from_secs(10);
@@ -273,6 +276,9 @@ fn run(seed: u64, controls: Controls) -> Outcome {
                     outcome.satisfied = outcome.satisfied.saturating_add(1);
                     outcome.shaped_satisfied =
                         outcome.shaped_satisfied.saturating_add(usize::from(shaped));
+                    outcome.extended_satisfied = outcome
+                        .extended_satisfied
+                        .saturating_add(usize::from(shaped && extended));
                     // The event landed: nothing below it changes any more.
                     madsim::time::sleep(Duration::from_millis(300)).await;
                     outcome.foreign_applied |= foreign_applied(&cluster, group).await;
@@ -310,8 +316,11 @@ fn a_leader_before_the_plan_never_extends_the_plans_leader() {
 /// Each defence alone keeps X's write from being applied, and each run
 /// shows that it fired: with only the fence, or only the plan term vote
 /// (#613), X's entry stays out of P's log and the plan is satisfied; with
-/// only the guard, X extends P's log and the guard keeps P from being
-/// elected.
+/// only the guard, the guard keeps P from being elected wherever X extended
+/// its log. X does not always extend it: when X reached P's replica of a
+/// group during an earlier group's plan, the cut later removes X's entry
+/// behind X's back, and X, which counts it replicated, does not send it
+/// again within the window.
 #[test]
 fn either_defence_against_a_foreign_entry_alone_suffices() {
     let _guard = sim_test_guard();
@@ -346,14 +355,10 @@ fn either_defence_against_a_foreign_entry_alone_suffices() {
             "seed {seed} guard only: {outcome:?}"
         );
         assert_eq!(
-            outcome.extended, outcome.shaped,
+            outcome.extended_satisfied, 0,
             "seed {seed} guard only: {outcome:?}"
         );
-        assert_eq!(
-            outcome.shaped_satisfied, 0,
-            "seed {seed} guard only: {outcome:?}"
-        );
-        guarded = guarded.saturating_add(outcome.shaped);
+        guarded = guarded.saturating_add(outcome.extended);
     }
     assert!(
         fenced > 0 && guarded > 0 && voted > 0,

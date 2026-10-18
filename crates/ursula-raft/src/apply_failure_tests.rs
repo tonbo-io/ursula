@@ -710,7 +710,10 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
             )
             .await
             .unwrap();
-            assert!(matches!(result, Err(openraft::error::RaftError::Fatal(_))));
+            assert!(
+                matches!(result, Err(openraft::error::RaftError::Fatal(_))),
+                "{result:?}"
+            );
             // A surviving follower must elect a new leader and learn the
             // committed poison through Raft replication, not a test-delivered ACK.
             let waits = engines

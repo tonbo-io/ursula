@@ -1852,8 +1852,8 @@ pub(crate) async fn stage_external_payload(
 /// or a pre-proposal check, rejected on every replica alike, or a refusal
 /// before proposal), a request the runtime refused before dispatch, or a
 /// group this node does not host ([`refused_before_proposal`]). Every other
-/// failure (a lost response, a leadership refusal reported by OpenRaft after
-/// `client_write` (RT1), a transport or storage error, an untyped engine
+/// failure (a lost response, an entry OpenRaft appended and then discarded
+/// (RT1), a transport or storage error, an untyped engine
 /// error) may follow a committed proposal that references the object, so the
 /// object is kept. An orphan sweep or stream GC reclaims it if nothing does.
 ///
@@ -2925,9 +2925,34 @@ pub(crate) async fn add_raft_learner(
             }),
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("add raft learner: {err}"),
+        Err(err) => match err.api_error() {
+            // Refused before anything was appended: retry on the leader.
+            Some(openraft::error::ClientWriteError::ForwardToLeader(forward)) => {
+                membership_forward_response("add raft learner", forward.leader_id)
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("add raft learner: {err}"),
+            )
+                .into_response(),
+        },
+    }
+}
+
+/// The answer to a membership request OpenRaft refused before appending it:
+/// `409` naming the leader when one is known, else `503` with
+/// `Retry-After`, as while a new leader waits for its quorum.
+fn membership_forward_response(operation: &str, leader: Option<u64>) -> Response {
+    match leader {
+        Some(leader) => (
+            StatusCode::CONFLICT,
+            format!("{operation}: not the leader; node {leader} leads"),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            format!("{operation}: no leader with a live quorum; retry"),
         )
             .into_response(),
     }
@@ -2975,11 +3000,31 @@ pub(crate) async fn change_raft_membership(
             }),
         )
             .into_response(),
-        Err(err) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("change raft membership: {err}"),
-        )
-            .into_response(),
+        Err(err) => match err.api_error() {
+            // Refused before anything was appended: retry on the leader.
+            Some(openraft::error::ClientWriteError::ForwardToLeader(forward)) => {
+                match forward.leader_id {
+                    Some(leader) => (
+                        StatusCode::CONFLICT,
+                        axum::Json(ursula_proto::admin::MembershipResponse {
+                            raft_group_id: raft_group_id.0,
+                            current_leader: Some(leader),
+                            changed: false,
+                            reason: Some("not leader".to_owned()),
+                            voter_ids: BTreeSet::new(),
+                            log_index: None,
+                        }),
+                    )
+                        .into_response(),
+                    None => membership_forward_response("change raft membership", None),
+                }
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("change raft membership: {err}"),
+            )
+                .into_response(),
+        },
     }
 }
 

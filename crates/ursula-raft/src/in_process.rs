@@ -27,13 +27,14 @@ use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::rt::WatchReceiver;
-use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 
 use crate::registry::SnapshotInstallError;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateStatus;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
+use crate::types::UrsulaSnapshot;
 
 #[derive(Debug, Clone, Default)]
 pub struct InProcessRaftRegistry {
@@ -643,6 +644,8 @@ impl InProcessRaftNetwork {
 }
 
 impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
+    type SnapshotData = SnapshotData;
+
     async fn append_entries(
         &mut self,
         rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
@@ -743,7 +746,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
     async fn full_snapshot(
         &mut self,
         vote: VoteOf<UrsulaRaftTypeConfig>,
-        snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
         cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {

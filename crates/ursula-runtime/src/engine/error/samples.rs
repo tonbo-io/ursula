@@ -206,6 +206,7 @@ fn leadership_refusals() -> Vec<LeadershipRefusal> {
     let reasons = every_unit!(LeadershipReason {
         Follower,
         SteppedDown,
+        LeadershipTransfer,
         QuorumUnconfirmed,
         ReadIndexBehind,
         LeaderUnreachable,

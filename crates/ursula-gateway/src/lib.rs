@@ -1815,6 +1815,15 @@ impl Pace {
     }
 }
 
+/// The timer that paces a body read: madsim's under `cfg(madsim)`, so that
+/// a simulated server drains a refused body in virtual time.
+mod clock {
+    #[cfg(madsim)]
+    pub(super) use madsim::time::timeout;
+    #[cfg(not(madsim))]
+    pub(super) use tokio::time::timeout;
+}
+
 /// `after` past `at`, or a year past it at most: a reading is cut by then
 /// whatever the configuration.
 fn later(at: Instant, after: Duration) -> Instant {
@@ -1902,7 +1911,8 @@ impl BodyReader {
         loop {
             self.close_windows(Instant::now())?;
             let (deadline, cut) = self.deadline();
-            match tokio::time::timeout_at(deadline, self.body.frame()).await {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match clock::timeout(left, self.body.frame()).await {
                 Err(_elapsed) => return Err(cut),
                 Ok(None) => return Ok(None),
                 Ok(Some(Ok(frame))) => {

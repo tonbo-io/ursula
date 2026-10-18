@@ -28,7 +28,7 @@ First-principles thinking and the elegance of the implementation come before com
 - **Language**: Rust 2024 Edition, nightly toolchain
 - **Async Runtime**: Tokio (multi-thread + single-thread worker pools)
 - **HTTP Server**: axum (stateless front door)
-- **Raft Consensus**: OpenRaft `=0.10.0-alpha.28` from crates.io. The only `[patch.crates-io]` entry is the vendored `futures-macro` (`third_party/futures-macro`) for madsim determinism
+- **Raft Consensus**: OpenRaft `=0.10.0-alpha.37` from crates.io. The only `[patch.crates-io]` entry is the vendored `futures-macro` (`third_party/futures-macro`) for madsim determinism
 - **gRPC**: tonic (inter-node Raft RPCs)
 - **Serialization**: serde, prost (protobuf)
 - **Cold Storage**: OpenDAL (S3, memory backends)

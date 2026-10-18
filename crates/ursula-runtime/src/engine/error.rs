@@ -109,10 +109,14 @@ pub enum Proposal {
 pub enum LeadershipReason {
     /// The replica's own leadership check found that it does not lead.
     Follower,
-    /// OpenRaft reported, after it took the command, that the replica no
-    /// longer leads.
+    /// OpenRaft found that the replica no longer leads: it refused the
+    /// command before appending it, or discarded it after it took it.
     SteppedDown,
-    /// A leader could not confirm its leadership with a quorum.
+    /// The leader is handing its leadership to another replica. The target
+    /// does not lead yet, so the refusal names no leader.
+    LeadershipTransfer,
+    /// A leader could not confirm its leadership with a quorum, as when no
+    /// quorum acknowledged it within its lease.
     QuorumUnconfirmed,
     /// A leader did not apply the read index in time.
     ReadIndexBehind,
@@ -927,13 +931,14 @@ impl GroupEngineError {
         }
     }
 
-    /// What a failed write did. Only the runtime's own refusals before it
-    /// proposed (the engine's leadership check, the core worker's check of
-    /// the group's unapplied bytes, the cold-tier admission, a pending
-    /// history) are [`WriteEffect::NotProposed`]. A leadership refusal
-    /// OpenRaft reports after `client_write` may follow a committed entry
-    /// (RT1), so it is [`WriteEffect::Unknown`]. It classifies a write's
-    /// error only: a read's refusal proposes nothing either way.
+    /// What a failed write did. Refusals before anything was proposed (the
+    /// engine's leadership check, the core worker's check of the group's
+    /// unapplied bytes, the cold-tier admission, a pending history, and
+    /// OpenRaft's forward before it appends) are [`WriteEffect::NotProposed`].
+    /// An entry OpenRaft appended and then discarded may still commit
+    /// through another leader (RT1), so it is [`WriteEffect::Unknown`]. It
+    /// classifies a write's error only: a read's refusal proposes nothing
+    /// either way.
     pub fn write_effect(&self) -> WriteEffect {
         match self {
             Self::Stream(_) => WriteEffect::Refused,

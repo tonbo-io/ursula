@@ -607,6 +607,7 @@ pub(crate) async fn write_commands_on_raft(
         history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
+    await_first_quorum_ack(&raft).await;
     // A replica that lost the leadership during the admits refuses every
     // command here, before proposing any, as `write` does.
     if let Err(refused) = refuse_unless_leader(&raft) {
@@ -618,27 +619,63 @@ pub(crate) async fn write_commands_on_raft(
     })?;
     let responses = stream.map_ok(|result| match result {
         Ok(response) => write_result_from_raft_response(response.response).unwrap_or_else(Err),
-        Err(err) => {
-            tracing::debug!(error = %err, "OpenRaft client_write_many forwarded to leader");
-            Err(leadership_refusal(
-                LeadershipReason::SteppedDown,
-                Proposal::MayHaveCommitted,
-                err.leader_id,
-                err.leader_node.as_ref(),
-                &GroupLeadership::of(&raft.metrics().borrow_watched()),
-            ))
-        }
+        Err(err) => Err(client_write_refusal(
+            &err,
+            &GroupLeadership::of(&raft.metrics().borrow_watched()),
+        )),
     });
     Ok(collect_batch_responses(responses, expected_responses).await)
+}
+
+/// Waits, at most `election_timeout_min`, until this leader holds a quorum
+/// acknowledgement, or until the replica no longer leads. OpenRaft refuses a
+/// proposal while no quorum acknowledged the leader within its lease, as for
+/// a new leader until its first follower answers. Waiting here turns that
+/// round trip after each election into latency instead of a `503`. The wait
+/// watches the metrics, so a leader that steps down meanwhile goes on at
+/// once. A leader that no quorum acknowledges in time, or a replica that does
+/// not lead, goes on to be refused before proposal.
+pub(crate) async fn await_first_quorum_ack(
+    raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+) {
+    let budget = Duration::from_millis(raft.config().election_timeout_min);
+    await_quorum_ack_on(raft.metrics(), budget).await;
+}
+
+/// [`await_first_quorum_ack`] on the metrics watch `metrics`, bounded by
+/// `budget`.
+pub(crate) async fn await_quorum_ack_on(
+    metrics: openraft::type_config::alias::WatchReceiverOf<
+        UrsulaRaftTypeConfig,
+        openraft::RaftMetrics<UrsulaRaftTypeConfig>,
+    >,
+    budget: Duration,
+) {
+    fn settled(metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
+        metrics.state != openraft::ServerState::Leader || metrics.last_quorum_acked.is_some()
+    }
+    if settled(&metrics.borrow_watched()) {
+        return;
+    }
+    let wait = openraft::metrics::Wait {
+        timeout: Some(budget),
+        rx: metrics,
+    };
+    if let Err(error) = wait
+        .metrics(settled, "a new leader's first quorum acknowledgement")
+        .await
+    {
+        tracing::debug!(%error, "a write found no quorum acknowledgement of this leader");
+    }
 }
 
 /// The one check, right before commands go to OpenRaft, that this replica
 /// leads the group, for a single write ([`RaftGroupEngine::write`]) and a
 /// batch ([`write_commands_on_raft`]) alike. A replica that does not lead
 /// refuses here, before proposing, so its refusal says that nothing applied
-/// (a redirect or `NO_LEADER`). OpenRaft's own forward after it took a
-/// command may follow a committed entry (RT1), so it stays ambiguous. One
-/// view of the metrics decides and names the leader.
+/// (a redirect or `NO_LEADER`). OpenRaft checks again when it takes the
+/// command ([`client_write_refusal`]). One view of the metrics decides and
+/// names the leader.
 ///
 /// [`RaftGroupEngine::write`]: crate::engine::RaftGroupEngine::write
 pub(crate) fn refuse_unless_leader(
@@ -710,18 +747,69 @@ pub(crate) fn group_engine_client_write_error(
     >,
     leadership: &GroupLeadership,
 ) -> GroupEngineError {
-    if let Some(forward) = err.forward_to_leader() {
-        tracing::debug!(error = %err, "OpenRaft client_write forwarded to leader");
-        return leadership_refusal(
-            LeadershipReason::SteppedDown,
-            Proposal::MayHaveCommitted,
-            forward.leader_id,
-            forward.leader_node.as_ref(),
-            leadership,
-        );
+    match err.api_error() {
+        Some(refusal) => client_write_refusal(refusal, leadership),
+        None => {
+            tracing::warn!(error = %err, "Raft write response lost after submission");
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
+        }
     }
-    tracing::warn!(error = %err, "Raft write response lost after submission");
-    GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
+}
+
+/// Map OpenRaft's refusal of a proposed write (RT1). OpenRaft forwards a
+/// write only before it appends the entry: on a replica that does not lead,
+/// a leader whose quorum lease expired, or one that is handing its
+/// leadership over. Nothing of the write applied, so the answer is a
+/// redirect or `NO_LEADER`. Only an entry OpenRaft appended and then
+/// discarded for another leader's log may still commit through that leader,
+/// so that refusal stays ambiguous. A normal write cannot fail a membership
+/// change or a precondition, so either is logged as a bug and answered as an
+/// unknown outcome.
+pub(crate) fn client_write_refusal(
+    err: &openraft::error::ClientWriteError<UrsulaRaftTypeConfig>,
+    leadership: &GroupLeadership,
+) -> GroupEngineError {
+    use openraft::error::ClientWriteError;
+    match err {
+        ClientWriteError::ForwardToLeader(forward) => {
+            tracing::debug!(error = %err, "OpenRaft refused a write before appending it");
+            leadership_refusal(
+                forward_reason(forward.reason, LeadershipReason::SteppedDown),
+                Proposal::NotProposed,
+                forward.leader_id,
+                forward.leader_node.as_ref(),
+                leadership,
+            )
+        }
+        ClientWriteError::LogEntryDiscarded(forward) => {
+            tracing::debug!(error = %err, "OpenRaft discarded a proposed write");
+            leadership_refusal(
+                LeadershipReason::SteppedDown,
+                Proposal::MayHaveCommitted,
+                forward.leader_id,
+                forward.leader_node.as_ref(),
+                leadership,
+            )
+        }
+        ClientWriteError::ChangeMembershipError(_) | ClientWriteError::PreconditionFailed(_) => {
+            tracing::error!(error = %err, "OpenRaft refused a normal write with a membership or precondition error");
+            GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
+        }
+    }
+}
+
+/// Why OpenRaft forwarded a request, as a leadership refusal says it.
+/// `not_leader` is the reason for a replica that does not lead.
+fn forward_reason(
+    reason: openraft::errors::ForwardReason,
+    not_leader: LeadershipReason,
+) -> LeadershipReason {
+    use openraft::errors::ForwardReason;
+    match reason {
+        ForwardReason::NotLeader => not_leader,
+        ForwardReason::LeaseExpired => LeadershipReason::QuorumUnconfirmed,
+        ForwardReason::LeadershipTransfer => LeadershipReason::LeadershipTransfer,
+    }
 }
 
 /// Map a failed ReadIndex barrier (`Raft::get_read_linearizer`). Nothing was
@@ -745,7 +833,7 @@ pub(crate) fn group_engine_linearizable_read_error(
     match err.api_error() {
         Some(openraft::error::LinearizableReadError::ForwardToLeader(forward)) => {
             leadership_refusal(
-                LeadershipReason::Follower,
+                forward_reason(forward.reason, LeadershipReason::Follower),
                 Proposal::NotProposed,
                 forward.leader_id,
                 forward.leader_node.as_ref(),
@@ -774,10 +862,9 @@ pub(crate) fn unknown_leader(reason: LeadershipReason, proposal: Proposal) -> Gr
 }
 
 /// A leadership refusal naming the leader `leader_id` that this replica's
-/// view `leadership` knows with its term. `proposal` is
-/// [`Proposal::NotProposed`] only for a local leadership check that runs
-/// before anything is proposed (RT1); a forward OpenRaft reports after
-/// `client_write` may follow a committed entry.
+/// view `leadership` knows with its term. `proposal` says whether the
+/// command may have been appended (RT1): only an entry OpenRaft appended
+/// and then discarded may have.
 pub(crate) fn leadership_refusal(
     reason: LeadershipReason,
     proposal: Proposal,
@@ -847,6 +934,7 @@ mod leadership_refusal_tests {
     use ursula_runtime::LeadershipRefusal;
     use ursula_runtime::Proposal;
 
+    use super::client_write_refusal;
     use super::leadership_refusal;
     use crate::GroupLeadership;
     use crate::leadership::LeaderRole;
@@ -917,5 +1005,61 @@ mod leadership_refusal_tests {
                 address: Some("http://node-3:4438".to_owned()),
             })
         );
+    }
+
+    /// OpenRaft forwards a write only before it appends the entry, so each
+    /// forward reason answers that nothing applied. Only a discarded entry
+    /// may still commit.
+    #[test]
+    fn client_write_refusals_say_whether_openraft_appended() {
+        use openraft::errors::ClientWriteError;
+        use openraft::errors::ForwardReason;
+        use openraft::errors::ForwardToLeader;
+
+        let to_node_3 = |reason| {
+            ForwardToLeader::new(3, BasicNode::new("http://node-3:4438")).with_reason(reason)
+        };
+        // Node 2 while it still leads in term 7.
+        let leading = GroupLeadership {
+            node_id: 2,
+            term: 7,
+            role: LeaderRole::Leads,
+        };
+        let refused = |error, view: &GroupLeadership| match client_write_refusal(&error, view) {
+            GroupEngineError::NotLeader(refusal) => refusal,
+            other => panic!("expected a leadership refusal, got {other:?}"),
+        };
+        // A replica that stepped down follows the leader OpenRaft names.
+        let stepped_down = refused(
+            ClientWriteError::ForwardToLeader(to_node_3(ForwardReason::NotLeader)),
+            &following(3),
+        );
+        assert_eq!(stepped_down.proposal, Proposal::NotProposed);
+        assert_eq!(stepped_down.reason, LeadershipReason::SteppedDown);
+        assert_eq!(stepped_down.leader.map(|leader| leader.node_id), Some(3));
+        // A leader past its lease names no leader.
+        let lease = refused(
+            ClientWriteError::ForwardToLeader(
+                ForwardToLeader::empty().with_reason(ForwardReason::LeaseExpired),
+            ),
+            &leading,
+        );
+        assert_eq!(lease.proposal, Proposal::NotProposed);
+        assert_eq!(lease.reason, LeadershipReason::QuorumUnconfirmed);
+        assert_eq!(lease.leader, None);
+        // A transfer's target does not lead yet: no term, so no leader.
+        let transfer = refused(
+            ClientWriteError::ForwardToLeader(to_node_3(ForwardReason::LeadershipTransfer)),
+            &leading,
+        );
+        assert_eq!(transfer.proposal, Proposal::NotProposed);
+        assert_eq!(transfer.reason, LeadershipReason::LeadershipTransfer);
+        assert_eq!(transfer.leader, None);
+        let discarded = refused(
+            ClientWriteError::LogEntryDiscarded(to_node_3(ForwardReason::NotLeader)),
+            &following(3),
+        );
+        assert_eq!(discarded.proposal, Proposal::MayHaveCommitted);
+        assert_eq!(discarded.reason, LeadershipReason::SteppedDown);
     }
 }

@@ -138,6 +138,7 @@ use super::ThreeNodeRaftSimConfig;
 use super::ThreeNodeRaftSimOutcome;
 use super::accepted_loss::read_local;
 use super::accepted_loss::try_append;
+use super::accepted_loss::try_append_every_group;
 use super::journal_cluster::JOURNAL_GROUPS;
 use super::journal_cluster::JournalCluster;
 use super::journal_cluster::SimPlanTransport;
@@ -1339,13 +1340,65 @@ async fn roll_back_a_minority_change(
     context: &str,
 ) {
     let a = plan.leader;
+    if plan.loss == Loss::Blackout {
+        // The other voters must not campaign before they lose power: no vote
+        // term rises above the logs, so the plan cuts nothing.
+        for node in others {
+            for group in JOURNAL_GROUPS {
+                cluster.engines[&(group, *node)]
+                    .raft_handle()
+                    .runtime_config()
+                    .elect(false);
+            }
+        }
+    }
     for voter in others {
         cluster.policy.partition_bidirectional(a, *voter);
         cluster.policy.partition_bidirectional(LEARNER, *voter);
     }
+    let change = match plan.change {
+        Change::Promote | Change::PromoteCompleted | Change::LearnerAhead | Change::CommitAhead => {
+            ChangeMembers::AddVoterIds(BTreeSet::from([LEARNER]))
+        }
+        Change::Remove(voter)
+        | Change::RemovedMissed(voter)
+        | Change::TwoRecoveries { behind: voter, .. } => {
+            ChangeMembers::RemoveVoters(BTreeSet::from([voter]))
+        }
+    };
+    // A leader proposes only while a quorum acknowledged it within its
+    // lease, so every group's change, and a cut-off leader's write, go out
+    // together, right after the cut.
+    let changes = JOURNAL_GROUPS
+        .into_iter()
+        .map(|group| {
+            let raft = cluster.engines[&(group, a)].raft_handle();
+            let change = change.clone();
+            async move {
+                // The change never commits: give up on its answer.
+                if let Ok(answer) = madsim::time::timeout(
+                    Duration::from_millis(300),
+                    raft.change_membership(change, false),
+                )
+                .await
+                {
+                    tracing::info!(?answer, group, "the change answered");
+                }
+            }
+        })
+        .collect::<Vec<_>>();
+    let cut_off = plan.loss == Loss::CutOff;
+    let stale = async {
+        if cut_off {
+            // Dropped by the cut whether or not it is acknowledged.
+            let committed = try_append_every_group(cluster, a, STALE).await;
+            if !committed.is_empty() {
+                tracing::info!(?committed, "the cut-off leader acknowledged its write");
+            }
+        }
+    };
+    futures_util::future::join(futures_util::future::join_all(changes), stale).await;
     if plan.loss == Loss::Blackout {
-        // The other voters lose power first, before they could campaign:
-        // no vote term rises above the logs, so the plan cuts nothing.
         for node in others {
             cluster.stop_node(*node).await;
         }
@@ -1354,27 +1407,6 @@ async fn roll_back_a_minority_change(
         }
     }
     for group in JOURNAL_GROUPS {
-        let change = match plan.change {
-            Change::Promote
-            | Change::PromoteCompleted
-            | Change::LearnerAhead
-            | Change::CommitAhead => ChangeMembers::AddVoterIds(BTreeSet::from([LEARNER])),
-            Change::Remove(voter)
-            | Change::RemovedMissed(voter)
-            | Change::TwoRecoveries { behind: voter, .. } => {
-                ChangeMembers::RemoveVoters(BTreeSet::from([voter]))
-            }
-        };
-        let raft = cluster.engines[&(group, a)].raft_handle();
-        // The change never commits: give up on its answer.
-        if let Ok(answer) = madsim::time::timeout(
-            Duration::from_millis(300),
-            raft.change_membership(change, false),
-        )
-        .await
-        {
-            tracing::info!(?answer, group, "the change answered");
-        }
         for node_id in [a, LEARNER] {
             let (configs, _) = membership_of(cluster, group, node_id);
             assert_eq!(
@@ -1387,12 +1419,6 @@ async fn roll_back_a_minority_change(
 
     match plan.loss {
         Loss::CutOff => {
-            for group in JOURNAL_GROUPS {
-                // Dropped by the cut whether or not it is acknowledged.
-                if try_append(cluster, group, a, STALE).await {
-                    tracing::info!(group, "the cut-off leader acknowledged its write");
-                }
-            }
             // The others elect a leader, which acknowledges writes.
             for group in JOURNAL_GROUPS {
                 let deadline = madsim::time::Instant::now() + Duration::from_secs(10);

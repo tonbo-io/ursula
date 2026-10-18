@@ -46,7 +46,6 @@ async fn leader_read_log_index(engine: &RaftGroupEngine) -> u64 {
         .ensure_linearizable(openraft::ReadPolicy::ReadIndex)
         .await
         .expect("leader read index")
-        .expect("leader committed log id")
         .index()
 }
 

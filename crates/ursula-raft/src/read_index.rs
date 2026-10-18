@@ -1,12 +1,13 @@
 //! Coalesced ReadIndex confirmation for one Raft group (D10).
 //!
-//! openraft 0.10.0-alpha.28 sends a heartbeat to every voter for each
-//! `get_read_linearizer` call; it does not batch concurrent callers. This
-//! barrier runs at most one confirmation round per group at a time. Readers
-//! that arrive while a round is in flight share the next round, which starts
-//! when the current one ends. A reader never shares a round that started
-//! before it arrived, so every round's read index is taken after each of its
-//! readers began.
+//! OpenRaft queues each `get_read_linearizer` call until a heartbeat round
+//! that began after it reaches a quorum, and reads queued together share
+//! that round. This barrier still runs at most one confirmation round per
+//! group at a time, so concurrent readers make one call and one wait for the
+//! local apply. Readers that arrive while a round is in flight share the next
+//! round, which starts when the current one ends. A reader never shares a
+//! round that started before it arrived, so every round's read index is
+//! taken after each of its readers began.
 //!
 //! The runtime calls the barrier before it queues a linearizable read
 //! (`ursula_runtime::LinearizableReadBarrier`), and the engine calls it
@@ -21,12 +22,10 @@ use std::time::Duration;
 use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::future::Shared;
+use openraft::LinearizerOption;
 use openraft::ReadPolicy;
 use openraft::alias::LogIdOf;
-use openraft::error::LinearizableReadError;
-use openraft::rt::Instant;
 use openraft::rt::WatchReceiver;
-use openraft::type_config::TypeConfigExt;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::LinearizableReadBarrier;
@@ -131,49 +130,30 @@ impl LinearizableReadBarrier for ReadIndexBarrier {
 /// One confirmation round: confirm leadership with a quorum (ReadIndex),
 /// then wait until the local state machine has applied the read index.
 ///
-/// One heartbeat round waits one heartbeat interval for the quorum, which a
-/// loaded leader can miss. While this node still believes it leads,
-/// `QuorumNotEnough` is retried (at most one round per heartbeat interval)
-/// until `election_timeout_min` has passed; only then is it a 503. The wait
-/// for the local apply is bounded by the same timeout and also ends in a
-/// 503, so a read never hangs on a stalled state machine.
+/// The round takes no earlier acknowledgement (a zero age, so never a lease
+/// read): OpenRaft queues it until a heartbeat round that began after it
+/// reaches a quorum. It waits at most `election_timeout_min` for that
+/// quorum, then fails with `QuorumNotEnough` (a 503), or with
+/// `ForwardToLeader` once this node steps down. The wait for the local apply
+/// is bounded by the same timeout and also ends in a 503, so a read never
+/// hangs on a stalled state machine.
 async fn confirm(raft: &RaftGroupHandle) -> Outcome {
     if !raft.is_leader() {
         return Ok(None);
     }
-    let config = raft.config();
-    let budget = Duration::from_millis(config.election_timeout_min);
-    let round = Duration::from_millis(config.heartbeat_interval);
-    let began = UrsulaRaftTypeConfig::now();
-    let leadership = || GroupLeadership::of(&raft.metrics().borrow_watched());
-    let linearizer = loop {
-        let started = UrsulaRaftTypeConfig::now();
-        match raft.get_read_linearizer(ReadPolicy::ReadIndex).await {
-            Ok(linearizer) => break linearizer,
-            Err(err)
-                if matches!(
-                    err.api_error(),
-                    Some(LinearizableReadError::QuorumNotEnough(_))
-                ) && raft.is_leader()
-                    && began.elapsed() < budget =>
-            {
-                tracing::debug!("OpenRaft {OPERATION} retrying leadership confirmation: {err}");
-                // Sleep out the rest of this heartbeat interval, but never past the budget.
-                let until_next_round = round
-                    .saturating_sub(started.elapsed())
-                    .min(budget.saturating_sub(began.elapsed()));
-                UrsulaRaftTypeConfig::sleep(until_next_round).await;
-            }
-            Err(err) => {
-                return Err(group_engine_linearizable_read_error(
-                    err,
-                    OPERATION,
-                    &leadership(),
-                ));
-            }
-        }
-    };
-    let read_log_id = *linearizer.read_log_id();
+    let budget = Duration::from_millis(raft.config().election_timeout_min);
+    let fresh_quorum = LinearizerOption::from(ReadPolicy::ReadIndex).with_wait_timeout(budget);
+    let linearizer = raft
+        .get_read_linearizer(fresh_quorum)
+        .await
+        .map_err(|err| {
+            group_engine_linearizable_read_error(
+                err,
+                OPERATION,
+                &GroupLeadership::of(&raft.metrics().borrow_watched()),
+            )
+        })?;
+    let read_log_id = *linearizer.read_log_id().log_id();
     match linearizer.try_await_ready(raft, Some(budget)).await {
         Ok(Ok(_)) => Ok(Some(read_log_id)),
         Ok(Err(state)) => {

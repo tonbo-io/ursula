@@ -2133,9 +2133,9 @@ dependencies = [
 
 [[package]]
 name = "openraft"
-version = "0.10.0-alpha.28"
+version = "0.10.0-alpha.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0456aaaa818f1bd12179999d4ebbefc8f0a14091a9c6481cfda4f3ef93e76ac4"
+checksum = "225e445aeba04deb36474dfc77d7b8f54364cfbee968851e31d50f4db4b7c53a"
 dependencies = [
  "anyerror",
  "backoff-series",
@@ -2150,6 +2150,7 @@ dependencies = [
  "openraft-rt",
  "openraft-rt-tokio",
  "peel-off",
+ "quorum-set",
  "rand 0.10.1",
  "serde",
  "smallvec",
@@ -2160,22 +2161,22 @@ dependencies = [
 
 [[package]]
 name = "openraft-macros"
-version = "0.10.0-alpha.28"
+version = "0.10.0-alpha.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1db90aa6d2074d963f8ca2360b146f2423fe914e336c8e66aeb6c266ef295cf9"
+checksum = "0aa8e23a59e3b485cae920364ee1290f4deb5e5468cbce25be12397856273dab"
 dependencies = [
  "chrono",
  "proc-macro2",
  "quote",
  "semver",
- "syn 2.0.117",
+ "syn 3.0.9",
 ]
 
 [[package]]
 name = "openraft-rt"
-version = "0.10.0-alpha.28"
+version = "0.10.0-alpha.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d9d3c0616bcb3be41c1ac5743cf60a3cbc73f62ab2458527b40079ce3d077c9"
+checksum = "abdbb3b5cbb27c4f6520b60b385a1dd4f170dd9a971cc057da3641c4baa7e649"
 dependencies = [
  "futures-channel",
  "futures-util",
@@ -2186,9 +2187,9 @@ dependencies = [
 
 [[package]]
 name = "openraft-rt-tokio"
-version = "0.10.0-alpha.28"
+version = "0.10.0-alpha.37"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6a3c58d8a68bd8f6398fde62afde01aa876ad412a10f86c8aa341d833490796"
+checksum = "fc4f79eaaf4c90b816235b72376b48b96f72167d15f0aaadaee50f965e8ba909"
 dependencies = [
  "futures-util",
  "openraft-rt",
@@ -2752,6 +2753,16 @@ dependencies = [
  "socket2 0.6.3",
  "tracing",
  "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "quorum-set"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65fbaef7c5116d9b9c8764bf8e33bad95ec88cee358d414f99eabc667d5a8daf"
+dependencies = [
+ "sha2",
+ "validit",
 ]
 
 [[package]]
@@ -3434,6 +3445,17 @@ name = "syn"
 version = "2.0.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e665b8803e7b1d2a727f4023456bbbbe74da67099c585258af0ad9c5013b9b99"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
+name = "syn"
+version = "3.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d78c8dee4c7bf0e14673097256fed6142ce9d3b85a408189d07482442145823b"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4182,6 +4204,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "jsonwebtoken",
+ "madsim",
  "percent-encoding",
  "rand 0.10.1",
  "reqwest",
