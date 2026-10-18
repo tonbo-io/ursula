@@ -19,17 +19,18 @@ pub enum GroupSnapshotError {
     #[error("snapshot content does not restore")]
     InvalidContent(#[source] StreamSnapshotError),
     /// The snapshot this node persisted names an object outside the
-    /// namespace this node owns for the group, as when the node started
-    /// with another node's data directory or with another snapshot prefix.
+    /// directory this node owns for the group,
+    /// `{prefix}/node-{node}/group-{gid}/`, as when the node started with
+    /// another node's data directory or with another snapshot prefix.
     #[error(
         "raft group {raft_group_id:?}: the persisted snapshot names {key}, outside this node's \
-         snapshot namespace {prefix}. Start the node with an empty raft.wal.path to rejoin as \
-         a wiped node"
+         snapshot directory {directory}. Start the node with an empty raft.wal.path to rejoin \
+         as a wiped node"
     )]
     ForeignKey {
         raft_group_id: RaftGroupId,
         key: String,
-        prefix: String,
+        directory: String,
     },
     /// The snapshot object the persisted pointer names is gone.
     #[error("raft group {raft_group_id:?}: snapshot object {key} is missing")]
@@ -50,7 +51,7 @@ pub enum GroupSnapshotError {
     #[error("raft group {raft_group_id:?}: the persisted snapshot pointer is unreadable")]
     PointerUnreadable { raft_group_id: RaftGroupId },
     /// The snapshot store did not answer `operation` on `key`. The cause is
-    /// logged where it is converted. Retryable.
+    /// logged where it is converted.
     #[error("raft group {raft_group_id:?}: snapshot store {operation} of {key} failed")]
     StoreUnavailable {
         raft_group_id: RaftGroupId,
@@ -66,9 +67,12 @@ pub enum SnapshotObjectCheck {
     StoredSize { expected: u64, actual: u64 },
     /// The decompressed body's size differs from the pointer's.
     LogicalSize { expected: u64, actual: u64 },
-    /// The stored object does not decompress.
+    /// The stored object does not decompress, or is larger than the node
+    /// addresses.
     Decompress,
-    /// The body does not decode as a group snapshot.
+    /// The body does not decode as a group snapshot. This includes a body
+    /// of another format epoch: it is refused like any other, and the
+    /// epoch is logged where the refusal is converted.
     Decode,
 }
 
@@ -100,6 +104,8 @@ pub enum SnapshotStoreOperation {
     List,
     /// Deleting an object.
     Delete,
+    /// Copying an object inside the store.
+    Copy,
 }
 
 impl fmt::Display for SnapshotStoreOperation {
@@ -110,22 +116,25 @@ impl fmt::Display for SnapshotStoreOperation {
             Self::Put => "PUT",
             Self::List => "LIST",
             Self::Delete => "DELETE",
+            Self::Copy => "COPY",
         })
     }
 }
 
 impl GroupSnapshotError {
-    /// See [`super::GroupEngineError::status`]. Only an unavailable store
-    /// may answer on a retry: every other refusal holds until an operator
-    /// acts.
+    /// See [`super::GroupEngineError::status`]. Every refusal is
+    /// persistent: a group whose snapshot does not restore answers 500 with
+    /// no `Retry-After`, as it did while these refusals were free text. An
+    /// unavailable store is named apart so that a later change can make it
+    /// retryable without a new wire variant.
     pub fn status(&self) -> ErrorStatus {
         match self {
-            Self::StoreUnavailable { .. } => ErrorStatus::Temporary,
             Self::InvalidContent(_)
             | Self::ForeignKey { .. }
             | Self::ObjectMissing { .. }
             | Self::ObjectCorrupt { .. }
-            | Self::PointerUnreadable { .. } => ErrorStatus::Persistent,
+            | Self::PointerUnreadable { .. }
+            | Self::StoreUnavailable { .. } => ErrorStatus::Persistent,
         }
     }
 
@@ -144,7 +153,9 @@ impl GroupSnapshotError {
 
     /// See [`super::GroupEngineError::peer_backs_off`]. A replica that
     /// cannot restore its own snapshot takes nothing from a peer until it
-    /// does, so the peer backs off.
+    /// does, so the peer backs off. Content that does not restore is the
+    /// sender's own snapshot, which waiting does not change, so the sender
+    /// hears of it at once.
     pub fn peer_backs_off(&self) -> bool {
         match self {
             Self::InvalidContent(_) => false,

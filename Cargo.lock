@@ -4254,6 +4254,7 @@ dependencies = [
  "futures-util",
  "madsim",
  "madsim-tokio",
+ "opendal",
  "openraft",
  "openraft-macros",
  "openraft-rt",

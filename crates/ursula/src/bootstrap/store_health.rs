@@ -1043,9 +1043,11 @@ mod tests {
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async {
-                Err(SnapshotStoreError::Io(std::io::Error::other(
-                    "probe-only store",
-                )))
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
+                ))
             })
         }
 
@@ -1054,9 +1056,11 @@ mod tests {
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
             Box::pin(async {
-                Err(SnapshotStoreError::Io(std::io::Error::other(
-                    "probe-only store",
-                )))
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Get,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
+                ))
             })
         }
 
@@ -1085,13 +1089,65 @@ mod tests {
                 }
                 tokio::time::sleep(latency).await;
                 if fails {
-                    Err(SnapshotStoreError::Io(std::io::Error::other(
-                        "scripted probe failure",
-                    )))
+                    Err(ursula_runtime::SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Head,
+                        "test",
+                        opendal::Error::new(
+                            opendal::ErrorKind::Unexpected,
+                            "scripted probe failure",
+                        ),
+                    ))
                 } else {
                     Ok(())
                 }
             })
+        }
+
+        fn namespace(
+            &self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::OwnedNamespace {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
+        }
+
+        fn stage<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
         }
     }
 

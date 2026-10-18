@@ -13,6 +13,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::KeyHold;
+use ursula_runtime::Release;
 use ursula_runtime::SnapshotLocation;
 use ursula_shard::RaftGroupId;
 
@@ -47,8 +48,11 @@ openraft::declare_raft_types!(
 #[derive(Debug, Clone)]
 pub struct SnapshotData {
     pointer_bytes: Vec<u8>,
-    lease: Option<KeyHold<SnapshotLocation>>,
+    lease: Option<SnapshotLease>,
 }
+
+/// The hold a [`SnapshotData`] keeps on the object its pointer names.
+pub type SnapshotLease = KeyHold<SnapshotLocation, Release>;
 
 impl SnapshotData {
     /// The snapshot data of `pointer_bytes`, holding nothing.
@@ -64,13 +68,16 @@ impl SnapshotData {
         &self.pointer_bytes
     }
 
-    /// The encoded snapshot pointer, ending the hold.
-    pub fn into_pointer_bytes(self) -> Vec<u8> {
-        self.pointer_bytes
+    /// The encoded snapshot pointer and the hold on the object it names.
+    /// The caller keeps the hold for as long as the pointer is in use, as
+    /// until the RPC that sends it returns.
+    #[must_use = "the lease keeps the named object while the pointer is in use"]
+    pub fn into_parts(self) -> (Vec<u8>, Option<SnapshotLease>) {
+        (self.pointer_bytes, self.lease)
     }
 
     /// The hold on the object the pointer names, if the data holds one.
-    pub fn lease(&self) -> Option<&KeyHold<SnapshotLocation>> {
+    pub fn lease(&self) -> Option<&SnapshotLease> {
         self.lease.as_ref()
     }
 }

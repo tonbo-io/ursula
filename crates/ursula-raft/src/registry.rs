@@ -61,7 +61,6 @@ use crate::snapshot_codec::decode_group_snapshot;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
-use crate::state_machine::location_key;
 use crate::types::RaftGroupMetricsSnapshot;
 use crate::types::RaftLogProgressSnapshot;
 use crate::types::SnapshotData;
@@ -305,10 +304,15 @@ pub struct SnapshotGcPass {
 }
 
 /// Failure of snapshot admission, of the prefetch and copy of an incoming
-/// snapshot, of its installation, or of reference publication. It never
-/// leaves this crate as a value: each transport converts it once, the gRPC
-/// plane by [`From`] into `tonic::Status` and the in-process network by
-/// [`SnapshotInstallError::peer_backs_off`].
+/// snapshot, of its installation, or of reference publication. It is the
+/// error of [`RaftGroupHandleRegistry::install_full_snapshot`] and is not
+/// part of any wire form. The gRPC plane converts it once, by [`From`] into
+/// `tonic::Status`, whose code is [`SnapshotInstallError::code`].
+///
+/// The in-process network of the tests and the simulation classifies it on
+/// its own, and does not yet back off for every refusal the gRPC plane
+/// answers `UNAVAILABLE`: admission and publication failures stay network
+/// errors there.
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotInstallError {
     #[error("snapshot group {group:?} is not registered")]
@@ -388,22 +392,16 @@ pub enum SnapshotInstallError {
 }
 
 impl SnapshotInstallError {
-    /// The gRPC code the sender gets for every refusal but
-    /// [`Self::Group`], which [`crate::grpc::group_rpc_status`] classifies.
-    /// No refusal is `FAILED_PRECONDITION` (#539).
-    fn code(&self) -> tonic::Code {
+    /// The gRPC code the sender gets. A [`Self::Group`] refusal gets the
+    /// code of the group's error ([`crate::grpc::group_rpc_code`]). No
+    /// refusal is `FAILED_PRECONDITION` (#539).
+    pub(crate) fn code(&self) -> tonic::Code {
         match self {
             Self::NotRegistered { .. } => tonic::Code::NotFound,
             Self::PointerUndecodable { .. } => tonic::Code::InvalidArgument,
             Self::Undecodable { .. } => tonic::Code::DataLoss,
             Self::PointerEncode { .. } => tonic::Code::Internal,
-            Self::Group(error) => {
-                if error.peer_backs_off() {
-                    tonic::Code::Unavailable
-                } else {
-                    tonic::Code::Internal
-                }
-            }
+            Self::Group(error) => crate::grpc::group_rpc_code(error),
             Self::ShuttingDown { .. }
             | Self::Publication(_)
             | Self::Task(_)
@@ -425,10 +423,7 @@ impl SnapshotInstallError {
 
 impl From<SnapshotInstallError> for tonic::Status {
     fn from(error: SnapshotInstallError) -> Self {
-        match error {
-            SnapshotInstallError::Group(error) => crate::grpc::group_rpc_status(error),
-            error => Self::new(error.code(), error.to_string()),
-        }
+        Self::new(error.code(), error.to_string())
     }
 }
 
@@ -1585,31 +1580,36 @@ impl RaftGroupHandleRegistry {
         snapshot: TypeConfigSnapshotOf<UrsulaRaftTypeConfig>,
     ) -> Result<PrefetchedInstallSnapshot, SnapshotInstallError> {
         let group = raft_group_id;
-        let pointer_bytes = snapshot.snapshot.into_pointer_bytes();
+        // Kept until the prefetch returns.
+        let (pointer_bytes, _incoming_lease) = snapshot.snapshot.into_parts();
         let pointer = SnapshotPointer::decode(&pointer_bytes)
             .map_err(|source| SnapshotInstallError::PointerUndecodable { group, source })?;
         let SnapshotPointer {
             snapshot_id,
             location,
         } = pointer;
-        if let SnapshotLocation::Inline { bytes } = &location {
-            let history = decode_group_snapshot(bytes)
-                .map_err(|source| SnapshotInstallError::Undecodable {
-                    group,
-                    snapshot_id: snapshot_id.clone(),
-                    source,
-                })?
-                .stream_snapshot
-                .history;
-            return Ok(PrefetchedInstallSnapshot {
-                snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
-                    meta: snapshot.meta,
-                    snapshot: SnapshotData::new(pointer_bytes),
-                },
-                guard: None,
-                history: Some(history),
-            });
-        }
+        let source_key = match &location {
+            SnapshotLocation::S3 { key, .. } => key.clone(),
+            SnapshotLocation::Local { path, .. } => path.display().to_string(),
+            SnapshotLocation::Inline { bytes } => {
+                let history = decode_group_snapshot(bytes)
+                    .map_err(|source| SnapshotInstallError::Undecodable {
+                        group,
+                        snapshot_id: snapshot_id.clone(),
+                        source,
+                    })?
+                    .stream_snapshot
+                    .history;
+                return Ok(PrefetchedInstallSnapshot {
+                    snapshot: TypeConfigSnapshotOf::<UrsulaRaftTypeConfig> {
+                        meta: snapshot.meta,
+                        snapshot: SnapshotData::new(pointer_bytes),
+                    },
+                    guard: None,
+                    history: Some(history),
+                });
+            }
+        };
 
         let snapshot_store = self.snapshot_store();
         let reference = self
@@ -1633,7 +1633,7 @@ impl RaftGroupHandleRegistry {
                     }
                     source => SnapshotInstallError::SourceRead {
                         group,
-                        source_key: location_key(&location),
+                        source_key: source_key.clone(),
                         source,
                     },
                 })?;
@@ -1878,9 +1878,14 @@ mod tests {
         ) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
                 if self.fail_pin.load(Ordering::SeqCst) {
-                    return Err(SnapshotStoreError::Io(std::io::Error::other(
-                        "temporary pin PUT outage",
-                    )));
+                    return Err(ursula_runtime::SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Put,
+                        "test",
+                        opendal::Error::new(
+                            opendal::ErrorKind::Unexpected,
+                            "temporary pin PUT outage",
+                        ),
+                    ));
                 }
                 if let SnapshotLocation::S3 { key, .. } = location {
                     self.pins.lock().unwrap().insert(key.clone());
@@ -1895,9 +1900,14 @@ mod tests {
         ) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
                 if self.fail_current.load(Ordering::SeqCst) {
-                    return Err(SnapshotStoreError::Io(std::io::Error::other(
-                        "temporary current-reference PUT outage",
-                    )));
+                    return Err(ursula_runtime::SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Put,
+                        "test",
+                        opendal::Error::new(
+                            opendal::ErrorKind::Unexpected,
+                            "temporary current-reference PUT outage",
+                        ),
+                    ));
                 }
                 if self.pause_current.load(Ordering::SeqCst) {
                     self.entered_current.notify_one();
@@ -1926,6 +1936,53 @@ mod tests {
                 self.pins.lock().unwrap().retain(|key| keys.contains(key));
                 Ok(())
             })
+        }
+
+        fn namespace(
+            &self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::OwnedNamespace {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
+        }
+
+        fn stage<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
         }
     }
 
@@ -2664,13 +2721,60 @@ mod tests {
             let bytes = self.bytes.clone();
             Box::pin(async move {
                 bytes.ok_or_else(|| SnapshotStoreError::NotFound {
-                    key: location_key(location),
+                    key: crate::state_machine::object_key(location).expect("an external location"),
                 })
             })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move { Ok(()) })
+        }
+
+        fn namespace(
+            &self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::OwnedNamespace {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
+        }
+
+        fn stage<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
         }
     }
 
@@ -2836,6 +2940,126 @@ mod tests {
         assert_eq!(tonic::Status::from(err).code(), tonic::Code::Unavailable);
     }
 
+    /// Every install refusal's answer: its gRPC code, whether the sender
+    /// backs off, and whether the in-process network makes it an
+    /// unreachable target. The table is an exhaustive match, and no refusal
+    /// is `FAILED_PRECONDITION` (#539).
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn every_install_refusal_answers_its_table_row() {
+        use tonic::Code;
+        use ursula_runtime::GroupEngineError;
+        use ursula_runtime::GroupInfraError;
+
+        /// `(gRPC code, peer_backs_off, in-process unreachable)`.
+        fn expected(error: &SnapshotInstallError) -> (Code, bool, bool) {
+            match error {
+                SnapshotInstallError::NotRegistered { .. } => (Code::NotFound, false, false),
+                SnapshotInstallError::ShuttingDown { .. }
+                | SnapshotInstallError::Publication(_)
+                | SnapshotInstallError::Task(_) => (Code::Unavailable, true, false),
+                SnapshotInstallError::Group(group) => match group.infra() {
+                    Some(GroupInfraError::CommittedOverwrite { .. }) => {
+                        (Code::Unavailable, true, true)
+                    }
+                    Some(GroupInfraError::RaftGroupNotRegistered { .. }) => {
+                        (Code::NotFound, false, false)
+                    }
+                    _ => (Code::Internal, false, false),
+                },
+                SnapshotInstallError::GateClosed { .. }
+                | SnapshotInstallError::SourceMissing { .. }
+                | SnapshotInstallError::SourceRead { .. }
+                | SnapshotInstallError::CopyWrite { .. }
+                | SnapshotInstallError::CopyVerify { .. }
+                | SnapshotInstallError::NameCollision { .. } => (Code::Unavailable, true, true),
+                SnapshotInstallError::PointerUndecodable { .. } => {
+                    (Code::InvalidArgument, false, false)
+                }
+                SnapshotInstallError::Undecodable { .. } => (Code::DataLoss, false, false),
+                SnapshotInstallError::PointerEncode { .. } => (Code::Internal, false, false),
+            }
+        }
+
+        let group = RaftGroupId(7);
+        let store_error = || SnapshotStoreError::NotFound {
+            key: "snapshots/k.snap".to_owned(),
+        };
+        let cancelled = {
+            let task = crate::rt::spawn(std::future::pending::<()>());
+            task.abort();
+            task.await.expect_err("an aborted task")
+        };
+        let samples = vec![
+            SnapshotInstallError::NotRegistered { group },
+            SnapshotInstallError::ShuttingDown { group },
+            SnapshotInstallError::Group(GroupEngineError::Infra(
+                GroupInfraError::CommittedOverwrite {
+                    raft_group_id: group,
+                    committed: 2,
+                    index: 1,
+                },
+            )),
+            SnapshotInstallError::Group(GroupEngineError::Infra(
+                GroupInfraError::RaftGroupNotRegistered {
+                    raft_group_id: group,
+                },
+            )),
+            SnapshotInstallError::Group(GroupEngineError::new("internal")),
+            SnapshotInstallError::Publication(store_error()),
+            SnapshotInstallError::Task(cancelled),
+            SnapshotInstallError::GateClosed { group },
+            SnapshotInstallError::PointerUndecodable {
+                group,
+                source: store_error(),
+            },
+            SnapshotInstallError::SourceMissing {
+                group,
+                source_key: "k".to_owned(),
+            },
+            SnapshotInstallError::SourceRead {
+                group,
+                source_key: "k".to_owned(),
+                source: store_error(),
+            },
+            SnapshotInstallError::Undecodable {
+                group,
+                snapshot_id: "s".to_owned(),
+                source: store_error(),
+            },
+            SnapshotInstallError::CopyWrite {
+                group,
+                own_key: "k".to_owned(),
+                source: store_error(),
+            },
+            SnapshotInstallError::CopyVerify {
+                group,
+                own_key: "k".to_owned(),
+                expected: 2,
+                actual: 1,
+            },
+            SnapshotInstallError::NameCollision {
+                group,
+                own_key: "k".to_owned(),
+            },
+            SnapshotInstallError::PointerEncode {
+                group,
+                source: store_error(),
+            },
+        ];
+        for error in samples {
+            let row = (
+                error.code(),
+                error.peer_backs_off(),
+                crate::in_process::install_error_backs_off(&error),
+            );
+            assert_eq!(row, expected(&error), "{error:?}");
+            assert_ne!(error.code(), Code::FailedPrecondition, "{error:?}");
+            let code = error.code();
+            assert_eq!(tonic::Status::from(error).code(), code);
+        }
+    }
+
     #[tokio::test]
     async fn prefetch_snapshot_for_install_does_not_download_inline_snapshot() {
         let registry = RaftGroupHandleRegistry::default();
@@ -2856,7 +3080,7 @@ mod tests {
             .await
             .expect("inline snapshot does not touch snapshot store");
         let pointer =
-            SnapshotPointer::decode(&prefetched.snapshot.snapshot.into_pointer_bytes()).unwrap();
+            SnapshotPointer::decode(prefetched.snapshot.snapshot.pointer_bytes()).unwrap();
         assert!(matches!(pointer.location, SnapshotLocation::Inline { .. }));
     }
 

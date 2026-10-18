@@ -31,6 +31,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_shard::RaftGroupId;
 
 use crate::SnapshotStoreOperation;
 
@@ -194,21 +195,66 @@ impl SnapshotPointer {
     }
 }
 
+/// A snapshot store's prefix: the path below the cold root that holds its
+/// objects. It is not empty, has no empty component, and has no leading or
+/// trailing `/`, so every key under it renders and parses the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SnapshotPrefix(String);
+
+impl SnapshotPrefix {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SnapshotPrefix {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&str> for SnapshotPrefix {
+    type Error = SnapshotStoreError;
+
+    /// Trims the leading and trailing `/` of `prefix` and refuses what is
+    /// left if it is empty or has an empty component.
+    fn try_from(prefix: &str) -> Result<Self, Self::Error> {
+        let trimmed = prefix.trim_matches('/');
+        if trimmed.is_empty() || trimmed.split('/').any(str::is_empty) {
+            return Err(SnapshotStoreError::Config {
+                problem: SnapshotStoreConfigProblem::InvalidPrefix {
+                    prefix: prefix.to_owned(),
+                },
+            });
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+}
+
 /// The node that owns a group's snapshot objects: the only node that writes
-/// or deletes them.
+/// or deletes them. A store knows its own node, so only it names an owner
+/// it acts for. A parsed key names the owner it was written by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotOwner {
-    pub node_id: u64,
-    pub raft_group_id: u32,
+    node_id: u64,
+    raft_group_id: RaftGroupId,
 }
 
 impl SnapshotOwner {
+    pub fn node_id(&self) -> u64 {
+        self.node_id
+    }
+
+    pub fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
     /// The directory of the owner's objects under `prefix`:
     /// `{prefix}/node-{node}/group-{gid}/`.
-    pub fn directory(&self, prefix: &str) -> String {
+    pub fn directory(&self, prefix: &SnapshotPrefix) -> String {
         format!(
             "{prefix}/node-{}/group-{}/",
-            self.node_id, self.raft_group_id
+            self.node_id, self.raft_group_id.0
         )
     }
 }
@@ -216,13 +262,14 @@ impl SnapshotOwner {
 /// The key of an owned snapshot object,
 /// `{prefix}/node-{node}/group-{gid}/{index:020}-{nonce:016x}.snap`. `index`
 /// is the snapshot's last log index, so a group's objects list in log
-/// order, and `nonce` is drawn at random for every write, so no two writes
-/// share a name.
+/// order, and `nonce` is drawn for every write, so no two writes share a
+/// name. Parsing a key names whoever wrote it. Only the store that owns it
+/// hands it out as an [`OwnedObject`], the one form a delete takes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct OwnedKey {
-    pub owner: SnapshotOwner,
-    pub index: u64,
-    pub nonce: u64,
+    owner: SnapshotOwner,
+    index: u64,
+    nonce: u64,
 }
 
 /// Why a key is not an [`OwnedKey`] under a prefix.
@@ -246,13 +293,25 @@ pub enum OwnedKeyProblem {
 #[error("{key} is not an owned snapshot object key under {prefix}: {problem:?}")]
 pub struct OwnedKeyError {
     pub key: String,
-    pub prefix: String,
+    pub prefix: SnapshotPrefix,
     pub problem: OwnedKeyProblem,
 }
 
 impl OwnedKey {
+    pub fn owner(&self) -> SnapshotOwner {
+        self.owner
+    }
+
+    pub fn index(&self) -> u64 {
+        self.index
+    }
+
+    pub fn nonce(&self) -> u64 {
+        self.nonce
+    }
+
     /// The full object key under `prefix`.
-    pub fn render(&self, prefix: &str) -> String {
+    pub fn render(&self, prefix: &SnapshotPrefix) -> String {
         format!(
             "{}{:020}-{:016x}.snap",
             self.owner.directory(prefix),
@@ -265,14 +324,14 @@ impl OwnedKey {
     /// end at a `/`, and every number must be in the form [`Self::render`]
     /// writes, so `node-1` never matches `node-10` and a parsed key renders
     /// back to the same text.
-    pub fn parse(prefix: &str, key: &str) -> Result<Self, OwnedKeyError> {
+    pub fn parse(prefix: &SnapshotPrefix, key: &str) -> Result<Self, OwnedKeyError> {
         let refuse = |problem| OwnedKeyError {
             key: key.to_owned(),
-            prefix: prefix.to_owned(),
+            prefix: prefix.clone(),
             problem,
         };
         let rest = key
-            .strip_prefix(prefix)
+            .strip_prefix(prefix.as_str())
             .and_then(|rest| rest.strip_prefix('/'))
             .ok_or_else(|| refuse(OwnedKeyProblem::OutsidePrefix))?;
         let mut components = rest.split('/');
@@ -300,7 +359,7 @@ impl OwnedKey {
         Ok(Self {
             owner: SnapshotOwner {
                 node_id,
-                raft_group_id,
+                raft_group_id: RaftGroupId(raft_group_id),
             },
             index,
             nonce,
@@ -335,12 +394,53 @@ fn padded_nonce(text: &str) -> Option<u64> {
     u64::from_str_radix(text, 16).ok()
 }
 
-/// The keys a node may commit for one group: inline pointers, and S3 keys
-/// under its own directory of the store's prefix.
+/// An object of this node, as its store listed it ([`SnapshotStore::list_own`]):
+/// the only form [`SnapshotStore::delete_own`] takes, so a delete of another
+/// node's object cannot be written.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct OwnedObject {
+    key: OwnedKey,
+    path: String,
+}
+
+impl OwnedObject {
+    pub fn key(&self) -> &OwnedKey {
+        &self.key
+    }
+
+    /// The object's full key in the store.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// The keys a node may commit for one group, as its store names them
+/// ([`SnapshotStore::namespace`]): inline pointers, and, in a store with
+/// external objects, the S3 keys under the node's own directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnedNamespace {
-    pub prefix: String,
-    pub owner: SnapshotOwner,
+    directory: Option<OwnedDirectory>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OwnedDirectory {
+    prefix: SnapshotPrefix,
+    owner: SnapshotOwner,
+}
+
+impl OwnedNamespace {
+    /// The namespace of a store without external objects: inline pointers
+    /// only.
+    fn inline_only() -> Self {
+        Self { directory: None }
+    }
+
+    /// The directory of the node's objects, if its store holds any.
+    pub fn directory(&self) -> Option<String> {
+        self.directory
+            .as_ref()
+            .map(|directory| directory.owner.directory(&directory.prefix))
+    }
 }
 
 /// Why a pointer is not an [`OwnedPointer`].
@@ -349,6 +449,10 @@ pub enum NotOwned {
     /// The pointer names an S3 key outside the node's own directory.
     #[error("snapshot key {key} lies outside the owned directory {directory}")]
     ForeignKey { key: String, directory: String },
+    /// The pointer names an S3 key, and the node's store holds no external
+    /// objects.
+    #[error("snapshot key {key} names an object, and this node's store holds none")]
+    NoObjectStore { key: String },
     /// The pointer names a local file, which no node owns in a store.
     #[error("snapshot pointer names the local file {path:?}")]
     LocalPath { path: PathBuf },
@@ -376,16 +480,22 @@ impl TryFrom<(SnapshotPointer, &OwnedNamespace)> for OwnedPointer {
     fn try_from(
         (pointer, namespace): (SnapshotPointer, &OwnedNamespace),
     ) -> Result<Self, Self::Error> {
-        match &pointer.location {
-            SnapshotLocation::Inline { .. } => Ok(Self(pointer)),
-            SnapshotLocation::Local { path, .. } => Err(NotOwned::LocalPath { path: path.clone() }),
-            SnapshotLocation::S3 { key, .. } => match OwnedKey::parse(&namespace.prefix, key) {
-                Ok(owned) if owned.owner == namespace.owner => Ok(Self(pointer)),
-                Ok(_) | Err(_) => Err(NotOwned::ForeignKey {
-                    key: key.clone(),
-                    directory: namespace.owner.directory(&namespace.prefix),
-                }),
-            },
+        let key = match &pointer.location {
+            SnapshotLocation::Inline { .. } => return Ok(Self(pointer)),
+            SnapshotLocation::Local { path, .. } => {
+                return Err(NotOwned::LocalPath { path: path.clone() });
+            }
+            SnapshotLocation::S3 { key, .. } => key,
+        };
+        let Some(directory) = &namespace.directory else {
+            return Err(NotOwned::NoObjectStore { key: key.clone() });
+        };
+        match OwnedKey::parse(&directory.prefix, key) {
+            Ok(owned) if owned.owner == directory.owner => Ok(Self(pointer)),
+            Ok(_) | Err(_) => Err(NotOwned::ForeignKey {
+                key: key.clone(),
+                directory: directory.owner.directory(&directory.prefix),
+            }),
         }
     }
 }
@@ -398,12 +508,35 @@ pub enum StagedSnapshot {
     Object(StagedObject),
 }
 
-/// The object of a [`StagedSnapshot`].
+/// The object of a [`StagedSnapshot`]. Its one location is rendered from
+/// its key, so what the write creates and what it returns cannot differ.
 pub struct StagedObject {
-    pub key: OwnedKey,
-    /// The location the write creates: an S3 key that no reference shares.
-    pub location: SnapshotLocation,
+    key: OwnedKey,
+    prefix: SnapshotPrefix,
+    size_bytes: u64,
     stored: Vec<u8>,
+}
+
+impl StagedObject {
+    pub fn key(&self) -> &OwnedKey {
+        &self.key
+    }
+
+    /// The object's full key in the store.
+    pub fn path(&self) -> String {
+        self.key.render(&self.prefix)
+    }
+
+    /// The location the write creates: an S3 key that no reference shares.
+    pub fn location(&self) -> SnapshotLocation {
+        SnapshotLocation::S3 {
+            key: self.path(),
+            size_bytes: self.size_bytes,
+            stored_size_bytes: self.stored.len() as u64,
+            compression: SnapshotCompression::Zstd,
+            shared_object: false,
+        }
+    }
 }
 
 impl StagedSnapshot {
@@ -413,7 +546,7 @@ impl StagedSnapshot {
             Self::Inline { bytes } => SnapshotLocation::Inline {
                 bytes: bytes.clone(),
             },
-            Self::Object(object) => object.location.clone(),
+            Self::Object(object) => object.location(),
         }
     }
 
@@ -421,7 +554,7 @@ impl StagedSnapshot {
     pub fn key(&self) -> Option<&OwnedKey> {
         match self {
             Self::Inline { .. } => None,
-            Self::Object(object) => Some(&object.key),
+            Self::Object(object) => Some(object.key()),
         }
     }
 }
@@ -436,18 +569,18 @@ impl Debug for StagedSnapshot {
             Self::Object(object) => f
                 .debug_struct("Object")
                 .field("key", &object.key)
-                .field("location", &object.location)
-                .field("stored", &object.stored.len())
+                .field("location", &object.location())
                 .finish(),
         }
     }
 }
 
-/// What a listing of an owner's directory holds ([`SnapshotStore::list_own`]).
+/// What a listing of a node's directory for a group holds
+/// ([`SnapshotStore::list_own`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct OwnListing {
-    /// The objects that parse as the owner's keys, in key order.
-    pub owned: Vec<OwnedKey>,
+    /// The objects that parse as the node's keys, in key order.
+    pub owned: Vec<OwnedObject>,
     /// Every other file in the directory.
     pub foreign: Vec<String>,
 }
@@ -469,7 +602,7 @@ impl fmt::Display for SnapshotBackend {
 }
 
 /// What is missing from the config of an S3 snapshot store.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SnapshotStoreConfigProblem {
     /// The cold store has no S3 section.
     NoS3Config,
@@ -479,18 +612,24 @@ pub enum SnapshotStoreConfigProblem {
     EmptyBucket,
     /// The S3 backend was chosen in a simulation, which has no S3 I/O.
     NoS3UnderSimulation,
+    /// The snapshot prefix is empty, or has an empty component.
+    InvalidPrefix { prefix: String },
 }
 
 impl fmt::Display for SnapshotStoreConfigProblem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::NoS3Config => "S3 config is required for the snapshot S3 backend",
-            Self::NoBucket => "an S3 bucket is required for the snapshot S3 backend",
-            Self::EmptyBucket => "the snapshot S3 bucket must not be empty",
+        match self {
+            Self::NoS3Config => f.write_str("S3 config is required for the snapshot S3 backend"),
+            Self::NoBucket => f.write_str("an S3 bucket is required for the snapshot S3 backend"),
+            Self::EmptyBucket => f.write_str("the snapshot S3 bucket must not be empty"),
             Self::NoS3UnderSimulation => {
-                "the snapshot S3 backend has no I/O under madsim; use 'inline'"
+                f.write_str("the snapshot S3 backend has no I/O under madsim, use 'inline'")
             }
-        })
+            Self::InvalidPrefix { prefix } => write!(
+                f,
+                "the snapshot S3 prefix {prefix:?} is empty or has an empty component"
+            ),
+        }
     }
 }
 
@@ -500,6 +639,8 @@ pub enum SnapshotStoreError {
     #[error("snapshot object {key} not found")]
     NotFound { key: String },
     /// A write that creates an object only if none has its name found one.
+    /// Behind the store's retries, a create whose answer was lost and that
+    /// is sent again finds its own object, so it is answered this way too.
     #[error("snapshot object {key} already exists")]
     NameCollision { key: String },
     /// The stored object's size is not the pointer's.
@@ -524,14 +665,22 @@ pub enum SnapshotStoreError {
         expected: u64,
         actual: u64,
     },
-    /// The stored object does not decompress, or its logical size does not
-    /// fit in memory.
+    /// The stored object does not decompress.
     #[error("snapshot object {key} does not decompress")]
     Decompress {
         key: String,
         #[source]
         source: io::Error,
     },
+    /// The pointer's logical size does not fit in this node's memory.
+    #[error("snapshot object {key} is {size_bytes} bytes, more than this node addresses")]
+    LogicalSizeUnaddressable { key: String, size_bytes: u64 },
+    /// The store knows no node it acts for, so it owns no object.
+    #[error("the snapshot store has no node identity, so it owns no object")]
+    NoNodeIdentity,
+    /// An object was handed to a store that does not own it.
+    #[error("snapshot object {path} is not this node's")]
+    NotOwnedHere { path: String },
     /// Compressing a snapshot body failed.
     #[error("compress a snapshot body")]
     Compress(#[source] io::Error),
@@ -558,8 +707,11 @@ pub enum SnapshotStoreError {
     #[error("apply the cold tier's S3 encryption to the snapshot store")]
     Encryption(#[source] io::Error),
     /// A key lies outside the group's namespace of the store.
-    #[error("snapshot key {key} lies outside the namespace of group {raft_group_id}")]
-    OutsideGroup { raft_group_id: u32, key: String },
+    #[error("snapshot key {key} lies outside the namespace of group {}", .raft_group_id.0)]
+    OutsideGroup {
+        raft_group_id: RaftGroupId,
+        key: String,
+    },
     /// A reference record names another version, node or group.
     #[error("snapshot reference record {record} is not this group's or node's")]
     InvalidReference { record: String },
@@ -699,53 +851,35 @@ pub trait SnapshotStore: Send + Sync + Debug {
         })
     }
 
-    /// Makes the snapshot of `owner`'s group at log index `index` ready to
+    /// The keys this store's node may commit for `raft_group_id`.
+    fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace;
+
+    /// Makes the snapshot of `raft_group_id` at log index `index` ready to
     /// write, with no I/O: an external store compresses it and draws a fresh
-    /// [`OwnedKey`] for it, so the caller can hold the key before the write.
-    /// The default keeps the bytes inline.
+    /// [`OwnedKey`] of its node for it, so the caller can hold the key before
+    /// the write.
     fn stage<'a>(
         &'a self,
-        _owner: SnapshotOwner,
-        _index: u64,
+        raft_group_id: RaftGroupId,
+        index: u64,
         chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
-        Box::pin(async move {
-            Ok(StagedSnapshot::Inline {
-                bytes: collect_inline_snapshot(chunks).await?,
-            })
-        })
-    }
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot>;
 
     /// Writes a staged snapshot and returns its location. An object is
     /// created only if no object has its name
     /// ([`SnapshotStoreError::NameCollision`] otherwise), and never
-    /// overwrites one. The default holds inline snapshots only.
+    /// overwrites one.
     fn write_staged<'a>(
         &'a self,
         staged: StagedSnapshot,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        Box::pin(async move {
-            match staged {
-                StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
-                StagedSnapshot::Object(object) => Err(SnapshotStoreError::UnsupportedLocation {
-                    store: SnapshotBackend::Inline,
-                    location: object.location.kind(),
-                }),
-            }
-        })
-    }
+    ) -> SnapshotStoreFuture<'a, SnapshotLocation>;
 
-    /// Lists `owner`'s directory of the store. A store without external
-    /// objects has none.
-    fn list_own<'a>(&'a self, _owner: SnapshotOwner) -> SnapshotStoreFuture<'a, OwnListing> {
-        Box::pin(async move { Ok(OwnListing::default()) })
-    }
+    /// Lists this store's node's directory for `raft_group_id`.
+    fn list_own<'a>(&'a self, raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing>;
 
-    /// Deletes an owned object; a missing one is not an error. A store
-    /// without external objects has nothing to delete.
-    fn delete_own<'a>(&'a self, _key: OwnedKey) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
-    }
+    /// Deletes an object this store listed as its own. A missing one is not
+    /// an error.
+    fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()>;
 
     /// Retrieve a snapshot blob given its location.
     fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>>;
@@ -881,6 +1015,51 @@ impl SnapshotStore for InlineSnapshotStore {
     fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
         Box::pin(async move { Ok(()) })
     }
+
+    /// Inline pointers only.
+    fn namespace(&self, _raft_group_id: RaftGroupId) -> OwnedNamespace {
+        OwnedNamespace::inline_only()
+    }
+
+    /// Keeps the bytes inline.
+    fn stage<'a>(
+        &'a self,
+        _raft_group_id: RaftGroupId,
+        _index: u64,
+        chunks: SnapshotBytesIterator,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        Box::pin(async move {
+            Ok(StagedSnapshot::Inline {
+                bytes: collect_inline_snapshot(chunks).await?,
+            })
+        })
+    }
+
+    /// Holds inline snapshots only.
+    fn write_staged<'a>(
+        &'a self,
+        staged: StagedSnapshot,
+    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+        Box::pin(async move {
+            match staged {
+                StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
+                StagedSnapshot::Object(object) => Err(SnapshotStoreError::UnsupportedLocation {
+                    store: SnapshotBackend::Inline,
+                    location: object.location().kind(),
+                }),
+            }
+        })
+    }
+
+    /// Holds no object.
+    fn list_own<'a>(&'a self, _raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing> {
+        Box::pin(async move { Ok(OwnListing::default()) })
+    }
+
+    /// Owns no object, so every object is another store's.
+    fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Err(SnapshotStoreError::NotOwnedHere { path: object.path }) })
+    }
 }
 
 #[cfg(not(madsim))]
@@ -923,16 +1102,20 @@ mod s3 {
     use opendal::ErrorKind;
     use opendal::Operator;
     use opendal::Scheme;
+    use ursula_shard::RaftGroupId;
 
     use super::OwnListing;
+    use super::OwnedDirectory;
     use super::OwnedKey;
     use super::OwnedNamespace;
+    use super::OwnedObject;
     use super::SnapshotBackend;
     use super::SnapshotBytesIterator;
     use super::SnapshotCompression;
     use super::SnapshotKey;
     use super::SnapshotLocation;
     use super::SnapshotOwner;
+    use super::SnapshotPrefix;
     use super::SnapshotPrune;
     use super::SnapshotReferenceConfig;
     use super::SnapshotStore;
@@ -969,10 +1152,12 @@ mod s3 {
     /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
     pub struct S3SnapshotStore {
         operator: Operator,
-        prefix: String,
+        prefix: SnapshotPrefix,
         references: Option<SnapshotReferenceConfig>,
         gc_grace: Duration,
         conditional_create: ConditionalCreate,
+        /// Draws the nonce of every staged object.
+        nonces: fn() -> u64,
     }
 
     impl std::fmt::Debug for S3SnapshotStore {
@@ -987,18 +1172,38 @@ mod s3 {
     }
 
     impl S3SnapshotStore {
-        pub fn new(operator: Operator, prefix: impl Into<String>) -> Self {
-            let mut prefix = prefix.into();
-            while prefix.ends_with('/') {
-                prefix.pop();
-            }
+        pub fn new(operator: Operator, prefix: SnapshotPrefix) -> Self {
             Self {
                 operator,
                 prefix,
                 references: None,
                 gc_grace: S3_SNAPSHOT_GC_GRACE,
                 conditional_create: ConditionalCreate::Required,
+                nonces: rand::random,
             }
+        }
+
+        /// Draws the nonces of staged objects from `nonces` instead of at
+        /// random, as a simulation does from its seed.
+        pub fn with_nonces(mut self, nonces: fn() -> u64) -> Self {
+            self.nonces = nonces;
+            self
+        }
+
+        /// The node this store acts for: the node of its references.
+        fn node_id(&self) -> Option<u64> {
+            self.references
+                .as_ref()
+                .map(|references| references.node_id)
+        }
+
+        /// This store's node as the owner of `raft_group_id`'s objects.
+        fn owner(&self, raft_group_id: RaftGroupId) -> Result<SnapshotOwner, SnapshotStoreError> {
+            let node_id = self.node_id().ok_or(SnapshotStoreError::NoNodeIdentity)?;
+            Ok(SnapshotOwner {
+                node_id,
+                raft_group_id,
+            })
         }
 
         pub fn with_references(mut self, references: SnapshotReferenceConfig) -> Self {
@@ -1027,20 +1232,25 @@ mod s3 {
         /// in-memory operator cannot create an object only if it is absent,
         /// so [`SnapshotStore::write_staged`] checks for the name first,
         /// which no concurrent writer of a test races.
-        pub fn memory_for_tests(prefix: impl Into<String>) -> Result<Self, SnapshotStoreError> {
+        #[cfg(any(test, feature = "test-support"))]
+        pub fn memory_for_tests(prefix: &str) -> Result<Self, SnapshotStoreError> {
             let operator = Operator::via_iter(Scheme::Memory, [])
                 .map_err(|err| SnapshotStoreError::Open(Box::new(err)))?;
-            let mut store = Self::new(operator, prefix);
+            let mut store = Self::new(operator, SnapshotPrefix::try_from(prefix)?);
             store.conditional_create = ConditionalCreate::EmulatedForTests;
             Ok(store)
         }
 
-        /// The keys this store lets `owner` commit.
-        pub fn namespace(&self, owner: SnapshotOwner) -> OwnedNamespace {
-            OwnedNamespace {
-                prefix: self.prefix.clone(),
-                owner,
-            }
+        /// A store of node `node_id` on this store's operator and prefix.
+        #[cfg(test)]
+        pub(crate) fn sibling_for_tests(&self, node_id: u64) -> Self {
+            let mut sibling = Self::new(self.operator.clone(), self.prefix.clone());
+            sibling.conditional_create = self.conditional_create;
+            sibling.with_references(SnapshotReferenceConfig {
+                node_id,
+                default_voters: std::collections::BTreeSet::from([node_id]),
+                per_group_voters: std::collections::BTreeMap::new(),
+            })
         }
 
         #[cfg(test)]
@@ -1070,8 +1280,9 @@ mod s3 {
         /// (defaults to `snapshots`) for separation.
         pub fn try_new(
             config: &crate::ColdConfig,
-            prefix: impl Into<String>,
+            prefix: &str,
         ) -> Result<Self, SnapshotStoreError> {
+            let prefix = SnapshotPrefix::try_from(prefix)?;
             let config_problem = |problem| SnapshotStoreError::Config { problem };
             let s3 = config
                 .s3
@@ -1311,7 +1522,7 @@ mod s3 {
                 Ok(key)
             } else {
                 Err(SnapshotStoreError::OutsideGroup {
-                    raft_group_id,
+                    raft_group_id: RaftGroupId(raft_group_id),
                     key: key.to_owned(),
                 })
             }
@@ -1337,7 +1548,8 @@ mod s3 {
         Ok((stored_bytes, size_bytes))
     }
 
-    /// Compresses `chunks` off the async worker.
+    /// Compresses `chunks` off the async worker, for an owned object, whose
+    /// name is drawn and not hashed.
     async fn compress_off_worker(
         chunks: SnapshotBytesIterator,
     ) -> Result<(Vec<u8>, u64), SnapshotStoreError> {
@@ -1346,6 +1558,24 @@ mod s3 {
             .map_err(|err| {
                 SnapshotStoreError::Io(io::Error::other(format!("join s3 snapshot encoder: {err}")))
             })?
+    }
+
+    /// Compresses `chunks` and hashes the result, both off the async worker,
+    /// for a content-addressed object.
+    async fn compress_and_hash_off_worker(
+        chunks: SnapshotBytesIterator,
+    ) -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
+        tokio::task::spawn_blocking(
+            move || -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
+                let (stored, size_bytes) = compress_snapshot_chunks(chunks)?;
+                let digest = blake3::hash(&stored);
+                Ok((stored, size_bytes, digest))
+            },
+        )
+        .await
+        .map_err(|err| {
+            SnapshotStoreError::Io(io::Error::other(format!("join s3 snapshot encoder: {err}")))
+        })?
     }
 
     impl SnapshotStore for S3SnapshotStore {
@@ -1474,8 +1704,9 @@ mod s3 {
             chunks: SnapshotBytesIterator,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
             Box::pin(async move {
-                let (stored_bytes, size_bytes) = compress_off_worker(chunks).await?;
-                let object_key = self.object_key(&key, blake3::hash(&stored_bytes));
+                let (stored_bytes, size_bytes, digest) =
+                    compress_and_hash_off_worker(chunks).await?;
+                let object_key = self.object_key(&key, digest);
                 let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
                 Ok(SnapshotLocation::S3 {
                     key: object_key,
@@ -1487,29 +1718,35 @@ mod s3 {
             })
         }
 
+        fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace {
+            match self.owner(raft_group_id) {
+                Ok(owner) => OwnedNamespace {
+                    directory: Some(OwnedDirectory {
+                        prefix: self.prefix.clone(),
+                        owner,
+                    }),
+                },
+                Err(_no_identity) => OwnedNamespace::inline_only(),
+            }
+        }
+
         fn stage<'a>(
             &'a self,
-            owner: SnapshotOwner,
+            raft_group_id: RaftGroupId,
             index: u64,
             chunks: SnapshotBytesIterator,
         ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
             Box::pin(async move {
+                let owner = self.owner(raft_group_id)?;
                 let (stored, size_bytes) = compress_off_worker(chunks).await?;
-                let key = OwnedKey {
-                    owner,
-                    index,
-                    nonce: rand::random(),
-                };
-                let location = SnapshotLocation::S3 {
-                    key: key.render(&self.prefix),
-                    size_bytes,
-                    stored_size_bytes: stored.len() as u64,
-                    compression: SnapshotCompression::Zstd,
-                    shared_object: false,
-                };
                 Ok(StagedSnapshot::Object(StagedObject {
-                    key,
-                    location,
+                    key: OwnedKey {
+                        owner,
+                        index,
+                        nonce: (self.nonces)(),
+                    },
+                    prefix: self.prefix.clone(),
+                    size_bytes,
                     stored,
                 }))
             })
@@ -1522,21 +1759,29 @@ mod s3 {
             Box::pin(async move {
                 match staged {
                     StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
-                    StagedSnapshot::Object(StagedObject {
-                        key,
-                        location,
-                        stored,
-                    }) => {
-                        self.create_object(&key.render(&self.prefix), stored)
-                            .await?;
+                    StagedSnapshot::Object(object) => {
+                        if object.prefix != self.prefix
+                            || Some(object.key.owner.node_id) != self.node_id()
+                        {
+                            return Err(SnapshotStoreError::NotOwnedHere {
+                                path: object.path(),
+                            });
+                        }
+                        let location = object.location();
+                        let path = object.path();
+                        self.create_object(&path, object.stored).await?;
                         Ok(location)
                     }
                 }
             })
         }
 
-        fn list_own<'a>(&'a self, owner: SnapshotOwner) -> SnapshotStoreFuture<'a, OwnListing> {
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: RaftGroupId,
+        ) -> SnapshotStoreFuture<'a, OwnListing> {
             Box::pin(async move {
+                let owner = self.owner(raft_group_id)?;
                 let directory = owner.directory(&self.prefix);
                 let entries = self
                     .operator
@@ -1552,7 +1797,10 @@ mod s3 {
                         continue;
                     }
                     match OwnedKey::parse(&self.prefix, entry.path()) {
-                        Ok(key) if key.owner == owner => listing.owned.push(key),
+                        Ok(key) if key.owner == owner => listing.owned.push(OwnedObject {
+                            key,
+                            path: entry.path().to_owned(),
+                        }),
                         Ok(_) | Err(_) => listing.foreign.push(entry.path().to_owned()),
                     }
                 }
@@ -1562,15 +1810,20 @@ mod s3 {
             })
         }
 
-        fn delete_own<'a>(&'a self, key: OwnedKey) -> SnapshotStoreFuture<'a, ()> {
+        fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()> {
             Box::pin(async move {
-                let key = key.render(&self.prefix);
-                match self.operator.delete(&key).await {
+                let owned = OwnedKey::parse(&self.prefix, &object.path).is_ok_and(|key| {
+                    key == object.key && Some(key.owner.node_id) == self.node_id()
+                });
+                if !owned {
+                    return Err(SnapshotStoreError::NotOwnedHere { path: object.path });
+                }
+                match self.operator.delete(&object.path).await {
                     Ok(()) => Ok(()),
                     Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
                     Err(err) => Err(SnapshotStoreError::backend(
                         SnapshotStoreOperation::Delete,
-                        key,
+                        object.path,
                         err,
                     )),
                 }
@@ -1611,10 +1864,10 @@ mod s3 {
                     SnapshotCompression::None => stored_bytes,
                     SnapshotCompression::Zstd => zstd::bulk::decompress(
                         &stored_bytes,
-                        usize::try_from(*size_bytes).map_err(|source| {
-                            SnapshotStoreError::Decompress {
+                        usize::try_from(*size_bytes).map_err(|_overflow| {
+                            SnapshotStoreError::LogicalSizeUnaddressable {
                                 key: key.clone(),
-                                source: io::Error::new(io::ErrorKind::InvalidData, source),
+                                size_bytes: *size_bytes,
                             }
                         })?,
                     )
@@ -2233,20 +2486,25 @@ mod tests {
     #[tokio::test]
     async fn s3_pending_pins_protect_install_and_only_retire_this_nodes_obsolete_pins() {
         let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, []).unwrap();
-        let store = S3SnapshotStore::new(operator.clone(), "snapshot-pin-gc")
-            .with_references(SnapshotReferenceConfig {
-                node_id: 1,
-                default_voters: BTreeSet::from([1]),
-                per_group_voters: BTreeMap::new(),
-            })
-            .with_gc_grace(std::time::Duration::ZERO);
-        let other = S3SnapshotStore::new(operator, "snapshot-pin-gc").with_references(
-            SnapshotReferenceConfig {
-                node_id: 2,
-                default_voters: BTreeSet::from([1]),
-                per_group_voters: BTreeMap::new(),
-            },
-        );
+        let store = S3SnapshotStore::new(
+            operator.clone(),
+            SnapshotPrefix::try_from("snapshot-pin-gc").unwrap(),
+        )
+        .with_references(SnapshotReferenceConfig {
+            node_id: 1,
+            default_voters: BTreeSet::from([1]),
+            per_group_voters: BTreeMap::new(),
+        })
+        .with_gc_grace(std::time::Duration::ZERO);
+        let other = S3SnapshotStore::new(
+            operator,
+            SnapshotPrefix::try_from("snapshot-pin-gc").unwrap(),
+        )
+        .with_references(SnapshotReferenceConfig {
+            node_id: 2,
+            default_voters: BTreeSet::from([1]),
+            per_group_voters: BTreeMap::new(),
+        });
         let old = store
             .upload(test_key(7, "old"), b"old".to_vec().into())
             .await
@@ -2668,7 +2926,7 @@ mod tests {
         )
         .unwrap()
         .finish();
-        let store = S3SnapshotStore::new(operator, "snapshots")
+        let store = S3SnapshotStore::new(operator, SnapshotPrefix::try_from("snapshots").unwrap())
             .with_references(SnapshotReferenceConfig {
                 node_id: 1,
                 default_voters: BTreeSet::from([1]),
@@ -2695,12 +2953,47 @@ mod tests {
     fn owner(node_id: u64, raft_group_id: u32) -> SnapshotOwner {
         SnapshotOwner {
             node_id,
-            raft_group_id,
+            raft_group_id: RaftGroupId(raft_group_id),
         }
+    }
+
+    fn prefix(text: &str) -> SnapshotPrefix {
+        SnapshotPrefix::try_from(text).unwrap()
     }
 
     fn body(bytes: &'static [u8]) -> SnapshotBytesIterator {
         Box::new(std::iter::once(Ok(Bytes::from_static(bytes))))
+    }
+
+    /// A prefix is trimmed of its `/`s and refused when nothing is left or
+    /// a component is empty, so no owned key renders with a leading `/`.
+    #[test]
+    fn a_snapshot_prefix_is_never_empty() {
+        assert_eq!(prefix("snapshots").as_str(), "snapshots");
+        assert_eq!(prefix("/snapshots/").as_str(), "snapshots");
+        assert_eq!(prefix("a/b/").as_str(), "a/b");
+        for refused in ["", "/", "//", "a//b"] {
+            assert!(
+                matches!(
+                    SnapshotPrefix::try_from(refused),
+                    Err(SnapshotStoreError::Config {
+                        problem: SnapshotStoreConfigProblem::InvalidPrefix { .. }
+                    })
+                ),
+                "{refused:?}"
+            );
+        }
+        let key = OwnedKey {
+            owner: owner(1, 7),
+            index: 1,
+            nonce: 2,
+        };
+        let trailing = prefix("snapshots/");
+        assert_eq!(
+            key.render(&trailing),
+            "snapshots/node-1/group-7/00000000000000000001-0000000000000002.snap"
+        );
+        assert_eq!(OwnedKey::parse(&trailing, &key.render(&trailing)), Ok(key));
     }
 
     /// An owned key renders as `{prefix}/node-{node}/group-{gid}/{index:020}-{nonce:016x}.snap`
@@ -2712,19 +3005,20 @@ mod tests {
             index: 42,
             nonce: 0xab,
         };
-        let rendered = key.render("snapshots");
+        let snapshots = prefix("snapshots");
+        let rendered = key.render(&snapshots);
         assert_eq!(
             rendered,
             "snapshots/node-1/group-7/00000000000000000042-00000000000000ab.snap"
         );
-        assert_eq!(OwnedKey::parse("snapshots", &rendered), Ok(key));
+        assert_eq!(OwnedKey::parse(&snapshots, &rendered), Ok(key));
         let largest = OwnedKey {
             owner: owner(u64::MAX, u32::MAX),
             index: u64::MAX,
             nonce: u64::MAX,
         };
         assert_eq!(
-            OwnedKey::parse("p", &largest.render("p")),
+            OwnedKey::parse(&prefix("p"), &largest.render(&prefix("p"))),
             Ok(largest),
             "every field round-trips at its maximum"
         );
@@ -2736,13 +3030,16 @@ mod tests {
     #[test]
     fn the_owned_key_parser_compares_components() {
         let problem =
-            |prefix: &str, key: &str| OwnedKey::parse(prefix, key).expect_err(key).problem;
+            |under: &str, key: &str| OwnedKey::parse(&prefix(under), key).expect_err(key).problem;
         let name = "00000000000000000042-00000000000000ab.snap";
-        let node_ten = OwnedKey::parse("snapshots", &format!("snapshots/node-10/group-7/{name}"))
-            .expect("node 10's key parses");
-        assert_eq!(node_ten.owner, owner(10, 7));
-        assert_ne!(node_ten.owner, owner(1, 7));
-        for (prefix, key, expected) in [
+        let node_ten = OwnedKey::parse(
+            &prefix("snapshots"),
+            &format!("snapshots/node-10/group-7/{name}"),
+        )
+        .expect("node 10's key parses");
+        assert_eq!(node_ten.owner(), owner(10, 7));
+        assert_ne!(node_ten.owner(), owner(1, 7));
+        for (under, key, expected) in [
             (
                 "snap",
                 format!("snapshots/node-1/group-7/{name}"),
@@ -2751,6 +3048,11 @@ mod tests {
             (
                 "snapshots",
                 format!("other/node-1/group-7/{name}"),
+                OwnedKeyProblem::OutsidePrefix,
+            ),
+            (
+                "snapshots",
+                format!("/node-1/group-7/{name}"),
                 OwnedKeyProblem::OutsidePrefix,
             ),
             (
@@ -2814,18 +3116,32 @@ mod tests {
                 OwnedKeyProblem::Node,
             ),
         ] {
-            assert_eq!(problem(prefix, &key), expected, "{key}");
+            assert_eq!(problem(under, &key), expected, "{key}");
         }
     }
 
-    /// A pointer is owned when it is inline or names a key of this node and
-    /// group, and refused otherwise.
+    #[cfg(not(madsim))]
+    fn node_store(node_id: u64) -> S3SnapshotStore {
+        S3SnapshotStore::memory_for_tests("snapshots")
+            .unwrap()
+            .with_references(SnapshotReferenceConfig {
+                node_id,
+                default_voters: BTreeSet::from([node_id]),
+                per_group_voters: BTreeMap::new(),
+            })
+    }
+
+    /// A store owns inline pointers and the keys of its own node and group,
+    /// and refuses every other pointer. A store without external objects
+    /// owns inline pointers only.
+    #[cfg(not(madsim))]
     #[test]
     fn an_owned_pointer_is_inline_or_under_its_own_directory() {
-        let namespace = OwnedNamespace {
-            prefix: "snapshots".to_owned(),
-            owner: owner(1, 7),
-        };
+        let namespace = node_store(1).namespace(RaftGroupId(7));
+        assert_eq!(
+            namespace.directory().as_deref(),
+            Some("snapshots/node-1/group-7/")
+        );
         let s3 = |key: String| SnapshotPointer {
             snapshot_id: "s".to_owned(),
             location: SnapshotLocation::S3 {
@@ -2836,35 +3152,25 @@ mod tests {
                 shared_object: false,
             },
         };
-        let own = OwnedKey {
-            owner: owner(1, 7),
-            index: 3,
-            nonce: 4,
-        }
-        .render("snapshots");
+        let inline = SnapshotPointer {
+            snapshot_id: "s".to_owned(),
+            location: SnapshotLocation::Inline { bytes: vec![1] },
+        };
+        let key_of = |node_id, group| {
+            OwnedKey {
+                owner: owner(node_id, group),
+                index: 3,
+                nonce: 4,
+            }
+            .render(&prefix("snapshots"))
+        };
+        let own = key_of(1, 7);
         let owned = OwnedPointer::try_from((s3(own.clone()), &namespace)).expect("own key");
-        assert_eq!(owned.pointer().location, s3(own).location);
-        OwnedPointer::try_from((
-            SnapshotPointer {
-                snapshot_id: "s".to_owned(),
-                location: SnapshotLocation::Inline { bytes: vec![1] },
-            },
-            &namespace,
-        ))
-        .expect("an inline pointer is owned");
+        assert_eq!(owned.pointer().location, s3(own.clone()).location);
+        OwnedPointer::try_from((inline.clone(), &namespace)).expect("an inline pointer is owned");
         for foreign in [
-            OwnedKey {
-                owner: owner(10, 7),
-                index: 3,
-                nonce: 4,
-            }
-            .render("snapshots"),
-            OwnedKey {
-                owner: owner(1, 8),
-                index: 3,
-                nonce: 4,
-            }
-            .render("snapshots"),
+            key_of(10, 7),
+            key_of(1, 8),
             "snapshots/group-7/objects/abc.snap".to_owned(),
         ] {
             let refused = OwnedPointer::try_from((s3(foreign.clone()), &namespace))
@@ -2885,6 +3191,20 @@ mod tests {
             &namespace,
         ));
         assert!(matches!(local, Err(NotOwned::LocalPath { .. })));
+
+        let inline_only = InlineSnapshotStore.namespace(RaftGroupId(7));
+        assert_eq!(inline_only.directory(), None);
+        OwnedPointer::try_from((inline, &inline_only)).expect("an inline pointer is owned");
+        assert!(matches!(
+            OwnedPointer::try_from((s3(own), &inline_only)),
+            Err(NotOwned::NoObjectStore { .. })
+        ));
+        let anonymous = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        assert_eq!(
+            anonymous.namespace(RaftGroupId(7)).directory(),
+            None,
+            "a store without a node identity owns no key"
+        );
     }
 
     /// `into_io` keeps the store error as the I/O error's source, so the
@@ -2908,12 +3228,14 @@ mod tests {
         );
     }
 
-    /// The inline store stages and writes inline, lists nothing and deletes
-    /// nothing.
+    /// The inline store stages and writes inline, and lists nothing.
     #[tokio::test]
     async fn the_inline_store_stages_inline() {
         let store = InlineSnapshotStore;
-        let staged = store.stage(owner(1, 7), 3, body(b"inline")).await.unwrap();
+        let staged = store
+            .stage(RaftGroupId(7), 3, body(b"inline"))
+            .await
+            .unwrap();
         assert!(staged.key().is_none());
         assert_eq!(
             store.write_staged(staged).await.unwrap(),
@@ -2922,24 +3244,40 @@ mod tests {
             }
         );
         assert_eq!(
-            store.list_own(owner(1, 7)).await.unwrap(),
+            store.list_own(RaftGroupId(7)).await.unwrap(),
             OwnListing::default()
         );
     }
 
-    /// `stage` draws a fresh owned key and does no I/O. `write_staged`
-    /// creates the object, and the location it returns is the one the stage
-    /// named before the write.
+    /// A store without a node identity owns nothing: it stages and lists
+    /// nothing.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_a_store_without_a_node_owns_nothing() {
+        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        assert!(matches!(
+            store.stage(RaftGroupId(7), 1, body(b"x")).await,
+            Err(SnapshotStoreError::NoNodeIdentity)
+        ));
+        assert!(matches!(
+            store.list_own(RaftGroupId(7)).await,
+            Err(SnapshotStoreError::NoNodeIdentity)
+        ));
+    }
+
+    /// `stage` draws a fresh key of the store's node and does no I/O.
+    /// `write_staged` creates the object, and the location it returns is the
+    /// one the stage named before the write.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn s3_stage_names_a_fresh_owned_key_and_write_staged_creates_it() {
-        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let store = node_store(1);
         let payload = b"owned snapshot body".repeat(64);
         let chunks: SnapshotBytesIterator =
             Box::new(std::iter::once(Ok(Bytes::from(payload.clone()))));
-        let staged = store.stage(owner(1, 7), 42, chunks).await.unwrap();
+        let staged = store.stage(RaftGroupId(7), 42, chunks).await.unwrap();
         let key = *staged.key().expect("an S3 stage names an object");
-        assert_eq!((key.owner, key.index), (owner(1, 7), 42));
+        assert_eq!((key.owner(), key.index()), (owner(1, 7), 42));
         let location = staged.location();
         let SnapshotLocation::S3 {
             key: rendered,
@@ -2951,7 +3289,7 @@ mod tests {
         else {
             panic!("expected an S3 location, got {location:?}");
         };
-        assert_eq!(rendered, &key.render("snapshots"));
+        assert_eq!(rendered, &key.render(&prefix("snapshots")));
         assert_eq!(*size_bytes, payload.len() as u64);
         assert!(*stored_size_bytes < *size_bytes);
         assert_eq!(*compression, SnapshotCompression::Zstd);
@@ -2967,10 +3305,10 @@ mod tests {
         assert_eq!(store.download(&location).await.unwrap(), payload);
         store.verify_uploaded(&location).await.unwrap();
 
-        let other = store.stage(owner(1, 7), 42, body(b"x")).await.unwrap();
+        let other = store.stage(RaftGroupId(7), 42, body(b"x")).await.unwrap();
         assert_ne!(
-            other.key().map(|other| other.nonce),
-            Some(key.nonce),
+            other.key().map(OwnedKey::nonce),
+            Some(key.nonce()),
             "every stage draws its own name"
         );
     }
@@ -2980,25 +3318,26 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn s3_write_staged_refuses_a_name_that_exists() {
-        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
-        let staged = store.stage(owner(1, 7), 1, body(b"first")).await.unwrap();
-        let location = staged.location();
+        let store = node_store(1).with_nonces(|| 7);
+        let first = store
+            .stage(RaftGroupId(7), 1, body(b"first"))
+            .await
+            .unwrap();
+        let location = store.write_staged(first).await.unwrap();
+        let again = store
+            .stage(RaftGroupId(7), 1, body(b"second"))
+            .await
+            .unwrap();
+        assert_eq!(again.location().kind(), SnapshotLocationKind::S3);
+        let refused = store.write_staged(again).await.unwrap_err();
         let SnapshotLocation::S3 { key, .. } = &location else {
             panic!("expected an S3 location");
         };
-        store
-            .write_raw_for_tests(key, b"squatter".to_vec())
-            .await
-            .unwrap();
-        let refused = store.write_staged(staged).await.unwrap_err();
         assert!(
             matches!(&refused, SnapshotStoreError::NameCollision { key: collided } if collided == key),
             "{refused:?}"
         );
-        assert!(matches!(
-            store.download(&location).await,
-            Err(SnapshotStoreError::SizeMismatch { .. })
-        ));
+        assert_eq!(store.download(&location).await.unwrap(), b"first");
     }
 
     /// Outside the test store, a backend that cannot create an object only
@@ -3007,8 +3346,14 @@ mod tests {
     #[tokio::test]
     async fn s3_write_staged_refuses_a_backend_without_conditional_create() {
         let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, []).unwrap();
-        let store = S3SnapshotStore::new(operator, "snapshots");
-        let staged = store.stage(owner(1, 7), 1, body(b"body")).await.unwrap();
+        let store = S3SnapshotStore::new(operator, prefix("snapshots")).with_references(
+            SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: BTreeSet::from([1]),
+                per_group_voters: BTreeMap::new(),
+            },
+        );
+        let staged = store.stage(RaftGroupId(7), 1, body(b"body")).await.unwrap();
         let location = staged.location();
         let refused = store.write_staged(staged).await.unwrap_err();
         assert!(
@@ -3024,49 +3369,65 @@ mod tests {
         ));
     }
 
-    /// `list_own` lists only the owner's directory, never node 10's for
-    /// node 1, and reports a file there that is no owned key apart.
-    /// `delete_own` deletes an owned object and takes a missing one.
+    /// `list_own` lists only the store's node directory, never node 10's
+    /// for node 1, and reports a file there that is no owned key apart.
+    /// `delete_own` deletes a listed object, takes a missing one, and
+    /// refuses an object another node's store listed.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn s3_list_own_and_delete_own_stay_in_the_owners_directory() {
-        let store = S3SnapshotStore::memory_for_tests("snapshots").unwrap();
+        let one = node_store(1);
+        let ten = one.sibling_for_tests(10);
         let mut written = Vec::new();
-        for (node_id, index) in [(1, 5), (1, 3), (10, 4)] {
+        for (store, index) in [(&one, 5), (&one, 3), (&ten, 4)] {
             let staged = store
-                .stage(owner(node_id, 7), index, body(b"body"))
+                .stage(RaftGroupId(7), index, body(b"body"))
                 .await
                 .unwrap();
             written.push(*staged.key().unwrap());
             store.write_staged(staged).await.unwrap();
         }
-        let other_group = store.stage(owner(1, 8), 9, body(b"body")).await.unwrap();
-        store.write_staged(other_group).await.unwrap();
-        store
-            .write_raw_for_tests("snapshots/node-1/group-7/stray.json", b"{}".to_vec())
+        let other_group = one.stage(RaftGroupId(8), 9, body(b"body")).await.unwrap();
+        one.write_staged(other_group).await.unwrap();
+        one.write_raw_for_tests("snapshots/node-1/group-7/stray.json", b"{}".to_vec())
             .await
             .unwrap();
 
-        let listing = store.list_own(owner(1, 7)).await.unwrap();
+        let listing = one.list_own(RaftGroupId(7)).await.unwrap();
+        let keys = |listing: &OwnListing| -> Vec<OwnedKey> {
+            listing.owned.iter().map(|object| *object.key()).collect()
+        };
         let mut own = vec![written[1], written[0]];
         own.sort_unstable();
-        assert_eq!(listing.owned, own);
+        assert_eq!(keys(&listing), own);
         assert_eq!(listing.foreign, vec![
             "snapshots/node-1/group-7/stray.json".to_owned()
         ]);
-        assert_eq!(store.list_own(owner(10, 7)).await.unwrap().owned, vec![
-            written[2]
-        ]);
+        let tens = ten.list_own(RaftGroupId(7)).await.unwrap();
+        assert_eq!(keys(&tens), vec![written[2]]);
 
-        store.delete_own(written[0]).await.unwrap();
-        store.delete_own(written[0]).await.unwrap();
-        assert_eq!(store.list_own(owner(1, 7)).await.unwrap().owned, vec![
+        assert!(
+            matches!(
+                one.delete_own(tens.owned[0].clone()).await,
+                Err(SnapshotStoreError::NotOwnedHere { .. })
+            ),
+            "node 1's store refuses node 10's object"
+        );
+        let first = listing
+            .owned
+            .iter()
+            .find(|object| *object.key() == written[0])
+            .unwrap()
+            .clone();
+        one.delete_own(first.clone()).await.unwrap();
+        one.delete_own(first).await.unwrap();
+        assert_eq!(keys(&one.list_own(RaftGroupId(7)).await.unwrap()), vec![
             written[1]
         ]);
         assert_eq!(
-            store.list_own(owner(10, 7)).await.unwrap().owned,
+            keys(&ten.list_own(RaftGroupId(7)).await.unwrap()),
             vec![written[2]],
-            "node 1's delete leaves node 10's object"
+            "node 1's deletes leave node 10's object"
         );
     }
 }

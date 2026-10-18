@@ -712,26 +712,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             .await
             .map_err(|err| {
                 let message = format!("remote full snapshot on node {}: {err}", self.target);
-                // A refused overwrite backs the sender off, as does every
-                // typed refusal of the prefetch that the gRPC plane answers
-                // `UNAVAILABLE`. Admission and publication failures stay
-                // network errors, as on this network before.
-                let backs_off = match &err {
-                    SnapshotInstallError::Group(group) => refuses_overwrite(group),
-                    SnapshotInstallError::NotRegistered { .. }
-                    | SnapshotInstallError::ShuttingDown { .. }
-                    | SnapshotInstallError::Publication(_)
-                    | SnapshotInstallError::Task(_) => false,
-                    SnapshotInstallError::GateClosed { .. }
-                    | SnapshotInstallError::PointerUndecodable { .. }
-                    | SnapshotInstallError::SourceMissing { .. }
-                    | SnapshotInstallError::SourceRead { .. }
-                    | SnapshotInstallError::Undecodable { .. }
-                    | SnapshotInstallError::CopyWrite { .. }
-                    | SnapshotInstallError::CopyVerify { .. }
-                    | SnapshotInstallError::NameCollision { .. }
-                    | SnapshotInstallError::PointerEncode { .. } => err.peer_backs_off(),
-                };
+                let backs_off = install_error_backs_off(&err);
                 if backs_off {
                     StreamingError::Unreachable(Unreachable::from_string(message))
                 } else {
@@ -799,6 +780,32 @@ async fn sleep_in_process_raft_network(delay: Duration) {
 /// committed (#613). The gRPC network answers it `Unavailable`,
 /// which the client reports as unreachable, so OpenRaft backs off instead of
 /// resending at once; this network classifies it the same.
+/// Whether a full snapshot refused with `error` backs the sender off, as an
+/// unreachable target, rather than failing as a network error. A refused
+/// overwrite backs it off, as does every typed refusal of the prefetch that
+/// the gRPC plane answers `UNAVAILABLE`. Admission and publication failures
+/// stay network errors, as on this network before. Unifying this with
+/// [`SnapshotInstallError::peer_backs_off`] shifts the simulation's seeds,
+/// so it waits for a change that records them anew.
+pub(crate) fn install_error_backs_off(error: &SnapshotInstallError) -> bool {
+    match error {
+        SnapshotInstallError::Group(group) => refuses_overwrite(group),
+        SnapshotInstallError::NotRegistered { .. }
+        | SnapshotInstallError::ShuttingDown { .. }
+        | SnapshotInstallError::Publication(_)
+        | SnapshotInstallError::Task(_) => false,
+        SnapshotInstallError::GateClosed { .. }
+        | SnapshotInstallError::PointerUndecodable { .. }
+        | SnapshotInstallError::SourceMissing { .. }
+        | SnapshotInstallError::SourceRead { .. }
+        | SnapshotInstallError::Undecodable { .. }
+        | SnapshotInstallError::CopyWrite { .. }
+        | SnapshotInstallError::CopyVerify { .. }
+        | SnapshotInstallError::NameCollision { .. }
+        | SnapshotInstallError::PointerEncode { .. } => error.peer_backs_off(),
+    }
+}
+
 fn refuses_overwrite(error: &ursula_runtime::GroupEngineError) -> bool {
     matches!(
         error.infra(),

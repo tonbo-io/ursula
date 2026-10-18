@@ -615,7 +615,7 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
             raft_group_id: GROUP,
             key: "snapshots/node-10/group-7/00000000000000000042-00000000000000ab.snap"
                 .to_owned(),
-            prefix: "snapshots/node-1/group-7/".to_owned(),
+            directory: "snapshots/node-1/group-7/".to_owned(),
         },
         GroupSnapshotError::ObjectMissing { .. } => GroupSnapshotError::ObjectMissing {
             raft_group_id: GROUP,
@@ -664,7 +664,8 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
             Head,
             Put,
             List,
-            Delete
+            Delete,
+            Copy
         })
         .into_iter()
         // The sample above carries this operation.

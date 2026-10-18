@@ -231,6 +231,7 @@ pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;
 pub use types::RaftLogProgressSnapshot;
 pub use types::SnapshotData;
+pub use types::SnapshotLease;
 pub use types::StaticGrpcRaftMembershipConfig;
 pub use types::UrsulaAppendEntriesRequest;
 pub use types::UrsulaAppendEntriesResponse;

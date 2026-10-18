@@ -643,13 +643,19 @@ where S: raft_internal_proto::raft_internal_server::RaftInternal {
 /// when the peer should back off before it sends again
 /// ([`ursula_runtime::GroupEngineError::peer_backs_off`]), else `INTERNAL`.
 pub(crate) fn group_rpc_status(error: ursula_runtime::GroupEngineError) -> tonic::Status {
+    tonic::Status::new(group_rpc_code(&error), error.to_string())
+}
+
+/// The gRPC code of a group's error: `NOT_FOUND` for a group this node does
+/// not run, `UNAVAILABLE` when the peer backs off, `INTERNAL` otherwise.
+pub(crate) fn group_rpc_code(error: &ursula_runtime::GroupEngineError) -> tonic::Code {
     if let Some(ursula_runtime::GroupInfraError::RaftGroupNotRegistered { .. }) = error.infra() {
-        return tonic::Status::not_found(error.to_string());
+        return tonic::Code::NotFound;
     }
     if error.peer_backs_off() {
-        return tonic::Status::unavailable(error.to_string());
+        return tonic::Code::Unavailable;
     }
-    tonic::Status::internal(error.to_string())
+    tonic::Code::Internal
 }
 
 async fn handle_append_envelope(
@@ -1976,13 +1982,15 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         option: RPCOption,
     ) -> Result<SnapshotResponse<UrsulaRaftTypeConfig>, StreamingError<UrsulaRaftTypeConfig>> {
+        // The lease keeps the object the pointer names until the RPC returns.
+        let (snapshot_payload, _lease) = snapshot.snapshot.into_parts();
         let request = raft_internal_proto::RaftFullSnapshotRequestV1 {
             raft_group_id: self.raft_group_id.0,
             node_id: self.target,
             protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
             vote: encode_wire(&vote),
             snapshot_meta: encode_wire(&snapshot.meta),
-            snapshot_payload: snapshot.snapshot.into_pointer_bytes().into(),
+            snapshot_payload: snapshot_payload.into(),
         };
         GRPC_SNAPSHOT_REQUESTS.fetch_add(1, Ordering::Relaxed);
         GRPC_SNAPSHOT_REQUEST_BYTES.fetch_add(request.encoded_len() as u64, Ordering::Relaxed);

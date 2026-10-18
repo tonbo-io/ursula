@@ -19,9 +19,9 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
 
-use ursula_runtime::HoldDrop;
 use ursula_runtime::KeyHold;
 use ursula_runtime::KeyHolds;
+use ursula_runtime::Release;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPrune;
@@ -55,7 +55,7 @@ pub(crate) struct SnapshotReferences {
     state: Mutex<ReferenceState>,
     /// The locations prepared builds and installs lease, each until its
     /// lease drops.
-    leases: KeyHolds<SnapshotLocation>,
+    leases: KeyHolds<SnapshotLocation, Release>,
     /// G: how long a replaced current object stays pinned, and how long
     /// after an upload or a restore the group's GC pass runs.
     gc_grace: Duration,
@@ -196,7 +196,7 @@ pub(crate) enum SnapshotGcError {
 }
 
 /// A prepared build's or install's lease on the location it may commit.
-pub(crate) type SnapshotReferenceLease = KeyHold<SnapshotLocation>;
+pub(crate) type SnapshotReferenceLease = KeyHold<SnapshotLocation, Release>;
 
 #[cfg(test)]
 impl Default for SnapshotReferences {
@@ -212,7 +212,7 @@ impl SnapshotReferences {
         Self {
             serial: AsyncMutex::new(PublicationRetry::default()),
             state: Mutex::new(ReferenceState::default()),
-            leases: KeyHolds::new(HoldDrop::Release),
+            leases: KeyHolds::new(),
             gc_grace: gc_grace.min(MAX_GC_GRACE),
         }
     }
@@ -704,14 +704,26 @@ mod tests {
             _key: SnapshotKey,
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async { Err(SnapshotStoreError::Io(std::io::Error::other("down"))) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "down"),
+                ))
+            })
         }
 
         fn download<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Io(std::io::Error::other("down"))) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Get,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "down"),
+                ))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -723,7 +735,60 @@ mod tests {
             _raft_group_id: u32,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async { Err(SnapshotStoreError::Io(std::io::Error::other("down"))) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "down"),
+                ))
+            })
+        }
+
+        fn namespace(
+            &self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::OwnedNamespace {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
+        }
+
+        fn stage<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+            static INLINE: ursula_runtime::InlineSnapshotStore =
+                ursula_runtime::InlineSnapshotStore;
+            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
         }
     }
 
