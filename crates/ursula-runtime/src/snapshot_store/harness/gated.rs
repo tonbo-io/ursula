@@ -1,13 +1,16 @@
 //! A snapshot store wrapper that pauses operations at named gates, so a
 //! test can force one order of a build against a GC pass.
 //!
-//! Each owned-key operation ([`StoreOp`]) has two gates: one before it
-//! reaches the wrapped store and one after the store answered, before the
-//! caller sees the answer ([`GatePoint`]). A gate passes everything until a
-//! test holds it. While held, the operations that arrive wait there, and
-//! [`SnapshotStoreGates::release`] lets them through one by one in the
-//! order they arrived. Every arrival and pass is logged, so a test asserts
-//! the order the operations took.
+//! Each owned-key operation ([`StoreOp`]) of a node has two gates: one
+//! before it reaches the wrapped store and one after the store answered,
+//! before the caller sees the answer ([`GatePoint`]). A gate passes
+//! everything until a test holds it. While held, the operations that
+//! arrive wait there, and [`SnapshotStoreGates::release`] lets them through
+//! one at a time in the order they arrived. A waiter whose future is
+//! dropped, by a timeout, a shutdown or a killed node, gives up its turn,
+//! so it never holds back the ones behind it. Every arrival, pass and
+//! abandoned wait is logged, so a test asserts the order the operations
+//! took.
 //!
 //! The gates of a GC pass are its seams: `After(ListOwn)` sits between the
 //! LIST and the read of the holds, and `Before(DeleteOwn)` between that
@@ -15,11 +18,13 @@
 //! LIST and its DELETEs, hold `After(ListOwn)`, start the pass, wait for its
 //! arrival, run the build's lease, `write_staged` and commit, then release.
 //!
-//! The gates wait on a [`Notify`], which wakes waiters in the order they
-//! queued, and draw nothing at random, so they keep a madsim run
-//! deterministic.
+//! The order of passes comes from the tickets, never from the order in
+//! which [`Notify`] wakes the waiters, and the gates draw nothing at
+//! random. Under madsim the wake-ups are scheduled from the seed, so a
+//! gated run replays.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::pin::pin;
 use std::sync::Arc;
@@ -68,23 +73,26 @@ pub enum GatePoint {
     After,
 }
 
-/// One gate: an operation and a point.
+/// One gate: a node's operation at a point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Gate {
+    pub node_id: u64,
     pub op: StoreOp,
     pub point: GatePoint,
 }
 
 impl Gate {
-    pub const fn before(op: StoreOp) -> Self {
+    pub const fn before(node_id: u64, op: StoreOp) -> Self {
         Self {
+            node_id,
             op,
             point: GatePoint::Before,
         }
     }
 
-    pub const fn after(op: StoreOp) -> Self {
+    pub const fn after(node_id: u64, op: StoreOp) -> Self {
         Self {
+            node_id,
             op,
             point: GatePoint::After,
         }
@@ -93,20 +101,30 @@ impl Gate {
 
 impl fmt::Display for Gate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}({:?})", self.point, self.op)
+        write!(f, "node {} {:?}({:?})", self.node_id, self.point, self.op)
     }
 }
 
-/// Whether an operation reached a gate or went through it.
+/// A misuse of the gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GateError {
+    /// Only a held gate can release operations.
+    #[error("{gate} is not held")]
+    NotHeld { gate: Gate },
+}
+
+/// What happened to an operation at a gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatePass {
     Arrived,
     Passed,
+    /// The operation's future was dropped while it waited.
+    Abandoned,
 }
 
 /// One entry of the gate log. `ticket` numbers the arrivals at the gate
 /// from 0, and `subject` names what the operation acts on: the object key,
-/// or the group and index of a stage or a LIST.
+/// or the node, group and index of a stage or a LIST.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GateEvent {
     pub gate: Gate,
@@ -119,8 +137,36 @@ pub struct GateEvent {
 struct GateCounts {
     arrived: usize,
     passed: usize,
-    /// While held, the arrivals with a lower ticket may pass.
+    abandoned: usize,
+    /// While held, how many passes the gate allows in all.
     allowed: Option<usize>,
+    /// The lowest ticket that neither passed nor was abandoned.
+    next: usize,
+    /// Tickets above `next` that passed or were abandoned.
+    resolved_ahead: BTreeSet<usize>,
+}
+
+impl GateCounts {
+    /// Whether the arrival with `ticket` may go through now.
+    fn may_pass(&self, ticket: usize) -> bool {
+        match self.allowed {
+            None => true,
+            // A held gate lets its arrivals through one at a time, in
+            // ticket order, whichever waiter wakes first.
+            Some(allowed) => self.passed < allowed && ticket == self.next,
+        }
+    }
+
+    fn resolve(&mut self, ticket: usize) {
+        if ticket != self.next {
+            self.resolved_ahead.insert(ticket);
+            return;
+        }
+        self.next = self.next.saturating_add(1);
+        while self.resolved_ahead.remove(&self.next) {
+            self.next = self.next.saturating_add(1);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -135,11 +181,30 @@ struct GatesShared {
     changed: Notify,
 }
 
-/// The gates of a [`GatedSnapshotStore`]. Clones share them, so one set
-/// can gate the stores of several nodes.
+/// The gates of [`GatedSnapshotStore`]s. Clones share them, so one set
+/// gates the stores of several nodes, each under its own node id.
 #[derive(Debug, Clone, Default)]
 pub struct SnapshotStoreGates {
     shared: Arc<GatesShared>,
+}
+
+/// An operation waiting at a gate. Dropped before it passes, it gives up
+/// its ticket.
+struct Waiting<'g> {
+    gates: &'g SnapshotStoreGates,
+    gate: Gate,
+    ticket: usize,
+    /// Taken when the operation passes.
+    subject: Option<String>,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        if let Some(subject) = self.subject.take() {
+            self.gates
+                .finish(self.gate, self.ticket, subject, GatePass::Abandoned);
+        }
+    }
 }
 
 impl SnapshotStoreGates {
@@ -154,20 +219,31 @@ impl SnapshotStoreGates {
         self.update(|state| {
             let counts = state.gates.entry(gate).or_default();
             if counts.allowed.is_none() {
-                counts.allowed = Some(counts.arrived);
+                let waiting = counts
+                    .arrived
+                    .saturating_sub(counts.passed)
+                    .saturating_sub(counts.abandoned);
+                counts.allowed = Some(counts.passed.saturating_add(waiting));
             }
         });
     }
 
     /// Lets the next `count` operations held at `gate` through, in the
-    /// order they arrived, those yet to arrive included.
-    pub fn release(&self, gate: Gate, count: usize) {
+    /// order they arrived, those yet to arrive included. Refused unless
+    /// the gate is held.
+    pub fn release(&self, gate: Gate, count: usize) -> Result<(), GateError> {
+        let mut released = Err(GateError::NotHeld { gate });
         self.update(|state| {
-            let counts = state.gates.entry(gate).or_default();
-            if let Some(allowed) = counts.allowed.as_mut() {
+            if let Some(allowed) = state
+                .gates
+                .get_mut(&gate)
+                .and_then(|counts| counts.allowed.as_mut())
+            {
                 *allowed = allowed.saturating_add(count);
+                released = Ok(());
             }
         });
+        released
     }
 
     /// Stops holding `gate` and lets every operation waiting there through.
@@ -216,7 +292,7 @@ impl SnapshotStoreGates {
         .await;
     }
 
-    /// Every arrival and pass, in order.
+    /// Every arrival, pass and abandoned wait, in order.
     pub fn log(&self) -> Vec<GateEvent> {
         self.state().log.clone()
     }
@@ -255,6 +331,25 @@ impl SnapshotStoreGates {
         }
     }
 
+    /// Records that the arrival with `ticket` passed or was abandoned.
+    fn finish(&self, gate: Gate, ticket: usize, subject: String, pass: GatePass) {
+        self.update(|state| {
+            let counts = state.gates.entry(gate).or_default();
+            if pass == GatePass::Passed {
+                counts.passed = counts.passed.saturating_add(1);
+            } else {
+                counts.abandoned = counts.abandoned.saturating_add(1);
+            }
+            counts.resolve(ticket);
+            state.log.push(GateEvent {
+                gate,
+                ticket,
+                subject,
+                pass,
+            });
+        });
+    }
+
     /// Takes an operation on `subject` through `gate`, waiting while the
     /// gate holds it.
     async fn pass(&self, gate: Gate, subject: String) {
@@ -270,42 +365,46 @@ impl SnapshotStoreGates {
                 pass: GatePass::Arrived,
             });
         });
+        let mut waiting = Waiting {
+            gates: self,
+            gate,
+            ticket,
+            subject: Some(subject),
+        };
         self.wait_until(|state| {
             state
                 .gates
                 .get(&gate)
-                .is_none_or(|counts| match counts.allowed {
-                    None => true,
-                    // A held gate lets its arrivals through one at a time,
-                    // in ticket order, whichever waiter wakes first.
-                    Some(allowed) => ticket < allowed && ticket == counts.passed,
-                })
+                .is_none_or(|counts| counts.may_pass(ticket))
         })
         .await;
-        self.update(|state| {
-            let counts = state.gates.entry(gate).or_default();
-            counts.passed = counts.passed.saturating_add(1);
-            state.log.push(GateEvent {
-                gate,
-                ticket,
-                subject,
-                pass: GatePass::Passed,
-            });
-        });
+        if let Some(subject) = waiting.subject.take() {
+            self.finish(gate, ticket, subject, GatePass::Passed);
+        }
     }
 }
 
-/// A [`SnapshotStore`] that takes each [`StoreOp`] of the wrapped store
-/// through its two gates. Every other method goes straight through.
+/// A [`SnapshotStore`] of node `node_id` that takes each [`StoreOp`] of the
+/// wrapped store through its two gates. Every other method goes straight
+/// through.
 #[derive(Debug, Clone)]
 pub struct GatedSnapshotStore {
+    node_id: u64,
     inner: SharedSnapshotStore,
     gates: SnapshotStoreGates,
 }
 
 impl GatedSnapshotStore {
-    pub fn new(inner: SharedSnapshotStore, gates: SnapshotStoreGates) -> Self {
-        Self { inner, gates }
+    pub fn new(node_id: u64, inner: SharedSnapshotStore, gates: SnapshotStoreGates) -> Self {
+        Self {
+            node_id,
+            inner,
+            gates,
+        }
+    }
+
+    pub fn node_id(&self) -> u64 {
+        self.node_id
     }
 
     pub fn gates(&self) -> &SnapshotStoreGates {
@@ -317,9 +416,13 @@ impl GatedSnapshotStore {
     }
 
     async fn gated<T>(&self, op: StoreOp, subject: String, act: impl Future<Output = T>) -> T {
-        self.gates.pass(Gate::before(op), subject.clone()).await;
+        self.gates
+            .pass(Gate::before(self.node_id, op), subject.clone())
+            .await;
         let answer = act.await;
-        self.gates.pass(Gate::after(op), subject).await;
+        self.gates
+            .pass(Gate::after(self.node_id, op), subject)
+            .await;
         answer
     }
 }
@@ -367,7 +470,7 @@ impl SnapshotStore for GatedSnapshotStore {
         index: u64,
         chunks: SnapshotBytesIterator,
     ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
-        let subject = format!("group-{}/{index}", raft_group_id.0);
+        let subject = format!("node-{}/group-{}/{index}", self.node_id, raft_group_id.0);
         Box::pin(self.gated(
             StoreOp::Stage,
             subject,
@@ -388,7 +491,7 @@ impl SnapshotStore for GatedSnapshotStore {
     }
 
     fn list_own<'a>(&'a self, raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing> {
-        let subject = format!("group-{}", raft_group_id.0);
+        let subject = format!("node-{}/group-{}", self.node_id, raft_group_id.0);
         Box::pin(self.gated(
             StoreOp::ListOwn,
             subject,

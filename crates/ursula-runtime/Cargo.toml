@@ -65,9 +65,13 @@ name = "atomic_padding"
 harness = false
 
 [features]
-# `group_engine_error_samples`: one sample of every variant of
-# `GroupEngineError` and of every type it carries, for the wire fixture and
-# the classification tables of dependent crates.
+# Test-only APIs for dependent crates:
+# - `group_engine_error_samples`: one sample of every variant of
+#   `GroupEngineError` and of every type it carries, for the wire fixture
+#   and the classification tables of dependent crates.
+# - `snapshot_harness`: the faulty in-memory snapshot store, the gated store
+#   wrapper and the snapshot ownership invariant checkers, which also build
+#   under `cfg(madsim)` without this feature.
 test-support = []
 
 [lints]

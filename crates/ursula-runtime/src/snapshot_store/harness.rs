@@ -9,13 +9,14 @@
 //! - [`memory`]: [`MemorySnapshotBucket`], one in-memory bucket that every
 //!   node shares, and [`MemorySnapshotStore`], a node's store on it. Each
 //!   request waits a drawn delay before and after it acts. PUTs can fail to
-//!   the client and land later, LISTs can omit recent keys and repeat
+//!   the client and land anyway, LISTs can omit recent keys and repeat
 //!   deleted ones, creates honour If-None-Match, nonces come from the seed,
-//!   and a DELETE outside the deleting node's directory panics (I2).
-//! - [`gated`]: [`GatedSnapshotStore`], which wraps any store and pauses
-//!   each owned-key operation before or after it acts until a test
+//!   and a DELETE outside the deleting node's directory panics (I2). Its GC
+//!   is P3's owner pass: it keeps no reference records.
+//! - [`gated`]: [`GatedSnapshotStore`], which wraps a node's store and
+//!   pauses each owned-key operation before or after it acts until a test
 //!   releases it, so a test can force one order of a build against a GC
-//!   pass.
+//!   pass. A waiter that is dropped gives up its turn.
 //! - [`invariants`]: I1 to I5 over a [`SnapshotStoreView`] and what each
 //!   node names, which the caller supplies.
 
@@ -26,6 +27,7 @@ pub mod memory;
 mod tests;
 
 pub use gated::Gate;
+pub use gated::GateError;
 pub use gated::GateEvent;
 pub use gated::GatePass;
 pub use gated::GatePoint;
@@ -40,6 +42,7 @@ pub use invariants::ReadOutcome;
 pub use invariants::SnapshotInvariantViolation;
 pub use invariants::SnapshotStoreView;
 pub use invariants::StoreDelete;
+pub use invariants::ViewObject;
 pub use invariants::check_committed_reads_found;
 pub use invariants::check_named_keys_exist;
 pub use invariants::check_no_foreign_delete;
@@ -47,7 +50,7 @@ pub use invariants::check_quiet_prefixes;
 pub use invariants::check_superseded_without_marker;
 pub use invariants::contains_marker;
 pub use memory::DelayRange;
-pub use memory::ForeignDeletes;
+pub use memory::DeleteOutcome;
 pub use memory::MemorySnapshotBucket;
 pub use memory::MemorySnapshotStore;
 pub use memory::PerMille;

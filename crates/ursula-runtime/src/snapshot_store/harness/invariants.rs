@@ -13,8 +13,8 @@
 //!   directory.
 //! - I3 ([`check_committed_reads_found`]): no restore and no committed
 //!   install sees `NotFound`.
-//! - I4 ([`check_superseded_without_marker`]): past the bound, no
-//!   superseded object holds the marker.
+//! - I4 ([`check_superseded_without_marker`]): past the bound, no object
+//!   that no node names holds the marker, orphans included.
 //! - I5 ([`check_quiet_prefixes`]): once quiet, each node's directory
 //!   holds only the keys its metadata names.
 //!
@@ -34,9 +34,18 @@ use crate::snapshot_store::SnapshotStoreError;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SnapshotStoreView {
     pub prefix: SnapshotPrefix,
-    /// Every object's key and logical (decompressed) bytes.
-    pub objects: BTreeMap<String, Vec<u8>>,
+    /// Every object by key.
+    pub objects: BTreeMap<String, ViewObject>,
     pub deletes: Vec<StoreDelete>,
+}
+
+/// One object of a [`SnapshotStoreView`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ViewObject {
+    /// The logical (decompressed) bytes.
+    pub bytes: Vec<u8>,
+    /// How long ago the object landed in the store.
+    pub age: Duration,
 }
 
 /// A DELETE of `path` that node `node_id` sent.
@@ -143,12 +152,10 @@ pub enum SnapshotInvariantViolation {
         path: String,
         purpose: CommittedReadPurpose,
     },
-    #[error(
-        "I4: {path} still holds the marker {superseded_for:?} after it was superseded, past {bound:?}"
-    )]
+    #[error("I4: {path}, which no node names, holds the marker after {age:?}, past {bound:?}")]
     SupersededHoldsMarker {
         path: String,
-        superseded_for: Duration,
+        age: Duration,
         bound: Duration,
     },
     #[error("I5: node {node_id}'s directory holds {path}, which its metadata does not name")]
@@ -207,27 +214,36 @@ pub fn check_committed_reads_found<'r>(
     }
 }
 
-/// I4: no object superseded more than `bound` ago still holds the marker.
-/// `superseded` maps each superseded key to how long ago it was superseded,
-/// and `holds_marker` reads an object's logical bytes.
-pub fn check_superseded_without_marker(
+/// I4: no object that no node names holds the marker longer than
+/// `bound`. That covers a replaced current as well as an orphan, such as
+/// a late PUT that landed after its build gave up or the object of an
+/// abandoned build. An object is aged from the later of its landing and
+/// its supersession: `superseded` maps a key a node named to how long ago
+/// it stopped naming it, and a key missing from it is aged from its
+/// landing. `holds_marker` reads an object's logical bytes. With stale
+/// LISTs on, pass the bound plus their `stale_for`.
+pub fn check_superseded_without_marker<'n, N: NodeSnapshotNames + 'n>(
     view: &SnapshotStoreView,
+    nodes: impl IntoIterator<Item = &'n N>,
     superseded: &BTreeMap<String, Duration>,
     bound: Duration,
     holds_marker: impl Fn(&[u8]) -> bool,
 ) -> Result<(), SnapshotInvariantViolation> {
-    for (path, superseded_for) in superseded {
-        if *superseded_for <= bound {
+    let named: BTreeSet<String> = nodes
+        .into_iter()
+        .flat_map(|node| node.named_keys())
+        .collect();
+    for (path, object) in &view.objects {
+        if named.contains(path) {
             continue;
         }
-        if view
-            .objects
+        let age = superseded
             .get(path)
-            .is_some_and(|bytes| holds_marker(bytes.as_slice()))
-        {
+            .map_or(object.age, |since| object.age.min(*since));
+        if age > bound && holds_marker(object.bytes.as_slice()) {
             return Err(SnapshotInvariantViolation::SupersededHoldsMarker {
                 path: path.clone(),
-                superseded_for: *superseded_for,
+                age,
                 bound,
             });
         }
