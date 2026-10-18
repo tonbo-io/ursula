@@ -811,7 +811,7 @@ impl GroupEngineFactory for MadsimScopedRaftGroupEngineFactory {
             let inner = RaftGroupEngine::new_single_node_on_log_store_with_options(
                 placement,
                 log_store,
-                wal.recording_work(super::sim_wal::engine_options(Some(metrics), None)),
+                wal.recording_work(sim_wal::engine_options(Some(metrics), None)),
             )
             .await?;
             let engine: Box<dyn GroupEngine> = Box::new(MadsimScopedGroupEngine {
