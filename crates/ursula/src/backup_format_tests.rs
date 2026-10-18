@@ -56,7 +56,8 @@ fn fixture_store() -> BackupStore {
     BackupStore::open(FIXTURE).expect("open the fixture backup")
 }
 
-/// A one-group cluster of this release on `cold_store`.
+/// A one-group cluster of this release on `cold_store`: node 1, which
+/// `ursulactl` finds by its metrics.
 fn cluster(cold_store: ColdStoreHandle) -> Router {
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         RuntimeConfig::new(1, 1),
@@ -64,7 +65,7 @@ fn cluster(cold_store: ColdStoreHandle) -> Router {
         Some(cold_store),
     )
     .expect("runtime");
-    router_with_http_state(HttpState::new(runtime))
+    router_with_http_state(HttpState::new(runtime).with_configured_node_id(1))
 }
 
 /// A cold store holding every cold object of the source cluster.
