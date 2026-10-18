@@ -557,7 +557,7 @@ async fn build_three_node_cluster_gating(
         } else {
             None
         };
-        let engine = RaftGroupEngine::new_node(
+        let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             placement(),
             node_id,
             config.clone(),
