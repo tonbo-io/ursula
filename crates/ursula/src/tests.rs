@@ -13828,12 +13828,26 @@ async fn a0_09_generate_backup_format_4_fixture() {
             "/tenant-a/ttl",
             &[
                 (CONTENT_TYPE.as_str(), "text/plain"),
-                (HEADER_STREAM_TTL, "86400"),
+                (HEADER_STREAM_TTL, "3000000000"),
             ],
             Body::from("ttl"),
         )
         .await,
         "ttl create",
+    )
+    .await;
+    ok(
+        http_put(
+            &a,
+            "/tenant-a/expiring",
+            &[
+                (CONTENT_TYPE.as_str(), "text/plain"),
+                (HEADER_STREAM_EXPIRES_AT, "2100-01-01T00:00:00Z"),
+            ],
+            Body::from("expiring"),
+        )
+        .await,
+        "expiring create",
     )
     .await;
 
