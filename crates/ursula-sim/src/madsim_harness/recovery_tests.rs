@@ -109,31 +109,38 @@ async fn wait_healed(cluster: &JournalCluster, context: &str, timeout: Duration)
     wait_healed_checking(cluster, context, timeout, |_| {}).await;
 }
 
-/// Waits until the cluster [`healed`] while every leader keeps every node a
-/// voter of a single config: a follower that lost entries is rewound in
-/// place, and nothing removes it or proposes a joint config.
-async fn wait_healed_as_voters(cluster: &JournalCluster, context: &str, timeout: Duration) {
-    wait_healed_checking(cluster, context, timeout, |cluster| {
-        assert_every_node_a_voter(cluster, context);
-    })
-    .await;
-}
-
-/// Every running leader's membership is a single config whose voters are
-/// every node.
-fn assert_every_node_a_voter(cluster: &JournalCluster, context: &str) {
+/// Each group's membership log index on its leader. A follower that lost
+/// entries is rewound in place, so a repair leaves it unchanged: nothing
+/// removes the follower or proposes a joint config.
+async fn membership_indexes(cluster: &JournalCluster, context: &str) -> Vec<Option<u64>> {
+    let mut indexes = Vec::new();
     for group in JOURNAL_GROUPS {
-        let Some(leader) = leader_by_state(cluster, group) else {
-            continue;
-        };
-        let membership = metrics(cluster, group, leader).membership_config;
-        let configs = membership.membership().get_joint_config().clone();
-        assert_eq!(
-            configs,
-            vec![NODES.into_iter().collect::<std::collections::BTreeSet<_>>()],
-            "{context}: group {group}: leader {leader} changed the voters"
+        let leader = wait_leader(cluster, group, context).await;
+        indexes.push(
+            metrics(cluster, group, leader)
+                .membership_config
+                .log_id()
+                .as_ref()
+                .map(|log_id| log_id.index),
         );
     }
+    indexes
+}
+
+/// Waits until the cluster [`healed`] and checks that no group changed its
+/// membership since `before` ([`membership_indexes`]).
+async fn wait_healed_with_membership(
+    cluster: &JournalCluster,
+    context: &str,
+    timeout: Duration,
+    before: &[Option<u64>],
+) {
+    wait_healed(cluster, context, timeout).await;
+    assert_eq!(
+        membership_indexes(cluster, context).await,
+        before,
+        "{context}: a group changed its membership to heal"
+    );
 }
 
 /// Waits until the cluster [`healed`], running `check` on every poll. A
@@ -381,6 +388,7 @@ fn a_follower_that_lost_its_disk_is_rewound_in_place_while_writes_continue() {
                 cluster.append(group, 6).await;
             }
             let victim = cluster.follower_of_every_group(seed).await;
+            let memberships = membership_indexes(&cluster, &context).await;
             cluster.stop_node(victim).await;
             cluster.wals.insert(
                 victim,
@@ -412,9 +420,9 @@ fn a_follower_that_lost_its_disk_is_rewound_in_place_while_writes_continue() {
             // Writes keep flowing while the emptied replica is rewound.
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 12).await;
-                assert_every_node_a_voter(&cluster, &context);
             }
-            wait_healed_as_voters(&cluster, &context, Duration::from_secs(20)).await;
+            wait_healed_with_membership(&cluster, &context, Duration::from_secs(20), &memberships)
+                .await;
             for group in JOURNAL_GROUPS {
                 assert_eq!(
                     log_state(&cluster, group, victim),
@@ -487,6 +495,7 @@ fn a_surviving_leader_rewinds_a_majority_of_followers_that_lost_their_tail() {
             // One node leads every group.
             let leader = wait_leader(&cluster, 0, &context).await;
             lead_every_group(&cluster, leader, &context).await;
+            let memberships = membership_indexes(&cluster, &context).await;
             let followers = NODES
                 .into_iter()
                 .filter(|node_id| *node_id != leader)
@@ -505,7 +514,8 @@ fn a_surviving_leader_rewinds_a_majority_of_followers_that_lost_their_tail() {
             for group in JOURNAL_GROUPS {
                 cluster.append(group, 6).await;
             }
-            wait_healed_as_voters(&cluster, &context, Duration::from_secs(15)).await;
+            wait_healed_with_membership(&cluster, &context, Duration::from_secs(15), &memberships)
+                .await;
             assert_no_vote_while_gated(&cluster, &context);
             cluster.verify_reads().await;
         });
@@ -933,7 +943,7 @@ async fn wait_lease_renewed(
 }
 
 /// Waits until the cluster [`healed`] while `leader` leads every group with
-/// its lease renewed and every node stays a voter.
+/// its lease renewed.
 async fn wait_healed_holding_lease(
     cluster: &JournalCluster,
     leader: u64,
@@ -942,7 +952,6 @@ async fn wait_healed_holding_lease(
 ) {
     let lease = cluster.election_timeout_max();
     wait_healed_checking(cluster, context, timeout, |cluster| {
-        assert_every_node_a_voter(cluster, context);
         for group in JOURNAL_GROUPS {
             let age = quorum_ack_age(cluster, group, leader);
             assert!(
@@ -968,9 +977,8 @@ async fn wait_healed_holding_lease(
 #[test]
 fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
     let _guard = sim_test_guard();
-    let mut observed = 0_u64;
     for seed in seeds_from_env("RECOVERY_GATE_SEEDS", &JOURNAL_POWER_LOSS_SEEDS) {
-        observed = observed.saturating_add(run_with_madsim(seed, async move {
+        run_with_madsim(seed, async move {
             let context = format!("seed {seed}");
             let (mut cluster, survivor, followers) =
                 followers_lose_a_committed_tail("gate-idle-majority", &context).await;
@@ -1002,25 +1010,20 @@ fn a_surviving_leader_rewinds_an_idle_majority_that_lost_committed_entries() {
                 "{context}: no follower answered a conflict below its matched index"
             );
             assert_no_vote_while_gated(&cluster, &context);
-            let reported = JOURNAL_GROUPS
-                .into_iter()
-                .flat_map(|group| {
-                    cluster.rejoins[&(group, survivor)]
-                        .log_reversions()
-                        .into_values()
-                })
-                .sum::<u64>();
+            // The survivor's heal driver saw the rewinds the network saw.
+            let observed = cluster.recovery_registries[&survivor].follower_log_reversions();
+            assert!(
+                followers
+                    .iter()
+                    .any(|node_id| observed.get(node_id).is_some_and(|count| *count > 0)),
+                "{context}: the survivor's heal driver observed no reversion: {observed:?}"
+            );
             for group in JOURNAL_GROUPS {
                 wait_writable(&mut cluster, group, &context).await;
             }
             cluster.verify_reads().await;
-            reported
-        }));
+        });
     }
-    assert!(
-        observed > 0,
-        "the survivor's heal driver must observe the followers' log reversions"
-    );
 }
 
 /// Without log reversion, the survivor's OpenRaft takes the first conflict
@@ -1404,8 +1407,8 @@ fn a_genesis_vote_floor_survives_a_restart_before_the_first_election() {
 /// A follower A loses its unsynced tail while the other follower B is cut
 /// off, and the leader rewinds A in place. B then loses its own tail before
 /// A caught up, so for a while each follower lacks entries the leader
-/// committed. Both stay voters: no joint config ever appears, every group
-/// heals without an operator and keeps every acknowledged write.
+/// committed. Both stay voters: no group changes its membership, and every
+/// group heals without an operator and keeps every acknowledged write.
 #[test]
 fn another_power_loss_during_a_rewind_keeps_every_voter_without_losing_acks() {
     let _guard = sim_test_guard();
@@ -1421,6 +1424,7 @@ fn another_power_loss_during_a_rewind_keeps_every_voter_without_losing_acks() {
             }
             let leader = wait_leader(&cluster, 0, &context).await;
             lead_every_group(&cluster, leader, &context).await;
+            let memberships = membership_indexes(&cluster, &context).await;
             let followers: Vec<_> = NODES.into_iter().filter(|id| *id != leader).collect();
             let (a, b) = (followers[0], followers[1]);
             // Keep B alive, but out of reach while A is rewound.
@@ -1429,7 +1433,6 @@ fn another_power_loss_during_a_rewind_keeps_every_voter_without_losing_acks() {
             assert!(unsynced_loss_and_restart(&mut cluster, a).await > 0);
             let deadline = madsim::time::Instant::now() + Duration::from_secs(5);
             while cluster.reversions.from(a) == 0 {
-                assert_every_node_a_voter(&cluster, &context);
                 assert!(
                     madsim::time::Instant::now() < deadline,
                     "{context}: the leader never saw node {a} lose entries"
@@ -1441,7 +1444,8 @@ fn another_power_loss_during_a_rewind_keeps_every_voter_without_losing_acks() {
             assert!(unsynced_loss_and_restart(&mut cluster, b).await > 0);
             assert!(metrics(&cluster, 0, b).last_log_index < before_loss);
             cluster.policy.clear();
-            wait_healed_as_voters(&cluster, &context, Duration::from_secs(15)).await;
+            wait_healed_with_membership(&cluster, &context, Duration::from_secs(15), &memberships)
+                .await;
             assert_no_vote_while_gated(&cluster, &context);
             cluster.verify_reads().await;
         });

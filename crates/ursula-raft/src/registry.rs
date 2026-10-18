@@ -266,6 +266,9 @@ pub struct RaftGroupHandleRegistry {
     /// This node's cluster identity on the Raft gRPC plane and the peers
     /// refused for another cluster id.
     peer_cluster: crate::peer_cluster::PeerCluster,
+    /// How often each follower lost entries it had acknowledged to a leader
+    /// on this node ([`Self::follower_log_reversions`]).
+    follower_log_reversions: crate::rejoin::FollowerLogReversions,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -283,6 +286,7 @@ impl Default for RaftGroupHandleRegistry {
             snapshot_install: SnapshotInstallCoordinator::new(1),
             wal_opening: Arc::new(Mutex::new(None)),
             peer_cluster: crate::peer_cluster::PeerCluster::default(),
+            follower_log_reversions: Default::default(),
         }
     }
 }
@@ -977,25 +981,19 @@ impl RaftGroupHandleRegistry {
     }
 
     /// How many times each follower lost Raft log entries it had
-    /// acknowledged to a replica of this node as its leader, by follower
-    /// node id, summed over this node's groups since their replicas started.
-    /// The leader rewinds such a follower in place. A follower that keeps
-    /// appearing here without a host crash or a lost disk points at a disk
-    /// that drops synced writes, or at a bug.
+    /// acknowledged to a leader on this node, by follower node id, over all
+    /// groups since the node started. It only grows: a group's restart or
+    /// stop keeps its counts. The leader rewinds such a follower in place. A
+    /// follower that keeps appearing here without a host crash or a lost
+    /// disk points at a disk that drops synced writes, or at a bug.
     pub fn follower_log_reversions(&self) -> BTreeMap<u64, u64> {
-        let mut total = BTreeMap::<u64, u64>::new();
-        for gate in self
-            .groups
-            .load()
-            .values()
-            .filter_map(|entry| entry.active()?.recovery.clone())
-        {
-            for (target, count) in gate.log_reversions() {
-                let sum = total.entry(target).or_insert(0);
-                *sum = sum.saturating_add(count);
-            }
-        }
-        total
+        self.follower_log_reversions.snapshot()
+    }
+
+    /// The counter behind [`Self::follower_log_reversions`], which the heal
+    /// drivers of this node's groups count into.
+    pub(crate) fn follower_log_reversion_counter(&self) -> crate::rejoin::FollowerLogReversions {
+        self.follower_log_reversions.clone()
     }
 
     /// Groups whose gated replica on this node got no leader barrier and
@@ -2044,13 +2042,33 @@ mod tests {
         crate::RaftGroupEngine,
         ReferenceWalRoot,
     ) {
-        reference_failure_engine_for_group(store, RaftGroupId(7), Default::default()).await
+        reference_failure_engine_for_group(store, RaftGroupId(7), Default::default(), None).await
+    }
+
+    /// [`reference_failure_engine_for_group`] for group 7, started with the
+    /// recovery gate `recovery`, as a node's engine factory starts it.
+    async fn gated_reference_failure_engine(
+        store: Arc<FailingReferenceStore>,
+        recovery: Arc<crate::GroupRejoin>,
+    ) -> (
+        RaftGroupHandleRegistry,
+        crate::RaftGroupEngine,
+        ReferenceWalRoot,
+    ) {
+        reference_failure_engine_for_group(
+            store,
+            RaftGroupId(7),
+            Default::default(),
+            Some(recovery),
+        )
+        .await
     }
 
     async fn reference_failure_engine_for_group(
         store: Arc<FailingReferenceStore>,
         group: RaftGroupId,
         snapshot_install: SnapshotInstallCoordinator,
+        recovery: Option<Arc<crate::GroupRejoin>>,
     ) -> (
         RaftGroupHandleRegistry,
         crate::RaftGroupEngine,
@@ -2095,6 +2113,7 @@ mod tests {
                 snapshot_store: Some(store),
                 snapshot_install: Some(registry.snapshot_install_coordinator()),
                 cold_store: Some(Arc::new(ursula_runtime::ColdStore::memory().unwrap())),
+                recovery,
                 ..Default::default()
             },
         )
@@ -2128,7 +2147,6 @@ mod tests {
     #[tokio::test]
     async fn a_replica_holding_a_plan_takes_no_snapshot_from_a_leader_before_it() {
         let store = Arc::new(FailingReferenceStore::default());
-        let (registry, engine, _root) = reference_failure_engine(store).await;
         let gate_root = tempfile::tempdir().expect("gate WAL root");
         let gate_store = crate::log_store::RaftWal::start(
             gate_root.path(),
@@ -2150,6 +2168,7 @@ mod tests {
                 .await
                 .expect("open the gate"),
         );
+        let (registry, engine, _root) = gated_reference_failure_engine(store, gate.clone()).await;
         engine.publish_recovery(gate.clone(), &registry).unwrap();
         gate.hold_plan(&crate::log_store::RecoveryRecord {
             leader: 2,
@@ -2221,6 +2240,7 @@ mod tests {
             store,
             RaftGroupId(7),
             registry.snapshot_install_coordinator(),
+            None,
         )
         .await;
         registry.register_engine(&replacement);
@@ -2374,10 +2394,12 @@ mod tests {
             slow_store.clone(),
             RaftGroupId(7),
             coordinator.clone(),
+            None,
         )
         .await;
         let (fast_registry, fast_engine, _fast_root) =
-            reference_failure_engine_for_group(Arc::default(), RaftGroupId(6), coordinator).await;
+            reference_failure_engine_for_group(Arc::default(), RaftGroupId(6), coordinator, None)
+                .await;
         let slow = crate::rt::spawn(async move {
             slow_registry
                 .install_full_snapshot(

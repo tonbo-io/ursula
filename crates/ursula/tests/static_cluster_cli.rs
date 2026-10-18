@@ -3371,7 +3371,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // `wait` sees the same rebuilt voter.
+    // `wait` sees the same caught-up voter.
     let outcome =
         ursula_ctl::wait_node_ready(&nodes, &nodes[2], &ctl, &ursula_ctl::CatchUpOptions {
             stall_timeout: Duration::from_secs(30),
@@ -3460,6 +3460,27 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     );
     assert!(ctl.set_maintenance_drain(&nodes[2], false).await.is_err());
     drop(children);
+}
+
+/// Each survivor's membership log index, by node and group.
+async fn survivor_membership_indexes(
+    ctl: &ursula_ctl::MetricsClient,
+    survivors: &[ursula_ctl::NodeInfo],
+) -> std::collections::BTreeMap<(u64, u64), Option<u64>> {
+    ctl.fetch_cluster(survivors)
+        .await
+        .expect("fetch the survivors")
+        .per_node
+        .iter()
+        .flat_map(|view| {
+            view.groups.iter().map(move |group| {
+                (
+                    (view.node.id, group.raft_group_id),
+                    group.maintenance.membership_log_index,
+                )
+            })
+        })
+        .collect()
 }
 
 fn native_host_inventory(
@@ -3753,6 +3774,14 @@ async fn run_cli_host_recovery(candidate_fate: CandidateFate) {
     if candidate_fate == CandidateFate::DiesUnreached {
         node_3_raft.partition().await;
     }
+    // The survivors' memberships before the candidate starts: no heal step
+    // changes them while it catches up (#698).
+    let survivors_before = nodes
+        .iter()
+        .filter(|node| node.id != 3)
+        .cloned()
+        .collect::<Vec<_>>();
+    let memberships_before = survivor_membership_indexes(&ctl, &survivors_before).await;
     // The replacement host starts with an empty WAL.
     remove_test_path(node_wal_dir(wal_root.path(), 3));
     std::fs::write(&replacement_config, replacement_text).unwrap();
@@ -3789,11 +3818,22 @@ async fn run_cli_host_recovery(candidate_fate: CandidateFate) {
         if candidate_fate == CandidateFate::DiesAfterItsConflict {
             // The candidate's empty log conflicts below what its leaders had
             // matched of the node it replaces. A leader sends it entries only
-            // once it rewound it, and it stays a voter meanwhile.
+            // once it rewound it, and it stays a voter meanwhile: no
+            // survivor's membership changes until the kill.
+            let survivors = nodes
+                .iter()
+                .filter(|node| node.id != 3)
+                .cloned()
+                .collect::<Vec<_>>();
             let deadline = tokio::time::Instant::now()
                 .checked_add(Duration::from_secs(60))
                 .unwrap();
             loop {
+                assert_eq!(
+                    survivor_membership_indexes(&ctl, &survivors).await,
+                    memberships_before,
+                    "a survivor changed its membership while the candidate caught up"
+                );
                 let rewound = ctl.fetch_node(&nodes[2]).await.is_ok_and(|view| {
                     (0..6_u64).all(|group_id| {
                         view.group(group_id)
@@ -3810,21 +3850,11 @@ async fn run_cli_host_recovery(candidate_fate: CandidateFate) {
                 );
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-            let survivors = nodes
-                .iter()
-                .filter(|node| node.id != 3)
-                .cloned()
-                .collect::<Vec<_>>();
-            for view in ctl.fetch_cluster(&survivors).await.unwrap().per_node {
-                for group in &view.groups {
-                    assert!(
-                        group.voter_ids.contains(&3) && group.learner_ids.is_empty(),
-                        "node {} demoted the candidate in group {}",
-                        view.node.id,
-                        group.raft_group_id
-                    );
-                }
-            }
+            assert_eq!(
+                survivor_membership_indexes(&ctl, &survivors).await,
+                memberships_before,
+                "a survivor changed its membership while the candidate caught up"
+            );
         }
         let candidate = state.operation().unwrap().replacement.clone().unwrap();
         let config = children[2].config_path.clone().unwrap();
@@ -3959,7 +3989,7 @@ async fn run_cli_host_recovery(candidate_fate: CandidateFate) {
         }
         ctl
     };
-    // The leaders rebuild the replacement by themselves; the operator waits
+    // The leaders catch the replacement up by themselves; the operator waits
     // for it and lifts its startup drain.
     let outcome =
         ursula_ctl::wait_node_ready(&nodes, &nodes[2], &ctl, &ursula_ctl::CatchUpOptions {

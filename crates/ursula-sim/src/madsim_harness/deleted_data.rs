@@ -97,6 +97,7 @@ use super::journal_cluster::leader_by_state;
 use super::journal_cluster::metrics;
 use super::journal_cluster::set_snapshot_drivers;
 use super::journal_cluster::wait_leader;
+use super::recovery_wiring::REVERSION_INVARIANT;
 
 pub(super) const BOUND_INVARIANT: &str = "deleted_data_leaves_within_bound";
 #[cfg(test)]
@@ -1332,6 +1333,18 @@ pub(super) async fn run_deleted_data_inner(
             ),
         }),
     }
+    let unaccounted = cluster.reversions.unaccounted();
+    if !unaccounted.is_empty() {
+        fail(
+            &mut trace,
+            REVERSION_INVARIANT,
+            "scenario_end",
+            format!(
+                "seed {}: replicas with an open gate lost acknowledged entries: {unaccounted:?}",
+                config.seed
+            ),
+        );
+    }
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
         leader_id: leader,
@@ -1448,6 +1461,18 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
         purged: purged_at_build,
         snapshot,
     });
+    let unaccounted = cluster.reversions.unaccounted();
+    if !unaccounted.is_empty() {
+        fail(
+            &mut trace,
+            REVERSION_INVARIANT,
+            "scenario_end",
+            format!(
+                "seed {}: replicas with an open gate lost acknowledged entries: {unaccounted:?}",
+                config.seed
+            ),
+        );
+    }
     ThreeNodeRaftSimOutcome {
         seed: config.seed,
         leader_id: leader,

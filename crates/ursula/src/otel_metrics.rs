@@ -95,10 +95,10 @@ pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegi
              raft.wal.fsync = never or a lost disk, otherwise check the follower's disk",
         )
         .with_callback(move |observer| {
-            for (target, count) in reversion_registry.follower_log_reversions() {
+            for (follower, count) in reversion_registry.follower_log_reversions() {
                 observer.observe(count, &[KeyValue::new(
-                    "target",
-                    i64::try_from(target).unwrap_or(i64::MAX),
+                    "follower",
+                    i64::try_from(follower).unwrap_or(i64::MAX),
                 )]);
             }
         })

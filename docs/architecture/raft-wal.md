@@ -294,9 +294,11 @@ its log to it again. The follower stays a voter, and no membership entry is
 proposed. A follower checks the leader's vote before its log, so its conflict
 still counts as its acknowledgement of the leader. The leader keeps its quorum
 and its lease while the follower catches up, even when the followers that lost
-entries are a majority. This is safe because the leader holds every committed
-entry and a replica that may have lost entries votes for no one until its gate
-opens.
+entries are a majority, as long as they kept their vote. A replica that lost
+its vote, such as one on a wiped disk, answers errors until a quorum without it
+proves a vote floor, so two such replicas of three never heal on their own.
+This is safe because the leader holds every committed entry and a replica that
+may have lost entries votes for no one until its gate opens.
 
 The heal driver observes each reversion in the leader's replication metrics. It
 logs a warning that names the group and the follower and counts it per
@@ -482,7 +484,7 @@ only while a follower catches up from disk.
 `RaftWal::recovery_state` report whether and why the node opened recovering.
 `recovery_gates` and the `ursula.raft.recovery_gates` gauge list gated replicas
 and stalled groups. The `ursula.raft.follower_log_reversions` counter, labelled
-by `target`, counts the followers a leader on this node rewound because they
+by `follower`, counts the followers a leader on this node rewound because they
 lost entries they had acknowledged. `/__ursula/ready` names `wal_disk_pressure`,
 `recovery_stalled` or `recovery_gate_closed` and reports the watermarks.
 

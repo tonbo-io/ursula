@@ -156,8 +156,10 @@ pub struct RaftGroupEngineOptions {
     pub snapshot_record: Option<crate::SnapshotRecord>,
     /// The replica's recovery gate. Its recovery plan fences the history
     /// before the Raft core starts, so a plan's leader that restarts never
-    /// leads without it (N1, #581 review). The gate is bound later by
-    /// [`RaftGroupEngine::publish_recovery`].
+    /// leads without it (N1, #581 review). A gated engine runs OpenRaft with
+    /// log reversion allowed, so its leader rewinds a follower that lost
+    /// entries in place (`config_for_recovery`). The gate is bound later by
+    /// [`RaftGroupEngine::publish_recovery`], which binds no other gate.
     pub recovery: Option<Arc<crate::GroupRejoin>>,
     /// This node's side of the cluster-id check: its identity, stamped on
     /// the reads and purges it forwards to a leader, and where a leader's
@@ -199,6 +201,11 @@ pub(crate) struct StartupFault {
 }
 
 pub struct RaftGroupEngine {
+    /// The recovery gate the engine started with
+    /// ([`RaftGroupEngineOptions::recovery`]), the only one
+    /// [`Self::publish_recovery`] binds: its Raft allows log reversion only
+    /// if it started gated.
+    pub(crate) built_with_gate: Option<Arc<crate::GroupRejoin>>,
     pub(crate) rejoin: std::sync::Mutex<Option<Arc<crate::GroupRejoin>>>,
     /// The group's history on this replica, and the leader's fence while it
     /// is pending (#581 sections 4.3 and 4.5).
@@ -355,6 +362,7 @@ impl ForwardedReadEngine {
     /// The engine value the read runs on. Its lifecycle parts own nothing.
     fn reader(self) -> RaftGroupEngine {
         RaftGroupEngine {
+            built_with_gate: None,
             rejoin: Default::default(),
             history: self.history,
             apply_health: self.apply_health,
@@ -860,6 +868,7 @@ impl RaftGroupEngine {
             history.clone(),
         )));
         Ok(Self {
+            built_with_gate: recovery,
             rejoin: Default::default(),
             history,
             apply_health,
@@ -950,6 +959,20 @@ impl RaftGroupEngine {
                 ursula_runtime::GroupInfraError::RecoveryGroupMismatch {
                     expected: self.placement.raft_group_id,
                     actual: gate.raft_group_id(),
+                },
+            ));
+        }
+        // Only the gate the engine started with: one that started without a
+        // gate runs OpenRaft without log reversion, which a gated replica's
+        // leader needs.
+        if !self
+            .built_with_gate
+            .as_ref()
+            .is_some_and(|built| Arc::ptr_eq(built, &gate))
+        {
+            return Err(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
+                    raft_group_id: self.placement.raft_group_id,
                 },
             ));
         }

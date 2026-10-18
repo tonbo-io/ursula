@@ -214,7 +214,6 @@ pub use rejoin::ReplicaRestart;
 pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::leads_live;
 pub use rejoin::run_group_bootstrap;
-pub use rejoin::run_rejoin_heal;
 pub use rejoin::run_rejoin_vote_barrier;
 #[cfg(madsim)]
 pub use sim_runtime::MadsimOpenRaftRuntime;

@@ -206,6 +206,10 @@ pub(super) struct JournalCluster {
     pub(super) node_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
     /// The snapshot driver task of each running node.
     driver_tasks: BTreeMap<u64, madsim::task::JoinHandle<()>>,
+    /// Each node's registry its recovery drivers attach to, kept across its
+    /// restarts as a node's runtime keeps its own: its heal drivers count
+    /// follower log reversions there.
+    pub(super) recovery_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
 }
 
 impl JournalCluster {
@@ -325,6 +329,9 @@ impl JournalCluster {
                 .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
                 .collect(),
             driver_tasks: BTreeMap::new(),
+            recovery_registries: (1..=nodes)
+                .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
+                .collect(),
         }
     }
 
@@ -459,6 +466,7 @@ impl JournalCluster {
             &registry,
             &self.policy,
             &voters,
+            &self.recovery_registries[&node_id],
         );
         registry.register(node_id, &engine);
         if self.drivers.is_some() {

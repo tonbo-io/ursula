@@ -527,7 +527,7 @@ What you can additionally rely on:
   refuses data and peers of another format epoch and does not migrate them.
   Backups have a format of their own (see Format compatibility above).
 
-Node-level loss: replace the host with the same `node_id` and cluster config. Each group's leader rebuilds the replacement from the other voters (see [Rejoining a wiped node](#rejoining-a-wiped-node)). `ursulactl wait --node N` returns once the replacement is a voter of every group and has caught up, and `ursulactl verify-cluster` then requires every configured voter to be present and caught up. `ursulactl wait-ready` checks the whole cluster: leaders for every group, complete voter sets and `200` from every node's `/__ursula/ready`. Run it before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
+Node-level loss: replace the host with the same `node_id` and cluster config. Each group's leader catches the replacement up from the other voters, and it stays a voter (see [Rejoining a wiped node](#rejoining-a-wiped-node)). `ursulactl wait --node N` returns once the replacement has caught up in every group, and `ursulactl verify-cluster` then requires every configured voter to be present and caught up. `ursulactl wait-ready` checks the whole cluster: leaders for every group, complete voter sets and `200` from every node's `/__ursula/ready`. Run it before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
 
 ### Copying cold objects
 

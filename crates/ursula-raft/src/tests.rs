@@ -477,7 +477,61 @@ async fn build_three_node_cluster_at(
     u64,
     Vec<tempfile::TempDir>,
 ) {
+    let (registry, engines, leader, roots, _gate) =
+        build_three_node_cluster_gating(cluster_name, policy, address, None).await;
+    (registry, engines, leader, roots)
+}
+
+/// The node that [`build_three_node_cluster_with_a_gated_node`] gates.
+#[cfg(not(madsim))]
+const GATED_NODE: u64 = 3;
+
+/// [`build_three_node_cluster`] whose node [`GATED_NODE`] starts as a node on
+/// an empty WAL does, as the node's engine factory starts it: with a closed
+/// recovery gate over its own log store and no vote floor. It does not
+/// campaign, joins only the first election, and takes no replication until
+/// the test gives it a floor. Nodes 1 and 2 elect the leader.
+#[cfg(not(madsim))]
+async fn build_three_node_cluster_with_a_gated_node(
+    cluster_name: &str,
+) -> (
+    InProcessRaftRegistry,
+    Vec<RaftGroupEngine>,
+    u64,
+    Vec<tempfile::TempDir>,
+    Arc<GroupRejoin>,
+) {
+    let (registry, engines, leader, roots, gate) = build_three_node_cluster_gating(
+        cluster_name,
+        None,
+        |node_id| format!("node-{node_id}"),
+        Some(GATED_NODE),
+    )
+    .await;
+    (
+        registry,
+        engines,
+        leader,
+        roots,
+        gate.expect("the gated node's gate"),
+    )
+}
+
+#[cfg(not(madsim))]
+async fn build_three_node_cluster_gating(
+    cluster_name: &str,
+    policy: Option<InProcessRaftNetworkPolicy>,
+    address: impl Fn(u64) -> String,
+    gated: Option<u64>,
+) -> (
+    InProcessRaftRegistry,
+    Vec<RaftGroupEngine>,
+    u64,
+    Vec<tempfile::TempDir>,
+    Option<Arc<GroupRejoin>>,
+) {
     let registry = InProcessRaftRegistry::default();
+    let mut gate = None;
     // OpenRaft also uses election_timeout_min as the vote RPC deadline.
     // Leave room for concurrent tests fsyncing votes on the same executor host.
     let config = raft_config(cluster_name, 500, 1_000);
@@ -494,17 +548,35 @@ async fn build_three_node_cluster_at(
             network = network.with_policy(policy.clone());
         }
         let (wal_root, log_store) = fresh_journal_store();
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+        let node_gate = if gated == Some(node_id) {
+            Some(Arc::new(
+                GroupRejoin::durable(node_id, placement().raft_group_id, &log_store)
+                    .await
+                    .expect("open the gate"),
+            ))
+        } else {
+            None
+        };
+        let engine = RaftGroupEngine::new_node(
             placement(),
             node_id,
             config.clone(),
             network,
             log_store,
-            None,
-            None,
+            RaftGroupEngineOptions {
+                recovery: node_gate.clone(),
+                ..Default::default()
+            },
         )
         .await
         .expect("create cluster raft group node");
+        if let Some(node_gate) = node_gate {
+            // Bound before the node is reachable, so it never campaigns.
+            engine
+                .publish_recovery(node_gate.clone(), &RaftGroupHandleRegistry::default())
+                .expect("bind the gate");
+            gate = Some(node_gate);
+        }
         registry.register(node_id, &engine);
         engines.push(engine);
         wal_roots.push(wal_root);
@@ -545,7 +617,7 @@ async fn build_three_node_cluster_at(
     })
     .await
     .expect("election and quorum readiness share the existing five-second budget");
-    (registry, engines, leader_id, wal_roots)
+    (registry, engines, leader_id, wal_roots, gate)
 }
 
 /// Read a stream through the engine's state machine; the outer result is the
@@ -4165,13 +4237,7 @@ async fn registry_handoff_rejects_invalid_targets_and_transfers_to_a_healthy_vot
         .await
         .unwrap();
     let registry = RaftGroupHandleRegistry::default();
-    let (_root, store) = fresh_journal_store();
-    let gate = Arc::new(
-        GroupRejoin::durable(leader, placement().raft_group_id, &store)
-            .await
-            .expect("open the gate"),
-    );
-    engine.publish_recovery(gate.clone(), &registry).unwrap();
+    registry.register_engine(engine);
     assert!(matches!(
         registry
             .transfer_leader(placement().raft_group_id, leader)
@@ -4516,7 +4582,8 @@ async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
 #[tokio::test]
 async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follower() {
     use openraft::rt::WatchReceiver;
-    let (_network, engines, leader, _roots) = build_three_node_cluster("self-election", None).await;
+    let (_network, engines, leader, _roots, gate) =
+        build_three_node_cluster_with_a_gated_node("self-election").await;
     let group = placement().raft_group_id;
     let engine = |id: u64| {
         engines
@@ -4530,7 +4597,7 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
         registry
     };
     let term = |id: u64| engine(id).raft.metrics().borrow_watched().current_term;
-    let gated = (1..=3).find(|id| *id != leader).unwrap();
+    let gated = GATED_NODE;
     let eligible = (1..=3).find(|id| *id != leader && *id != gated).unwrap();
 
     let leader_raft = engine(leader).raft_handle();
@@ -4551,13 +4618,6 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
         .unwrap();
     assert_eq!(leader_raft.metrics().borrow_watched().vote, vote);
 
-    let (_gate_root, gate_store) = fresh_journal_store();
-    let gate = Arc::new(
-        GroupRejoin::durable(gated, group, &gate_store)
-            .await
-            .unwrap()
-            .over_foreign_store(),
-    );
     assert!(!gate.vote_gate_open());
     let gated_registry = RaftGroupHandleRegistry::default();
     engine(gated)
@@ -4619,8 +4679,8 @@ async fn registry_self_election_refuses_the_leader_and_elects_an_eligible_follow
 #[tokio::test]
 async fn registry_handoff_to_a_gated_follower_is_refused_by_the_follower() {
     use openraft::rt::WatchReceiver;
-    let (network, engines, leader, _roots) =
-        build_three_node_cluster("handoff-gated-target", None).await;
+    let (network, engines, leader, _roots, gate) =
+        build_three_node_cluster_with_a_gated_node("handoff-gated-target").await;
     let group = placement().raft_group_id;
     let engine = |id: u64| {
         engines
@@ -4628,25 +4688,15 @@ async fn registry_handoff_to_a_gated_follower_is_refused_by_the_follower() {
             .find(|engine| engine.raft.metrics().borrow_watched().id == id)
             .unwrap()
     };
-    let gated = (1..=3).find(|id| *id != leader).unwrap();
+    let gated = GATED_NODE;
     let leader_raft = engine(leader).raft_handle();
     let vote = leader_raft.metrics().borrow_watched().vote;
 
     // The gate keeps the target out of elections. Its vote floor lets it
-    // keep taking the leader's appends, so the leader's handoff policy
-    // still accepts it as a target.
-    let (_gate_root, gate_store) = fresh_journal_store();
-    let gate = Arc::new(
-        GroupRejoin::durable(gated, group, &gate_store)
-            .await
-            .unwrap()
-            .over_foreign_store(),
-    );
+    // take the leader's appends, so the leader's handoff policy accepts it
+    // as a target once it caught up.
     gate.establish_vote_floor(vote).await.unwrap();
     assert!(!gate.vote_gate_open());
-    engine(gated)
-        .publish_recovery(gate, &RaftGroupHandleRegistry::default())
-        .unwrap();
     network.register(gated, engine(gated));
     leader_raft
         .client_write(create_command(ursula_shard::BucketStreamId::new(

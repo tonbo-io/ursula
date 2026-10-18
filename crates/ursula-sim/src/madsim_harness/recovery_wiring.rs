@@ -108,11 +108,12 @@ pub(super) fn wire_recovery(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
+    recovery_registry: &RaftGroupHandleRegistry,
 ) {
     engine
         .attach_recovery(
             rejoin.clone(),
-            &RaftGroupHandleRegistry::default(),
+            recovery_registry,
             voters.clone(),
             InProcessRecoveryTransport {
                 registry: registry.clone(),
@@ -237,6 +238,10 @@ pub(super) struct ReversionAnswer {
     pub(super) target_gate: Option<RecoveryGateStatus>,
 }
 
+/// The invariant a conflict below a matched index from a replica whose gate
+/// was open breaks ([`ReversionLog::unaccounted`]).
+pub(super) const REVERSION_INVARIANT: &str = "follower_reversion_needs_a_closed_gate";
+
 /// Every conflict below a matched index a simulated network delivered.
 #[derive(Debug, Clone, Default)]
 pub(super) struct ReversionLog(Arc<Mutex<Vec<ReversionAnswer>>>);
@@ -263,8 +268,8 @@ impl ReversionLog {
     /// The conflicts below a matched index that came from a replica whose
     /// recovery gate was open, or that has none. Only a replica that may
     /// have lost acknowledged entries starts gated (closed, or held by a
-    /// recovery plan), so each of these is a reversion nothing accounts for.
-    #[cfg(test)]
+    /// recovery plan), so each of these is a reversion nothing accounts for
+    /// ([`REVERSION_INVARIANT`]).
     pub(super) fn unaccounted(&self) -> Vec<ReversionAnswer> {
         self.0
             .lock()

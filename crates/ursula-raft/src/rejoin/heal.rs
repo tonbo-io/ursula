@@ -3,18 +3,22 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 use std::time::Duration;
 
 use openraft::BasicNode;
 use openraft::ChangeMembers;
 use openraft::RaftMetrics;
 use openraft::ServerState;
+use openraft::alias::LogIdOf;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
 
 use super::GroupRejoin;
 use super::REJOIN_HEAL_STEP_TIMEOUT;
-use super::attach::wait_recovery_change;
+use super::attach::Wake;
+use super::attach::wait_change;
 use super::log_index;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
@@ -118,7 +122,7 @@ fn heal_view(metrics: &RaftMetrics<UrsulaRaftTypeConfig>, configured: &BTreeSet<
 /// it lost entries it had acknowledged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LogReversion {
-    pub target: u64,
+    pub follower: u64,
     pub matched: u64,
     pub now: Option<u64>,
 }
@@ -134,92 +138,167 @@ pub(crate) struct ReversionWatch {
 
 impl ReversionWatch {
     /// The followers whose matched index went down since the previous
-    /// observation under the same leadership `vote`. A new leadership starts
-    /// afresh, since a new leader learns what each follower holds.
+    /// observation under the leadership `vote`, read from OpenRaft's
+    /// replication metrics. A new leadership starts afresh, since a new
+    /// leader learns what each follower holds. Allocates only to report a
+    /// reversion or to track a follower it has not seen match yet.
     pub(crate) fn observe(
         &mut self,
         vote: &UrsulaVote,
-        is_leader: bool,
-        matched: &BTreeMap<u64, Option<u64>>,
+        replication: &BTreeMap<u64, Option<LogIdOf<UrsulaRaftTypeConfig>>>,
     ) -> Vec<LogReversion> {
-        if !is_leader || self.leader.as_ref() != Some(vote) {
-            self.leader = is_leader.then_some(*vote);
+        if self.leader.as_ref() != Some(vote) {
+            self.leader = Some(*vote);
             self.matched.clear();
         }
-        if !is_leader {
-            return Vec::new();
-        }
-        let mut reversions = Vec::new();
         // A follower leaving the membership leaves the replication metrics:
         // that is no reversion.
         self.matched
-            .retain(|target, _| matched.contains_key(target));
-        for (target, now) in matched {
-            let previous = self.matched.get(target).copied();
-            if let Some(previous) = previous
+            .retain(|follower, _| replication.contains_key(follower));
+        let mut reversions = Vec::new();
+        for (follower, now) in replication {
+            let now = log_index(now.as_ref());
+            if let Some(previous) = self.matched.get(follower).copied()
                 && now.is_none_or(|now| now < previous)
             {
                 reversions.push(LogReversion {
-                    target: *target,
+                    follower: *follower,
                     matched: previous,
-                    now: *now,
+                    now,
                 });
             }
+            // Replacing the value of a follower already tracked allocates
+            // nothing.
             match now {
                 Some(now) => {
-                    self.matched.insert(*target, *now);
+                    self.matched.insert(*follower, now);
                 }
                 None => {
-                    self.matched.remove(target);
+                    self.matched.remove(follower);
                 }
             }
         }
         reversions
     }
+
+    /// This replica stopped leading: the next leadership starts afresh.
+    pub(crate) fn forget(&mut self) {
+        self.leader = None;
+        self.matched.clear();
+    }
 }
 
-/// Leader-side heal driver for one group. It observes follower log
-/// reversions, which OpenRaft repairs in place, and counts and reports each
-/// one. It also brings the membership back to the configured voters (add a
-/// missing one as a learner, promote it once caught up, flatten a stale
-/// joint config). Returns once the Raft stops.
-pub async fn run_rejoin_heal(
+/// How many times each follower lost entries it had acknowledged to a
+/// leader on this node, by follower node id. One per node, in its registry,
+/// so it only grows: a group's restart or a stopped group keeps its counts.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FollowerLogReversions(Arc<Mutex<BTreeMap<u64, u64>>>);
+
+impl FollowerLogReversions {
+    fn record(&self, follower: u64) {
+        let mut counts = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let count = counts.entry(follower).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    pub(crate) fn snapshot(&self) -> BTreeMap<u64, u64> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+}
+
+/// What a heal plan depends on besides replication progress: a change of it
+/// plans at once, anything else waits for the interval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlanInputs {
+    state: ServerState,
+    membership: Option<LogIdOf<UrsulaRaftTypeConfig>>,
+}
+
+/// Leader-side heal driver for one group. While this replica leads, it
+/// observes follower log reversions, which OpenRaft repairs in place, and
+/// counts each one in `reversions` and logs it. It also brings the
+/// membership back to the configured voters (add a missing one as a
+/// learner, promote it once caught up, flatten a stale joint config).
+/// Returns once the Raft stops.
+pub(crate) async fn run_rejoin_heal(
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
     configured: BTreeMap<u64, BasicNode>,
     interval: Duration,
+    reversions: FollowerLogReversions,
 ) {
     let configured_ids = configured.keys().copied().collect::<BTreeSet<_>>();
     // The log id of the joint config seen on the previous tick, if any.
     let mut last_joint = None;
     let mut last_attempt = None;
     let mut joint_since = crate::rt::time::Instant::now();
-    let mut reversions = ReversionWatch::default();
-    // Every metrics change wakes the driver, replication progress included,
-    // so the observer sees a rewound follower before it matches again.
-    let mut observed = raft.metrics();
+    let mut watch = ReversionWatch::default();
+    let mut planned: Option<(PlanInputs, crate::rt::time::Instant)> = None;
+    // A follower wakes on server-state changes only. A leader wakes on every
+    // metrics change, replication progress included, so the observer sees a
+    // rewound follower's matched index drop before it matches again.
+    let mut server = raft.server_metrics();
+    let mut metrics = raft.metrics();
     let mut changes = rejoin.changes.subscribe();
+    let mut leading = false;
     loop {
-        if !wait_recovery_change(&mut observed, &mut changes, interval).await {
+        let wake = if leading {
+            wait_change(&mut metrics, &mut changes, interval).await
+        } else {
+            wait_change(&mut server, &mut changes, interval).await
+        };
+        let Some(wake) = wake else {
             return;
-        }
+        };
         let (step, reverted) = {
-            let metrics = observed.borrow_watched();
-            if metrics.running_state.is_err() {
+            let current = metrics.borrow_watched();
+            if current.running_state.is_err() {
                 return;
             }
-            let mut view = heal_view(&metrics, &configured_ids);
-            let reverted = reversions.observe(&metrics.vote, view.is_leader, &view.matched);
-            let joint = (!view.uniform).then(|| *metrics.membership_config.log_id());
-            if joint != last_joint {
-                joint_since = crate::rt::time::Instant::now();
-            }
-            view.stale_joint = joint.is_some() && joint_since.elapsed() >= interval;
-            last_joint = joint;
-            (plan_heal_step(&view), reverted)
+            leading = current.state == ServerState::Leader;
+            let reverted = match current.replication.as_ref() {
+                Some(replication) if leading => watch.observe(&current.vote, replication),
+                _ => {
+                    watch.forget();
+                    Vec::new()
+                }
+            };
+            let inputs = PlanInputs {
+                state: current.state,
+                membership: *current.membership_config.log_id(),
+            };
+            let due = wake != Wake::Metrics
+                || planned
+                    .is_none_or(|(previous, at)| previous != inputs || at.elapsed() >= interval);
+            let step = if due {
+                planned = Some((inputs, crate::rt::time::Instant::now()));
+                let mut view = heal_view(&current, &configured_ids);
+                let joint = (!view.uniform).then_some(inputs.membership);
+                if joint != last_joint {
+                    joint_since = crate::rt::time::Instant::now();
+                }
+                view.stale_joint = joint.is_some() && joint_since.elapsed() >= interval;
+                last_joint = joint;
+                plan_heal_step(&view)
+            } else {
+                None
+            };
+            (step, reverted)
         };
         for reversion in reverted {
-            rejoin.record_log_reversion(reversion);
+            reversions.record(reversion.follower);
+            tracing::warn!(
+                node_id = rejoin.node_id,
+                raft_group_id = rejoin.raft_group_id.0,
+                follower = reversion.follower,
+                matched_index = reversion.matched,
+                now_matched_index = ?reversion.now,
+                "recovery: follower lost Raft log entries it had acknowledged; replicating \
+                 this leader's log to it again"
+            );
         }
         let Some(step) = step else {
             continue;

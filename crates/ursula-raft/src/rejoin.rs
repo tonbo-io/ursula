@@ -45,7 +45,7 @@
 //!   and the conflict still counts as its acknowledgement of the leader, so
 //!   the leader keeps its quorum. That is safe because the leader holds
 //!   every committed entry and the follower votes for no one until its gate
-//!   opens. The heal driver ([`run_rejoin_heal`]) observes each reversion
+//!   opens. The heal driver (`run_rejoin_heal`) observes each reversion
 //!   in the replication metrics, counts it per follower and logs it, and
 //!   brings the membership back to the configured voters when an operator
 //!   or a recovery plan left one out.
@@ -80,7 +80,6 @@
 //! lost entries keeps its vote restricted through restarts, and its
 //! satisfied plan closes its gate until a leader's barrier opens it.
 
-use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -232,11 +231,13 @@ pub(crate) enum VoteScreen {
 }
 
 /// The catch-up point from a fresh outbound quorum-confirmed barrier: the
-/// leader's committed vote and the commit index the replica must apply.
+/// leader's committed vote and the barrier index the replica must apply,
+/// the higher of the read index and the leader's last log index
+/// (`registry::confirm_recovery_barrier`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CatchUpTarget {
     leader: UrsulaVote,
-    commit_index: u64,
+    barrier_index: u64,
 }
 
 /// What a gated replica knows about its group's history.
@@ -415,19 +416,20 @@ impl VoteGate {
 
     /// Only this process's outbound recovery probe may establish a catch-up
     /// target. Inbound replication may have been delayed across the restart.
-    pub(crate) fn confirm_barrier(&mut self, leader: UrsulaVote, commit_index: u64) {
+    /// `barrier_index` is the index the barrier names ([`CatchUpTarget`]).
+    pub(crate) fn confirm_barrier(&mut self, leader: UrsulaVote, barrier_index: u64) {
         let Self::Closed { group, recovery } = self else {
             return;
         };
         if !leader.is_committed() {
             return;
         }
-        if commit_index >= 1 {
+        if barrier_index >= 1 {
             *group = GroupEvidence::Initialized;
         }
         match recovery {
             GateRecovery::CatchingUp(target) if target.leader == leader => {
-                target.commit_index = target.commit_index.max(commit_index);
+                target.barrier_index = target.barrier_index.max(barrier_index);
             }
             // A deposed (or incomparable) leader does not move the target.
             GateRecovery::CatchingUp(target)
@@ -435,7 +437,7 @@ impl VoteGate {
             GateRecovery::AwaitingBarrier | GateRecovery::Stalled | GateRecovery::CatchingUp(_) => {
                 *recovery = GateRecovery::CatchingUp(CatchUpTarget {
                     leader,
-                    commit_index,
+                    barrier_index,
                 });
             }
         }
@@ -502,7 +504,7 @@ impl VoteGate {
             Self::Closed { recovery, .. } => match recovery {
                 GateRecovery::CatchingUp(target) => local
                     .last_applied
-                    .is_some_and(|applied| applied >= target.commit_index),
+                    .is_some_and(|applied| applied >= target.barrier_index),
                 GateRecovery::AwaitingBarrier | GateRecovery::Stalled => false,
             },
         }
@@ -990,17 +992,13 @@ pub(crate) enum PlanTaken {
     Restart(RecoveryPlanReport),
 }
 
-/// One replica's recovery state for one group: the inbound vote gate and,
-/// while it leads, how often each follower lost entries.
+/// One replica's recovery state for one group: the inbound vote gate.
 pub struct GroupRejoin {
     node_id: u64,
     raft_group_id: RaftGroupId,
     metrics: OnceLock<MetricsReceiver>,
     gate: Mutex<VoteGate>,
     vote_floor: Mutex<Option<UrsulaVote>>,
-    /// How many times each follower lost entries it had acknowledged to
-    /// this replica as its leader ([`Self::record_log_reversion`]).
-    log_reversions: Mutex<BTreeMap<u64, u64>>,
     /// The group's log store, which keeps its log state and where the gate
     /// records that it opened. Weak, so a stopped group's store closes even
     /// while its gate is still registered.
@@ -1011,9 +1009,6 @@ pub struct GroupRejoin {
     /// install queues for the group's lock, the node's permit or a download.
     /// A refusal for a snapshot only grows firmer as the marker rises.
     refused_snapshot: Mutex<Option<(String, ursula_runtime::GroupInfraError)>>,
-    /// [`Self::over_foreign_store`].
-    #[cfg(test)]
-    foreign_store: bool,
     /// The committed leader whose AppendEntries reached this replica last,
     /// and when.
     last_leader_append: Mutex<
@@ -1219,13 +1214,10 @@ impl GroupRejoin {
             // granting a vote or acknowledging a leader persists a higher
             // vote first, so a durable `(0, 0)` proves neither happened.
             vote_floor: Mutex::new(store.vote()),
-            log_reversions: Mutex::new(BTreeMap::new()),
             store: Arc::downgrade(store),
             changes: UrsulaRaftTypeConfig::watch_channel(()).0,
             last_leader_append: Mutex::new(None),
             refused_snapshot: Mutex::new(None),
-            #[cfg(test)]
-            foreign_store: false,
             cut_refused,
             stall_after: OnceLock::new(),
             #[cfg(any(test, feature = "fault-injection"))]
@@ -1380,9 +1372,11 @@ impl GroupRejoin {
         Ok(())
     }
 
-    pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, commit_index: u64) {
+    /// Records a fresh barrier from `leader` whose index is `barrier_index`
+    /// ([`CatchUpTarget`]), when that leader's vote is at or above the floor.
+    pub(crate) fn confirm_barrier(&self, leader: UrsulaVote, barrier_index: u64) {
         if self.replication_allowed(leader) {
-            self.gate().confirm_barrier(leader, commit_index);
+            self.gate().confirm_barrier(leader, barrier_index);
         }
     }
 
@@ -1586,8 +1580,6 @@ impl GroupRejoin {
         .max();
         let held = store.last_held_index();
         let behind = raft.is_some_and(|index| held.is_none_or(|held| index > held));
-        #[cfg(test)]
-        let behind = behind && !self.foreign_store;
         if behind {
             return Err(ursula_runtime::GroupInfraError::LogBehindCommit {
                 raft_group_id: self.raft_group_id,
@@ -1595,23 +1587,7 @@ impl GroupRejoin {
                 held,
             });
         }
-        #[cfg(test)]
-        let raft = if self.foreign_store {
-            raft.zip(held).map(|(index, held)| index.min(held))
-        } else {
-            raft
-        };
         Ok(stored.max(raft))
-    }
-
-    /// A gate built over another store than the one its engine keeps its
-    /// log in, as unit tests that need a closed gate on a running cluster
-    /// do: OpenRaft's indexes say nothing about that store, so the marker
-    /// reads them only up to its last entry.
-    #[cfg(test)]
-    pub(crate) fn over_foreign_store(mut self) -> Self {
-        self.foreign_store = true;
-        self
     }
 
     /// The commit screen (#613): refuses an append, or a snapshot install,
@@ -2427,38 +2403,6 @@ impl GroupRejoin {
                 Some((request.vote, UrsulaRaftTypeConfig::now()));
         }
     }
-
-    /// Leader side: count and report that a follower lost entries it had
-    /// acknowledged, as the heal driver observed it. OpenRaft already
-    /// rewound the follower and replicates its log to it again.
-    pub(crate) fn record_log_reversion(&self, reversion: heal::LogReversion) {
-        {
-            let mut counts = self
-                .log_reversions
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let count = counts.entry(reversion.target).or_insert(0);
-            *count = count.saturating_add(1);
-        }
-        tracing::warn!(
-            node_id = self.node_id,
-            raft_group_id = self.raft_group_id.0,
-            target = reversion.target,
-            matched_index = reversion.matched,
-            now_matched_index = ?reversion.now,
-            "recovery: follower lost Raft log entries it had acknowledged; replicating this \
-             leader's log to it again"
-        );
-    }
-
-    /// How many times each follower lost entries it had acknowledged to
-    /// this replica as its leader, since the replica started.
-    pub fn log_reversions(&self) -> BTreeMap<u64, u64> {
-        self.log_reversions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
 }
 
 #[cfg(test)]
@@ -2891,25 +2835,30 @@ mod tests {
     /// a membership change.
     #[test]
     fn the_reversion_observer_reports_a_matched_index_that_went_down() {
-        let matched = |entries: &[(u64, Option<u64>)]| entries.iter().copied().collect();
+        let matched = |entries: &[(u64, Option<u64>)]| {
+            entries
+                .iter()
+                .map(|(follower, index)| (*follower, index.map(|index| log_id(3, 1, index))))
+                .collect::<BTreeMap<_, _>>()
+        };
         let vote = leader(3, 1);
         let mut watch = ReversionWatch::default();
         assert!(
             watch
-                .observe(&vote, true, &matched(&[(2, Some(10)), (3, Some(10))]))
+                .observe(&vote, &matched(&[(2, Some(10)), (3, Some(10))]))
                 .is_empty()
         );
         // Matching goes up: nothing.
         assert!(
             watch
-                .observe(&vote, true, &matched(&[(2, Some(12)), (3, Some(12))]))
+                .observe(&vote, &matched(&[(2, Some(12)), (3, Some(12))]))
                 .is_empty()
         );
         // OpenRaft rewound 3: its matched index is reset.
         assert_eq!(
-            watch.observe(&vote, true, &matched(&[(2, Some(12)), (3, None)])),
+            watch.observe(&vote, &matched(&[(2, Some(12)), (3, None)])),
             vec![LogReversion {
-                target: 3,
+                follower: 3,
                 matched: 12,
                 now: None,
             }]
@@ -2917,19 +2866,19 @@ mod tests {
         // It matches again from below, and catches up: one report only.
         assert!(
             watch
-                .observe(&vote, true, &matched(&[(2, Some(12)), (3, Some(4))]))
+                .observe(&vote, &matched(&[(2, Some(12)), (3, Some(4))]))
                 .is_empty()
         );
         assert!(
             watch
-                .observe(&vote, true, &matched(&[(2, Some(12)), (3, Some(12))]))
+                .observe(&vote, &matched(&[(2, Some(12)), (3, Some(12))]))
                 .is_empty()
         );
         // A drop seen without the reset in between is reported too.
         assert_eq!(
-            watch.observe(&vote, true, &matched(&[(2, Some(7)), (3, Some(12))])),
+            watch.observe(&vote, &matched(&[(2, Some(7)), (3, Some(12))])),
             vec![LogReversion {
-                target: 2,
+                follower: 2,
                 matched: 12,
                 now: Some(7),
             }]
@@ -2938,27 +2887,19 @@ mod tests {
         let next = leader(4, 1);
         assert!(
             watch
-                .observe(&next, true, &matched(&[(2, Some(1)), (3, Some(1))]))
+                .observe(&next, &matched(&[(2, Some(1)), (3, Some(1))]))
                 .is_empty()
         );
         // A follower that left the membership and came back is no reversion.
+        assert!(watch.observe(&next, &matched(&[(2, Some(1))])).is_empty());
         assert!(
             watch
-                .observe(&next, true, &matched(&[(2, Some(1))]))
+                .observe(&next, &matched(&[(2, Some(1)), (3, None)]))
                 .is_empty()
         );
-        assert!(
-            watch
-                .observe(&next, true, &matched(&[(2, Some(1)), (3, None)]))
-                .is_empty()
-        );
-        // A replica that stopped leading observes nothing.
-        assert!(watch.observe(&next, false, &matched(&[])).is_empty());
-        assert!(
-            watch
-                .observe(&next, true, &matched(&[(2, None)]))
-                .is_empty()
-        );
+        // A replica that stopped leading starts afresh when it leads again.
+        watch.forget();
+        assert!(watch.observe(&next, &matched(&[(2, None)])).is_empty());
     }
 
     /// A gate follows the group's durable log state: closed with an
@@ -3386,6 +3327,7 @@ pub use bootstrap::PeerGroupLog;
 use bootstrap::bootstrap_decision;
 pub use bootstrap::bootstrap_probe_vote;
 pub use bootstrap::run_group_bootstrap;
+pub(crate) use heal::FollowerLogReversions;
 #[cfg(test)]
 use heal::HealStep;
 #[cfg(test)]
@@ -3396,4 +3338,4 @@ use heal::LogReversion;
 use heal::ReversionWatch;
 #[cfg(test)]
 use heal::plan_heal_step;
-pub use heal::run_rejoin_heal;
+pub(crate) use heal::run_rejoin_heal;

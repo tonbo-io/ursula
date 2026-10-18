@@ -3911,21 +3911,9 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
         .await
         .expect("warm stale empty node 3 groups");
 
-    // The leaders rebuild the emptied node 3 by themselves (remove, learner,
-    // catch-up from the purged snapshot, promote).
+    // The leaders catch the emptied node 3 up by themselves, from the purged
+    // snapshot. It stays a voter throughout.
     for (group_index, stream_id) in streams_by_group.iter().enumerate() {
-        let raft_group_id = RaftGroupId(group_index as u32);
-        stale_replacement
-            .registry
-            .get(raft_group_id)
-            .expect("stale replacement group")
-            .wait(Some(Duration::from_secs(30)))
-            .metrics(
-                |metrics| metrics.membership_config.voter_ids().any(|id| id == 3),
-                format!("emptied node 3 healed back into group {group_index}"),
-            )
-            .await
-            .expect("wait for node 3 self-heal");
         wait_raft_state_machine_payload(
             &stale_replacement.registry,
             stale_replacement.runtime.locate(stream_id),
@@ -3960,21 +3948,8 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
         .await
         .expect("warm final empty node 3 groups");
 
-    // Restarted empty a second time, it is rebuilt again.
+    // Restarted empty a second time, it is caught up again.
     for (group_index, stream_id) in streams_by_group.iter().enumerate() {
-        let raft_group_id = RaftGroupId(group_index as u32);
-        let restarted_raft = restarted
-            .registry
-            .get(raft_group_id)
-            .expect("restarted group");
-        restarted_raft
-            .wait(Some(Duration::from_secs(30)))
-            .metrics(
-                |metrics| metrics.membership_config.voter_ids().any(|id| id == 3),
-                format!("restarted node 3 rejoined group {group_index}"),
-            )
-            .await
-            .expect("wait for restarted node membership");
         wait_raft_state_machine_payload(
             &restarted.registry,
             restarted.runtime.locate(stream_id),
@@ -6428,7 +6403,10 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         ),
         ursula_raft::SingleNodeRaftNetworkFactory,
         store,
-        ursula_raft::RaftGroupEngineOptions::default(),
+        ursula_raft::RaftGroupEngineOptions {
+            recovery: Some(gate.clone()),
+            ..Default::default()
+        },
     )
     .await
     .expect("recovering engine");
@@ -6544,7 +6522,10 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             ),
             ursula_raft::SingleNodeRaftNetworkFactory,
             store.clone(),
-            ursula_raft::RaftGroupEngineOptions::default(),
+            ursula_raft::RaftGroupEngineOptions {
+                recovery: Some(gate.clone()),
+                ..Default::default()
+            },
         )
         .await
         .expect("recovering group");
