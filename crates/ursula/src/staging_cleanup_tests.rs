@@ -36,6 +36,9 @@ use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngine;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::LeadershipRefusal;
+use ursula_runtime::Proposal;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RuntimeConfig;
@@ -404,14 +407,23 @@ fn cleanup_rule_classifies_runtime_errors() {
             message: "write page".to_owned()
         }
     ));
-    // RT1: OpenRaft reports ForwardToLeader from a dropped responder after
+    // RT1: OpenRaft reports a forward from a dropped responder after
     // step-down or log purge, when the entry may already have committed. Only
     // the local pre-proposal leadership check is a definite rejection.
-    assert!(!staged_external_definitely_unreferenced(&engine(
-        GroupEngineError::forward_to_leader("client_write responder", Some(2), None)
+    let not_leader = |proposal, reason| {
+        engine(GroupEngineError::NotLeader(LeadershipRefusal {
+            leader: None,
+            proposal,
+            reason,
+        }))
+    };
+    assert!(!staged_external_definitely_unreferenced(&not_leader(
+        Proposal::MayHaveCommitted,
+        LeadershipReason::SteppedDown,
     )));
-    assert!(staged_external_definitely_unreferenced(&engine(
-        GroupEngineError::forward_to_leader_before_proposal("not leader", Some(2), None)
+    assert!(staged_external_definitely_unreferenced(&not_leader(
+        Proposal::NotProposed,
+        LeadershipReason::Follower,
     )));
     assert!(staged_external_definitely_unreferenced(
         &RuntimeError::GroupNotHosted {

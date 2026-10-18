@@ -1,23 +1,44 @@
+mod error;
+#[cfg(test)]
+mod error_tests;
 #[cfg(test)]
 mod hygiene_tests;
 pub mod in_memory;
 
-use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+pub use error::AnswerProblem;
+pub use error::ColdOperation;
+pub use error::EngineOperation;
+pub use error::ForwardFailure;
+pub use error::ForwardedRpc;
+pub use error::GroupEngineError;
+pub use error::GroupInfraError;
+pub use error::GroupSnapshotError;
+pub use error::KnownLeader;
+pub use error::LeadershipReason;
+pub use error::LeadershipRefusal;
+pub use error::MembershipInitRefusal;
+pub use error::Proposal;
+pub use error::ResponseKind;
+pub use error::StaticMembershipProblem;
+pub use error::StreamRefusal;
+pub use error::UnproposableCommand;
+pub use error::WalOpenFailureKind;
+pub use error::WriteEffect;
+pub use error::cold_store_failure;
+#[cfg(any(test, feature = "test-support"))]
+pub use error::samples::group_engine_errors as group_engine_error_samples;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
-use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcPlanEntry;
-use ursula_stream::StreamErrorCode;
-use ursula_stream::StreamErrorContext;
 
 use crate::command::GroupSnapshot;
 use crate::metrics::RaftSnapshotBuildSample;
@@ -231,6 +252,58 @@ pub enum GroupWriteResponse {
     PurgeBucket(PurgeBucketResponse),
     ImportGroupState(crate::request::ImportGroupStateResponse),
     /// A history event applied (#581 section 4.3).
+    NewHistory(crate::request::NewHistoryResponse),
+    TidyStream(crate::request::TidyStreamResponse),
+    DeferColdGc(DeferColdGcResponse),
+    OffloadColdRefs(crate::cold_refs::OffloadStreamColdRefsResponse),
+}
+
+/// `GroupWriteResponse::kind` and one `TryFrom<GroupWriteResponse>` per
+/// response: a caller that expects one kind of response gets it, or
+/// [`GroupInfraError::UnexpectedResponse`] naming what it got.
+macro_rules! group_write_responses {
+    ($($variant:ident($response:ty)),+ $(,)?) => {
+        impl GroupWriteResponse {
+            pub fn kind(&self) -> ResponseKind {
+                match self {
+                    $(Self::$variant(_) => ResponseKind::$variant,)+
+                }
+            }
+        }
+
+        $(
+            impl TryFrom<GroupWriteResponse> for $response {
+                type Error = GroupEngineError;
+
+                fn try_from(response: GroupWriteResponse) -> Result<Self, Self::Error> {
+                    match response {
+                        GroupWriteResponse::$variant(response) => Ok(response),
+                        other => Err(GroupEngineError::Infra(
+                            GroupInfraError::UnexpectedResponse {
+                                expected: ResponseKind::$variant,
+                                actual: other.kind(),
+                            },
+                        )),
+                    }
+                }
+            }
+        )+
+    };
+}
+
+group_write_responses! {
+    CreateStream(CreateStreamResponse),
+    Append(AppendResponse),
+    PublishSnapshot(PublishSnapshotResponse),
+    AdvanceRetention(AdvanceRetentionResponse),
+    TouchStreamAccess(TouchStreamAccessResponse),
+    FlushCold(FlushColdResponse),
+    CompactCold(CompactColdResponse),
+    CloseStream(CloseStreamResponse),
+    DeleteStream(DeleteStreamResponse),
+    AckColdGc(AckColdGcResponse),
+    PurgeBucket(PurgeBucketResponse),
+    ImportGroupState(crate::request::ImportGroupStateResponse),
     NewHistory(crate::request::NewHistoryResponse),
     TidyStream(crate::request::TidyStreamResponse),
     DeferColdGc(DeferColdGcResponse),
@@ -904,485 +977,5 @@ impl GroupEngineMetrics {
                 external_upload,
                 inline_fallback,
             });
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GroupLeaderHint {
-    pub node_id: Option<u64>,
-    pub address: Option<String>,
-    /// The term in which the replica that refused knew `node_id` to lead,
-    /// read with it from one view. `None` when it did not know.
-    pub term: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StreamEngineError {
-    message: String,
-    code: StreamErrorCode,
-    next_offset: Option<u64>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    context: Vec<StreamErrorContext>,
-}
-
-/// A command the data-group apply dispatcher cannot execute. The proposal
-/// boundary refuses it before anything is written, because once committed it
-/// would stop every replica of the group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum UnproposableCommand {
-    /// Stream commands create their bucket inside their own apply.
-    CreateBucket,
-    /// Only a leader's history driver proposes a history event.
-    NewHistory,
-}
-
-/// Serializable startup classification. The WAL facade retains the native
-/// source chain; the engine boundary logs it before converting to this type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WalOpenFailureKind {
-    Io,
-    Corrupt,
-    IncompatibleFormat,
-    Locked,
-    DuplicateGroup,
-    Stopped,
-    InvalidConfiguration,
-    InvalidRecord,
-    Poisoned,
-}
-
-/// Infra error variants with structured fields render their human message on
-/// demand (`message`) instead of storing a denormalized copy alongside the
-/// fields. `Internal` is the exception: it carries free-form text with no
-/// structured source, so it keeps an owned `message`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum GroupInfraError {
-    #[error(
-        "recovery gate node {actual} differs from engine node {expected} for {raft_group_id:?}"
-    )]
-    RecoveryNodeMismatch {
-        raft_group_id: RaftGroupId,
-        expected: u64,
-        actual: u64,
-    },
-    #[error("raft group {raft_group_id:?} is not registered on this node")]
-    RaftGroupNotRegistered { raft_group_id: RaftGroupId },
-    #[error("recovery gate for group {raft_group_id:?} is already bound")]
-    RecoveryAlreadyBound { raft_group_id: RaftGroupId },
-    #[error("recovery gate group {actual:?} differs from engine group {expected:?}")]
-    RecoveryGroupMismatch {
-        expected: RaftGroupId,
-        actual: RaftGroupId,
-    },
-    #[error(
-        "raft group {raft_group_id:?} stopped after a committed apply failure; retain WAL for corrected-code replay"
-    )]
-    ApplyStopped {
-        raft_group_id: RaftGroupId,
-        term: u64,
-        index: u64,
-        kind: ursula_proto::admin::ApplyFailureKind,
-    },
-    #[error("command {command:?} cannot be proposed to a data Raft group")]
-    InvalidRaftCommand { command: UnproposableCommand },
-    #[error("open WAL for raft group {raft_group_id:?} on core {core_id:?}: {failure:?}")]
-    WalOpen {
-        core_id: CoreId,
-        raft_group_id: RaftGroupId,
-        failure: WalOpenFailureKind,
-    },
-    #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
-    RecoveryVoteFloor { raft_group_id: RaftGroupId },
-    /// This replica restarts to run a recovery plan's cut (#581 section
-    /// 4.5): it takes no replication until it has. Retryable.
-    #[error("raft group {raft_group_id:?} restarts to cut its log for a recovery plan")]
-    RecoveryCutting { raft_group_id: RaftGroupId },
-    /// The sender's entries differ from this replica's at or below the entry
-    /// it knows is committed (#613): taking them would overwrite committed
-    /// entries. Raft never sends that; a recovery plan led from a replica
-    /// that knew less would. The replica takes nothing from the sender.
-    #[error(
-        "raft group {raft_group_id:?}: the sender's entries differ from this replica's at index \
-         {index}, at or below the committed index {committed}"
-    )]
-    CommittedOverwrite {
-        raft_group_id: RaftGroupId,
-        committed: u64,
-        index: u64,
-    },
-    /// OpenRaft committed or applied entry `committed`, above the last entry
-    /// `held` that this replica's log store holds: the store has not yet
-    /// recorded an install OpenRaft admitted (#613). The commit screen cannot
-    /// compare anything until it has, so the replica takes nothing from the
-    /// sender meanwhile. Retryable.
-    #[error(
-        "raft group {raft_group_id:?}: committed index {committed} is above the last entry \
-         {held:?} its log store holds; replication waits until the store catches up"
-    )]
-    LogBehindCommit {
-        raft_group_id: RaftGroupId,
-        committed: u64,
-        held: Option<u64>,
-    },
-    /// A snapshot of history `history`, which replaced history `replaced`,
-    /// while this replica's commit marker lies in history `local` (`None`
-    /// when its log could not be read): nothing shows that the snapshot
-    /// kept this replica's committed entries (#613). The replica takes
-    /// nothing from the sender; it rejoins as a wiped node.
-    #[error(
-        "raft group {raft_group_id:?}: a snapshot of history {history:#x}, which replaced \
-         {replaced:#x}, does not continue this replica's committed history {local:?}"
-    )]
-    UnrelatedHistory {
-        raft_group_id: RaftGroupId,
-        history: u64,
-        replaced: u64,
-        local: Option<u64>,
-    },
-    /// This replica holds a recovery plan and the sender leads at or below
-    /// the plan's term: a leader elected before the plan, whose entries it
-    /// takes no more (#581 section 4.5). Retryable for the sender, which a
-    /// leader under the plan replaces.
-    #[error(
-        "raft group {raft_group_id:?} holds a recovery plan with plan term {plan_term}; it takes \
-         no replication from a leader at or below it"
-    )]
-    RecoveryPlanFenced {
-        raft_group_id: RaftGroupId,
-        plan_term: u64,
-    },
-    /// This replica leads the group, and the group's history is pending: its
-    /// genesis, or the history event of a recovery plan, has not applied
-    /// (#581 sections 4.3 and 4.5). The leader serves and admits nothing but
-    /// the event until it does. Retryable.
-    #[error(
-        "raft group {raft_group_id:?} waits for its history event; its leader serves nothing before it"
-    )]
-    RecoveryPending { raft_group_id: RaftGroupId },
-    #[error("the Raft owner has stopped")]
-    OwnerStopped,
-    #[error("write outcome is unknown; the proposal may have committed")]
-    OutcomeUnknown,
-    /// A read or write of the cold tier failed. `detail` names the object
-    /// and the store's error, for the server's log only.
-    #[error("{detail}")]
-    ColdStore { detail: String },
-    #[error("{message}")]
-    Internal { message: String },
-    #[error("ProtoDecode: protobuf raft payload missing {field}")]
-    ProtoDecode { field: String },
-    #[error(
-        "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
-    )]
-    ColdBackpressure {
-        stream_id: BucketStreamId,
-        before_group_hot_bytes: u64,
-        after_group_hot_bytes: u64,
-        limit: u64,
-    },
-    #[error(
-        "RaftUncommittedBackpressure: group uncommitted bytes {current} plus incoming {incoming} would exceed limit {limit}"
-    )]
-    RaftUncommittedBackpressure {
-        current: u64,
-        incoming: u64,
-        limit: u64,
-    },
-}
-
-impl GroupInfraError {
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal {
-            message: message.into(),
-        }
-    }
-
-    pub fn proto_decode(field: impl Into<String>) -> Self {
-        Self::ProtoDecode {
-            field: field.into(),
-        }
-    }
-
-    pub fn cold_backpressure(
-        stream_id: BucketStreamId,
-        before_group_hot_bytes: u64,
-        after_group_hot_bytes: u64,
-        limit: u64,
-    ) -> Self {
-        Self::ColdBackpressure {
-            stream_id,
-            before_group_hot_bytes,
-            after_group_hot_bytes,
-            limit,
-        }
-    }
-
-    pub fn raft_uncommitted_backpressure(current: u64, incoming: u64, limit: u64) -> Self {
-        Self::RaftUncommittedBackpressure {
-            current,
-            incoming,
-            limit,
-        }
-    }
-
-    pub fn message(&self) -> Cow<'_, str> {
-        match self {
-            Self::Internal { message } => Cow::Borrowed(message),
-            other => Cow::Owned(other.to_string()),
-        }
-    }
-
-    pub fn is_cold_backpressure(&self) -> bool {
-        matches!(self, Self::ColdBackpressure { .. })
-    }
-
-    pub fn is_backpressure(&self) -> bool {
-        matches!(
-            self,
-            Self::ColdBackpressure { .. } | Self::RaftUncommittedBackpressure { .. }
-        )
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
-pub enum GroupEngineError {
-    #[error("{}", .0.message)]
-    Stream(StreamEngineError),
-    #[error("{}", .0.message())]
-    Infra(GroupInfraError),
-    #[error("{message}")]
-    ForwardToLeader {
-        message: String,
-        leader_hint: GroupLeaderHint,
-        /// True only when the node checked leadership locally before it
-        /// proposed anything (RT1). A forward reported by OpenRaft after
-        /// `client_write` (a responder dropped on step-down or log purge) may
-        /// follow a committed entry, so it stays `false`: ambiguous.
-        #[serde(default)]
-        before_proposal: bool,
-    },
-}
-
-impl GroupEngineError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self::Infra(GroupInfraError::internal(message))
-    }
-
-    pub fn cold_backpressure(
-        stream_id: BucketStreamId,
-        before_group_hot_bytes: u64,
-        after_group_hot_bytes: u64,
-        limit: u64,
-    ) -> Self {
-        Self::Infra(GroupInfraError::cold_backpressure(
-            stream_id,
-            before_group_hot_bytes,
-            after_group_hot_bytes,
-            limit,
-        ))
-    }
-
-    pub fn raft_uncommitted_backpressure(current: u64, incoming: u64, limit: u64) -> Self {
-        Self::Infra(GroupInfraError::raft_uncommitted_backpressure(
-            current, incoming, limit,
-        ))
-    }
-
-    pub fn stream(code: StreamErrorCode, message: impl Into<String>) -> Self {
-        Self::stream_with_next_offset(code, message, None)
-    }
-
-    pub fn stream_with_next_offset(
-        code: StreamErrorCode,
-        message: impl Into<String>,
-        next_offset: Option<u64>,
-    ) -> Self {
-        Self::stream_with_context(code, message, next_offset, vec![])
-    }
-
-    pub fn stream_with_context(
-        code: StreamErrorCode,
-        message: impl Into<String>,
-        next_offset: Option<u64>,
-        context: Vec<StreamErrorContext>,
-    ) -> Self {
-        Self::Stream(StreamEngineError {
-            message: format!("{code:?}: {}", message.into()),
-            code,
-            next_offset,
-            context,
-        })
-    }
-
-    pub fn stream_from_replicated(
-        message: impl Into<String>,
-        code: StreamErrorCode,
-        next_offset: Option<u64>,
-        context: Vec<StreamErrorContext>,
-    ) -> Self {
-        Self::Stream(StreamEngineError {
-            message: message.into(),
-            code,
-            next_offset,
-            context,
-        })
-    }
-
-    /// A forward-to-leader error whose command may already have been
-    /// proposed (and even committed): callers must not treat it as a
-    /// definite rejection.
-    pub fn forward_to_leader(
-        message: impl Into<String>,
-        node_id: Option<u64>,
-        address: Option<String>,
-    ) -> Self {
-        Self::ForwardToLeader {
-            message: message.into(),
-            leader_hint: GroupLeaderHint {
-                node_id,
-                address,
-                term: None,
-            },
-            before_proposal: false,
-        }
-    }
-
-    /// A forward-to-leader error raised by a local leadership check before
-    /// anything was proposed: the command definitely did not commit here.
-    pub fn forward_to_leader_before_proposal(
-        message: impl Into<String>,
-        node_id: Option<u64>,
-        address: Option<String>,
-    ) -> Self {
-        Self::ForwardToLeader {
-            message: message.into(),
-            leader_hint: GroupLeaderHint {
-                node_id,
-                address,
-                term: None,
-            },
-            before_proposal: true,
-        }
-    }
-
-    /// Names the term of a forward-to-leader error's leader. Other errors
-    /// are returned unchanged.
-    #[must_use]
-    pub fn with_leader_term(mut self, leader_term: Option<u64>) -> Self {
-        if let Self::ForwardToLeader { leader_hint, .. } = &mut self {
-            leader_hint.term = leader_term;
-        }
-        self
-    }
-
-    /// True when this is a forward-to-leader error raised before proposal.
-    pub fn is_forward_before_proposal(&self) -> bool {
-        matches!(self, Self::ForwardToLeader {
-            before_proposal: true,
-            ..
-        })
-    }
-
-    pub fn message(&self) -> Cow<'_, str> {
-        match self {
-            Self::Stream(err) => Cow::Borrowed(&err.message),
-            Self::Infra(err) => err.message(),
-            Self::ForwardToLeader { message, .. } => Cow::Borrowed(message),
-        }
-    }
-
-    pub fn code(&self) -> Option<StreamErrorCode> {
-        match self {
-            Self::Stream(err) => Some(err.code),
-            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
-        }
-    }
-
-    /// A stream refusal's own text, without the code the message starts
-    /// with: what the state machine said about the request, which names
-    /// nothing but what the request named. `None` for every other error.
-    pub fn refusal_text(&self) -> Option<&str> {
-        match self {
-            Self::Stream(err) => {
-                let prefix = format!("{:?}: ", err.code);
-                Some(err.message.strip_prefix(&prefix).unwrap_or(&err.message))
-            }
-            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
-        }
-    }
-
-    pub fn stream_parts(
-        &self,
-    ) -> Option<(&str, StreamErrorCode, Option<u64>, &[StreamErrorContext])> {
-        match self {
-            Self::Stream(err) => Some((&err.message, err.code, err.next_offset, &err.context)),
-            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
-        }
-    }
-
-    pub fn next_offset(&self) -> Option<u64> {
-        match self {
-            Self::Stream(err) => err.next_offset,
-            Self::Infra(_) | Self::ForwardToLeader { .. } => None,
-        }
-    }
-
-    pub fn context(&self) -> &[StreamErrorContext] {
-        match self {
-            Self::Stream(err) => &err.context,
-            Self::Infra(_) | Self::ForwardToLeader { .. } => &[],
-        }
-    }
-
-    pub fn leader_hint(&self) -> Option<&GroupLeaderHint> {
-        match self {
-            Self::ForwardToLeader { leader_hint, .. } => Some(leader_hint),
-            Self::Stream(_) | Self::Infra(_) => None,
-        }
-    }
-
-    pub fn infra(&self) -> Option<&GroupInfraError> {
-        match self {
-            Self::Infra(err) => Some(err),
-            Self::Stream(_) | Self::ForwardToLeader { .. } => None,
-        }
-    }
-
-    pub fn is_cold_backpressure(&self) -> bool {
-        self.infra()
-            .is_some_and(GroupInfraError::is_cold_backpressure)
-    }
-
-    pub fn is_backpressure(&self) -> bool {
-        self.infra().is_some_and(GroupInfraError::is_backpressure)
-    }
-
-    /// Whether the runtime raised a write's error before the write's command
-    /// was proposed, so that nothing of the write can apply: the engine's own leadership check, the core worker's check of
-    /// the group's unapplied bytes (before any engine sees the command), or
-    /// the engine's cold-tier admission. Every other error, a forward OpenRaft
-    /// reports after `client_write` among them, can follow a proposal or is no
-    /// refusal to retry. It classifies a write's error only: a read's forward
-    /// is raised before any proposal as well (on a follower, or on a leader
-    /// that could not confirm it leads) and is no refusal of a write. The HTTP
-    /// layer deletes a staged external payload only after such a refusal.
-    pub fn is_refused_before_proposal(&self) -> bool {
-        self.is_forward_before_proposal()
-            || matches!(
-                self.infra(),
-                Some(
-                    GroupInfraError::RaftUncommittedBackpressure { .. }
-                        | GroupInfraError::ColdBackpressure { .. }
-                        | GroupInfraError::RecoveryPending { .. }
-                )
-            )
-    }
-
-    /// The group's leader waits for its history event (#581 section 4.5):
-    /// nothing was proposed, and a retry soon succeeds.
-    pub fn is_history_pending(&self) -> bool {
-        matches!(self.infra(), Some(GroupInfraError::RecoveryPending { .. }))
-            || self.code() == Some(StreamErrorCode::HistoryPending)
     }
 }

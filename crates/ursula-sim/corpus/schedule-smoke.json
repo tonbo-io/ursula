@@ -1044,7 +1044,7 @@
               "bucket_id": "benchcmp",
               "stream_id": "ursula-sim-schedule-65-cold-read-fault"
             },
-            "message": "cold store fault injected for read_object_range 'benchcmp/ursula-sim-schedule-65-cold-read-fault/chunks/seed-65-fault-000000.bin': seeded cold read fault"
+            "message": "cold tier payload read of stream benchcmp/ursula-sim-schedule-65-cold-read-fault failed"
           }
         ]
       }
@@ -1313,7 +1313,7 @@
             },
             "requested_len": 4,
             "returned_len": 2,
-            "message": "cold object 'benchcmp/ursula-sim-schedule-68-cold-read-truncate/chunks/seed-68-truncate-000000.bin' returned 2 bytes for requested range [0..4)"
+            "message": "cold tier payload read of stream benchcmp/ursula-sim-schedule-68-cold-read-truncate failed"
           }
         ]
       }

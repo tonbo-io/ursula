@@ -153,25 +153,10 @@ fn producer(id: &str, epoch: u64, seq: u64) -> ProducerRequest {
 }
 
 #[test]
-fn stream_from_replicated_preserves_wire_message() {
-    let err = GroupEngineError::stream_from_replicated(
-        "wire message already includes code",
-        StreamErrorCode::StreamGone,
-        Some(7),
-        vec![StreamErrorContext::StreamClosed],
-    );
-
-    assert_eq!(err.message(), "wire message already includes code");
-    assert_eq!(err.code(), Some(StreamErrorCode::StreamGone));
-    assert_eq!(err.next_offset(), Some(7));
-    assert_eq!(err.context(), &[StreamErrorContext::StreamClosed]);
-}
-
-#[test]
-fn stream_parts_returns_stream_fields_only() {
-    let err = GroupEngineError::stream_from_replicated(
-        "wire stream message",
+fn a_stream_refusal_keeps_its_text_apart_from_its_code() {
+    let err = GroupEngineError::stream_with_context(
         StreamErrorCode::ProducerSeqConflict,
+        "producer conflict",
         Some(11),
         vec![StreamErrorContext::ProducerSeqConflict {
             expected_seq: 10,
@@ -179,23 +164,22 @@ fn stream_parts_returns_stream_fields_only() {
         }],
     );
 
-    let (message, code, next_offset, context) = err
-        .stream_parts()
-        .expect("stream error exposes stream parts");
-    assert_eq!(message, "wire stream message");
-    assert_eq!(code, StreamErrorCode::ProducerSeqConflict);
-    assert_eq!(next_offset, Some(11));
-    assert_eq!(context, &[StreamErrorContext::ProducerSeqConflict {
+    assert_eq!(err.refusal_text(), Some("producer conflict"));
+    assert_eq!(err.to_string(), "ProducerSeqConflict: producer conflict");
+    assert_eq!(err.code(), Some(StreamErrorCode::ProducerSeqConflict));
+    assert_eq!(err.next_offset(), Some(11));
+    assert_eq!(err.context(), &[StreamErrorContext::ProducerSeqConflict {
         expected_seq: 10,
         received_seq: 7,
     }]);
 
-    assert!(GroupEngineError::new("infra").stream_parts().is_none());
-    assert!(
-        GroupEngineError::forward_to_leader("forward", None, None)
-            .stream_parts()
-            .is_none()
-    );
+    let not_leader = GroupEngineError::NotLeader(LeadershipRefusal {
+        leader: None,
+        proposal: Proposal::NotProposed,
+        reason: LeadershipReason::Follower,
+    });
+    assert_eq!(not_leader.refusal_text(), None);
+    assert_eq!(not_leader.code(), None);
 }
 
 #[test]
@@ -244,8 +228,17 @@ fn group_engine_error_variants_separate_stream_infra_and_forwarding() {
         GroupEngineError::Infra(GroupInfraError::Internal { .. })
     ));
 
-    let forward = GroupEngineError::forward_to_leader("forward to leader", Some(2), None);
-    assert!(matches!(forward, GroupEngineError::ForwardToLeader { .. }));
+    let forward = GroupEngineError::NotLeader(LeadershipRefusal {
+        leader: Some(KnownLeader {
+            node_id: 2,
+            term: 3,
+            address: None,
+        }),
+        proposal: Proposal::MayHaveCommitted,
+        reason: LeadershipReason::SteppedDown,
+    });
+    assert!(forward.not_leader().is_some());
+    assert!(!forward.applied_nothing());
 }
 
 #[test]

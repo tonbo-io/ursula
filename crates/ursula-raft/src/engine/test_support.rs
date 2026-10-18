@@ -9,6 +9,7 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
 use super::DurableRaftGroupEngineFactory;
+use crate::RaftGroupHandleRegistry;
 use crate::RaftWal;
 
 /// A runtime of single-node Raft groups whose journals live in a temporary
@@ -31,6 +32,16 @@ pub(crate) fn spawn_journal_runtime(
     config: RuntimeConfig,
     cold_store: Option<Arc<ColdStore>>,
 ) -> JournalRuntime {
+    spawn_journal_runtime_published(config, cold_store, None)
+}
+
+/// [`spawn_journal_runtime`] whose groups publish their resources, their
+/// history among them, to `registry`.
+pub(crate) fn spawn_journal_runtime_published(
+    config: RuntimeConfig,
+    cold_store: Option<Arc<ColdStore>>,
+    registry: Option<RaftGroupHandleRegistry>,
+) -> JournalRuntime {
     let wal_root = tempfile::tempdir().expect("WAL root");
     let log_stores = RaftWal::start(
         wal_root.path(),
@@ -39,12 +50,14 @@ pub(crate) fn spawn_journal_runtime(
             .expect("valid topology"),
     )
     .expect("start the WAL");
-    let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
-        config,
-        DurableRaftGroupEngineFactory::with_cold_store(log_stores, cold_store.clone()),
-        cold_store,
-    )
-    .expect("spawn raft runtime");
+    let mut factory =
+        DurableRaftGroupEngineFactory::with_cold_store(log_stores, cold_store.clone());
+    if let Some(registry) = registry {
+        factory = factory.with_registry(registry);
+    }
+    let runtime =
+        ShardRuntime::spawn_with_engine_factory_and_cold_store(config, factory, cold_store)
+            .expect("spawn raft runtime");
     JournalRuntime {
         runtime,
         _wal_root: wal_root,

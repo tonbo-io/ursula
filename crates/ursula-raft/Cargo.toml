@@ -55,6 +55,9 @@ rand = { workspace = true, features = ["std", "std_rng", "thread_rng"] }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
+# `group_engine_error_samples`, for the wire fixture and classification
+# tables of `GroupEngineError`.
+ursula-runtime = { workspace = true, features = ["test-support"] }
 anyhow = { workspace = true }
 axum = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }

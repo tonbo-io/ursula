@@ -227,7 +227,7 @@ impl StreamStateMachine {
                 return Err(StreamSnapshotError::PayloadLengthMismatch {
                     stream_id,
                     tail_offset: entry.metadata.tail_offset,
-                    payload_len: entry.payload.len(),
+                    payload_len: u64::try_from(entry.payload.len()).unwrap_or(u64::MAX),
                 });
             }
             if machine.registry.contains_key(&stream_id) {

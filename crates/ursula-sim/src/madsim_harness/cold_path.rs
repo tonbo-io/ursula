@@ -2,7 +2,10 @@
 
 use ursula_runtime::AppendResponse;
 use ursula_runtime::ColdFlushCandidate;
+use ursula_runtime::ColdOperation;
 use ursula_runtime::FlushColdResponse;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
 
 use super::AppendRequest;
 use super::Arc;
@@ -807,13 +810,29 @@ pub(super) async fn run_cold_read_truncate_inner(
         )
         .await;
     if let Some(returned_len) = truncate_returned_len {
-        let message = first_read
-            .expect_err("injected cold read truncation should fail the first cold read")
-            .to_string();
+        let error =
+            first_read.expect_err("injected cold read truncation should fail the first cold read");
         assert!(
-            message.contains(&format!("returned {returned_len} bytes")),
-            "cold read truncation should surface the short-body length: {message}"
+            matches!(
+                &error,
+                GroupEngineError::Infra(GroupInfraError::ColdStore {
+                    operation: ColdOperation::ReadPayload { stream_id },
+                }) if *stream_id == config.stream
+            ),
+            "cold read truncation should fail the stream's payload read: {error:?}"
         );
+        assert!(
+            SimTrace::last_recorded()
+                .events
+                .iter()
+                .any(|event| matches!(
+                    event,
+                    SimEvent::ColdStoreTruncateInjected { returned_len: len, .. }
+                        if *len == returned_len
+                )),
+            "the cold store should record the short body of {returned_len} bytes"
+        );
+        let message = error.to_string();
         setup.trace.push(SimEvent::ColdReadTruncateObserved {
             node_id: faulted_node_id,
             stream: config.stream.clone(),

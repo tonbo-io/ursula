@@ -5,9 +5,11 @@
 //! [`GroupEngineError`], the forwarded read responses) and openraft's own
 //! serde-capable RPC/log types travel as self-describing MessagePack produced
 //! directly by their serde derives — there are no hand-written per-field proto
-//! mirrors. MessagePack (with named struct fields) is used instead of a
-//! positional format because the wire types rely on `serde(default)` and
-//! `skip_serializing_if`, which require a self-describing wire.
+//! mirrors. MessagePack with named struct fields is self-describing, so a
+//! decoder names the field or variant it cannot read. Within a minor the wire
+//! form of `GroupEngineError` and of every type it carries is frozen, with
+//! every field required: the `group-engine-errors-epoch<N>.json` fixture
+//! shows any change.
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -217,5 +219,127 @@ mod tests {
                 imported: Some([0xcd; 32]),
             })
         ));
+    }
+
+    /// Within a minor, the wire form of `GroupEngineError` and of every type
+    /// it carries is frozen: a follower decodes the error a leader of
+    /// another patch release answers a forwarded `GroupRead` or `GroupWrite`
+    /// with. One sample of every variant (`group_engine_error_samples`,
+    /// built behind exhaustive matches) encodes to the fixture's bytes, and
+    /// decoding and re-encoding them reproduces each byte for byte. A change
+    /// to the fixture is a change to the protocol.
+    #[test]
+    fn group_engine_errors_epoch5_wire_form_is_stable() {
+        let actual: std::collections::BTreeMap<String, Vec<u8>> =
+            ursula_runtime::group_engine_error_samples()
+                .iter()
+                .map(|error| (format!("{error:?}"), encode_wire(error).to_vec()))
+                .collect();
+        for (name, bytes) in &actual {
+            let decoded: ursula_runtime::GroupEngineError =
+                decode_wire(bytes, name).expect("a sample decodes");
+            assert_eq!(&encode_wire(&decoded)[..], bytes.as_slice(), "{name}");
+            assert_eq!(&format!("{decoded:?}"), name);
+        }
+        let fixture: std::collections::BTreeMap<String, Vec<u8>> =
+            serde_json::from_str(include_str!("fixtures/group-engine-errors-epoch5.json"))
+                .expect("the fixture parses");
+        assert!(
+            fixture == actual,
+            "the wire form of GroupEngineError differs from the fixture; the samples encode \
+             as:\n{}",
+            one_sample_per_line(&actual)
+        );
+    }
+
+    /// The fixture's form: a JSON object with one sample per line.
+    fn one_sample_per_line(samples: &std::collections::BTreeMap<String, Vec<u8>>) -> String {
+        let lines: Vec<String> = samples
+            .iter()
+            .map(|(name, bytes)| {
+                format!(
+                    "{}: {}",
+                    serde_json::to_string(name).expect("a name renders"),
+                    serde_json::to_string(bytes).expect("bytes render")
+                )
+            })
+            .collect();
+        format!("{{\n{}\n}}\n", lines.join(",\n"))
+    }
+
+    /// An error decodes from its own bytes and re-encodes to them, whatever
+    /// its free fields hold.
+    mod group_engine_error_round_trip {
+        use proptest::prelude::*;
+        use ursula_runtime::GroupEngineError;
+        use ursula_runtime::GroupInfraError;
+        use ursula_shard::BucketStreamId;
+
+        use super::decode_wire;
+        use super::encode_wire;
+
+        /// `error` with its free fields replaced by `text`, `number` and
+        /// `maybe`.
+        fn vary(
+            error: GroupEngineError,
+            text: String,
+            number: u64,
+            maybe: Option<u64>,
+        ) -> GroupEngineError {
+            match error {
+                GroupEngineError::Stream(mut refusal) => {
+                    refusal.text = text;
+                    refusal.next_offset = maybe;
+                    GroupEngineError::Stream(refusal)
+                }
+                GroupEngineError::NotLeader(mut refusal) => {
+                    if let Some(leader) = refusal.leader.as_mut() {
+                        leader.node_id = number;
+                        leader.term = maybe.unwrap_or(number);
+                        leader.address = Some(text);
+                    }
+                    GroupEngineError::NotLeader(refusal)
+                }
+                GroupEngineError::Infra(GroupInfraError::ColdBackpressure { .. }) => {
+                    GroupEngineError::Infra(GroupInfraError::ColdBackpressure {
+                        stream_id: BucketStreamId::new(text.clone(), text),
+                        before_group_hot_bytes: number,
+                        after_group_hot_bytes: maybe.unwrap_or(number),
+                        limit: number,
+                    })
+                }
+                GroupEngineError::Infra(GroupInfraError::LogBehindCommit {
+                    raft_group_id, ..
+                }) => GroupEngineError::Infra(GroupInfraError::LogBehindCommit {
+                    raft_group_id,
+                    committed: number,
+                    held: maybe,
+                }),
+                GroupEngineError::Infra(GroupInfraError::Internal { .. }) => {
+                    GroupEngineError::Infra(GroupInfraError::Internal { message: text })
+                }
+                other => other,
+            }
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn an_error_round_trips_byte_for_byte(
+                index in any::<prop::sample::Index>(),
+                text in ".{0,24}",
+                number in any::<u64>(),
+                maybe in any::<Option<u64>>(),
+            ) {
+                let samples = ursula_runtime::group_engine_error_samples();
+                let error = vary(index.get(&samples).clone(), text, number, maybe);
+                let bytes = encode_wire(&error);
+                let decoded: GroupEngineError =
+                    decode_wire(&bytes, "group engine error").expect("decodes");
+                prop_assert_eq!(&decoded, &error);
+                prop_assert_eq!(encode_wire(&decoded), bytes);
+            }
+        }
     }
 }

@@ -89,7 +89,7 @@ pub struct StreamSnapshotEntry {
     pub inherited: Option<InheritedHistory>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum StreamSnapshotError {
     #[error("snapshot contains duplicate bucket '{0}'")]
     DuplicateBucket(String),
@@ -112,7 +112,7 @@ pub enum StreamSnapshotError {
     PayloadLengthMismatch {
         stream_id: BucketStreamId,
         tail_offset: u64,
-        payload_len: usize,
+        payload_len: u64,
     },
     #[error(
         "snapshot stream '{stream_id}' visible snapshot offset {snapshot_offset} is beyond tail offset {tail_offset}"

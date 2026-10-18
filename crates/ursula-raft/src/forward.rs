@@ -12,11 +12,18 @@ use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use ursula_runtime::FollowerRead;
+use ursula_runtime::ForwardFailure;
+use ursula_runtime::ForwardedRpc;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
+use ursula_runtime::KnownLeader;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::LeadershipRefusal;
+use ursula_runtime::Proposal;
 use ursula_runtime::PurgeBucketResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
@@ -229,30 +236,6 @@ pub(crate) async fn forward_purge_bucket_to_leader(
 /// the client gets this node's retryable answer.
 const FORWARD_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The leader RPCs a follower forwards.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForwardedRpc {
-    /// A read or HEAD the leader serves.
-    GroupRead,
-    /// A bucket purge the leader proposes.
-    GroupWrite,
-}
-
-impl ForwardedRpc {
-    fn route(self) -> &'static str {
-        match self {
-            Self::GroupRead => "GroupRead",
-            Self::GroupWrite => "GroupWrite",
-        }
-    }
-}
-
-impl std::fmt::Display for ForwardedRpc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.route())
-    }
-}
-
 /// Why a forwarded leader RPC got no answer from the leader's group.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ForwardError {
@@ -268,8 +251,9 @@ pub(crate) enum ForwardError {
         address: String,
         cluster_id: ursula_headers::ClusterId,
     },
-    #[error("invalid gRPC leader endpoint {address}")]
+    #[error("{rpc} cannot be forwarded: invalid gRPC leader endpoint {address}")]
     InvalidEndpoint {
+        rpc: ForwardedRpc,
         address: String,
         #[source]
         source: tonic::transport::Error,
@@ -321,40 +305,45 @@ impl ForwardError {
     /// The engine-level answer, decided here only. A leader this node
     /// cannot reach is, to the client, a leader it does not know:
     /// leader-unknown (HTTP 503 with `Retry-After`), retried once the
-    /// election or the connection settles. Its message names no internal
-    /// address; the full error is logged where it happens.
+    /// election or the connection settles. The native error is logged here
+    /// and stays out of the answer, which names no internal address.
     fn into_engine_error(self) -> GroupEngineError {
-        if let Self::OtherCluster { .. } = &self {
+        let (rpc, failure) = match &self {
             // Nothing ran on the refusing node. To the client it is a leader
             // this node cannot use, so it answers 503 with Retry-After while
             // the group elects a leader of this cluster.
-            return GroupEngineError::forward_to_leader_before_proposal(
-                "the raft group leader is in another cluster; retry",
-                None,
-                None,
-            );
-        }
-        if self.leader_unreachable() {
+            Self::OtherCluster { .. } => {
+                return unknown_leader(
+                    LeadershipReason::LeaderInOtherCluster,
+                    Proposal::NotProposed,
+                );
+            }
             // A purge whose request reached the leader's socket may have
             // committed there.
-            let proposal_may_have_started = matches!(
-                &self,
-                Self::Transport {
-                    rpc: ForwardedRpc::GroupWrite,
-                    ..
-                } | Self::TimedOut {
-                    rpc: ForwardedRpc::GroupWrite,
-                    ..
-                }
-            );
-            let message = "the raft group leader is unreachable; retry";
-            return if proposal_may_have_started {
-                GroupEngineError::forward_to_leader(message, None, None)
-            } else {
-                GroupEngineError::forward_to_leader_before_proposal(message, None, None)
-            };
-        }
-        GroupEngineError::new(ErrorChain(&self).to_string())
+            Self::Transport {
+                rpc: ForwardedRpc::GroupWrite,
+                ..
+            }
+            | Self::TimedOut {
+                rpc: ForwardedRpc::GroupWrite,
+                ..
+            } => {
+                return unknown_leader(
+                    LeadershipReason::LeaderUnreachable,
+                    Proposal::MayHaveCommitted,
+                );
+            }
+            Self::Connect { .. } | Self::Transport { .. } | Self::TimedOut { .. } => {
+                return unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
+            }
+            Self::NoIdentity { rpc } => (*rpc, ForwardFailure::NoIdentity),
+            Self::InvalidEndpoint { rpc, .. } => (*rpc, ForwardFailure::InvalidEndpoint),
+            Self::Refused { rpc, source, .. } => (*rpc, ForwardFailure::Refused {
+                grpc_code: i32::from(source.code()),
+            }),
+        };
+        tracing::warn!(error = %ErrorChain(&self), "forwarded leader RPC failed");
+        GroupEngineError::Infra(GroupInfraError::ForwardFailed { rpc, failure })
     }
 }
 
@@ -400,7 +389,7 @@ where
         timeout: FORWARD_RPC_TIMEOUT,
     };
     let connected =
-        crate::rt::time::timeout(FORWARD_RPC_TIMEOUT, LEADER_CHANNELS.connect(address)).await;
+        crate::rt::time::timeout(FORWARD_RPC_TIMEOUT, LEADER_CHANNELS.connect(address, rpc)).await;
     let mut dropped_channel = false;
     let error = match connected {
         Err(_elapsed) => timed_out(),
@@ -526,13 +515,19 @@ impl LeaderChannels {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The cached channel to `address`, or a new connection to it.
-    async fn connect(&self, address: &str) -> Result<LeaderChannel, ForwardError> {
+    /// The cached channel to `address`, or a new connection to it for
+    /// `rpc`.
+    async fn connect(
+        &self,
+        address: &str,
+        rpc: ForwardedRpc,
+    ) -> Result<LeaderChannel, ForwardError> {
         if let Some(cached) = self.lock().by_address.get(address) {
             return Ok(cached.clone());
         }
         let channel = peer_endpoint(address)
             .map_err(|source| ForwardError::InvalidEndpoint {
+                rpc,
                 address: address.to_owned(),
                 source,
             })?
@@ -637,13 +632,16 @@ pub(crate) async fn write_commands_on_raft(
     })?;
     let responses = stream.map_ok(|result| match result {
         Ok(response) => write_result_from_raft_response(response.response).unwrap_or_else(Err),
-        Err(err) => Err(group_engine_forward_to_leader_error(
-            format!("OpenRaft client_write_many forwarded to leader: {err}"),
-            err.leader_id,
-            err.leader_node.as_ref(),
-            &GroupLeadership::of(&raft.metrics().borrow_watched()),
-            false,
-        )),
+        Err(err) => {
+            tracing::debug!(error = %err, "OpenRaft client_write_many forwarded to leader");
+            Err(leadership_refusal(
+                LeadershipReason::SteppedDown,
+                Proposal::MayHaveCommitted,
+                err.leader_id,
+                err.leader_node.as_ref(),
+                &GroupLeadership::of(&raft.metrics().borrow_watched()),
+            ))
+        }
     });
     Ok(collect_batch_responses(responses, expected_responses).await)
 }
@@ -674,12 +672,12 @@ pub(crate) fn refuse_unless_leader(
             .get_node(&leader)
             .cloned()
     });
-    Err(group_engine_forward_to_leader_error(
-        "OpenRaft group write has to run on the local leader runtime",
+    Err(leadership_refusal(
+        LeadershipReason::Follower,
+        Proposal::NotProposed,
         leader_id,
         leader_node.as_ref(),
         &leadership,
-        true,
     ))
 }
 
@@ -727,12 +725,13 @@ pub(crate) fn group_engine_client_write_error(
     leadership: &GroupLeadership,
 ) -> GroupEngineError {
     if let Some(forward) = err.forward_to_leader() {
-        return group_engine_forward_to_leader_error(
-            format!("OpenRaft client_write forwarded to leader: {err}"),
+        tracing::debug!(error = %err, "OpenRaft client_write forwarded to leader");
+        return leadership_refusal(
+            LeadershipReason::SteppedDown,
+            Proposal::MayHaveCommitted,
             forward.leader_id,
             forward.leader_node.as_ref(),
             leadership,
-            false,
         );
     }
     tracing::warn!(error = %err, "Raft write response lost after submission");
@@ -746,7 +745,7 @@ pub(crate) fn group_engine_client_write_error(
 /// acknowledged writes. A fatal error stays internal.
 ///
 /// openraft's error text names internal node addresses (the quorum error
-/// lists every member), so the client sees a fixed message and the full
+/// lists every member), so the answer names only the reason and the full
 /// error is logged at debug level only.
 pub(crate) fn group_engine_linearizable_read_error(
     err: openraft::error::RaftError<
@@ -759,18 +758,16 @@ pub(crate) fn group_engine_linearizable_read_error(
     tracing::debug!("OpenRaft {operation} could not confirm leadership: {err}");
     match err.api_error() {
         Some(openraft::error::LinearizableReadError::ForwardToLeader(forward)) => {
-            group_engine_forward_to_leader_error(
-                format!("OpenRaft {operation} has to forward request to leader"),
+            leadership_refusal(
+                LeadershipReason::Follower,
+                Proposal::NotProposed,
                 forward.leader_id,
                 forward.leader_node.as_ref(),
                 leadership,
-                true,
             )
         }
         Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
-            group_engine_leader_read_unavailable(format!(
-                "OpenRaft {operation} could not confirm leadership with a quorum"
-            ))
+            unknown_leader(LeadershipReason::QuorumUnconfirmed, Proposal::NotProposed)
         }
         None => GroupEngineError::new(format!(
             "OpenRaft {operation} could not confirm leadership: {err}"
@@ -778,44 +775,50 @@ pub(crate) fn group_engine_linearizable_read_error(
     }
 }
 
-/// The leader-unknown answer (503 with Retry-After) for a leader read that
-/// could not be linearized in time: no quorum confirmed leadership, or the
-/// local state machine did not reach the read index. `message` (the 503
-/// body) names which, without internal addresses.
-pub(crate) fn group_engine_leader_read_unavailable(message: String) -> GroupEngineError {
-    GroupEngineError::forward_to_leader_before_proposal(message, None, None)
+/// A leadership refusal that names no leader: the answer is leader-unknown
+/// (HTTP 503 with `Retry-After`), for a read whose leader could not be
+/// linearized in time (no quorum confirmed it, or the local state machine
+/// did not reach the read index) and for a leader this node cannot use.
+pub(crate) fn unknown_leader(reason: LeadershipReason, proposal: Proposal) -> GroupEngineError {
+    GroupEngineError::NotLeader(LeadershipRefusal {
+        leader: None,
+        proposal,
+        reason,
+    })
 }
 
-/// `before_proposal` is true only for a local leadership check that runs
+/// A leadership refusal naming the leader `leader_id` that this replica's
+/// view `leadership` knows with its term. `proposal` is
+/// [`Proposal::NotProposed`] only for a local leadership check that runs
 /// before anything is proposed (RT1); a forward OpenRaft reports after
-/// `client_write` is ambiguous, because the entry may already have committed.
-pub(crate) fn group_engine_forward_to_leader_error(
-    message: impl Into<String>,
+/// `client_write` may follow a committed entry.
+pub(crate) fn leadership_refusal(
+    reason: LeadershipReason,
+    proposal: Proposal,
     leader_id: Option<u64>,
     leader_node: Option<&BasicNode>,
     leadership: &GroupLeadership,
-    before_proposal: bool,
 ) -> GroupEngineError {
-    let build = if before_proposal {
-        GroupEngineError::forward_to_leader_before_proposal
-    } else {
-        GroupEngineError::forward_to_leader
-    };
-    // The write bounced because this node is not the leader. If the reported
-    // leader is *this* node, leadership is in a transient step-down/election
-    // window: redirecting the client back to ourselves would just loop, so
-    // report leader-unknown and let the HTTP layer answer with a retryable 503.
-    if leader_id == Some(leadership.node_id) {
-        return build(message, None, None);
-    }
-    // The hint names the leader's term only when this replica's view names
-    // the same leader: a redirect carries the leader and its term together.
-    build(
-        message,
-        leader_id,
-        leader_node.map(|node| node.addr.clone()),
-    )
-    .with_leader_term(leader_id.and_then(|leader| leadership.term_of(leader)))
+    // If the reported leader is *this* node, leadership is in a transient
+    // step-down/election window: redirecting the client back to ourselves
+    // would just loop, so report leader-unknown and let the HTTP layer
+    // answer with a retryable 503. The refusal names a leader only with the
+    // term this replica's view knows it in: a redirect carries the leader
+    // and its term together.
+    let leader = leader_id
+        .filter(|&leader| leader != leadership.node_id)
+        .and_then(|node_id| {
+            Some(KnownLeader {
+                node_id,
+                term: leadership.term_of(node_id)?,
+                address: leader_node.map(|node| node.addr.clone()),
+            })
+        });
+    GroupEngineError::NotLeader(LeadershipRefusal {
+        leader,
+        proposal,
+        reason,
+    })
 }
 #[cfg(test)]
 mod batch_response_tests {
@@ -846,5 +849,87 @@ mod batch_response_tests {
                 ))
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod leadership_refusal_tests {
+    use openraft::BasicNode;
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::KnownLeader;
+    use ursula_runtime::LeadershipReason;
+    use ursula_runtime::LeadershipRefusal;
+    use ursula_runtime::Proposal;
+
+    use super::leadership_refusal;
+    use crate::GroupLeadership;
+    use crate::leadership::LeaderRole;
+
+    /// Node 2's view in term 7, following `leader`.
+    fn following(leader: u64) -> GroupLeadership {
+        GroupLeadership {
+            node_id: 2,
+            term: 7,
+            role: LeaderRole::Follows {
+                leader_id: leader,
+                leader_address: None,
+            },
+        }
+    }
+
+    fn leader_of(error: GroupEngineError) -> Option<KnownLeader> {
+        match error {
+            GroupEngineError::NotLeader(LeadershipRefusal {
+                leader,
+                proposal: Proposal::NotProposed,
+                reason: LeadershipReason::Follower,
+            }) => leader,
+            other => panic!("expected a leadership refusal, got {other:?}"),
+        }
+    }
+
+    fn refusal(leader_id: Option<u64>, leadership: &GroupLeadership) -> Option<KnownLeader> {
+        leader_of(leadership_refusal(
+            LeadershipReason::Follower,
+            Proposal::NotProposed,
+            leader_id,
+            Some(&BasicNode::new("http://node-3:4438")),
+            leadership,
+        ))
+    }
+
+    /// A refusal naming the refusing node would redirect the client back to
+    /// it: it names no leader.
+    #[test]
+    fn the_refusing_node_naming_itself_names_no_leader() {
+        assert_eq!(refusal(Some(2), &following(2)), None);
+    }
+
+    /// A leader whose term this view does not know is not named: a redirect
+    /// carries the leader and its term together.
+    #[test]
+    fn a_leader_of_an_unknown_term_is_not_named() {
+        assert_eq!(refusal(Some(3), &following(4)), None);
+        assert_eq!(
+            refusal(Some(3), &GroupLeadership {
+                node_id: 2,
+                term: 7,
+                role: LeaderRole::Unknown,
+            }),
+            None
+        );
+        assert_eq!(refusal(None, &following(3)), None);
+    }
+
+    #[test]
+    fn a_leader_of_a_known_term_is_named_with_it() {
+        assert_eq!(
+            refusal(Some(3), &following(3)),
+            Some(KnownLeader {
+                node_id: 3,
+                term: 7,
+                address: Some("http://node-3:4438".to_owned()),
+            })
+        );
     }
 }

@@ -974,12 +974,12 @@ impl ClientWriteLeaderRouter {
     }
 
     /// The redirect for `err`, typed through `ursula-headers`: to the
-    /// leader its hint names, in the term the hint names
+    /// leader its leadership refusal names, in the term it leads in
     /// ([`RoutingAnswer::NotLeader`]), or, from a node that hosts no replica
     /// of the group, to one that does ([`RoutingAnswer::NotHosted`]). `None`
-    /// for a hint without a leader, its term or an address, and for a hint
-    /// naming this node: the caller answers a retryable `503` instead, so no
-    /// redirect lacks the group, or the leader and its term.
+    /// for a refusal that names no leader, or one with no address: the
+    /// caller answers a retryable `503` instead, so no redirect lacks the
+    /// group, or the leader and its term.
     fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
         let (base, answer) = match err {
             RuntimeError::GroupNotHosted { raft_group_id, .. } => (
@@ -993,15 +993,13 @@ impl ClientWriteLeaderRouter {
                 error,
                 ..
             } => {
-                let hint = error.leader_hint()?;
-                let leader_id = hint.node_id?;
-                let term = hint.term?;
+                let leader = error.not_leader()?.leader.as_ref()?;
                 (
-                    self.peer_base(leader_id, hint.address.as_deref())?,
+                    self.peer_base(leader.node_id, leader.address.as_deref())?,
                     RoutingAnswer::NotLeader {
-                        leader: ursula_headers::NodeId::from_u64(leader_id),
+                        leader: ursula_headers::NodeId::from_u64(leader.node_id),
                         group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
-                        term: ursula_headers::RaftTerm::from_u64(term),
+                        term: ursula_headers::RaftTerm::from_u64(leader.term),
                     },
                 )
             }
@@ -1849,18 +1847,20 @@ pub(crate) async fn stage_external_payload(
 
 /// Bounded-state F5 cleanup rule (ungated): a staged external object may be
 /// deleted only when its append or create definitely did not commit. That is
-/// a typed stream error (apply, or a pre-proposal check, rejected it on every
-/// replica alike), a request the runtime refused before dispatch, or a refusal
-/// before proposal ([`refused_before_proposal`]: a redirect raised by the
-/// local leadership check, a backpressure rejection, a group this node does
-/// not host). Every other failure (a lost response, a forward-to-leader reported
-/// by OpenRaft after `client_write` (RT1), a transport or storage error, an
-/// untyped engine error) may follow a committed proposal that references the
-/// object, so the object is kept. An orphan sweep or stream GC reclaims it if
-/// nothing does.
+/// a write the group engine applied nothing of
+/// ([`GroupEngineError::applied_nothing`]: a typed stream error, which apply,
+/// or a pre-proposal check, rejected on every replica alike, or a refusal
+/// before proposal), a request the runtime refused before dispatch, or a
+/// group this node does not host ([`refused_before_proposal`]). Every other
+/// failure (a lost response, a leadership refusal reported by OpenRaft after
+/// `client_write` (RT1), a transport or storage error, an untyped engine
+/// error) may follow a committed proposal that references the object, so the
+/// object is kept. An orphan sweep or stream GC reclaims it if nothing does.
+///
+/// [`GroupEngineError::applied_nothing`]: ursula_runtime::GroupEngineError::applied_nothing
 pub(crate) fn staged_external_definitely_unreferenced(err: &RuntimeError) -> bool {
     match err {
-        RuntimeError::GroupEngine { error, .. } if error.code().is_some() => true,
+        RuntimeError::GroupEngine { error, .. } => error.applied_nothing(),
         RuntimeError::InvalidRaftGroup { .. } => true,
         other => refused_before_proposal(other),
     }
@@ -5420,18 +5420,18 @@ fn is_leadership_refusal(err: &RuntimeError) -> bool {
 /// Whether the runtime refused `err`'s write before it proposed the write's
 /// command, so the command never reached the Raft log: a group this node does
 /// not host, or what the engine refused before proposing
-/// ([`GroupEngineError::is_refused_before_proposal`]). Every other failure can
+/// ([`GroupEngineError::refused_before_proposal`]). Every other failure can
 /// follow a proposal (a forward or a lost response after `client_write`, a
 /// group that stopped applying, a storage error) or is no refusal to retry.
 /// The F5 staged-payload cleanup asks, and the answer to a leadership
 /// refusal says it: a redirect or `NO_LEADER` only when this holds
 /// ([`leader_unknown_retry_response`]).
 ///
-/// [`GroupEngineError::is_refused_before_proposal`]: ursula_runtime::GroupEngineError::is_refused_before_proposal
+/// [`GroupEngineError::refused_before_proposal`]: ursula_runtime::GroupEngineError::refused_before_proposal
 fn refused_before_proposal(err: &RuntimeError) -> bool {
     match err {
         RuntimeError::GroupNotHosted { .. } => true,
-        RuntimeError::GroupEngine { error, .. } => error.is_refused_before_proposal(),
+        RuntimeError::GroupEngine { error, .. } => error.refused_before_proposal(),
         RuntimeError::InvalidConfig(_)
         | RuntimeError::InvalidRaftGroup { .. }
         | RuntimeError::SnapshotPlacementMismatch { .. }
@@ -5446,11 +5446,10 @@ fn refused_before_proposal(err: &RuntimeError) -> bool {
     }
 }
 
-/// True when `err` is a group-engine error asking the caller to forward to the
-/// leader (carries a leader hint), regardless of whether the leader is yet
-/// known.
+/// True when `err` is a group engine's leadership refusal, whether or not it
+/// names the leader.
 fn is_forward_to_leader(err: &RuntimeError) -> bool {
-    err.leader_hint().is_some()
+    err.not_leader().is_some()
 }
 
 /// The `503` with `Retry-After: 1` of a leadership refusal that does not

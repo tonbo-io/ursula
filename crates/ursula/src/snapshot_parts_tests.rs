@@ -51,7 +51,10 @@ use ursula_runtime::GroupTouchStreamAccessFuture;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngine;
 use ursula_runtime::InMemoryGroupEngineFactory;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
+use ursula_runtime::Proposal;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RouteWriteRequest;
@@ -694,11 +697,11 @@ impl GroupEngine for FlakyPublishEngine {
             .is_ok();
         if refused {
             return Box::pin(async {
-                Err(GroupEngineError::forward_to_leader_before_proposal(
-                    "injected: leadership moved during the copy",
-                    None,
-                    None,
-                ))
+                Err(GroupEngineError::NotLeader(LeadershipRefusal {
+                    leader: None,
+                    proposal: Proposal::NotProposed,
+                    reason: LeadershipReason::Follower,
+                }))
             });
         }
         self.inner.publish_snapshot(request, placement)

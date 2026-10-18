@@ -113,7 +113,6 @@ pub struct CreateStreamResponse {
     /// The token of the stream incarnation the write applied to, rendered
     /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
     /// unknown and renders no header.
-    #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
@@ -293,7 +292,6 @@ pub struct ReadStreamResponse {
     pub closed: bool,
     /// The token of the stream that served the read (D12). A token is
     /// never `0`; `0` means unknown and renders no header.
-    #[serde(default)]
     pub incarnation: u64,
 }
 
@@ -481,7 +479,6 @@ pub struct PublishSnapshotResponse {
     /// The token of the stream incarnation the write applied to, rendered
     /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
     /// unknown and renders no header.
-    #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
@@ -508,7 +505,6 @@ pub struct AdvanceRetentionResponse {
     /// The token of the stream incarnation the write applied to, rendered
     /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
     /// unknown and renders no header.
-    #[serde(default)]
     pub incarnation: u64,
     /// Hot backlog after the write applied (bounded-stream-state F6a), so
     /// the runtime records its metric without a second state-machine round
@@ -676,7 +672,6 @@ pub struct CloseStreamResponse {
     /// The token of the stream incarnation the write applied to, rendered
     /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
     /// unknown and renders no header.
-    #[serde(default)]
     pub incarnation: u64,
 }
 
@@ -996,7 +991,6 @@ pub struct AppendResponse {
     /// The token of the stream incarnation the write applied to, rendered
     /// as `Stream-Incarnation` (D12). A token is never `0`; `0` means
     /// unknown and renders no header.
-    #[serde(default)]
     pub incarnation: u64,
 }
 

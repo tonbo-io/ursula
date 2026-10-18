@@ -12,7 +12,8 @@ use openraft::type_config::alias::WatchReceiverOf;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
-use ursula_runtime::GroupLeaderHint;
+use ursula_runtime::LeadershipRefusal;
+use ursula_runtime::Proposal;
 
 use super::*;
 use crate::grpc::GrpcRaftNetworkFactory;
@@ -466,11 +467,11 @@ fn probe_attempt_error(error: RecoveryProbeError) -> AttemptError {
 fn read_attempt_error(error: GroupEngineError) -> AttemptError {
     let text = format!("{error:?}");
     match error {
-        GroupEngineError::ForwardToLeader {
-            leader_hint: GroupLeaderHint { node_id: None, .. },
-            before_proposal: true,
+        GroupEngineError::NotLeader(LeadershipRefusal {
+            leader: None,
+            proposal: Proposal::NotProposed,
             ..
-        } => AttemptError::Transient(text),
+        }) => AttemptError::Transient(text),
         _ => AttemptError::Fatal(text),
     }
 }
@@ -1198,7 +1199,7 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
         )
         .await
         .expect_err("boundary requires a current leader proof");
-    assert!(unconfirmed.leader_hint().is_some(), "{unconfirmed:?}");
+    assert!(unconfirmed.not_leader().is_some(), "{unconfirmed:?}");
     assert_ne!(unconfirmed.code(), Some(StreamErrorCode::OffsetOutOfRange));
     services[2].pause_replication.store(false, Ordering::SeqCst);
     services[0].pause_replication.store(false, Ordering::SeqCst);
@@ -1494,7 +1495,7 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
             .read_stream(request, placement())
             .await
             .expect_err("waits for a quorum");
-        assert!(refused.leader_hint().is_some(), "{name}: {refused:?}");
+        assert!(refused.not_leader().is_some(), "{name}: {refused:?}");
         assert!(
             !may_hold_only_for_a_lagging_state(&refused),
             "{name}: {refused:?}"

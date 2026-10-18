@@ -175,7 +175,8 @@ Follow the typed-error style of the early crates: `ursula-runtime`'s `RuntimeErr
 - Library code returns a `thiserror` enum defined at the module or crate boundary. Variants carry structured fields (identifiers as newtypes such as `RaftGroupId`), not pre-formatted strings.
 - Do not return `Result<_, String>`, `Box<dyn Error>` or `anyhow::Result` from library APIs. `anyhow` is for binary `main`/CLI glue and tests. Do not wrap failures that are not I/O in `io::Error::other`.
 - Keep the source error with `#[from]` or `#[source]` instead of `to_string()`. Discard it only when it carries no information (an integer conversion overflow, a poisoned lock, a closed channel), and then name the binding (`|_overflow|`, `|_poisoned|`, `|_closed|`) so the discard is deliberate. Never write `map_err(|_| ...)`.
-- Make every distinction a caller acts on a variant: retryable or permanent, not leader or protocol mismatch, outcome unknown or failed. Expose classification through methods such as `RuntimeError::leader_hint()`, never by matching message text.
+- Make every distinction a caller acts on a variant: retryable or permanent, not leader or protocol mismatch, outcome unknown or failed. Expose classification through methods such as `GroupEngineError::write_effect()`, never by matching message text.
+- Within a minor, the wire form of `GroupEngineError` and every type it carries is frozen. The `group-engine-errors-epoch<N>.json` fixture in `crates/ursula-raft/src/fixtures` shows any change.
 - Convert to transport errors in one place per transport (`impl From<GrpcRpcError> for tonic::Status`, `impl IntoResponse`) and choose the precise status code.
 - Tests assert the variant, for example `assert!(matches!(err, Error::StaleFence { .. }))`, not `is_err()` or a message substring.
 

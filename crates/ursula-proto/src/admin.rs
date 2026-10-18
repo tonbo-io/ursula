@@ -59,8 +59,11 @@ pub struct ApplyFailure {
 pub enum ApplyFailureKind {
     Panic,
     InvariantViolation,
-    /// A kind a newer server of the same minor version reports that this
-    /// build does not know. The group is still stopped.
+    /// A kind this build does not know. The kinds are frozen within a minor,
+    /// since `GroupEngineError::ApplyStopped` carries one over the Raft RPC,
+    /// so only an admin-plane reader of another minor's metrics gets it. The
+    /// group is still stopped. It does not round-trip: it encodes as
+    /// `unknown`, not as the kind it stands for.
     #[serde(other)]
     Unknown,
 }
@@ -480,8 +483,8 @@ mod tests {
     use super::RaftMaintenanceReport;
     use super::TransferRejection;
 
-    /// A newer server may report a failure kind this build does not know.
-    /// The stopped group's diagnostics still decode.
+    /// An admin-plane reader of another minor's metrics may meet a failure
+    /// kind it does not know. The stopped group's diagnostics still decode.
     #[test]
     fn unknown_apply_failure_kinds_decode() {
         let failure: ApplyFailure = serde_json::from_str(
