@@ -615,7 +615,7 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
             raft_group_id: GROUP,
             key: "snapshots/node-10/group-7/00000000000000000042-00000000000000ab.snap"
                 .to_owned(),
-            directory: "snapshots/node-1/group-7/".to_owned(),
+            directory: Some("snapshots/node-1/group-7/".to_owned()),
         },
         GroupSnapshotError::ObjectMissing { .. } => GroupSnapshotError::ObjectMissing {
             raft_group_id: GROUP,
@@ -636,6 +636,11 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
         },
     });
     errors.extend(contents.into_iter().map(GroupSnapshotError::InvalidContent));
+    errors.push(GroupSnapshotError::ForeignKey {
+        raft_group_id: GROUP,
+        key: key(),
+        directory: None,
+    });
     errors.extend(
         every!(SnapshotObjectCheck {
             SnapshotObjectCheck::StoredSize { .. } => SnapshotObjectCheck::StoredSize {

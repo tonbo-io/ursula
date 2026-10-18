@@ -21,16 +21,17 @@ pub enum GroupSnapshotError {
     /// The snapshot this node persisted names an object outside the
     /// directory this node owns for the group,
     /// `{prefix}/node-{node}/group-{gid}/`, as when the node started with
-    /// another node's data directory or with another snapshot prefix.
+    /// another node's data directory, with another snapshot prefix, or with
+    /// a store that holds no objects. `directory` is `None` in the last case.
     #[error(
         "raft group {raft_group_id:?}: the persisted snapshot names {key}, outside this node's \
-         snapshot directory {directory}. Start the node with an empty raft.wal.path to rejoin \
-         as a wiped node"
+         snapshot directory {directory:?}. Start the node with its raft.wal.path directory \
+         emptied to rejoin as a wiped node"
     )]
     ForeignKey {
         raft_group_id: RaftGroupId,
         key: String,
-        directory: String,
+        directory: Option<String>,
     },
     /// The snapshot object the persisted pointer names is gone.
     #[error("raft group {raft_group_id:?}: snapshot object {key} is missing")]
@@ -45,9 +46,12 @@ pub enum GroupSnapshotError {
         key: String,
         check: SnapshotObjectCheck,
     },
-    /// This node's persisted snapshot pointer cannot be read: its metadata
-    /// file does not read, decode or become durable. The cause is logged
-    /// where it is converted.
+    /// This node's persisted snapshot pointer cannot be used, for a reason
+    /// no retry changes: its metadata file does not read, decode or become
+    /// durable, an inline pointer's body does not decode, or the store
+    /// cannot protect the object it names (a pin record that does not
+    /// decode, a store that is misconfigured). The cause is logged where it
+    /// is converted.
     #[error("raft group {raft_group_id:?}: the persisted snapshot pointer is unreadable")]
     PointerUnreadable { raft_group_id: RaftGroupId },
     /// The snapshot store did not answer `operation` on `key`. The cause is

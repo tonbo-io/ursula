@@ -668,9 +668,10 @@ impl Default for ColdCacheConfig {
 pub struct RaftSnapshotConfig {
     /// Snapshot store backend.
     pub backend: RaftSnapshotBackend,
-    /// S3 namespace for snapshot objects, relative to the cold-storage root.
-    /// Used only when `backend` is `S3`.
-    pub s3_prefix: Option<String>,
+    /// S3 namespace for snapshot objects, relative to the cold-storage root
+    /// ([`SnapshotPrefix`], `snapshots` when unset). Used only when `backend`
+    /// is `S3`.
+    pub s3_prefix: Option<SnapshotPrefix>,
     /// Interval for the manual snapshot driver, which snapshots each group by
     /// Raft log bytes (bounded-stream-state F12e).
     ///
@@ -679,6 +680,108 @@ pub struct RaftSnapshotConfig {
     /// health. Explicit `0s` disables the manual driver and keeps openraft's
     /// entry-count policy (`raft.snapshot_logs_since_last`).
     pub drive_interval: Option<HumanDuration>,
+}
+
+impl RaftSnapshotConfig {
+    /// The snapshot prefix this config names, `snapshots` when unset.
+    pub fn snapshot_prefix(&self) -> SnapshotPrefix {
+        self.s3_prefix.clone().unwrap_or_default()
+    }
+}
+
+/// The prefix of a node's snapshot objects (`storage.snapshot.s3_prefix`),
+/// parsed once, where the config is read. It is one or more `/`-separated
+/// components of ASCII letters, digits, `-`, `_` and `.`, other than `.` and
+/// `..`, so no object store rewrites a key under it: no empty component, no
+/// whitespace, no leading or trailing `/`. A leading or trailing `/` in the
+/// config is trimmed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct SnapshotPrefix(String);
+
+/// The prefix a node uses when `storage.snapshot.s3_prefix` is unset.
+pub const DEFAULT_SNAPSHOT_PREFIX: &str = "snapshots";
+
+/// Why a configured snapshot prefix is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPrefixProblem {
+    /// Nothing is left once the leading and trailing `/` are trimmed.
+    Empty,
+    /// A component is empty, as in `a//b`.
+    EmptyComponent,
+    /// A component is `.` or `..`.
+    DotComponent,
+    /// The prefix holds a character outside the allowed set.
+    Character { found: char },
+}
+
+/// A refused `storage.snapshot.s3_prefix`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("storage.snapshot.s3_prefix {prefix:?} is not a snapshot prefix: {problem:?}")]
+pub struct SnapshotPrefixError {
+    pub prefix: String,
+    pub problem: SnapshotPrefixProblem,
+}
+
+impl SnapshotPrefix {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for SnapshotPrefix {
+    fn default() -> Self {
+        Self(DEFAULT_SNAPSHOT_PREFIX.to_owned())
+    }
+}
+
+impl std::fmt::Display for SnapshotPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&str> for SnapshotPrefix {
+    type Error = SnapshotPrefixError;
+
+    fn try_from(prefix: &str) -> Result<Self, Self::Error> {
+        let refuse = |problem| SnapshotPrefixError {
+            prefix: prefix.to_owned(),
+            problem,
+        };
+        if let Some(found) = prefix
+            .chars()
+            .find(|c| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')))
+        {
+            return Err(refuse(SnapshotPrefixProblem::Character { found }));
+        }
+        let trimmed = prefix.trim_matches('/');
+        if trimmed.is_empty() {
+            return Err(refuse(SnapshotPrefixProblem::Empty));
+        }
+        for component in trimmed.split('/') {
+            match component {
+                "" => return Err(refuse(SnapshotPrefixProblem::EmptyComponent)),
+                "." | ".." => return Err(refuse(SnapshotPrefixProblem::DotComponent)),
+                _ => {}
+            }
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+}
+
+impl TryFrom<String> for SnapshotPrefix {
+    type Error = SnapshotPrefixError;
+
+    fn try_from(prefix: String) -> Result<Self, Self::Error> {
+        Self::try_from(prefix.as_str())
+    }
+}
+
+impl From<SnapshotPrefix> for String {
+    fn from(prefix: SnapshotPrefix) -> Self {
+        prefix.0
+    }
 }
 
 impl Default for RaftSnapshotConfig {

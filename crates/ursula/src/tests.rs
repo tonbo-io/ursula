@@ -8073,52 +8073,7 @@ mod snapshot_driver {
             })
         }
 
-        fn namespace(
-            &self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::OwnedNamespace {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
-        }
-
-        fn stage<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-            index: u64,
-            chunks: ursula_runtime::SnapshotBytesIterator,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
-        }
-
-        fn write_staged<'a>(
-            &'a self,
-            staged: ursula_runtime::StagedSnapshot,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
-        }
-
-        fn list_own<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
-        }
-
-        fn delete_own<'a>(
-            &'a self,
-            object: ursula_runtime::OwnedObject,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
-        }
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// The snapshot builds a node runs at once by default, as the server's
@@ -8992,6 +8947,7 @@ mod snapshot_driver {
             inner: ursula_runtime::S3SnapshotStore::new(
                 operator,
                 ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
+                1,
             )
             .with_references(ursula_runtime::SnapshotReferenceConfig {
                 node_id: 1,
@@ -10633,52 +10589,7 @@ mod leadership_shed {
             })
         }
 
-        fn namespace(
-            &self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::OwnedNamespace {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
-        }
-
-        fn stage<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-            index: u64,
-            chunks: ursula_runtime::SnapshotBytesIterator,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
-        }
-
-        fn write_staged<'a>(
-            &'a self,
-            staged: ursula_runtime::StagedSnapshot,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
-        }
-
-        fn list_own<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
-        }
-
-        fn delete_own<'a>(
-            &'a self,
-            object: ursula_runtime::OwnedObject,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
-        }
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// Through the snapshot driver, the production entry point, with the

@@ -1155,3 +1155,81 @@ bucket = "my-bucket"
         }
     }
 }
+
+mod snapshot_prefix_tests {
+    use crate::RaftSnapshotConfig;
+    use crate::SnapshotPrefix;
+    use crate::SnapshotPrefixError;
+    use crate::SnapshotPrefixProblem;
+
+    fn problem(prefix: &str) -> SnapshotPrefixProblem {
+        SnapshotPrefix::try_from(prefix).expect_err(prefix).problem
+    }
+
+    /// A prefix is trimmed of a leading and trailing `/`, and its components
+    /// are kept as written.
+    #[test]
+    fn a_snapshot_prefix_keeps_its_components() {
+        for (configured, kept) in [
+            ("snapshots", "snapshots"),
+            ("snapshots/", "snapshots"),
+            ("/snapshots/", "snapshots"),
+            ("a/b/", "a/b"),
+            ("team-1/snap_shots.v2", "team-1/snap_shots.v2"),
+        ] {
+            assert_eq!(SnapshotPrefix::try_from(configured).unwrap().as_str(), kept);
+        }
+        assert_eq!(SnapshotPrefix::default().as_str(), "snapshots");
+    }
+
+    /// Every prefix an object store would rewrite is refused: empty, an
+    /// empty or dot component, whitespace, which OpenDAL trims, and any
+    /// other character outside the safe set.
+    #[test]
+    fn a_snapshot_prefix_refuses_what_a_store_rewrites() {
+        for empty in ["", "/", "//"] {
+            assert_eq!(problem(empty), SnapshotPrefixProblem::Empty, "{empty:?}");
+        }
+        assert_eq!(problem("a//b"), SnapshotPrefixProblem::EmptyComponent);
+        assert_eq!(problem("a/./b"), SnapshotPrefixProblem::DotComponent);
+        assert_eq!(problem(".."), SnapshotPrefixProblem::DotComponent);
+        for (prefix, found) in [
+            (" snapshots", ' '),
+            (" /snapshots", ' '),
+            ("snapshots ", ' '),
+            ("snap\tshots", '\t'),
+            ("snäpshots", 'ä'),
+            ("snap*", '*'),
+        ] {
+            assert_eq!(
+                problem(prefix),
+                SnapshotPrefixProblem::Character { found },
+                "{prefix:?}"
+            );
+        }
+    }
+
+    /// The config refuses a bad prefix where it is read, and the error
+    /// names the key.
+    #[test]
+    fn the_config_refuses_a_bad_prefix_when_read() {
+        let parsed: RaftSnapshotConfig =
+            toml::from_str("backend = \"s3\"\ns3_prefix = \"/team/snapshots/\"\n").unwrap();
+        assert_eq!(parsed.snapshot_prefix().as_str(), "team/snapshots");
+        assert_eq!(
+            RaftSnapshotConfig::default().snapshot_prefix().as_str(),
+            "snapshots"
+        );
+        let refused = toml::from_str::<RaftSnapshotConfig>("s3_prefix = \" snapshots\"\n")
+            .expect_err("a leading space");
+        assert!(
+            refused.to_string().contains("storage.snapshot.s3_prefix"),
+            "{refused}"
+        );
+        let error = SnapshotPrefixError {
+            prefix: String::new(),
+            problem: SnapshotPrefixProblem::Empty,
+        };
+        assert_eq!(SnapshotPrefix::try_from(""), Err(error));
+    }
+}

@@ -35,6 +35,7 @@ use ursula_runtime::ColdHotBacklog;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::ErrorChain;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
@@ -1489,6 +1490,9 @@ pub(crate) enum SnapshotRestoreError {
     Object {
         raft_group_id: RaftGroupId,
         key: Option<String>,
+        /// The directory this node owns for the group, if its store holds
+        /// objects.
+        directory: Option<String>,
         #[source]
         source: SnapshotStoreError,
     },
@@ -1514,14 +1518,14 @@ impl From<SnapshotRestoreError> for GroupEngineError {
                 raft_group_id,
                 source,
             } => {
-                tracing::error!(?raft_group_id, error = %source, "the persisted snapshot metadata does not read");
+                tracing::error!(?raft_group_id, error = %ErrorChain(&source), "the persisted snapshot metadata does not read");
                 GroupSnapshotError::PointerUnreadable { raft_group_id }
             }
             SnapshotRestoreError::Pointer {
                 raft_group_id,
                 source,
             } => {
-                tracing::error!(?raft_group_id, error = %source, "the persisted snapshot pointer does not decode");
+                tracing::error!(?raft_group_id, error = %ErrorChain(&source), "the persisted snapshot pointer does not decode");
                 GroupSnapshotError::PointerUnreadable { raft_group_id }
             }
             SnapshotRestoreError::Content {
@@ -1529,7 +1533,7 @@ impl From<SnapshotRestoreError> for GroupEngineError {
                 key,
                 source,
             } => {
-                tracing::error!(?raft_group_id, ?key, error = %source, "the persisted snapshot does not decode");
+                tracing::error!(?raft_group_id, ?key, error = %ErrorChain(&source), "the persisted snapshot does not decode");
                 match key {
                     Some(key) => GroupSnapshotError::ObjectCorrupt {
                         raft_group_id,
@@ -1544,11 +1548,12 @@ impl From<SnapshotRestoreError> for GroupEngineError {
             SnapshotRestoreError::Object {
                 raft_group_id,
                 key,
+                directory,
                 source,
             } => {
-                tracing::error!(?raft_group_id, ?key, error = %source, "the persisted snapshot object does not restore");
+                tracing::error!(?raft_group_id, ?key, error = %ErrorChain(&source), "the persisted snapshot object does not restore");
                 match key {
-                    Some(key) => object_refusal(raft_group_id, key, source),
+                    Some(key) => object_refusal(raft_group_id, key, directory, source),
                     None => GroupSnapshotError::PointerUnreadable { raft_group_id },
                 }
             }
@@ -1561,6 +1566,7 @@ impl From<SnapshotRestoreError> for GroupEngineError {
 fn object_refusal(
     raft_group_id: RaftGroupId,
     key: String,
+    directory: Option<String>,
     error: SnapshotStoreError,
 ) -> GroupSnapshotError {
     let corrupt = |key, check| GroupSnapshotError::ObjectCorrupt {
@@ -1600,19 +1606,31 @@ fn object_refusal(
             key,
             operation: SnapshotStoreOperation::Get,
         },
-        // The pointer names what this store does not hold, or the records
-        // that protect it do not read: no retry reads it.
+        // The pointer names an object outside this node's namespace, or one
+        // its store does not hold, as after a change of `s3_prefix` or of
+        // the snapshot backend.
+        SnapshotStoreError::OutsideGroup { key, .. } => GroupSnapshotError::ForeignKey {
+            raft_group_id,
+            key,
+            directory,
+        },
+        SnapshotStoreError::UnsupportedLocation { .. } => GroupSnapshotError::ForeignKey {
+            raft_group_id,
+            key,
+            directory,
+        },
+        // The records that protect the object do not read, or the store is
+        // misconfigured: no retry reads it.
         SnapshotStoreError::NameCollision { .. }
-        | SnapshotStoreError::NoNodeIdentity
         | SnapshotStoreError::NotOwnedHere { .. }
+        | SnapshotStoreError::Encoder(_)
         | SnapshotStoreError::Compress(_)
         | SnapshotStoreError::BodyTooLarge
-        | SnapshotStoreError::UnsupportedLocation { .. }
         | SnapshotStoreError::ConditionalCreateUnsupported { .. }
         | SnapshotStoreError::Config { .. }
         | SnapshotStoreError::Open(_)
         | SnapshotStoreError::Encryption(_)
-        | SnapshotStoreError::OutsideGroup { .. }
+        | SnapshotStoreError::InvalidPrefix(_)
         | SnapshotStoreError::InvalidReference { .. }
         | SnapshotStoreError::ReferenceEncode(_)
         | SnapshotStoreError::ReferenceDecode { .. }
@@ -1801,9 +1819,11 @@ impl RaftGroupStateMachine {
             Disk::sync_dir(parent).map_err(metadata)?;
         }
         let key = object_key(&pointer.location);
+        let directory = self.snapshot_store.namespace(raft_group_id).directory();
         let object = |source| SnapshotRestoreError::Object {
             raft_group_id,
             key: key.clone(),
+            directory: directory.clone(),
             source,
         };
         let references = self.snapshot_install.references(raft_group_id.0);
@@ -1851,7 +1871,7 @@ impl RaftGroupStateMachine {
             .publish_current(&self.snapshot_store, self.placement.raft_group_id.0)
             .await
         {
-            tracing::warn!(%err, "restored snapshot remains pinned while current-reference publication is unavailable");
+            tracing::warn!(error = %ErrorChain(&err), "restored snapshot remains pinned while current-reference publication is unavailable");
         }
         // The reconcile above dropped the pins of the objects that were
         // retiring before the restart: the restart ended this process's
@@ -2368,7 +2388,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                     Err(err) => {
                         tracing::warn!(
                             snapshot_id,
-                            error = %err,
+                            error = %ErrorChain(&err),
                             "falling back to inline OpenRaft snapshot after external snapshot verification failed"
                         );
                         SnapshotLocation::Inline {
@@ -2385,7 +2405,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             Err(err) => {
                 tracing::warn!(
                     snapshot_id,
-                    error = %err,
+                    error = %ErrorChain(&err),
                     "falling back to inline OpenRaft snapshot after external snapshot upload failed"
                 );
                 SnapshotLocation::Inline {
@@ -2413,7 +2433,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         {
             Ok(reference) => reference,
             Err(err) => {
-                tracing::warn!(snapshot_id, %err, "falling back to inline snapshot after external pin failure");
+                tracing::warn!(snapshot_id, error = %ErrorChain(&err), "falling back to inline snapshot after external pin failure");
                 pointer.location = SnapshotLocation::Inline {
                     bytes: group_snapshot_frames(Arc::clone(snapshot))
                         .collect::<Result<Vec<_>, _>>()
@@ -2492,7 +2512,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             .publish_current(&self.snapshot_store, self.placement.raft_group_id.0)
             .await
         {
-            tracing::warn!(snapshot_id, %err, "snapshot remains pinned while current-reference publication is unavailable");
+            tracing::warn!(snapshot_id, error = %ErrorChain(&err), "snapshot remains pinned while current-reference publication is unavailable");
         }
         // The object this build replaced stays pinned for the GC grace, so
         // this pass deletes only what was retiring before (#669).
@@ -2519,7 +2539,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
                 }
                 tracing::warn!(
                     snapshot_id = pointer.snapshot_id,
-                    error = %err,
+                    error = %ErrorChain(&err),
                     "failed to prune retired OpenRaft snapshots"
                 );
             }
@@ -2983,7 +3003,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let metadata = directory.path().join("group-7.snapshot.json");
         let store: SharedSnapshotStore =
-            Arc::new(ursula_runtime::S3SnapshotStore::memory_for_tests("stale-build").unwrap());
+            Arc::new(ursula_runtime::S3SnapshotStore::memory_for_tests("stale-build", 1).unwrap());
         let coordinator = SnapshotInstallCoordinator::default();
         let mut state = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
@@ -3068,10 +3088,10 @@ mod tests {
             raft_group_id: RaftGroupId(7),
         };
         let raw_store = Arc::new(
-            S3SnapshotStore::memory_for_tests(&format!(
-                "state-machine-snapshot-retention-{}",
-                std::process::id()
-            ))
+            S3SnapshotStore::memory_for_tests(
+                &format!("state-machine-snapshot-retention-{}", std::process::id()),
+                1,
+            )
             .expect("memory S3 snapshot store"),
         );
         let snapshot_store: SharedSnapshotStore = raw_store.clone();
@@ -3218,54 +3238,7 @@ mod tests {
                 Box::pin(async move { Ok(()) })
             }
 
-            fn namespace(
-                &self,
-                raft_group_id: ursula_shard::RaftGroupId,
-            ) -> ursula_runtime::OwnedNamespace {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
-            }
-
-            fn stage<'a>(
-                &'a self,
-                raft_group_id: ursula_shard::RaftGroupId,
-                index: u64,
-                chunks: ursula_runtime::SnapshotBytesIterator,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot>
-            {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
-            }
-
-            fn write_staged<'a>(
-                &'a self,
-                staged: ursula_runtime::StagedSnapshot,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation>
-            {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
-            }
-
-            fn list_own<'a>(
-                &'a self,
-                raft_group_id: ursula_shard::RaftGroupId,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
-            }
-
-            fn delete_own<'a>(
-                &'a self,
-                object: ursula_runtime::OwnedObject,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
-            }
+            ursula_runtime::inline_owned_snapshot_methods!();
         }
 
         let placement = ShardPlacement {
@@ -3318,18 +3291,21 @@ mod tests {
         assert_eq!(coordinator.available_permits(), 1);
     }
 
-    /// The restore refusal of every class of store failure on the object
-    /// the persisted pointer names, and of an unreadable pointer, body or
-    /// metadata file.
+    /// The restore refusal of a sample of each kind of store failure on the
+    /// object the persisted pointer names, and of an unreadable pointer,
+    /// body or metadata file. `object_refusal`'s own match is the
+    /// exhaustive one.
     #[test]
     fn every_restore_failure_answers_its_refusal() {
         use ursula_runtime::SnapshotStoreConfigProblem;
 
         let group = ursula_shard::RaftGroupId(7);
         let key = || "snapshots/k.snap".to_owned();
+        let directory = || Some("snapshots/node-1/group-7/".to_owned());
         let object = |source| SnapshotRestoreError::Object {
             raft_group_id: group,
             key: Some(key()),
+            directory: directory(),
             source,
         };
         let corrupt = |check| GroupSnapshotError::ObjectCorrupt {
@@ -3405,6 +3381,33 @@ mod tests {
                 },
             ),
             (
+                object(SnapshotStoreError::OutsideGroup {
+                    raft_group_id: group,
+                    key: key(),
+                }),
+                GroupSnapshotError::ForeignKey {
+                    raft_group_id: group,
+                    key: key(),
+                    directory: directory(),
+                },
+            ),
+            (
+                SnapshotRestoreError::Object {
+                    raft_group_id: group,
+                    key: Some(key()),
+                    directory: None,
+                    source: SnapshotStoreError::UnsupportedLocation {
+                        store: ursula_runtime::SnapshotBackend::Inline,
+                        location: ursula_runtime::SnapshotLocationKind::S3,
+                    },
+                },
+                GroupSnapshotError::ForeignKey {
+                    raft_group_id: group,
+                    key: key(),
+                    directory: None,
+                },
+            ),
+            (
                 object(SnapshotStoreError::InvalidReference { record: key() }),
                 unreadable.clone(),
             ),
@@ -3418,6 +3421,7 @@ mod tests {
                 SnapshotRestoreError::Object {
                     raft_group_id: group,
                     key: None,
+                    directory: directory(),
                     source: SnapshotStoreError::NotFound { key: key() },
                 },
                 unreadable.clone(),
@@ -4010,54 +4014,7 @@ mod tests {
                 })
             }
 
-            fn namespace(
-                &self,
-                raft_group_id: ursula_shard::RaftGroupId,
-            ) -> ursula_runtime::OwnedNamespace {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
-            }
-
-            fn stage<'a>(
-                &'a self,
-                raft_group_id: ursula_shard::RaftGroupId,
-                index: u64,
-                chunks: ursula_runtime::SnapshotBytesIterator,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot>
-            {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
-            }
-
-            fn write_staged<'a>(
-                &'a self,
-                staged: ursula_runtime::StagedSnapshot,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation>
-            {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
-            }
-
-            fn list_own<'a>(
-                &'a self,
-                raft_group_id: ursula_shard::RaftGroupId,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
-            }
-
-            fn delete_own<'a>(
-                &'a self,
-                object: ursula_runtime::OwnedObject,
-            ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-                static INLINE: ursula_runtime::InlineSnapshotStore =
-                    ursula_runtime::InlineSnapshotStore;
-                ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
-            }
+            ursula_runtime::inline_owned_snapshot_methods!();
         }
 
         let placement = ShardPlacement {

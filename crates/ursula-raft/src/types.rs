@@ -75,11 +75,6 @@ impl SnapshotData {
     pub fn into_parts(self) -> (Vec<u8>, Option<SnapshotLease>) {
         (self.pointer_bytes, self.lease)
     }
-
-    /// The hold on the object the pointer names, if the data holds one.
-    pub fn lease(&self) -> Option<&SnapshotLease> {
-        self.lease.as_ref()
-    }
 }
 
 /// The Raft log bytes an entry is counted as: what the snapshot cadence

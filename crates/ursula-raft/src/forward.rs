@@ -11,6 +11,7 @@ use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
+use ursula_runtime::ErrorChain;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::ForwardFailure;
 use ursula_runtime::ForwardedRpc;
@@ -463,21 +464,6 @@ where
         );
     }
     Err(error)
-}
-
-/// Renders an error with its sources, for logs.
-struct ErrorChain<'a>(&'a (dyn std::error::Error + 'static));
-
-impl std::fmt::Display for ErrorChain<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)?;
-        let mut source = self.0.source();
-        while let Some(error) = source {
-            write!(f, ": {error}")?;
-            source = error.source();
-        }
-        Ok(())
-    }
 }
 
 /// The forwarding channels of this process, one HTTP/2 channel per leader

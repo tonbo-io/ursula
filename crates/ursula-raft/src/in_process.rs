@@ -711,7 +711,11 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             .install_full_snapshot(group, vote, snapshot)
             .await
             .map_err(|err| {
-                let message = format!("remote full snapshot on node {}: {err}", self.target);
+                let message = format!(
+                    "remote full snapshot on node {}: {}",
+                    self.target,
+                    ursula_runtime::ErrorChain(&err)
+                );
                 let backs_off = install_error_backs_off(&err);
                 if backs_off {
                     StreamingError::Unreachable(Unreachable::from_string(message))
@@ -775,16 +779,12 @@ async fn sleep_in_process_raft_network(delay: Duration) {
     std::thread::sleep(delay);
 }
 
-/// Whether the commit screen refused the request: it would replace entries
-/// the replica knows are committed, or the replica's log lags what OpenRaft
-/// committed (#613). The gRPC network answers it `Unavailable`,
-/// which the client reports as unreachable, so OpenRaft backs off instead of
-/// resending at once; this network classifies it the same.
 /// Whether a full snapshot refused with `error` backs the sender off, as an
 /// unreachable target, rather than failing as a network error. A refused
 /// overwrite backs it off, as does every typed refusal of the prefetch that
 /// the gRPC plane answers `UNAVAILABLE`. Admission and publication failures
-/// stay network errors, as on this network before. Unifying this with
+/// stay network errors, as on this network before, and so does every other
+/// group refusal, `Group(OwnerStopped)` among them. Unifying this with
 /// [`SnapshotInstallError::peer_backs_off`] shifts the simulation's seeds,
 /// so it waits for a change that records them anew (#725).
 pub(crate) fn install_error_backs_off(error: &SnapshotInstallError) -> bool {
@@ -806,6 +806,11 @@ pub(crate) fn install_error_backs_off(error: &SnapshotInstallError) -> bool {
     }
 }
 
+/// Whether the commit screen refused the request: it would replace entries
+/// the replica knows are committed, or the replica's log lags what OpenRaft
+/// committed (#613). The gRPC network answers it `Unavailable`,
+/// which the client reports as unreachable, so OpenRaft backs off instead of
+/// resending at once; this network classifies it the same.
 fn refuses_overwrite(error: &ursula_runtime::GroupEngineError) -> bool {
     matches!(
         error.infra(),

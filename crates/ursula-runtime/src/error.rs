@@ -146,3 +146,21 @@ impl RuntimeError {
         }
     }
 }
+
+/// Renders an error with its chain of sources, `error: source: source`, for
+/// logs and for the message of a transport's answer. A typed error keeps its
+/// cause as a source rather than in its own text, so a log that prints only
+/// the error loses the cause.
+pub struct ErrorChain<'a>(pub &'a (dyn std::error::Error + 'static));
+
+impl std::fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(error) = source {
+            write!(f, ": {error}")?;
+            source = error.source();
+        }
+        Ok(())
+    }
+}

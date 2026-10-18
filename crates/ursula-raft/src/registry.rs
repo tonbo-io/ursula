@@ -37,6 +37,7 @@ use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
+use ursula_runtime::ErrorChain;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
@@ -311,8 +312,9 @@ pub struct SnapshotGcPass {
 ///
 /// The in-process network of the tests and the simulation classifies it on
 /// its own, and does not yet back off for every refusal the gRPC plane
-/// answers `UNAVAILABLE`: admission and publication failures stay network
-/// errors there.
+/// answers `UNAVAILABLE`. Admission and publication failures stay network
+/// errors there, and so does every group refusal but a refused overwrite,
+/// `Group(OwnerStopped)` among them (#725).
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotInstallError {
     #[error("snapshot group {group:?} is not registered")]
@@ -423,7 +425,7 @@ impl SnapshotInstallError {
 
 impl From<SnapshotInstallError> for tonic::Status {
     fn from(error: SnapshotInstallError) -> Self {
-        Self::new(error.code(), error.to_string())
+        Self::new(error.code(), ErrorChain(&error).to_string())
     }
 }
 
@@ -1068,7 +1070,7 @@ impl RaftGroupHandleRegistry {
                     pass.failed = pass.failed.saturating_add(1);
                     tracing::warn!(
                         raft_group_id = group,
-                        %err,
+                        error = %ErrorChain(&err),
                         "snapshot GC pass failed; retrying later"
                     );
                 }
@@ -1938,52 +1940,7 @@ mod tests {
             })
         }
 
-        fn namespace(
-            &self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::OwnedNamespace {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
-        }
-
-        fn stage<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-            index: u64,
-            chunks: ursula_runtime::SnapshotBytesIterator,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
-        }
-
-        fn write_staged<'a>(
-            &'a self,
-            staged: ursula_runtime::StagedSnapshot,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
-        }
-
-        fn list_own<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
-        }
-
-        fn delete_own<'a>(
-            &'a self,
-            object: ursula_runtime::OwnedObject,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
-        }
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     struct ReferenceWalRoot {
@@ -2730,52 +2687,7 @@ mod tests {
             Box::pin(async move { Ok(()) })
         }
 
-        fn namespace(
-            &self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::OwnedNamespace {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::namespace(&INLINE, raft_group_id)
-        }
-
-        fn stage<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-            index: u64,
-            chunks: ursula_runtime::SnapshotBytesIterator,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::stage(&INLINE, raft_group_id, index, chunks)
-        }
-
-        fn write_staged<'a>(
-            &'a self,
-            staged: ursula_runtime::StagedSnapshot,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::write_staged(&INLINE, staged)
-        }
-
-        fn list_own<'a>(
-            &'a self,
-            raft_group_id: ursula_shard::RaftGroupId,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::list_own(&INLINE, raft_group_id)
-        }
-
-        fn delete_own<'a>(
-            &'a self,
-            object: ursula_runtime::OwnedObject,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-            static INLINE: ursula_runtime::InlineSnapshotStore =
-                ursula_runtime::InlineSnapshotStore;
-            ursula_runtime::SnapshotStore::delete_own(&INLINE, object)
-        }
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     fn snapshot_meta(snapshot_id: &str) -> openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig> {
@@ -2958,15 +2870,21 @@ mod tests {
                 SnapshotInstallError::ShuttingDown { .. }
                 | SnapshotInstallError::Publication(_)
                 | SnapshotInstallError::Task(_) => (Code::Unavailable, true, false),
-                SnapshotInstallError::Group(group) => match group.infra() {
-                    Some(GroupInfraError::CommittedOverwrite { .. }) => {
-                        (Code::Unavailable, true, true)
-                    }
-                    Some(GroupInfraError::RaftGroupNotRegistered { .. }) => {
-                        (Code::NotFound, false, false)
-                    }
-                    _ => (Code::Internal, false, false),
-                },
+                // A group refusal answers by the group's own classification
+                // on gRPC. In-process only a refused overwrite backs off
+                // (#725).
+                SnapshotInstallError::Group(group) => (
+                    crate::grpc::group_rpc_code(group),
+                    group.peer_backs_off(),
+                    matches!(
+                        group.infra(),
+                        Some(
+                            GroupInfraError::CommittedOverwrite { .. }
+                                | GroupInfraError::UnrelatedHistory { .. }
+                                | GroupInfraError::LogBehindCommit { .. }
+                        )
+                    ),
+                ),
                 SnapshotInstallError::GateClosed { .. }
                 | SnapshotInstallError::SourceMissing { .. }
                 | SnapshotInstallError::SourceRead { .. }
@@ -3006,6 +2924,7 @@ mod tests {
                 },
             )),
             SnapshotInstallError::Group(GroupEngineError::new("internal")),
+            SnapshotInstallError::Group(GroupEngineError::Infra(GroupInfraError::OwnerStopped)),
             SnapshotInstallError::Publication(store_error()),
             SnapshotInstallError::Task(cancelled),
             SnapshotInstallError::GateClosed { group },
@@ -3047,6 +2966,13 @@ mod tests {
                 source: store_error(),
             },
         ];
+        let owner_stopped =
+            SnapshotInstallError::Group(GroupEngineError::Infra(GroupInfraError::OwnerStopped));
+        assert_eq!(
+            expected(&owner_stopped),
+            (Code::Unavailable, true, false),
+            "a stopped owner backs the sender off on gRPC, not in-process (#725)"
+        );
         for error in samples {
             let row = (
                 error.code(),

@@ -209,6 +209,7 @@ pub use engine::in_memory::InMemoryGroupEngine;
 pub use engine::in_memory::InMemoryGroupEngineFactory;
 pub use engine::in_memory::next_repair_cursor;
 pub use engine::in_memory::repair_cold_index_response;
+pub use error::ErrorChain;
 pub use error::ErrorStatus;
 pub use error::RuntimeError;
 pub use key_holds::DropPolicy;
