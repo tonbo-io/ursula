@@ -234,6 +234,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 .open(placement, metrics.clone())
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let apply_stop_signal = log_store.apply_stop_signal();
+            let snapshot_journal = log_store.snapshot_journal();
             let health = crate::apply_failure::ApplyHealth::default();
             let engine = RaftGroupEngine::new_single_node_observed(
                 placement,
@@ -255,6 +256,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                     metrics: Some(metrics),
                     cold_store: self.cold_store.clone(),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
+                    snapshot_journal: Some(snapshot_journal),
                     snapshot_build: self
                         .registry
                         .as_ref()
@@ -561,6 +563,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
             let apply_stop_signal = store.apply_stop_signal();
+            let snapshot_journal = store.snapshot_journal();
             let health = crate::apply_failure::ApplyHealth::default();
             let engine = RaftGroupEngine::new_node_observed(
                 placement,
@@ -581,6 +584,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         .filter(|(group, _)| *group == placement.raft_group_id)
                         .map(|(_, fault)| fault),
                     snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
+                    snapshot_journal: Some(snapshot_journal),
                     recovery: Some(rejoin.clone()),
                     peer_cluster: Some(self.registry.peer_cluster().clone()),
                     #[cfg(test)]

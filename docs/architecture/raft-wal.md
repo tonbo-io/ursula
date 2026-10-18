@@ -129,6 +129,15 @@ a crash loses one, OpenRaft re-establishes the boundary after restart. A fresh
 state machine restores the latest snapshot and applies entries only as their
 commit becomes known, so an uncommitted suffix is never application state.
 
+A group's snapshot pointer (`core-N/group-G.snapshot.json`) is synced on its
+own, so the journal is synced before the pointer is published, for a snapshot
+the replica installed and one it built. A durable pointer therefore implies a
+durable truncate of any uncommitted tail the snapshot replaced. Each snapshot
+publication costs one journal `fsync`. At startup a replica refuses to open a
+group whose log holds an entry, or whose commit marker names one, at or after
+the restored snapshot's index but below the snapshot in log-id order. It
+reports `WalOpen` with `log_below_snapshot`.
+
 Once the newest segment reaches `segment_size`, the writer rotates: it syncs
 the segment, then creates the next one and makes its header and directory entry
 durable before any frame goes to it. A crash can therefore only cut the newest

@@ -525,6 +525,12 @@ pub(crate) enum CoreWriteOp {
     /// gate stays closed across restarts until a leader's barrier or a new
     /// plan (m2, #581 review).
     DropPlan { group_id: u32 },
+    /// Writes nothing: answered once every record written before it is
+    /// durable, as the journal is synced for a `Recovery` record. A group's
+    /// snapshot record is published only after one ([`SnapshotJournal`]).
+    ///
+    /// [`SnapshotJournal`]: super::SnapshotJournal
+    Sync,
     /// The snapshot driver's tick (#669): a maintenance pass as of `now` on
     /// the driver's clock, which frees segments that have held dead frames
     /// for `max_dirty_age`. It is answered once the pass ran.
@@ -2089,6 +2095,10 @@ fn write_core_log_batch(
         };
         let position = match &request.op {
             CoreWriteOp::Maintain { .. } => None,
+            CoreWriteOp::Sync => {
+                requires_sync = true;
+                None
+            }
             CoreWriteOp::Vote { group_id, vote } => {
                 metadata_ops = metadata_ops.saturating_add(1);
                 metadata_changed |= journal.metadata.set_vote(*group_id, *vote);
@@ -2519,7 +2529,9 @@ pub(crate) fn raft_group_log_record_count(record: &RaftGroupLogRecord) -> usize 
 ///
 /// Committed and truncate markers are replay optimizations. Losing either in a
 /// crash leaves the durable entries intact and OpenRaft re-establishes the
-/// marker after restart. Reclaim syncs any outstanding purge markers before
+/// marker after restart. The one record outside the journal that depends on
+/// a truncate, a group's snapshot record, is published only after a sync
+/// ([`CoreWriteOp::Sync`]). Reclaim syncs any outstanding purge markers before
 /// deleting the segments they cover, under both policies. Votes are not journal
 /// records: the metadata file holds them and is always `fsync`ed.
 pub(crate) fn raft_group_log_record_requires_sync(

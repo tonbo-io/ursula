@@ -418,6 +418,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
         InvalidConfiguration,
         InvalidRecord,
         Poisoned,
+        LogBelowSnapshot,
     });
     errors.extend(failures.iter().map(|&failure| GroupInfraError::WalOpen {
         core_id: CoreId(2),

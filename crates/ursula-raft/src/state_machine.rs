@@ -1625,6 +1625,9 @@ pub struct RaftGroupStateMachine {
     pub(crate) snapshot_build: SnapshotBuildCoordinator,
     pub(crate) snapshot_install: SnapshotInstallCoordinator,
     snapshot_metadata_path: Option<PathBuf>,
+    /// The core journal holding the group's log: a snapshot record is
+    /// published only after it synced ([`crate::SnapshotJournal`]).
+    pub(crate) snapshot_journal: Option<crate::SnapshotJournal>,
     /// Log applied since the last snapshot (F12e), read by the driver.
     log_gauge: Arc<GroupLogGauge>,
     /// The engine's token: OpenRaft's state-machine worker owns this state
@@ -1728,6 +1731,7 @@ impl RaftGroupStateMachine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
+            snapshot_journal: None,
             log_gauge,
             work: WorkToken::detached(),
         }
@@ -1970,6 +1974,7 @@ impl RaftGroupStateMachine {
             metrics: self.metrics.clone(),
             build,
             snapshot_metadata_path: self.snapshot_metadata_path.clone(),
+            snapshot_journal: self.snapshot_journal.clone(),
             log_gauge: Arc::clone(&self.log_gauge),
             log_mark: self.log_gauge.mark(),
             references: self
@@ -2243,6 +2248,11 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             .snapshot_install
             .references(self.placement.raft_group_id.0);
         let meta = meta.clone();
+        // The truncate of a conflicting tail this install replaced must be
+        // durable before the record is (R1).
+        if let Some(journal) = &self.snapshot_journal {
+            journal.sync().await.map_err(io::Error::from)?;
+        }
         snapshot_metadata_work(self.metadata_serial.clone(), move || {
             let _reference = reference;
             persist_snapshot_candidate(
@@ -2295,6 +2305,7 @@ pub struct RaftGroupSnapshotBuilder {
     /// The build's permit, counted in flight until the builder is dropped.
     build: SnapshotBuildLease,
     snapshot_metadata_path: Option<PathBuf>,
+    snapshot_journal: Option<crate::SnapshotJournal>,
     log_gauge: Arc<GroupLogGauge>,
     /// The applied log this snapshot covers (F12e).
     log_mark: GroupLogMark,
@@ -2458,6 +2469,10 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         let log_gauge = self.log_gauge.clone();
         let log_mark = self.log_mark;
         let snapshot_index = meta.last_log_id.map_or(0, |log_id| log_id.index());
+        // As for an install: the journal before the record (R1).
+        if let Some(journal) = &self.snapshot_journal {
+            journal.sync().await.map_err(io::Error::from)?;
+        }
         let chosen = snapshot_metadata_work(self.metadata_serial.clone(), move || {
             let _reference = reference;
             let previous = current_snapshot.lock().expect("snapshot mutex").clone();
@@ -2906,6 +2921,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
             work: crate::openraft_work::WorkToken::detached(),
+            snapshot_journal: None,
         };
         builder.build_snapshot().await.expect("persist snapshot");
         // #561: the build records what it covers while it holds its permit.
@@ -2977,6 +2993,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: Some(metadata_path.clone()),
             work: crate::openraft_work::WorkToken::detached(),
+            snapshot_journal: None,
         };
         builder.build_snapshot().await.expect("persist snapshot");
 
@@ -3130,6 +3147,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
+            snapshot_journal: None,
         };
         let first_snapshot = first.build_snapshot().await.expect("first snapshot");
         let first_pointer = SnapshotPointer::decode(first_snapshot.snapshot.pointer_bytes())
@@ -3150,6 +3168,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
+            snapshot_journal: None,
         };
         let second_snapshot = second.build_snapshot().await.expect("second snapshot");
         let second_pointer = SnapshotPointer::decode(second_snapshot.snapshot.pointer_bytes())
@@ -3187,6 +3206,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
+            snapshot_journal: None,
         };
         let third_snapshot = third.build_snapshot().await.expect("third snapshot");
         let third_pointer = SnapshotPointer::decode(third_snapshot.snapshot.pointer_bytes())
@@ -3283,6 +3303,7 @@ mod tests {
             references: Arc::default(),
             snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
+            snapshot_journal: None,
         };
 
         let snapshot = builder.build_snapshot().await.expect("inline fallback");
@@ -4065,6 +4086,7 @@ mod tests {
                 references: Arc::default(),
                 snapshot_metadata_path: None,
                 work: crate::openraft_work::WorkToken::detached(),
+                snapshot_journal: None,
             };
             let coordinator = builder.build.coordinator.clone();
             {

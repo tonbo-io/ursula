@@ -8,6 +8,7 @@ use crate::log_store::CoreJournalError;
 use crate::log_store::JournalError;
 use crate::log_store::MarkRecoveringError;
 use crate::log_store::RaftWalError;
+use crate::log_store::SnapshotOrderError;
 use crate::log_store::StateFileError;
 
 pub(super) fn group_open_error(
@@ -29,6 +30,21 @@ pub(super) fn group_open_error(
         core_id: placement.core_id,
         raft_group_id: placement.raft_group_id,
         failure,
+    })
+}
+
+/// The group's log contradicts its restored snapshot record (R1): the
+/// replica refuses to open the group.
+pub(super) fn snapshot_order_error(
+    placement: ShardPlacement,
+    source: SnapshotOrderError,
+) -> GroupEngineError {
+    tracing::error!(core_id = placement.core_id.0, raft_group_id = placement.raft_group_id.0,
+        error = %source, "the group's log contradicts its restored snapshot record");
+    GroupEngineError::Infra(GroupInfraError::WalOpen {
+        core_id: placement.core_id,
+        raft_group_id: placement.raft_group_id,
+        failure: WalOpenFailureKind::LogBelowSnapshot,
     })
 }
 

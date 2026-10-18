@@ -398,6 +398,7 @@ impl JournalCluster {
             // them at startup, as in production.
             options.snapshot_metadata_path =
                 Some(self.wals[&node_id].snapshot_metadata_path(placement));
+            options.snapshot_journal = Some(store.snapshot_journal());
         }
         options.apply_fault = self
             .faulty

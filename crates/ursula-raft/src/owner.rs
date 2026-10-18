@@ -133,8 +133,8 @@ impl OwnerRaftHandle {
     /// leader forwards every write to `target`, sends no heartbeats, never
     /// campaigns, and refuses a candidate with a shorter log without adopting
     /// its term. Its `elect` keeps that leader state behind a new candidacy.
-    /// So the leader steps down as a follower would ([`transfer_step_down`]),
-    /// which drops the leader state, then campaigns, shed or not. A refused
+    /// So the leader steps down as a follower would, which drops the leader
+    /// state, then campaigns, shed or not ([`step_down_and_campaign`]). A refused
     /// step-down is retried every minimum election timeout until the
     /// leadership or the vote changes.
     pub(crate) fn abandon_stalled_transfer(&self, vote: UrsulaVote, target: u64) {
@@ -157,39 +157,44 @@ impl OwnerRaftHandle {
                     if !matches!(settled, Err(openraft::metrics::WaitError::Timeout(..))) {
                         return;
                     }
-                    let last_log_id = raft.data_metrics().borrow_watched().last_log;
-                    match raft
-                        .vote(transfer_step_down(vote, target, last_log_id))
-                        .await
-                    {
-                        Ok(stepped_down) if stepped_down.vote_granted => {
+                    match step_down_and_campaign(&raft, vote, target).await {
+                        Ok(StepDown::Campaigned) => {
                             tracing::warn!(
                                 node_id = raft.metrics().borrow_watched().id,
                                 target,
                                 %vote,
                                 ?deadline,
-                                "leadership transfer did not complete; stepping down and \
-                                 campaigning"
+                                "leadership transfer did not complete; stepped down and \
+                                 campaigned"
                             );
-                            if let Err(error) = raft.trigger().elect(false).await {
-                                tracing::warn!(
-                                    %error,
-                                    "campaign after abandoning a leadership transfer"
-                                );
-                            }
                             return;
                         }
-                        Ok(refused) => {
+                        Ok(StepDown::Refused { by }) => {
                             tracing::debug!(
                                 target,
                                 %vote,
-                                refused_by = %refused.vote,
+                                refused_by = %by,
                                 "step-down from a stalled leadership transfer refused; retrying"
                             );
                             wait = retry;
                         }
+                        Err(StepDownError::Campaign(error)) => {
+                            tracing::warn!(
+                                %error,
+                                target,
+                                %vote,
+                                "stepped down from a stalled leadership transfer, but the \
+                                 campaign after it did not start"
+                            );
+                            return;
+                        }
                         Err(error) => {
-                            tracing::warn!(%error, target, "abandon a stalled leadership transfer");
+                            tracing::warn!(
+                                ?error,
+                                target,
+                                %vote,
+                                "could not step down from a stalled leadership transfer"
+                            );
                             return;
                         }
                     }
@@ -199,6 +204,19 @@ impl OwnerRaftHandle {
         if self.mailbox.sender.send(job).is_err() {
             tracing::debug!("owner Raft stopped before bounding a leadership transfer");
         }
+    }
+
+    /// Starts a new term with this leader's own campaign. It steps down
+    /// first, to `target`, as [`Self::abandon_stalled_transfer`] does
+    /// ([`step_down_and_campaign`]). `target` must be another node. A
+    /// single-voter group may name a node outside its membership, which
+    /// never answers, so the leader wins its campaign alone.
+    #[cfg(any(test, feature = "fault-injection"))]
+    pub async fn step_down_and_campaign(&self, target: u64) -> Result<StepDown, StepDownError> {
+        let vote = self.metrics.borrow_watched().vote;
+        self.call(move |raft| async move { step_down_and_campaign(&raft, vote, target).await })
+            .await
+            .map_err(|stopped| StepDownError::Vote(RaftError::Fatal(stopped)))?
     }
 
     pub(crate) async fn call<F, Fut, R>(&self, operation: F) -> Result<R, Fatal<C>>
@@ -391,6 +409,64 @@ pub(crate) fn transfer_step_down(
     );
     request.leadership_transfer = true;
     request
+}
+
+/// How a leader's [`step_down_and_campaign`] ended.
+#[derive(Debug)]
+pub enum StepDown {
+    /// The leader granted itself the step-down vote, which dropped its
+    /// leader state, and then started a campaign.
+    Campaigned,
+    /// The node already holds a vote above the step-down vote: the
+    /// leadership moved on without this step-down.
+    Refused { by: UrsulaVote },
+}
+
+/// Why a leader's [`step_down_and_campaign`] did not finish.
+#[derive(Debug, thiserror::Error)]
+pub enum StepDownError {
+    #[error("submit the step-down vote")]
+    Vote(#[source] RaftError<C>),
+    #[error("start the campaign after a step-down")]
+    Campaign(#[source] Fatal<C>),
+    /// The step-down named this node: a vote for itself is its own
+    /// candidacy, under which OpenRaft keeps the leader state.
+    #[error("a leader steps down to another node, not to itself (node {target})")]
+    TargetIsSelf { target: u64 },
+}
+
+/// Steps the leader at `vote` down to `target`, then campaigns.
+///
+/// OpenRaft's `elect` on a leader starts a candidacy at a higher vote but
+/// keeps the leader state, and a leader call before that election ends
+/// breaks its invariant that the leader's vote is at least the node's vote
+/// (#516, #721). So the leader first grants itself [`transfer_step_down`],
+/// which drops the leader state as for any follower, and campaigns only
+/// then. `target` must be another node
+/// ([`StepDownError::TargetIsSelf`]).
+pub(crate) async fn step_down_and_campaign(
+    raft: &RaftGroupHandle,
+    vote: UrsulaVote,
+    target: u64,
+) -> Result<StepDown, StepDownError> {
+    if raft.metrics().borrow_watched().id == target {
+        return Err(StepDownError::TargetIsSelf { target });
+    }
+    let last_log_id = raft.data_metrics().borrow_watched().last_log;
+    let stepped_down = raft
+        .vote(transfer_step_down(vote, target, last_log_id))
+        .await
+        .map_err(StepDownError::Vote)?;
+    if !stepped_down.vote_granted {
+        return Ok(StepDown::Refused {
+            by: stepped_down.vote,
+        });
+    }
+    raft.trigger()
+        .elect(false)
+        .await
+        .map_err(StepDownError::Campaign)?;
+    Ok(StepDown::Campaigned)
 }
 
 /// Administrative triggers execute on the owner, including their task creation.

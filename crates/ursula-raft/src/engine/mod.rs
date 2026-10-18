@@ -149,6 +149,14 @@ pub struct RaftGroupEngineOptions {
     pub snapshot_build: Option<SnapshotBuildCoordinator>,
     pub snapshot_install: Option<SnapshotInstallCoordinator>,
     pub snapshot_metadata_path: Option<PathBuf>,
+    /// The core journal of the group's log store
+    /// ([`RaftGroupFileLogStore::snapshot_journal`]): a snapshot record at
+    /// `snapshot_metadata_path` is published only after it synced, and a
+    /// restored one is checked against the log. `None` for a log store
+    /// without a journal.
+    ///
+    /// [`RaftGroupFileLogStore::snapshot_journal`]: crate::RaftGroupFileLogStore::snapshot_journal
+    pub snapshot_journal: Option<crate::SnapshotJournal>,
     /// The replica's recovery gate. Its recovery plan fences the history
     /// before the Raft core starts, so a plan's leader that restarts never
     /// leads without it (N1, #581 review). The gate is bound later by
@@ -721,6 +729,7 @@ impl RaftGroupEngine {
             snapshot_build,
             snapshot_install,
             snapshot_metadata_path,
+            snapshot_journal,
             recovery,
             peer_cluster,
             #[cfg(test)]
@@ -754,6 +763,7 @@ impl RaftGroupEngine {
             snapshot_metadata_path,
         );
         state_machine.apply_stop_signal = apply_stop_signal;
+        state_machine.snapshot_journal = snapshot_journal;
         state_machine.apply_health = apply_health.clone();
         #[cfg(any(test, madsim, feature = "fault-injection"))]
         {
@@ -763,6 +773,13 @@ impl RaftGroupEngine {
             .restore_persisted_snapshot()
             .await
             .map_err(GroupEngineError::from)?;
+        if let Some(snapshot) = state_machine.last_applied_log_id
+            && let Some(journal) = &state_machine.snapshot_journal
+        {
+            journal
+                .check_restored(snapshot)
+                .map_err(|source| wal_error::snapshot_order_error(placement, source))?;
+        }
         // One page cache per group, shared by the read path and the state
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.
@@ -1300,8 +1317,8 @@ impl RaftGroupEngine {
         {
             return Ok(read_index);
         }
-        match self.read_barrier.round().await? {
-            Some(read_index) => Ok(read_index),
+        match self.read_barrier.confirm_read_log_id().await? {
+            Some(read_log_id) => Ok(read_log_id.index()),
             None => Err(self.not_leader_for_read(operation).await),
         }
     }

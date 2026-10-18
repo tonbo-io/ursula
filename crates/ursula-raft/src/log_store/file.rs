@@ -147,6 +147,104 @@ impl StoreLog {
     }
 }
 
+/// A restored snapshot record that the group's log contradicts: at or after
+/// the snapshot's index the log holds an entry, or its commit marker names
+/// one, that is below the snapshot in log-id order (R1). Such an entry
+/// cannot be committed, and a replica with it would compare its log wrongly
+/// in elections ([`SnapshotJournal::check_restored`]).
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotOrderError {
+    #[error(
+        "the log holds {held:?} at or after the restored snapshot {snapshot:?}, below it in \
+         log-id order"
+    )]
+    HeldBelow {
+        snapshot: LogIdOf<UrsulaRaftTypeConfig>,
+        held: LogIdOf<UrsulaRaftTypeConfig>,
+    },
+    #[error(
+        "the log's commit marker {committed:?} is at or after the restored snapshot \
+         {snapshot:?}, below it in log-id order"
+    )]
+    CommittedBelow {
+        snapshot: LogIdOf<UrsulaRaftTypeConfig>,
+        committed: LogIdOf<UrsulaRaftTypeConfig>,
+    },
+}
+
+/// What a group's snapshot record needs from the core journal that holds
+/// the group's log ([`RaftGroupFileLogStore::snapshot_journal`]).
+///
+/// A follower installs a snapshot over a conflicting uncommitted tail in
+/// three steps: it truncates that tail in the journal, publishes the
+/// snapshot record, and purges the log through the snapshot. The record is
+/// synced on its own, and under `fsync = never` the truncate is not. So the
+/// record is published only after [`Self::sync`]: a durable record then
+/// implies a durable truncate, or a durable overwrite of the tail. A
+/// snapshot this replica built is published the same way.
+///
+/// Three invariants carry the proof that a restored record never sits
+/// above a stale tail. The core journal survives a crash as a prefix of
+/// what was written, so a durable sync makes every record before it
+/// durable. Log matching: an entry at the snapshot's index or later that
+/// has a lower leader id than the snapshot's entry is not in the history
+/// the snapshot's committed entry belongs to, and neither is any entry
+/// after it, so none of them is committed. And the sync above, which
+/// orders the truncate of those entries before the record.
+/// [`Self::check_restored`] is the tripwire for a log that breaks them.
+#[derive(Clone)]
+pub struct SnapshotJournal {
+    journal: std::path::PathBuf,
+    /// Weak: a state machine OpenRaft keeps running after the group shut
+    /// down must not hold the journal, and its lock, open (#709).
+    writer: std::sync::Weak<CoreFileLogWriter>,
+    log: Arc<Mutex<GroupLog>>,
+}
+
+impl std::fmt::Debug for SnapshotJournal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotJournal")
+            .field("journal", &self.journal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotJournal {
+    /// Returns once every record the journal took before this call is
+    /// durable: one journal `fsync`.
+    pub(crate) async fn sync(&self) -> Result<(), CoreJournalError> {
+        let writer = self
+            .writer
+            .upgrade()
+            .ok_or_else(|| CoreJournalError::WriterStopped {
+                journal: self.journal.clone(),
+            })?;
+        writer.write(CoreWriteOp::Sync).await.map(drop)
+    }
+
+    /// Refuses a log that contradicts the restored `snapshot`: an entry at
+    /// or after its index, or a commit marker there, below it in log-id
+    /// order. Run before the group's Raft core reads the log.
+    pub(crate) fn check_restored(
+        &self,
+        snapshot: LogIdOf<UrsulaRaftTypeConfig>,
+    ) -> Result<(), SnapshotOrderError> {
+        let log = lock(&self.log);
+        if let Some(held) = log.held_below_snapshot(snapshot) {
+            return Err(SnapshotOrderError::HeldBelow { snapshot, held });
+        }
+        match log.committed() {
+            Some(committed) if committed.index() >= snapshot.index() && committed < snapshot => {
+                Err(SnapshotOrderError::CommittedBelow {
+                    snapshot,
+                    committed,
+                })
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+}
+
 /// A recovery cut that did not run.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryCutError {
@@ -445,6 +543,16 @@ impl RaftGroupFileLogStore {
         self.record_timing(1, timing);
         *lock(&self.recovery) = record;
         Ok(())
+    }
+
+    /// The handle a snapshot record of this group publishes and restores
+    /// through ([`SnapshotJournal`]).
+    pub fn snapshot_journal(&self) -> SnapshotJournal {
+        SnapshotJournal {
+            journal: self.core_writer.dir().to_path_buf(),
+            writer: Arc::downgrade(&self.core_writer),
+            log: self.log.clone(),
+        }
     }
 
     /// The id of the entry this store holds at `index`, or of the last

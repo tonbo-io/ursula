@@ -62,6 +62,8 @@ pub use disk::JournalFile;
 pub use disk::LockAttempt;
 pub use file::RaftGroupFileLogStore;
 pub use file::RecoveryCutError;
+pub use file::SnapshotJournal;
+pub use file::SnapshotOrderError;
 pub use frozen::ArchiveDefect;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;

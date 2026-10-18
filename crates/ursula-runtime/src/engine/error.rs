@@ -159,6 +159,9 @@ pub enum WalOpenFailureKind {
     InvalidConfiguration,
     InvalidRecord,
     Poisoned,
+    /// The log holds an entry, or a commit marker, at or after the restored
+    /// snapshot's index but below the snapshot in log-id order.
+    LogBelowSnapshot,
 }
 
 /// The kind of an engine response: what a caller expected, and what it got
