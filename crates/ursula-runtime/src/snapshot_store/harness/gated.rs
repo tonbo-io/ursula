@@ -274,7 +274,12 @@ impl SnapshotStoreGates {
             state
                 .gates
                 .get(&gate)
-                .is_none_or(|counts| counts.allowed.is_none_or(|allowed| ticket < allowed))
+                .is_none_or(|counts| match counts.allowed {
+                    None => true,
+                    // A held gate lets its arrivals through one at a time,
+                    // in ticket order, whichever waiter wakes first.
+                    Some(allowed) => ticket < allowed && ticket == counts.passed,
+                })
         })
         .await;
         self.update(|state| {
