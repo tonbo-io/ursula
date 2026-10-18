@@ -436,6 +436,26 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("maxRequestBodyBytes", result.stderr)
 
+    def test_snapshot_prefix_follows_the_servers_rule(self) -> None:
+        # The schema accepts exactly what the server's `SnapshotPrefix`
+        # accepts: every leading and trailing '/' trimmed, then components
+        # separated by single '/'s, none of them '.' or '..'.
+        for prefix in ("snapshots", "/snapshots/", "a/b", "//a", "a//", ".hidden", "..x"):
+            config = render_config(
+                *NAMED, "--set", "s3.bucket=bkt", "--set", "snapshotStore.backend=s3",
+                "--set-string", f"snapshotStore.prefix={prefix}",
+            )
+            self.assertIn(f"s3_prefix = {json.dumps(prefix)}", config)
+        for prefix in ("", "/", ".", "..", "./a", "a/.", "a/../b", "a//b", " snapshots", "snap*"):
+            result = subprocess.run(
+                ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+                 "--set", "snapshotStore.backend=s3", "--set-string", f"snapshotStore.prefix={prefix}"],
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(result.returncode, 0, prefix)
+            self.assertIn("prefix", result.stderr, prefix)
+
     def test_admin_plane_defaults_to_loopback(self) -> None:
         config = render_config(*NAMED, "--set", "s3.bucket=bkt")
 

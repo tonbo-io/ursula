@@ -842,10 +842,12 @@ async fn startup_snapshot_corruption_is_not_an_isolated_apply_failure() {
         runtime.warm_all_groups().await,
         Err(ursula_runtime::RuntimeError::GroupEngine {
             error: ursula_runtime::GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::Internal { .. }
+                ursula_runtime::GroupInfraError::Snapshot(
+                    ursula_runtime::GroupSnapshotError::PointerUnreadable { raft_group_id }
+                )
             ),
             ..
-        })
+        }) if raft_group_id == placement(0).raft_group_id
     ));
     assert!(registry.metrics_snapshot().is_empty());
     assert_eq!(std::fs::read(metadata).unwrap(), b"not a snapshot envelope");

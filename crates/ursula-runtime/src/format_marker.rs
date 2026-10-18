@@ -178,12 +178,7 @@ impl FormatEpochNamespace {
         let namespace = if cold.backend == ColdBackend::S3 {
             String::new()
         } else if snapshot_backend == RaftSnapshotBackend::S3 {
-            let prefix = snapshot
-                .s3_prefix
-                .as_deref()
-                .unwrap_or("snapshots")
-                .trim_matches('/');
-            format!("{prefix}/")
+            format!("{}/", snapshot.snapshot_prefix())
         } else {
             return Ok(None);
         };

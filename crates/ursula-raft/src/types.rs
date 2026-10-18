@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::io::Cursor;
 use std::time::Duration;
 
 use openraft::alias::VoteOf;
@@ -13,6 +12,9 @@ use serde::Serialize;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
+use ursula_runtime::KeyHold;
+use ursula_runtime::Release;
+use ursula_runtime::SnapshotLocation;
 use ursula_shard::RaftGroupId;
 
 /// Under `fsync = always`, how long the per-core journal writer waits for the
@@ -35,9 +37,45 @@ openraft::declare_raft_types!(
         D = GroupWriteCommand,
         R = RaftGroupResponse,
         Node = openraft::BasicNode,
-        SnapshotData = Cursor<Vec<u8>>,
+        SnapshotData = crate::types::SnapshotData,
         AsyncRuntime = OpenRaftRuntime,
 );
+
+/// What a group snapshot carries through OpenRaft: the encoded
+/// [`ursula_runtime::SnapshotPointer`], and a hold on the object it names
+/// for as long as OpenRaft keeps the snapshot, as during a send. No snapshot
+/// takes a hold yet, so the lease is `None` everywhere.
+#[derive(Debug, Clone)]
+pub struct SnapshotData {
+    pointer_bytes: Vec<u8>,
+    lease: Option<SnapshotLease>,
+}
+
+/// The hold a [`SnapshotData`] keeps on the object its pointer names.
+pub type SnapshotLease = KeyHold<SnapshotLocation, Release>;
+
+impl SnapshotData {
+    /// The snapshot data of `pointer_bytes`, holding nothing.
+    pub fn new(pointer_bytes: Vec<u8>) -> Self {
+        Self {
+            pointer_bytes,
+            lease: None,
+        }
+    }
+
+    /// The encoded snapshot pointer.
+    pub fn pointer_bytes(&self) -> &[u8] {
+        &self.pointer_bytes
+    }
+
+    /// The encoded snapshot pointer and the hold on the object it names.
+    /// The caller keeps the hold for as long as the pointer is in use, as
+    /// until the RPC that sends it returns.
+    #[must_use = "the lease keeps the named object while the pointer is in use"]
+    pub fn into_parts(self) -> (Vec<u8>, Option<SnapshotLease>) {
+        (self.pointer_bytes, self.lease)
+    }
+}
 
 /// The Raft log bytes an entry is counted as: what the snapshot cadence
 /// adds when the entry is applied, what it weighs in the WAL's entry cache,

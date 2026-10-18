@@ -317,7 +317,11 @@ pub(crate) fn spawn_store_health_gate(
                 {
                     Ok(Ok(())) => true,
                     Ok(Err(err)) => {
-                        tracing::warn!(node_id, %err, "snapshot store health probe failed");
+                        tracing::warn!(
+                            node_id,
+                            error = %ursula_runtime::ErrorChain(&err),
+                            "snapshot store health probe failed"
+                        );
                         false
                     }
                     Err(_elapsed) => {
@@ -394,7 +398,6 @@ mod tests {
     use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
-    use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
     use ursula_shard::BucketStreamId;
 
@@ -1042,14 +1045,26 @@ mod tests {
             _key: SnapshotKey,
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
+                ))
+            })
         }
 
         fn download<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Get,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
+                ))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -1077,12 +1092,21 @@ mod tests {
                 }
                 tokio::time::sleep(latency).await;
                 if fails {
-                    Err(SnapshotStoreError::Backend("scripted probe failure".into()))
+                    Err(ursula_runtime::SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Head,
+                        "test",
+                        opendal::Error::new(
+                            opendal::ErrorKind::Unexpected,
+                            "scripted probe failure",
+                        ),
+                    ))
                 } else {
                     Ok(())
                 }
             })
         }
+
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// A runtime with one group on the test's own tokio runtime.

@@ -11,13 +11,17 @@
 //! pass of the group ([`SnapshotReferences::collect_garbage`]) that prunes
 //! every object nothing names any more. A node without a driver prunes after
 //! each build instead.
+//!
+//! The leases of builds and installs are a [`KeyHolds`] set that releases a
+//! hold when its lease drops.
 
-use std::collections::BTreeMap;
-use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
 
+use ursula_runtime::KeyHold;
+use ursula_runtime::KeyHolds;
+use ursula_runtime::Release;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPrune;
@@ -49,6 +53,9 @@ const MAX_GC_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 pub(crate) struct SnapshotReferences {
     serial: AsyncMutex<PublicationRetry>,
     state: Mutex<ReferenceState>,
+    /// The locations prepared builds and installs lease, each until its
+    /// lease drops.
+    leases: KeyHolds<SnapshotLocation, Release>,
     /// G: how long a replaced current object stays pinned, and how long
     /// after an upload or a restore the group's GC pass runs.
     gc_grace: Duration,
@@ -64,7 +71,6 @@ struct PublicationRetry {
 struct ReferenceState {
     current_known: bool,
     current: Option<SnapshotLocation>,
-    active: BTreeMap<String, (SnapshotLocation, usize)>,
     // A terminal metadata failure may have published this candidate before
     // returning an error. Keep it beyond the failed engine's lease lifetime.
     failed_candidate: Option<SnapshotLocation>,
@@ -174,18 +180,6 @@ impl ReferenceState {
             self.passes.add(until);
         }
     }
-
-    /// The external locations this node pins at `now`.
-    fn retained(&mut self, now: Instant) -> Vec<SnapshotLocation> {
-        self.settle(now);
-        self.current
-            .iter()
-            .cloned()
-            .chain(self.failed_candidate.iter().cloned())
-            .chain(self.active.values().map(|(location, _)| location.clone()))
-            .chain(self.retiring.iter().map(|object| object.location.clone()))
-            .collect()
-    }
 }
 
 /// A GC pass of one group that failed (#669). The pass runs again later,
@@ -201,27 +195,8 @@ pub(crate) enum SnapshotGcError {
     Prune(#[source] SnapshotStoreError),
 }
 
-#[derive(Debug)]
-pub(crate) struct SnapshotReferenceLease {
-    references: Arc<SnapshotReferences>,
-    key: String,
-}
-
-impl Drop for SnapshotReferenceLease {
-    fn drop(&mut self) {
-        let mut state = self
-            .references
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, count)) = state.active.get_mut(&self.key) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.active.remove(&self.key);
-            }
-        }
-    }
-}
+/// A prepared build's or install's lease on the location it may commit.
+pub(crate) type SnapshotReferenceLease = KeyHold<SnapshotLocation, Release>;
 
 #[cfg(test)]
 impl Default for SnapshotReferences {
@@ -237,12 +212,13 @@ impl SnapshotReferences {
         Self {
             serial: AsyncMutex::new(PublicationRetry::default()),
             state: Mutex::new(ReferenceState::default()),
+            leases: KeyHolds::new(),
             gc_grace: gc_grace.min(MAX_GC_GRACE),
         }
     }
 
     pub(crate) async fn prepare(
-        self: &Arc<Self>,
+        &self,
         store: &SharedSnapshotStore,
         group: u32,
         location: &SnapshotLocation,
@@ -251,26 +227,34 @@ impl SnapshotReferences {
             return Ok(None);
         };
         let _serial = self.serial.lock().await;
-        let mut retained = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retained(Instant::now());
+        let mut retained = self.retained(Instant::now());
         retained.push(location.clone());
         // Reconcile abandoned pins before creating more. On durable startup,
         // the incoming location is the restored pointer and must be retained.
         store.reconcile_reference_pins(group, &retained).await?;
         store.pin_reference(group, location).await?;
+        Ok(Some(self.leases.hold(key.clone(), location.clone())))
+    }
+
+    /// The external locations this node pins at `now`: the current one, a
+    /// failed candidate, the leased ones and the retiring ones.
+    ///
+    /// The leases are read before the state. A lease drops only after its
+    /// location became current or was given up, so a location whose lease
+    /// is gone by the first read is current by the second, if it is still
+    /// needed at all.
+    fn retained(&self, now: Instant) -> Vec<SnapshotLocation> {
+        let leased = self.leases.values();
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        let (_, count) = state
-            .active
-            .entry(key.clone())
-            .or_insert((location.clone(), 0));
-        *count = count.saturating_add(1);
-        Ok(Some(SnapshotReferenceLease {
-            references: self.clone(),
-            key: key.clone(),
-        }))
+        state.settle(now);
+        state
+            .current
+            .iter()
+            .cloned()
+            .chain(state.failed_candidate.iter().cloned())
+            .chain(leased)
+            .chain(state.retiring.iter().map(|object| object.location.clone()))
+            .collect()
     }
 
     /// Metadata publication is terminally latched after this failure, so there
@@ -454,11 +438,7 @@ impl SnapshotReferences {
         };
         // An expired pin drops here, also on a node that runs no snapshot
         // driver.
-        let retained = self
-            .state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retained(Instant::now());
+        let retained = self.retained(Instant::now());
         let cleanup = store.reconcile_reference_pins(group, &retained).await;
         let result = publication.and(cleanup);
         if result.is_err() {
@@ -519,7 +499,7 @@ mod tests {
     }
 
     fn retained(references: &SnapshotReferences) -> Vec<SnapshotLocation> {
-        references.state.lock().unwrap().retained(Instant::now())
+        references.retained(Instant::now())
     }
 
     /// #669: the object a new current replaces stays retained, so its pin
@@ -582,7 +562,7 @@ mod tests {
 
     fn store() -> SharedSnapshotStore {
         Arc::new(
-            S3SnapshotStore::memory_for_tests("snapshots")
+            S3SnapshotStore::memory_for_tests("snapshots", 1)
                 .unwrap()
                 .with_references(SnapshotReferenceConfig {
                     node_id: 1,
@@ -643,7 +623,7 @@ mod tests {
         );
         assert!(matches!(
             store.download(&old).await,
-            Err(SnapshotStoreError::NotFound(_))
+            Err(SnapshotStoreError::NotFound { .. })
         ));
         assert_eq!(store.download(&new).await.unwrap(), b"new");
         assert!(!references.gc_due(later(now, GRACE.saturating_mul(10))));
@@ -707,7 +687,7 @@ mod tests {
         );
         assert!(matches!(
             store.download(&old).await,
-            Err(SnapshotStoreError::NotFound(_))
+            Err(SnapshotStoreError::NotFound { .. })
         ));
         assert_eq!(store.download(&new).await.unwrap(), b"new");
         assert_eq!(store.download(&newer).await.unwrap(), b"newer");
@@ -724,14 +704,26 @@ mod tests {
             _key: SnapshotKey,
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("down".to_owned())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "down"),
+                ))
+            })
         }
 
         fn download<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("down".to_owned())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Get,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "down"),
+                ))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -743,8 +735,16 @@ mod tests {
             _raft_group_id: u32,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("down".to_owned())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "down"),
+                ))
+            })
         }
+
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// The retry after failed passes doubles from 30 s and stops at 15 min.

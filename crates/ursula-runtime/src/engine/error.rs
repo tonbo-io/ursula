@@ -33,6 +33,8 @@ use std::fmt;
 use serde::Deserialize;
 use serde::Serialize;
 pub use snapshot::GroupSnapshotError;
+pub use snapshot::SnapshotObjectCheck;
+pub use snapshot::SnapshotStoreOperation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;

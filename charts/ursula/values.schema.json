@@ -1475,7 +1475,9 @@
         },
         "prefix": {
           "type": "string",
-          "description": "Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots."
+          "minLength": 1,
+          "pattern": "^/*(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+)(/(?:[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.[A-Za-z0-9_-][A-Za-z0-9._-]*|\\.\\.[A-Za-z0-9._-]+))*/*$",
+          "description": "Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots. Leading and trailing '/' are trimmed, and what is left is one or more components separated by single '/'s, each of ASCII letters, digits, '-', '_' and '.' and none of them '.' or '..'. Ursula refuses any other prefix at startup."
         },
         "driveIntervalMs": {
           "type": [

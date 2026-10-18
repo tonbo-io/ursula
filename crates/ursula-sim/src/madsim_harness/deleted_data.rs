@@ -547,7 +547,7 @@ async fn snapshot_holds_marker(cluster: &JournalCluster, node_id: u64) -> Option
         .get_snapshot()
         .await
         .unwrap_or_else(|error| panic!("node {node_id}: read the current snapshot: {error}"))?;
-    let pointer = SnapshotPointer::decode(snapshot.snapshot.get_ref())
+    let pointer = SnapshotPointer::decode(snapshot.snapshot.pointer_bytes())
         .unwrap_or_else(|error| panic!("node {node_id}: decode the snapshot pointer: {error}"));
     let SnapshotLocation::Inline { bytes } = &pointer.location else {
         panic!("node {node_id}: a simulated snapshot is inline");

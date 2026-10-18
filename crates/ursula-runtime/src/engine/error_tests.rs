@@ -48,6 +48,13 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(_)) => {
                 (Persistent, Unknown, false)
             }
+            GroupInfraError::Snapshot(
+                GroupSnapshotError::ForeignKey { .. }
+                | GroupSnapshotError::ObjectMissing { .. }
+                | GroupSnapshotError::ObjectCorrupt { .. }
+                | GroupSnapshotError::PointerUnreadable { .. }
+                | GroupSnapshotError::StoreUnavailable { .. },
+            ) => (Persistent, Unknown, true),
             GroupInfraError::RecoveryNodeMismatch { .. }
             | GroupInfraError::RaftGroupNotRegistered { .. }
             | GroupInfraError::RecoveryAlreadyBound { .. }

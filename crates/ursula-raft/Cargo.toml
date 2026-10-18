@@ -61,6 +61,8 @@ ursula-runtime = { workspace = true, features = ["test-support"] }
 anyhow = { workspace = true }
 axum = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
+# Backend failures of the snapshot store, for the fakes and the restore table.
+opendal = { workspace = true }
 proptest = { workspace = true }
 raft-log = "0.4.5"
 tempfile = { workspace = true }

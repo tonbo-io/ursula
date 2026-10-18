@@ -8020,8 +8020,13 @@ mod snapshot_driver {
                 self.uploads.send_modify(|uploads| {
                     uploads.running = uploads.running.saturating_sub(1);
                 });
-                released
-                    .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))?;
+                released.map_err(|_closed| {
+                    ursula_runtime::SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Put,
+                        "test",
+                        opendal::Error::new(opendal::ErrorKind::Unexpected, "the gate is gone"),
+                    )
+                })?;
                 Ok(SnapshotLocation::Inline {
                     bytes: bytes.to_vec(),
                 })
@@ -8032,7 +8037,13 @@ mod snapshot_driver {
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("inline only".into())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Get,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "inline only"),
+                ))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -8052,9 +8063,17 @@ mod snapshot_driver {
                     .wait_for(|held| !*held)
                     .await
                     .map(|_released| ursula_runtime::SnapshotPrune::Unmanaged)
-                    .map_err(|_closed| SnapshotStoreError::Backend("the gate is gone".into()))
+                    .map_err(|_closed| {
+                        ursula_runtime::SnapshotStoreError::backend(
+                            ursula_runtime::SnapshotStoreOperation::Get,
+                            "test",
+                            opendal::Error::new(opendal::ErrorKind::Unexpected, "the gate is gone"),
+                        )
+                    })
             })
         }
+
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// The snapshot builds a node runs at once by default, as the server's
@@ -8223,7 +8242,7 @@ mod snapshot_driver {
             .await
             .expect("read the current snapshot")
             .expect("a current snapshot");
-        let pointer = ursula_runtime::SnapshotPointer::decode(snapshot.snapshot.get_ref())
+        let pointer = ursula_runtime::SnapshotPointer::decode(snapshot.snapshot.pointer_bytes())
             .expect("decode the snapshot pointer");
         let SnapshotLocation::Inline { bytes } = &pointer.location else {
             panic!("an inline snapshot: {:?}", pointer.location);
@@ -8776,7 +8795,7 @@ mod snapshot_driver {
                             found = found.saturating_add(1);
                         }
                     }
-                    Err(SnapshotStoreError::NotFound(_)) => {}
+                    Err(SnapshotStoreError::NotFound { .. }) => {}
                     Err(err) => panic!("read {location:?}: {err}"),
                 }
             }
@@ -8858,6 +8877,43 @@ mod snapshot_driver {
         ) -> SnapshotStoreFuture<'a, ()> {
             self.inner.verify_uploaded(location)
         }
+
+        fn namespace(
+            &self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::OwnedNamespace {
+            ursula_runtime::SnapshotStore::namespace(&self.inner, raft_group_id)
+        }
+
+        fn stage<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            ursula_runtime::SnapshotStore::stage(&self.inner, raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
+            ursula_runtime::SnapshotStore::write_staged(&self.inner, staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: ursula_shard::RaftGroupId,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            ursula_runtime::SnapshotStore::list_own(&self.inner, raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
+            ursula_runtime::SnapshotStore::delete_own(&self.inner, object)
+        }
     }
 
     /// How the node's snapshot store treats an object nothing names.
@@ -8888,16 +8944,20 @@ mod snapshot_driver {
         .expect("object store")
         .finish();
         let store = Arc::new(RecordingStore {
-            inner: ursula_runtime::S3SnapshotStore::new(operator, "snapshots")
-                .with_references(ursula_runtime::SnapshotReferenceConfig {
-                    node_id: 1,
-                    default_voters: BTreeSet::from([1]),
-                    per_group_voters: BTreeMap::new(),
-                })
-                .with_gc_grace(match object_grace {
-                    ObjectGrace::GcGrace => gc_grace,
-                    ObjectGrace::Hour => Duration::from_secs(60 * 60),
-                }),
+            inner: ursula_runtime::S3SnapshotStore::new(
+                operator,
+                ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
+                1,
+            )
+            .with_references(ursula_runtime::SnapshotReferenceConfig {
+                node_id: 1,
+                default_voters: BTreeSet::from([1]),
+                per_group_voters: BTreeMap::new(),
+            })
+            .with_gc_grace(match object_grace {
+                ObjectGrace::GcGrace => gc_grace,
+                ObjectGrace::Hour => Duration::from_secs(60 * 60),
+            }),
             uploaded: std::sync::Mutex::new(Vec::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -10129,7 +10189,6 @@ mod leadership_shed {
     use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
-    use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
     use ursula_shard::BucketStreamId;
     use ursula_shard::RaftGroupId;
@@ -10487,14 +10546,26 @@ mod leadership_shed {
             _key: SnapshotKey,
             _bytes: Bytes,
         ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Put,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
+                ))
+            })
         }
 
         fn download<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
         ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async { Err(SnapshotStoreError::Backend("probe-only store".into())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Get,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
+                ))
+            })
         }
 
         fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
@@ -10509,8 +10580,16 @@ mod leadership_shed {
             let led = led_by(&self.registry, 1);
             self.probes
                 .send_modify(|probes| probes.push((led, shedding)));
-            Box::pin(async { Err(SnapshotStoreError::Backend("the store is down".into())) })
+            Box::pin(async {
+                Err(ursula_runtime::SnapshotStoreError::backend(
+                    ursula_runtime::SnapshotStoreOperation::Head,
+                    "test",
+                    opendal::Error::new(opendal::ErrorKind::Unexpected, "the store is down"),
+                ))
+            })
         }
+
+        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// Through the snapshot driver, the production entry point, with the
