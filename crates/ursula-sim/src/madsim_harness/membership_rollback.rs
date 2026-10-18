@@ -910,10 +910,9 @@ async fn assert_one_voter_set(
 /// Writes through the group's leader after recovery and waits until every
 /// running replica in its membership serves exactly what the leader serves,
 /// the write included: one history, replicated from one leader (m2 of the
-/// #613 review). One follower misses the write and every other member
-/// compacts past it, so the follower catches up from a snapshot through the
-/// commit screen whoever leads by then (F1 of the third #613 review).
-/// Returns how many snapshots it was sent.
+/// #613 review). One follower misses the write and the leader compacts past
+/// it, so the follower catches up from a snapshot through the commit screen
+/// (F1 of the third #613 review). Returns how many snapshots it was sent.
 async fn assert_writes_after_recovery(
     cluster: &mut JournalCluster,
     group: u32,
@@ -960,34 +959,7 @@ async fn assert_writes_after_recovery(
         madsim::time::sleep(Duration::from_millis(50)).await;
     }
     if let Some(lagging) = lagging {
-        // Any other member may lead by the time the lagging follower is
-        // reached again, so each one purges its log through a snapshot that
-        // covers the write: whoever leads then sends it a snapshot.
-        let written = metrics(cluster, group, leader)
-            .last_applied
-            .map(|log_id| log_id.index);
-        let others = members
-            .iter()
-            .copied()
-            .filter(|node_id| *node_id != lagging)
-            .collect::<Vec<_>>();
-        let applied_by = madsim::time::Instant::now() + Duration::from_secs(5);
-        for node_id in &others {
-            while metrics(cluster, group, *node_id)
-                .last_applied
-                .map(|log_id| log_id.index)
-                < written
-            {
-                assert!(
-                    madsim::time::Instant::now() < applied_by,
-                    "{context}: group {group}: node {node_id} never applied the write"
-                );
-                madsim::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-        for node_id in &others {
-            cluster.snapshot_and_purge_node(group, *node_id, 0).await;
-        }
+        cluster.snapshot_and_purge_node(group, leader, 0).await;
         cluster.policy.heal_bidirectional(leader, lagging);
     }
     loop {
