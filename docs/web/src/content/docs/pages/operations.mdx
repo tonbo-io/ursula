@@ -509,7 +509,7 @@ The recovery contract:
 - **Fresh identity on restore.** Restore replays each snapshot as one replicated write on the target cluster, which keeps its own raft membership and log identity. Nothing from the source cluster's raft metadata is reused. Groups that already hold buckets refuse the import with `409`, and group-count mismatches fail closed before the first import. Group commit indexes and per-stream append counters restart under the new identity. Stream bytes, offsets, close/TTL state, published snapshots, retention floors, and producer dedup states are preserved exactly.
 - **A restore is a new history.** Each group's import starts a new history of the group, so every restored stream answers with a new `Stream-Incarnation`. A client that holds a stream's token from the source cluster gets `412` with the new token, and `HEAD` names the source token as `Stream-Previous-Incarnation` with the restored tail as `Stream-Inherited-Offset` (or, for a stream the source had not written since a rewrite of its own, the token from before that rewrite): what the client derived from bytes below it still holds. Every producer epoch claimed on the source is closed: a producer's next new write of it answers `403` with `Producer-Outcome: epoch-closed;by=history` and the last seq the backup kept, and the producer claims a new epoch. The import requires `x-ursula-backup-blake3`, the BLAKE3 digest of the group's backup object, which `ursulactl restore` sends. A repeat of an import that applied answers `200` with `"already": true` and starts no second history, so a restore interrupted by a timeout or a leader change can run again.
 - **Cold objects are part of the backup set.** Snapshots reference cold-tier chunks, cold-index pages and external payloads by object key. The backup holds the references, not the objects. The restored cluster's cold store must hold the same objects under the same keys: point it at a copy (see [Copying cold objects](#copying-cold-objects)). `backup-verify` validates snapshots but does not dereference cold objects. `restore` asks the target cluster, before the first import, to check every group's references against its own cold store (`POST /__ursula/backup/group/{group}/cold-check`). If any object is missing, it stops with nothing imported and prints how many are missing and the first keys.
-- **Format compatibility.** The backup format is the format epoch: `format_version` 4 in the manifest and in `/__ursula/backup/info`, and `format_epoch` 4 in every group object. A backup restores only into a cluster of the format epoch that wrote it. `ursulactl` refuses a manifest or a target cluster of another version before the first import, and a server refuses to import a group of another format epoch (`400`).
+- **Format compatibility.** Backups have a format version of their own: `format_version` 4 in the manifest and in `/__ursula/backup/info`, and `format_epoch` 4 in every group object. It changes only when what a backup holds changes (the manifest, the group snapshots or the cold objects they reference), not with the format epoch. Ursula 0.8 and 0.9 write backup format 4, so 0.9 restores 0.8 backups. `ursulactl` refuses a manifest or a target cluster of another backup format before the first import, and a server refuses to import a group of another backup format (`400`).
 - **RTO** is dominated by transferring and importing the group snapshots. Each import is a single replicated write per group.
 
 The recovery drill runs in CI (`backup_restore_drill_preserves_streams_and_allows_continued_appends`): write, snapshot, retain and close, back up, destroy the cluster, restore, verify checksums, offsets and boundaries, and continue appending.
@@ -518,10 +518,10 @@ What you can additionally rely on:
 
 - **Quorum durability.** Acknowledged writes survive as long as a majority of voters survives. Three voters across AZs tolerate any single-AZ outage.
 - **Cold-tier durability.** Once flushed to S3, a chunk inherits S3-grade durability. The unflushed window is bounded by the flush interval (seconds by default).
-- **Format epoch 4, no migration.** The Raft WAL, snapshots, backups, the
-  object-storage prefix and the Raft gRPC protocol carry format epoch 4. A node
-  refuses data, backups and peers of another format epoch and does not migrate
-  them.
+- **Format epoch 5, no migration.** The Raft WAL, snapshots, the
+  object-storage prefix and the Raft gRPC protocol carry format epoch 5. A node
+  refuses data and peers of another format epoch and does not migrate them.
+  Backups have a format of their own (see Format compatibility above).
 
 Node-level loss: replace the host with the same `node_id` and cluster config. Each group's leader rebuilds the replacement from the other voters (see [Rejoining a wiped node](#rejoining-a-wiped-node)). `ursulactl wait --node N` returns once the replacement is a voter of every group and has caught up, and `ursulactl verify-cluster` then requires every configured voter to be present and caught up. `ursulactl wait-ready` checks the whole cluster: leaders for every group, complete voter sets and `200` from every node's `/__ursula/ready`. Run it before declaring the recovery done. Total-cluster loss: restore the latest verified backup into a fresh cluster as above.
 
@@ -542,6 +542,18 @@ aws s3 sync s3://my-bucket/source/cold/ s3://my-bucket/target/cold/ \
 For MinIO or another S3-compatible store, add `--endpoint-url`. The copy must match the backup, so the source must not change its cold objects in between. Stopping writes is not enough: an idle cluster still compacts small cold chunks and deletes the ones it replaced a few minutes later. If the source cluster still runs, stop its nodes once the backup verifies, then copy. `restore` checks that the copy is complete.
 
 Never point two clusters at one prefix, and never point a new cluster at the source's prefix in place. After a restore both clusters hold the same streams under the same keys, but each one deletes cold objects by its own state alone: the cold GC after a delete, a retention advance or a compaction, the orphan sweep for unreferenced objects older than a day, and the pruning of `snapshots/` by the cluster's own references. Two clusters on one prefix delete objects the other still reads. A copy also leaves the source cluster and its prefix as they were, so the source stays a way back until clients switch.
+
+## Upgrading to 0.9
+
+**0.9.0 is a breaking release.** It changes the storage and protocol format to format epoch 5. A 0.9 node refuses epoch-4 Raft WAL directories and object-storage prefixes at startup and refuses 0.8 peers, and a 0.8 node refuses 0.9 peers. There is no in-place upgrade, no rolling upgrade and no rollback. Backups keep backup format 4, so `ursulactl restore` of 0.9 restores 0.8 backups into a fresh 0.9 cluster. If you cannot move your data yet, stay on 0.8.2.
+
+1. **Back up the 0.8 cluster** with the 0.8 `ursulactl`. First stop client writes, or accept that writes 0.8 acknowledges after a group's export are missing from 0.9. Then run `backup-create` and `backup-verify`. Once the backup verifies, stop the 0.8 nodes so that their cold objects stop changing.
+2. **Install 0.9 fresh.** Use empty PVCs and never-used prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.8, or a failed upgrade attempt, wrote to. Keep the 0.8 cluster's `server.cluster_id` (Helm `server.clusterId`) and `raft.group_count`.
+3. **Copy the cold objects** into the 0.9 cluster's cold root after the 0.9 nodes have written their `URSULA_FORMAT_EPOCH` marker. Skip the marker and `snapshots/` ([Copying cold objects](#copying-cold-objects)).
+4. **Restore with the 0.9 `ursulactl`.** `ursulactl restore` checks the copy against every group's references and then imports each group.
+5. **Clients** that keep state follow the new `Stream-Incarnation` of every restored stream, as after any restore.
+
+`helm upgrade` from 0.8 stops at the first pod. The new pod finds the 0.8 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`. With `OnDelete`, also delete the refused pod after the rollback so that it starts from the 0.8 template again. The 0.8 cluster and its prefix stay as they were, so they remain a way back until clients switch.
 
 ## Upgrading to 0.8
 

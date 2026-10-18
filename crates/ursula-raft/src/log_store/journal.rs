@@ -1221,43 +1221,49 @@ mod tests {
         }
     }
 
+    /// Journals of earlier epochs, 0.6 (version 2) through 0.8 (version 4),
+    /// are refused. The version is checked before the header length and the
+    /// checksum.
     #[test]
-    fn an_epoch_2_journal_is_refused() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = dir.path().join("journal");
-        let mut file = File::create(&path).expect("create epoch-2 journal");
-        file.write_all(b"URSJWAL\0").expect("magic");
-        file.write_all(&2_u16.to_le_bytes()).expect("version");
-        file.write_all(&16_u16.to_le_bytes())
-            .expect("header length");
-        file.write_all(&[0; 4]).expect("reserved");
-        let payload = b"\"epoch 2\"";
-        file.write_all(&u32::try_from(payload.len()).expect("fits").to_le_bytes())
-            .expect("length");
-        file.write_all(&crc32fast::hash(payload).to_le_bytes())
-            .expect("checksum");
-        file.write_all(payload).expect("payload");
-        file.sync_data().expect("sync");
+    fn journals_of_earlier_epochs_are_refused() {
+        for version in [2_u16, 3, 4] {
+            let dir = tempfile::tempdir().expect("temp dir");
+            let path = dir.path().join("journal");
+            let mut file = File::create(&path).expect("create an old journal");
+            file.write_all(b"URSJWAL\0").expect("magic");
+            file.write_all(&version.to_le_bytes()).expect("version");
+            file.write_all(&16_u16.to_le_bytes())
+                .expect("header length");
+            file.write_all(&[0; 4]).expect("reserved");
+            let payload = b"\"an old epoch\"";
+            file.write_all(&u32::try_from(payload.len()).expect("fits").to_le_bytes())
+                .expect("length");
+            file.write_all(&crc32fast::hash(payload).to_le_bytes())
+                .expect("checksum");
+            file.write_all(payload).expect("payload");
+            file.sync_data().expect("sync");
 
-        for mode in [JournalReplayMode::Strict, JournalReplayMode::VerifiedPrefix] {
-            let err = recover(&path, mode).expect_err("epoch 2 is refused");
-            assert!(matches!(err, JournalError::UnsupportedVersion {
-                version: 2,
-                ..
-            }));
+            for mode in [JournalReplayMode::Strict, JournalReplayMode::VerifiedPrefix] {
+                let err = recover(&path, mode).expect_err("an old epoch is refused");
+                assert!(
+                    matches!(err, JournalError::UnsupportedVersion { version: found, .. } if found == version),
+                    "{err}"
+                );
+                assert!(
+                    err.to_string().contains(&format!(
+                        "format epoch {} only",
+                        ursula_stream::FORMAT_EPOCH
+                    )),
+                    "{err}"
+                );
+            }
+            let err =
+                JournalWriter::open(&path, FIRST_SEQUENCE).expect_err("no append to an old epoch");
             assert!(
-                err.to_string().contains(&format!(
-                    "format epoch {} only",
-                    ursula_stream::FORMAT_EPOCH
-                )),
+                matches!(err, JournalError::UnsupportedVersion { version: found, .. } if found == version),
                 "{err}"
             );
         }
-        let err = JournalWriter::open(&path, FIRST_SEQUENCE).expect_err("no append to epoch 2");
-        assert!(matches!(err, JournalError::UnsupportedVersion {
-            version: 2,
-            ..
-        }));
     }
 
     #[test]

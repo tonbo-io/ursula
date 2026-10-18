@@ -3,6 +3,23 @@ title: Release notes
 description: Changes that affect clients and operators, newest first.
 ---
 
+## 0.9.0
+
+**0.9.0 is a breaking release.** It changes the storage and protocol format to format epoch 5. A 0.9 node refuses epoch-4 Raft WAL directories and object-storage prefixes at startup and refuses 0.8 peers, and a 0.8 node refuses 0.9 peers. There is no in-place upgrade, no rolling upgrade and no rollback. Backups keep backup format 4, so `ursulactl restore` of 0.9 restores 0.8 backups into a fresh 0.9 cluster.
+
+- **If you cannot move your data yet, stay on 0.8.2.**
+- **Deploy 0.9 fresh:** empty PVCs and never-used object-storage prefixes for the cold store and S3 snapshots. Never reuse a prefix that 0.8, or a failed upgrade attempt, wrote to.
+- **Move your data with a backup.** Stop client writes to the 0.8 cluster, or accept that writes it acknowledges after a group's export are missing from 0.9. Back up the 0.8 cluster with `ursulactl backup-create` and check it with `ursulactl backup-verify`. Then stop the 0.8 nodes, copy their cold objects into the 0.9 cluster's cold root ([Copying cold objects](/docs/operations#copying-cold-objects)) and run `ursulactl restore` of 0.9. Give the 0.9 cluster the 0.8 cluster's `server.cluster_id` and `raft.group_count`. Every restored stream answers with a new `Stream-Incarnation`, as after any restore.
+- **`helm upgrade` from 0.8 stops at the first pod.** The new pod finds the 0.8 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`.
+- **Keep the peer lists of 0.8 and 0.9 nodes apart.** A 0.9 node with a configured 0.8 peer refuses to start. A node that exchanges a Raft RPC with a node of the other release answers `503` with `format_epoch_mismatch` on `/__ursula/ready` until it restarts.
+
+See [Upgrading to 0.9](/docs/operations#upgrading-to-09).
+
+### Formats
+
+- **Format epoch 5.** The Raft WAL journal and state files, the WAL directory and object-storage markers, group snapshots, snapshot references and the Raft gRPC protocol carry format epoch 5. A node refuses data and peers of another epoch.
+- **Backups have a format version of their own.** Backup format 4 is the format of 0.8 and 0.9: `format_version` 4 in `manifest.json` and in `GET /__ursula/backup/info`, and `format_epoch` 4 in every group object. It changes only when what a backup holds changes: the manifest, the group snapshots or the cold objects they reference. `ursulactl` refuses a backup or a target cluster of another backup format, such as a 0.7 backup (format 3), before the first import.
+
 ## 0.8.2
 
 0.8.2 removes the experimental event-time indexer and changes nothing else: format epoch 4, the server's storage and protocol formats and the extension's formats (`USQ2`, `USS3`, `USL1`) are unchanged. 0.8.1 and 0.8.2 nodes run in one cluster during a rolling upgrade, and 0.8.1 and 0.8.2 owners and readers of one stream work side by side. Upgrade in place with an ordinary rolling restart (`helm upgrade`), with no fresh install or data move, once your values no longer set the indexer. Rolling back to 0.8.1 is safe.

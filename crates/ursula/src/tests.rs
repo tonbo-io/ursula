@@ -11467,20 +11467,25 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
 }
 
 /// E10: an import is refused with 400 before decoding when its group has no
-/// format epoch (Ursula 0.5.x) or another epoch.
+/// backup format (Ursula 0.5.x) or another one.
 #[tokio::test]
-async fn backup_import_refuses_groups_without_this_format_epoch() {
+async fn backup_import_refuses_groups_of_another_backup_format() {
     let app = test_router();
-    let without_epoch =
+    let without_format =
         rmp_serde::to_vec_named(&json!({"buckets": ["tenant-a"], "streams": []})).unwrap();
-    let other_epoch = rmp_serde::to_vec_named(&ursula_runtime::StreamSnapshot {
-        format_epoch: ursula_runtime::FORMAT_EPOCH - 1,
-        ..ursula_runtime::StreamSnapshot::default()
-    })
-    .unwrap();
+    let other_format = |format_version| {
+        rmp_serde::to_vec_named(&ursula_runtime::StreamSnapshot {
+            format_version,
+            ..ursula_runtime::StreamSnapshot::default()
+        })
+        .unwrap()
+    };
+    let older = ursula_runtime::BACKUP_FORMAT_VERSION - 1;
+    let newer = ursula_runtime::BACKUP_FORMAT_VERSION + 1;
     for (body, expected) in [
-        (without_epoch, "has no format_epoch"),
-        (other_epoch, "unsupported format_epoch"),
+        (without_format, "has no format_epoch field".to_owned()),
+        (other_format(older), format!("is backup format {older}")),
+        (other_format(newer), format!("is backup format {newer}")),
     ] {
         let digest = blake3::hash(&body).to_hex().to_string();
         let response = http_post(
@@ -11496,7 +11501,7 @@ async fn backup_import_refuses_groups_without_this_format_epoch() {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let body = body_bytes(response).await;
         let body = std::str::from_utf8(&body).expect("utf8");
-        assert!(body.contains(expected), "{body}");
+        assert!(body.contains(&expected), "{body}");
     }
 }
 
@@ -11713,7 +11718,10 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     assert_eq!(info.status(), StatusCode::OK);
     let info: serde_json::Value =
         serde_json::from_slice(&body_bytes(info).await).expect("backup info json");
-    assert_eq!(info["format_version"], ursula_runtime::FORMAT_EPOCH);
+    assert_eq!(
+        info["format_version"],
+        ursula_runtime::BACKUP_FORMAT_VERSION
+    );
     let group_count = info["raft_group_count"].as_u64().expect("group count");
     let mut exports = Vec::new();
     for group in 0..group_count {

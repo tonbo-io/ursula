@@ -359,15 +359,15 @@ plus `snapshotStore.prefix`.
 
 ## Upgrade Limitations
 
-Ursula 0.7 (format epoch 3) cannot read the data or the backups of a 0.6
-release. Install it fresh, as a new release with new PVCs and a new
-`s3.prefix` (and, with cold storage off and S3 snapshots, a new
-`snapshotStore.prefix`). Remove `raft.storageMode`,
-`raft.allowVolatileMultiPeer` and `persistence.enabled` from values files. The
-values schema refuses them. `helm upgrade` from 0.6 stops before a second voter
-is replaced, because the first new pod finds the 0.6 data on its volume and
-exits at startup. Recover with `helm rollback`. See the operations guide's
-"Upgrading to 0.7".
+Ursula 0.9 (format epoch 5) cannot read the data of a 0.8 release. Install it
+fresh, as a new release with new PVCs and a new `s3.prefix` (and, with cold
+storage off and S3 snapshots, a new `snapshotStore.prefix`). `helm upgrade`
+from 0.8 stops before a second voter is replaced, because the first new pod
+finds the 0.8 data on its volume and exits at startup. Recover with
+`helm rollback`. Move the data with `ursulactl backup-create` on 0.8 and
+`ursulactl restore` on 0.9, and keep the 0.8 release's `server.clusterId` and
+`raft.groupCount` on the new release. See the operations guide's "Upgrading to
+0.9".
 
 Until the operator exists, Kubernetes StatefulSet rolling updates do not
 transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.
