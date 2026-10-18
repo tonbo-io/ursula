@@ -26,6 +26,7 @@ use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
+use openraft::rt::WatchReceiver;
 use openraft::type_config::alias::SnapshotOf as TypeConfigSnapshotOf;
 
 use crate::registry::SnapshotInstallError;
@@ -171,7 +172,6 @@ pub struct InProcessRaftNetworkFactory {
     registry: InProcessRaftRegistry,
     source: Option<u64>,
     policy: InProcessRaftNetworkPolicy,
-    rejoin: Option<Arc<GroupRejoin>>,
 }
 
 impl InProcessRaftNetworkFactory {
@@ -180,15 +180,7 @@ impl InProcessRaftNetworkFactory {
             registry,
             source: None,
             policy: InProcessRaftNetworkPolicy::default(),
-            rejoin: None,
         }
-    }
-
-    /// The sending node's recovery gate: replication answers that show a
-    /// follower lost its log go to it instead of to OpenRaft.
-    pub fn with_rejoin(mut self, rejoin: Arc<GroupRejoin>) -> Self {
-        self.rejoin = Some(rejoin);
-        self
     }
 
     pub fn with_source(mut self, source: u64) -> Self {
@@ -211,7 +203,6 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for InProcessRaftNetworkFactory {
             target,
             registry: self.registry.clone(),
             policy: self.policy.clone(),
-            rejoin: self.rejoin.clone(),
         }
     }
 }
@@ -281,6 +272,19 @@ pub enum InProcessRaftNetworkEvent {
         granted: bool,
         target_gate: Option<RecoveryGateStatus>,
     },
+    /// The target answered `Conflict` to an append whose previous entry is
+    /// at or below the index the sender's leadership saw it match: the
+    /// target lost entries it had acknowledged. `target_gate` is the
+    /// target's recovery gate when the request reached it. Only a replica
+    /// whose gate is closed may lose acknowledged entries, so a simulation
+    /// fails on one whose gate was `Open`.
+    ConflictBelowMatching {
+        source: Option<u64>,
+        target: u64,
+        conflict_index: u64,
+        matched_index: u64,
+        target_gate: Option<RecoveryGateStatus>,
+    },
 }
 
 type InProcessRaftNetworkObserver = Arc<dyn Fn(InProcessRaftNetworkEvent) + Send + Sync>;
@@ -298,6 +302,9 @@ struct InProcessRaftNetworkPolicyState {
     /// How long appends that carry entries take from one node to another
     /// ([`InProcessRaftNetworkPolicy::set_entries_delay`]).
     entries_delays: BTreeMap<(u64, u64), Duration>,
+    /// Targets whose `Conflict` answers the sender gets as unreachable
+    /// ([`InProcessRaftNetworkPolicy::hide_conflicts`]).
+    hidden_conflicts: BTreeSet<u64>,
 }
 
 impl Debug for InProcessRaftNetworkPolicy {
@@ -345,6 +352,31 @@ impl InProcessRaftNetworkPolicy {
         }
     }
 
+    /// Answers every `Conflict` that `target` delivers as an unreachable
+    /// target, or no longer with `false`, as a network that hides a
+    /// follower's conflicts from its leader would. OpenRaft counts a
+    /// conflict as the follower's acknowledgement of the leader, and an
+    /// error as none, so a negative control shows what hiding them costs.
+    pub fn hide_conflicts(&self, target: u64, hide: bool) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("in-process raft network policy mutex");
+        if hide {
+            inner.hidden_conflicts.insert(target);
+        } else {
+            inner.hidden_conflicts.remove(&target);
+        }
+    }
+
+    fn hides_conflicts(&self, target: u64) -> bool {
+        self.inner
+            .lock()
+            .expect("in-process raft network policy mutex")
+            .hidden_conflicts
+            .contains(&target)
+    }
+
     /// How long an append that carries entries takes from `source` to
     /// `target`.
     fn entries_delay(&self, source: Option<u64>, target: u64) -> Option<Duration> {
@@ -388,6 +420,7 @@ impl InProcessRaftNetworkPolicy {
         inner.delay = None;
         inner.partitions.clear();
         inner.entries_delays.clear();
+        inner.hidden_conflicts.clear();
         self.notify_policy_changed(InProcessRaftNetworkPolicyEvent::Clear);
     }
 
@@ -526,7 +559,6 @@ pub struct InProcessRaftNetwork {
     target: u64,
     registry: InProcessRaftRegistry,
     policy: InProcessRaftNetworkPolicy,
-    rejoin: Option<Arc<GroupRejoin>>,
 }
 
 impl InProcessRaftNetwork {
@@ -535,6 +567,23 @@ impl InProcessRaftNetwork {
             "in-process raft node {} is not registered",
             self.target
         ))
+    }
+
+    /// The index the sender's leadership under `leader` saw the target
+    /// match, if it did.
+    fn matched_by_sender(&self, leader: &VoteOf<UrsulaRaftTypeConfig>) -> Option<u64> {
+        let raft = self.registry.get(self.source?)?;
+        let metrics = raft.metrics();
+        let metrics = metrics.borrow_watched();
+        if &metrics.vote != leader {
+            return None;
+        }
+        metrics
+            .replication
+            .as_ref()?
+            .get(&self.target)?
+            .as_ref()
+            .map(|log_id| log_id.index)
     }
 
     async fn before_rpc(
@@ -621,9 +670,9 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::AppendEntries,
         });
-        let leader = rpc.vote;
-        let prev_log_id = rpc.prev_log_id;
-        let sent_last_log_id = rpc.entries.last().map(|entry| entry.log_id);
+        let matched = self.matched_by_sender(&rpc.vote);
+        let conflict_index = rpc.prev_log_id.map(|log_id| log_id.index);
+        let target_gate = target.rejoin(group).map(|rejoin| rejoin.status());
         let response = target.append_entries(group, rpc).await.map_err(|err| {
             let message = format!("remote AppendEntries on node {}: {err}", self.target);
             if refuses_overwrite(&err) {
@@ -632,19 +681,25 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
                 RPCError::Network(NetworkError::from_string(message))
             }
         })?;
-        if let Some(rejoin) = &self.rejoin
-            && rejoin.follower_lost_log(
-                self.target,
-                &leader,
-                prev_log_id.as_ref(),
-                sent_last_log_id.as_ref(),
-                &response,
-            )
-        {
-            return Err(RPCError::Network(NetworkError::from_string(format!(
-                "node {} lost Raft log entries it had acknowledged",
-                self.target
-            ))));
+        if matches!(response, AppendEntriesResponse::Conflict) {
+            if let (Some(conflict_index), Some(matched_index)) = (conflict_index, matched)
+                && conflict_index <= matched_index
+            {
+                self.policy
+                    .notify(InProcessRaftNetworkEvent::ConflictBelowMatching {
+                        source: self.source,
+                        target: self.target,
+                        conflict_index,
+                        matched_index,
+                        target_gate,
+                    });
+            }
+            if self.policy.hides_conflicts(self.target) {
+                return Err(RPCError::Unreachable(Unreachable::from_string(format!(
+                    "in-process raft hides the conflicts of node {}",
+                    self.target
+                ))));
+            }
         }
         Ok(response)
     }

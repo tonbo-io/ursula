@@ -114,7 +114,7 @@ For redundancy alerts, inspect the JSON metric `raft_maintenance.group_issues`.
 Alert on `incomplete_voter_set` or `joint_membership`, and treat a missing
 maintenance report as unavailable evidence. Also alert on nonempty
 `raft_maintenance.node_issues`. These fields remain strict when healthy
-survivors return 200 from `/__ursula/ready` during a replica rebuild.
+survivors return 200 from `/__ursula/ready` while a replica catches up.
 They are JSON report fields, not new OTLP instrument names.
 
 ```bash

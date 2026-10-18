@@ -66,7 +66,7 @@ enum Command {
     Undrain(NodeArgs),
     /// Block until one node is back as a voter in every group and caught up.
     /// Progress-gated: a node that keeps advancing is never timed out. A
-    /// node that lost entries is rebuilt by its groups' leaders meanwhile.
+    /// node that lost entries is caught up by its groups' leaders meanwhile.
     Wait(WaitArgs),
     /// Strictly verify that every configured node is a voter in every group,
     /// caught up, and observes a usable leader.

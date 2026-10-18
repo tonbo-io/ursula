@@ -7,8 +7,9 @@
 //! verbs around the platform's own restart, one node at a time: drain the
 //! node, restart it, wait until it is a caught-up voter again, undrain it. A
 //! node that lost entries it had acknowledged (a host crash under
-//! `raft.wal.fsync = never`, or a lost disk) is gated and rebuilt by its
-//! groups' leaders; waiting covers that rebuild too.
+//! `raft.wal.fsync = never`, or a lost disk) is gated, stays a voter, and
+//! its groups' leaders replicate their logs to it again. Waiting covers that
+//! catch-up too.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -226,7 +227,7 @@ pub(crate) async fn clear_maintenance_drain(client: &MetricsClient, target: &Nod
 pub struct CatchUpOptions {
     /// Abort when the target makes no catch-up progress (no new applied
     /// entries, no new voter memberships) for this long. This is the real
-    /// control: a rebuild that keeps advancing is never timed out.
+    /// control: a catch-up that keeps advancing is never timed out.
     pub stall_timeout: Duration,
     /// Absolute backstop above the stall detector.
     pub ready_timeout: Duration,
@@ -387,8 +388,8 @@ impl TargetProgress {
 }
 
 /// A target that reports no applied entries in any group after the readiness
-/// window either never attached as a learner or never came back up; plain gap
-/// numbers do not tell an operator that.
+/// window either never reached its groups' leaders or never came back up;
+/// plain gap numbers do not tell an operator that.
 fn missing_target_timeout_hint(report: &crate::plan::ReadinessReport) -> Option<&'static str> {
     let all_unapplied = !report.per_group.is_empty()
         && report
@@ -401,7 +402,8 @@ fn missing_target_timeout_hint(report: &crate::plan::ReadinessReport) -> Option<
     Some(
         "target reports no applied entries in any group; check that the \
          replacement process started and that it can reach its groups' \
-         leaders, which rebuild a replica that lost its log",
+         leaders, which replicate their logs again to a replica that lost \
+         its log",
     )
 }
 
@@ -725,7 +727,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_timeout_hint_points_to_the_leaders_rebuild() {
+    fn missing_target_timeout_hint_points_to_the_leaders_catch_up() {
         let snapshot = ClusterSnapshot {
             per_node: vec![crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(
                 7,
@@ -740,7 +742,7 @@ mod tests {
 
         let hint = missing_target_timeout_hint(&report).expect("missing target hint");
         assert!(
-            hint.contains("rebuild a replica that lost its log"),
+            hint.contains("replicate their logs again to a replica that lost its log"),
             "{hint}"
         );
     }

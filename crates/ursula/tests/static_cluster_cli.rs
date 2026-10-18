@@ -2960,8 +2960,8 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     // A voter replaced on an empty WAL directory (its disk was lost) must not
     // re-run per-group Initialize for the groups it bootstraps (2 and 5 of 6
     // for node 3): it must never become eligible to vote with nothing applied.
-    // The leaders see it lost the entries it had acknowledged and rebuild it
-    // through remove, learner, catch-up and promote with no operator.
+    // The leaders see it lost the entries it had acknowledged and rewind it in
+    // place: it stays a voter and catches up with no operator.
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping restart self-heal test");
@@ -3044,8 +3044,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     .await
     .expect("capture requires full startup recovery, not listener readiness");
     // Force the wiped replica to catch up through a snapshot. The proxy holds
-    // that transfer until we have observed the real automatic learner phase.
-    // Membership changes still come exclusively from the production heal driver.
+    // that transfer until we have observed it gated while it is still a voter.
     let before_wipe = ctl.fetch_cluster(&nodes).await.unwrap();
     for view in before_wipe.per_node.iter().filter(|view| view.node.id != 3) {
         for group in &view.groups {
@@ -3198,7 +3197,8 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     .unwrap();
 
     // Observe the actual empty-WAL recovery before allowing another maintenance
-    // operation. This exercises startup gates and learner catch-up, not a live demotion.
+    // operation: the wiped node stays a voter of every group, its gates stay
+    // closed while it cannot catch up, and the survivors serve.
     let mut readiness_nodes = nodes.clone();
     for node in &mut readiness_nodes {
         node.expected_process_incarnation = None;
@@ -3222,17 +3222,29 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
             let report: ursula_proto::admin::ServingReadiness = response.json().await.unwrap();
             serving.push((status, report));
         }
-        let target_report = snapshot.node(3).unwrap().raft_maintenance.as_ref().unwrap();
-        let target_is_learner =
-            target_report.group_issues.values().flatten().any(|issue| {
-                *issue == ursula_proto::admin::RaftMaintenanceIssue::LocalReplicaNotVoter
-            });
-        if target_is_learner
-            && snapshot.per_node.iter().all(|view| {
-                view.raft_maintenance
-                    .as_ref()
-                    .is_some_and(|report| !report.ready())
+        // No heal step removes a voter that lost its log.
+        for view in snapshot.per_node.iter().filter(|view| view.node.id != 3) {
+            for group in &view.groups {
+                assert!(
+                    group.voter_ids.contains(&3) && group.learner_ids.is_empty(),
+                    "node {} demoted the wiped voter in group {}: {snapshot:?}",
+                    view.node.id,
+                    group.raft_group_id
+                );
+            }
+        }
+        let target = snapshot.node(3).unwrap();
+        let target_gated = (0..6_u64).all(|group_id| {
+            target.group(group_id).is_some_and(|group| {
+                group.recovery_gate != ursula_proto::admin::RecoveryGateStatus::Open
             })
+        });
+        let target_unready = target
+            .raft_maintenance
+            .as_ref()
+            .is_some_and(|report| !report.ready());
+        if target_gated
+            && target_unready
             && serving[0].0 == reqwest::StatusCode::OK
             && serving[1].0 == reqwest::StatusCode::OK
         {
@@ -3244,15 +3256,11 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
                         | ursula_proto::admin::ServingReadinessReason::RecoveryGateClosed
                 )
             ));
-            for view in &snapshot.per_node {
-                let local = ursula_ctl::metrics::ClusterSnapshot {
-                    per_node: vec![view.clone()],
-                };
-                assert!(matches!(
-                    ursula_ctl::observe::check_maintenance_snapshot(&local, 1, 6),
-                    Err(ursula_ctl::observe::ReadinessRefusal::Maintenance { .. })
-                ));
-            }
+            // The gated replica's own report blocks another maintenance.
+            assert!(matches!(
+                ursula_ctl::observe::check_maintenance_snapshot(&snapshot, 3, 6),
+                Err(ursula_ctl::observe::ReadinessRefusal::Maintenance { .. })
+            ));
             let refusal = ursula_ctl::wait_ready(
                 &readiness_client,
                 &readiness_nodes,
@@ -3270,7 +3278,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         }
         assert!(
             began.elapsed() < Duration::from_secs(30),
-            "did not observe gated empty-WAL learner with serving survivors: {snapshot:?}, {serving:?}"
+            "did not observe a gated empty-WAL voter with serving survivors: {snapshot:?}, {serving:?}"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -3363,7 +3371,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    // `wait` sees the same rebuilt voter.
+    // `wait` sees the same caught-up voter.
     let outcome =
         ursula_ctl::wait_node_ready(&nodes, &nodes[2], &ctl, &ursula_ctl::CatchUpOptions {
             stall_timeout: Duration::from_secs(30),
@@ -3454,6 +3462,27 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     drop(children);
 }
 
+/// Each survivor's membership log index, by node and group.
+async fn survivor_membership_indexes(
+    ctl: &ursula_ctl::MetricsClient,
+    survivors: &[ursula_ctl::NodeInfo],
+) -> std::collections::BTreeMap<(u64, u64), Option<u64>> {
+    ctl.fetch_cluster(survivors)
+        .await
+        .expect("fetch the survivors")
+        .per_node
+        .iter()
+        .flat_map(|view| {
+            view.groups.iter().map(move |group| {
+                (
+                    (view.node.id, group.raft_group_id),
+                    group.maintenance.membership_log_index,
+                )
+            })
+        })
+        .collect()
+}
+
 fn native_host_inventory(
     nodes: &[ursula_ctl::NodeInfo],
     observation: ursula_ctl::reservation::PrefixObservation,
@@ -3514,15 +3543,35 @@ async fn append_idempotent_until_acked(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_host_recovery_keeps_ack_tail_across_abrupt_voter_loss() {
-    run_cli_host_recovery(false).await;
+    run_cli_host_recovery(CandidateFate::Recovers).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_host_recovery_restages_a_bound_candidate_without_losing_acks() {
-    run_cli_host_recovery(true).await;
+    run_cli_host_recovery(CandidateFate::DiesUnreached).await;
 }
 
-async fn run_cli_host_recovery(interrupt_candidate: bool) {
+/// #698: the candidate dies after its group leaders saw its conflict and
+/// rewound it. It stays a voter of every group, so the survivors still
+/// prove the candidate's loss and the replacement is restaged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_host_recovery_restages_a_candidate_that_dies_after_its_leaders_rewound_it() {
+    run_cli_host_recovery(CandidateFate::DiesAfterItsConflict).await;
+}
+
+/// What happens to the bound replacement candidate of a host recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateFate {
+    /// It catches up and the replacement completes.
+    Recovers,
+    /// It is killed before its group leaders reach it.
+    DiesUnreached,
+    /// It is killed once every group's leader saw its conflict, rewound it
+    /// and replicated to it.
+    DiesAfterItsConflict,
+}
+
+async fn run_cli_host_recovery(candidate_fate: CandidateFate) {
     use ursula_ctl::reservation::HostRequest;
     use ursula_ctl::reservation::HostTerminationObservation;
     use ursula_ctl::reservation::OwnershipRequest;
@@ -3720,14 +3769,19 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
         );
     }
     drop(children.pop());
-    // A candidate that dies after its group leaders started rebuilding it
-    // stays a learner in their groups, and the survivors refuse the proof that
-    // restaging needs (`docs/architecture/cluster-membership.md`). This test
-    // covers the candidate that dies first, so its leaders must not reach it
-    // until it has been killed.
-    if interrupt_candidate {
+    // A candidate that dies first: its leaders must not reach it until it has
+    // been killed.
+    if candidate_fate == CandidateFate::DiesUnreached {
         node_3_raft.partition().await;
     }
+    // The survivors' memberships before the candidate starts: no heal step
+    // changes them while it catches up (#698).
+    let survivors_before = nodes
+        .iter()
+        .filter(|node| node.id != 3)
+        .cloned()
+        .collect::<Vec<_>>();
+    let memberships_before = survivor_membership_indexes(&ctl, &survivors_before).await;
     // The replacement host starts with an empty WAL.
     remove_test_path(node_wal_dir(wal_root.path(), 3));
     std::fs::write(&replacement_config, replacement_text).unwrap();
@@ -3758,7 +3812,50 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
     let mut last_sequence = 1;
     let mut last_payload = "during-recovery";
     let mut expected_payload = b"before-faultduring-recovery".to_vec();
-    let ctl = if interrupt_candidate {
+    let ctl = if candidate_fate == CandidateFate::Recovers {
+        ctl
+    } else {
+        if candidate_fate == CandidateFate::DiesAfterItsConflict {
+            // The candidate's empty log conflicts below what its leaders had
+            // matched of the node it replaces. A leader sends it entries only
+            // once it rewound it, and it stays a voter meanwhile: no
+            // survivor's membership changes until the kill.
+            let survivors = nodes
+                .iter()
+                .filter(|node| node.id != 3)
+                .cloned()
+                .collect::<Vec<_>>();
+            let deadline = tokio::time::Instant::now()
+                .checked_add(Duration::from_secs(60))
+                .unwrap();
+            loop {
+                assert_eq!(
+                    survivor_membership_indexes(&ctl, &survivors).await,
+                    memberships_before,
+                    "a survivor changed its membership while the candidate caught up"
+                );
+                let rewound = ctl.fetch_node(&nodes[2]).await.is_ok_and(|view| {
+                    (0..6_u64).all(|group_id| {
+                        view.group(group_id)
+                            .is_some_and(|group| group.last_log_index.is_some())
+                    })
+                });
+                if rewound {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the candidate's leaders never replicated to it: {:?}",
+                    ctl.try_fetch_cluster(&nodes).await
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                survivor_membership_indexes(&ctl, &survivors).await,
+                memberships_before,
+                "a survivor changed its membership while the candidate caught up"
+            );
+        }
         let candidate = state.operation().unwrap().replacement.clone().unwrap();
         let config = children[2].config_path.clone().unwrap();
         let text = std::fs::read_to_string(&config).unwrap();
@@ -3891,10 +3988,8 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
             ctl.set_maintenance_fence(node, false).await.unwrap();
         }
         ctl
-    } else {
-        ctl
     };
-    // The leaders rebuild the replacement by themselves; the operator waits
+    // The leaders catch the replacement up by themselves; the operator waits
     // for it and lifts its startup drain.
     let outcome =
         ursula_ctl::wait_node_ready(&nodes, &nodes[2], &ctl, &ursula_ctl::CatchUpOptions {
@@ -3980,10 +4075,10 @@ async fn run_cli_host_recovery(interrupt_candidate: bool) {
             .unwrap()
             .source
             .provider_instance,
-        if interrupt_candidate {
-            "native-instance-3-restaged"
-        } else {
+        if candidate_fate == CandidateFate::Recovers {
             "native-instance-3-replacement"
+        } else {
+            "native-instance-3-restaged"
         }
     );
     assert!(

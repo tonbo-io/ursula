@@ -21,7 +21,7 @@ ursulactl verify-cluster --config manifest.json
 On bare metal the restart in the middle is `systemctl restart ursula` on the host. The drain planning and readiness logic is exercised under [deterministic simulation](/docs/architecture/overview).
 
 <Warning>
-The naive procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. A restarted voter that lost entries, for example after a host crash under `raft.wal.fsync = "never"` or with a replaced disk, stays out of elections until its group leader has rebuilt it. Always drain before restart and wait for catch-up before moving to the next voter.
+The naive procedure of "restart followers, then leader" does **not** wait for `applied_index` to catch up between steps. A restarted voter that lost entries, for example after a host crash under `raft.wal.fsync = "never"` or with a replaced disk, stays out of elections until it has caught up with its group leader. Always drain before restart and wait for catch-up before moving to the next voter.
 </Warning>
 
 ## Verbs
@@ -146,9 +146,9 @@ Per-node fields, all optional except `id`:
 
 ## Restarting a voter that lost its log
 
-A voter that shut down cleanly comes back with every entry it acknowledged and only catches up on what it missed. A voter that lost entries (a host crash under `raft.wal.fsync = "never"`, a journal I/O error, a wiped or replaced disk) needs no ursulactl verb either: it stays behind its recovery gate, and each group leader rebuilds it by itself, removing the voter, adding it back as a learner and promoting it after catch-up (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Keep the node drained and run `wait` until every group has promoted it. A group whose majority lost entries at once waits for an operator instead (see [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash)).
+A voter that shut down cleanly comes back with every entry it acknowledged and only catches up on what it missed. A voter that lost entries (a host crash under `raft.wal.fsync = "never"`, a journal I/O error, a wiped or replaced disk) needs no ursulactl verb either: it stays behind its recovery gate and stays a voter, and each group leader catches it up by itself (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Keep the node drained and run `wait` until it caught up in every group. A group whose majority lost entries at once waits for an operator instead (see [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash)).
 
-The rebuild of a voter that lost its disk installs snapshots for every group and can take 10+ minutes. `wait` is progress-gated, so no timeout tuning is needed: a rebuild that keeps advancing is never timed out, and `--stall-timeout-secs` (default 90) only aborts a node that stops making progress.
+The catch-up of a voter that lost its disk installs snapshots for every group and can take 10+ minutes. `wait` is progress-gated, so no timeout tuning is needed: a catch-up that keeps advancing is never timed out, and `--stall-timeout-secs` (default 90) only aborts a node that stops making progress.
 
 ## `status`
 

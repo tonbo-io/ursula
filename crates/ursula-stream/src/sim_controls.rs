@@ -119,6 +119,12 @@ pub enum Defence {
     /// shutdown returns once RaftCore stopped, and that work may still hold
     /// the group's log store and change its state.
     EngineWorkWait,
+    /// A group with a recovery gate runs OpenRaft with log reversion
+    /// allowed, so a leader rewinds a follower that answers a conflict below
+    /// the index it had matched and replicates its log to it again. Off,
+    /// OpenRaft treats that conflict as a bug and its debug assertion
+    /// reports it.
+    FollowerRewind,
 }
 
 #[cfg(madsim)]
@@ -128,8 +134,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 25]> = const { Cell::new([false; 25]) };
-        static FIRED: Cell<[u64; 25]> = const { Cell::new([0; 25]) };
+        static OFF: Cell<[bool; 26]> = const { Cell::new([false; 26]) };
+        static FIRED: Cell<[u64; 26]> = const { Cell::new([0; 26]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -159,6 +165,7 @@ mod switches {
             Defence::WalDirtyAge => 22,
             Defence::ExpirySweep => 23,
             Defence::EngineWorkWait => 24,
+            Defence::FollowerRewind => 25,
         }
     }
 
@@ -181,7 +188,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 25]));
+        FIRED.with(|fired| fired.set([0; 26]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

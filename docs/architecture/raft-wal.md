@@ -274,26 +274,54 @@ as a follower. A failed write stops the group. Votes for other replicas are
 never changed.
 
 **Opening.** The barrier driver asks the current leader for a fresh ReadIndex
-barrier (`RejoinBarrier`) and opens the gate once the replica applied its
-committed index. Inbound replication alone never opens it. The gate records
-`initialized`, opens, and the driver refreshes the election policy.
+barrier (`RejoinBarrier`) and opens the gate once the replica applied the
+barrier's index. That index is the higher of the read index and the leader's
+last log index read after the round (`confirm_recovery_barrier`). The read
+index alone can be too low: an acknowledgement the replica's previous process
+sent before its host crashed can reach the leader after the round and count
+the replica's lost copy of an entry toward its commit. Within one leadership
+such an acknowledgement names no entry past the leader's last log index, so a
+replica that applied that index holds every entry it could count. Inbound
+replication alone never opens the gate. The gate records `initialized`, opens,
+and the driver refreshes the election policy.
 
-**Heal and rewind.** A follower that answers `Conflict` at or below the index it
-had matched in this leadership lost entries. The network layer hands OpenRaft an
-error instead, and the heal driver removes the voter, re-adds it as a learner
-and promotes it after catch-up. It removes only when a quorum of voters,
-counting the leader, kept their log and answered within one minimum election
-timeout. Otherwise the leader, which holds every committed entry, allows
-OpenRaft one rewind per affected follower and replicates its log again. Only the
-conflict of a request carrying entries reaches OpenRaft, and an idle group gets
-an unchanged membership entry to carry the rewind. Desired voters come from the
+**Rewind in place.** A follower that answers `Conflict` at or below the index it
+had matched in this leadership lost entries. Every group with a recovery gate
+runs OpenRaft with `allow_log_reversion`, and the network passes every conflict
+to OpenRaft unchanged. The leader resets its progress for that follower on the
+first such conflict, from a heartbeat or a replication request, and replicates
+its log to it again. The follower stays a voter, and no membership entry is
+proposed. A follower checks the leader's vote before its log, so its conflict
+still counts as its acknowledgement of the leader. The leader keeps its quorum
+and its lease while the follower catches up, even when the followers that lost
+entries are a majority, as long as they kept their vote. A replica that lost
+its vote, such as one on a wiped disk, answers errors until a quorum without it
+proves a vote floor, so two such replicas of three never heal on their own.
+This is safe because the leader holds every committed entry and a replica that
+may have lost entries votes for no one until its gate opens.
+
+The heal driver observes each reversion in the leader's replication metrics. It
+logs a warning that names the group and the follower and counts it per
+follower in `ursula.raft.follower_log_reversions`. A follower that lost entries
+without a host crash or a lost disk, for example on a disk that drops synced
+writes, shows up there. The driver also adds a configured voter that is missing
+back as a learner, promotes it once it caught up, and flattens a joint
+configuration whose second step never committed. Desired voters come from the
 static configuration.
 
-**Handoff.** A leader hands off only to another voter that kept its log,
-acknowledged it within one minimum election timeout (1.5 s) and holds every
-committed entry (`ElectionPolicy::validate_handoff`, used by every planner and
-the admin transfer endpoint). If the target has not taken over within two
-maximum election timeouts (6 s), the leader steps down and campaigns.
+**Lease while followers catch up.** Gated followers renew the leader's lease
+before they caught up. If they cannot catch up, for example when one needs a
+snapshot while the snapshot store is unavailable, the leader stays live
+(`leads_live`) and a recovery plan refuses to fence the group. Writes are then
+accepted and wait for a commit, and they can time out with an unknown outcome
+instead of being refused before the proposal.
+
+**Handoff.** A leader hands off only to another voter that acknowledged it
+within one minimum election timeout (1.5 s) and holds every committed entry
+(`ElectionPolicy::validate_handoff`, used by every planner and the admin
+transfer endpoint). A follower the leader rewound is refused as lagging until
+it caught up. If the target has not taken over within two maximum election
+timeouts (6 s), the leader steps down and campaigns.
 
 **Stall and accept-unsynced-loss.** A gated replica with no barrier and no
 apply for 30 s reports its group stalled: a majority may be gated, so the group
@@ -455,7 +483,9 @@ only while a follower catches up from disk.
 `wal_recovery` in the metrics JSON, the `ursula.wal.recovering` gauge and
 `RaftWal::recovery_state` report whether and why the node opened recovering.
 `recovery_gates` and the `ursula.raft.recovery_gates` gauge list gated replicas
-and stalled groups. `/__ursula/ready` names `wal_disk_pressure`,
+and stalled groups. The `ursula.raft.follower_log_reversions` counter, labelled
+by `follower`, counts the followers a leader on this node rewound because they
+lost entries they had acknowledged. `/__ursula/ready` names `wal_disk_pressure`,
 `recovery_stalled` or `recovery_gate_closed` and reports the watermarks.
 
 ## Component boundaries
@@ -477,15 +507,16 @@ vote, because OpenRaft would start that election while still holding its old
 leader state. The check reads only the request's vote, and OpenRaft acts on a
 transfer only while the node holds that vote, so nothing slips in between.
 
-Bootstrap and heal wait on server-state and gate notifications, and the barrier
+Bootstrap waits on server-state and gate notifications, heal on every metrics
+change, so it sees a rewound follower's matched index drop, and the barrier
 driver also watches apply progress. They keep deadlines for retries and stall
-reporting and rate-limit repeated steps. If a voter loses its log during a joint
-membership change, repair restores replication before finishing it. Segment
-pressure reaches the snapshot driver through `LaggingGroups`.
+reporting and rate-limit repeated steps. Segment pressure reaches the snapshot
+driver through `LaggingGroups`.
 
 `GET /__ursula/raft/{group}/quorum`, which requires the incarnation header,
 confirms a fresh ReadIndex round with an unchanged committed leader vote and
-returns the group, leader, term and required applied index. It is an
+returns the group, leader, term and required applied index, the higher of the
+read index and the leader's last log index. It is an
 observation, not permission to remove a voter. `ursulactl` uses only the admin
 protocol and does not depend on `ursula-raft`. The fault-injection `InProcess*`
 network is compiled only under `cfg(test)` or `cfg(madsim)`.

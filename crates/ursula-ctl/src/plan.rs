@@ -155,7 +155,7 @@ pub struct GroupReadiness {
 ///      For an expected single-voter group, use its own committed prefix.
 ///   3. The target has applied something once any peer has committed past the
 ///      initial membership entry. An empty voter (a replica that lost its log
-///      and has not been rebuilt yet) is never ready, whatever the lag
+///      and has not caught up yet) is never ready, whatever the lag
 ///      tolerance: counting it ready leaves the group on two real copies.
 ///
 /// Groups invisible to the target (e.g. because it just restarted and hasn't

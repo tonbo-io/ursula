@@ -267,7 +267,7 @@ jobs:
 
       # Recovery gate: a replica that may have lost acknowledged entries (a
       # power loss under fsync = never, or a lost disk) votes only after it
-      # applied a fresh leader barrier, the leader rebuilds or rewinds it, and
+      # applied a fresh leader barrier, the leader rewinds it in place, and
       # a group whose majority is gated stops until the operator accepts the
       # loss of the unsynced tail. The filter also runs the regression
       # schedules in recovery_tests::regression: an accepted leader that

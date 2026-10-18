@@ -57,6 +57,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
 use super::recovery_wiring;
+use super::recovery_wiring::ReversionLog;
 use super::recovery_wiring::VoteLog;
 use super::sim_wal::SimNodeWal;
 
@@ -174,6 +175,8 @@ pub(super) struct JournalCluster {
     pub(super) policy: InProcessRaftNetworkPolicy,
     /// Every vote answer the network delivered.
     pub(super) votes: VoteLog,
+    /// Every conflict below a matched index the network delivered.
+    pub(super) reversions: ReversionLog,
     pub(super) wals: BTreeMap<u64, SimNodeWal>,
     registries: BTreeMap<u32, InProcessRaftRegistry>,
     pub(super) engines: BTreeMap<(u32, u64), RaftGroupEngine>,
@@ -203,6 +206,10 @@ pub(super) struct JournalCluster {
     pub(super) node_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
     /// The snapshot driver task of each running node.
     driver_tasks: BTreeMap<u64, madsim::task::JoinHandle<()>>,
+    /// Each node's registry its recovery drivers attach to, kept across its
+    /// restarts as a node's runtime keeps its own: its heal drivers count
+    /// follower log reversions there.
+    pub(super) recovery_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
 }
 
 impl JournalCluster {
@@ -287,11 +294,12 @@ impl JournalCluster {
             config.purge_batch_size = 1;
         }
         let config = Arc::new(config.validate().expect("valid raft config"));
-        let (policy, votes) = recovery_wiring::vote_recording_network_policy();
+        let (policy, votes, reversions) = recovery_wiring::vote_recording_network_policy();
         Self {
             config,
             policy,
             votes,
+            reversions,
             wals: (1..=nodes)
                 .map(|node_id| {
                     (
@@ -321,7 +329,30 @@ impl JournalCluster {
                 .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
                 .collect(),
             driver_tasks: BTreeMap::new(),
+            recovery_registries: (1..=nodes)
+                .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
+                .collect(),
         }
+    }
+
+    /// The maximum election timeout every replica runs with: OpenRaft's
+    /// leader lease.
+    #[cfg(test)]
+    pub(super) fn election_timeout_max(&self) -> Duration {
+        Duration::from_millis(self.config.election_timeout_max)
+    }
+
+    /// The recovery barrier `leader`'s replica of `group` confirms, through
+    /// the node's production registry, as the barrier RPC serves it.
+    #[cfg(test)]
+    pub(super) async fn confirm_recovery_barrier(
+        &self,
+        group: u32,
+        leader: u64,
+    ) -> Result<(ursula_raft::UrsulaVote, u64), ursula_raft::QuorumProofError> {
+        self.registries[&group]
+            .confirm_recovery_barrier(leader, RaftGroupId(group))
+            .await
     }
 
     /// Every node, the spares included.
@@ -410,8 +441,7 @@ impl JournalCluster {
             Arc::new(config),
             InProcessRaftNetworkFactory::new(registry.clone())
                 .with_source(node_id)
-                .with_policy(self.policy.clone())
-                .with_rejoin(rejoin.clone()),
+                .with_policy(self.policy.clone()),
             store,
             options,
         )
@@ -436,6 +466,7 @@ impl JournalCluster {
             &registry,
             &self.policy,
             &voters,
+            &self.recovery_registries[&node_id],
         );
         registry.register(node_id, &engine);
         if self.drivers.is_some() {
@@ -459,6 +490,8 @@ impl JournalCluster {
     pub(super) async fn stop_replica(&mut self, group: u32, node_id: u64) {
         self.registries[&group].unregister(node_id);
         self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
+        // The counts stay, the stopped engine's resources go.
+        self.recovery_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
         self.rejoins.remove(&(group, node_id));
         if let Some(engine) = self.engines.remove(&(group, node_id)) {
             engine.shutdown().await.expect("stop the replica");
@@ -491,6 +524,8 @@ impl JournalCluster {
         for group in JOURNAL_GROUPS {
             self.registries[&group].unregister(node_id);
             self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
+            // The counts stay, the stopped engine's resources go.
+            self.recovery_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
             match self.engines.remove(&(group, node_id)) {
                 Some(engine) => engine.shutdown().await.expect("stop the replica"),
                 None => {

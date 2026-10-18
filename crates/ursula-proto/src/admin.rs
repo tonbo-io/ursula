@@ -700,7 +700,6 @@ pub enum TransferRejection {
     NotRegistered,
     NotLeader,
     InvalidTarget,
-    RecoveringTarget,
     /// The target has not answered the leader recently or lacks committed
     /// entries, so the handoff could not complete now.
     UnreadyTarget,
@@ -712,10 +711,7 @@ pub enum TransferRejection {
 }
 impl TransferRejection {
     pub fn should_replan(self) -> bool {
-        matches!(
-            self,
-            Self::NotLeader | Self::RecoveringTarget | Self::UnreadyTarget
-        )
+        matches!(self, Self::NotLeader | Self::UnreadyTarget)
     }
 }
 

@@ -55,13 +55,14 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
 `/cluster/status`. Use the JSON snapshot for detailed diagnosis and
 `ursulactl wait-ready` for cluster-wide Raft readiness.
 
-### Serving during a replica rebuild
+### Serving while a replica catches up
 
 `raft_replica_unready` means local Raft participation is not safe for serving.
 Inspect `raft_maintenance.group_issues` for `local_replica_not_voter`,
 `membership_not_applied`, `not_applied`, `apply_lag` or `leader_unknown`. A
-wiped replica stays 503 while its recovery gate is closed and while it is a
-learner. Healthy surviving voters can return 200 during the repair. A voter
+wiped replica stays 503 while its recovery gate is closed and it catches up.
+It stays a voter throughout. Healthy surviving voters can return 200 during
+the repair. A voter
 leaving a joint membership also stays unready once any configuration excludes
 it. A replica whose own gate is open reports `leader_unknown` for a group that
 has no leader, for example a group stalled because a majority of its voters
@@ -190,7 +191,7 @@ or without its run state file, or with an emptied WAL directory. Under
 journal segment ended in a complete invalid frame, although no acknowledged
 write was lost. Each
 gated group waits until it has applied a fresh barrier from the group's leader,
-and its leader rebuilds the replica meanwhile. `recovery_gates` in
+and its leader catches the replica up meanwhile, which stays a voter. `recovery_gates` in
 `/__ursula/metrics` lists the gated groups. This normally clears in seconds
 once a leader is reachable. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).

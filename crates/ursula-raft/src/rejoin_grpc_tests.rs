@@ -204,15 +204,18 @@ async fn new_recovery_engine(
             .await
             .expect("open the gate"),
     );
-    let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+    // The gate goes in as the node's engine factory hands it over, so the
+    // group runs with log reversion allowed.
+    let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
         placement(),
         id,
         config,
-        GrpcRaftNetworkFactory::new(Arc::default(), placement().raft_group_id)
-            .with_rejoin(Some(gate.clone())),
+        GrpcRaftNetworkFactory::new(Arc::default(), placement().raft_group_id),
         store.clone(),
-        None,
-        None,
+        RaftGroupEngineOptions {
+            recovery: Some(gate.clone()),
+            ..Default::default()
+        },
     )
     .await
     .expect("new engine on an empty WAL");

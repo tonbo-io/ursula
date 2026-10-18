@@ -182,8 +182,7 @@ maintenance_recover_operation() {
       replace_pod "${maintenance_ordinal}" "${maintenance_source_uid}"
     else
       # An executor can have died after deletion. Binding is observation only.
-      # Do not demand complete three-voter membership during the selected
-      # target's automatic remove/learner/promote recovery interval.
+      # Do not demand that the selected target already caught up.
       log "source UID already retired; resuming only its saved replacement"
     fi
     wait_for_pod_started "${maintenance_ordinal}"
@@ -222,7 +221,7 @@ maintenance_recover_operation() {
     start_forward "${maintenance_ordinal}"
   fi
   maintenance_activate "${MANIFEST}"
-  # The replacement started drained. Its group leaders rebuild it if it lost
+  # The replacement started drained. Its group leaders catch it up if it lost
   # Raft log entries, so wait until it is a caught-up voter, then undrain it.
   "${CTL}" wait --config "${MANIFEST}" --node "${maintenance_node}" \
     --stall-timeout-secs 300 --ready-timeout-secs 1800 --lag-tolerance 16

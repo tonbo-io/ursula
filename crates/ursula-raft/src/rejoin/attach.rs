@@ -97,20 +97,42 @@ mod recovery_task_tests {
     }
 }
 
+/// What woke a recovery driver ([`wait_change`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Wake {
+    /// The Raft metrics it watches changed.
+    Metrics,
+    /// The recovery gate changed.
+    Gate,
+    /// The retry deadline passed.
+    Deadline,
+}
+
 /// A retry deadline is still needed for unavailable peers and stall reporting.
 /// Local state changes wake the driver without waiting for that deadline.
+/// `false` once the Raft or the gate is gone.
 pub(super) async fn wait_recovery_change<T: Send + Sync>(
     metrics: &mut openraft::type_config::alias::WatchReceiverOf<crate::UrsulaRaftTypeConfig, T>,
     gate: &mut openraft::type_config::alias::WatchReceiverOf<crate::UrsulaRaftTypeConfig, ()>,
     retry: Duration,
 ) -> bool {
+    wait_change(metrics, gate, retry).await.is_some()
+}
+
+/// [`wait_recovery_change`], saying what woke the driver, or `None` once the
+/// Raft or the gate is gone. Allocates nothing.
+pub(super) async fn wait_change<T: Send + Sync>(
+    metrics: &mut openraft::type_config::alias::WatchReceiverOf<crate::UrsulaRaftTypeConfig, T>,
+    gate: &mut openraft::type_config::alias::WatchReceiverOf<crate::UrsulaRaftTypeConfig, ()>,
+    retry: Duration,
+) -> Option<Wake> {
     use futures_util::future::Either;
-    let change =
-        futures_util::future::select(Box::pin(metrics.changed()), Box::pin(gate.changed()));
-    match crate::rt::time::timeout(retry, change).await {
-        Ok(Either::Left((result, _))) => result.is_ok(),
-        Ok(Either::Right((result, _))) => result.is_ok(),
-        Err(_) => true,
+    let metrics = std::pin::pin!(metrics.changed());
+    let gate = std::pin::pin!(gate.changed());
+    match crate::rt::time::timeout(retry, futures_util::future::select(metrics, gate)).await {
+        Ok(Either::Left((result, _))) => result.is_ok().then_some(Wake::Metrics),
+        Ok(Either::Right((result, _))) => result.is_ok().then_some(Wake::Gate),
+        Err(_elapsed) => Some(Wake::Deadline),
     }
 }
 
@@ -157,6 +179,7 @@ impl RecoveryGate {
             rejoin.clone(),
             nodes.clone(),
             config.interval,
+            registry.follower_log_reversion_counter(),
         )));
         rejoin.set_stall_after(config.stall_after);
         self.push(crate::rt::spawn(run_rejoin_vote_barrier(

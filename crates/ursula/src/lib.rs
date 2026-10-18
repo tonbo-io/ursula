@@ -3053,9 +3053,6 @@ fn transfer_raft_error_response(
         LeadershipTransferError::NotLeader { .. } => {
             (StatusCode::CONFLICT, TransferRejection::NotLeader)
         }
-        LeadershipTransferError::RecoveringTarget { .. } => {
-            (StatusCode::CONFLICT, TransferRejection::RecoveringTarget)
-        }
         LeadershipTransferError::UnreachableTarget { .. }
         | LeadershipTransferError::LaggingTarget { .. } => {
             (StatusCode::CONFLICT, TransferRejection::UnreadyTarget)

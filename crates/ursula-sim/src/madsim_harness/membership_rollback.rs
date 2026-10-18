@@ -147,6 +147,7 @@ use super::journal_cluster::lead_every_group;
 use super::journal_cluster::member_view;
 use super::journal_cluster::metrics;
 use super::recovery_wiring::RECOVERY_STALL_AFTER;
+use super::recovery_wiring::REVERSION_INVARIANT;
 
 pub(super) const HISTORY_INVARIANT: &str = "membership_rollback_keeps_history";
 pub(super) const UNPLANNED_LEADER_INVARIANT: &str =
@@ -1123,6 +1124,18 @@ pub(super) async fn run_membership_rollback_inner(
                 &context,
             )
             .await;
+            let unaccounted = cluster.reversions.unaccounted();
+            if !unaccounted.is_empty() {
+                fail(
+                    &mut trace,
+                    REVERSION_INVARIANT,
+                    "scenario_end",
+                    format!(
+                        "seed {}: replicas with an open gate lost acknowledged entries: {unaccounted:?}",
+                        config.seed
+                    ),
+                );
+            }
             return ThreeNodeRaftSimOutcome {
                 seed: config.seed,
                 leader_id: a,
@@ -1294,6 +1307,18 @@ pub(super) async fn run_membership_rollback_inner(
             plans: u64::try_from(plans).unwrap_or(u64::MAX),
             fenced: u64::try_from(fenced).unwrap_or(u64::MAX),
         });
+    }
+    let unaccounted = cluster.reversions.unaccounted();
+    if !unaccounted.is_empty() {
+        fail(
+            &mut trace,
+            REVERSION_INVARIANT,
+            "scenario_end",
+            format!(
+                "seed {}: replicas with an open gate lost acknowledged entries: {unaccounted:?}",
+                config.seed
+            ),
+        );
     }
     ThreeNodeRaftSimOutcome {
         seed: config.seed,

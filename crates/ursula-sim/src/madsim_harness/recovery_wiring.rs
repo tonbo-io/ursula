@@ -108,11 +108,12 @@ pub(super) fn wire_recovery(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
     voters: &BTreeMap<u64, BasicNode>,
+    recovery_registry: &RaftGroupHandleRegistry,
 ) {
     engine
         .attach_recovery(
             rejoin.clone(),
-            &RaftGroupHandleRegistry::default(),
+            recovery_registry,
             voters.clone(),
             InProcessRecoveryTransport {
                 registry: registry.clone(),
@@ -225,30 +226,105 @@ impl VoteLog {
     }
 }
 
+/// One conflict a replica answered below the index its leader had seen it
+/// match: it lost entries it had acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ReversionAnswer {
+    pub(super) source: Option<u64>,
+    pub(super) target: u64,
+    pub(super) conflict_index: u64,
+    pub(super) matched_index: u64,
+    /// The target's recovery gate when the request reached it.
+    pub(super) target_gate: Option<RecoveryGateStatus>,
+}
+
+/// The invariant a conflict below a matched index from a replica whose gate
+/// was open breaks ([`ReversionLog::unaccounted`]).
+pub(super) const REVERSION_INVARIANT: &str = "follower_reversion_needs_a_closed_gate";
+
+/// Every conflict below a matched index a simulated network delivered.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ReversionLog(Arc<Mutex<Vec<ReversionAnswer>>>);
+
+impl ReversionLog {
+    fn push(&self, answer: ReversionAnswer) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(answer);
+    }
+
+    /// How many conflicts below a matched index `target` answered.
+    #[cfg(test)]
+    pub(super) fn from(&self, target: u64) -> usize {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|answer| answer.target == target)
+            .count()
+    }
+
+    /// The conflicts below a matched index that came from a replica whose
+    /// recovery gate was open, or that has none. Only a replica that may
+    /// have lost acknowledged entries starts gated (closed, or held by a
+    /// recovery plan), so each of these is a reversion nothing accounts for
+    /// ([`REVERSION_INVARIANT`]).
+    pub(super) fn unaccounted(&self) -> Vec<ReversionAnswer> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|answer| {
+                answer
+                    .target_gate
+                    .is_none_or(|gate| gate == RecoveryGateStatus::Open)
+            })
+            .copied()
+            .collect()
+    }
+}
+
 /// A simulated network that traces as `sim_network_policy` does and also
-/// records every vote answer.
-pub(super) fn vote_recording_network_policy() -> (InProcessRaftNetworkPolicy, VoteLog) {
+/// records every vote answer and every conflict below a matched index.
+pub(super) fn vote_recording_network_policy() -> (InProcessRaftNetworkPolicy, VoteLog, ReversionLog)
+{
     let policy = InProcessRaftNetworkPolicy::default();
     let votes = VoteLog::default();
+    let reversions = ReversionLog::default();
     let recorded = votes.clone();
+    let reverted = reversions.clone();
     policy.set_observer(move |event| {
-        if let InProcessRaftNetworkEvent::VoteAnswered {
-            source,
-            target,
-            granted,
-            target_gate,
-        } = &event
-        {
-            recorded.push(VoteAnswer {
+        match &event {
+            InProcessRaftNetworkEvent::VoteAnswered {
+                source,
+                target,
+                granted,
+                target_gate,
+            } => recorded.push(VoteAnswer {
                 source: *source,
                 target: *target,
                 granted: *granted,
                 target_gate: *target_gate,
-            });
+            }),
+            InProcessRaftNetworkEvent::ConflictBelowMatching {
+                source,
+                target,
+                conflict_index,
+                matched_index,
+                target_gate,
+            } => reverted.push(ReversionAnswer {
+                source: *source,
+                target: *target,
+                conflict_index: *conflict_index,
+                matched_index: *matched_index,
+                target_gate: *target_gate,
+            }),
+            _ => {}
         }
         if let Some(event) = sim_event_from_network_event(event) {
             SimTrace::record(event);
         }
     });
-    (policy, votes)
+    (policy, votes, reversions)
 }
