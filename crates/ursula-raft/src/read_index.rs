@@ -33,7 +33,7 @@ use ursula_runtime::Proposal;
 use ursula_runtime::ReadIndexFuture;
 
 use crate::GroupLeadership;
-use crate::forward::group_engine_linearizable_read_error;
+use crate::engine::openraft_error::group_engine_linearizable_read_error;
 use crate::forward::unknown_leader;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
@@ -165,8 +165,6 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
                 Proposal::NotProposed,
             ))
         }
-        Err(fatal) => Err(GroupEngineError::new(format!(
-            "OpenRaft {OPERATION} could not apply the read index: {fatal}"
-        ))),
+        Err(fatal) => Err(crate::owner::owner_stopped(fatal)),
     }
 }

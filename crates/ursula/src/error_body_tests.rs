@@ -719,7 +719,6 @@ fn every_group_engine_error_answers_its_table_row() {
                 | GroupInfraError::RecoveryPlanFenced { .. }
                 | GroupInfraError::OwnerStopped
                 | GroupInfraError::Internal { .. }
-                | GroupInfraError::ProtoDecode { .. }
                 | GroupInfraError::UnexpectedResponse { .. }
                 | GroupInfraError::MissingStreamId { .. }
                 | GroupInfraError::Unsupported { .. }

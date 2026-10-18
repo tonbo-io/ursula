@@ -202,6 +202,7 @@ pub use registry::SingleNodeRaftNetworkFactory;
 pub use registry::SnapshotBuildError;
 pub use registry::SnapshotGcPass;
 pub use registry::SnapshotInstallError;
+pub use rejoin::GateOpenError;
 pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
 pub use rejoin::PeerGroupLog;

@@ -1890,11 +1890,8 @@ impl RaftGroupStateMachine {
         self.log_gauge.progress()
     }
 
-    pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, io::Error> {
-        self.engine
-            .snapshot(self.placement)
-            .await
-            .map_err(group_engine_io_error)
+    pub async fn group_snapshot(&mut self) -> Result<GroupSnapshot, GroupEngineError> {
+        self.engine.snapshot(self.placement).await
     }
 
     pub async fn head_stream(
@@ -2111,8 +2108,9 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                                 index,
                             }) if index == entry.log_id.index() => {
                                 return Err(GroupEngineError::Infra(
-                                    ursula_runtime::GroupInfraError::ProtoDecode {
-                                        field: "injected-after-mutation".to_owned(),
+                                    ursula_runtime::GroupInfraError::UnexpectedResponse {
+                                        expected: ursula_runtime::ResponseKind::Append,
+                                        actual: ursula_runtime::ResponseKind::Missing,
                                     },
                                 ));
                             }

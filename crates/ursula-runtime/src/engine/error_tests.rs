@@ -68,7 +68,6 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             | GroupInfraError::LogBelowSnapshot { .. }
             | GroupInfraError::ColdStore { .. }
             | GroupInfraError::Internal { .. }
-            | GroupInfraError::ProtoDecode { .. }
             | GroupInfraError::UnexpectedResponse { .. }
             | GroupInfraError::MissingStreamId { .. }
             | GroupInfraError::BootstrapWindowNotHot { .. }

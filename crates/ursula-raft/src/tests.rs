@@ -343,30 +343,53 @@ fn raft_wire_encoding_is_byte_stable_across_round_trips() {
     assert_eq!(encode_wire(&decoded_record), encoded_record);
 }
 
-#[test]
-fn required_missing_proto_field_returns_typed_proto_decode_error() {
-    let err = required::<u64>(None, "group_engine_error.error")
-        .expect_err("missing required field should decode to an error");
+/// A forwarded write that the leader refuses as a whole answers each of
+/// its commands with the leader's typed refusal, so the follower answers
+/// what the leader would have (a pending history answers `503`), where a
+/// gRPC status carried only its text.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
 
-    assert!(matches!(
-        err,
-        GroupEngineError::Infra(GroupInfraError::ProtoDecode {
-            field,
-            ..
-        }) if field == "group_engine_error.error"
-    ));
-}
-
-#[test]
-fn group_engine_error_codec_round_trips_proto_decode_kind() {
-    let err = GroupEngineError::Infra(GroupInfraError::ProtoDecode {
-        field: "group_engine_error.error".to_owned(),
+    let wal_root = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
+            .with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let service = crate::grpc::RaftGrpcService::new(registry);
+    // A data group never takes CreateBucket: the leader refuses the batch
+    // before it proposes any of it.
+    let unproposable = GroupWriteCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
+        bucket_id: "forwarded".to_owned(),
     });
-
-    let decoded: GroupEngineError =
-        decode_wire(&encode_wire(&err), "group engine error").expect("decode group engine error");
-
-    assert_eq!(decoded, err);
+    let response = service
+        .group_write(tonic::Request::new(
+            crate::raft_internal_proto::GroupWriteRequestV1 {
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                command_payloads: vec![encode_wire(&unproposable), encode_wire(&unproposable)],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a refused batch is an answer, not a gRPC error")
+        .into_inner();
+    assert_eq!(response.results.len(), 2);
+    for result in response.results {
+        assert!(!result.ok);
+        let refusal: GroupEngineError =
+            decode_wire(&result.payload, "group engine error").expect("decodes");
+        assert_eq!(
+            refusal,
+            GroupEngineError::Infra(GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::CreateBucket,
+            })
+        );
+    }
 }
 
 fn placement() -> ShardPlacement {
@@ -4269,9 +4292,7 @@ fn forwarded_reads_carry_linearizability_over_grpc() {
         follower: FollowerRead::Immutable,
         ..request.clone()
     }] {
-        let wire = crate::forward::read_stream_read_v1(&request)
-            .expect("wire read")
-            .encode_to_vec();
+        let wire = crate::forward::read_stream_read_v1(&request).encode_to_vec();
         let decoded =
             crate::raft_internal_proto::ReadStreamReadV1::decode(wire.as_slice()).expect("decode");
         let served =

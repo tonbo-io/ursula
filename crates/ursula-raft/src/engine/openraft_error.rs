@@ -1,0 +1,181 @@
+//! The one conversion from OpenRaft's errors to the group engine's error.
+//!
+//! OpenRaft's errors are not serializable, and their text names internal
+//! node addresses (a quorum error lists every member). Each conversion here
+//! logs the native error once and answers with the variant a caller acts
+//! on: a leadership refusal for a forward, `OutcomeUnknown` for a write
+//! whose answer was lost, and the setup variants for a group that does not
+//! start. A Raft core that stopped (`Fatal`) is `OwnerStopped`, through
+//! [`owner_stopped`], the conversion every owner call uses.
+
+use std::time::Duration;
+
+use openraft::Config;
+use openraft::error::ClientWriteError;
+use openraft::error::InitializeError;
+use openraft::error::LinearizableReadError;
+use openraft::error::RaftError;
+use openraft::errors::ForwardReason;
+use openraft::metrics::WaitError;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
+use ursula_runtime::LeadershipReason;
+use ursula_runtime::MembershipInitRefusal;
+use ursula_runtime::Proposal;
+use ursula_shard::RaftGroupId;
+
+use crate::GroupLeadership;
+use crate::forward::leadership_refusal;
+use crate::forward::unknown_leader;
+use crate::owner::owner_stopped;
+use crate::types::UrsulaRaftTypeConfig;
+
+type C = UrsulaRaftTypeConfig;
+
+/// `config` once OpenRaft validates it. A config it refuses is the group's
+/// [`GroupInfraError::InvalidRaftConfig`], which names the timings.
+pub(crate) fn validated_config(config: Config) -> Result<Config, GroupEngineError> {
+    let heartbeat_ms = config.heartbeat_interval;
+    let election_timeout_min_ms = config.election_timeout_min;
+    let election_timeout_max_ms = config.election_timeout_max;
+    config.validate().map_err(|source| {
+        tracing::error!(error = %source, "OpenRaft refused the group's Raft config");
+        GroupEngineError::Infra(GroupInfraError::InvalidRaftConfig {
+            heartbeat_ms,
+            election_timeout_min_ms,
+            election_timeout_max_ms,
+        })
+    })
+}
+
+/// OpenRaft's refusal to initialize the membership of `raft_group_id`.
+pub(crate) fn initialize_error(
+    raft_group_id: RaftGroupId,
+    error: RaftError<C, InitializeError<C>>,
+) -> GroupEngineError {
+    let refusal = match &error {
+        RaftError::Fatal(fatal) => return owner_stopped(fatal),
+        RaftError::APIError(InitializeError::NotAllowed(_)) => MembershipInitRefusal::NotAllowed,
+        RaftError::APIError(InitializeError::NotInMembers(_)) => {
+            MembershipInitRefusal::NotInMembers
+        }
+    };
+    tracing::error!(raft_group_id = raft_group_id.0, %error, "OpenRaft refused to initialize the group's membership");
+    GroupEngineError::Infra(GroupInfraError::MembershipInit {
+        raft_group_id,
+        refusal,
+    })
+}
+
+/// A wait of `raft_group_id`, at most `timeout`, for an expected leader that
+/// did not see it.
+pub(crate) fn leader_wait_error(
+    raft_group_id: RaftGroupId,
+    timeout: Duration,
+    error: WaitError,
+) -> GroupEngineError {
+    match error {
+        WaitError::Timeout(..) => {
+            tracing::warn!(raft_group_id = raft_group_id.0, %error, "the group observed no expected leader in time");
+            GroupEngineError::Infra(GroupInfraError::LeaderWaitTimedOut {
+                raft_group_id,
+                timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+            })
+        }
+        WaitError::ShuttingDown => owner_stopped(error),
+    }
+}
+
+/// A write that OpenRaft refused, or whose answer was lost after it took it.
+pub(crate) fn group_engine_client_write_error(
+    err: RaftError<C, ClientWriteError<C>>,
+    leadership: &GroupLeadership,
+) -> GroupEngineError {
+    match err.api_error() {
+        Some(refusal) => client_write_refusal(refusal, leadership),
+        None => {
+            tracing::warn!(error = %err, "Raft write response lost after submission");
+            GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
+        }
+    }
+}
+
+/// Map OpenRaft's refusal of a proposed write (RT1). OpenRaft forwards a
+/// write only before it appends the entry: on a replica that does not lead,
+/// a leader whose quorum lease expired, or one that is handing its
+/// leadership over. Nothing of the write applied, so the answer is a
+/// redirect or `NO_LEADER`. Only an entry OpenRaft appended and then
+/// discarded for another leader's log may still commit through that leader,
+/// so that refusal stays ambiguous. A normal write cannot fail a membership
+/// change or a precondition, so either is logged as a bug and answered as an
+/// unknown outcome.
+pub(crate) fn client_write_refusal(
+    err: &ClientWriteError<C>,
+    leadership: &GroupLeadership,
+) -> GroupEngineError {
+    match err {
+        ClientWriteError::ForwardToLeader(forward) => {
+            tracing::debug!(error = %err, "OpenRaft refused a write before appending it");
+            leadership_refusal(
+                forward_reason(forward.reason, LeadershipReason::SteppedDown),
+                Proposal::NotProposed,
+                forward.leader_id,
+                forward.leader_node.as_ref(),
+                leadership,
+            )
+        }
+        ClientWriteError::LogEntryDiscarded(forward) => {
+            tracing::debug!(error = %err, "OpenRaft discarded a proposed write");
+            leadership_refusal(
+                LeadershipReason::SteppedDown,
+                Proposal::MayHaveCommitted,
+                forward.leader_id,
+                forward.leader_node.as_ref(),
+                leadership,
+            )
+        }
+        ClientWriteError::ChangeMembershipError(_) | ClientWriteError::PreconditionFailed(_) => {
+            tracing::error!(error = %err, "OpenRaft refused a normal write with a membership or precondition error");
+            GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
+        }
+    }
+}
+
+/// Why OpenRaft forwarded a request, as a leadership refusal says it.
+/// `not_leader` is the reason for a replica that does not lead.
+fn forward_reason(reason: ForwardReason, not_leader: LeadershipReason) -> LeadershipReason {
+    match reason {
+        ForwardReason::NotLeader => not_leader,
+        ForwardReason::LeaseExpired => LeadershipReason::QuorumUnconfirmed,
+        ForwardReason::LeadershipTransfer => LeadershipReason::LeadershipTransfer,
+    }
+}
+
+/// Map a failed ReadIndex barrier (`Raft::get_read_linearizer`). Nothing was
+/// proposed. A lost leadership forwards to the known leader (503 while it is
+/// unknown), and a leader that cannot reach a quorum answers leader-unknown
+/// (503) rather than serving a view that may miss a newer leader's
+/// acknowledged writes. A stopped core is the stopped owner.
+///
+/// The answer names only the reason; the full error is logged at debug
+/// level only.
+pub(crate) fn group_engine_linearizable_read_error(
+    err: RaftError<C, LinearizableReadError<C>>,
+    operation: &'static str,
+    leadership: &GroupLeadership,
+) -> GroupEngineError {
+    tracing::debug!("OpenRaft {operation} could not confirm leadership: {err}");
+    match &err {
+        RaftError::APIError(LinearizableReadError::ForwardToLeader(forward)) => leadership_refusal(
+            forward_reason(forward.reason, LeadershipReason::Follower),
+            Proposal::NotProposed,
+            forward.leader_id,
+            forward.leader_node.as_ref(),
+            leadership,
+        ),
+        RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
+            unknown_leader(LeadershipReason::QuorumUnconfirmed, Proposal::NotProposed)
+        }
+        RaftError::Fatal(fatal) => owner_stopped(fatal),
+    }
+}

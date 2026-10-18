@@ -639,15 +639,6 @@ pub enum RecoveryGateError {
         source: CoreJournalError,
     },
     #[error(
-        "record that this replica of raft group {}, which led it, starts as a follower: {source}",
-        .raft_group_id.0
-    )]
-    StartAsFollower {
-        raft_group_id: RaftGroupId,
-        #[source]
-        source: CoreJournalError,
-    },
-    #[error(
         "raft group {} on this replica follows the live leader {leader}; a recovery plan is \
          only for a group without one",
         .raft_group_id.0
@@ -696,16 +687,6 @@ pub enum RecoveryGateError {
         .raft_group_id.0
     )]
     CutMembershipUnknown { raft_group_id: RaftGroupId },
-    #[error(
-        "raft group {}: record the plan term as the vote of the plan's leader before its Raft \
-         core starts",
-        .raft_group_id.0
-    )]
-    RaisePlanVote {
-        raft_group_id: RaftGroupId,
-        #[source]
-        source: CoreJournalError,
-    },
     #[error(
         "raft group {}'s recovery gate on this replica is {status:?}, not stalled: a leader's \
          barrier may still open it without losing anything; plan only a group whose gated \
@@ -801,17 +782,59 @@ pub enum RecoveryGateError {
         leader_term: u64,
         current_term: u64,
     },
-    #[error("run the recovery cut of raft group {}: {source}", .raft_group_id.0)]
-    Cut {
-        raft_group_id: RaftGroupId,
-        #[source]
-        source: crate::log_store::RecoveryCutError,
-    },
     #[error("restart raft group {}'s replica to run its recovery cut: {source}", .raft_group_id.0)]
     Restart {
         raft_group_id: RaftGroupId,
         #[source]
         source: Box<ursula_runtime::RuntimeError>,
+    },
+}
+
+/// A recovery gate that did not open when its replica started
+/// ([`GroupRejoin::durable`]): a write or read of the replica's log store
+/// failed, and the group does not start. The engine factory converts it
+/// once into the group's `RecoveryGateOpen` error.
+#[derive(Debug, thiserror::Error)]
+pub enum GateOpenError {
+    #[error(
+        "record that this replica of raft group {}, which led it, starts as a follower",
+        .raft_group_id.0
+    )]
+    StartAsFollower {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
+    },
+    #[error(
+        "raft group {}: drop the recovery plan whose cut cannot run",
+        .raft_group_id.0
+    )]
+    DropPlan {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
+    },
+    #[error(
+        "raft group {}: record the plan term as the vote of the plan's leader before its Raft \
+         core starts",
+        .raft_group_id.0
+    )]
+    RaisePlanVote {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
+    },
+    #[error("raft group {}: cut the log for the recovery plan", .raft_group_id.0)]
+    CutLog {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("raft group {}: record the recovery cut as done", .raft_group_id.0)]
+    CutRecord {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: CoreJournalError,
     },
 }
 
@@ -859,11 +882,7 @@ impl RecoveryGateError {
             {
                 return PlanAnswer::Unavailable;
             }
-            Self::Record { .. }
-            | Self::Cut { .. }
-            | Self::Restart { .. }
-            | Self::StartAsFollower { .. }
-            | Self::RaisePlanVote { .. } => return PlanAnswer::Failed,
+            Self::Record { .. } | Self::Restart { .. } => return PlanAnswer::Failed,
             Self::OwnerStopped { .. } | Self::NotStarted { .. } | Self::JobAborted { .. } => {
                 return PlanAnswer::Unavailable;
             }
@@ -1060,11 +1079,11 @@ impl GroupRejoin {
         node_id: u64,
         raft_group_id: RaftGroupId,
         store: &Arc<RaftGroupFileLogStore>,
-    ) -> Result<Self, RecoveryGateError> {
+    ) -> Result<Self, GateOpenError> {
         store
             .prevent_crashed_leader_resume(node_id)
             .await
-            .map_err(|source| RecoveryGateError::StartAsFollower {
+            .map_err(|source| GateOpenError::StartAsFollower {
                 raft_group_id,
                 source,
             })?;
@@ -1083,7 +1102,7 @@ impl GroupRejoin {
                 // m4 (#581 review): a leadership this replica held is for
                 // the log it cut: it never resumes it.
                 store.start_as_follower(node_id).await.map_err(|source| {
-                    RecoveryGateError::StartAsFollower {
+                    GateOpenError::StartAsFollower {
                         raft_group_id,
                         source,
                     }
@@ -1104,20 +1123,26 @@ impl GroupRejoin {
                 store
                     .drop_unrunnable_plan()
                     .await
-                    .map_err(|source| RecoveryGateError::Record {
+                    .map_err(|source| GateOpenError::DropPlan {
                         raft_group_id,
                         source,
                     })?;
                 store.start_as_follower(node_id).await.map_err(|source| {
-                    RecoveryGateError::StartAsFollower {
+                    GateOpenError::StartAsFollower {
                         raft_group_id,
                         source,
                     }
                 })?;
                 cut_refused = Some((committed, held));
             }
-            Err(source) => {
-                return Err(RecoveryGateError::Cut {
+            Err(crate::log_store::RecoveryCutError::Io(source)) => {
+                return Err(GateOpenError::CutLog {
+                    raft_group_id,
+                    source,
+                });
+            }
+            Err(crate::log_store::RecoveryCutError::Journal(source)) => {
+                return Err(GateOpenError::CutRecord {
                     raft_group_id,
                     source,
                 });
@@ -1136,7 +1161,7 @@ impl GroupRejoin {
                      log entries it acknowledged; it keeps its vote restricted"
                 );
                 store.start_as_follower(node_id).await.map_err(|source| {
-                    RecoveryGateError::StartAsFollower {
+                    GateOpenError::StartAsFollower {
                         raft_group_id,
                         source,
                     }
@@ -1152,7 +1177,7 @@ impl GroupRejoin {
             // it never resumes it (M2, #581 review).
             (Some(record), _) => {
                 store.start_as_follower(node_id).await.map_err(|source| {
-                    RecoveryGateError::StartAsFollower {
+                    GateOpenError::StartAsFollower {
                         raft_group_id,
                         source,
                     }
@@ -1175,7 +1200,7 @@ impl GroupRejoin {
                             node_id,
                         ))
                         .await
-                        .map_err(|source| RecoveryGateError::RaisePlanVote {
+                        .map_err(|source| GateOpenError::RaisePlanVote {
                             raft_group_id,
                             source,
                         })?;
@@ -1193,7 +1218,7 @@ impl GroupRejoin {
                      leader barrier"
                 );
                 store.start_as_follower(node_id).await.map_err(|source| {
-                    RecoveryGateError::StartAsFollower {
+                    GateOpenError::StartAsFollower {
                         raft_group_id,
                         source,
                     }

@@ -41,6 +41,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
+use ursula_runtime::ErrorChain;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
@@ -206,7 +207,27 @@ static GRPC_SNAPSHOT_PAYLOAD_BYTES: AtomicU64 = AtomicU64::new(0);
 static GRPC_SNAPSHOT_RESPONSE_BYTES: AtomicU64 = AtomicU64::new(0);
 use crate::registry::RaftGroupHandleRegistry;
 
-const APPEND_STREAM_BACKLOG_FULL: &str = "raft append stream backlog full";
+/// Why an AppendStream call failed: its session's byte budget stayed full
+/// until the call's deadline, or the call got a gRPC error.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum AppendCallError {
+    /// Congestion on a live stream, not a broken channel: rebuilding the
+    /// channel would not drain it. To OpenRaft the peer is unreachable, so
+    /// replication backs off.
+    #[error("raft append stream backlog full: {queued} of {budget} bytes queued")]
+    BacklogFull { queued: usize, budget: usize },
+    #[error(transparent)]
+    Status(#[from] tonic::Status),
+}
+
+impl From<AppendCallError> for tonic::Status {
+    fn from(error: AppendCallError) -> Self {
+        match error {
+            AppendCallError::BacklogFull { .. } => tonic::Status::unavailable(error.to_string()),
+            AppendCallError::Status(status) => status,
+        }
+    }
+}
 
 /// A Raft gRPC client that stamps this node's [`PeerIdentity`] on every
 /// request.
@@ -229,7 +250,7 @@ pub(crate) enum RecoveryProbeError {
     #[error("recovery RPC: {0}")]
     Rpc(#[from] tonic::Status),
     #[error("recovery payload: {0}")]
-    Payload(#[from] ursula_runtime::GroupEngineError),
+    Payload(#[from] crate::codec::WireDecodeError),
     #[error("recovery peer does not report itself as committed leader")]
     NotLeader,
 }
@@ -655,6 +676,47 @@ pub(crate) fn group_rpc_code(error: &ursula_runtime::GroupEngineError) -> tonic:
     tonic::Code::Internal
 }
 
+/// The gRPC status of a leadership transfer this node refused or could not
+/// hand to OpenRaft, its one conversion (#539): the group's own error as
+/// [`group_rpc_status`] converts it (`NOT_FOUND` for a group this node does
+/// not run), `UNAVAILABLE` for a stopped Raft core, and
+/// `FAILED_PRECONDITION` for the election policy's refusal. No refusal
+/// carries the protocol-mismatch text, so none reads as another format
+/// epoch ([`crate::format_epoch`]).
+impl From<crate::IncomingTransferError> for tonic::Status {
+    fn from(error: crate::IncomingTransferError) -> Self {
+        use crate::IncomingTransferError;
+        match error {
+            IncomingTransferError::Group(error) => group_rpc_status(error),
+            IncomingTransferError::Raft { .. } => {
+                tonic::Status::unavailable(ErrorChain(&error).to_string())
+            }
+            IncomingTransferError::OwnCommittedVote { .. }
+            | IncomingTransferError::MayNotCampaign { .. } => {
+                tonic::Status::failed_precondition(error.to_string())
+            }
+        }
+    }
+}
+
+/// The gRPC status of a recovery barrier this node could not confirm, its
+/// one conversion: `NOT_FOUND` for a group it does not run, `UNAVAILABLE`
+/// when the ReadIndex round failed, and `FAILED_PRECONDITION` when this
+/// replica does not lead (or not yet, or no longer).
+impl From<crate::QuorumProofError> for tonic::Status {
+    fn from(error: crate::QuorumProofError) -> Self {
+        use crate::QuorumProofError;
+        let code = match &error {
+            QuorumProofError::NotRegistered { .. } => tonic::Code::NotFound,
+            QuorumProofError::Read { .. } => tonic::Code::Unavailable,
+            QuorumProofError::NotLeader { .. }
+            | QuorumProofError::LeadershipChanged { .. }
+            | QuorumProofError::HistoryPending { .. } => tonic::Code::FailedPrecondition,
+        };
+        tonic::Status::new(code, error.to_string())
+    }
+}
+
 async fn handle_append_envelope(
     registry: RaftGroupHandleRegistry,
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
@@ -865,8 +927,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 request.shard_id,
                 request.raft_group_id,
                 "group_write_request",
-            )
-            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            )?;
             let entry = self
                 .registry
                 .entry(placement.raft_group_id)
@@ -875,17 +936,20 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let history = entry.history.clone();
             let commands = request
                 .command_payloads
-                .into_iter()
-                .map(|payload| decode_wire(&payload, "group command"))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+                .iter()
+                .map(|payload| decode_rpc_payload(payload, "group command"))
+                .collect::<Result<Vec<_>, _>>()?;
+            let count = commands.len();
+            // A refusal of the whole batch answers each command with it, so
+            // the sender keeps the leader's typed answer (a pending history,
+            // an unknown outcome).
             let results =
                 raft.call(move |raft| async move {
                     write_commands_on_raft(raft, &history, commands).await
                 })
                 .await
-                .map_err(|err| tonic::Status::unavailable(err.to_string()))?
-                .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+                .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
+                .unwrap_or_else(|refusal| vec![Err(refusal); count]);
             let results = results
                 .into_iter()
                 .map(|result| match result {
@@ -921,15 +985,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .confirm_recovery_barrier(group)
             .await
-            .map_err(|error| match error {
-                crate::QuorumProofError::NotRegistered { .. } => {
-                    tonic::Status::not_found(error.to_string())
-                }
-                crate::QuorumProofError::Read { .. } => {
-                    tonic::Status::unavailable(error.to_string())
-                }
-                _ => tonic::Status::failed_precondition(error.to_string()),
-            })?;
+            .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&vote),
@@ -954,7 +1010,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .handle_transfer_leader(raft_group_id, openraft_request)
             .await
-            .map_err(|err| tonic::Status::failed_precondition(err.to_string()))?;
+            .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {
                 response: encode_wire(&response),
@@ -977,8 +1033,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 request.shard_id,
                 request.raft_group_id,
                 "group_read_request",
-            )
-            .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?;
+            )?;
             let entry = self
                 .registry
                 .entry(placement.raft_group_id)
@@ -1015,9 +1070,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         log_gauge,
                     };
                     let stream_id = BucketStreamId::new(request.bucket_id, request.stream_id);
-                    let result = match required(request.read, "group_read.read")
-                        .map_err(|err| tonic::Status::invalid_argument(err.to_string()))?
-                    {
+                    let result = match required(request.read, "group_read.read")? {
                         raft_internal_proto::group_read_request_v1::Read::Head(head) => engine
                             .head_stream(
                                 head_stream_request_from_v1(stream_id, request.now_ms, head),
@@ -1042,7 +1095,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     Ok::<_, tonic::Status>(result)
                 })
                 .await
-                .map_err(|err| tonic::Status::unavailable(err.to_string()))??;
+                .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))??;
             let response = match result {
                 Ok(response) => response,
                 Err(err) => raft_internal_proto::GroupReadResponseV1 {
@@ -1103,8 +1156,12 @@ pub(crate) fn read_stream_request_from_v1(
 
 /// Decode a MessagePack RPC payload carried inside a proto envelope, mapping
 /// failures to `InvalidArgument`.
-fn decode_rpc_payload<T: DeserializeOwned>(bytes: &[u8], what: &str) -> Result<T, GrpcRpcError> {
-    decode_wire(bytes, what).map_err(|err| GrpcRpcError::invalid_argument(err.to_string()))
+fn decode_rpc_payload<T: DeserializeOwned>(
+    bytes: &[u8],
+    what: &'static str,
+) -> Result<T, GrpcRpcError> {
+    decode_wire(bytes, what)
+        .map_err(|err| GrpcRpcError::invalid_argument(ErrorChain(&err).to_string()))
 }
 
 /// Validate the shared protocol-version + registered-group preamble carried by
@@ -1408,7 +1465,7 @@ impl GrpcRaftNetwork {
         &self,
         envelope: raft_internal_proto::RaftRpcEnvelopeV1,
         option: RPCOption,
-    ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
+    ) -> Result<raft_internal_proto::RaftRpcAckV1, AppendCallError> {
         let client = self
             .client()
             .map_err(|err| tonic::Status::unavailable(err.to_string()))?;
@@ -1435,14 +1492,14 @@ impl GrpcRaftNetwork {
         };
         let Some(permit) = admitted else {
             GRPC_APPEND_STREAM_BACKPRESSURE_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return Err(tonic::Status::unavailable(format!(
-                "{APPEND_STREAM_BACKLOG_FULL}: {} of {} bytes queued",
-                self.transport
+            return Err(AppendCallError::BacklogFull {
+                queued: self
+                    .transport
                     .budget
                     .bytes
                     .saturating_sub(session.budget.available_permits()),
-                self.transport.budget.bytes,
-            )));
+                budget: self.transport.budget.bytes,
+            });
         };
         let queued = QueuedAppendBytes::new(
             permit,
@@ -1460,13 +1517,15 @@ impl GrpcRaftNetwork {
             })
             .map_err(|_closed| tonic::Status::unavailable("raft append stream is closed"))?;
         match tokio::time::timeout_at(deadline, response_receiver).await {
-            Ok(Ok(result)) => result,
+            Ok(Ok(result)) => Ok(result?),
             Ok(Err(_)) => Err(tonic::Status::unavailable(
                 "raft append stream closed without a response",
-            )),
+            )
+            .into()),
             Err(_) => Err(tonic::Status::deadline_exceeded(
                 "raft append stream exceeded the OpenRaft hard TTL",
-            )),
+            )
+            .into()),
         }
     }
 
@@ -1480,12 +1539,11 @@ impl GrpcRaftNetwork {
                 self.note_success();
                 Ok(ack)
             }
-            Err(status) => {
+            Err(error) => {
                 // A full queue is congestion on a live stream, not a broken channel: rebuilding
                 // the channel would not drain it.
-                let backpressure = status.code() == tonic::Code::Unavailable
-                    && status.message().starts_with(APPEND_STREAM_BACKLOG_FULL);
-                let (mapped, _) = self.map_tonic_status("AppendStream", status);
+                let backpressure = matches!(error, AppendCallError::BacklogFull { .. });
+                let (mapped, _) = self.map_tonic_status("AppendStream", error.into());
                 // The append stream's calls only see a refused stream close; the
                 // session recorded the refusal. Like a full queue, it is not a
                 // broken channel.
@@ -1507,13 +1565,15 @@ impl GrpcRaftNetwork {
     /// Decode the MessagePack payload of an envelope-style ack.
     fn decode_rpc_ack<T: DeserializeOwned>(
         &self,
-        route: &str,
+        route: &'static str,
         payload: &[u8],
     ) -> Result<T, RPCError<UrsulaRaftTypeConfig>> {
         decode_wire(payload, route).map_err(|err| {
             raft_rpc_network_error(format!(
-                "decode {route} response from node {} at {}: {err}",
-                self.target, self.endpoint
+                "{route} response from node {} at {}: {}",
+                self.target,
+                self.endpoint,
+                ErrorChain(&err)
             ))
         })
     }
@@ -2300,14 +2360,14 @@ mod reconnect_tests {
             let result = network
                 .try_append_stream(envelope(), RPCOption::new(Duration::from_millis(1)))
                 .await;
-            let status = result.expect_err("a stalled peer never answers");
-            match status.code() {
-                tonic::Code::DeadlineExceeded => timed_out += 1,
-                tonic::Code::Unavailable => {
-                    assert!(status.message().starts_with(APPEND_STREAM_BACKLOG_FULL));
-                    rejected += 1;
+            match result.expect_err("a stalled peer never answers") {
+                AppendCallError::Status(status)
+                    if status.code() == tonic::Code::DeadlineExceeded =>
+                {
+                    timed_out += 1;
                 }
-                code => panic!("unexpected status {code:?}"),
+                AppendCallError::BacklogFull { .. } => rejected += 1,
+                other => panic!("unexpected error {other:?}"),
             }
         }
         // Only what fits the budget was queued (and is still held: nothing drained it).
@@ -2373,14 +2433,13 @@ mod reconnect_tests {
             .try_append_stream(envelope(2, 16), RPCOption::new(Duration::from_millis(50)))
             .await
             .expect_err("the small call waits behind the large one");
-        assert_eq!(small.code(), tonic::Code::Unavailable);
-        assert!(small.message().starts_with(APPEND_STREAM_BACKLOG_FULL));
+        assert!(matches!(small, AppendCallError::BacklogFull { .. }));
 
         drop(others);
         let large = large.await.expect("large call task");
         // Admitted and queued; the stalled peer never answers it.
         assert_eq!(
-            large.expect_err("stalled peer").code(),
+            tonic::Status::from(large.expect_err("stalled peer")).code(),
             tonic::Code::DeadlineExceeded
         );
         transport
@@ -2474,11 +2533,8 @@ mod reconnect_tests {
 
         let results = futures_util::future::join_all(calls).await;
 
-        assert!(results.iter().all(|result| {
-            result
-                .as_ref()
-                .expect_err("missing group should fail")
-                .code()
+        assert!(results.into_iter().all(|result| {
+            tonic::Status::from(result.expect_err("missing group should fail")).code()
                 == tonic::Code::NotFound
         }));
         assert!(
@@ -2517,10 +2573,12 @@ mod reconnect_tests {
         );
         // Each call waits for its answer, so each goes out in a frame of its own.
         for envelope in [large.clone(), large, envelope_of(1024)] {
-            let status = network
-                .try_append_stream(envelope, RPCOption::new(Duration::from_secs(10)))
-                .await
-                .expect_err("the peer hosts no group");
+            let status = tonic::Status::from(
+                network
+                    .try_append_stream(envelope, RPCOption::new(Duration::from_secs(10)))
+                    .await
+                    .expect_err("the peer hosts no group"),
+            );
             // The peer answered the call, so its frame went out.
             assert_eq!(status.code(), tonic::Code::NotFound);
         }
@@ -2553,12 +2611,11 @@ mod reconnect_tests {
         );
 
         assert_eq!(
-            first_result.expect_err("missing group should fail").code(),
+            tonic::Status::from(first_result.expect_err("missing group should fail")).code(),
             tonic::Code::NotFound
         );
         assert_eq!(
-            second_result
-                .expect_err("second missing group should fail")
+            tonic::Status::from(second_result.expect_err("second missing group should fail"))
                 .code(),
             tonic::Code::NotFound
         );
@@ -2587,7 +2644,7 @@ mod reconnect_tests {
             .try_append_stream(envelope(1), RPCOption::new(Duration::from_secs(2)))
             .await;
         assert_eq!(
-            result.expect_err("missing group should still fail").code(),
+            tonic::Status::from(result.expect_err("missing group should still fail")).code(),
             tonic::Code::NotFound
         );
         let replacement_sender = transport
@@ -2898,7 +2955,6 @@ mod group_rpc_status_tests {
                 | GroupInfraError::RecoveryPending { .. }
                 | GroupInfraError::ColdStore { .. }
                 | GroupInfraError::Internal { .. }
-                | GroupInfraError::ProtoDecode { .. }
                 | GroupInfraError::ColdBackpressure { .. }
                 | GroupInfraError::RaftUncommittedBackpressure { .. }
                 | GroupInfraError::UnexpectedResponse { .. }
@@ -2922,6 +2978,95 @@ mod group_rpc_status_tests {
         for error in ursula_runtime::group_engine_error_samples() {
             let code = expected(&error);
             assert_eq!(group_rpc_status(error.clone()).code(), code, "{error:?}");
+        }
+    }
+
+    /// #539: a leadership transfer this node refused or could not take
+    /// answers a precise code, and none reads as another format epoch's
+    /// protocol mismatch.
+    #[test]
+    fn transfer_refusals_answer_precise_codes_and_never_a_protocol_mismatch() {
+        use crate::IncomingTransferError;
+        let group = ursula_shard::RaftGroupId(7);
+        let cases = [
+            (
+                IncomingTransferError::Group(GroupEngineError::Infra(
+                    GroupInfraError::RaftGroupNotRegistered {
+                        raft_group_id: group,
+                    },
+                )),
+                Code::NotFound,
+            ),
+            (
+                IncomingTransferError::Group(GroupEngineError::Infra(
+                    GroupInfraError::OwnerStopped,
+                )),
+                Code::Unavailable,
+            ),
+            (
+                IncomingTransferError::OwnCommittedVote {
+                    group,
+                    vote: crate::UrsulaVote::new_committed(3, 1),
+                },
+                Code::FailedPrecondition,
+            ),
+            (
+                IncomingTransferError::MayNotCampaign { group },
+                Code::FailedPrecondition,
+            ),
+            (
+                IncomingTransferError::Raft {
+                    group,
+                    source: openraft::error::Fatal::Stopped,
+                },
+                Code::Unavailable,
+            ),
+        ];
+        for (error, code) in cases {
+            let status = tonic::Status::from(error);
+            assert_eq!(status.code(), code, "{status:?}");
+            assert!(
+                !crate::format_epoch::is_protocol_mismatch(&status),
+                "{status:?}"
+            );
+        }
+    }
+
+    /// A recovery barrier this node could not confirm answers a precise
+    /// code, and none reads as a protocol mismatch.
+    #[test]
+    fn barrier_refusals_answer_precise_codes_and_never_a_protocol_mismatch() {
+        use crate::QuorumProofError;
+        let group = ursula_shard::RaftGroupId(7);
+        let cases = [
+            (QuorumProofError::NotRegistered { group }, Code::NotFound),
+            (
+                QuorumProofError::Read {
+                    group,
+                    source: GroupEngineError::Infra(GroupInfraError::OwnerStopped),
+                },
+                Code::Unavailable,
+            ),
+            (
+                QuorumProofError::NotLeader { group },
+                Code::FailedPrecondition,
+            ),
+            (
+                QuorumProofError::LeadershipChanged { group },
+                Code::FailedPrecondition,
+            ),
+            (
+                QuorumProofError::HistoryPending { group },
+                Code::FailedPrecondition,
+            ),
+        ];
+        for (error, code) in cases {
+            let status = tonic::Status::from(error);
+            assert_eq!(status.code(), code, "{status:?}");
+            assert!(
+                !crate::format_epoch::is_protocol_mismatch(&status),
+                "{status:?}"
+            );
         }
     }
 }

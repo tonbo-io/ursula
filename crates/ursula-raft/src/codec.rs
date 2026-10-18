@@ -2,7 +2,7 @@
 //! the openraft envelope types.
 //!
 //! The canonical types ([`GroupWriteCommand`], [`ursula_runtime::GroupWriteResponse`],
-//! [`GroupEngineError`], the forwarded read responses) and openraft's own
+//! [`ursula_runtime::GroupEngineError`], the forwarded read responses) and openraft's own
 //! serde-capable RPC/log types travel as self-describing MessagePack produced
 //! directly by their serde derives — there are no hand-written per-field proto
 //! mirrors. MessagePack with named struct fields is self-describing, so a
@@ -14,12 +14,24 @@
 use bytes::Bytes;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupInfraError;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
+
+use crate::grpc::GrpcRpcError;
+
+/// A wire value that does not decode. Each caller converts it once: the
+/// Raft gRPC plane refuses the request as `INVALID_ARGUMENT`, a follower
+/// answers a forwarded RPC's undecodable answer as
+/// `ForwardedAnswerInvalid`, and an outbound RPC fails as a network error.
+#[derive(Debug, thiserror::Error)]
+#[error("decode wire {what}")]
+pub(crate) struct WireDecodeError {
+    pub(crate) what: &'static str,
+    #[source]
+    pub(crate) source: rmp_serde::decode::Error,
+}
 
 /// Encodes a canonical value into its MessagePack wire form.
 ///
@@ -33,20 +45,22 @@ pub(crate) fn encode_wire<T: Serialize>(value: &T) -> Bytes {
 
 pub(crate) fn decode_wire<T: DeserializeOwned>(
     bytes: &[u8],
-    what: &str,
-) -> Result<T, GroupEngineError> {
-    rmp_serde::from_slice(bytes)
-        .map_err(|err| GroupEngineError::new(format!("decode wire {what}: {err}")))
+    what: &'static str,
+) -> Result<T, WireDecodeError> {
+    rmp_serde::from_slice(bytes).map_err(|source| WireDecodeError { what, source })
 }
 
+/// The placement a Raft gRPC request names, refused as `INVALID_ARGUMENT`
+/// when its core id does not fit.
 pub(crate) fn placement_from_parts(
     core_id: u32,
     shard_id: u32,
     raft_group_id: u32,
     field: &str,
-) -> Result<ShardPlacement, GroupEngineError> {
-    let core_id = u16::try_from(core_id)
-        .map_err(|_overflow| GroupEngineError::new(format!("{field}.core_id does not fit u16")))?;
+) -> Result<ShardPlacement, GrpcRpcError> {
+    let core_id = u16::try_from(core_id).map_err(|_overflow| {
+        GrpcRpcError::invalid_argument(format!("{field}.core_id does not fit u16"))
+    })?;
     Ok(ShardPlacement {
         core_id: CoreId(core_id),
         shard_id: ShardId(shard_id),
@@ -54,8 +68,10 @@ pub(crate) fn placement_from_parts(
     })
 }
 
-pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GroupEngineError> {
-    value.ok_or_else(|| GroupEngineError::Infra(GroupInfraError::proto_decode(field)))
+/// A field a Raft gRPC request must carry, refused as `INVALID_ARGUMENT`
+/// when it is missing.
+pub(crate) fn required<T>(value: Option<T>, field: &str) -> Result<T, GrpcRpcError> {
+    value.ok_or_else(|| GrpcRpcError::invalid_argument(format!("missing {field}")))
 }
 
 #[cfg(test)]
@@ -106,7 +122,7 @@ mod tests {
             name: &str,
         ) -> T {
             let bytes: Vec<u8> = serde_json::from_value(fixtures[name].clone()).unwrap();
-            let value: T = decode_wire(&bytes, name).unwrap();
+            let value: T = decode_wire(&bytes, "fixture").unwrap();
             assert_eq!(encode_wire(&value).as_ref(), bytes.as_slice());
             value
         }
@@ -236,7 +252,7 @@ mod tests {
                 .collect();
         for (name, bytes) in &actual {
             let decoded: ursula_runtime::GroupEngineError =
-                decode_wire(bytes, name).expect("a sample decodes");
+                decode_wire(bytes, "sample").expect("a sample decodes");
             assert_eq!(&encode_wire(&decoded)[..], bytes.as_slice(), "{name}");
             assert_eq!(&format!("{decoded:?}"), name);
         }

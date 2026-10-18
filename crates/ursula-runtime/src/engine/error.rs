@@ -199,6 +199,8 @@ pub enum ResponseKind {
     BucketCreated,
     BucketAlreadyExists,
     StreamError,
+    /// Any group write's answer, which a normal Raft entry gets.
+    GroupWrite,
     /// OpenRaft's answer to a blank entry.
     RaftBlank,
     /// OpenRaft's answer to a membership entry.
@@ -521,8 +523,6 @@ pub enum GroupInfraError {
     ColdStore { operation: ColdOperation },
     #[error("{message}")]
     Internal { message: String },
-    #[error("ProtoDecode: protobuf raft payload missing {field}")]
-    ProtoDecode { field: String },
     #[error(
         "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
     )]
@@ -636,12 +636,6 @@ impl GroupInfraError {
         }
     }
 
-    pub fn proto_decode(field: impl Into<String>) -> Self {
-        Self::ProtoDecode {
-            field: field.into(),
-        }
-    }
-
     pub fn cold_backpressure(
         stream_id: BucketStreamId,
         before_group_hot_bytes: u64,
@@ -702,7 +696,6 @@ impl GroupInfraError {
             | Self::OutcomeUnknown
             | Self::ColdStore { .. }
             | Self::Internal { .. }
-            | Self::ProtoDecode { .. }
             | Self::UnexpectedResponse { .. }
             | Self::MissingStreamId { .. }
             | Self::Unsupported { .. }
@@ -751,7 +744,6 @@ impl GroupInfraError {
             | Self::OutcomeUnknown
             | Self::ColdStore { .. }
             | Self::Internal { .. }
-            | Self::ProtoDecode { .. }
             | Self::UnexpectedResponse { .. }
             | Self::MissingStreamId { .. }
             | Self::BootstrapWindowNotHot { .. }
@@ -790,7 +782,6 @@ impl GroupInfraError {
             | Self::RecoveryPending { .. }
             | Self::ColdStore { .. }
             | Self::Internal { .. }
-            | Self::ProtoDecode { .. }
             | Self::ColdBackpressure { .. }
             | Self::RaftUncommittedBackpressure { .. }
             | Self::UnexpectedResponse { .. }
