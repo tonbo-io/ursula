@@ -27,6 +27,7 @@ use super::GroupSnapshotError;
 use super::KnownLeader;
 use super::LeadershipReason;
 use super::LeadershipRefusal;
+use super::LogPosition;
 use super::MembershipInitRefusal;
 use super::Proposal;
 use super::ResponseKind;
@@ -289,6 +290,20 @@ fn infra_errors() -> Vec<GroupInfraError> {
             raft_group_id: GROUP,
             committed: 12,
             held: Some(10),
+        },
+        GroupInfraError::LogBelowSnapshot { .. } => GroupInfraError::LogBelowSnapshot {
+            core_id: CoreId(2),
+            raft_group_id: GROUP,
+            snapshot: LogPosition {
+                term: 2,
+                node_id: 2,
+                index: 3,
+            },
+            held: LogPosition {
+                term: 1,
+                node_id: 1,
+                index: 5,
+            },
         },
         GroupInfraError::UnrelatedHistory { .. } => GroupInfraError::UnrelatedHistory {
             raft_group_id: GROUP,

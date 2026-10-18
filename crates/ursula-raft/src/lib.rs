@@ -66,6 +66,10 @@ mod owner;
 pub use leadership::GroupLeadership;
 pub use leadership::LeaderRole;
 pub use owner::OwnerRaftHandle;
+#[cfg(any(test, feature = "fault-injection"))]
+pub use owner::StepDown;
+#[cfg(any(test, feature = "fault-injection"))]
+pub use owner::StepDownError;
 mod codec;
 mod election;
 mod engine;
@@ -157,6 +161,8 @@ pub use log_store::RaftWal;
 pub use log_store::RaftWalError;
 pub use log_store::RecoveryRecord;
 pub use log_store::RecoveryState;
+pub use log_store::SnapshotOrderError;
+pub use log_store::SnapshotRecord;
 pub use log_store::WalMaintenance;
 pub use log_store::WalOpening;
 pub use log_store::generate_cluster_id;

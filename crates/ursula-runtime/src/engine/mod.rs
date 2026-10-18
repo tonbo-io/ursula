@@ -20,6 +20,7 @@ pub use error::GroupSnapshotError;
 pub use error::KnownLeader;
 pub use error::LeadershipReason;
 pub use error::LeadershipRefusal;
+pub use error::LogPosition;
 pub use error::MembershipInitRefusal;
 pub use error::Proposal;
 pub use error::ResponseKind;

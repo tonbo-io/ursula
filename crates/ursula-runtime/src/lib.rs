@@ -192,6 +192,7 @@ pub use engine::HistoryWatch;
 pub use engine::KnownLeader;
 pub use engine::LeadershipReason;
 pub use engine::LeadershipRefusal;
+pub use engine::LogPosition;
 pub use engine::MembershipInitRefusal;
 pub use engine::Proposal;
 pub use engine::ResponseKind;

@@ -1862,7 +1862,13 @@ async fn a_new_raft_term_lists_the_stream_again() {
         .leadership(RaftGroupId(0))
         .expect("leadership")
         .term;
-    raft.trigger().elect(false).await.expect("elect again");
+    // An election on a leader keeps its leader state (#721): step down to a
+    // node outside the single-voter membership first, as production does.
+    let stepped_down = raft
+        .step_down_and_campaign(2)
+        .await
+        .expect("step down and campaign");
+    assert!(matches!(stepped_down, ursula_raft::StepDown::Campaigned));
     raft.wait(Some(Duration::from_secs(5)))
         .metrics(
             |metrics| metrics.current_term > term && metrics.state == openraft::ServerState::Leader,

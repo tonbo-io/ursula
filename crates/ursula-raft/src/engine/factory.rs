@@ -234,56 +234,56 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 .open(placement, metrics.clone())
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let apply_stop_signal = log_store.apply_stop_signal();
+            let snapshot_record = log_store.snapshot_record();
             let health = crate::apply_failure::ApplyHealth::default();
-            let engine = RaftGroupEngine::new_single_node_observed(
-                placement,
-                SINGLE_NODE_ID,
-                BasicNode::new("local"),
-                config,
-                log_store,
-                RaftGroupEngineOptions {
-                    apply_stop_signal: Some(apply_stop_signal),
-                    #[cfg(test)]
-                    apply_fault: self
-                        .fail_apply_at
-                        .filter(|(group, _)| *group == placement.raft_group_id)
-                        .map(
-                            |(_, index)| crate::apply_failure::ApplyFault::PanicAfterMutation {
-                                index,
-                            },
-                        ),
-                    metrics: Some(metrics),
-                    cold_store: self.cold_store.clone(),
-                    snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
-                    snapshot_build: self
-                        .registry
-                        .as_ref()
-                        .filter(|_| self.engine_config.is_some())
-                        .map(RaftGroupHandleRegistry::snapshot_build_coordinator),
-                    snapshot_install: self
-                        .registry
-                        .as_ref()
-                        .filter(|_| self.engine_config.is_some())
-                        .map(RaftGroupHandleRegistry::snapshot_install_coordinator),
-                    #[cfg(test)]
-                    work_stop_timeout: self.work_stop_timeout,
-                    engine_work: Some(self.log_stores.engine_work_ledger()),
-                    ..Default::default()
-                },
-                health.clone(),
-            )
-            .await
-            .inspect_err(|_error| {
-                if let Some(stopped) = health.stopped()
-                    && let Some(registry) = &self.registry
-                {
-                    registry.register_apply_stopped(
-                        placement.raft_group_id,
-                        SINGLE_NODE_ID,
-                        stopped,
-                    );
-                }
-            })?;
+            let engine =
+                RaftGroupEngine::new_single_node_observed(
+                    placement,
+                    SINGLE_NODE_ID,
+                    BasicNode::new("local"),
+                    config,
+                    log_store,
+                    RaftGroupEngineOptions {
+                        apply_stop_signal: Some(apply_stop_signal),
+                        #[cfg(test)]
+                        apply_fault: self
+                            .fail_apply_at
+                            .filter(|(group, _)| *group == placement.raft_group_id)
+                            .map(|(_, index)| {
+                                crate::apply_failure::ApplyFault::PanicAfterMutation { index }
+                            }),
+                        metrics: Some(metrics),
+                        cold_store: self.cold_store.clone(),
+                        snapshot_record: Some(snapshot_record),
+                        snapshot_build: self
+                            .registry
+                            .as_ref()
+                            .filter(|_| self.engine_config.is_some())
+                            .map(RaftGroupHandleRegistry::snapshot_build_coordinator),
+                        snapshot_install: self
+                            .registry
+                            .as_ref()
+                            .filter(|_| self.engine_config.is_some())
+                            .map(RaftGroupHandleRegistry::snapshot_install_coordinator),
+                        #[cfg(test)]
+                        work_stop_timeout: self.work_stop_timeout,
+                        engine_work: Some(self.log_stores.engine_work_ledger()),
+                        ..Default::default()
+                    },
+                    health.clone(),
+                )
+                .await
+                .inspect_err(|_error| {
+                    if let Some(stopped) = health.stopped()
+                        && let Some(registry) = &self.registry
+                    {
+                        registry.register_apply_stopped(
+                            placement.raft_group_id,
+                            SINGLE_NODE_ID,
+                            stopped,
+                        );
+                    }
+                })?;
             if let Some(registry) = &self.registry {
                 registry.register_engine(&engine);
             }
@@ -561,6 +561,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures)
                 .with_rejoin(Some(rejoin.clone()));
             let apply_stop_signal = store.apply_stop_signal();
+            let snapshot_record = store.snapshot_record();
             let health = crate::apply_failure::ApplyHealth::default();
             let engine = RaftGroupEngine::new_node_observed(
                 placement,
@@ -580,7 +581,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                         .apply_fault
                         .filter(|(group, _)| *group == placement.raft_group_id)
                         .map(|(_, fault)| fault),
-                    snapshot_metadata_path: Some(self.log_stores.snapshot_metadata_path(placement)),
+                    snapshot_record: Some(snapshot_record),
                     recovery: Some(rejoin.clone()),
                     peer_cluster: Some(self.registry.peer_cluster().clone()),
                     #[cfg(test)]

@@ -637,6 +637,17 @@ impl GroupLog {
             .or(self.last_purged.filter(|purged| purged.index == index))
     }
 
+    /// An entry this log holds at or after `snapshot`'s index that is
+    /// below `snapshot` in log-id order, if any: the last entry of the
+    /// first leader's run with a lower leader id. Entries at or after the
+    /// index with `snapshot`'s own leader id are at or above it.
+    pub(crate) fn held_below_snapshot(&self, snapshot: LogId) -> Option<LogId> {
+        let last = self.last_index().filter(|last| *last >= snapshot.index)?;
+        self.key_log_ids(snapshot.index, last)
+            .into_iter()
+            .find(|key| *key < snapshot)
+    }
+
     /// The last log id of each leader's run of entries within
     /// `first..=last`, as OpenRaft's key log ids are.
     pub(crate) fn key_log_ids(&self, first: u64, last: u64) -> Vec<LogId> {

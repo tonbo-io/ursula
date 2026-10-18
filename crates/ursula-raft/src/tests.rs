@@ -1754,6 +1754,117 @@ fn assert_refused<T>(what: &str, result: Result<T, GroupEngineError>) {
     }
 }
 
+/// A ReadIndex round answers with its full read log id, and that id names
+/// the leadership the round confirmed: the leader's committed vote. A
+/// replica that does not lead confirms no round.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn the_read_index_barrier_names_the_leadership_of_its_round() {
+    use openraft::rt::WatchReceiver;
+
+    let (_registry, engines, leader, _wal_roots) =
+        build_three_node_cluster("ursula-read-log-id-test", None).await;
+    let leader_index = usize::try_from(leader - 1).expect("leader id fits usize");
+    let engine = &engines[leader_index];
+    create_stream_via_raft(engine, bsid("read-log-id")).await;
+    let vote = engine.raft.metrics().borrow_watched().vote;
+    assert!(vote.is_committed());
+
+    let read_log_id = engine
+        .read_barrier
+        .confirm_read_log_id()
+        .await
+        .expect("a round with a live quorum")
+        .expect("the leader confirms its round");
+    assert_eq!(
+        *read_log_id.committed_leader_id(),
+        vote.leader_id().to_committed()
+    );
+    let after = engine.raft.metrics().borrow_watched().clone();
+    assert_eq!(after.vote, vote, "the leadership did not change meanwhile");
+    assert!(
+        after
+            .last_applied
+            .is_some_and(|applied| applied.index() >= read_log_id.index()),
+        "the round answers once the leader applied its read log id"
+    );
+
+    let follower = &engines[usize::from(leader_index == 0)];
+    assert_eq!(
+        follower
+            .read_barrier
+            .confirm_read_log_id()
+            .await
+            .expect("a follower's round"),
+        None
+    );
+    shutdown_all(&engines).await;
+}
+
+/// A ReadIndex round needs a quorum that answers after the read arrives. A
+/// leader cut off right after its quorum confirmed it still holds that
+/// acknowledgement within the leader lease, so a lease read answers from
+/// it. The round must not: it confirms with heartbeats of its own, which no
+/// quorum answers, and the read is refused as leader-unavailable.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_read_index_round_needs_a_quorum_after_the_read_arrives() {
+    use openraft::Instant;
+    use openraft::rt::WatchReceiver;
+
+    let policy = InProcessRaftNetworkPolicy::default();
+    // The cluster's leader has confirmed a quorum (`confirm_recovery_barrier`)
+    // and keeps it fresh with heartbeats until the partition.
+    let (_registry, engines, leader, _wal_roots) =
+        build_three_node_cluster("ursula-fresh-read-index-test", Some(policy.clone())).await;
+    let engine = &engines[usize::try_from(leader - 1).expect("leader id fits usize")];
+    for node_id in (1..=3).filter(|node_id| *node_id != leader) {
+        policy.partition_bidirectional(leader, node_id);
+    }
+
+    // Right after the partition the leader still holds that
+    // acknowledgement within the lease, so a lease read answers from it.
+    let lease = Duration::from_millis(engine.raft.config().election_timeout_max);
+    assert!(
+        engine
+            .raft
+            .metrics()
+            .borrow_watched()
+            .last_quorum_acked
+            .as_ref()
+            .is_some_and(|acked| acked.elapsed() < lease),
+        "the acknowledgement from before the partition is within the lease"
+    );
+    let lease_read = engine
+        .raft
+        .get_read_linearizer(openraft::ReadPolicy::LeaseRead)
+        .await
+        .expect("a lease read answers from that acknowledgement");
+    assert!(
+        lease_read.read_log_id().index() > 0,
+        "the lease read confirmed a read log id"
+    );
+
+    let refused = engine
+        .read_barrier
+        .confirm_read_log_id()
+        .await
+        .expect_err("no quorum answers the round");
+    assert!(
+        matches!(
+            refused.not_leader(),
+            Some(ursula_runtime::LeadershipRefusal {
+                leader: None,
+                proposal: ursula_runtime::Proposal::NotProposed,
+                reason: ursula_runtime::LeadershipReason::QuorumUnconfirmed,
+            })
+        ),
+        "expected leader-unavailable, got {refused:?}"
+    );
+    assert!(engine.raft.is_leader(), "only the round refuses the read");
+    shutdown_all(&engines).await;
+}
+
 /// The engine's one leadership check, which runs right before commands go to
 /// OpenRaft, reports its forward as raised before proposal: on its own,
 /// inside `write`, and inside a batch, for every entry. A forward that
@@ -3455,14 +3566,16 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
     let release = Arc::new(crate::rt::sync::Notify::new());
+    let store = wal.open(placement(), metrics()).unwrap();
+    let record = store.snapshot_record();
     let started = RaftGroupEngine::new_single_node(
         placement(),
         1,
         BasicNode::new("local"),
         raft_config("failed-start", 30, 60),
-        wal.open(placement(), metrics()).unwrap(),
+        store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            snapshot_record: Some(record),
             engine_work: Some(wal.engine_work_ledger()),
             startup_fault: Some(StartupFault {
                 release: Arc::clone(&release),
@@ -3503,14 +3616,16 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+    let store = wal.open(placement(), metrics()).unwrap();
+    let record = store.snapshot_record();
     let engine = RaftGroupEngine::new_single_node(
         placement(),
         1,
         BasicNode::new("local"),
         raft_config("dropped-engine", 30, 60),
-        wal.open(placement(), metrics()).unwrap(),
+        store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            snapshot_record: Some(record),
             engine_work: Some(wal.engine_work_ledger()),
             ..Default::default()
         },
@@ -4546,9 +4661,9 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
     impl ursula_runtime::LinearizableReadBarrier for VoteChangingBarrier {
         fn confirm(&self) -> ursula_runtime::ReadIndexFuture {
             let raft = self.raft.clone();
-            let round = self.barrier.round();
+            let round = self.barrier.confirm_read_log_id();
             Box::pin(async move {
-                let outcome = round.await?;
+                let outcome = round.await?.map(|read_log_id| read_log_id.index());
                 raft.runtime_config().elect(false);
                 raft.append_entries(UrsulaAppendEntriesRequest {
                     vote: UrsulaVote::new_committed(99, 2),
@@ -4597,6 +4712,37 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
         result,
         Err(crate::QuorumProofError::LeadershipChanged { .. })
     ));
+}
+
+/// The engine factory hands each group its snapshot record from the
+/// group's log store, so a record it publishes follows a journal sync (R1).
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_engine_factory_wires_the_snapshot_record_to_the_log_store() {
+    let wal_root = tempfile::tempdir().unwrap();
+    let wal = start_wal(wal_root.path(), 1, 1);
+    let expected = wal.snapshot_metadata_path(placement());
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let path = registry
+        .get(RaftGroupId(0))
+        .unwrap()
+        .with_state_machine(|state_machine| {
+            Box::pin(async move {
+                state_machine
+                    .snapshot_record
+                    .as_ref()
+                    .map(|record| record.path().to_path_buf())
+            })
+        })
+        .await
+        .unwrap();
+    assert_eq!(path, Some(expected));
 }
 
 #[cfg(not(madsim))]
@@ -5069,12 +5215,8 @@ async fn reopen_journal_engine_with(
     cluster_name: &str,
     options: RaftGroupEngineOptions,
 ) -> RaftGroupEngine {
-    let store = wal
-        .open(
-            placement(),
-            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
-        .expect("the group's log store opens");
+    let store = reopen_journal_store(wal);
+    let snapshot_record = store.snapshot_record();
     RaftGroupEngine::new_single_node(
         placement(),
         1,
@@ -5082,12 +5224,245 @@ async fn reopen_journal_engine_with(
         raft_config(cluster_name, 30, 60),
         store,
         RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            snapshot_record: Some(snapshot_record),
             ..options
         },
     )
     .await
     .unwrap()
+}
+
+/// `placement()`'s log store over `wal`. It opens at once: a previous
+/// engine of the group released it before its shutdown returned (#709).
+#[cfg(not(madsim))]
+fn reopen_journal_store(wal: &RaftWal) -> Arc<RaftGroupFileLogStore> {
+    wal.open(
+        placement(),
+        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+    )
+    .expect("the group's log store opens")
+}
+
+/// R1: a follower installed a snapshot over a conflicting uncommitted tail,
+/// and a power loss under `fsync = never` kept the synced snapshot record but
+/// lost the WAL's truncate of that tail. A replica now syncs the journal
+/// before it publishes the record
+/// (`a_snapshot_record_is_published_after_the_journal_syncs`), so only a
+/// record written without that sync leaves this disk: WAL entries at and
+/// after the snapshot's index from an older term. Under alpha.28 the group
+/// opened and OpenRaft purged only through the snapshot's index, so the
+/// later entries stayed and the log's last entry sat below its last purged
+/// one. The replica refuses to open such a log.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_log_below_its_restored_snapshot_refuses_to_open() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let membership = openraft::Membership::new_with_defaults(vec![BTreeSet::from([1, 2, 3])], []);
+    // The disk the power loss left. Term 1 wrote entries 1 to 5 and
+    // committed only entry 1. The replica then followed term 2's leader,
+    // whose vote survives: votes are always synced.
+    {
+        let mut store = reopen_journal_store(&wal);
+        store
+            .save_vote(&openraft::Vote::new_committed(2, 2))
+            .await
+            .unwrap();
+        let mut entries = vec![Entry::new(
+            log_id(1),
+            EntryPayload::Membership(membership.clone()),
+        )];
+        entries.extend((2..=5).map(|index| Entry::new(log_id(index), EntryPayload::Blank)));
+        store.append(entries, IOFlushed::noop()).await.unwrap();
+        store.save_committed(Some(log_id(1))).await.unwrap();
+    }
+    // Term 2 committed its own entry at index 3, and the follower's record
+    // of the snapshot through it is durable.
+    let snapshot_log_id = LogId {
+        leader_id: CommittedLeaderId::new(2, 2),
+        index: 3,
+    };
+    let metadata_path = wal.snapshot_metadata_path(placement());
+    {
+        let mut machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement(),
+            None,
+            None,
+            ursula_runtime::default_snapshot_store(),
+            crate::state_machine::SnapshotBuildCoordinator::default(),
+            crate::state_machine::SnapshotInstallCoordinator::default(),
+            Some(metadata_path.clone()),
+        );
+        let snapshot = ursula_runtime::GroupSnapshot {
+            placement: placement(),
+            group_commit_index: snapshot_log_id.index,
+            stream_snapshot: Default::default(),
+            stream_append_counts: Vec::new(),
+        };
+        let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect();
+        let pointer = ursula_runtime::SnapshotPointer {
+            snapshot_id: "lost-truncate".to_owned(),
+            location: ursula_runtime::SnapshotLocation::Inline { bytes },
+        };
+        let meta = openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+            last_log_id: Some(snapshot_log_id),
+            last_membership: openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                Some(log_id(1)),
+                membership,
+            ),
+            snapshot_id: pointer.snapshot_id.clone(),
+        };
+        machine
+            .install_snapshot(
+                &meta,
+                crate::types::SnapshotData::new(pointer.encode_binary().unwrap()),
+            )
+            .await
+            .unwrap();
+    }
+
+    let store = reopen_journal_store(&wal);
+    let snapshot_record = store.snapshot_record();
+    let opened = RaftGroupEngine::new_node(
+        placement(),
+        1,
+        raft_config("lost-truncate", 500, 1_000),
+        InProcessRaftNetworkFactory::new(InProcessRaftRegistry::default()).with_source(1),
+        store,
+        RaftGroupEngineOptions {
+            snapshot_record: Some(snapshot_record),
+            peer_cluster: Some(crate::peer_cluster::test_peer_cluster(1)),
+            ..Default::default()
+        },
+    )
+    .await;
+    match opened {
+        Err(GroupEngineError::Infra(GroupInfraError::LogBelowSnapshot {
+            core_id,
+            raft_group_id,
+            snapshot,
+            held,
+        })) => {
+            assert_eq!(
+                (core_id, raft_group_id),
+                (placement().core_id, placement().raft_group_id)
+            );
+            assert_eq!(snapshot, ursula_runtime::LogPosition {
+                term: 2,
+                node_id: 2,
+                index: 3,
+            });
+            assert_eq!(held, ursula_runtime::LogPosition {
+                term: 1,
+                node_id: 1,
+                index: 5,
+            });
+        }
+        Err(other) => panic!("expected the log-below-snapshot refusal, got {other:?}"),
+        Ok(_) => panic!("a replica opened a log that holds term 1's tail after its snapshot"),
+    }
+}
+
+/// The restored-snapshot check refuses only a log that holds, or commits,
+/// an entry at or after the snapshot's index below it in log-id order. A
+/// log purged through the snapshot and extended by its leader, and a log
+/// that holds the snapshot's own entry and later ones, open.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn the_restored_snapshot_check_keeps_a_log_that_continues_the_snapshot() {
+    // `IOFlushed::noop` does not wait for the writer: each case syncs, which
+    // returns once every record before it joined the store's index.
+    let snapshot = LogId {
+        leader_id: CommittedLeaderId::new(2, 2),
+        index: 3,
+    };
+    let term_2 = |index: u64| LogId {
+        leader_id: CommittedLeaderId::new(2, 2),
+        index,
+    };
+    let blank = |log_id| Entry::new(log_id, EntryPayload::Blank);
+
+    // A follower that held term 1's committed entries 1 and 2 installed
+    // term 2's snapshot through 3, purged through it, and took term 2's
+    // next entries.
+    let (_purged_root, mut purged) = fresh_journal_store();
+    purged
+        .save_vote(&openraft::Vote::new_committed(2, 2))
+        .await
+        .unwrap();
+    purged
+        .append(vec![blank(log_id(1)), blank(log_id(2))], IOFlushed::noop())
+        .await
+        .unwrap();
+    purged.save_committed(Some(snapshot)).await.unwrap();
+    purged.purge(snapshot).await.unwrap();
+    purged
+        .append(vec![blank(term_2(4)), blank(term_2(5))], IOFlushed::noop())
+        .await
+        .unwrap();
+    purged.snapshot_record().sync().await.unwrap();
+    purged
+        .snapshot_record()
+        .check_restored(snapshot)
+        .expect("a log that continues a purged snapshot");
+
+    // A replica that took term 2's entries 3 and 4 and built a snapshot
+    // through 3: the snapshot's own entry, and a later one.
+    let (_held_root, mut held) = fresh_journal_store();
+    held.save_vote(&openraft::Vote::new_committed(2, 2))
+        .await
+        .unwrap();
+    held.append(
+        vec![
+            blank(log_id(1)),
+            blank(log_id(2)),
+            blank(term_2(3)),
+            blank(term_2(4)),
+        ],
+        IOFlushed::noop(),
+    )
+    .await
+    .unwrap();
+    held.save_committed(Some(term_2(4))).await.unwrap();
+    held.snapshot_record().sync().await.unwrap();
+    held.snapshot_record()
+        .check_restored(snapshot)
+        .expect("a log that holds the snapshot's entry");
+
+    // An older term's entries at and after the index.
+    let (_stale_root, mut stale) = fresh_journal_store();
+    stale
+        .append(
+            (1..=5)
+                .map(|index| blank(log_id(index)))
+                .collect::<Vec<_>>(),
+            IOFlushed::noop(),
+        )
+        .await
+        .unwrap();
+    stale.snapshot_record().sync().await.unwrap();
+    assert!(matches!(
+        stale.snapshot_record().check_restored(snapshot),
+        Err(SnapshotOrderError::HeldBelow { held, .. }) if held == log_id(5)
+    ));
+
+    // A commit marker at or after the index from an older term.
+    let (_committed_root, mut committed) = fresh_journal_store();
+    committed
+        .append(vec![blank(log_id(1)), blank(log_id(2))], IOFlushed::noop())
+        .await
+        .unwrap();
+    committed.save_committed(Some(log_id(4))).await.unwrap();
+    committed.snapshot_record().sync().await.unwrap();
+    assert!(matches!(
+        committed.snapshot_record().check_restored(snapshot),
+        Err(SnapshotOrderError::CommittedBelow { committed, .. }) if committed == log_id(4)
+    ));
 }
 
 /// A stream created through `engine`, which returns once the group applied
@@ -5405,6 +5780,7 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("the stopped engine released the group's log store");
+    let reopened_record = reopened.snapshot_record();
 
     // The queued work ran before the shutdown returned: the applies
     // answered, a build started, and the refused install left the gauge
@@ -5441,7 +5817,7 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
         reopened,
         RaftGroupEngineOptions {
             snapshot_build: Some(queued.builds.clone()),
-            snapshot_metadata_path: Some(metadata_path.clone()),
+            snapshot_record: Some(reopened_record),
             ..Default::default()
         },
     )

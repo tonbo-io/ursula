@@ -18,6 +18,7 @@ use std::ops::Bound;
 use std::ops::RangeBounds;
 use std::ops::RangeInclusive;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
@@ -145,6 +146,123 @@ impl StoreLog {
             Self::Empty(EmptyHistory::Unknown) | Self::Recovering => GroupLogState::Recovering,
         }
     }
+}
+
+/// A restored snapshot record that the group's log contradicts: at or after
+/// the snapshot's index the log holds an entry, or its commit marker names
+/// one, that is below the snapshot in log-id order (R1). Such an entry
+/// cannot be committed, and a replica with it would compare its log wrongly
+/// in elections ([`SnapshotRecord::check_restored`]).
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotOrderError {
+    #[error(
+        "the log holds {held:?} at or after the restored snapshot {snapshot:?}, below it in \
+         log-id order"
+    )]
+    HeldBelow {
+        snapshot: LogIdOf<UrsulaRaftTypeConfig>,
+        held: LogIdOf<UrsulaRaftTypeConfig>,
+    },
+    #[error(
+        "the log's commit marker {committed:?} is at or after the restored snapshot \
+         {snapshot:?}, below it in log-id order"
+    )]
+    CommittedBelow {
+        snapshot: LogIdOf<UrsulaRaftTypeConfig>,
+        committed: LogIdOf<UrsulaRaftTypeConfig>,
+    },
+}
+
+/// Where a group's snapshot record lives, beside the core journal that
+/// holds the group's log ([`RaftGroupFileLogStore::snapshot_record`]). One
+/// handle yields both, so a record is never published without the journal
+/// sync below.
+///
+/// A follower installs a snapshot over a conflicting uncommitted tail in
+/// three steps: it truncates that tail in the journal, publishes the
+/// snapshot record, and purges the log through the snapshot. The record is
+/// synced on its own, and a truncate is not, under either `fsync` policy:
+/// it waits for the next synced batch of the core. So the record is
+/// published only after [`Self::sync`]: a durable record then implies a
+/// durable truncate, or a durable overwrite of the tail. A snapshot this
+/// replica built is published the same way.
+///
+/// Three invariants carry the proof that a restored record never sits
+/// above a stale tail. The core journal survives a crash as a prefix of
+/// what was written, so a durable sync makes every record before it
+/// durable. Log matching: an entry at the snapshot's index or later that
+/// has a lower leader id than the snapshot's entry is not in the history
+/// the snapshot's committed entry belongs to, and neither is any entry
+/// after it, so none of them is committed. And the sync above, which
+/// orders the truncate of those entries before the record.
+/// [`Self::check_restored`] is the tripwire for a log that breaks them.
+#[derive(Clone)]
+pub struct SnapshotRecord {
+    path: PathBuf,
+    placement: ShardPlacement,
+    metrics: GroupEngineMetrics,
+    journal: PathBuf,
+    /// Weak: a state machine OpenRaft keeps running after the group shut
+    /// down must not hold the journal, and its lock, open (#709).
+    writer: std::sync::Weak<CoreFileLogWriter>,
+    log: Arc<Mutex<GroupLog>>,
+}
+
+impl std::fmt::Debug for SnapshotRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotRecord")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotRecord {
+    /// The file that holds the group's current snapshot record.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns once every record the journal took before this call is
+    /// durable: one journal `fsync`, counted in the group's WAL metrics.
+    pub(crate) async fn sync(&self) -> Result<(), CoreJournalError> {
+        let writer = self
+            .writer
+            .upgrade()
+            .ok_or_else(|| CoreJournalError::WriterStopped {
+                journal: self.journal.clone(),
+            })?;
+        let timing = writer.write(CoreWriteOp::Sync).await?;
+        record_write_timing(&self.metrics, self.placement, 0, timing);
+        Ok(())
+    }
+
+    /// Refuses a log that contradicts the restored `snapshot`: an entry at
+    /// or after its index, or a commit marker there, below it in log-id
+    /// order. Run before the group's Raft core reads the log.
+    pub(crate) fn check_restored(
+        &self,
+        snapshot: LogIdOf<UrsulaRaftTypeConfig>,
+    ) -> Result<(), SnapshotOrderError> {
+        let log = lock(&self.log);
+        if let Some(held) = log.held_below_snapshot(snapshot) {
+            return Err(SnapshotOrderError::HeldBelow { snapshot, held });
+        }
+        match log.committed() {
+            Some(committed) if committed.index() >= snapshot.index() && committed < snapshot => {
+                Err(SnapshotOrderError::CommittedBelow {
+                    snapshot,
+                    committed,
+                })
+            }
+            Some(_) | None => Ok(()),
+        }
+    }
+}
+
+/// The file name of group `raft_group_id`'s snapshot record in its core's
+/// journal directory.
+pub(crate) fn snapshot_record_file(raft_group_id: u32) -> String {
+    format!("group-{raft_group_id}.snapshot.json")
 }
 
 /// A recovery cut that did not run.
@@ -447,6 +565,22 @@ impl RaftGroupFileLogStore {
         Ok(())
     }
 
+    /// Where this group's snapshot record lives, and the journal sync it is
+    /// published after ([`SnapshotRecord`]).
+    pub fn snapshot_record(&self) -> SnapshotRecord {
+        SnapshotRecord {
+            path: self
+                .core_writer
+                .dir()
+                .join(snapshot_record_file(self.placement.raft_group_id.0)),
+            placement: self.placement,
+            metrics: self.metrics.clone(),
+            journal: self.core_writer.dir().to_path_buf(),
+            writer: Arc::downgrade(&self.core_writer),
+            log: self.log.clone(),
+        }
+    }
+
     /// The id of the entry this store holds at `index`, or of the last
     /// purged entry when that is at `index`.
     pub(crate) fn log_id_at(&self, index: u64) -> Option<LogIdOf<UrsulaRaftTypeConfig>> {
@@ -592,17 +726,7 @@ impl RaftGroupFileLogStore {
     }
 
     fn record_timing(&self, record_count: usize, timing: CoreFileLogWriteTiming) {
-        self.metrics.record_wal_batch(
-            self.placement,
-            record_count,
-            timing.write_ns,
-            timing.sync_ns,
-        );
-        self.metrics
-            .record_wal_storage(self.placement, timing.storage);
-        if let Some(memory) = timing.memory {
-            self.metrics.record_wal_memory(self.placement, memory);
-        }
+        record_write_timing(&self.metrics, self.placement, record_count, timing);
     }
 
     /// Reads the entries of `range`: cached ones from memory, older ones
@@ -700,6 +824,20 @@ fn merge_pending(
         durable.push(entry);
     }
     durable
+}
+
+/// Records what one write to the core journal cost in the group's metrics.
+fn record_write_timing(
+    metrics: &GroupEngineMetrics,
+    placement: ShardPlacement,
+    record_count: usize,
+    timing: CoreFileLogWriteTiming,
+) {
+    metrics.record_wal_batch(placement, record_count, timing.write_ns, timing.sync_ns);
+    metrics.record_wal_storage(placement, timing.storage);
+    if let Some(memory) = timing.memory {
+        metrics.record_wal_memory(placement, memory);
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {

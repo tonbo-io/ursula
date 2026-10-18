@@ -22,6 +22,7 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::future::Shared;
 use openraft::ReadPolicy;
+use openraft::alias::LogIdOf;
 use openraft::error::LinearizableReadError;
 use openraft::rt::Instant;
 use openraft::rt::WatchReceiver;
@@ -38,9 +39,9 @@ use crate::forward::unknown_leader;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
 
-/// `Ok(Some(read_index))` once the confirmed leader has applied the read
-/// index, `Ok(None)` when this replica does not lead.
-type Outcome = Result<Option<u64>, GroupEngineError>;
+/// `Ok(Some(read_log_id))` once the confirmed leader has applied the
+/// round's read log id, `Ok(None)` when this replica does not lead.
+type Outcome = Result<Option<LogIdOf<UrsulaRaftTypeConfig>>, GroupEngineError>;
 type Round = Shared<BoxFuture<'static, Outcome>>;
 
 const OPERATION: &str = "linearizable read";
@@ -71,9 +72,14 @@ impl ReadIndexBarrier {
         }
     }
 
+    /// The read log id of a round that starts after this call: the entry
+    /// the confirmed leader has applied before the round answers. Its leader
+    /// id names the leadership the round confirmed, because a leader reads
+    /// at its own first entry or at a later committed one.
+    ///
     /// Joins the open round, or opens one that starts once the round in
     /// flight has finished.
-    pub(crate) fn round(&self) -> Round {
+    pub(crate) fn confirm_read_log_id(&self) -> Round {
         let mut rounds = self.rounds.lock().unwrap_or_else(PoisonError::into_inner);
         if rounds.open
             && let Some(round) = rounds.latest.as_ref()
@@ -115,7 +121,10 @@ impl std::fmt::Debug for ReadIndexBarrier {
 
 impl LinearizableReadBarrier for ReadIndexBarrier {
     fn confirm(&self) -> ReadIndexFuture {
-        Box::pin(self.round())
+        Box::pin(
+            self.confirm_read_log_id()
+                .map(|outcome| outcome.map(|read_log_id| read_log_id.map(|log_id| log_id.index()))),
+        )
     }
 }
 
@@ -164,9 +173,9 @@ async fn confirm(raft: &RaftGroupHandle) -> Outcome {
             }
         }
     };
-    let read_index = linearizer.read_log_id().index();
+    let read_log_id = *linearizer.read_log_id();
     match linearizer.try_await_ready(raft, Some(budget)).await {
-        Ok(Ok(_)) => Ok(Some(read_index)),
+        Ok(Ok(_)) => Ok(Some(read_log_id)),
         Ok(Err(state)) => {
             tracing::debug!(
                 "OpenRaft {OPERATION} timed out waiting to apply the read index: {state:?}"

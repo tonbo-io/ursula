@@ -2015,9 +2015,10 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     // initialize already starts an election. Allow only the intended leader
     // to retry a vote RPC timeout during bootstrap; freeze ticks again before
     // the paused-journal assertion so this test cannot elect a replacement.
+    // No explicit elect: one that lands after this node won would start an
+    // election on a leader, which keeps its leader state (#721).
     leader.runtime_config().tick(true);
     leader.initialize(members).await.unwrap();
-    leader.trigger().elect(false).await.unwrap();
     leader
         .wait(Some(Duration::from_secs(5)))
         .current_leader(1, "leader elected")
