@@ -654,6 +654,7 @@ EXPECTED_PR_FAMILIES = {
     "deleted-data-leaves-within-bound",
     "deleted-data-across-segments",
     "deleted-data-after-expiry",
+    "engine-restart-leaves-no-work",
 }
 EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
 EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
@@ -669,6 +670,7 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "deleted-data-leaves-within-bound-extended",
     "deleted-data-across-segments-extended",
     "deleted-data-after-expiry-extended",
+    "engine-restart-leaves-no-work-extended",
 }
 EXPECTED_NIGHTLY_RANGES = {"60..=199", "503..=504"}
 

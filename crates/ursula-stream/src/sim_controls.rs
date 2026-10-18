@@ -113,6 +113,12 @@ pub enum Defence {
     /// expired stream that no request names stays in its group: no other
     /// command removes a stream it does not name.
     ExpirySweep,
+    /// A group engine's shutdown returns only once the work OpenRaft runs
+    /// for it on tasks of its own ended: its state-machine worker, the
+    /// snapshot builds it spawned and its log readers (#709). Off, the
+    /// shutdown returns once RaftCore stopped, and that work may still hold
+    /// the group's log store and change its state.
+    EngineWorkWait,
 }
 
 #[cfg(madsim)]
@@ -122,8 +128,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 24]> = const { Cell::new([false; 24]) };
-        static FIRED: Cell<[u64; 24]> = const { Cell::new([0; 24]) };
+        static OFF: Cell<[bool; 25]> = const { Cell::new([false; 25]) };
+        static FIRED: Cell<[u64; 25]> = const { Cell::new([0; 25]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -152,6 +158,7 @@ mod switches {
             Defence::RestorePurge => 21,
             Defence::WalDirtyAge => 22,
             Defence::ExpirySweep => 23,
+            Defence::EngineWorkWait => 24,
         }
     }
 
@@ -174,7 +181,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 24]));
+        FIRED.with(|fired| fired.set([0; 25]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -29,6 +29,8 @@
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
+//! - [`openraft_work`]: the work OpenRaft runs for a group engine on tasks of
+//!   its own, which the engine's shutdown waits for (#709).
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
 //!   mismatch record readiness reads.
 //! - [`forward`]: leader-forwarding helpers used by the engine when a node is a follower.
@@ -76,6 +78,7 @@ mod in_process;
 mod log_store;
 mod maintenance;
 mod meta;
+mod openraft_work;
 mod peer_channel;
 mod peer_cluster;
 mod read_index;

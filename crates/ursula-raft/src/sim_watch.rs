@@ -47,6 +47,9 @@ struct Shared<T> {
     senders: AtomicUsize,
     receivers: AtomicUsize,
     changed: Notify,
+    /// Wakes the senders waiting in [`Sender::closed`] once the last
+    /// receiver is gone.
+    receivers_gone: Notify,
 }
 
 impl<T> Shared<T> {
@@ -111,6 +114,7 @@ impl<T> Sender<T> {
                 senders: AtomicUsize::new(1),
                 receivers: AtomicUsize::new(0),
                 changed: Notify::new(),
+                receivers_gone: Notify::new(),
             }),
         }
     }
@@ -162,6 +166,25 @@ impl<T> Sender<T> {
     /// A receiver that has seen the current value.
     pub fn subscribe(&self) -> Receiver<T> {
         self.shared.subscribe()
+    }
+
+    /// Whether every receiver is gone.
+    pub fn is_closed(&self) -> bool {
+        self.shared.receivers.load(Ordering::SeqCst) == 0
+    }
+
+    /// Waits until every receiver is gone. Any number of callers may wait.
+    pub async fn closed(&self) {
+        loop {
+            // Register before checking, so a drop between the check and the
+            // wait still wakes this caller.
+            let mut gone = pin!(self.shared.receivers_gone.notified());
+            gone.as_mut().enable();
+            if self.is_closed() {
+                return;
+            }
+            gone.await;
+        }
     }
 }
 
@@ -244,7 +267,9 @@ impl<T> Clone for Receiver<T> {
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        self.shared.receivers.fetch_sub(1, Ordering::SeqCst);
+        if self.shared.receivers.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.shared.receivers_gone.notify_waiters();
+        }
     }
 }
 
@@ -262,6 +287,35 @@ mod tests {
 
     use super::channel;
     use super::error::RecvError;
+
+    /// Every sender waiting in `closed` wakes once the last receiver is
+    /// gone, a receiver dropped while they wait included, and a wait that
+    /// starts after it returns at once.
+    #[test]
+    fn every_closed_waiter_wakes_once_the_last_receiver_goes() {
+        crate::sim_runtime::run_seeded(0, None, || async {
+            let (tx, rx) = channel(0);
+            let tx = std::sync::Arc::new(tx);
+            let other = rx.clone();
+            let waiters = [0, 1].map(|_| {
+                let tx = std::sync::Arc::clone(&tx);
+                crate::rt::spawn(async move { tx.closed().await })
+            });
+            // Both waiters registered and checked; one receiver goes while
+            // they wait, and they keep waiting for the other.
+            crate::rt::task::yield_now().await;
+            drop(rx);
+            crate::rt::task::yield_now().await;
+            assert!(!tx.is_closed());
+            assert!(waiters.iter().all(|waiter| !waiter.is_finished()));
+            drop(other);
+            for waiter in waiters {
+                waiter.await.unwrap();
+            }
+            assert!(tx.is_closed());
+            assert!(tx.closed().now_or_never().is_some());
+        });
+    }
 
     #[test]
     fn a_value_borrowed_after_changed_is_not_delivered_twice() {

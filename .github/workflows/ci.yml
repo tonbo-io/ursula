@@ -163,7 +163,8 @@ jobs:
             --seed-family recovery-plan-membership-rollback \
             --seed-family deleted-data-leaves-within-bound \
             --seed-family deleted-data-across-segments \
-            --seed-family deleted-data-after-expiry
+            --seed-family deleted-data-after-expiry \
+            --seed-family engine-restart-leaves-no-work
           mkdir -p target/ursula-sim-seed-146-cold-write-delay-minimize
           jq '.[] | select(.schedule.seed == 146)' crates/ursula-sim/corpus/schedule-smoke.json \
             > target/ursula-sim-seed-146-cold-write-delay-minimize/seed-146-record.json

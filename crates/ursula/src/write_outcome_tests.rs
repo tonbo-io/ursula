@@ -1212,6 +1212,15 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
             }));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
+        "group-restarting" => {
+            node.create(path, TEXT, b"").await;
+            node.fail_next_write(GroupEngineError::Infra(
+                GroupInfraError::PreviousEngineWorkRunning {
+                    raft_group_id: ursula_shard::RaftGroupId(0),
+                },
+            ));
+            node.send(via, produce(path, 0, 0, b"a", &[])).await
+        }
         "json-boundary-unverified" => {
             node.create(path, OCTET, b"abc").await;
             node.fail_next_write(GroupEngineError::stream(

@@ -20,6 +20,8 @@ use super::deleted_data::Controls as DeletedDataControls;
 use super::deleted_data::run_deleted_data_inner;
 #[cfg(test)]
 use super::deleted_data::run_operator_snapshot_under_purge_inner;
+use super::engine_restart::Controls as EngineRestartControls;
+use super::engine_restart::run_engine_restart_inner;
 use super::has_cold_write_fault_in_fault_plan;
 use super::has_corrupt_http_live_limit_backpressure_expectation_in_fault_plan;
 use super::has_corrupt_http_live_sse_next_offset_expectation_in_fault_plan;
@@ -301,7 +303,26 @@ impl ThreeNodeRaftSim {
             SimScenario::DeletedDataLeavesWithinBound => {
                 Self::run_deleted_data_with_controls_report(config, DeletedDataControls::default())
             }
+            SimScenario::EngineRestartLeavesNoWork => {
+                Self::run_engine_restart_with_controls_report(
+                    config,
+                    EngineRestartControls::default(),
+                )
+            }
         }
+    }
+
+    /// Runs the engine-restart scenario (#709) with `controls`.
+    pub(super) fn run_engine_restart_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: EngineRestartControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::EngineRestartLeavesNoWork,
+            seed,
+            run_engine_restart_inner(config, controls),
+        )
     }
 
     /// Runs the deleted-data bound scenario (#669) with `controls`.

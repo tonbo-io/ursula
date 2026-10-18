@@ -141,6 +141,7 @@
 //! | `raft-uncommitted-backpressure` | node | `503` | `RAFT_UNCOMMITTED_BACKPRESSURE` | `Refused` |
 //! | `history-pending` | node | `503` | `HISTORY_PENDING`: before the proposal, or a deterministic refusal at apply | `Refused` |
 //! | `apply-stopped` | node | `503` | `APPLY_STOPPED` | `Refused` |
+//! | `group-restarting` | node | `503` | `GROUP_RESTARTING` | `Refused` |
 //! | `json-boundary-unverified` | node | `503` | `JSON_BOUNDARY_UNVERIFIED`: a deterministic refusal at apply | `Refused` |
 //! | `snapshot-commits-busy` | node | `503` | `SNAPSHOT_COMMITS_BUSY` | `Refused` |
 //! | `snapshot-commit-in-progress` | node | `503` | `SNAPSHOT_COMMIT_IN_PROGRESS`: an earlier attempt of the commit, another commit or a discard of the stream runs | `Unknown` |
@@ -388,6 +389,8 @@ pub fn proves_refusal(status: u16, code: &ErrorCode) -> bool {
         | ErrorCode::ColdBackpressure
         | ErrorCode::RaftUncommittedBackpressure
         | ErrorCode::ApplyStopped
+        // No engine of the group runs on the node.
+        | ErrorCode::GroupRestarting
         // Before the proposal, or a deterministic refusal at apply.
         | ErrorCode::HistoryPending
         // A deterministic refusal at apply: never applied unverified

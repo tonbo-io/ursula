@@ -204,6 +204,7 @@ const EXPECTED: &[Expected] = expected! {
     "raft-uncommitted-backpressure" => Resend, Resend, Resend, SAFE_RESEND;
     "history-pending" => Resend, Resend, Resend, SAFE_RESEND;
     "apply-stopped" => Resend, Resend, Resend, SAFE_RESEND;
+    "group-restarting" => Resend, Resend, Resend, SAFE_RESEND;
     "json-boundary-unverified" => Resend, -, Resend, SAFE_RESEND;
     "snapshot-commits-busy" => Resend, -, Resend, SAFE_RESEND;
     "snapshot-commit-in-progress" => Resend, -, Resend, FOLLOWS;

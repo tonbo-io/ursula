@@ -377,7 +377,7 @@ impl JournalCluster {
 
     /// Starts `node_id`'s replica of `group` from its log store, as the
     /// node's engine factory does.
-    async fn start_replica(&mut self, group: u32, node_id: u64) {
+    pub(super) async fn start_replica(&mut self, group: u32, node_id: u64) {
         let voters = recovery_wiring::configured_voters(1..=self.voters);
         let placement = group_placement(group);
         let store = self.wals[&node_id]
@@ -404,6 +404,7 @@ impl JournalCluster {
             .filter(|(faulty, _)| *faulty == group)
             .map(|(_, fault)| fault);
         options.recovery = Some(rejoin.clone());
+        let options = self.wals[&node_id].recording_work(options);
         let started = RaftGroupEngine::new_node(
             placement,
             node_id,
@@ -449,13 +450,20 @@ impl JournalCluster {
     /// restarts one group's engine for a recovery plan's cut: the engine
     /// stops, its log store closes, and the replica starts again from it.
     pub(super) async fn restart_replica(&mut self, group: u32, node_id: u64) {
+        self.stop_replica(group, node_id).await;
+        self.start_replica(group, node_id).await;
+    }
+
+    /// Stops `node_id`'s replica of `group` alone, as the node's runtime
+    /// stops one group's engine. Once its shutdown returned, nothing of the
+    /// engine runs or holds the group's log store (#709).
+    pub(super) async fn stop_replica(&mut self, group: u32, node_id: u64) {
         self.registries[&group].unregister(node_id);
         self.node_registries[&node_id].unregister_group_for_simulation(RaftGroupId(group));
         self.rejoins.remove(&(group, node_id));
         if let Some(engine) = self.engines.remove(&(group, node_id)) {
             engine.shutdown().await.expect("stop the replica");
         }
-        self.start_replica(group, node_id).await;
     }
 
     /// The `accept-unsynced-loss` admin route on `node_id` for `group`: the

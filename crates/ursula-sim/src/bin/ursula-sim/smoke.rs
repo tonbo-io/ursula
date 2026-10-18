@@ -338,6 +338,10 @@ fn generate_deleted_data_leaves_within_bound(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::DeletedDataLeavesWithinBound)
 }
 
+fn generate_engine_restart_leaves_no_work(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::EngineRestartLeavesNoWork)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -463,6 +467,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 649,
         kind: "deleted-data-leaves-within-bound",
         generate: generate_deleted_data_leaves_within_bound,
+    },
+    SeedFamily {
+        name: "engine-restart-leaves-no-work",
+        start: 540,
+        end: 545,
+        kind: "engine-restart-leaves-no-work",
+        generate: generate_engine_restart_leaves_no_work,
+    },
+    SeedFamily {
+        name: "engine-restart-leaves-no-work-extended",
+        start: 1000,
+        end: 1029,
+        kind: "engine-restart-leaves-no-work",
+        generate: generate_engine_restart_leaves_no_work,
     },
     SeedFamily {
         name: "deleted-data-after-expiry",

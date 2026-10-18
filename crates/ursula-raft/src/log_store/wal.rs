@@ -62,6 +62,9 @@ pub struct RaftWal {
     /// One slot per core. Opening a journal holds only its core's slot, so
     /// cores recover their journals in parallel.
     core_writers: Arc<Mutex<CoreWriterSlots>>,
+    /// The OpenRaft work of each group's latest engine in this run: a group
+    /// opens again only once its previous engine's work ended (#709).
+    engine_work: crate::openraft_work::EngineWorkLedger,
 }
 
 impl RaftWal {
@@ -105,6 +108,7 @@ impl RaftWal {
             tuning,
             lagging: Arc::new(LaggingGroups::default()),
             core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
+            engine_work: crate::openraft_work::EngineWorkLedger::default(),
         })
     }
 
@@ -211,14 +215,34 @@ impl RaftWal {
         Ok(writer)
     }
 
+    /// Opens `placement`'s log store. A group whose previous engine's
+    /// OpenRaft work still runs is refused at once
+    /// ([`RaftWalError::PreviousEngineRunning`]): that work may still change
+    /// the group's state (#709).
     pub fn open(
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
+        self.engine_work
+            .admit(placement.raft_group_id)
+            .map_err(|_running| RaftWalError::PreviousEngineRunning { placement })?;
         let core_writer = self.core_writer(placement, metrics.clone())?;
         RaftGroupFileLogStore::open(placement, metrics, core_writer)
             .map_err(|source| RaftWalError::OpenGroup { placement, source })
+    }
+
+    /// The ledger engines of this WAL's groups record their OpenRaft work in
+    /// as soon as their Raft starts (#709).
+    pub(crate) fn engine_work_ledger(&self) -> crate::openraft_work::EngineWorkLedger {
+        self.engine_work.clone()
+    }
+
+    /// Waits until the OpenRaft work of `raft_group_id`'s latest engine
+    /// ended.
+    #[cfg(test)]
+    pub(crate) async fn engine_work_ended(&self, raft_group_id: ursula_shard::RaftGroupId) {
+        self.engine_work.ended(raft_group_id).await;
     }
 
     /// What the snapshot driver needs of this WAL (#669): the lagging

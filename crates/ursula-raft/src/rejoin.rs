@@ -902,6 +902,14 @@ impl RecoveryGateError {
             Self::SingleVoterCut { .. } => RecoveryPlanRefusal::SingleVoterCut,
             Self::PlanTermBelowVote { .. } => RecoveryPlanRefusal::PlanTermBelowVote,
             Self::NotRegistered { .. } => return PlanAnswer::NotRegistered,
+            // A restart that failed for a reason that passes is retryable,
+            // as one refused while the group's previous engine still stops
+            // (#709). The error's own status decides, not a list of cases.
+            Self::Restart { source, .. }
+                if source.status() == ursula_runtime::ErrorStatus::Temporary =>
+            {
+                return PlanAnswer::Unavailable;
+            }
             Self::Record { .. }
             | Self::Cut { .. }
             | Self::Restart { .. }

@@ -14,6 +14,12 @@ pub(super) fn group_open_error(
     placement: ShardPlacement,
     source: RaftWalError,
 ) -> GroupEngineError {
+    // Not a failure of the WAL: the group opens on a later request (#709).
+    if let RaftWalError::PreviousEngineRunning { .. } = source {
+        return GroupEngineError::Infra(GroupInfraError::PreviousEngineWorkRunning {
+            raft_group_id: placement.raft_group_id,
+        });
+    }
     let failure = classify(&source);
     // GroupEngineError is a cross-crate, serializable protocol value. Native
     // non-serializable sources stay intact at the WAL API and are recorded here.
@@ -55,6 +61,7 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         },
         RaftWalError::ShutDown { .. } => WalOpenFailureKind::Stopped,
         RaftWalError::LockPoisoned => WalOpenFailureKind::Poisoned,
+        RaftWalError::PreviousEngineRunning { .. } => WalOpenFailureKind::DuplicateGroup,
     }
 }
 

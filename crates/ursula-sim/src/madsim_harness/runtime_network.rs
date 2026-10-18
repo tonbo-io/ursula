@@ -23,6 +23,7 @@ use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::MadsimOpenRaftRuntime;
 use ursula_raft::RaftGroupEngine;
+use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
@@ -315,7 +316,7 @@ impl MadsimRuntimeRaftNetworkFactory {
             ))
         })?;
         let log_store = wal.open(control.placement, control.metrics.clone()).await;
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+        let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             control.placement,
             node_id,
             control.config,
@@ -323,8 +324,11 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .with_source(node_id)
                 .with_policy(self.policy.clone()),
             log_store,
-            Some(control.metrics),
-            self.cold_store.clone(),
+            wal.recording_work(RaftGroupEngineOptions {
+                metrics: Some(control.metrics),
+                cold_store: self.cold_store.clone(),
+                ..Default::default()
+            }),
         )
         .await?;
         control.registry.register(node_id, &engine);
@@ -391,7 +395,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                     .clone();
                 let log_store = wal.open(placement, metrics.clone()).await;
                 wals.insert(node_id, wal);
-                let engine = RaftGroupEngine::new_node_with_log_store_and_network(
+                let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
                     placement,
                     node_id,
                     config.clone(),
@@ -399,8 +403,11 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                         .with_source(node_id)
                         .with_policy(policy.clone()),
                     log_store,
-                    Some(metrics.clone()),
-                    cold_store.clone(),
+                    wals[&node_id].recording_work(RaftGroupEngineOptions {
+                        metrics: Some(metrics.clone()),
+                        cold_store: cold_store.clone(),
+                        ..Default::default()
+                    }),
                 )
                 .await?;
                 registry.register(node_id, &engine);

@@ -3359,6 +3359,206 @@ async fn shard_runtime_restarts_one_group_engine_from_its_log_store() {
     assert_eq!(read.payload, b"kept+more");
 }
 
+/// A restart whose old engine's OpenRaft work does not end keeps the group
+/// closed (#709): the shutdown fails typed, a request that would start the
+/// group again is refused at once, typed, while that work runs, and the
+/// group starts on the first request after it ended, with what its log
+/// store held.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_keeps_the_group_closed_while_its_old_work_runs() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let registry = RaftGroupHandleRegistry::default();
+    let wal = start_wal(wal_root.path(), 1, 1);
+    let mut factory =
+        DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone());
+    factory.work_stop_timeout = Some(Duration::from_millis(200));
+    let runtime = ShardRuntime::spawn_with_engine_factory(hosted_config(1, 1), factory)
+        .expect("spawn runtime with raft group engine factory");
+    let stream_id = bsid("held-restart");
+    runtime
+        .create_stream(create_req(stream_id.clone()))
+        .await
+        .expect("create");
+    runtime
+        .append(AppendRequest::from_bytes(
+            stream_id.clone(),
+            b"kept".to_vec(),
+        ))
+        .await
+        .expect("append");
+    let raft_group_id = runtime.locate(&stream_id).raft_group_id;
+    let owner = registry
+        .entry(raft_group_id)
+        .expect("the group's engine is registered")
+        .raft()
+        .clone();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let held = tokio::spawn(async move {
+        let _answered = owner
+            .with_state_machine(move |_state_machine| {
+                Box::pin(async move {
+                    entered_tx.send(()).expect("the test waits for the worker");
+                    released.await.expect("the test releases the worker");
+                })
+            })
+            .await;
+    });
+    entered_rx
+        .await
+        .expect("the worker runs the external function");
+
+    let restarted = runtime.restart_group_engine(raft_group_id).await;
+    assert!(
+        matches!(
+            &restarted,
+            Err(ursula_runtime::RuntimeError::GroupEngine {
+                error: GroupEngineError::Infra(GroupInfraError::EngineWorkOutlivedShutdown { .. }),
+                ..
+            })
+        ),
+        "{restarted:?}"
+    );
+    let refused = runtime.read_stream(read_req(stream_id.clone(), 16)).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(ursula_runtime::RuntimeError::GroupEngine {
+                error: GroupEngineError::Infra(GroupInfraError::PreviousEngineWorkRunning {
+                    raft_group_id: refused_group,
+                }),
+                ..
+            }) if *refused_group == raft_group_id
+        ),
+        "{refused:?}"
+    );
+    release.send(()).expect("the worker is still held");
+    held.await.unwrap();
+    // The group opens on the first request once the old work ended.
+    wal.engine_work_ended(raft_group_id).await;
+    let read = runtime
+        .read_stream(read_req(stream_id, 16))
+        .await
+        .expect("the group starts once its old work ended");
+    assert_eq!(read.payload, b"kept");
+}
+
+/// A single-node engine whose start fails once its Raft runs keeps its
+/// group closed until its work ended (#709): the WAL refuses to open the
+/// group while the failed engine's worker still runs, and opens it once the
+/// stopping task the WAL keeps finished.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+    let release = Arc::new(crate::rt::sync::Notify::new());
+    let started = RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config("failed-start", 30, 60),
+        wal.open(placement(), metrics()).unwrap(),
+        RaftGroupEngineOptions {
+            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            engine_work: Some(wal.engine_work_ledger()),
+            startup_fault: Some(StartupFault {
+                release: Arc::clone(&release),
+            }),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(matches!(
+        started,
+        Err(GroupEngineError::Infra(
+            GroupInfraError::LeaderWaitTimedOut { timeout_ms: 0, .. }
+        ))
+    ));
+    assert!(matches!(
+        wal.open(placement(), metrics()),
+        Err(crate::log_store::RaftWalError::PreviousEngineRunning { placement: refused })
+            if refused == placement()
+    ));
+
+    release.notify_one();
+    wal.engine_work_ended(placement().raft_group_id).await;
+    let store = wal
+        .open(placement(), metrics())
+        .expect("the group opens once the failed start's work ended");
+    drop(store);
+    wal.shutdown().await.unwrap();
+}
+
+/// An engine dropped before its shutdown, as by a group actor that
+/// panicked while the registry still holds its Raft, stops in the
+/// background (#709): its group stays closed while the engine's work runs,
+/// and opens once that work ended, though a handle on its Raft outlives the
+/// engine.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+    let engine = RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config("dropped-engine", 30, 60),
+        wal.open(placement(), metrics()).unwrap(),
+        RaftGroupEngineOptions {
+            snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
+            engine_work: Some(wal.engine_work_ledger()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("start the engine");
+    // What the registry keeps of a registered engine.
+    let kept = engine.raft_handle();
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel::<()>();
+    let worker = engine.raft_handle();
+    let held = tokio::spawn(async move {
+        let _answered = worker
+            .with_state_machine(move |_state_machine| {
+                Box::pin(async move {
+                    entered_tx.send(()).expect("the test waits for the worker");
+                    released.await.expect("the test releases the worker");
+                })
+            })
+            .await;
+    });
+    entered_rx
+        .await
+        .expect("the worker runs the external function");
+
+    drop(engine);
+    assert!(matches!(
+        wal.open(placement(), metrics()),
+        Err(crate::log_store::RaftWalError::PreviousEngineRunning { placement: refused })
+            if refused == placement()
+    ));
+
+    release.send(()).expect("the worker is still held");
+    held.await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        wal.engine_work_ended(placement().raft_group_id),
+    )
+    .await
+    .expect("the dropped engine's work ends");
+    let store = wal
+        .open(placement(), metrics())
+        .expect("the group opens once the dropped engine's work ended");
+    drop(store);
+    drop(kept);
+    wal.shutdown().await.unwrap();
+}
+
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
@@ -4808,46 +5008,29 @@ async fn a_follower_proposes_no_expiry_sweep() {
     shutdown_all(&engines).await;
 }
 
-/// OpenRaft runs a snapshot build in a task of its own that its shutdown
+/// OpenRaft runs a snapshot build in a task of its own that `Raft::shutdown`
 /// neither stops nor waits for. A build still running when its group engine
-/// shuts down publishes no snapshot metadata afterwards, so nothing writes
-/// the WAL directory once the WAL closes, and a restarted replica of the
-/// group owns its metadata file alone (#489).
+/// shuts down publishes no snapshot metadata (#489), and the engine's
+/// shutdown returns only once the build ended (#709): nothing writes the WAL
+/// directory once the WAL closes.
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_snapshot_build_that_outlives_its_engine_publishes_nothing() {
+async fn a_snapshot_build_running_at_shutdown_publishes_nothing_and_is_awaited() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let metadata_path = wal.snapshot_metadata_path(placement());
-    let store = wal
-        .open(
-            placement(),
-            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-        )
-        .unwrap();
-    let engine = RaftGroupEngine::new_single_node(
-        placement(),
-        1,
-        BasicNode::new("local"),
-        raft_config("build-outlives-engine", 30, 60),
-        store,
-        RaftGroupEngineOptions {
-            snapshot_metadata_path: Some(metadata_path.clone()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let engine = reopen_journal_engine(&wal, "build-at-shutdown").await;
     // Stand in for the build OpenRaft detached: its builder, taken while the
-    // group runs, builds only after the engine shut down.
+    // group runs, builds only once the engine's shutdown began.
     let mut builder = engine
         .with_state_machine(|state_machine| {
             Box::pin(async move { state_machine.get_snapshot_builder().await })
         })
         .await
         .unwrap();
-    engine.shutdown().await.unwrap();
-    wal.shutdown().await.unwrap();
+    let work = builder.work.clone();
+    let shutdown = tokio::spawn(async move { engine.shutdown().await });
+    work.stopping().await;
 
     let error = builder.build_snapshot().await.unwrap_err();
     assert!(matches!(
@@ -4860,43 +5043,38 @@ async fn a_snapshot_build_that_outlives_its_engine_publishes_nothing() {
         !metadata_path.exists() && !metadata_path.with_extension("json.tmp").exists(),
         "a build published snapshot metadata after its engine shut down"
     );
+    assert!(
+        !shutdown.is_finished(),
+        "the engine's shutdown returned while a build of the engine ran"
+    );
     drop(builder);
+    drop(work);
+    shutdown.await.unwrap().unwrap();
+    wal.shutdown().await.unwrap();
     fs::remove_dir_all(root.path()).expect("nothing writes the closed WAL directory");
 }
 
 /// A single-node engine of `placement()` over `wal` whose snapshot metadata
-/// lives at the WAL's own path, as the factory builds it. The previous
-/// engine's store and its core journal may still be open for a moment after
-/// its shutdown: the OpenRaft state-machine worker it leaves running holds
-/// the store until it exits, and dropping the last store stops the core
-/// writer, which then releases the journal lock (#709).
+/// lives at the WAL's own path, as the factory builds it. The group's log
+/// store opens at once: a previous engine of the group released it before
+/// its shutdown returned (#709).
 #[cfg(not(madsim))]
 async fn reopen_journal_engine(wal: &RaftWal, cluster_name: &str) -> RaftGroupEngine {
-    let store = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match wal.open(
-                placement(),
-                ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-            ) {
-                Ok(store) => break store,
-                // Still registered in the core writer, or the writer whose
-                // last handle the worker dropped still holds the journal lock.
-                Err(
-                    crate::log_store::RaftWalError::OpenGroup {
-                        source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
-                        ..
-                    }
-                    | crate::log_store::RaftWalError::OpenCore {
-                        source: crate::log_store::CoreJournalError::Locked { .. },
-                        ..
-                    },
-                ) => tokio::time::sleep(Duration::from_millis(10)).await,
-                Err(err) => panic!("open the group's log store: {err}"),
-            }
-        }
-    })
-    .await
-    .expect("the stopped engine's log store closes");
+    reopen_journal_engine_with(wal, cluster_name, RaftGroupEngineOptions::default()).await
+}
+
+#[cfg(not(madsim))]
+async fn reopen_journal_engine_with(
+    wal: &RaftWal,
+    cluster_name: &str,
+    options: RaftGroupEngineOptions,
+) -> RaftGroupEngine {
+    let store = wal
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("the group's log store opens");
     RaftGroupEngine::new_single_node(
         placement(),
         1,
@@ -4905,7 +5083,7 @@ async fn reopen_journal_engine(wal: &RaftWal, cluster_name: &str) -> RaftGroupEn
         store,
         RaftGroupEngineOptions {
             snapshot_metadata_path: Some(wal.snapshot_metadata_path(placement())),
-            ..Default::default()
+            ..options
         },
     )
     .await
@@ -4938,9 +5116,9 @@ async fn snapshot_builder_after_write(
 
 /// The restart of a recovery plan's cut (#489): engine A of a group stops
 /// with a snapshot build still running, and engine B of the same group opens
-/// on the same WAL and metadata path and publishes its own snapshot. A's
-/// build, ending only then, publishes nothing over B's pointer, and B, whose
-/// publication is its own, builds and publishes again.
+/// on the same WAL and metadata path. A's build publishes nothing, A's
+/// shutdown returns only once it ended, and B, which opens right after,
+/// builds and publishes its own snapshots.
 #[cfg(not(madsim))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
@@ -4950,19 +5128,9 @@ async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
 
     let mut engine_a = reopen_journal_engine(&wal, "restart-overlap-a").await;
     let mut stale = snapshot_builder_after_write(&mut engine_a, "written-by-a").await;
-    engine_a.shutdown().await.unwrap();
-    drop(engine_a);
-
-    let mut engine_b = reopen_journal_engine(&wal, "restart-overlap-b").await;
-    let mut first = snapshot_builder_after_write(&mut engine_b, "written-by-b").await;
-    let first_built = first.build_snapshot().await.expect("B publishes");
-    drop(first);
-    let published = fs::read(&metadata_path).expect("B's pointer");
-    assert!(
-        stale.meta.last_log_id < first_built.meta.last_log_id,
-        "the restarted replica applied past the stopped engine"
-    );
-
+    let work = stale.work.clone();
+    let shutdown = tokio::spawn(async move { engine_a.shutdown().await });
+    work.stopping().await;
     let error = stale.build_snapshot().await.unwrap_err();
     assert!(matches!(
         error.get_ref().and_then(
@@ -4970,11 +5138,23 @@ async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
         ),
         Some(crate::state_machine::SnapshotMetadataStopped::EngineShutDown)
     ));
+    let stale_index = stale.meta.last_log_id;
     drop(stale);
-    assert_eq!(
-        fs::read(&metadata_path).expect("B's pointer"),
-        published,
-        "a build of the stopped engine replaced the restarted replica's pointer"
+    drop(work);
+    shutdown.await.unwrap().unwrap();
+    assert!(
+        !metadata_path.exists(),
+        "a build of the stopped engine published"
+    );
+
+    let mut engine_b = reopen_journal_engine(&wal, "restart-overlap-b").await;
+    let mut first = snapshot_builder_after_write(&mut engine_b, "written-by-b").await;
+    let first_built = first.build_snapshot().await.expect("B publishes");
+    drop(first);
+    let published = fs::read(&metadata_path).expect("B's pointer");
+    assert!(
+        stale_index < first_built.meta.last_log_id,
+        "the restarted replica applied past the stopped engine"
     );
 
     let mut second = snapshot_builder_after_write(&mut engine_b, "written-by-b-again").await;
@@ -4989,5 +5169,384 @@ async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
 
     engine_b.shutdown().await.unwrap();
     drop(engine_b);
+    wal.shutdown().await.unwrap();
+}
+
+/// Holds `raft`'s state-machine worker in an external function until
+/// `release` fires, and returns once the worker runs it: every command
+/// OpenRaft sends the worker meanwhile queues behind it.
+#[cfg(not(madsim))]
+async fn hold_state_machine_worker(
+    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    release: tokio::sync::oneshot::Receiver<()>,
+) -> tokio::task::JoinHandle<()> {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let held = tokio::spawn(async move {
+        // The worker answers once released; a worker that stopped first
+        // answers nothing, which is no failure here.
+        let _answered = raft
+            .with_state_machine(move |_state_machine| {
+                Box::pin(async move {
+                    entered_tx.send(()).expect("the test waits for the worker");
+                    release.await.expect("the test releases the worker");
+                })
+            })
+            .await;
+    });
+    entered_rx
+        .await
+        .expect("the worker runs the external function");
+    held
+}
+
+/// What a group's node-wide state shows of the work its engines ran: the
+/// log gauge the next engine of the group shares, the builds in flight on
+/// the node and the group's snapshot metadata.
+#[cfg(not(madsim))]
+#[derive(Debug, PartialEq)]
+struct GroupWorkTrace {
+    progress: crate::snapshot_cadence::GroupLogProgress,
+    running_builds: usize,
+    metadata: Option<Vec<u8>>,
+}
+
+#[cfg(not(madsim))]
+fn group_work_trace(
+    builds: &crate::state_machine::SnapshotBuildCoordinator,
+    metadata_path: &Path,
+) -> GroupWorkTrace {
+    GroupWorkTrace {
+        progress: builds.log_gauge(placement().raft_group_id.0).progress(),
+        running_builds: builds.running_builds(),
+        metadata: fs::read(metadata_path).ok(),
+    }
+}
+
+/// A single-node engine of `placement()` whose state-machine worker is
+/// held while three committed applies, a snapshot build and a full
+/// snapshot install of a later leader queue behind it.
+#[cfg(not(madsim))]
+struct QueuedWork {
+    engine: RaftGroupEngine,
+    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+    release: tokio::sync::oneshot::Sender<()>,
+    held: tokio::task::JoinHandle<()>,
+    /// Each queued write, answering whether it applied.
+    writes: Vec<tokio::task::JoinHandle<bool>>,
+    /// The install's request. A refused install answers nothing; what
+    /// counts is that it ran.
+    install: tokio::task::JoinHandle<()>,
+    builds: crate::state_machine::SnapshotBuildCoordinator,
+    /// Taken before the worker is released: a build starting or ending
+    /// shows in it.
+    builds_changed: crate::state_machine::BuildsChanged,
+}
+
+#[cfg(not(madsim))]
+async fn queue_state_machine_work(
+    wal: &RaftWal,
+    cluster_name: &str,
+    work_stop_timeout: Option<Duration>,
+) -> QueuedWork {
+    let builds = crate::state_machine::SnapshotBuildCoordinator::default();
+    let mut engine = reopen_journal_engine_with(wal, cluster_name, RaftGroupEngineOptions {
+        snapshot_build: Some(builds.clone()),
+        work_stop_timeout,
+        ..Default::default()
+    })
+    .await;
+    let stream = bsid(cluster_name);
+    engine
+        .create_stream(
+            create_req(stream.clone()),
+            placement(),
+            ColdWriteAdmission::default(),
+        )
+        .await
+        .unwrap();
+    let raft = engine.raft_handle();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let held = hold_state_machine_worker(raft.clone(), released).await;
+
+    // Applies: committed, so RaftCore sent them to the held worker.
+    let committed = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
+        .local_committed
+        .map_or(0, |log_id| log_id.index);
+    let writes = (0..3)
+        .map(|_| {
+            let raft = raft.clone();
+            let command = append_command(stream.clone(), b"queued");
+            tokio::spawn(async move { raft.client_write(command).await.is_ok() })
+        })
+        .collect::<Vec<_>>();
+    let queued = committed.saturating_add(3);
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .local_committed
+                    .is_some_and(|log_id| log_id.index >= queued)
+            },
+            "the queued writes commit",
+        )
+        .await
+        .unwrap();
+    // A snapshot build, then a full snapshot install of a later leader:
+    // RaftCore takes requests in order and sends both to the worker as it
+    // handles them, so both are queued once it adopted the leader's term.
+    raft.trigger().snapshot().await.unwrap();
+    let installed_index = queued.saturating_add(10);
+    let installed_id = LogId {
+        leader_id: CommittedLeaderId::new(9, 2),
+        index: installed_index,
+    };
+    let group = ursula_runtime::GroupSnapshot {
+        placement: placement(),
+        group_commit_index: installed_index,
+        stream_snapshot: Default::default(),
+        stream_append_counts: Vec::new(),
+    };
+    let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(group))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .concat();
+    let pointer = ursula_runtime::SnapshotPointer {
+        snapshot_id: "queued-install".to_owned(),
+        location: ursula_runtime::SnapshotLocation::Inline { bytes },
+    };
+    let snapshot = openraft::alias::SnapshotOf::<UrsulaRaftTypeConfig> {
+        meta: openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+            last_log_id: Some(installed_id),
+            last_membership: openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                Some(installed_id),
+                openraft::Membership::new(
+                    vec![BTreeSet::from([1])],
+                    BTreeMap::from([(1, BasicNode::new("local"))]),
+                )
+                .unwrap(),
+            ),
+            snapshot_id: "queued-install".to_owned(),
+        },
+        snapshot: crate::types::SnapshotData::new(pointer.encode_binary().unwrap()),
+    };
+    let install = {
+        let raft = raft.clone();
+        tokio::spawn(async move {
+            let _answer = raft
+                .install_full_snapshot(UrsulaVote::new_committed(9, 2), snapshot)
+                .await;
+        })
+    };
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(
+            // It may campaign past that term once the leader stays silent.
+            |metrics| metrics.current_term >= 9,
+            "RaftCore adopts the installing leader's term",
+        )
+        .await
+        .unwrap();
+    let builds_changed = builds.subscribe_builds();
+    QueuedWork {
+        engine,
+        raft,
+        release,
+        held,
+        writes,
+        install,
+        builds,
+        builds_changed,
+    }
+}
+
+/// OpenRaft's shutdown stops RaftCore and leaves its state-machine worker
+/// running whatever it already received (#709). Applies, a snapshot build
+/// and a full snapshot install queue behind a held worker, and the engine
+/// shuts down. The worker runs them only after RaftCore stopped, and the
+/// engine's shutdown returns only once it did: what the group's node-wide
+/// state shows then holds, and the group's log store opens again at once,
+/// as a restart in the same process opens it. The install of an engine
+/// that is shutting down is refused and leaves the gauge alone.
+///
+/// The control below runs the same work with a shutdown that does not
+/// wait.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metadata_path = wal.snapshot_metadata_path(placement());
+    let queued = queue_state_machine_work(&wal, "queued-work", None).await;
+    let before = group_work_trace(&queued.builds, &metadata_path);
+    assert!(!before.progress.has_snapshot);
+
+    // The worker goes on only after RaftCore stopped.
+    let release = queued.release;
+    let releaser = {
+        let raft = queued.raft.clone();
+        tokio::spawn(async move {
+            raft.wait(Some(Duration::from_secs(10)))
+                .metrics(
+                    |metrics| matches!(metrics.state, openraft::ServerState::Shutdown),
+                    "RaftCore stops",
+                )
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            release.send(()).expect("the worker is still held");
+        })
+    };
+    queued.engine.shutdown().await.unwrap();
+    let after = group_work_trace(&queued.builds, &metadata_path);
+    // The group opens again at once: nothing of the stopped engine holds
+    // its log store.
+    let reopened = wal
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("the stopped engine released the group's log store");
+
+    // The queued work ran before the shutdown returned: the applies
+    // answered, a build started, and the refused install left the gauge
+    // without a snapshot.
+    for write in queued.writes {
+        assert!(write.await.unwrap(), "the queued write applied");
+    }
+    tokio::time::timeout(Duration::from_millis(1), queued.builds_changed.changed())
+        .await
+        .expect("a queued build started before the shutdown returned");
+    assert!(
+        !after.progress.has_snapshot
+            && after.progress.last_snapshot_bytes == 0
+            && after.running_builds == 0,
+        "the refused install left the gauge alone: {after:?}"
+    );
+    assert!(after.progress.log_bytes > before.progress.log_bytes);
+    releaser.await.unwrap();
+    queued.held.await.unwrap();
+    queued.install.await.unwrap();
+    // And nothing of it runs after.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        group_work_trace(&queued.builds, &metadata_path),
+        after,
+        "work of the stopped engine ran after its shutdown returned"
+    );
+
+    let engine = RaftGroupEngine::new_single_node(
+        placement(),
+        1,
+        BasicNode::new("local"),
+        raft_config("queued-work-reopened", 30, 60),
+        reopened,
+        RaftGroupEngineOptions {
+            snapshot_build: Some(queued.builds.clone()),
+            snapshot_metadata_path: Some(metadata_path.clone()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    engine.shutdown().await.unwrap();
+    wal.shutdown().await.unwrap();
+}
+
+/// The negative control of the test above: a shutdown that waits no time
+/// for OpenRaft's work returns while the worker is held. It fails typed,
+/// the group's log store does not open, and the queued applies change the
+/// gauge only after it returned.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shutdown_that_does_not_wait_leaves_the_queued_work_running() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metadata_path = wal.snapshot_metadata_path(placement());
+    let queued = queue_state_machine_work(&wal, "unwaited-work", Some(Duration::ZERO)).await;
+
+    let stopped = queued.engine.shutdown().await;
+    assert!(
+        matches!(
+            &stopped,
+            Err(GroupEngineError::Infra(GroupInfraError::EngineWorkOutlivedShutdown {
+                raft_group_id,
+                waited_ms: 0,
+            })) if *raft_group_id == placement().raft_group_id
+        ),
+        "{stopped:?}"
+    );
+    let at_return = group_work_trace(&queued.builds, &metadata_path);
+    assert!(matches!(
+        wal.open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        ),
+        Err(crate::log_store::RaftWalError::OpenGroup {
+            source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
+            ..
+        })
+    ));
+
+    queued.release.send(()).expect("the worker is still held");
+    for write in queued.writes {
+        assert!(write.await.unwrap(), "the queued write applied");
+    }
+    assert_ne!(
+        group_work_trace(&queued.builds, &metadata_path),
+        at_return,
+        "the queued applies ran after the shutdown returned"
+    );
+    queued.held.await.unwrap();
+    queued.install.await.unwrap();
+}
+
+/// OpenRaft work of an engine that does not end within the shutdown's
+/// bound fails the shutdown, typed, and keeps the group closed: its log
+/// store does not open while the work holds it. A later shutdown returns
+/// once the work ended (#709).
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engine_shutdown_names_openraft_work_that_does_not_end() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let engine = reopen_journal_engine_with(&wal, "stuck-work", RaftGroupEngineOptions {
+        work_stop_timeout: Some(Duration::from_millis(200)),
+        ..Default::default()
+    })
+    .await;
+    let (release, released) = tokio::sync::oneshot::channel();
+    let held = hold_state_machine_worker(engine.raft_handle(), released).await;
+
+    let stopped = engine.shutdown().await;
+    assert!(
+        matches!(
+            &stopped,
+            Err(GroupEngineError::Infra(GroupInfraError::EngineWorkOutlivedShutdown {
+                raft_group_id,
+                waited_ms: 200,
+            })) if *raft_group_id == placement().raft_group_id
+        ),
+        "{stopped:?}"
+    );
+    assert!(matches!(
+        wal.open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        ),
+        Err(crate::log_store::RaftWalError::OpenGroup {
+            source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
+            ..
+        })
+    ));
+
+    release.send(()).unwrap();
+    held.await.unwrap();
+    engine.shutdown().await.unwrap();
+    let store = wal
+        .open(
+            placement(),
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("the ended work released the group's log store");
+    drop(store);
     wal.shutdown().await.unwrap();
 }

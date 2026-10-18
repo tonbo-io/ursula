@@ -34,3 +34,28 @@ pub use tokio::sync;
 pub use tokio::task;
 #[cfg(not(madsim))]
 pub use tokio::time;
+
+/// Spawns `future` on the runtime this thread runs on, or returns `None`
+/// outside one: a value's drop may run where no runtime does.
+#[cfg(not(madsim))]
+pub(crate) fn try_spawn<F>(future: F) -> Option<task::JoinHandle<F::Output>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    tokio::runtime::Handle::try_current()
+        .ok()
+        .map(|runtime| runtime.spawn(future))
+}
+
+/// Spawns `future` on the simulation's runtime, or returns `None` outside
+/// one: a value's drop may run where no runtime does.
+#[cfg(madsim)]
+pub(crate) fn try_spawn<F>(future: F) -> Option<task::JoinHandle<F::Output>>
+where
+    F: std::future::Future + Send + 'static,
+    F::Output: Send + 'static,
+{
+    madsim::runtime::Handle::try_current().ok()?;
+    Some(sim_tokio::spawn(future))
+}

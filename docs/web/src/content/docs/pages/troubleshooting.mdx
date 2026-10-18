@@ -79,6 +79,19 @@ the group with `apply_stopped`, so `ursulactl wait-ready` refuses disruption
 until the group recovers. Follow [Recovering stopped Raft
 groups](/docs/apply-failure-recovery) and never skip the committed record.
 
+### `503` with `GROUP_RESTARTING` from one group
+
+The group's engine on this node is stopping or restarting, and the previous
+engine's Raft work has not ended yet. The node opens the group only once that
+work ends, because it could still change the group's state. A request that
+arrives meanwhile is refused at once, so the code shows up briefly during any
+restart of the group. Retry the request. If the answer persists for more than
+30 seconds, the previous engine is stuck. Its shutdown logged
+`EngineWorkOutlivedShutdown` at error level, with the group and how many of
+the engine's state-machine workers, snapshot builders, log readers, network
+clients and snapshot installs still ran. Collect the node's logs and restart
+the node.
+
 ## Startup failures
 
 ### WAL topology mismatch or missing topology

@@ -185,7 +185,7 @@ const RESTARTED_MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveGroup {
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
-    pub(crate) snapshot_installs: Arc<crate::state_machine::SnapshotInstallLifecycle>,
+    pub(crate) snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
     pub(crate) cache: Option<GroupColdIndexCache>,
     pub(crate) barrier: Arc<ReadIndexBarrier>,
     pub(crate) recovery: Option<Arc<GroupRejoin>>,
@@ -1470,28 +1470,39 @@ impl RaftGroupHandleRegistry {
         // The admitted task retains prefetch and permits through Raft consumption,
         // even when the RPC waiter disconnects or is canceled.
         crate::rt::spawn(async move {
-            let _lifetime = lifetime;
             let _serial = serial;
             let _permit = permit;
-            let current = raft
-                .get_snapshot()
-                .await
-                .map_err(crate::owner::owner_stopped)?;
-            let already_current = current.as_ref().is_some_and(|current| {
-                current.meta == snapshot.meta
-                    && current.snapshot.pointer_bytes() == snapshot.snapshot.pointer_bytes()
-            });
-            let prefetched = if already_current {
-                PrefetchedInstallSnapshot {
-                    snapshot,
-                    guard: None,
-                    history: None,
-                }
-            } else {
-                registry
-                    .prefetch_snapshot_for_install(raft_group_id, snapshot)
-                    .await?
+            // A download of an engine that is shutting down stops: the
+            // shutdown waits for this task (#709).
+            let prepared = lifetime
+                .until_stopping(async {
+                    let current = raft
+                        .get_snapshot()
+                        .await
+                        .map_err(crate::owner::owner_stopped)?;
+                    let already_current = current.as_ref().is_some_and(|current| {
+                        current.meta == snapshot.meta
+                            && current.snapshot.pointer_bytes() == snapshot.snapshot.pointer_bytes()
+                    });
+                    if already_current {
+                        Ok::<_, SnapshotInstallError>(PrefetchedInstallSnapshot {
+                            snapshot,
+                            guard: None,
+                            history: None,
+                        })
+                    } else {
+                        registry
+                            .prefetch_snapshot_for_install(raft_group_id, snapshot)
+                            .await
+                    }
+                })
+                .await;
+            let Some(prefetched) = prepared else {
+                return Err(SnapshotInstallError::ShuttingDown {
+                    group: raft_group_id,
+                });
             };
+            let prefetched = prefetched?;
             let _prefetch_guard = prefetched.guard;
             let snapshot = prefetched.snapshot;
             let incoming_history = prefetched.history;
@@ -1566,10 +1577,17 @@ impl RaftGroupHandleRegistry {
             // the snapshot driver's next tick deletes what retired before
             // (#669).
             references.schedule_pass(crate::rt::time::Instant::now());
-            let publication = references
-                .publish_current(&registry.snapshot_store(), raft_group_id.0)
+            // A publication of an engine that is shutting down stops: the
+            // shutdown waits for this task, and the next engine publishes its
+            // own current reference (#709).
+            let publication = lifetime
+                .until_stopping(
+                    references.publish_current(&registry.snapshot_store(), raft_group_id.0),
+                )
                 .await
+                .unwrap_or(Ok(()))
                 .map_err(SnapshotInstallError::Publication);
+            drop(lifetime);
             result.and_then(|response| publication.map(|()| response))
         })
         .await
@@ -2381,7 +2399,7 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn shutdown_drains_canceled_install_before_reopened_group_publication() {
+    async fn shutdown_stops_a_canceled_install_before_reopened_group_publication() {
         let store = Arc::new(FailingReferenceStore::default());
         store.pause_current.store(true, Ordering::SeqCst);
         let (registry, engine, _root) = reference_failure_engine(store.clone()).await;
@@ -2405,11 +2423,10 @@ mod tests {
         raft.wait(Some(Duration::from_secs(2)))
             .metrics(
                 |metrics| matches!(metrics.state, openraft::ServerState::Shutdown),
-                "Raft stops before draining reference publication",
+                "Raft stops before the admitted install's publication ends",
             )
             .await
             .unwrap();
-        assert!(!shutdown.is_finished());
         let refused = crate::rt::spawn({
             let registry = registry.clone();
             async move {
@@ -2422,13 +2439,15 @@ mod tests {
                     .await
             }
         });
-        store.pause_current.store(false, Ordering::SeqCst);
-        store.release_current.notify_one();
+        // The shutdown stops the admitted install's paused publication
+        // instead of waiting for it, and returns once the task ended (#709).
         shutdown.await.unwrap().unwrap();
         assert!(matches!(
             refused.await.unwrap().unwrap_err(),
             SnapshotInstallError::ShuttingDown { .. }
         ));
+        store.pause_current.store(false, Ordering::SeqCst);
+        store.release_current.notify_one();
         // Reopen against the same external reference namespace. No canceled
         // task from the retired engine may publish or reconcile behind this.
         let (replacement_registry, replacement, _replacement_root) =
