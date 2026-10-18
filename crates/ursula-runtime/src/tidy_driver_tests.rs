@@ -8,13 +8,25 @@ use ursula_shard::BucketStreamId;
 use ursula_stream::ProducerRequest;
 
 use crate::AppendRequest;
+use crate::CloseStreamRequest;
 use crate::CreateStreamRequest;
 use crate::RuntimeConfig;
 use crate::ShardRuntime;
+use crate::TidyStreamsRequest;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 
 /// F3: a producer idle this long expires at the next tidy.
 const PRODUCER_IDLE_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
+
+/// A tidy pass with the scheduled sweep's budget.
+fn tidy(max_streams: usize, max_expiry_sweeps: usize, now_ms: u64) -> TidyStreamsRequest {
+    TidyStreamsRequest {
+        max_streams,
+        max_expiry_sweeps,
+        expiry_sweep_budget: crate::expiry_sweep::GROUP_BUDGET,
+        now_ms,
+    }
+}
 
 fn spawn() -> ShardRuntime {
     ShardRuntime::spawn(RuntimeConfig::new(1, 2)).expect("spawn runtime")
@@ -56,23 +68,26 @@ async fn tidy_pass_converges_streams_with_idle_producers() {
     }
     // Before the expiry nothing has debt and nothing is proposed.
     let report = runtime
-        .tidy_streams_all_groups_once(64, 0, 10)
+        .tidy_streams_all_groups_once(tidy(64, 0, 10))
         .await
+        .into_result()
         .expect("tidy pass before the expiry");
     assert_eq!(report.tidied, 0);
 
     let expired = 1 + PRODUCER_IDLE_EXPIRY_MS;
     // At most one stream per group per pass, so the pass is rate-limited.
     let report = runtime
-        .tidy_streams_all_groups_once(1, 0, expired)
+        .tidy_streams_all_groups_once(tidy(1, 0, expired))
         .await
+        .into_result()
         .expect("bounded tidy pass");
     assert!(report.tidied >= 1 && report.tidied <= 2, "{report:?}");
     let mut passes = 1;
     loop {
         let report = runtime
-            .tidy_streams_all_groups_once(1, 0, expired)
+            .tidy_streams_all_groups_once(tidy(1, 0, expired))
             .await
+            .into_result()
             .expect("tidy pass");
         if report.tidied == 0 {
             break;
@@ -102,9 +117,11 @@ async fn stream_count(runtime: &ShardRuntime) -> u64 {
 }
 
 /// #669: the leader's expiry sweep removes expired streams a group never
-/// writes to again, at most its command cap per group and pass, reports the
-/// groups it left due, and sums its commands over the groups. Plain appends
-/// to a live stream never sweep.
+/// writes to again with `ExpireStreams` entries of 256 streams, at most its
+/// entry cap per group and pass, reports the groups it left capped, and
+/// sums its entries and removals over the groups. Writes never remove an
+/// expired stream they do not name: creates, appends and closes leave them
+/// for the sweep.
 #[tokio::test]
 async fn expiry_sweep_removes_expired_streams_within_its_cap() {
     let runtime = spawn();
@@ -125,51 +142,74 @@ async fn expiry_sweep_removes_expired_streams_within_its_cap() {
         .create_stream(request)
         .await
         .expect("create the live stream");
-    let mut append = AppendRequest::from_bytes(live, b"after".to_vec());
-    append.now_ms = expired_at.saturating_add(10_000);
+    let later = expired_at.saturating_add(10_000);
+    let mut append = AppendRequest::from_bytes(live.clone(), b"after".to_vec());
+    append.now_ms = later;
     runtime.append(append).await.expect("append");
-    assert_eq!(stream_count(&runtime).await, 1_201, "appends never sweep");
+    let mut request = CreateStreamRequest::new(
+        BucketStreamId::new("expiry", "created-later"),
+        DEFAULT_CONTENT_TYPE,
+    );
+    request.now_ms = later;
+    runtime.create_stream(request).await.expect("create later");
+    runtime
+        .close_stream(CloseStreamRequest {
+            stream_id: live,
+            stream_seq: None,
+            producer: None,
+            now_ms: later,
+            if_incarnation: None,
+        })
+        .await
+        .expect("close");
+    assert_eq!(stream_count(&runtime).await, 1_202, "writes never sweep");
 
     // Within the clock grace nothing is swept.
     let report = runtime
-        .tidy_streams_all_groups_once(0, 16, expired_at.saturating_add(999))
+        .tidy_streams_all_groups_once(tidy(0, 16, expired_at.saturating_add(999)))
         .await
+        .into_result()
         .expect("a pass within the grace");
     assert_eq!(report.expiry_sweeps, 0);
-    assert_eq!(stream_count(&runtime).await, 1_201);
+    assert_eq!(stream_count(&runtime).await, 1_202);
 
-    // One command per group removes at most 257 streams in each.
-    let now = expired_at.saturating_add(10_000);
+    // One entry per group removes 256 streams in each, and leaves both
+    // groups capped.
+    let now = later;
     let report = runtime
-        .tidy_streams_all_groups_once(0, 1, now)
+        .tidy_streams_all_groups_once(tidy(0, 1, now))
         .await
+        .into_result()
         .expect("a capped pass");
     assert_eq!(report.expiry_sweeps, 2, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 512, "{report:?}");
     assert_eq!(report.expiry_due_groups, 2, "{report:?}");
-    let left = stream_count(&runtime).await;
-    assert!(
-        (1_201 - 2 * 257..1_201).contains(&left),
-        "{left} streams left"
-    );
+    assert_eq!(report.expiry_capped_groups, 2, "{report:?}");
+    assert_eq!(stream_count(&runtime).await, 1_202 - 512);
 
     let report = runtime
-        .tidy_streams_all_groups_once(0, 16, now)
+        .tidy_streams_all_groups_once(tidy(0, 16, now))
         .await
+        .into_result()
         .expect("a full pass");
     assert!(report.expiry_sweeps >= 2, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 1_200 - 512, "{report:?}");
     assert_eq!(report.expiry_due_groups, 0, "{report:?}");
-    assert_eq!(stream_count(&runtime).await, 1);
+    assert_eq!(report.expiry_capped_groups, 0, "{report:?}");
+    assert_eq!(stream_count(&runtime).await, 2);
     let snapshot = runtime.metrics().snapshot();
     assert_eq!(
         snapshot.ttl_expiry_sweeps,
         report.expiry_sweeps.saturating_add(2)
     );
+    assert_eq!(snapshot.ttl_expiry_swept_streams, 1_200);
     assert_eq!(snapshot.ttl_expiry_sweep_due_groups, 0);
 
     // Nothing left: the next pass proposes nothing.
     let report = runtime
-        .tidy_streams_all_groups_once(0, 16, now)
+        .tidy_streams_all_groups_once(tidy(0, 16, now))
         .await
+        .into_result()
         .expect("an idle pass");
     assert_eq!(report.expiry_sweeps, 0);
 }

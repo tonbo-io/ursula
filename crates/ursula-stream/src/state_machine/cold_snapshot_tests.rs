@@ -125,6 +125,7 @@ fn cold_snapshot_keeps_a_reference_and_queues_unreferenced_bodies() {
     // Deleting the stream releases the visible body.
     machine.apply(StreamCommand::DeleteStream {
         stream_id: stream(),
+        now_ms: 0,
     });
     assert!(
         gc_paths(&machine)

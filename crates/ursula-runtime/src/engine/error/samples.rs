@@ -465,6 +465,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             TidyStream,
             DeferColdGc,
             OffloadColdRefs,
+            ExpireStreams,
             BucketCreated,
             BucketAlreadyExists,
             StreamError,

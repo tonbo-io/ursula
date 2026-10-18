@@ -173,17 +173,20 @@ impl StreamRegistry {
         }
     }
 
-    /// The stream of the TTL heap's front entry, when that entry is due at
-    /// `now_ms`; `None` when the heap is empty or its front is not due yet.
+    /// Whether the TTL heap's front entry is due at `now_ms`: `false` when
+    /// the heap is empty or its front is not due yet.
     ///
-    /// `None` is exact: every live stream with an expiry has one armed entry
-    /// at or before its true expiry, so a front past `now_ms` means no
-    /// stream has expired. `Some` may name a stale entry, of a stream that
-    /// was removed or renewed since. A sweep at `now_ms` still makes
-    /// progress on it: [`Self::pop_expired`] discards or re-arms that front.
-    pub(super) fn ttl_front_due(&self, now_ms: u64) -> Option<BucketStreamId> {
-        let Reverse(front) = self.ttl.entries.peek()?;
-        (front.expires_at_ms <= now_ms).then(|| front.stream_id.clone())
+    /// `false` is exact: every live stream with an expiry has one armed
+    /// entry at or before its true expiry, so a front past `now_ms` means
+    /// no stream has expired. `true` may come from a stale entry, of a
+    /// stream that was removed or renewed since. An `ExpireStreams` at
+    /// `now_ms` still makes progress on it: [`Self::pop_expired`] discards
+    /// or re-arms that front.
+    pub(super) fn ttl_front_due(&self, now_ms: u64) -> bool {
+        self.ttl
+            .entries
+            .peek()
+            .is_some_and(|Reverse(front)| front.expires_at_ms <= now_ms)
     }
 
     fn arm_ttl_entry(&mut self, stream_id: &BucketStreamId, key: StreamKey) {
@@ -399,7 +402,7 @@ mod tests {
                         let expected = reference.pop_expired(&registry, now);
                         assert_eq!(actual, expected, "seed {seed} at {now}");
                         // The front check is exact when it finds nothing due.
-                        if due.is_none() {
+                        if !due {
                             assert_eq!(actual, None, "seed {seed} at {now}: front not due");
                         }
                         let Some(expired) = actual else {
@@ -409,7 +412,7 @@ mod tests {
                     },
                 }
                 // A front not due means no live stream has expired.
-                if registry.ttl_front_due(now).is_none() {
+                if !registry.ttl_front_due(now) {
                     assert!(
                         registry
                             .slots()

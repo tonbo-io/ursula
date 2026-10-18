@@ -578,6 +578,7 @@ async fn orphan_sweep_reclaims_the_parts_of_a_deleted_stream() {
     runtime
         .delete_stream(crate::DeleteStreamRequest {
             stream_id: gone.clone(),
+            now_ms: 0,
             if_incarnation: None,
         })
         .await

@@ -56,6 +56,7 @@ async fn delete(runtime: &ShardRuntime, stream: &BucketStreamId) {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            now_ms: 0,
             if_incarnation: None,
         })
         .await

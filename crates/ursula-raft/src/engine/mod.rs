@@ -100,6 +100,7 @@ use ursula_runtime::RepairColdIndexResponse;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
+use ursula_runtime::TidyStreamsPass;
 use ursula_runtime::TidyStreamsRequest;
 use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
@@ -837,15 +838,14 @@ impl RaftGroupEngine {
     }
 
     /// The leader's expiry sweep of one tidy pass (#669,
-    /// [`ursula_runtime::expiry_sweep`]): while the front of the group's TTL
-    /// index is due at the pass's sweep clock, proposes the
-    /// `TouchStreamAccess { renew_ttl: false }` that names it, at most
-    /// `request.max_expiry_sweeps` times and for at most
-    /// [`ursula_runtime::expiry_sweep::GROUP_BUDGET`]. Each command applies
+    /// [`ursula_runtime::expiry_sweep`]): while the group's TTL front is due
+    /// at the pass's sweep clock, proposes `ExpireStreams`, at most
+    /// `request.max_expiry_sweeps` entries and for at most
+    /// `request.expiry_sweep_budget`. Each entry applies
     /// through [`Self::write`], with its apply-health, history and
     /// leadership checks. An error ends the sweep until the next pass,
-    /// keeps the commands committed so far in the report, and lets the
-    /// pass go on to `TidyStream`.
+    /// keeps the entries committed so far in the report, and lets the pass
+    /// go on to `TidyStream`.
     async fn sweep_expired_streams(&self, request: TidyStreamsRequest) -> TidyStreamsResponse {
         let mut report = TidyStreamsResponse::default();
         if request.max_expiry_sweeps == 0 || !expiry_sweep::enabled() {
@@ -855,32 +855,32 @@ impl RaftGroupEngine {
         let now_ms = expiry_sweep::sweep_now_ms(request.now_ms);
         let started = crate::rt::time::Instant::now();
         loop {
-            let target = match self
+            let due = match self
                 .with_state_machine(move |state_machine| {
-                    Box::pin(async move { state_machine.engine.expiry_sweep_target(now_ms) })
+                    Box::pin(async move { state_machine.engine.expiry_due(now_ms) })
                 })
                 .await
             {
-                Ok(target) => target,
+                Ok(due) => due,
                 Err(err) => {
                     expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
                     break;
                 }
             };
-            let Some(stream_id) = target else {
-                break;
-            };
-            if report.expiry_sweeps >= max || started.elapsed() >= expiry_sweep::GROUP_BUDGET {
-                report.expiry_due_groups = 1;
+            if !due {
                 break;
             }
-            if let Err(err) =
-                expiry_sweep::settle(self.write(expiry_sweep::command(stream_id, now_ms)).await)
-            {
-                expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
+            if report.expiry_sweeps >= max || started.elapsed() >= request.expiry_sweep_budget {
+                expiry_sweep::capped(&mut report);
                 break;
             }
-            report.expiry_sweeps = report.expiry_sweeps.saturating_add(1);
+            match expiry_sweep::settle(self.write(expiry_sweep::command(now_ms)).await) {
+                Ok(removed) => expiry_sweep::applied(&mut report, removed),
+                Err(err) => {
+                    expiry_sweep::interrupted(self.placement.raft_group_id, &err, &mut report);
+                    break;
+                }
+            }
         }
         report
     }
@@ -1595,30 +1595,49 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             // Leader-side driver: followers propose nothing.
             if !self.raft.is_leader() {
-                return Ok(TidyStreamsResponse::default());
+                return TidyStreamsPass::empty();
             }
+            // The sweep's report survives a failure of the `TidyStream`
+            // step, so a capped sweep still runs again soon.
             let mut report = self.sweep_expired_streams(request).await;
-            let candidates = self
+            let candidates = match self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {
-                        Ok::<_, GroupEngineError>(
-                            state_machine
-                                .engine
-                                .tidy_candidates(request.now_ms, request.max_streams),
-                        )
+                        state_machine
+                            .engine
+                            .tidy_candidates(request.now_ms, request.max_streams)
                     })
                 })
-                .await??;
+                .await
+            {
+                Ok(candidates) => candidates,
+                Err(err) => {
+                    return TidyStreamsPass {
+                        report,
+                        error: Some(err),
+                    };
+                }
+            };
             for stream_id in candidates {
-                let response = self
-                    .tidy_stream(stream_id, request.now_ms, placement)
-                    .await?;
-                report.tidied = report.tidied.saturating_add(1);
-                if response.debt_remaining {
-                    report.debt_remaining = report.debt_remaining.saturating_add(1);
+                match self.tidy_stream(stream_id, request.now_ms, placement).await {
+                    Ok(response) => {
+                        report.tidied = report.tidied.saturating_add(1);
+                        if response.debt_remaining {
+                            report.debt_remaining = report.debt_remaining.saturating_add(1);
+                        }
+                    }
+                    Err(err) => {
+                        return TidyStreamsPass {
+                            report,
+                            error: Some(err),
+                        };
+                    }
                 }
             }
-            Ok(report)
+            TidyStreamsPass {
+                report,
+                error: None,
+            }
         })
     }
 

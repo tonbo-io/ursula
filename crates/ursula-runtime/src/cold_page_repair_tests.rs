@@ -471,6 +471,7 @@ async fn f14b_cold_gc_continues_past_a_failing_group() {
         runtime
             .delete_stream(DeleteStreamRequest {
                 stream_id: stream.clone(),
+                now_ms: 0,
                 if_incarnation: None,
             })
             .await

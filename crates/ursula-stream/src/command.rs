@@ -1,4 +1,5 @@
 use std::fmt;
+use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 
 use bytes::Bytes;
@@ -129,8 +130,12 @@ pub enum StreamCommand {
         producer: Option<ProducerRequest>,
         now_ms: u64,
     },
+    /// Deletes a stream. `now_ms` is the proposer's clock: a stream expired
+    /// at it is already gone, so the delete removes it and answers 404, as
+    /// for a missing stream.
     DeleteStream {
         stream_id: BucketStreamId,
+        now_ms: u64,
     },
     /// Administrator-triggered tenant offboarding: removes every stream in
     /// the bucket and the bucket itself in this group. Monotonic
@@ -202,6 +207,17 @@ pub enum StreamCommand {
     TidyStream {
         stream_id: BucketStreamId,
         now_ms: u64,
+    },
+    /// Removes up to `limit` streams that expired at `now_ms` (bounded-state
+    /// F0), earliest expiry first, then by bucket and stream id. A group's
+    /// leader proposes it in its background sweep at its clock less a grace.
+    /// The removed set is a function of replicated state, `now_ms` and
+    /// `limit`, so every replica, restored or replayed, removes the same
+    /// streams. Group-scoped: it names no stream and refuses nothing. No
+    /// other command removes a stream it does not name.
+    ExpireStreams {
+        now_ms: u64,
+        limit: NonZeroU32,
     },
     /// Bounded-state F5: removes `refs` from the stream's
     /// state-held external payload locators after the leader wrote their
@@ -367,7 +383,7 @@ impl fmt::Display for StreamCommand {
                 replacement.end_offset
             ),
             Self::Close { stream_id, .. } => write!(f, "close_stream:{stream_id}"),
-            Self::DeleteStream { stream_id } => write!(f, "delete_stream:{stream_id}"),
+            Self::DeleteStream { stream_id, .. } => write!(f, "delete_stream:{stream_id}"),
             Self::PurgeBucket { bucket_id } => write!(f, "purge_bucket:{bucket_id}"),
             Self::AckColdGc { up_to_seq } => write!(f, "ack_cold_gc:up_to_seq={up_to_seq}"),
             Self::DeferColdGc { seq, .. } => write!(f, "defer_cold_gc:seq={seq}"),
@@ -381,6 +397,9 @@ impl fmt::Display for StreamCommand {
             ),
             Self::NewHistory { history, .. } => write!(f, "new_history:{history:#x}"),
             Self::TidyStream { stream_id, .. } => write!(f, "tidy_stream:{stream_id}"),
+            Self::ExpireStreams { now_ms, limit } => {
+                write!(f, "expire_streams:now_ms={now_ms}:limit={limit}")
+            }
             Self::OffloadColdRefs { stream_id, refs } => {
                 write!(f, "offload_cold_refs:{stream_id}:{} refs", refs.len())
             }

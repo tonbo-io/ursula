@@ -665,6 +665,7 @@ fn a_recreate_after_an_event_reports_nothing() {
     assert!(machine.stream_inherited(&stream_id).is_some());
     machine.apply(StreamCommand::DeleteStream {
         stream_id: stream_id.clone(),
+        now_ms: 0,
     });
     create(&mut machine, "s");
     assert_eq!(machine.stream_inherited(&stream_id), None);
@@ -883,6 +884,7 @@ fn run(ops: &[Op], with_event: bool) -> Result<(), String> {
                 let stream_id = &streams[*stream];
                 machine.apply_entry(index, StreamCommand::DeleteStream {
                     stream_id: stream_id.clone(),
+                    now_ms: 0,
                 });
                 if !matches!(
                     create_at(&mut machine, &stream_id.stream_id, 1),

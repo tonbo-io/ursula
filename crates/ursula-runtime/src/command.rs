@@ -189,6 +189,7 @@ impl From<DeleteStreamRequest> for StreamCommand {
     fn from(request: DeleteStreamRequest) -> Self {
         let command = Self::DeleteStream {
             stream_id: request.stream_id,
+            now_ms: request.now_ms,
         };
         if_incarnation(command, request.if_incarnation)
     }

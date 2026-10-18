@@ -3669,6 +3669,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
         8,
         GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
             stream_id: deleted,
+            now_ms: 0,
         }),
     )])
     .await;
@@ -4635,12 +4636,11 @@ fn expiring_create(
 }
 
 /// #669: a group's leader sweeps the streams that expired in it in its
-/// tidy pass, and the only entries the sweep appends are
-/// `TouchStreamAccess { renew_ttl: false }` at its clock less the grace:
-/// the command a read of an expired stream proposes.
+/// tidy pass, and the only entries the sweep appends are `ExpireStreams` at
+/// its clock less the grace, each removing up to 256 streams.
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn a_leader_sweeps_expired_streams_with_touch_only() {
+async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
     let (_wal_root, log_store) = fresh_journal_store();
     let mut engine =
         RaftGroupEngine::new_single_node_on_log_store(placement(), log_store.clone(), None)
@@ -4680,15 +4680,19 @@ async fn a_leader_sweeps_expired_streams_with_touch_only() {
             ursula_runtime::TidyStreamsRequest {
                 max_streams: 0,
                 max_expiry_sweeps: 16,
+                expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
                 now_ms: 20_000,
             },
             placement(),
         )
         .await
+        .into_result()
         .expect("a tidy pass");
-    // 257 streams, then the other 43.
+    // 256 streams, then the other 44.
     assert_eq!(report.expiry_sweeps, 2, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 300, "{report:?}");
     assert_eq!(report.expiry_due_groups, 0, "{report:?}");
+    assert_eq!(report.expiry_capped_groups, 0, "{report:?}");
     let after = last_index(log_store.clone()).await;
     assert_eq!(after, before.saturating_add(2));
 
@@ -4704,12 +4708,11 @@ async fn a_leader_sweeps_expired_streams_with_touch_only() {
             matches!(
                 &entry.payload,
                 EntryPayload::Normal(GroupWriteCommand::Stream(
-                    ursula_stream::StreamCommand::TouchStreamAccess {
+                    ursula_stream::StreamCommand::ExpireStreams {
                         now_ms: 19_000,
-                        renew_ttl: false,
-                        ..
+                        limit,
                     }
-                ))
+                )) if limit.get() == 256
             ),
             "the sweep appended {:?}",
             entry.payload
@@ -4724,11 +4727,13 @@ async fn a_leader_sweeps_expired_streams_with_touch_only() {
             ursula_runtime::TidyStreamsRequest {
                 max_streams: 0,
                 max_expiry_sweeps: 16,
+                expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
                 now_ms: 20_000,
             },
             placement(),
         )
         .await
+        .into_result()
         .expect("an idle pass");
     assert_eq!(report.expiry_sweeps, 0);
     engine.shutdown().await.expect("shutdown raft group engine");
@@ -4761,18 +4766,22 @@ async fn a_follower_proposes_no_expiry_sweep() {
     let request = ursula_runtime::TidyStreamsRequest {
         max_streams: 0,
         max_expiry_sweeps: 16,
+        expiry_sweep_budget: ursula_runtime::expiry_sweep::GROUP_BUDGET,
         now_ms: 20_000,
     };
     let report = engines[follower_index]
         .tidy_streams(request, placement())
         .await
+        .into_result()
         .expect("a follower's pass");
     assert_eq!(report, ursula_runtime::TidyStreamsResponse::default());
     let report = engines[leader_index]
         .tidy_streams(request, placement())
         .await
+        .into_result()
         .expect("the leader's pass");
     assert_eq!(report.expiry_sweeps, 1, "{report:?}");
+    assert_eq!(report.expiry_swept_streams, 1, "{report:?}");
     let swept = created_index.saturating_add(1);
     for engine in &engines {
         engine
@@ -4781,6 +4790,13 @@ async fn a_follower_proposes_no_expiry_sweep() {
             .applied_index_at_least(Some(swept), "sweep replicated")
             .await
             .expect("wait for the sweep");
+        let streams = engine
+            .with_state_machine(|state_machine| {
+                Box::pin(async move { state_machine.engine.state_gauges().streams })
+            })
+            .await
+            .expect("access the state machine");
+        assert_eq!(streams, 0, "the replica still holds the expired stream");
         let read = read_stream_via_state_machine(engine, bsid("expiring"), 16)
             .await
             .expect("access the state machine");

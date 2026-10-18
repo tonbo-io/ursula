@@ -206,8 +206,9 @@ fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
     assert!(matches!(
         machine.apply(StreamCommand::DeleteStream {
             stream_id: stream("hot-only"),
+            now_ms: 0,
         }),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     ));
     assert_eq!(machine.pending_cold_gc_len(), 0);
 
@@ -220,8 +221,9 @@ fn f18_delete_enqueues_stream_gc_only_when_bytes_left_the_hot_buffer() {
     assert!(matches!(
         machine.apply(StreamCommand::DeleteStream {
             stream_id: stream("flushed"),
+            now_ms: 0,
         }),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     ));
     assert_eq!(machine.pending_cold_gc_len(), 1);
 }
@@ -293,8 +295,9 @@ fn gc_queue_with_two_entries() -> StreamStateMachine {
         assert!(matches!(
             machine.apply(StreamCommand::DeleteStream {
                 stream_id: stream(id),
+                now_ms: 0,
             }),
-            StreamResponse::Deleted
+            StreamResponse::Deleted { expired: false }
         ));
     }
     assert_eq!(machine.pending_cold_gc_len(), 2);
@@ -363,8 +366,9 @@ fn flush_cold_from_a_removed_incarnation_is_stale() {
     assert!(matches!(
         machine.apply(StreamCommand::DeleteStream {
             stream_id: stream("reborn"),
+            now_ms: 0,
         }),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     ));
     create(&mut machine, "reborn", 100);
     append(&mut machine, "reborn", b"abcd");

@@ -187,9 +187,8 @@ mod tests {
                 && backup_digest == [0xab; 32]
                 && snapshot.buckets == ["tenant"]
         ));
-        // #669: the leader's background expiry sweep writes the
-        // `TouchStreamAccess { renew_ttl: false }` a read of an expired
-        // stream writes.
+        // A read of an expired stream writes `TouchStreamAccess`, whose
+        // apply removes that stream on every replica.
         let touch: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "touch_stream_access_entry");
         assert_eq!(touch.log_id, log);
         assert!(matches!(

@@ -36,7 +36,7 @@ use super::validate_message_count;
 
 impl StreamStateMachine {
     /// Applies one append, then enforces the F3 producer cap once.
-    pub fn append_borrowed(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
+    pub(super) fn append_borrowed(&mut self, input: AppendStreamInput<'_>) -> StreamResponse {
         let enforce_on = input.producer.as_ref().map(|_| input.stream_id.clone());
         let now_ms = input.now_ms;
         let response = 'append: {

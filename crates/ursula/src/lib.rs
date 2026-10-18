@@ -3777,11 +3777,22 @@ pub(crate) async fn delete_stream_by_id(
         .runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream_id.clone(),
+            now_ms: started_ms,
             if_incarnation,
         })
         .await
     {
-        Ok(_) => {
+        Ok(response) => {
+            // The stream had expired, so it was already gone: the delete
+            // removed it and answers as for a missing stream.
+            let expired = response.expired.then(|| RuntimeError::GroupEngine {
+                core_id: response.placement.core_id,
+                raft_group_id: response.placement.raft_group_id,
+                error: GroupEngineError::stream(
+                    StreamErrorCode::StreamNotFound,
+                    format!("stream '{stream_id}' does not exist"),
+                ),
+            });
             // The stream's staged parts can no longer be committed. The
             // cleanup runs after the answer, and only for a stream this
             // node counts parts of.
@@ -3795,6 +3806,9 @@ pub(crate) async fn delete_stream_by_id(
                     if_incarnation,
                     started_ms,
                 );
+            }
+            if let Some(err) = expired {
+                return write_error_or_leader_redirect_async(&state, err, &request_target).await;
             }
             let mut headers = HeaderMap::new();
             insert_default_response_headers(&mut headers);

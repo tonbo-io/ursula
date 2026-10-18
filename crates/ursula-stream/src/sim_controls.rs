@@ -108,10 +108,10 @@ pub enum Defence {
     /// the journal's size frees segments, so a small journal keeps a
     /// removed stream's records in its files.
     WalDirtyAge,
-    /// Each group's leader proposes `TouchStreamAccess { renew_ttl: false }`
-    /// for the streams that expired in its group, in its background tidy
-    /// pass (#669). Off, an expired stream leaves a group that takes no
-    /// write other than plain appends only once a request reaches it.
+    /// Each group's leader proposes `ExpireStreams` for the streams that
+    /// expired in its group, in its background tidy pass (#669). Off, an
+    /// expired stream that no request names stays in its group: no other
+    /// command removes a stream it does not name.
     ExpirySweep,
 }
 

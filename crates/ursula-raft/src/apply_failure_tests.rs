@@ -545,6 +545,7 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
     };
     let rejected = GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
         stream_id: ursula_shard::BucketStreamId::new("absent", "absent"),
+        now_ms: 0,
     });
     let result = state
         .engine

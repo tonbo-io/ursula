@@ -1421,6 +1421,7 @@ async fn snapshot_after_stream_delete_installs_without_dangling_append_count() {
     source
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            now_ms: 0,
             if_incarnation: None,
         })
         .await
@@ -1896,6 +1897,7 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: first,
+            now_ms: 0,
             if_incarnation: None,
         })
         .await
@@ -1915,6 +1917,7 @@ async fn packed_cold_object_survives_until_last_stream_is_deleted() {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: second,
+            now_ms: 0,
             if_incarnation: None,
         })
         .await
@@ -2139,6 +2142,7 @@ async fn all_stale_packed_candidates_reclaim_unpublished_object() {
         runtime
             .delete_stream(DeleteStreamRequest {
                 stream_id: stream.clone(),
+                now_ms: 0,
                 if_incarnation: None,
             })
             .await
@@ -2215,6 +2219,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            now_ms: 0,
             if_incarnation: None,
         })
         .await
@@ -2422,6 +2427,7 @@ async fn stale_cold_flush_batch_after_delete_recreate_is_classified_for_cleanup(
     runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            now_ms: 0,
             if_incarnation: None,
         })
         .await
@@ -2851,6 +2857,45 @@ async fn wait_read_stream_completes_on_close_at_tail() {
     assert_eq!(runtime.metrics().snapshot().live_read_waiters, 0);
 }
 
+/// A delete of a stream that had expired at its clock answers that the
+/// stream was already gone, but it removed the stream like any delete, so
+/// the runtime wakes a reader waiting on it at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_an_expired_stream_wakes_its_waiting_reader() {
+    let runtime = runtime(2, 8);
+    let stream = BucketStreamId::new("benchcmp", "wait-expired-delete");
+    let mut create = CreateStreamRequest::new(stream.clone(), DEFAULT_CONTENT_TYPE);
+    create.stream_expires_at_ms = Some(5_000);
+    create.now_ms = 1;
+    runtime.create_stream(create).await.expect("create stream");
+
+    let wait = {
+        let runtime = runtime.clone();
+        let stream = stream.clone();
+        tokio::spawn(async move { runtime.wait_read_stream(read_req(stream, 0, 16)).await })
+    };
+    wait_for_live_waiters(&runtime, 1).await;
+    let deleted = runtime
+        .delete_stream(DeleteStreamRequest {
+            stream_id: stream,
+            now_ms: 10_000,
+            if_incarnation: None,
+        })
+        .await
+        .expect("delete the expired stream");
+    assert!(deleted.expired);
+
+    let read = tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+        .await
+        .expect("the waiting reader wakes")
+        .expect("wait task");
+    assert!(
+        matches!(&read, Err(err) if err.stream_error_code() == Some(StreamErrorCode::StreamNotFound)),
+        "{read:?}"
+    );
+    wait_for_live_waiters(&runtime, 0).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn canceled_wait_read_stream_removes_owner_waiter() {
     let runtime = runtime(2, 8);
@@ -3078,6 +3123,7 @@ async fn delete_stream_removes_state_on_owner_group() {
     let deleted = runtime
         .delete_stream(DeleteStreamRequest {
             stream_id: stream.clone(),
+            now_ms: 0,
             if_incarnation: None,
         })
         .await
@@ -4122,6 +4168,7 @@ impl GroupEngine for RecordingEngine {
             Ok(DeleteStreamResponse {
                 placement,
                 group_commit_index: self.commit_index,
+                expired: false,
                 hot_backlog: None,
             })
         })

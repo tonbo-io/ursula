@@ -22,8 +22,9 @@
 //!
 //! The `deleted-data-after-expiry` seeds remove the stream by its TTL
 //! instead: it expires, nothing reads it, and the group either writes
-//! nothing more or takes plain appends to another stream, which never sweep.
-//! The run plays the tidy worker's role, which cannot run under madsim: every
+//! nothing more or takes writes to other streams (appends, creates and
+//! closes at the run's clock), none of which removes a stream it does not
+//! name. The run plays the tidy worker's role, which cannot run under madsim: every
 //! [`ursula_runtime::expiry_sweep::interval`] of the bound, each replica's
 //! tidy pass sweeps at the run's virtual wall clock, and only the leader's
 //! proposes. A replica's time counts from the first look at which its local
@@ -55,8 +56,8 @@
 //!   segment that held their dead frames is freed only once the journal
 //!   outgrows its budget, so a small journal keeps them in its files (a).
 //! - [`Controls::SWEEP_OFF`]: no leader sweeps, so an expired stream that
-//!   nothing reads stays in the group, quiet or taking plain appends, and in
-//!   its snapshot.
+//!   nothing reads stays in the group, quiet or taking writes to other
+//!   streams, and in its snapshot.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -68,6 +69,7 @@ use ursula_raft::JournalTuning;
 use ursula_raft::wal::diagnostics::JournalDisk;
 use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::CloseStreamRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::DeleteStreamRequest;
@@ -159,7 +161,7 @@ const EXPIRES_AFTER: Duration = Duration::from_secs(3);
 const STOP_BEFORE_EXPIRY: Duration = Duration::from_millis(200);
 /// How long that leader stays down.
 const EXPIRY_LEADER_DOWN: Duration = Duration::from_secs(4);
-/// How often an `appends` run appends to the group's other stream.
+/// How often a `writes` run writes to the group's other streams.
 const TRAFFIC_EVERY: Duration = Duration::from_millis(100);
 /// The run's virtual wall clock at its start: any time past the epoch.
 const SIM_WALL_START_MS: u64 = 1_700_000_000_000;
@@ -361,16 +363,19 @@ enum Removal {
 enum Traffic {
     /// Nothing.
     Quiet,
-    /// A plain append to the group's other stream every [`TRAFFIC_EVERY`],
-    /// which never sweeps.
-    Appends,
+    /// A write to another stream of the group every [`TRAFFIC_EVERY`], at
+    /// the run's clock: in turn a plain append to the group's other stream,
+    /// a create of a fresh stream without a TTL, and a close of that
+    /// stream. None of them removes the expired stream, which they do not
+    /// name.
+    Writes,
 }
 
 impl Traffic {
     fn name(self) -> &'static str {
         match self {
             Self::Quiet => "quiet",
-            Self::Appends => "appends",
+            Self::Writes => "writes",
         }
     }
 }
@@ -400,7 +405,7 @@ impl Plan {
             Removal::Expiry(if (seed / 4) % 2 == 1 {
                 Traffic::Quiet
             } else {
-                Traffic::Appends
+                Traffic::Writes
             })
         } else if purge {
             Removal::BucketPurge
@@ -806,53 +811,105 @@ async fn dropped(cluster: &JournalCluster, node_id: u64) -> bool {
 /// What runs beside the checks of an expiry run: the tidy worker's sweep,
 /// which cannot run under madsim (its wall clock reads 0 there), and the
 /// group's traffic.
+/// The run's virtual wall clock: [`SIM_WALL_START_MS`] when the run starts,
+/// then madsim's time. The tidy worker's wall clock reads 0 under madsim, so
+/// the run stamps its own requests with this one.
+#[derive(Debug, Clone, Copy)]
+struct RunClock {
+    started: madsim::time::Instant,
+}
+
+impl RunClock {
+    fn start() -> Self {
+        Self {
+            started: madsim::time::Instant::now(),
+        }
+    }
+
+    fn now_ms(self) -> u64 {
+        SIM_WALL_START_MS
+            .saturating_add(u64::try_from(self.started.elapsed().as_millis()).expect("a short run"))
+    }
+}
+
 #[derive(Debug)]
 struct Background {
-    started: madsim::time::Instant,
+    clock: RunClock,
     traffic: Traffic,
     next_sweep: madsim::time::Instant,
-    next_append: madsim::time::Instant,
+    next_write: madsim::time::Instant,
+    /// Writes a `writes` run proposed, which picks the next one.
+    writes: u64,
     /// Sweep commands the leaders committed.
     sweeps: u64,
 }
 
 impl Background {
-    fn new(traffic: Traffic) -> Self {
+    fn new(traffic: Traffic, clock: RunClock) -> Self {
         let now = madsim::time::Instant::now();
         Self {
-            started: now,
+            clock,
             traffic,
             next_sweep: now + expiry_sweep::interval(BOUND_DRIVERS.max_age),
-            next_append: now,
+            next_write: now,
+            writes: 0,
             sweeps: 0,
         }
     }
 
     /// The run's virtual wall clock.
     fn wall_ms(&self) -> u64 {
-        SIM_WALL_START_MS
-            .saturating_add(u64::try_from(self.started.elapsed().as_millis()).expect("a short run"))
+        self.clock.now_ms()
     }
 
-    /// Runs what is due: an append to the group's other stream, then every
+    /// Runs what is due: a write to another stream of the group, then every
     /// running replica's tidy pass, of which only the leader's proposes.
     async fn tick(&mut self, cluster: &mut JournalCluster) {
         let now = madsim::time::Instant::now();
-        if self.traffic == Traffic::Appends && now >= self.next_append {
-            self.next_append = now + TRAFFIC_EVERY;
+        if self.traffic == Traffic::Writes && now >= self.next_write {
+            self.next_write = now + TRAFFIC_EVERY;
+            let now_ms = self.wall_ms();
+            let write = self.writes;
             if let Some(leader) = leader_by_state(cluster, GROUP)
                 && let Some(engine) = cluster.engines.get_mut(&(GROUP, leader))
             {
-                // A lost append is followed by the next one.
-                drop(
-                    engine
-                        .append(
-                            AppendRequest::from_bytes(group_stream(GROUP), b"traffic;".to_vec()),
-                            group_placement(GROUP),
-                            ColdWriteAdmission::default(),
-                        )
-                        .await,
-                );
+                // A lost write is followed by the next one.
+                let placement = group_placement(GROUP);
+                match write % 3 {
+                    0 => {
+                        let mut request =
+                            AppendRequest::from_bytes(group_stream(GROUP), b"traffic;".to_vec());
+                        request.now_ms = now_ms;
+                        drop(
+                            engine
+                                .append(request, placement, ColdWriteAdmission::default())
+                                .await,
+                        );
+                    }
+                    1 => {
+                        let mut request = CreateStreamRequest::new(
+                            traffic_stream(write),
+                            "application/octet-stream",
+                        );
+                        request.now_ms = now_ms;
+                        drop(
+                            engine
+                                .create_stream(request, placement, ColdWriteAdmission::default())
+                                .await,
+                        );
+                    }
+                    _ => {
+                        let request = CloseStreamRequest {
+                            stream_id: traffic_stream(write.saturating_sub(1)),
+                            stream_seq: None,
+                            producer: None,
+                            now_ms,
+                            if_incarnation: None,
+                        };
+                        drop(engine.close_stream(request, placement).await);
+                    }
+                }
+                self.writes = write.saturating_add(1);
             }
         }
         if now < self.next_sweep {
@@ -861,22 +918,28 @@ impl Background {
         self.next_sweep = now + expiry_sweep::interval(BOUND_DRIVERS.max_age);
         let now_ms = self.wall_ms();
         for node_id in NODES {
-            if let Some(engine) = cluster.engines.get_mut(&(GROUP, node_id))
-                && let Ok(report) = engine
+            if let Some(engine) = cluster.engines.get_mut(&(GROUP, node_id)) {
+                let pass = engine
                     .tidy_streams(
                         TidyStreamsRequest {
                             max_streams: 0,
                             max_expiry_sweeps: expiry_sweep::MAX_COMMANDS_PER_GROUP,
+                            expiry_sweep_budget: expiry_sweep::GROUP_BUDGET,
                             now_ms,
                         },
                         group_placement(GROUP),
                     )
-                    .await
-            {
-                self.sweeps = self.sweeps.saturating_add(report.expiry_sweeps);
+                    .await;
+                self.sweeps = self.sweeps.saturating_add(pass.report.expiry_sweeps);
             }
         }
     }
+}
+
+/// The stream a `writes` run's write `write` creates or closes: one of the
+/// group's other streams, without a TTL.
+fn traffic_stream(write: u64) -> BucketStreamId {
+    BucketStreamId::new(group_stream(GROUP).bucket_id, format!("traffic-{write}"))
 }
 
 /// Runs what of `background` is due, if the run has one.
@@ -891,6 +954,7 @@ pub(super) async fn run_deleted_data_inner(
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
     let _switched = Switched::apply(controls, BOUND_DRIVERS);
+    let clock = RunClock::start();
     let plan = Plan::from_seed(config.seed);
     let mut trace = SimTrace::default();
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
@@ -905,7 +969,7 @@ pub(super) async fn run_deleted_data_inner(
     // the removed records and pin them.
     cluster.append(QUIET_GROUP, journals.quiet_entries).await;
     let mut background = match plan.removal {
-        Removal::Expiry(traffic) => Some(Background::new(traffic)),
+        Removal::Expiry(traffic) => Some(Background::new(traffic, clock)),
         Removal::Deletion | Removal::BucketPurge => None,
     };
     // When the expiry comes in this run, and on its virtual wall clock:
@@ -967,6 +1031,7 @@ pub(super) async fn run_deleted_data_inner(
                         .delete_stream(
                             DeleteStreamRequest {
                                 stream_id: marked_stream(),
+                                now_ms: clock.now_ms(),
                                 if_incarnation: None,
                             },
                             placement,
@@ -1290,6 +1355,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
     controls: Controls,
 ) -> ThreeNodeRaftSimOutcome {
     let _switched = Switched::apply(controls, DRIVERS);
+    let clock = RunClock::start();
     let mut trace = SimTrace::default();
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
     let context = format!("seed {} operator snapshot under a purge", config.seed);
@@ -1315,6 +1381,7 @@ pub(super) async fn run_operator_snapshot_under_purge_inner(
             .delete_stream(
                 DeleteStreamRequest {
                     stream_id: marked_stream(),
+                    now_ms: clock.now_ms(),
                     if_incarnation: None,
                 },
                 placement,
@@ -1507,11 +1574,11 @@ mod tests {
         assert!(message.contains("holds stream"), "{message}");
     }
 
-    /// Without the leader's sweep, plain appends to the group's other stream
-    /// never remove the expired stream either: an engine applies a plain
-    /// append without the state machine's sweep.
+    /// Without the leader's sweep, writes to other streams of the group, at
+    /// a clock past the expiry, never remove the expired stream either: no
+    /// command removes a stream it does not name.
     #[test]
-    fn negative_control_plain_appends_never_sweep_an_expired_stream() {
+    fn negative_control_writes_never_remove_an_expired_stream_they_do_not_name() {
         let _guard = sim_test_guard();
         let message = assert_fails(536, Controls::SWEEP_OFF, BOUND_INVARIANT);
         assert!(message.contains("holds stream"), "{message}");

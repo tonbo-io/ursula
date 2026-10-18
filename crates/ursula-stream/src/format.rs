@@ -10,8 +10,9 @@
 //! with a producer record of one receipt, closed-epoch reports, write digests
 //! and the per-stream epoch floor, and history identity: the group's history
 //! event, the history a producer record was claimed in, and what a stream
-//! inherited from the history before. Epoch 5 is the format of Ursula 0.9. A
-//! binary reads exactly one epoch: it refuses data and peers from any other
+//! inherited from the history before. Epoch 5 is the format of Ursula 0.9:
+//! the `ExpireStreams` command, a clock on `DeleteStream`, and writes that
+//! remove only the stream they name. A binary reads exactly one epoch: it refuses data and peers from any other
 //! epoch loudly, before it writes anything, and it does not convert them.
 //!
 //! Every version number that an earlier binary checks is set equal to

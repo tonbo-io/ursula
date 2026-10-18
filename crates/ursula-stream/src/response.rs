@@ -43,7 +43,13 @@ pub enum StreamResponse {
         next_offset: u64,
         producer: Option<ProducerAck>,
     },
-    Deleted,
+    /// A delete that removed the stream. `expired`: the stream had
+    /// expired at the delete's `now_ms`, so it was already gone to every
+    /// reader and the request answers 404, as for a missing stream. Either
+    /// way the delete removed it, and the runtime runs its usual follow-ups.
+    Deleted {
+        expired: bool,
+    },
     ColdFlushed {
         hot_start_offset: u64,
     },
@@ -103,6 +109,14 @@ pub enum StreamResponse {
     /// [`StreamCommand::TidyStream`]: crate::StreamCommand::TidyStream
     StreamTidied {
         debt_remaining: bool,
+    },
+    /// Result of [`StreamCommand::ExpireStreams`]: how many expired streams
+    /// the entry removed, at most its `limit`. Fewer than `limit` means no
+    /// stream of the group had expired at its `now_ms` afterwards.
+    ///
+    /// [`StreamCommand::ExpireStreams`]: crate::StreamCommand::ExpireStreams
+    StreamsExpired {
+        removed: u64,
     },
     /// Result of [`StreamCommand::OffloadColdRefs`]: how many of the listed
     /// refs were still in state and removed, and how many state-held external

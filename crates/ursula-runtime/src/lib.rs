@@ -32,7 +32,7 @@
 //! - [`tidy_worker`]: leader-side tidy driver (bounded-state F0): the
 //!   expiry sweep and `TidyStream`.
 //! - [`expiry_sweep`]: the leader's background sweep of expired streams
-//!   through the existing `TouchStreamAccess` command (F0, #669).
+//!   through the dedicated `ExpireStreams` command (F0, #669).
 
 mod admission;
 pub mod cold_index;
@@ -237,6 +237,7 @@ pub use request::DeferColdGcResponse;
 pub use request::DeleteStreamRequest;
 pub use request::DeleteStreamResponse;
 pub use request::EarlyAnswerQuery;
+pub use request::ExpireStreamsResponse;
 pub use request::FlushColdRequest;
 pub use request::FlushColdResponse;
 pub use request::FollowerRead;
@@ -263,6 +264,7 @@ pub use request::RouteWriteRequest;
 pub use request::RoutedWrite;
 pub use request::StreamAppendCount;
 pub use request::TidyStreamResponse;
+pub use request::TidyStreamsPass;
 pub use request::TidyStreamsRequest;
 pub use request::TidyStreamsResponse;
 pub use request::TouchStreamAccessResponse;

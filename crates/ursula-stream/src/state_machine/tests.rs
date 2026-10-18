@@ -66,7 +66,7 @@ fn usage_tracks_appends_retention_and_stream_lifecycle() {
 
     assert!(matches!(
         machine.apply(delete_cmd(stream("usage"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     ));
     let usage = bucket_usage(&machine, "benchcmp");
     assert_eq!(usage.stream_count, 0);
@@ -267,7 +267,17 @@ fn close_cmd(stream_id: BucketStreamId) -> StreamCommand {
 }
 
 fn delete_cmd(stream_id: BucketStreamId) -> StreamCommand {
-    StreamCommand::DeleteStream { stream_id }
+    StreamCommand::DeleteStream {
+        stream_id,
+        now_ms: 0,
+    }
+}
+
+fn expire_streams_cmd(now_ms: u64) -> StreamCommand {
+    StreamCommand::ExpireStreams {
+        now_ms,
+        limit: std::num::NonZeroU32::new(256).expect("positive"),
+    }
 }
 
 fn touch_cmd(stream_id: BucketStreamId, now_ms: u64) -> StreamCommand {
@@ -546,7 +556,7 @@ fn incarnation_precondition_refuses_a_command_proposed_before_a_recreate() {
 
     assert_eq!(
         machine.apply(delete_cmd(stream_id.clone())),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     create_stream(&mut machine, "if-incarnation");
     let current = machine.stream_incarnation(&stream_id).expect("recreated");
@@ -1438,7 +1448,7 @@ fn delete_stream_enqueues_cold_gc_then_ack_drains_it() {
     for id in ["cold-a", "cold-b"] {
         assert!(matches!(
             machine.apply(delete_cmd(stream(id))),
-            StreamResponse::Deleted
+            StreamResponse::Deleted { expired: false }
         ));
     }
 
@@ -1509,7 +1519,7 @@ fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
         StreamStateMachine::restore(machine.snapshot()).expect("restore shared pack refs");
     assert_eq!(
         restored.apply(delete_cmd(stream("pack-a"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     assert!(
         restored
@@ -1523,7 +1533,7 @@ fn shared_cold_object_is_reclaimed_after_last_stream_reference() {
 
     assert_eq!(
         restored.apply(delete_cmd(stream("pack-b"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     let shared_reclaims = restored
         .pending_cold_gc_batch(16)
@@ -1659,19 +1669,29 @@ fn expired_stream_with_cold_chunks_enqueues_cold_gc() {
     }));
     flush_one_cold_chunk(&mut machine, "ttl");
 
-    // A lazy access past the expiry removes the stream and queues its cold prefix.
+    // `HEAD` past the expiry reads it as gone and changes nothing.
     assert!(machine.head_at(&stream("ttl"), 2_000).is_none());
+    assert_eq!(machine.pending_cold_gc_len(), 0);
+    // The read path's replicated access removes it and queues its cold
+    // prefix.
+    assert_eq!(
+        machine.apply(touch_cmd(stream("ttl"), 2_000)),
+        StreamResponse::Accessed {
+            changed: true,
+            expired: true,
+        }
+    );
     let pending = machine.pending_cold_gc_batch(16);
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].target, ColdGcTarget::Stream(stream("ttl")));
 }
 
 #[test]
-fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
+fn expire_streams_removes_in_bounded_batches() {
     let mut machine = machine();
     create_stream(&mut machine, "active");
 
-    let expired_count = TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE + 6;
+    let expired_count = 262_usize;
     for index in 0..expired_count {
         let id = format!("old-{index:04}");
         assert!(matches!(
@@ -1682,8 +1702,10 @@ fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
             StreamResponse::Created { .. }
         ));
     }
-    assert_eq!(machine.snapshot().streams.len(), expired_count + 1);
+    let all = expired_count.saturating_add(1);
+    assert_eq!(machine.snapshot().streams.len(), all);
 
+    // An append removes no stream it does not name.
     assert!(matches!(
         machine.apply(append_cmd(stream("active"), b"x", Append {
             now_ms: 2_000,
@@ -1691,7 +1713,13 @@ fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
         })),
         StreamResponse::Appended { .. }
     ));
+    assert_eq!(machine.snapshot().streams.len(), all);
 
+    let expire = expire_streams_cmd(2_000);
+    assert_eq!(
+        machine.apply(expire.clone()),
+        StreamResponse::StreamsExpired { removed: 256 }
+    );
     let snapshot = machine.snapshot();
     let stream_ids = snapshot
         .streams
@@ -1701,12 +1729,13 @@ fn writes_sweep_expired_streams_in_bounded_deterministic_batches() {
     assert_eq!(stream_ids.len(), 7);
     assert!(stream_ids.contains(&"active"));
     assert!(!stream_ids.contains(&"old-0000"));
-    let last_swept = format!("old-{:04}", TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE - 1);
-    let first_retained = format!("old-{:04}", TTL_EXPIRY_SWEEP_MAX_STREAMS_PER_WRITE);
-    let last_retained = format!("old-{:04}", expired_count - 1);
-    assert!(!stream_ids.contains(&last_swept.as_str()));
-    assert!(stream_ids.contains(&first_retained.as_str()));
-    assert!(stream_ids.contains(&last_retained.as_str()));
+    assert!(!stream_ids.contains(&"old-0255"));
+    assert!(stream_ids.contains(&"old-0256"));
+    assert!(stream_ids.contains(&"old-0261"));
+    assert_eq!(machine.apply(expire), StreamResponse::StreamsExpired {
+        removed: 6
+    });
+    assert_eq!(machine.snapshot().streams.len(), 1);
 }
 
 #[test]
@@ -2158,7 +2187,7 @@ fn stale_cold_flush_candidate_after_delete_recreate_is_invalid_without_mutation(
 
     assert!(matches!(
         machine.apply(delete_cmd(stream("stale-cold"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     ));
     create_stream(&mut machine, "stale-cold");
     assert!(matches!(
@@ -2215,7 +2244,7 @@ fn plan_next_cold_flush_skips_deleted_streams() {
     ));
     assert_eq!(
         machine.apply(delete_cmd(stream("a-gone"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     assert!(matches!(
         machine.apply(append_cmd(stream("b-live"), b"live", Append::default())),
@@ -2269,7 +2298,7 @@ fn hot_payload_byte_metrics_follow_cold_flush() {
     assert_eq!(restored.total_hot_payload_bytes(), 3);
     assert_eq!(
         restored.apply(delete_cmd(stream("hot-b"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     assert_eq!(restored.total_hot_payload_bytes(), 1);
 }
@@ -2927,13 +2956,10 @@ fn renewed_ttl_ignores_stale_expiry_index_entry() {
             expired: false,
         }
     );
-    assert!(matches!(
-        machine.apply(create_cmd(stream("sweep-trigger"), Create {
-            now_ms: 2_100,
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
+    assert_eq!(
+        machine.apply(expire_streams_cmd(2_100)),
+        StreamResponse::StreamsExpired { removed: 0 }
+    );
 
     assert!(machine.head(&stream_id).is_some());
     assert!(machine.head_at(&stream_id, 2_500).is_none());
@@ -2954,13 +2980,10 @@ fn restore_rebuilds_ttl_index_from_stream_metadata() {
     ));
 
     let mut restored = StreamStateMachine::restore(machine.snapshot()).expect("restore");
-    assert!(matches!(
-        restored.apply(create_cmd(stream("restore-sweep-trigger"), Create {
-            now_ms: 2_100,
-            ..Create::default()
-        })),
-        StreamResponse::Created { .. }
-    ));
+    assert_eq!(
+        restored.apply(expire_streams_cmd(2_100)),
+        StreamResponse::StreamsExpired { removed: 1 }
+    );
     assert!(restored.head(&stream_id).is_none());
 }
 
@@ -3768,7 +3791,7 @@ proptest! {
         prop_assert!(
             matches!(
                 delete_response,
-                StreamResponse::Deleted
+                StreamResponse::Deleted { expired: false }
             ),
             "unexpected delete response: {:?}",
             delete_response
@@ -4100,7 +4123,7 @@ fn flush_and_delete(machine: &mut StreamStateMachine, id: &str) {
     ));
     assert_eq!(
         machine.apply(delete_cmd(stream(id))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
 }
 
@@ -4113,7 +4136,7 @@ fn c7_created_at_ms_is_unique_under_a_frozen_clock() {
         seen.push(created_at_ms(&machine, "frozen"));
         assert_eq!(
             machine.apply(delete_cmd(stream("frozen"))),
-            StreamResponse::Deleted
+            StreamResponse::Deleted { expired: false }
         );
     }
     create_stream(&mut machine, "other");
@@ -4139,7 +4162,7 @@ fn c7_last_created_at_ms_survives_snapshot_round_trip_and_is_normalized() {
     create_stream(&mut machine, "a");
     assert_eq!(
         machine.apply(delete_cmd(stream("a"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     let snapshot = machine.snapshot();
     assert_eq!(snapshot.last_created_at_ms, 1);
@@ -4214,7 +4237,7 @@ fn f14g_external_create_keeps_its_payload_in_state_for_gc() {
     ));
     assert_eq!(
         machine.apply(delete_cmd(stream("ext"))),
-        StreamResponse::Deleted
+        StreamResponse::Deleted { expired: false }
     );
     let entries = machine.pending_cold_gc_batch(8);
     assert_eq!(entries.len(), 2);
@@ -4627,8 +4650,10 @@ enum Leaves {
     Stays,
     /// `DeleteStream`.
     Deleted,
-    /// Its TTL runs out and a later command's sweep removes it.
+    /// Its TTL runs out and `ExpireStreams` removes it.
     Expires,
+    /// Its TTL runs out and a read's `TouchStreamAccess` removes it.
+    ReadExpired,
     /// Its TTL runs out and a create of the same id replaces it.
     Recreated,
 }
@@ -4638,6 +4663,7 @@ fn leaves_strategy() -> impl Strategy<Value = Leaves> {
         Just(Leaves::Stays),
         Just(Leaves::Deleted),
         Just(Leaves::Expires),
+        Just(Leaves::ReadExpired),
         Just(Leaves::Recreated),
     ]
 }
@@ -4659,7 +4685,11 @@ proptest! {
         let mut held = Vec::new();
         for (index, (payloads, leaves)) in streams.into_iter().enumerate() {
             let stream_id = stream(&format!("removed-{index}"));
-            let ttl_seconds = matches!(leaves, Leaves::Expires | Leaves::Recreated).then_some(1);
+            let ttl_seconds = matches!(
+                leaves,
+                Leaves::Expires | Leaves::ReadExpired | Leaves::Recreated
+            )
+            .then_some(1);
             let created = machine.apply(create_cmd(stream_id.clone(), Create {
                 ttl_seconds,
                 ..Create::default()
@@ -4675,11 +4705,11 @@ proptest! {
         }
         prop_assert_eq!(machine.removed_state(), RemovedState::default());
 
-        // Deletions carry no clock, so nothing expires meanwhile.
+        // Deletions at time 0, before any TTL ran out.
         let mut expected = RemovedState::default();
         for (stream_id, bytes, leaves) in &held {
             if *leaves == Leaves::Deleted {
-                prop_assert_eq!(machine.apply(delete_cmd(stream_id.clone())), StreamResponse::Deleted);
+                prop_assert_eq!(machine.apply(delete_cmd(stream_id.clone())), StreamResponse::Deleted { expired: false });
                 expected.streams = expected.streams.saturating_add(1);
                 expected.bytes = expected.bytes.saturating_add(*bytes);
                 prop_assert_eq!(machine.removed_state(), expected);
@@ -4687,20 +4717,21 @@ proptest! {
         }
 
         // One second on, every stream with a TTL expired. A touch or a
-        // create at that time removes it, or an earlier command's sweep did.
+        // create at that time removes the stream it names, and
+        // `ExpireStreams` removes the rest.
         let mut recreated = 0u64;
+        let mut expires = 0u64;
         for (stream_id, bytes, leaves) in &held {
             match leaves {
-                Leaves::Expires => {
-                    // An earlier command's sweep may have removed it.
+                Leaves::Expires => expires = expires.saturating_add(1),
+                Leaves::ReadExpired => {
                     let touched = machine.apply(touch_cmd(stream_id.clone(), 1_000));
-                    prop_assert!(
-                        matches!(
-                            touched,
-                            StreamResponse::Accessed { .. } | StreamResponse::Error { .. }
-                        ),
-                        "{:?}",
-                        touched
+                    prop_assert_eq!(
+                        touched,
+                        StreamResponse::Accessed {
+                            changed: true,
+                            expired: true,
+                        }
                     );
                 }
                 Leaves::Recreated => {
@@ -4716,6 +4747,10 @@ proptest! {
             expected.streams = expected.streams.saturating_add(1);
             expected.bytes = expected.bytes.saturating_add(*bytes);
         }
+        prop_assert_eq!(
+            machine.apply(expire_streams_cmd(1_000)),
+            StreamResponse::StreamsExpired { removed: expires }
+        );
         prop_assert_eq!(machine.removed_state(), expected);
 
         if purge {
