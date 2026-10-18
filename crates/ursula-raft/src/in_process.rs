@@ -786,7 +786,7 @@ async fn sleep_in_process_raft_network(delay: Duration) {
 /// the gRPC plane answers `UNAVAILABLE`. Admission and publication failures
 /// stay network errors, as on this network before. Unifying this with
 /// [`SnapshotInstallError::peer_backs_off`] shifts the simulation's seeds,
-/// so it waits for a change that records them anew.
+/// so it waits for a change that records them anew (#725).
 pub(crate) fn install_error_backs_off(error: &SnapshotInstallError) -> bool {
     match error {
         SnapshotInstallError::Group(group) => refuses_overwrite(group),

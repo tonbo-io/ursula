@@ -10233,7 +10233,6 @@ mod leadership_shed {
     use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
-    use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
     use ursula_shard::BucketStreamId;
     use ursula_shard::RaftGroupId;

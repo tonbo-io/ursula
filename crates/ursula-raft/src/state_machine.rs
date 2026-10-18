@@ -3169,7 +3169,6 @@ mod tests {
     #[tokio::test]
     async fn snapshot_builder_falls_back_to_inline_when_external_upload_fails() {
         use ursula_runtime::SnapshotStore;
-        use ursula_runtime::SnapshotStoreError;
         use ursula_runtime::SnapshotStoreFuture;
         use ursula_shard::CoreId;
         use ursula_shard::RaftGroupId;
