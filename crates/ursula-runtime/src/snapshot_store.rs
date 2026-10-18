@@ -378,7 +378,7 @@ impl TryFrom<(SnapshotPointer, &OwnedNamespace)> for OwnedPointer {
     ) -> Result<Self, Self::Error> {
         match &pointer.location {
             SnapshotLocation::Inline { .. } => Ok(Self(pointer)),
-            SnapshotLocation::Local { path } => Err(NotOwned::LocalPath { path: path.clone() }),
+            SnapshotLocation::Local { path, .. } => Err(NotOwned::LocalPath { path: path.clone() }),
             SnapshotLocation::S3 { key, .. } => match OwnedKey::parse(&namespace.prefix, key) {
                 Ok(owned) if owned.owner == namespace.owner => Ok(Self(pointer)),
                 Ok(_) | Err(_) => Err(NotOwned::ForeignKey {
