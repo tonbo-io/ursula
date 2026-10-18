@@ -23,6 +23,7 @@ ursula-shard = { workspace = true }
 [target.'cfg(madsim)'.dependencies]
 axum = { workspace = true }
 blake3 = { workspace = true }
+bytes = { workspace = true }
 futures-util = { workspace = true }
 madsim = { workspace = true }
 rmp-serde = { workspace = true }
