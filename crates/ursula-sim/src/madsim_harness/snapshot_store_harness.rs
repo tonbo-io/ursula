@@ -315,6 +315,10 @@ fn snapshot_store_harness_negative_control_lease_after_put_breaks_i1() {
 const CONCURRENT_SEEDS: std::ops::RangeInclusive<u64> = 1..=32;
 /// Builds against passes per seed in the concurrent case.
 const ROUNDS: u64 = 8;
+/// A seed on which a lease after the PUT loses the new key, and the round
+/// in which it does. Recorded from the CI run of #727, where 23 of the 32
+/// seeds broke the control.
+const LEASE_AFTER_PUT_BREAKS: (u64, u64) = (5, 1);
 
 /// What one concurrent run saw.
 #[derive(Debug, PartialEq, Eq)]
@@ -418,7 +422,7 @@ fn snapshot_store_harness_negative_control_concurrent_lease_after_put_breaks_i1(
     }
     println!("a lease after the PUT breaks I1 on (seed, round): {breaking:?}");
     assert!(
-        !breaking.is_empty(),
-        "a lease after the PUT breaks I1 on some seed of {CONCURRENT_SEEDS:?}"
+        breaking.contains(&LEASE_AFTER_PUT_BREAKS),
+        "a lease after the PUT breaks I1 on the pinned (seed, round) {LEASE_AFTER_PUT_BREAKS:?}: {breaking:?}"
     );
 }
