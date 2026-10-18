@@ -31,7 +31,6 @@ use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::InProcessRaftRpcKind;
 use ursula_raft::MadsimOpenRaftRuntime;
 use ursula_raft::RaftGroupEngine;
-use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::AppendExternalRequest;
@@ -812,10 +811,7 @@ impl GroupEngineFactory for MadsimScopedRaftGroupEngineFactory {
             let inner = RaftGroupEngine::new_single_node_on_log_store_with_options(
                 placement,
                 log_store,
-                wal.recording_work(RaftGroupEngineOptions {
-                    metrics: Some(metrics),
-                    ..Default::default()
-                }),
+                wal.recording_work(super::sim_wal::engine_options(Some(metrics), None)),
             )
             .await?;
             let engine: Box<dyn GroupEngine> = Box::new(MadsimScopedGroupEngine {

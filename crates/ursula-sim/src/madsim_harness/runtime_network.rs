@@ -23,7 +23,6 @@ use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::MadsimOpenRaftRuntime;
 use ursula_raft::RaftGroupEngine;
-use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
@@ -324,11 +323,10 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .with_source(node_id)
                 .with_policy(self.policy.clone()),
             log_store,
-            wal.recording_work(RaftGroupEngineOptions {
-                metrics: Some(control.metrics),
-                cold_store: self.cold_store.clone(),
-                ..Default::default()
-            }),
+            wal.recording_work(super::sim_wal::engine_options(
+                Some(control.metrics),
+                self.cold_store.clone(),
+            )),
         )
         .await?;
         control.registry.register(node_id, &engine);
@@ -403,11 +401,10 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                         .with_source(node_id)
                         .with_policy(policy.clone()),
                     log_store,
-                    wals[&node_id].recording_work(RaftGroupEngineOptions {
-                        metrics: Some(metrics.clone()),
-                        cold_store: cold_store.clone(),
-                        ..Default::default()
-                    }),
+                    wals[&node_id].recording_work(super::sim_wal::engine_options(
+                        Some(metrics.clone()),
+                        cold_store.clone(),
+                    )),
                 )
                 .await?;
                 registry.register(node_id, &engine);

@@ -289,3 +289,15 @@ async fn wait_released(store: &Weak<RaftGroupFileLogStore>) {
         "a stopped simulated engine still holds its raft log store"
     );
 }
+
+/// The options of a simulated engine with `metrics` and `cold_store`, which
+/// [`SimNodeWal::recording_work`] then records in its node's ledger.
+pub(super) fn engine_options(
+    metrics: Option<GroupEngineMetrics>,
+    cold_store: Option<ursula_runtime::ColdStoreHandle>,
+) -> RaftGroupEngineOptions {
+    let mut options = RaftGroupEngineOptions::default();
+    options.metrics = metrics;
+    options.cold_store = cold_store;
+    options
+}
