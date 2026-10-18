@@ -290,6 +290,8 @@ fn names_internals(message: &str) -> bool {
 #[tokio::test]
 async fn no_message_names_the_servers_internals() {
     use ursula_runtime::ColdOperation;
+    use ursula_runtime::ForwardFailure;
+    use ursula_runtime::ForwardedRpc;
     use ursula_runtime::GroupEngineError;
     use ursula_runtime::GroupInfraError;
     use ursula_runtime::KnownLeader;
@@ -347,9 +349,10 @@ async fn no_message_names_the_servers_internals() {
         ),
         // A forwarded read the leader refused.
         (
-            engine(GroupEngineError::new(format!(
-                "GroupRead to the group leader at {leader} was refused: version mismatch"
-            ))),
+            engine(GroupEngineError::Infra(GroupInfraError::ForwardFailed {
+                rpc: ForwardedRpc::GroupRead,
+                failure: ForwardFailure::Refused { grpc_code: 9 },
+            })),
             ErrorCode::Internal,
         ),
         // Pressure, whose detail counts other tenants' bytes.

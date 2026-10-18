@@ -39,6 +39,7 @@ use super::GroupEngineFactory;
 use super::GroupEngineMetrics;
 use super::GroupFlushColdFuture;
 use super::GroupHeadStreamFuture;
+use super::GroupInfraError;
 use super::GroupInstallSnapshotFuture;
 use super::GroupPlanColdFlushFuture;
 use super::GroupPlanColdGcFuture;
@@ -52,12 +53,14 @@ use super::GroupReadStreamFuture;
 use super::GroupReadStreamPartsFuture;
 use super::GroupRepairColdIndexFuture;
 use super::GroupRouteWriteFuture;
+use super::GroupSnapshotError;
 use super::GroupSnapshotFuture;
 use super::GroupStateGaugesFuture;
 use super::GroupTidyStreamFuture;
 use super::GroupTidyStreamsFuture;
 use super::GroupTouchStreamAccessFuture;
 use super::GroupWriteResponse;
+use super::ResponseKind;
 use super::cold_store_failure;
 use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdIndexPageKey;
@@ -305,7 +308,12 @@ impl InMemoryGroupEngine {
                     .state_machine
                     .incarnation_precondition(&command, incarnation)
                 {
-                    return self.group_response_from_stream(refusal, None, placement);
+                    return self.group_response_from_stream(
+                        refusal,
+                        answered_kind(&command),
+                        None,
+                        placement,
+                    );
                 }
                 self.apply_checked_stream_command(
                     *command,
@@ -316,6 +324,7 @@ impl InMemoryGroupEngine {
             }
             command => {
                 let stream_id = command_stream_id(&command);
+                let expected = answered_kind(&command);
                 // Commands whose pages the leader rewrote before proposing:
                 // compaction and F5 offloads (which may clip entries), plus
                 // external appends and creates (bounded-state F13). Every
@@ -345,7 +354,8 @@ impl InMemoryGroupEngine {
                     ensure_bucket_exists(&mut self.state_machine, stream_id)?;
                 }
                 let response = self.state_machine.apply_checked(index, command, check);
-                let response = self.group_response_from_stream(response, stream_id, placement);
+                let response =
+                    self.group_response_from_stream(response, expected, stream_id, placement);
                 if response.is_ok()
                     && let (Some(cache), Some(stream_id)) =
                         (self.cold_index_cache.as_ref(), compacted_stream_id.as_ref())
@@ -380,6 +390,7 @@ impl InMemoryGroupEngine {
     fn group_response_from_stream(
         &mut self,
         response: StreamResponse,
+        expected: ResponseKind,
         stream_id: Option<BucketStreamId>,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
@@ -389,7 +400,7 @@ impl InMemoryGroupEngine {
                 closed,
                 ..
             } => {
-                let stream_id = require_response_stream_id(stream_id, "created")?;
+                let stream_id = require_response_stream_id(stream_id, ResponseKind::CreateStream)?;
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::CreateStream(CreateStreamResponse {
                     placement,
@@ -420,7 +431,7 @@ impl InMemoryGroupEngine {
                 closed,
                 producer,
             } => {
-                let stream_id = require_response_stream_id(stream_id, "appended")?;
+                let stream_id = require_response_stream_id(stream_id, ResponseKind::Append)?;
                 let stream_hot_bytes = self.state_machine.hot_payload_len(&stream_id).unwrap_or(0);
                 let group_hot_bytes = self.state_machine.total_hot_payload_bytes();
                 if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
@@ -458,7 +469,7 @@ impl InMemoryGroupEngine {
                 ))
             }
             StreamResponse::StreamTidied { debt_remaining } => {
-                require_response_stream_id(stream_id, "tidied")?;
+                require_response_stream_id(stream_id, ResponseKind::TidyStream)?;
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::TidyStream(
                     crate::request::TidyStreamResponse {
@@ -548,7 +559,7 @@ impl InMemoryGroupEngine {
                 next_offset,
                 producer,
             } => {
-                let stream_id = require_response_stream_id(stream_id, "closed")?;
+                let stream_id = require_response_stream_id(stream_id, ResponseKind::CloseStream)?;
                 if !producer.as_ref().is_some_and(ProducerAck::is_repeat) {
                     self.advance_commit_index();
                 }
@@ -561,7 +572,7 @@ impl InMemoryGroupEngine {
                 }))
             }
             StreamResponse::Deleted { expired } => {
-                let stream_id = require_response_stream_id(stream_id, "deleted")?;
+                let stream_id = require_response_stream_id(stream_id, ResponseKind::DeleteStream)?;
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::DeleteStream(DeleteStreamResponse {
                     placement,
@@ -589,7 +600,7 @@ impl InMemoryGroupEngine {
                 }))
             }
             StreamResponse::ColdRefsOffloaded { removed, remaining } => {
-                require_response_stream_id(stream_id, "cold refs offloaded")?;
+                require_response_stream_id(stream_id, ResponseKind::OffloadColdRefs)?;
                 self.advance_commit_index();
                 Ok(GroupWriteResponse::OffloadColdRefs(
                     crate::cold_refs::OffloadStreamColdRefsResponse {
@@ -633,9 +644,12 @@ impl InMemoryGroupEngine {
                 context,
             )),
             other @ (StreamResponse::BucketCreated { .. }
-            | StreamResponse::BucketAlreadyExists { .. }) => Err(GroupEngineError::new(format!(
-                "unexpected group write response: {other:?}"
-            ))),
+            | StreamResponse::BucketAlreadyExists { .. }) => Err(GroupEngineError::Infra(
+                GroupInfraError::UnexpectedResponse {
+                    expected,
+                    actual: ResponseKind::from(&other),
+                },
+            )),
         }
     }
 
@@ -699,16 +713,9 @@ impl InMemoryGroupEngine {
                 u64::try_from(request.initial_payload.len()).unwrap_or(u64::MAX),
             )?;
         }
-        let response =
-            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
-                GroupWriteResponse::CreateStream(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected create stream write response: {other:?}"
-                    )));
-                }
-            };
-        Ok(response)
+        CreateStreamResponse::try_from(
+            self.apply_committed_write(GroupWriteCommand::from(request), placement)?,
+        )
     }
 
     pub(crate) fn append_with_admission_inner(
@@ -741,16 +748,9 @@ impl InMemoryGroupEngine {
                 u64::try_from(request.payload.len()).unwrap_or(u64::MAX),
             )?;
         }
-        let response =
-            match self.apply_committed_write(GroupWriteCommand::from(request), placement)? {
-                GroupWriteResponse::Append(response) => response,
-                other => {
-                    return Err(GroupEngineError::new(format!(
-                        "unexpected append write response: {other:?}"
-                    )));
-                }
-            };
-        Ok(response)
+        AppendResponse::try_from(
+            self.apply_committed_write(GroupWriteCommand::from(request), placement)?,
+        )
     }
 
     /// The early answer of [`GroupEngine::route_write`], from this
@@ -785,19 +785,14 @@ impl InMemoryGroupEngine {
         renew_ttl: bool,
         placement: ShardPlacement,
     ) -> Result<TouchStreamAccessResponse, GroupEngineError> {
-        match self.apply_committed_write(
+        TouchStreamAccessResponse::try_from(self.apply_committed_write(
             GroupWriteCommand::Stream(StreamCommand::TouchStreamAccess {
                 stream_id,
                 now_ms,
                 renew_ttl,
             }),
             placement,
-        )? {
-            GroupWriteResponse::TouchStreamAccess(response) => Ok(response),
-            other => Err(GroupEngineError::new(format!(
-                "unexpected touch stream access write response: {other:?}"
-            ))),
-        }
+        )?)
     }
 
     pub(crate) fn ensure_stream_access(
@@ -1107,9 +1102,13 @@ impl InMemoryGroupEngine {
             .iter()
             .any(|segment| !matches!(segment, StreamReadSegment::Hot(_)))
         {
-            return Err(GroupEngineError::new(format!(
-                "bootstrap window [{window_start}..{window_end}) for stream '{stream_id}' is not hot"
-            )));
+            return Err(GroupEngineError::Infra(
+                GroupInfraError::BootstrapWindowNotHot {
+                    stream_id: stream_id.clone(),
+                    start: window_start,
+                    end: window_end,
+                },
+            ));
         }
         let payload = self.read_own_payload_from_plan(stream_id, &plan).await?;
         if payload.len() != window_len {
@@ -1417,7 +1416,7 @@ impl InMemoryGroupEngine {
         stream_append_counts: Vec<StreamAppendCount>,
     ) -> Result<(), GroupEngineError> {
         let mut state_machine = StreamStateMachine::restore(stream_snapshot)
-            .map_err(|err| GroupEngineError::new(format!("restore stream snapshot: {err}")))?;
+            .map_err(|err| GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(err)))?;
         // A count for a stream the snapshot does not hold has nothing to
         // attach to and is dropped (F9: counts die with their slot).
         for count in stream_append_counts {
@@ -1450,12 +1449,7 @@ impl GroupEngine for InMemoryGroupEngine {
         }
         let command = GroupWriteCommand::from(request);
         Box::pin(async move {
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected create stream write response: {other:?}"
-                ))),
-            }
+            CreateStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -1468,12 +1462,7 @@ impl GroupEngine for InMemoryGroupEngine {
             // The state keeps the initial payload as a direct reference
             // (F14g), so the engine writes no page entry before proposing.
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected external create stream write response: {other:?}"
-                ))),
-            }
+            CreateStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -1516,12 +1505,7 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::PublishSnapshot(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected publish snapshot write response: {other:?}"
-                ))),
-            }
+            PublishSnapshotResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -1533,12 +1517,7 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::AdvanceRetention(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected advance retention write response: {other:?}"
-                ))),
-            }
+            AdvanceRetentionResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -1548,12 +1527,9 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> crate::GroupImportGroupStateFuture<'a> {
         Box::pin(async move {
-            match self.apply_stream_command(StreamCommand::from(request), placement)? {
-                GroupWriteResponse::ImportGroupState(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected group state import response: {other:?}"
-                ))),
-            }
+            ImportGroupStateResponse::try_from(
+                self.apply_stream_command(StreamCommand::from(request), placement)?,
+            )
         })
     }
 
@@ -1569,12 +1545,9 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupTidyStreamFuture<'a> {
         Box::pin(async move {
             let command = GroupWriteCommand::from(StreamCommand::TidyStream { stream_id, now_ms });
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::TidyStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected tidy stream write response: {other:?}"
-                ))),
-            }
+            crate::request::TidyStreamResponse::try_from(
+                self.apply_committed_write(command, placement)?,
+            )
         })
     }
 
@@ -1625,9 +1598,12 @@ impl GroupEngine for InMemoryGroupEngine {
                             report.refs_offloaded.saturating_add(response.removed);
                     }
                     Ok(other) => {
-                        return Err(GroupEngineError::new(format!(
-                            "unexpected offload cold refs write response: {other:?}"
-                        )));
+                        return Err(GroupEngineError::Infra(
+                            GroupInfraError::UnexpectedResponse {
+                                expected: ResponseKind::OffloadColdRefs,
+                                actual: other.kind(),
+                            },
+                        ));
                     }
                     Err(err) if err.code().is_some() => {
                         report.rejected = report.rejected.saturating_add(1);
@@ -1831,12 +1807,7 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::CloseStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected close stream write response: {other:?}"
-                ))),
-            }
+            CloseStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -1847,12 +1818,7 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupDeleteStreamFuture<'a> {
         let command = GroupWriteCommand::from(request);
         Box::pin(async move {
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::DeleteStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected delete stream write response: {other:?}"
-                ))),
-            }
+            DeleteStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -1862,15 +1828,10 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
-            match self.apply_committed_write(
+            PurgeBucketResponse::try_from(self.apply_committed_write(
                 GroupWriteCommand::Stream(StreamCommand::PurgeBucket { bucket_id }),
                 placement,
-            )? {
-                GroupWriteResponse::PurgeBucket(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected purge bucket write response: {other:?}"
-                ))),
-            }
+            )?)
         })
     }
 
@@ -1880,15 +1841,10 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async move {
-            match self.apply_committed_write(
+            AckColdGcResponse::try_from(self.apply_committed_write(
                 GroupWriteCommand::Stream(StreamCommand::AckColdGc { up_to_seq }),
                 placement,
-            )? {
-                GroupWriteResponse::AckColdGc(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected ack cold gc write response: {other:?}"
-                ))),
-            }
+            )?)
         })
     }
 
@@ -1899,15 +1855,10 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupDeferColdGcFuture<'a> {
         Box::pin(async move {
-            match self.apply_committed_write(
+            DeferColdGcResponse::try_from(self.apply_committed_write(
                 GroupWriteCommand::Stream(StreamCommand::DeferColdGc { seq, not_before_ms }),
                 placement,
-            )? {
-                GroupWriteResponse::DeferColdGc(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected defer cold gc write response: {other:?}"
-                ))),
-            }
+            )?)
         })
     }
 
@@ -1986,12 +1937,7 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append write response: {other:?}"
-                ))),
-            }
+            AppendResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -2006,12 +1952,7 @@ impl GroupEngine for InMemoryGroupEngine {
             // state; the offload pass writes the page entry once the append
             // committed.
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement)? {
-                GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected external append write response: {other:?}"
-                ))),
-            }
+            AppendResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
 
@@ -2056,33 +1997,19 @@ impl GroupEngine for InMemoryGroupEngine {
                 index_rollback = Some((store, rollback, request.stream_id.clone()));
             }
             let command = GroupWriteCommand::from(request);
-            match self.apply_committed_write(command, placement) {
-                Ok(GroupWriteResponse::FlushCold(response)) => Ok(response),
-                Ok(other) => {
-                    if let Some((store, rollback, stream_id)) = index_rollback {
-                        rollback_cold_index_pages(&store, rollback)
-                            .await
-                            .map_err(|err| {
-                                cold_store_failure(ColdOperation::RollbackIndex { stream_id }, err)
-                            })?;
-                    }
-                    Err(GroupEngineError::new(format!(
-                        "unexpected flush cold write response: {other:?}"
-                    )))
-                }
-                Err(err) => {
-                    if let Some((store, rollback, _stream_id)) = index_rollback {
-                        rollback_cold_index_pages(&store, rollback).await.map_err(
-                            |rollback_err| {
-                                GroupEngineError::new(format!(
-                                    "rollback cold index after flush failure: {rollback_err}"
-                                ))
-                            },
-                        )?;
-                    }
-                    Err(err)
-                }
+            let result = self
+                .apply_committed_write(command, placement)
+                .and_then(FlushColdResponse::try_from);
+            if result.is_err()
+                && let Some((store, rollback, stream_id)) = index_rollback
+            {
+                rollback_cold_index_pages(&store, rollback)
+                    .await
+                    .map_err(|err| {
+                        cold_store_failure(ColdOperation::RollbackIndex { stream_id }, err)
+                    })?;
             }
+            result
         })
     }
 
@@ -2094,6 +2021,9 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             let mut index_rollback = None;
             if let Some(cold_store) = self.cold_store.as_ref() {
+                let index_compacted_chunk = || ColdOperation::IndexCompactedChunk {
+                    stream_id: request.stream_id.clone(),
+                };
                 let generation = self
                     .state_machine
                     .cold_index_generation(&request.stream_id)
@@ -2107,7 +2037,7 @@ impl GroupEngine for InMemoryGroupEngine {
                         &request.replacement,
                     )
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                    .map_err(|err| cold_store_failure(index_compacted_chunk(), err))?
                 } else {
                     let Some(rollback) =
                         replace_cold_chunk_index_pages_with_rollback_in_generation(
@@ -2118,33 +2048,29 @@ impl GroupEngine for InMemoryGroupEngine {
                             &request.replacement,
                         )
                         .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))?
+                        .map_err(|err| cold_store_failure(index_compacted_chunk(), err))?
                     else {
-                        return Err(GroupEngineError::new(
-                            "cold compaction input no longer matches the cold index",
+                        return Err(GroupEngineError::Infra(
+                            GroupInfraError::ColdCompactionStale {
+                                stream_id: request.stream_id.clone(),
+                            },
                         ));
                     };
                     rollback
                 };
-                index_rollback = Some((store, rollback));
+                index_rollback = Some((store, rollback, request.stream_id.clone()));
             }
             let command = GroupWriteCommand::from(request);
-            let result = match self.apply_committed_write(command, placement) {
-                Ok(GroupWriteResponse::CompactCold(response)) => Ok(response),
-                Ok(other) => Err(GroupEngineError::new(format!(
-                    "unexpected compact cold write response: {other:?}"
-                ))),
-                Err(err) => Err(err),
-            };
+            let result = self
+                .apply_committed_write(command, placement)
+                .and_then(CompactColdResponse::try_from);
             if result.is_err()
-                && let Some((store, rollback)) = index_rollback
+                && let Some((store, rollback, stream_id)) = index_rollback
             {
                 rollback_cold_index_pages(&store, rollback)
                     .await
                     .map_err(|err| {
-                        GroupEngineError::new(format!(
-                            "rollback cold index after compaction failure: {err}"
-                        ))
+                        cold_store_failure(ColdOperation::RollbackIndex { stream_id }, err)
                     })?;
             }
             result
@@ -2304,9 +2230,12 @@ pub(crate) fn ensure_bucket_exists(
             next_offset,
             context,
         )),
-        other => Err(GroupEngineError::new(format!(
-            "unexpected create bucket response: {other:?}"
-        ))),
+        other => Err(GroupEngineError::Infra(
+            GroupInfraError::UnexpectedResponse {
+                expected: ResponseKind::BucketCreated,
+                actual: ResponseKind::from(&other),
+            },
+        )),
     }
 }
 
@@ -2338,6 +2267,36 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
     }
 }
 
+/// The kind of response the state machine answers `command` with, when it
+/// applies it.
+fn answered_kind(command: &StreamCommand) -> ResponseKind {
+    match command {
+        StreamCommand::CreateBucket { .. } => ResponseKind::BucketCreated,
+        StreamCommand::CreateStream { .. } | StreamCommand::CreateExternal { .. } => {
+            ResponseKind::CreateStream
+        }
+        StreamCommand::Append { .. } | StreamCommand::AppendExternal { .. } => ResponseKind::Append,
+        StreamCommand::PublishSnapshot { .. } | StreamCommand::PublishSnapshotExternal { .. } => {
+            ResponseKind::PublishSnapshot
+        }
+        StreamCommand::AdvanceRetention { .. } => ResponseKind::AdvanceRetention,
+        StreamCommand::TouchStreamAccess { .. } => ResponseKind::TouchStreamAccess,
+        StreamCommand::FlushCold { .. } => ResponseKind::FlushCold,
+        StreamCommand::CompactCold { .. } => ResponseKind::CompactCold,
+        StreamCommand::Close { .. } => ResponseKind::CloseStream,
+        StreamCommand::DeleteStream { .. } => ResponseKind::DeleteStream,
+        StreamCommand::AckColdGc { .. } => ResponseKind::AckColdGc,
+        StreamCommand::DeferColdGc { .. } => ResponseKind::DeferColdGc,
+        StreamCommand::PurgeBucket { .. } => ResponseKind::PurgeBucket,
+        StreamCommand::ImportSnapshot { .. } => ResponseKind::ImportGroupState,
+        StreamCommand::NewHistory { .. } => ResponseKind::NewHistory,
+        StreamCommand::TidyStream { .. } => ResponseKind::TidyStream,
+        StreamCommand::OffloadColdRefs { .. } => ResponseKind::OffloadColdRefs,
+        StreamCommand::ExpireStreams { .. } => ResponseKind::ExpireStreams,
+        StreamCommand::IfIncarnation { command, .. } => answered_kind(command),
+    }
+}
+
 /// [`StreamStateMachine::stream_incarnation`] for a response, read from the
 /// state that just served the write or read; `0` for a stream that no
 /// longer exists.
@@ -2352,13 +2311,11 @@ fn response_incarnation(
 
 fn require_response_stream_id(
     stream_id: Option<BucketStreamId>,
-    response: &str,
+    response: ResponseKind,
 ) -> Result<BucketStreamId, GroupEngineError> {
-    stream_id.ok_or_else(|| {
-        GroupEngineError::new(format!(
-            "{response} response for a command without a stream id"
-        ))
-    })
+    stream_id.ok_or(GroupEngineError::Infra(GroupInfraError::MissingStreamId {
+        response,
+    }))
 }
 
 /// Where the next repair step resumes: after the last stream of a full
@@ -2406,6 +2363,9 @@ pub(crate) fn stream_response_error(response: StreamResponse) -> GroupEngineErro
             next_offset,
             context,
         } => GroupEngineError::stream_with_context(code, message, next_offset, context),
-        other => GroupEngineError::new(format!("unexpected stream response error: {other:?}")),
+        other => GroupEngineError::Infra(GroupInfraError::UnexpectedResponse {
+            expected: ResponseKind::StreamError,
+            actual: ResponseKind::from(&other),
+        }),
     }
 }

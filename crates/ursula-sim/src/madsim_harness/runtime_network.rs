@@ -32,11 +32,42 @@ use ursula_runtime::GroupEngineCreateFuture;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::GroupInfraError;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use super::MadsimScopedGroupEngine;
 use super::SimNodeWal;
+
+/// How long a harness step waits for the group to elect a leader.
+const LEADER_WAIT: Duration = Duration::from_secs(5);
+
+/// Why a harness step on the runtime's Raft group failed.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum RuntimeNetworkError {
+    #[error("raft group {} has no recorded leader", .raft_group_id.0)]
+    LeaderUnknown { raft_group_id: RaftGroupId },
+    #[error("raft group {} has no group control", .raft_group_id.0)]
+    GroupUnknown { raft_group_id: RaftGroupId },
+    #[error("no raft group has been built")]
+    NoGroup,
+    #[error("raft group {} retains no follower to wait on", .raft_group_id.0)]
+    NoFollower { raft_group_id: RaftGroupId },
+    #[error("raft group {} elected no successor", .raft_group_id.0)]
+    NoSuccessor {
+        raft_group_id: RaftGroupId,
+        #[source]
+        source: openraft::metrics::WaitError,
+    },
+    #[error("raft group {} names no leader after its election", .raft_group_id.0)]
+    SuccessorMissing { raft_group_id: RaftGroupId },
+    #[error("node {node_id} is not a retained follower")]
+    NotAFollower { node_id: u64 },
+    #[error("node {node_id} has no log store")]
+    NoLogStore { node_id: u64 },
+    #[error(transparent)]
+    Engine(#[from] GroupEngineError),
+}
 
 #[derive(Clone)]
 pub(super) struct MadsimRuntimeRaftNetworkFactory {
@@ -117,23 +148,17 @@ impl MadsimRuntimeRaftNetworkFactory {
     pub(super) fn unregister_current_leader(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<u64, GroupEngineError> {
-        let leader_id = self.leader_id(raft_group_id).ok_or_else(|| {
-            GroupEngineError::new(format!(
-                "runtime raft leader for group {} not found",
-                raft_group_id.0
-            ))
-        })?;
+    ) -> Result<u64, RuntimeNetworkError> {
+        let leader_id = self
+            .leader_id(raft_group_id)
+            .ok_or(RuntimeNetworkError::LeaderUnknown { raft_group_id })?;
         let groups = self
             .groups
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let control = groups.get(&raft_group_id.0).ok_or_else(|| {
-            GroupEngineError::new(format!(
-                "runtime raft group control for group {} not found",
-                raft_group_id.0
-            ))
-        })?;
+        let control = groups
+            .get(&raft_group_id.0)
+            .ok_or(RuntimeNetworkError::GroupUnknown { raft_group_id })?;
         control.registry.unregister(leader_id);
         self.front_door
             .unregister_group_for_simulation(raft_group_id);
@@ -198,13 +223,10 @@ impl MadsimRuntimeRaftNetworkFactory {
     pub(super) async fn wait_successor(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<u64, GroupEngineError> {
-        let old_leader_id = self.leader_id(raft_group_id).ok_or_else(|| {
-            GroupEngineError::new(format!(
-                "runtime raft leader for group {} not found",
-                raft_group_id.0
-            ))
-        })?;
+    ) -> Result<u64, RuntimeNetworkError> {
+        let old_leader_id = self
+            .leader_id(raft_group_id)
+            .ok_or(RuntimeNetworkError::LeaderUnknown { raft_group_id })?;
         let handles = self
             .followers
             .lock()
@@ -216,9 +238,9 @@ impl MadsimRuntimeRaftNetworkFactory {
             .iter()
             .find(|(node_id, _)| *node_id != old_leader_id)
             .map(|(_, raft)| raft.clone())
-            .ok_or_else(|| GroupEngineError::new("runtime raft replacement follower not found"))?;
+            .ok_or(RuntimeNetworkError::NoFollower { raft_group_id })?;
         let metrics = wait_handle
-            .wait(Some(Duration::from_secs(5)))
+            .wait(Some(LEADER_WAIT))
             .metrics(
                 |metrics| {
                     metrics
@@ -228,18 +250,19 @@ impl MadsimRuntimeRaftNetworkFactory {
                 "runtime raft new leader elected after old leader shutdown",
             )
             .await
-            .map_err(|err| {
-                GroupEngineError::new(format!("wait for runtime raft replacement leader: {err}"))
+            .map_err(|source| RuntimeNetworkError::NoSuccessor {
+                raft_group_id,
+                source,
             })?;
         metrics
             .current_leader
-            .ok_or_else(|| GroupEngineError::new("runtime raft replacement leader missing"))
+            .ok_or(RuntimeNetworkError::SuccessorMissing { raft_group_id })
     }
 
     pub(super) async fn take_current_leader_engine(
         &self,
         raft_group_id: RaftGroupId,
-    ) -> Result<(u64, Box<dyn GroupEngine>), GroupEngineError> {
+    ) -> Result<(u64, Box<dyn GroupEngine>), RuntimeNetworkError> {
         let new_leader_id = self.wait_successor(raft_group_id).await?;
         let engine = {
             let mut followers = self
@@ -250,9 +273,9 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .iter()
                 .position(|(candidate, _)| *candidate == new_leader_id)
             else {
-                return Err(GroupEngineError::new(format!(
-                    "runtime raft replacement leader {new_leader_id} not retained as follower"
-                )));
+                return Err(RuntimeNetworkError::NotAFollower {
+                    node_id: new_leader_id,
+                });
             };
             followers.swap_remove(index).1
         };
@@ -269,7 +292,7 @@ impl MadsimRuntimeRaftNetworkFactory {
         Ok((new_leader_id, engine))
     }
 
-    pub(super) async fn stop_follower(&self, node_id: u64) -> Result<(), GroupEngineError> {
+    pub(super) async fn stop_follower(&self, node_id: u64) -> Result<(), RuntimeNetworkError> {
         let engine = {
             let mut followers = self
                 .followers
@@ -279,9 +302,7 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .iter()
                 .position(|(candidate, _)| *candidate == node_id)
             else {
-                return Err(GroupEngineError::new(format!(
-                    "runtime raft follower {node_id} not found"
-                )));
+                return Err(RuntimeNetworkError::NotAFollower { node_id });
             };
             followers.swap_remove(index).1
         };
@@ -294,10 +315,10 @@ impl MadsimRuntimeRaftNetworkFactory {
                 control.registry.unregister(node_id);
             }
         }
-        engine.shutdown().await
+        Ok(engine.shutdown().await?)
     }
 
-    pub(super) async fn restart_follower(&self, node_id: u64) -> Result<(), GroupEngineError> {
+    pub(super) async fn restart_follower(&self, node_id: u64) -> Result<(), RuntimeNetworkError> {
         let control = {
             let groups = self
                 .groups
@@ -307,13 +328,13 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .values()
                 .next()
                 .cloned()
-                .ok_or_else(|| GroupEngineError::new("runtime raft group control not found"))?
+                .ok_or(RuntimeNetworkError::NoGroup)?
         };
-        let wal = control.wals.get(&node_id).cloned().ok_or_else(|| {
-            GroupEngineError::new(format!(
-                "runtime raft log store for node {node_id} not found"
-            ))
-        })?;
+        let wal = control
+            .wals
+            .get(&node_id)
+            .cloned()
+            .ok_or(RuntimeNetworkError::NoLogStore { node_id })?;
         let log_store = wal.open(control.placement, control.metrics.clone()).await;
         let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             control.placement,
@@ -368,10 +389,15 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 config.replication_lag_threshold = 0;
                 config.snapshot_policy = SnapshotPolicy::LogsSinceLast(4);
             }
-            let config =
-                Arc::new(config.validate().map_err(|err| {
-                    GroupEngineError::new(format!("invalid OpenRaft config: {err}"))
-                })?);
+            let invalid_config = GroupInfraError::InvalidRaftConfig {
+                heartbeat_ms: config.heartbeat_interval,
+                election_timeout_min_ms: config.election_timeout_min,
+                election_timeout_max_ms: config.election_timeout_max,
+            };
+            let config = Arc::new(config.validate().map_err(|err| {
+                tracing::warn!(error = %err, "invalid OpenRaft config");
+                GroupEngineError::Infra(invalid_config)
+            })?);
             let mut nodes = BTreeMap::new();
             for node_id in 1..=3 {
                 nodes.insert(
@@ -415,10 +441,16 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
             let leader_metrics = engines[0]
                 .1
                 .raft_handle()
-                .wait(Some(Duration::from_secs(5)))
+                .wait(Some(LEADER_WAIT))
                 .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
                 .await
-                .map_err(|err| GroupEngineError::new(format!("wait for leader: {err}")))?;
+                .map_err(|err| {
+                    tracing::warn!(error = %err, "the runtime raft group elected no leader");
+                    GroupEngineError::Infra(GroupInfraError::LeaderWaitTimedOut {
+                        raft_group_id: placement.raft_group_id,
+                        timeout_ms: u64::try_from(LEADER_WAIT.as_millis()).unwrap_or(u64::MAX),
+                    })
+                })?;
             let leader_id = leader_metrics.current_leader.expect("leader id");
             leaders
                 .lock()

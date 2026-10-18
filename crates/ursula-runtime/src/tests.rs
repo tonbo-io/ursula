@@ -204,7 +204,7 @@ fn runtime_error_status_classifies_retryable_and_permanent_errors() {
     let internal = RuntimeError::GroupEngine {
         core_id: CoreId(0),
         raft_group_id: RaftGroupId(0),
-        error: GroupEngineError::new("OpenRaft client_write: timeout after retries"),
+        error: GroupEngineError::Infra(GroupInfraError::OutcomeUnknown),
     };
     assert_eq!(internal.status(), ErrorStatus::Persistent);
 }
@@ -222,10 +222,10 @@ fn group_engine_error_variants_separate_stream_infra_and_forwarding() {
     );
     assert!(matches!(stream, GroupEngineError::Stream(_)));
 
-    let infra = GroupEngineError::new("OpenRaft client_write failed");
+    let infra = GroupEngineError::from(GroupInfraError::OutcomeUnknown);
     assert!(matches!(
         infra,
-        GroupEngineError::Infra(GroupInfraError::Internal { .. })
+        GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
     ));
 
     let forward = GroupEngineError::NotLeader(LeadershipRefusal {
@@ -729,13 +729,10 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
         )
         .await
         .expect_err("duplicate cold flush should be stale");
-    assert!(
-        stale_flush
-            .message()
-            .contains("must start at the hot prefix"),
-        "message={}",
-        stale_flush.message()
-    );
+    assert_eq!(stale_flush.code(), Some(StreamErrorCode::InvalidColdFlush));
+    assert_eq!(stale_flush.context(), &[
+        StreamErrorContext::StaleColdFlushCandidate
+    ]);
     cold_store
         .delete_chunk(stale_path)
         .await
@@ -803,6 +800,99 @@ async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
     .await
     .expect("load rolled-back index");
     assert_eq!(chunks, vec![first, second]);
+}
+
+/// A compaction whose input chunks the cold index no longer holds is refused
+/// before it is proposed, so its caller deletes the replacement object.
+#[tokio::test]
+async fn stale_cold_compaction_input_is_refused_before_proposal() {
+    let placement = placement();
+    let stream = BucketStreamId::new("benchcmp", "stale-compact-index");
+    let cold_store = Arc::new(memory_cold_store());
+    let chunk = |start_offset, end_offset, object_size, name: &str| ColdChunkRef {
+        start_offset,
+        end_offset,
+        s3_path: format!("benchcmp/stale-compact-index/chunks/{name}.bin"),
+        object_size,
+        ..Default::default()
+    };
+    let mut engine = InMemoryGroupEngine::started_with_cold_store(cold_store);
+
+    let err = engine
+        .compact_cold(
+            CompactColdRequest {
+                stream_id: stream.clone(),
+                old_chunks: vec![chunk(0, 4, 4, "first"), chunk(4, 8, 4, "second")],
+                replacement: chunk(0, 8, 8, "replacement"),
+                gc_not_before_ms: 0,
+            },
+            placement,
+        )
+        .await
+        .expect_err("an unindexed input is stale");
+
+    assert_eq!(
+        err,
+        GroupEngineError::Infra(GroupInfraError::ColdCompactionStale { stream_id: stream })
+    );
+    assert!(err.applied_nothing());
+}
+
+/// An operation a test double leaves to the trait's default is refused as
+/// unsupported, before anything is proposed.
+#[tokio::test]
+async fn default_engine_operations_are_unsupported() {
+    let mut engine = FailingEngine;
+    let err = engine
+        .ack_cold_gc(1, placement())
+        .await
+        .expect_err("FailingEngine keeps the default");
+
+    assert_eq!(
+        err,
+        GroupEngineError::Infra(GroupInfraError::Unsupported {
+            operation: EngineOperation::AckColdGc,
+        })
+    );
+    assert!(err.refused_before_proposal());
+}
+
+/// A core refuses a second engine for a group it already runs.
+#[tokio::test]
+async fn second_engine_install_for_a_group_is_refused() {
+    let (_tx, rx) = tokio::sync::mpsc::channel(1);
+    let mut worker = CoreWorker {
+        core_id: CoreId(0),
+        rx,
+        engine_factory: Arc::new(InMemoryGroupEngineFactory::default()),
+        groups: std::collections::HashMap::new(),
+        metrics: Arc::new(RuntimeMetricsInner::new(1, 1)),
+        group_mailbox_capacity: 1,
+        cold_write_admission: ColdWriteAdmission {
+            max_hot_bytes_per_group: None,
+        },
+        raft_uncommitted_admission: RaftUncommittedAdmission {
+            max_uncommitted_bytes_per_group: None,
+        },
+        raft_uncommitted_bytes: Arc::new(crate::admission::RaftUncommittedBytesTracker::new(1)),
+        live_read_max_waiters_per_core: None,
+        read_materialization: Arc::new(Semaphore::new(1)),
+        read_barriers: crate::read_index::ReadIndexBarriers::default(),
+    };
+    worker
+        .install_group_engine(placement(), Box::new(InMemoryGroupEngine::started()))
+        .await
+        .expect("first install");
+
+    let err = worker
+        .install_group_engine(placement(), Box::new(InMemoryGroupEngine::started()))
+        .await
+        .expect_err("second install");
+
+    assert_eq!(err, RuntimeError::GroupAlreadyInstalled {
+        core_id: CoreId(0),
+        raft_group_id: RaftGroupId(0),
+    });
 }
 
 #[tokio::test]
@@ -1591,8 +1681,6 @@ async fn append_before_stream_setup_uses_stream_state_machine_error() {
             assert_eq!(core_id, placement.core_id);
             assert_eq!(raft_group_id, placement.raft_group_id);
             assert_eq!(error.code(), Some(StreamErrorCode::BucketNotFound));
-            let message = error.message();
-            assert!(message.contains("BucketNotFound"), "message={message}");
         }
         other => panic!("expected group engine error, got {other:?}"),
     }
@@ -3092,8 +3180,7 @@ async fn close_stream_allows_close_only_and_rejects_later_appends() {
         .expect_err("append after close rejected");
     match err {
         RuntimeError::GroupEngine { error, .. } => {
-            let message = error.message();
-            assert!(message.contains("StreamClosed"), "message={message}");
+            assert_eq!(error.code(), Some(StreamErrorCode::StreamClosed));
         }
         other => panic!("expected group engine error, got {other:?}"),
     }
@@ -3141,8 +3228,7 @@ async fn delete_stream_removes_state_on_owner_group() {
         .expect_err("head after delete rejected");
     match err {
         RuntimeError::GroupEngine { error, .. } => {
-            let message = error.message();
-            assert!(message.contains("StreamNotFound"), "message={message}");
+            assert_eq!(error.code(), Some(StreamErrorCode::StreamNotFound));
         }
         other => panic!("expected group engine error, got {other:?}"),
     }
@@ -3153,8 +3239,7 @@ async fn delete_stream_removes_state_on_owner_group() {
         .expect_err("append after delete rejected");
     match err {
         RuntimeError::GroupEngine { error, .. } => {
-            let message = error.message();
-            assert!(message.contains("StreamNotFound"), "message={message}");
+            assert_eq!(error.code(), Some(StreamErrorCode::StreamNotFound));
         }
         other => panic!("expected group engine error, got {other:?}"),
     }
@@ -3530,7 +3615,7 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
     assert_eq!(err, RuntimeError::GroupEngine {
         core_id: placement.core_id,
         raft_group_id: placement.raft_group_id,
-        error: GroupEngineError::new("proposal rejected"),
+        error: proposal_rejected(),
     });
     assert_eq!(runtime.metrics().snapshot().accepted_appends, 0);
 }
@@ -4440,6 +4525,12 @@ impl GroupEngineFactory for FailingFactory {
 
 struct FailingEngine;
 
+/// What every operation of [`FailingEngine`] answers: a proposal whose
+/// outcome is unknown.
+fn proposal_rejected() -> GroupEngineError {
+    GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
+}
+
 impl GroupEngine for FailingEngine {
     fn route_write<'a>(
         &'a mut self,
@@ -4459,7 +4550,7 @@ impl GroupEngine for FailingEngine {
         _placement: ShardPlacement,
         _admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn head_stream<'a>(
@@ -4467,7 +4558,7 @@ impl GroupEngine for FailingEngine {
         _request: HeadStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn read_stream<'a>(
@@ -4475,7 +4566,7 @@ impl GroupEngine for FailingEngine {
         _request: ReadStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupReadStreamFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn touch_stream_access<'a>(
@@ -4485,7 +4576,7 @@ impl GroupEngine for FailingEngine {
         _renew_ttl: bool,
         _placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn close_stream<'a>(
@@ -4493,7 +4584,7 @@ impl GroupEngine for FailingEngine {
         _request: CloseStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupCloseStreamFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn delete_stream<'a>(
@@ -4501,7 +4592,7 @@ impl GroupEngine for FailingEngine {
         _request: DeleteStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn append<'a>(
@@ -4510,18 +4601,18 @@ impl GroupEngine for FailingEngine {
         _placement: ShardPlacement,
         _admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn snapshot<'a>(&'a mut self, _placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 
     fn install_snapshot<'a>(
         &'a mut self,
         _snapshot: GroupSnapshot,
     ) -> GroupInstallSnapshotFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("proposal rejected")) })
+        Box::pin(async { Err(proposal_rejected()) })
     }
 }
 

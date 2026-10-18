@@ -484,10 +484,9 @@ impl CoreWorker {
         engine: Box<dyn GroupEngine>,
     ) -> Result<(), RuntimeError> {
         if self.groups.contains_key(&placement.raft_group_id) {
-            return Err(RuntimeError::GroupEngine {
+            return Err(RuntimeError::GroupAlreadyInstalled {
                 core_id: placement.core_id,
                 raft_group_id: placement.raft_group_id,
-                error: GroupEngineError::new("group engine already installed"),
             });
         }
         self.read_barriers

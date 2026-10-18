@@ -311,6 +311,12 @@ group_write_responses! {
     ExpireStreams(crate::request::ExpireStreamsResponse),
 }
 
+/// The error of a [`GroupEngine`] operation the engine leaves
+/// unimplemented: refused before anything was proposed.
+fn unsupported(operation: EngineOperation) -> GroupEngineError {
+    GroupEngineError::Infra(GroupInfraError::Unsupported { operation })
+}
+
 pub trait GroupEngine: Send + 'static {
     fn accepts_local_writes(&self) -> bool {
         true
@@ -332,15 +338,10 @@ pub trait GroupEngine: Send + 'static {
 
     fn create_stream_external<'a>(
         &'a mut self,
-        request: CreateStreamExternalRequest,
+        _request: CreateStreamExternalRequest,
         _placement: ShardPlacement,
     ) -> GroupCreateStreamFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "external stream create is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::CreateStreamExternal)) })
     }
 
     fn head_stream<'a>(
@@ -441,28 +442,18 @@ pub trait GroupEngine: Send + 'static {
 
     fn publish_snapshot<'a>(
         &'a mut self,
-        request: PublishSnapshotRequest,
+        _request: PublishSnapshotRequest,
         _placement: ShardPlacement,
     ) -> GroupPublishSnapshotFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "snapshot publish is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::PublishSnapshot)) })
     }
 
     fn advance_retention<'a>(
         &'a mut self,
-        request: AdvanceRetentionRequest,
+        _request: AdvanceRetentionRequest,
         _placement: ShardPlacement,
     ) -> GroupAdvanceRetentionFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "retention advance is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::AdvanceRetention)) })
     }
 
     /// Restore path: replaces an empty group's state with a backup snapshot
@@ -470,27 +461,17 @@ pub trait GroupEngine: Send + 'static {
     fn import_group_state<'a>(
         &'a mut self,
         _request: ImportGroupStateRequest,
-        placement: ShardPlacement,
+        _placement: ShardPlacement,
     ) -> GroupImportGroupStateFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "group state import is not supported for group {}",
-                placement.raft_group_id.0
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::ImportGroupState)) })
     }
 
     /// Bounded-state gauges of this replica's applied state
     /// (`docs/architecture/bounded-stream-state.md`, Gauges). Served from local
     /// state, leader or follower, like [`GroupEngine::bucket_usage`].
     /// Default unsupported.
-    fn state_gauges<'a>(&'a mut self, placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "state gauges are not supported for group {}",
-                placement.raft_group_id.0
-            )))
-        })
+    fn state_gauges<'a>(&'a mut self, _placement: ShardPlacement) -> GroupStateGaugesFuture<'a> {
+        Box::pin(async { Err(unsupported(EngineOperation::StateGauges)) })
     }
 
     /// Replicated `TidyStream` write (bounded-state F0); see
@@ -499,14 +480,9 @@ pub trait GroupEngine: Send + 'static {
         &'a mut self,
         _stream_id: BucketStreamId,
         _now_ms: u64,
-        placement: ShardPlacement,
+        _placement: ShardPlacement,
     ) -> GroupTidyStreamFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "stream tidy is not supported for group {}",
-                placement.raft_group_id.0
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::TidyStream)) })
     }
 
     /// One leader-side tidy pass (bounded-state F0): first the expiry sweep
@@ -537,28 +513,18 @@ pub trait GroupEngine: Send + 'static {
 
     fn read_snapshot<'a>(
         &'a mut self,
-        request: ReadSnapshotRequest,
+        _request: ReadSnapshotRequest,
         _placement: ShardPlacement,
     ) -> GroupReadSnapshotFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "snapshot read is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::ReadSnapshot)) })
     }
 
     fn bootstrap_stream<'a>(
         &'a mut self,
-        request: BootstrapStreamRequest,
+        _request: BootstrapStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupBootstrapStreamFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "bootstrap is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::BootstrapStream)) })
     }
 
     fn touch_stream_access<'a>(
@@ -588,7 +554,7 @@ pub trait GroupEngine: Send + 'static {
         _up_to_seq: u64,
         _placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("cold GC ack is not supported")) })
+        Box::pin(async { Err(unsupported(EngineOperation::AckColdGc)) })
     }
 
     /// Replicated `DeferColdGc` (bounded-state F14b): moves
@@ -600,7 +566,7 @@ pub trait GroupEngine: Send + 'static {
         _not_before_ms: u64,
         _placement: ShardPlacement,
     ) -> GroupDeferColdGcFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("cold GC deferral is not supported")) })
+        Box::pin(async { Err(unsupported(EngineOperation::DeferColdGc)) })
     }
 
     /// Replicated tenant offboarding: removes every stream in the bucket and
@@ -611,7 +577,7 @@ pub trait GroupEngine: Send + 'static {
         _bucket_id: String,
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
-        Box::pin(async { Err(GroupEngineError::new("bucket purge is not supported")) })
+        Box::pin(async { Err(unsupported(EngineOperation::PurgeBucket)) })
     }
 
     /// Leader-local read of the front of the cold-GC queue for the background
@@ -688,54 +654,34 @@ pub trait GroupEngine: Send + 'static {
 
     fn append_external<'a>(
         &'a mut self,
-        request: AppendExternalRequest,
+        _request: AppendExternalRequest,
         _placement: ShardPlacement,
     ) -> GroupAppendFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "external append is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::AppendExternal)) })
     }
 
     fn flush_cold<'a>(
         &'a mut self,
-        request: FlushColdRequest,
+        _request: FlushColdRequest,
         _placement: ShardPlacement,
     ) -> GroupFlushColdFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "cold flush is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::FlushCold)) })
     }
 
     fn compact_cold<'a>(
         &'a mut self,
-        request: CompactColdRequest,
+        _request: CompactColdRequest,
         _placement: ShardPlacement,
     ) -> GroupCompactColdFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "cold compaction is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::CompactCold)) })
     }
 
     fn plan_cold_flush<'a>(
         &'a mut self,
-        request: PlanColdFlushRequest,
+        _request: PlanColdFlushRequest,
         _placement: ShardPlacement,
     ) -> GroupPlanColdFlushFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "cold flush planning is not supported for stream '{}'",
-                request.stream_id
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::PlanColdFlush)) })
     }
 
     fn plan_next_cold_flush_batch<'a>(
@@ -744,23 +690,15 @@ pub trait GroupEngine: Send + 'static {
         _placement: ShardPlacement,
         _max_candidates: usize,
     ) -> GroupPlanNextColdFlushBatchFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(
-                "group cold flush planning is not supported",
-            ))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::PlanGroupColdFlush)) })
     }
 
     fn cold_hot_backlog<'a>(
         &'a mut self,
-        stream_id: BucketStreamId,
+        _stream_id: BucketStreamId,
         _placement: ShardPlacement,
     ) -> GroupColdHotBacklogFuture<'a> {
-        Box::pin(async move {
-            Err(GroupEngineError::new(format!(
-                "cold hot backlog is not supported for stream '{stream_id}'"
-            )))
-        })
+        Box::pin(async { Err(unsupported(EngineOperation::ColdHotBacklog)) })
     }
 
     fn snapshot<'a>(&'a mut self, placement: ShardPlacement) -> GroupSnapshotFuture<'a>;

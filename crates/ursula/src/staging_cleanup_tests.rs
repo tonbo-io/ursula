@@ -28,6 +28,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupHeadStreamFuture;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupReadStreamFuture;
 use ursula_runtime::GroupRouteWriteFuture;
@@ -86,9 +87,7 @@ impl GroupEngine for LostResponseEngine {
             self.inner
                 .create_stream_external(request, placement)
                 .await?;
-            Err(GroupEngineError::new(
-                "injected: response lost after commit",
-            ))
+            Err(GroupEngineError::Infra(GroupInfraError::OutcomeUnknown))
         })
     }
 
@@ -155,9 +154,7 @@ impl GroupEngine for LostResponseEngine {
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
             self.inner.append_external(request, placement).await?;
-            Err(GroupEngineError::new(
-                "injected: response lost after commit",
-            ))
+            Err(GroupEngineError::Infra(GroupInfraError::OutcomeUnknown))
         })
     }
 
@@ -397,7 +394,7 @@ fn cleanup_rule_classifies_runtime_errors() {
         GroupEngineError::stream(StreamErrorCode::StreamSeqConflict, "seq")
     )));
     assert!(!staged_external_definitely_unreferenced(&engine(
-        GroupEngineError::new("raft write timed out")
+        GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
     )));
     assert!(!staged_external_definitely_unreferenced(
         &RuntimeError::ResponseDropped { core_id: CoreId(0) }

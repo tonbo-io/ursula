@@ -1277,7 +1277,7 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
         }
         "internal" => {
             node.create(path, TEXT, b"").await;
-            node.fail_next_write(GroupEngineError::new("injected fault"));
+            node.fail_next_write(GroupEngineError::Infra(GroupInfraError::OwnerStopped));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
         "cold-store-failed" => {
