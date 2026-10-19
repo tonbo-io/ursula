@@ -703,7 +703,7 @@ mod tests {
     #[cfg(not(madsim))]
     #[test]
     fn a_run_state_matches_the_golden_file() {
-        const GOLDEN: &str = "";
+        const GOLDEN: &str = "5552535752554e00050000005c00000084a7626f6f745f6964d92430623366356331652d396432612d346537622d386336312d613162326333643465356636a56673796e63a6616c77617973a6737461747573a8706f69736f6e6564ae7265636f766572795f65706f63680427fbd867";
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(super::RUN_STATE_FILE);
         let current = RunState {
