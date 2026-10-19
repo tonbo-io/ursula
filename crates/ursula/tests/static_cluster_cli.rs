@@ -2745,6 +2745,462 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// Every file named `name` under `dir`, at any depth.
+fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
+    fn walk(dir: &Path, name: &str, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, name, found);
+            } else if path.file_name().is_some_and(|file| file == name) {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, name, &mut found);
+    found
+}
+
+/// The object keys that the snapshot record of group 0 in `wal_dir`
+/// (`group-0.snapshot.json`) names, decoded as a restore decodes it: none
+/// before the node wrote a record, else its one S3 key (#687).
+fn named_snapshot_keys(wal_dir: &Path) -> std::collections::BTreeSet<String> {
+    let records = files_named(wal_dir, "group-0.snapshot.json");
+    assert!(records.len() <= 1, "{records:?}");
+    let Some(record) = records.first() else {
+        return std::collections::BTreeSet::new();
+    };
+    let bytes = match std::fs::read(record) {
+        Ok(bytes) => bytes,
+        // The node's directory was wiped since the walk.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return std::collections::BTreeSet::new();
+        }
+        Err(err) => panic!("read the snapshot record {}: {err}", record.display()),
+    };
+    let pointer = ursula_raft::persisted_snapshot_pointer(&bytes)
+        .unwrap_or_else(|err| panic!("decode the snapshot record {}: {err}", record.display()));
+    match pointer.location {
+        ursula_runtime::SnapshotLocation::S3 { key, .. } => [key].into(),
+        other => panic!(
+            "the snapshot record {} names {other:?}, not an S3 object",
+            record.display()
+        ),
+    }
+}
+
+/// What each of `nodes`, by id and WAL directory, names of group 0.
+fn snapshot_names(nodes: &[(u64, PathBuf)]) -> Vec<ursula_runtime::snapshot_harness::NodeNames> {
+    nodes
+        .iter()
+        .map(|(node_id, wal_dir)| {
+            ursula_runtime::snapshot_harness::NodeNames::new(*node_id, named_snapshot_keys(wal_dir))
+        })
+        .collect()
+}
+
+/// What the bucket holds under each node's directory of group 0
+/// (`{prefix}/node-{n}/group-0/`), and what each node's snapshot record
+/// names. The names are read before and after the listing, and the reading
+/// starts again when they changed in between, so the view and the names
+/// belong to one point in time.
+async fn snapshot_ownership(
+    cold_store: &ColdStore,
+    prefix: &ursula_runtime::SnapshotPrefix,
+    nodes: &[(u64, PathBuf)],
+) -> (
+    ursula_runtime::snapshot_harness::SnapshotStoreView,
+    Vec<ursula_runtime::snapshot_harness::NodeNames>,
+) {
+    for _ in 0..20 {
+        let before = snapshot_names(nodes);
+        let mut objects = std::collections::BTreeMap::new();
+        for (node_id, _) in nodes {
+            let dir = format!(
+                "{}group-0/",
+                ursula_runtime::snapshot_harness::node_directory(prefix, *node_id)
+            );
+            for name in cold_store
+                .list_file_names(&dir)
+                .await
+                .unwrap_or_else(|err| panic!("list {dir}: {err}"))
+            {
+                objects.insert(
+                    format!("{dir}{name}"),
+                    ursula_runtime::snapshot_harness::ViewObject::default(),
+                );
+            }
+        }
+        let after = snapshot_names(nodes);
+        if before == after {
+            let view = ursula_runtime::snapshot_harness::SnapshotStoreView {
+                prefix: prefix.clone(),
+                objects,
+                deletes: Vec::new(),
+            };
+            return (view, after);
+        }
+    }
+    panic!("the snapshot records kept changing while the bucket was listed");
+}
+
+/// Checks I1, every key a node names exists, on the bucket now.
+async fn check_named_snapshot_objects_exist(
+    cold_store: &ColdStore,
+    prefix: &ursula_runtime::SnapshotPrefix,
+    nodes: &[(u64, PathBuf)],
+) -> Vec<ursula_runtime::snapshot_harness::NodeNames> {
+    let (view, names) = snapshot_ownership(cold_store, prefix, nodes).await;
+    if let Err(violation) = ursula_runtime::snapshot_harness::check_named_keys_exist(&view, &names)
+    {
+        panic!("{violation}: {view:?}, {names:?}");
+    }
+    names
+}
+
+/// Waits until I5 holds, each node's directory holding only the keys its
+/// record names, and checks I1 on every reading. Returns the names.
+async fn wait_quiet_snapshot_prefixes(
+    cold_store: &ColdStore,
+    prefix: &ursula_runtime::SnapshotPrefix,
+    nodes: &[(u64, PathBuf)],
+) -> Vec<ursula_runtime::snapshot_harness::NodeNames> {
+    // A node's GC pass runs once a key leaves its holds, and again one
+    // install timeout after its restore.
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(180))
+        .expect("a deadline");
+    loop {
+        let (view, names) = snapshot_ownership(cold_store, prefix, nodes).await;
+        if let Err(violation) =
+            ursula_runtime::snapshot_harness::check_named_keys_exist(&view, &names)
+        {
+            panic!("{violation}: {view:?}, {names:?}");
+        }
+        match ursula_runtime::snapshot_harness::check_quiet_prefixes(&view, &names) {
+            Ok(()) => return names,
+            Err(violation) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "{violation} once quiet: {view:?}, {names:?}"
+            ),
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The one key node `node_id` names, which it owns.
+fn owned_named_key(
+    names: &[ursula_runtime::snapshot_harness::NodeNames],
+    prefix: &ursula_runtime::SnapshotPrefix,
+    node_id: u64,
+) -> String {
+    let node = names
+        .iter()
+        .find(|node| node.node_id == node_id)
+        .expect("the node's names");
+    let mut keys = node.named.iter();
+    let (Some(key), None) = (keys.next(), keys.next()) else {
+        panic!("node {node_id} names {:?}, not one key", node.named);
+    };
+    let owner = ursula_runtime::OwnedKey::parse(prefix, key)
+        .unwrap_or_else(|err| panic!("{key} is not an owned key: {err}"))
+        .owner();
+    assert_eq!(owner.node_id(), node_id, "{key}");
+    assert_eq!(owner.raft_group_id().0, 0, "{key}");
+    key.clone()
+}
+
+/// Waits until `base_url` serves group 0: it answers ready, names a leader
+/// and applied at least `applied`.
+async fn wait_serves_group_zero(
+    client: &reqwest::Client,
+    base_url: &str,
+    applied: u64,
+    children: &mut [ChildGuard],
+) {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(120))
+        .expect("a deadline");
+    loop {
+        if let Some(report) = exited_child_report(children) {
+            panic!("a node exited while {base_url} caught up:\n{report}");
+        }
+        let ready = client
+            .get(format!("{base_url}/__ursula/ready"))
+            .send()
+            .await
+            .is_ok_and(|response| response.status() == reqwest::StatusCode::OK);
+        let group = node_metrics(client, base_url)
+            .await
+            .groups
+            .into_iter()
+            .find(|group| group.raft_group_id == 0);
+        if ready
+            && group.as_ref().is_some_and(|group| {
+                group.current_leader.is_some()
+                    && group
+                        .last_applied_index
+                        .is_some_and(|index| index >= applied)
+            })
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{base_url} does not serve group 0 at index {applied}: ready {ready}, {group:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Asks node `admin`'s group 0 for a snapshot and returns its index.
+async fn snapshot_group_zero(client: &reqwest::Client, admin: &str) -> u64 {
+    let response = admin_test_post(client, format!("{admin}/__ursula/raft/0/snapshot"))
+        .await
+        .send()
+        .await
+        .expect("trigger a snapshot");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let snapshot: ursula_proto::admin::SnapshotResponse =
+        response.json().await.expect("snapshot JSON");
+    snapshot.snapshot_index.expect("a snapshot index")
+}
+
+/// The last applied index of group 0 on `base_url`.
+async fn group_zero_applied(client: &reqwest::Client, base_url: &str) -> u64 {
+    group_zero_progress(client, base_url)
+        .await
+        .0
+        .expect("group 0 applied an entry")
+}
+
+/// #687, on real S3: a node whose disk was lost installs the leader's
+/// snapshot by writing its own copy under `snapshots/node-3/group-0/`, and
+/// every node, the wiped one last, restores the object its record names
+/// after a restart. At every reading every key a node names exists (I1),
+/// and once quiet each node's directory holds only what it names (I5).
+/// Runs on real S3 in CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores_from_s3() {
+    let _guard = static_cluster_cli_test_guard().await;
+    if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
+        tracing::warn!(
+            "skipping the S3 owned snapshot test; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
+        );
+        return;
+    }
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the S3 owned snapshot test");
+        return;
+    };
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let cold_root = match std::env::var("URSULA_S3_PREFIX") {
+        Ok(prefix) => format!("{prefix}/ursula-cli-s3-snapshot-owned/{suffix}"),
+        Err(_) => format!("ursula-cli-s3-snapshot-owned/{suffix}"),
+    };
+    let ports = [free_port(), free_port(), free_port()];
+    let peers: Vec<(u64, String)> = ports
+        .iter()
+        .zip(1_u64..)
+        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
+        .collect();
+    let root = std::env::temp_dir().join(format!(
+        "ursula-cli-s3-snapshot-owned-{}-{suffix}",
+        std::process::id()
+    ));
+    remove_test_path(&root);
+    std::fs::create_dir_all(&root).expect("create temp root");
+    let mut configs = Vec::new();
+    let mut admins = Vec::new();
+    let mut nodes = Vec::new();
+    for (node_id, port) in (1_u64..).zip(ports) {
+        let config = root.join(format!("node-{node_id}.toml"));
+        let wal_dir = root.join(format!("node-{node_id}-log"));
+        let admin_port = write_node_toml(
+            &config,
+            port,
+            node_id,
+            1,
+            &peers,
+            node_id == 1,
+            &wal_dir,
+            "s3",
+            Some(&cold_root),
+        );
+        let text = std::fs::read_to_string(&config).expect("read node config");
+        assert!(text.contains("init_membership_per_group = false\n"));
+        std::fs::write(
+            &config,
+            text.replace(
+                "init_membership_per_group = false\n",
+                "init_membership_per_group = false\ninstall_snapshot_timeout = \"40s\"\n",
+            )
+                // A short request timeout, so a lost request fails fast.
+                + "\n[storage.snapshot]\ns3_timeout = \"3s\"\ns3_max_retries = 1\n",
+        )
+        .expect("write node config");
+        admins.push(format!("http://127.0.0.1:{admin_port}"));
+        configs.push(config);
+        nodes.push((node_id, wal_dir));
+    }
+    let config = ursula_config::load_config(Some(&configs[0]), None, None)
+        .unwrap_or_else(|err| panic!("load config for the cold store: {err}"));
+    config
+        .validate()
+        .unwrap_or_else(|err| panic!("the node config is valid: {err}"));
+    // A follower's install copy, four snapshot-store requests of two 3 s
+    // attempts and a backoff of at most 2 s, fits inside the install
+    // timeout, as the server's startup check requires.
+    assert_eq!(
+        config.storage.snapshot.install_copy_budget(),
+        Duration::from_secs(32)
+    );
+    assert!(
+        config.storage.snapshot.install_copy_budget()
+            <= config.raft.install_snapshot_timeout.as_duration()
+    );
+    let prefix = config.storage.snapshot.snapshot_prefix();
+    let cold_store = ColdStore::try_new(&config.storage.cold)
+        .unwrap_or_else(|err| panic!("cold store creation failed: {err}"));
+    let mut children = configs
+        .iter()
+        .map(|config| spawn_node_with_cluster_config_and_cold_s3(binary, config))
+        .collect::<Vec<_>>();
+    let client = reqwest::Client::new();
+    for (_, url) in &peers {
+        wait_until_ready(&client, url, &mut children).await;
+    }
+
+    // 1. Every node snapshots group 0 into its own directory.
+    let stream = format!("{}/owned/snapshots", peers[0].1);
+    put_until_created(&client, &stream).await;
+    for _ in 0..3 {
+        post_until_no_content(&client, &stream, "before-the-wipe;").await;
+    }
+    let mut expected = "before-the-wipe;".repeat(3);
+    for (_, url) in &peers {
+        read_until_matches(
+            &client,
+            &format!("{url}/owned/snapshots?offset=0&max_bytes=1024"),
+            expected.as_bytes(),
+        )
+        .await;
+    }
+    for admin in &admins {
+        snapshot_group_zero(&client, admin).await;
+    }
+
+    // 2. Each node names one key of its own, which exists, and once quiet
+    // its directory holds nothing else.
+    let names = wait_quiet_snapshot_prefixes(&cold_store, &prefix, &nodes).await;
+    for (node_id, _) in &nodes {
+        owned_named_key(&names, &prefix, *node_id);
+    }
+
+    // 3. Node 3 loses its disk. Nodes 1 and 2 snapshot past a further write
+    // and purge their logs through it, so node 3 can catch up only through
+    // an installed snapshot. Its old objects stay in its directory.
+    drop(children.remove(2));
+    remove_test_path(&nodes[2].1);
+    post_until_no_content(&client, &stream, "while-wiped;").await;
+    expected.push_str("while-wiped;");
+    for (url, admin) in peers.iter().map(|(_, url)| url).zip(&admins).take(2) {
+        read_until_matches(
+            &client,
+            &format!("{url}/owned/snapshots?offset=0&max_bytes=1024"),
+            expected.as_bytes(),
+        )
+        .await;
+        let index = snapshot_group_zero(&client, admin).await;
+        let purge = admin_purge(
+            &client,
+            format!("{admin}/__ursula/raft/0/purge?upto={index}"),
+        )
+        .await;
+        assert_eq!(purge.status(), reqwest::StatusCode::OK);
+    }
+    let leader = wait_group_leader(&client, &peers[0].1, &peers, &mut children).await;
+    let leader_url = &peers[usize::try_from(leader.checked_sub(1).unwrap()).unwrap()].1;
+    let leader_applied = group_zero_applied(&client, leader_url).await;
+    children.push(spawn_node_with_cluster_config_and_cold_s3(
+        binary,
+        &configs[2],
+    ));
+    wait_until_ready(&client, &peers[2].1, &mut children).await;
+
+    // 4. Node 3 serves group 0 from its own copy of the leader's snapshot.
+    wait_serves_group_zero(&client, &peers[2].1, leader_applied, &mut children).await;
+    let names = check_named_snapshot_objects_exist(&cold_store, &prefix, &nodes).await;
+    let copy = owned_named_key(&names, &prefix, 3);
+    let leader_key = owned_named_key(&names, &prefix, leader);
+    assert_ne!(copy, leader_key, "node 3 names the leader's object");
+
+    // 5. The leader builds again. Once quiet, its directory holds only its
+    // new object, and node 3's only its copy: its objects from before the
+    // wipe are gone.
+    post_until_no_content(&client, &stream, "after-the-install;").await;
+    expected.push_str("after-the-install;");
+    read_until_matches(
+        &client,
+        &format!("{leader_url}/owned/snapshots?offset=0&max_bytes=1024"),
+        expected.as_bytes(),
+    )
+    .await;
+    let leader_admin = &admins[usize::try_from(leader.checked_sub(1).unwrap()).unwrap()];
+    snapshot_group_zero(&client, leader_admin).await;
+    let names = wait_quiet_snapshot_prefixes(&cold_store, &prefix, &nodes).await;
+    assert_ne!(
+        owned_named_key(&names, &prefix, leader),
+        leader_key,
+        "the leader's new build replaced its object"
+    );
+    assert_eq!(owned_named_key(&names, &prefix, 3), copy);
+
+    // 6. Each node in turn, node 3 last, restarts, restores the object its
+    // record names and serves group 0 again. No record changes, and every
+    // named key exists after each restart.
+    for (index, (node_id, _)) in nodes.iter().enumerate() {
+        wait_group_leader(&client, &peers[index].1, &peers, &mut children).await;
+        let applied = group_zero_applied(&client, &peers[index].1).await;
+        drop(children.remove(index));
+        children.insert(
+            index,
+            spawn_node_with_cluster_config_and_cold_s3(binary, &configs[index]),
+        );
+        wait_until_ready(&client, &peers[index].1, &mut children).await;
+        wait_serves_group_zero(&client, &peers[index].1, applied, &mut children).await;
+        let restored = check_named_snapshot_objects_exist(&cold_store, &prefix, &nodes).await;
+        assert_eq!(restored, names, "node {node_id}'s restart changed a record");
+    }
+    let quiet = wait_quiet_snapshot_prefixes(&cold_store, &prefix, &nodes).await;
+    assert_eq!(quiet, names);
+
+    // 7. Every node reads the whole stream.
+    for (_, url) in &peers {
+        read_until_matches(
+            &client,
+            &format!("{url}/owned/snapshots?offset=0&max_bytes=1024"),
+            expected.as_bytes(),
+        )
+        .await;
+    }
+
+    drop(children);
+    cold_store
+        .remove_all("")
+        .await
+        .expect("clear the S3 test root");
+    std::fs::remove_dir_all(&root).expect("remove temp root");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after_restart() {
     let _guard = static_cluster_cli_test_guard().await;
