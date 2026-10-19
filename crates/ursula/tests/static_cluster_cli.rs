@@ -2745,6 +2745,12 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
+/// An S3 failure as its kind, operation and path only. The store's own
+/// message can name the assumed role or the bucket, and CI logs are public.
+fn s3_failure(operation: &str, path: &str, err: &std::io::Error) -> String {
+    format!("{operation} {path:?} failed: {:?}", err.kind())
+}
+
 /// Every file named `name` under `dir`, at any depth.
 fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
     fn walk(dir: &Path, name: &str, found: &mut Vec<PathBuf>) {
@@ -2827,7 +2833,7 @@ async fn snapshot_ownership(
             for name in cold_store
                 .list_file_names(&dir)
                 .await
-                .unwrap_or_else(|err| panic!("list {dir}: {err}"))
+                .unwrap_or_else(|err| panic!("{}", s3_failure("list", &dir, &err)))
             {
                 objects.insert(
                     format!("{dir}{name}"),
@@ -3069,7 +3075,7 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
     );
     let prefix = config.storage.snapshot.snapshot_prefix();
     let cold_store = ColdStore::try_new(&config.storage.cold)
-        .unwrap_or_else(|err| panic!("cold store creation failed: {err}"));
+        .unwrap_or_else(|err| panic!("{}", s3_failure("open the cold store", "", &err)));
     let mut children = configs
         .iter()
         .map(|config| spawn_node_with_cluster_config_and_cold_s3(binary, config))
@@ -3197,7 +3203,7 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
     cold_store
         .remove_all("")
         .await
-        .expect("clear the S3 test root");
+        .unwrap_or_else(|err| panic!("{}", s3_failure("clear the test root", "", &err)));
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
