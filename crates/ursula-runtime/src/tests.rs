@@ -2482,7 +2482,7 @@ async fn stale_cold_compaction_deletes_its_replacement_and_goes_on() {
     );
 
     let stale_dir = crate::cold_store::cold_chunk_dir(&stale, stale_generation);
-    let events = events.lock().expect("event mutex");
+    let events = events.lock().expect("event mutex").clone();
     let written = events
         .iter()
         .find_map(|event| match event {
@@ -2499,7 +2499,6 @@ async fn stale_cold_compaction_deletes_its_replacement_and_goes_on() {
         )),
         "the stale replacement was not deleted: {events:?}"
     );
-    drop(events);
     let read = runtime
         .read_stream(read_req(live, 0, 8))
         .await
