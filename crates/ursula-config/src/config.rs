@@ -972,3 +972,31 @@ pub struct ObservabilityConfig {
     /// Enable tokio-console integration.
     pub tokio_console: bool,
 }
+
+#[cfg(test)]
+mod s3_budget_tests {
+    use std::time::Duration;
+
+    use super::s3_operation_budget;
+
+    #[test]
+    fn s3_operation_budget_covers_every_attempt_and_jittered_backoff() {
+        let secs = Duration::from_secs;
+        assert_eq!(s3_operation_budget(secs(10), 0), secs(10));
+        // The cold defaults: four attempts of 10 s, backoffs of at most 2, 4
+        // and 8 s.
+        assert_eq!(s3_operation_budget(secs(10), 3), secs(54));
+        // The snapshot defaults: two attempts of 10 s and one backoff of at
+        // most 2 s.
+        assert_eq!(s3_operation_budget(secs(10), 1), secs(22));
+        // Nine attempts of 1 s, backoffs that double from 1 s to the 60 s
+        // cap (2+4+8+16+32+64 s), then 120 s for each of the two retries
+        // past the cap: 9 + 126 + 240 s.
+        assert_eq!(s3_operation_budget(secs(1), 8), secs(375));
+        assert_eq!(
+            s3_operation_budget(Duration::MAX, 3),
+            Duration::MAX,
+            "saturates instead of overflowing"
+        );
+    }
+}

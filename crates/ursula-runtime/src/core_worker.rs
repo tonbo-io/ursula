@@ -981,6 +981,9 @@ impl CoreWorker {
         }
     }
 
+    /// Installs `engine` for a group the core does not run, for a
+    /// simulation or a test that builds its engine itself.
+    #[cfg(any(test, madsim))]
     pub(crate) async fn install_group_engine(
         &mut self,
         placement: ShardPlacement,
