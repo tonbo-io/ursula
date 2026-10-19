@@ -1,7 +1,7 @@
 //! `ursula-sim assert-shape`: compile-time-safe shape assertions for
 //! CI-generated minimize artifacts.
 //!
-//! Replaces fragile jq strict-equality blocks in `.github/workflows/ci.yml`:
+//! Replaces fragile jq strict-equality blocks in `.github/workflows/dst-nightly.yml`:
 //! the CI YAML stops doing `[steps[].action.action] == ["stop_current_leader",
 //! "restart_stopped_leader", ...]` and instead calls
 //!

@@ -10,18 +10,18 @@ Subcommand list (verb-first, flat namespace):
     layer2              no fail_point! macros in crates/
     ci-shape            no multi-element strict-equality jq step matches
     modularity          ratcheting line budget on madsim_harness/mod.rs
-    seed-inventory      family discipline and per-track seed budget
-    failure-guards      every failure-smoke entry has fresh PR CI coverage
+    seed-inventory      family discipline and seed budget
+    failure-guards      every failure-smoke entry has fresh nightly coverage
     sim-patches         vendored madsim patches match the crate graph
     all                 run every audit
 
   Reports (write target/ artifacts; CI uploads them):
     coverage-report     distinct stable trace event cardinality
-    seed-report         PR/nightly seed inventory snapshot
+    seed-report         nightly seed inventory snapshot
     result-summary      walk failure artifacts under target/
 
   Tools:
-    throughput          measure seeds/min/core; suggest PR/nightly budgets
+    throughput          measure seeds/min/core; suggest the nightly budget
 """
 
 from __future__ import annotations

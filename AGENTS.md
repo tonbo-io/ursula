@@ -298,7 +298,7 @@ RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- minimize \
   --output minimized.json
 ```
 
-**DST Nightly CI** runs a comprehensive seed sweep (seeds 60-199+) with both passing and expected-failure scenarios.
+**DST Nightly CI** runs a comprehensive seed sweep (seeds 60-199+) with both passing and expected-failure scenarios. It is the only workflow that runs DST: pull request CI does not, so check the latest nightly run before cutting a release.
 
 ### 6. Property-Based Tests
 

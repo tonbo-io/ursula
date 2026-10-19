@@ -18,7 +18,6 @@ SCHEDULE_CORPUS = CORPUS_DIR / "schedule-smoke.json"
 FAILURE_CORPUS = CORPUS_DIR / "failure-smoke.json"
 COVERAGE_BASELINE = CORPUS_DIR / "coverage-baseline.json"
 
-PR_WORKFLOW = ROOT / ".github/workflows/ci.yml"
 NIGHTLY_WORKFLOW = ROOT / ".github/workflows/dst-nightly.yml"
 SMOKE_RS = ROOT / "crates/ursula-sim/src/bin/ursula-sim/smoke.rs"
 HARNESS_ROOT = ROOT / "crates/ursula-sim/src/madsim_harness"
