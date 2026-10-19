@@ -721,7 +721,8 @@ async fn g1_snapshot_body_and_delete_producers_queue_only_accepted_paths() {
 /// stream's own bucket and once under another bucket. Group 1's state does
 /// not hold the stream, so its live generation does not protect it there.
 /// The worker refuses both entries, deletes none of the stream's chunks or
-/// pages, counts each refusal and acknowledges the entries.
+/// pages, counts each refusal, and acknowledges the entries without
+/// counting them as reclaimed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn g1_cold_gc_refuses_a_stream_entry_for_another_group_or_bucket() {
     let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
@@ -779,7 +780,7 @@ async fn g1_cold_gc_refuses_a_stream_entry_for_another_group_or_bucket() {
             .run_cold_gc_group_once(group, 16)
             .await
             .expect("cold gc pass"),
-        2
+        0
     );
     for chunk in &chunks {
         assert!(
@@ -796,6 +797,7 @@ async fn g1_cold_gc_refuses_a_stream_entry_for_another_group_or_bucket() {
     let metrics = runtime.metrics().snapshot();
     assert_eq!(metrics.cold_gc_foreign_paths_refused, 2);
     assert_eq!(metrics.cold_gc_errors, 0);
+    assert_eq!(metrics.cold_gc_reclaimed, 0);
     assert!(
         pending_gc(&runtime, group).await.is_empty(),
         "the entries are acknowledged"

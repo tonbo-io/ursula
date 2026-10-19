@@ -140,6 +140,14 @@ pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
 /// Longest backoff between retries of a failing cold GC entry (one hour).
 pub const COLD_GC_DEFER_MAX_BACKOFF_MS: u64 = 60 * 60 * 1_000;
 
+/// What the cold GC worker did with an entry it acknowledges.
+enum ColdGcEntryOutcome {
+    /// Its objects are deleted, apart from any path G1 refused.
+    Reclaimed,
+    /// G1 refused the whole entry, so nothing of it is deleted.
+    Refused,
+}
+
 /// Backoff for an entry that has already been deferred `attempts` times:
 /// 1 min, 2 min, 4 min, ... capped at one hour.
 pub fn cold_gc_defer_backoff_ms(attempts: u32) -> u64 {
@@ -1335,8 +1343,8 @@ impl ShardRuntime {
                 // so it cannot stall the queue (F14b).
                 ColdGcTarget::Stream(stream_id) => {
                     match check_cold_gc_stream(raft_group_id, entry, stream_id, locate) {
-                        Ok(()) => {
-                            self.reclaim_stream_incarnation(
+                        Ok(()) => self
+                            .reclaim_stream_incarnation(
                                 cold_store,
                                 raft_group_id,
                                 max_entries,
@@ -1344,15 +1352,15 @@ impl ShardRuntime {
                                 stream_id,
                             )
                             .await
-                        }
+                            .map(|()| ColdGcEntryOutcome::Reclaimed),
                         Err(refusal) => {
                             self.record_cold_gc_refusal(&refusal);
-                            Ok(())
+                            Ok(ColdGcEntryOutcome::Refused)
                         }
                     }
                 }
                 ColdGcTarget::Paths(paths) => {
-                    let mut outcome = Ok(());
+                    let mut outcome = Ok(ColdGcEntryOutcome::Reclaimed);
                     for path in paths {
                         // G1: only an exclusive chunk, a pack or an external
                         // payload of the entry's bucket that this group owns.
@@ -1373,10 +1381,13 @@ impl ShardRuntime {
                 }
             };
             match result {
-                Ok(()) => {
+                Ok(ColdGcEntryOutcome::Reclaimed) => {
                     acked_seq = Some(entry.seq);
                     reclaimed = reclaimed.saturating_add(1);
                 }
+                // Acknowledged so the queue moves on, but nothing was
+                // reclaimed.
+                Ok(ColdGcEntryOutcome::Refused) => acked_seq = Some(entry.seq),
                 Err(err) => {
                     self.metrics.record_cold_gc_error();
                     let error = RuntimeError::ColdStoreIo {
@@ -1436,6 +1447,8 @@ impl ShardRuntime {
     fn record_cold_gc_refusal(&self, refusal: &ColdGcRefusal) {
         self.metrics.record_cold_gc_refusal();
         tracing::error!(
+            raft_group_id = refusal.raft_group_id().0,
+            seq = refusal.seq(),
             error = %refusal,
             "cold GC refused to delete objects outside the entry's bucket, stream or group"
         );

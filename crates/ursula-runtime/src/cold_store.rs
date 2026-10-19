@@ -2028,11 +2028,11 @@ impl ColdGcPathKind {
     /// What `path` is, when it is an exclusive chunk, a pack or an external
     /// payload of bucket `bucket_id`. `None` for any other path, a path of
     /// another bucket included. The directory must be the one the key
-    /// function builds and the file name must have the form it writes.
+    /// function builds and the file name must have the form it writes. The
+    /// bucket and stream names must pass the create-time validators, so a
+    /// reserved bucket such as `snapshots` names nothing cold GC deletes.
     pub(crate) fn parse(bucket_id: &str, path: &str) -> Option<Self> {
-        if !is_cold_gc_name_segment(bucket_id) {
-            return None;
-        }
+        ursula_stream::validate_bucket_id(bucket_id).ok()?;
         let rest = path.strip_prefix(&cold_bucket_prefix(bucket_id))?;
         let segments = rest.split('/').collect::<Vec<_>>();
         let (name, dirs) = segments.split_last()?;
@@ -2071,7 +2071,9 @@ impl ColdGcPathKind {
     }
 
     fn stream_id(bucket_id: &str, stream: &str) -> Option<BucketStreamId> {
-        is_cold_gc_name_segment(stream).then(|| BucketStreamId::new(bucket_id, stream))
+        let stream_id = BucketStreamId::new(bucket_id, stream);
+        ursula_stream::validate_stream_id(&stream_id).ok()?;
+        Some(stream_id)
     }
 
     fn dir(&self, bucket_id: &str) -> String {
@@ -2105,14 +2107,6 @@ impl ColdGcPathKind {
     }
 }
 
-/// The least a bucket or stream name must be for cold GC to build a key
-/// from it: one non-empty path segment that does not step out of its
-/// directory. Cold GC does not apply the create-time naming rules, so the
-/// objects of streams created under older rules are still collected.
-fn is_cold_gc_name_segment(name: &str) -> bool {
-    !name.is_empty() && !name.contains('/') && name != "." && name != ".."
-}
-
 /// Why the cold GC worker did not delete what an entry names (G1).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum ColdGcRefusal {
@@ -2129,9 +2123,9 @@ pub(crate) enum ColdGcRefusal {
         bucket_id: String,
         path: String,
     },
-    /// A `Stream` entry names a stream that is not of the entry's bucket or
-    /// is placed in another group, so its cold objects are not this
-    /// group's to reclaim.
+    /// A `Stream` entry names a stream that is not of the entry's bucket, is
+    /// placed in another group, or has a bucket or stream name that create
+    /// refuses, so its cold objects are not this group's to reclaim.
     #[error(
         "cold GC entry {seq} of raft group {} names stream '{stream_id}', which is not a stream \
          of bucket '{bucket_id}' placed in the group, so none of its objects is deleted",
@@ -2143,6 +2137,22 @@ pub(crate) enum ColdGcRefusal {
         bucket_id: String,
         stream_id: BucketStreamId,
     },
+}
+
+impl ColdGcRefusal {
+    pub(crate) fn raft_group_id(&self) -> RaftGroupId {
+        match self {
+            Self::ForeignPath { raft_group_id, .. } | Self::ForeignStream { raft_group_id, .. } => {
+                *raft_group_id
+            }
+        }
+    }
+
+    pub(crate) fn seq(&self) -> u64 {
+        match self {
+            Self::ForeignPath { seq, .. } | Self::ForeignStream { seq, .. } => *seq,
+        }
+    }
 }
 
 /// The one check at the cold GC `Paths` delete site (G1): `path` of `entry`
@@ -2167,7 +2177,9 @@ pub(crate) fn check_cold_gc_path(
 
 /// The one check before the cold GC worker reclaims a `Stream` entry's
 /// incarnation (G1): group `raft_group_id` reclaims `stream_id` only if it
-/// is a stream of the entry's own bucket that `locate` places in the group.
+/// is a stream of the entry's own bucket that `locate` places in the group,
+/// and its bucket and stream names pass the create-time validators, so the
+/// guard accepts exactly the names create accepts.
 /// The entry's generation is checked against the group's own state only,
 /// so without this check an entry naming another group's stream at its
 /// live generation would delete that stream's objects.
@@ -2178,8 +2190,8 @@ pub(crate) fn check_cold_gc_stream(
     locate: impl Fn(&BucketStreamId) -> RaftGroupId,
 ) -> Result<(), ColdGcRefusal> {
     let owned = stream_id.bucket_id == entry.bucket_id
-        && is_cold_gc_name_segment(&stream_id.bucket_id)
-        && is_cold_gc_name_segment(&stream_id.stream_id)
+        && ursula_stream::validate_bucket_id(&stream_id.bucket_id).is_ok()
+        && ursula_stream::validate_stream_id(stream_id).is_ok()
         && locate(stream_id) == raft_group_id;
     if owned {
         return Ok(());
@@ -2373,6 +2385,7 @@ mod tests {
             format!("{GC_BUCKET}/../tenant-b/s/external/{external_name}"),
             format!("{GC_BUCKET}//external/{external_name}"),
             format!("{GC_BUCKET}/./external/{external_name}"),
+            format!("{GC_BUCKET}/$s/external/{external_name}"),
             format!("{GC_BUCKET}/s/external/"),
             format!("/{external}"),
             format!("{GC_BUCKET}/s/chunks/0000000000000007/"),
@@ -2391,9 +2404,10 @@ mod tests {
                 "{path}"
             );
         }
-        // An entry whose bucket is not one path segment deletes nothing,
-        // even a path of the matching shape.
-        for bucket in ["", ".", "..", "tenant-a/s"] {
+        // An entry of a reserved or invalid bucket deletes nothing, even a
+        // path of the matching shape: the guard accepts exactly the names
+        // create accepts.
+        for bucket in ["snapshots", "__ursula", "A", "", ".", "..", "tenant-a/s"] {
             let path = new_external_payload_path(&BucketStreamId::new(bucket, "s"));
             assert!(
                 matches!(
@@ -2405,23 +2419,10 @@ mod tests {
         }
     }
 
-    /// G1: the guard asks only that a bucket and a stream name be one safe
-    /// path segment, not that they pass today's create-time rules, so the
-    /// objects of streams named under older rules are still collected.
-    #[test]
-    fn cold_gc_guard_accepts_names_outside_the_create_time_rules() {
-        for (bucket, stream) in [("abc", "s"), ("Tenant.A", "s"), (GC_BUCKET, "$s")] {
-            let stream_id = BucketStreamId::new(bucket, stream);
-            assert_eq!(
-                gc_check(bucket, &new_external_payload_path(&stream_id)),
-                Ok(ColdGcPathKind::External { stream_id })
-            );
-        }
-    }
-
     /// G1: a `Stream` entry reclaims only a stream of its own bucket placed
-    /// in the executing group. One that names another bucket's stream, or a
-    /// stream placed in another group, is refused with the entry's identity.
+    /// in the executing group, whose names create accepts. One that names
+    /// another bucket's stream, a stream placed in another group or a name
+    /// create refuses is refused with the entry's identity.
     #[test]
     fn cold_gc_stream_guard_refuses_another_bucket_or_group() {
         let entry = gc_entry(GC_BUCKET);
@@ -2435,6 +2436,7 @@ mod tests {
             BucketStreamId::new(GC_BUCKET, "elsewhere"),
             BucketStreamId::new(GC_BUCKET, ".."),
             BucketStreamId::new(GC_BUCKET, ""),
+            BucketStreamId::new(GC_BUCKET, "$s"),
         ] {
             assert_eq!(
                 check_cold_gc_stream(GC_GROUP, &entry, &stream_id, gc_locate),
@@ -2444,6 +2446,18 @@ mod tests {
                     bucket_id: GC_BUCKET.to_owned(),
                     stream_id: stream_id.clone(),
                 }),
+                "{stream_id}"
+            );
+        }
+        // A stream of a reserved or invalid bucket is refused even when it
+        // is the entry's own bucket.
+        for bucket in ["snapshots", "__ursula", "A"] {
+            let stream_id = BucketStreamId::new(bucket, "s");
+            assert!(
+                matches!(
+                    check_cold_gc_stream(GC_GROUP, &gc_entry(bucket), &stream_id, gc_locate),
+                    Err(ColdGcRefusal::ForeignStream { .. })
+                ),
                 "{stream_id}"
             );
         }
