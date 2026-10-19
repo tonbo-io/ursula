@@ -13,9 +13,6 @@ use serde::Serialize;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
-use ursula_runtime::KeyHold;
-use ursula_runtime::Release;
-use ursula_runtime::SnapshotLocation;
 use ursula_shard::RaftGroupId;
 
 /// Under `fsync = always`, how long the per-core journal writer waits for the
@@ -47,16 +44,17 @@ pub type UrsulaSnapshot = SnapshotOf<UrsulaRaftTypeConfig, SnapshotData>;
 
 /// What a group snapshot carries through OpenRaft: the encoded
 /// [`ursula_runtime::SnapshotPointer`], and a hold on the object it names
-/// for as long as OpenRaft keeps the snapshot, as during a send. No snapshot
-/// takes a hold yet, so the lease is `None` everywhere.
+/// for as long as OpenRaft keeps the snapshot. The snapshot a replica hands
+/// OpenRaft to send leases its object ([`SnapshotLease`]), and the network
+/// keeps the lease until the RPC returns, so the object exists while the
+/// receiver reads it. A received snapshot holds nothing on the receiver.
 #[derive(Debug, Clone)]
 pub struct SnapshotData {
     pointer_bytes: Vec<u8>,
     lease: Option<SnapshotLease>,
 }
 
-/// The hold a [`SnapshotData`] keeps on the object its pointer names.
-pub type SnapshotLease = KeyHold<SnapshotLocation, Release>;
+pub use crate::snapshot_holds::SnapshotLease;
 
 impl SnapshotData {
     /// The snapshot data of `pointer_bytes`, holding nothing.
@@ -64,6 +62,15 @@ impl SnapshotData {
         Self {
             pointer_bytes,
             lease: None,
+        }
+    }
+
+    /// The snapshot data of `pointer_bytes` that holds the object it names
+    /// with `lease`, if it names one.
+    pub(crate) fn with_lease(pointer_bytes: Vec<u8>, lease: Option<SnapshotLease>) -> Self {
+        Self {
+            pointer_bytes,
+            lease,
         }
     }
 

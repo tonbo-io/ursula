@@ -82,8 +82,29 @@ groups](/docs/apply-failure-recovery) and never skip the committed record.
 
 ### `503` with `GROUP_RESTARTING` from one group
 
-The group's engine on this node is stopping or restarting, and the previous
-engine's Raft work has not ended yet. The node opens the group only once that
+The group's engine on this node did not open. There are two causes.
+
+**The snapshot store did not answer the group's restore.** With an S3
+snapshot store, opening a group reads the snapshot object its record names.
+When the store does not answer that read, the open fails after the whole
+restore attempt, and the node logs `the persisted snapshot object does not
+restore` at error level with the group and the object's key, and `the
+snapshot store did not answer the group's restore` at warn level with how
+many opens failed in a row. The node then answers the group's requests with
+this code at once, and opens the group again by itself after a wait that
+doubles per failed open, from 1 second up to 30 seconds.
+`open_backoff_groups` in `/__ursula/metrics` counts the groups that wait.
+An open runs on the core that owns the group, and an open that the store
+does not answer holds that core until the S3 client gives up, up to about
+54 seconds with the default `storage.cold.s3.timeout` and `max_retries`. The
+core's other groups wait meanwhile. Fix the node's reachability of the
+snapshot store: its endpoint, credentials and network path. The group opens
+at the first open after the store answers. A node whose store does not
+answer at startup starts anyway and keeps those groups closed until then.
+
+**The previous engine is still stopping.** The group's engine on this node
+is stopping or restarting, and the previous engine's Raft work has not ended
+yet. The node opens the group only once that
 work ends, because it could still change the group's state. A request that
 arrives meanwhile is refused at once, so the code shows up briefly during any
 restart of the group. Retry the request. If the answer persists for more than

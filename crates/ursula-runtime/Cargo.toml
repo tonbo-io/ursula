@@ -41,9 +41,6 @@ core_affinity = { workspace = true }
 [dev-dependencies]
 dhat = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
-# A local operator whose objects carry a modification time, for the
-# snapshot GC grace tests (#669).
-opendal = { workspace = true, features = ["services-fs"] }
 tempfile = { workspace = true }
 # The paused clock of the snapshot store harness tests.
 tokio = { workspace = true, features = ["test-util"] }

@@ -1,8 +1,9 @@
-//! The faulty in-memory snapshot store under madsim (#687, P4's store).
+//! The faulty in-memory snapshot store under madsim (#687).
 //!
-//! These cases exercise the store, the gates and the checkers. They barely
-//! exercise ownership itself, which needs P3's protocol and P4's
-//! scenarios:
+//! These cases exercise the store, the gates and the checkers, with a toy
+//! owner's pass of this file. The server's ownership protocol, its builds,
+//! sends, install copies, restores and GC passes, is tested on the same
+//! store and gates in `ursula-raft` (`snapshot_ownership_tests`):
 //!
 //! - `run_nodes`: three nodes share one bucket with PUT faults at rates the
 //!   seed picks and stale LISTs on. Each node builds and then runs an
@@ -17,10 +18,8 @@
 //!   so the seed picks the order. With the lease after the PUT, I1 breaks
 //!   on some seeds, one of them pinned.
 //!
-//! The negative controls switch the toy pass of this file, not a
-//! `sim_controls::Defence` of production code. P4 still owes the controls
-//! `LeaseAfterPut`, `HoldsBeforeList`, `NoInstallCopy`, `NoSendHold`,
-//! `SnapshotGcOff` and `PassBeforeRestore` on P3's protocol.
+//! The negative controls switch the toy pass of this file, not production
+//! code.
 //!
 //! Every seed runs twice and must log the same requests and gate events.
 
@@ -91,7 +90,7 @@ async fn build(store: &MemorySnapshotStore, index: u64) -> Option<String> {
     let body = chunks(format!("node-{}-index-{index}", store.node_id()));
     let staged = store.stage(GROUP, index, body).await.expect("stage");
     let path = staged_path(&staged);
-    let location = store.write_staged(staged).await.ok()?;
+    let location = store.write_staged(staged).await.ok()?.into_location();
     assert!(matches!(&location, SnapshotLocation::S3 { key, .. } if *key == path));
     store.verify_uploaded(&location).await.ok()?;
     Some(path)

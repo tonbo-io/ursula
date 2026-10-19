@@ -17,7 +17,7 @@
 //!
 //! Every version number that an earlier binary checks is set equal to
 //! [`FORMAT_EPOCH`]: the Raft WAL journal header and state files, the Raft
-//! gRPC protocol, group snapshots and the S3 snapshot references. The data
+//! gRPC protocol and group snapshots. The data
 //! directory and the object-storage namespace carry a marker with the epoch,
 //! and every group snapshot starts with a format-epoch frame. Cold-index
 //! pages carry a page version of their own.

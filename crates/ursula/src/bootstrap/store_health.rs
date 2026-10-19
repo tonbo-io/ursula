@@ -376,7 +376,6 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use axum::body::Bytes;
     use proptest::prelude::ProptestConfig;
     use proptest::prelude::prop;
     use proptest::prop_assert_eq;
@@ -395,7 +394,6 @@ mod tests {
     use ursula_runtime::RuntimeError;
     use ursula_runtime::RuntimeThreading;
     use ursula_runtime::ShardRuntime;
-    use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreFuture;
@@ -1040,24 +1038,10 @@ mod tests {
     }
 
     impl SnapshotStore for ScriptedProbeStore {
-        fn upload<'a>(
-            &'a self,
-            _key: SnapshotKey,
-            _bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async {
-                Err(ursula_runtime::SnapshotStoreError::backend(
-                    ursula_runtime::SnapshotStoreOperation::Put,
-                    "test",
-                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
-                ))
-            })
-        }
-
-        fn download<'a>(
+        fn read_stored<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StoredSnapshot> {
             Box::pin(async {
                 Err(ursula_runtime::SnapshotStoreError::backend(
                     ursula_runtime::SnapshotStoreOperation::Get,
@@ -1065,10 +1049,6 @@ mod tests {
                     opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
                 ))
             })
-        }
-
-        fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
         }
 
         fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {

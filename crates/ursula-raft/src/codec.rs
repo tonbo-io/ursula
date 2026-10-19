@@ -234,6 +234,35 @@ mod tests {
                 imported: Some([0xcd; 32]),
             })
         ));
+        // The snapshot pointer of an S3 snapshot, as `group-N.snapshot.json`
+        // and a FullSnapshot carry it (#687): it names an object of one
+        // node's own directory and no shared object, under the snapshot's
+        // own id.
+        let pointer: ursula_runtime::SnapshotPointer = check(&fixtures, "snapshot_pointer");
+        assert_eq!(
+            pointer.snapshot_id,
+            crate::state_machine::group_snapshot_id(ursula_shard::RaftGroupId(0), Some(log))
+        );
+        assert_eq!(pointer.location, ursula_runtime::SnapshotLocation::S3 {
+            key: "snapshots/node-2/group-0/00000000000000000019-0123456789abcdef.snap".to_owned(),
+            size_bytes: 4096,
+            stored_size_bytes: 1234,
+            compression: ursula_runtime::SnapshotCompression::Zstd,
+        });
+        let key = crate::state_machine::object_key(&pointer.location).expect("an object");
+        let owner = ursula_runtime::OwnedKey::parse(
+            &ursula_runtime::SnapshotPrefix::try_from("snapshots").expect("a prefix"),
+            &key,
+        )
+        .expect("an owned key");
+        assert_eq!(
+            (
+                owner.owner().node_id(),
+                owner.owner().raft_group_id(),
+                owner.index()
+            ),
+            (2, ursula_shard::RaftGroupId(0), 19)
+        );
     }
 
     /// Within a minor, the wire form of `GroupEngineError` and of every type

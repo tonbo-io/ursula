@@ -309,7 +309,6 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
     log_stores: RaftWal,
-    snapshot_store: Option<SharedSnapshotStore>,
     engine_config: RaftEngineConfig,
     /// Faulty code that every replica of one group runs, for tests.
     #[cfg(any(test, madsim, feature = "fault-injection"))]
@@ -343,7 +342,6 @@ impl StaticGrpcRaftGroupEngineFactory {
             registry,
             cold_store: None,
             log_stores,
-            snapshot_store: None,
             engine_config: RaftEngineConfig::default(),
             #[cfg(any(test, madsim, feature = "fault-injection"))]
             apply_fault: None,
@@ -370,9 +368,10 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
-    pub fn with_snapshot_store(mut self, snapshot_store: Option<SharedSnapshotStore>) -> Self {
-        self.registry.set_snapshot_store(snapshot_store.clone());
-        self.snapshot_store = snapshot_store;
+    /// The store every engine of the node writes its snapshot objects to:
+    /// the registry's ([`RaftGroupHandleRegistry::set_snapshot_store`]).
+    pub fn with_snapshot_store(self, snapshot_store: Option<SharedSnapshotStore>) -> Self {
+        self.registry.set_snapshot_store(snapshot_store);
         self
     }
 
@@ -563,7 +562,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     apply_stop_signal: Some(apply_stop_signal),
                     metrics: Some(metrics),
                     cold_store: self.cold_store.clone(),
-                    snapshot_store: self.snapshot_store.clone(),
+                    snapshot_store: Some(self.registry.snapshot_store()),
                     snapshot_build: Some(self.registry.snapshot_build_coordinator()),
                     snapshot_install: Some(self.registry.snapshot_install_coordinator()),
                     #[cfg(any(test, madsim, feature = "fault-injection"))]

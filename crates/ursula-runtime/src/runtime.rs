@@ -311,6 +311,7 @@ impl ShardRuntime {
             let (tx, rx) = mpsc::channel(config.mailbox_capacity.max(1));
             let worker = CoreWorker {
                 core_id,
+                reopens: BTreeSet::new(),
                 rx,
                 engine_factory: engine_factory.clone(),
                 groups: HashMap::new(),

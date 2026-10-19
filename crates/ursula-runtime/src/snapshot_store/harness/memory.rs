@@ -30,14 +30,12 @@
 //! that wants to see the damage builds its bucket with
 //! [`MemorySnapshotBucket::recording_foreign_deletes`] instead.
 //!
-//! The store keeps no reference records and its `prune_retired` deletes
-//! nothing, so on the protocol before P3 its objects only accumulate. GC is
-//! the owner's pass over [`SnapshotStore::list_own`] and
-//! [`SnapshotStore::delete_own`] that P3 brings.
+//! The store keeps no reference records. GC is the owner's pass over
+//! [`SnapshotStore::list_own`] and [`SnapshotStore::delete_own`].
 //!
 //! Quiescence. [`MemorySnapshotBucket::settle`] lands every late PUT at
-//! once, pulling future landings forward. That hides the second GC pass P3
-//! owes one install timeout after a failed write, so a simulation reaches
+//! once, pulling future landings forward. That hides the second GC pass a
+//! node owes one install timeout after a failed write, so a simulation reaches
 //! quiescence with [`MemorySnapshotBucket::wait_for_late_puts`] instead,
 //! which advances simulated time until the last late PUT landed. For that
 //! to model the protocol, `late_put_delay.max` must stay at or below the
@@ -66,12 +64,12 @@ use crate::rt::time::Instant;
 use crate::snapshot_store::OwnListing;
 use crate::snapshot_store::OwnedDirectory;
 use crate::snapshot_store::OwnedKey;
+use crate::snapshot_store::OwnedLocation;
 use crate::snapshot_store::OwnedNamespace;
 use crate::snapshot_store::OwnedObject;
 use crate::snapshot_store::SnapshotBackend;
 use crate::snapshot_store::SnapshotBytesIterator;
 use crate::snapshot_store::SnapshotCompression;
-use crate::snapshot_store::SnapshotKey;
 use crate::snapshot_store::SnapshotLocation;
 use crate::snapshot_store::SnapshotOwner;
 use crate::snapshot_store::SnapshotPrefix;
@@ -80,6 +78,7 @@ use crate::snapshot_store::SnapshotStoreError;
 use crate::snapshot_store::SnapshotStoreFuture;
 use crate::snapshot_store::StagedObject;
 use crate::snapshot_store::StagedSnapshot;
+use crate::snapshot_store::StoredSnapshot;
 
 /// The zstd level of staged objects, as the S3 store compresses them.
 const ZSTD_LEVEL: i32 = 3;
@@ -161,8 +160,8 @@ enum ForeignDeletes {
     /// Records the attempt and panics in the deleting task.
     Panic,
     /// Records the attempt. [`SnapshotStore::delete_own`] refuses it as the
-    /// S3 store does, and [`SnapshotStore::delete`], which S3 does not
-    /// scope, deletes the key. The bucket panics when it is dropped with
+    /// S3 store does, and [`MemorySnapshotStore::delete_unscoped`], which S3
+    /// does not scope, deletes the key. The bucket panics when it is dropped with
     /// recorded attempts no one read.
     Record,
 }
@@ -999,32 +998,14 @@ fn compress(chunks: SnapshotBytesIterator) -> Result<(Vec<u8>, u64), SnapshotSto
     Ok((stored, size_bytes))
 }
 
-/// The log index a snapshot id ends with (`group-{gid}-{leader}-{index}`).
-/// An id without one, as `group-{gid}-empty`, is refused: an owned key
-/// needs the index, and no index is made up for it. Only the legacy
-/// `upload` path names a snapshot by id. OpenRaft alpha.37 leaves the id
-/// empty, so after the bump that path is always refused, and P3, which
-/// stages builds and copies by their log index, removes it.
-fn snapshot_index(snapshot_id: &str) -> Result<u64, SnapshotStoreError> {
-    snapshot_id
-        .rsplit_once('-')
-        .and_then(|(_, index)| index.parse().ok())
-        .ok_or(SnapshotStoreError::MissingField {
-            field: "the log index of the snapshot id",
-        })
-}
-
 /// Node `node_id`'s store on a [`MemorySnapshotBucket`]. It implements the
 /// whole [`SnapshotStore`] trait, so a simulation injects it with the
 /// registry's `set_snapshot_store`.
 ///
 /// - The owned-key methods work as the S3 store's do.
-/// - `upload` and `upload_iter` stage and write under a fresh owned key at
-///   the snapshot id's log index.
 /// - `download` is a GET, and `verify_uploaded` a HEAD.
-/// - `delete` is a DELETE that S3 does not scope, so I2 is asserted here.
-/// - The reference methods and `prune_retired` are the trait's no-op
-///   defaults. GC is the owner's pass over `list_own` and `delete_own`.
+/// - [`MemorySnapshotStore::delete_unscoped`] is a DELETE of any key, as S3
+///   would serve one, for a negative control of I2.
 #[derive(Debug)]
 pub struct MemorySnapshotStore {
     bucket: MemorySnapshotBucket,
@@ -1101,7 +1082,19 @@ impl MemorySnapshotStore {
         chunks: SnapshotBytesIterator,
     ) -> Result<StagedSnapshot, SnapshotStoreError> {
         let (stored, size_bytes) = compress(chunks)?;
-        Ok(StagedSnapshot::Object(StagedObject {
+        Ok(self.staged_object(raft_group_id, index, Bytes::from(stored), size_bytes))
+    }
+
+    /// `stored`, zstd bytes of `size_bytes` logical bytes, staged under a
+    /// freshly drawn key of this node.
+    fn staged_object(
+        &self,
+        raft_group_id: RaftGroupId,
+        index: u64,
+        stored: Bytes,
+        size_bytes: u64,
+    ) -> StagedSnapshot {
+        StagedSnapshot::Object(StagedObject {
             key: OwnedKey {
                 owner: self.owner(raft_group_id),
                 index,
@@ -1110,12 +1103,46 @@ impl MemorySnapshotStore {
             prefix: self.prefix().clone(),
             size_bytes,
             stored,
-        }))
+        })
     }
 
-    async fn write(&self, staged: StagedSnapshot) -> Result<SnapshotLocation, SnapshotStoreError> {
+    /// A DELETE of the key `location` names, whoever owns it, as S3 serves
+    /// a DELETE no ownership scopes. It is not the trait's: a node deletes
+    /// only through [`SnapshotStore::delete_own`]. A negative control of I2
+    /// uses it, on a bucket that records foreign deletes.
+    pub async fn delete_unscoped(
+        &self,
+        location: &SnapshotLocation,
+    ) -> Result<(), SnapshotStoreError> {
+        let SnapshotLocation::S3 { key, .. } = location else {
+            return Ok(());
+        };
+        let node_id = self.node_id;
+        if is_owned_by(self.prefix(), node_id, key) {
+            let path = key.clone();
+            return self
+                .bucket
+                .request(move |state, now| state.delete(node_id, path, now))
+                .await;
+        }
+        // A recording bucket lets the delete go ahead, as S3 would.
+        self.foreign_delete(key);
+        let path = key.clone();
+        self.bucket
+            .request(move |state, now| {
+                if state.objects.remove(&path).is_some() {
+                    state.record_change(ChangeKind::Deleted, path, now);
+                }
+            })
+            .await;
+        Ok(())
+    }
+
+    async fn write(&self, staged: StagedSnapshot) -> Result<OwnedLocation, SnapshotStoreError> {
         let object = match staged {
-            StagedSnapshot::Inline { bytes } => return Ok(SnapshotLocation::Inline { bytes }),
+            StagedSnapshot::Inline { bytes } => {
+                return Ok(OwnedLocation(SnapshotLocation::Inline { bytes }));
+            }
             StagedSnapshot::Object(object) => object,
         };
         if &object.prefix != self.prefix() || object.key.owner.node_id != self.node_id {
@@ -1130,7 +1157,7 @@ impl MemorySnapshotStore {
         self.bucket
             .request(move |state, now| {
                 let stored = StoredObject {
-                    stored: object.stored,
+                    stored: object.stored.to_vec(),
                     compression,
                     size_bytes: object.size_bytes,
                     landed_at: now,
@@ -1138,33 +1165,11 @@ impl MemorySnapshotStore {
                 state.put(node_id, path, stored, now)
             })
             .await?;
-        Ok(location)
+        Ok(OwnedLocation(location))
     }
 }
 
 impl SnapshotStore for MemorySnapshotStore {
-    fn upload<'a>(
-        &'a self,
-        key: SnapshotKey,
-        bytes: Bytes,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        self.upload_iter(key, Box::new(std::iter::once(Ok(bytes))))
-    }
-
-    fn upload_iter<'a>(
-        &'a self,
-        key: SnapshotKey,
-        chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        Box::pin(async move {
-            let index = snapshot_index(&key.snapshot_id)?;
-            let staged = self
-                .stage_body(RaftGroupId(key.raft_group_id), index, chunks)
-                .await?;
-            self.write(staged).await
-        })
-    }
-
     fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace {
         OwnedNamespace {
             directory: Some(OwnedDirectory {
@@ -1183,10 +1188,31 @@ impl SnapshotStore for MemorySnapshotStore {
         Box::pin(self.stage_body(raft_group_id, index, chunks))
     }
 
+    /// Stages zstd bytes as they are, as the S3 store does.
+    fn stage_stored<'a>(
+        &'a self,
+        raft_group_id: RaftGroupId,
+        index: u64,
+        stored: StoredSnapshot,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        Box::pin(async move {
+            match stored.into_compressed() {
+                Ok((stored, size_bytes)) => {
+                    Ok(self.staged_object(raft_group_id, index, stored, size_bytes))
+                }
+                Err(uncompressed) => {
+                    let body = Bytes::from(uncompressed.body()?);
+                    self.stage_body(raft_group_id, index, Box::new(std::iter::once(Ok(body))))
+                        .await
+                }
+            }
+        })
+    }
+
     fn write_staged<'a>(
         &'a self,
         staged: StagedSnapshot,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+    ) -> SnapshotStoreFuture<'a, OwnedLocation> {
         Box::pin(self.write(staged))
     }
 
@@ -1215,12 +1241,12 @@ impl SnapshotStore for MemorySnapshotStore {
         })
     }
 
-    fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>> {
+    fn read_stored<'a>(
+        &'a self,
+        location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, StoredSnapshot> {
         Box::pin(async move {
-            let SnapshotLocation::S3 {
-                key, size_bytes, ..
-            } = location
-            else {
+            let SnapshotLocation::S3 { key, .. } = location else {
                 return Err(SnapshotStoreError::UnsupportedLocation {
                     store: SnapshotBackend::S3,
                     location: location.kind(),
@@ -1240,54 +1266,7 @@ impl SnapshotStore for MemorySnapshotStore {
                     object.ok_or_else(|| SnapshotStoreError::NotFound { key: key.clone() })
                 })
                 .await?;
-            let expected = location.stored_size_hint();
-            if object.stored.len() as u64 != expected {
-                return Err(SnapshotStoreError::SizeMismatch {
-                    key: key.clone(),
-                    expected,
-                    actual: object.stored.len() as u64,
-                });
-            }
-            let bytes = decode(key, &StoredObject {
-                compression: location.compression(),
-                size_bytes: *size_bytes,
-                ..object
-            })?;
-            if bytes.len() as u64 != *size_bytes {
-                return Err(SnapshotStoreError::LogicalSizeMismatch {
-                    key: key.clone(),
-                    expected: *size_bytes,
-                    actual: bytes.len() as u64,
-                });
-            }
-            Ok(bytes)
-        })
-    }
-
-    fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move {
-            let SnapshotLocation::S3 { key, .. } = location else {
-                return Ok(());
-            };
-            let node_id = self.node_id;
-            if is_owned_by(self.prefix(), node_id, key) {
-                let path = key.clone();
-                return self
-                    .bucket
-                    .request(move |state, now| state.delete(node_id, path, now))
-                    .await;
-            }
-            // A recording bucket lets the delete go ahead, as S3 would.
-            self.foreign_delete(key);
-            let path = key.clone();
-            self.bucket
-                .request(move |state, now| {
-                    if state.objects.remove(&path).is_some() {
-                        state.record_change(ChangeKind::Deleted, path, now);
-                    }
-                })
-                .await;
-            Ok(())
+            StoredSnapshot::of_object(location, Bytes::from(object.stored))
         })
     }
 

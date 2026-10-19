@@ -217,8 +217,9 @@ error_codes! {
     LiveReadBackpressure = "LIVE_READ_BACKPRESSURE", "the node serves as many live reads as it may; retry";
     /// The group stopped applying after a committed apply failure.
     ApplyStopped = "APPLY_STOPPED", "the stream's group stopped applying";
-    /// The stream's group restarts on this node and does not open while its
-    /// previous engine still runs (`503`).
+    /// The stream's group did not open on this node: its previous engine
+    /// still runs, or its snapshot store did not answer the restore of the
+    /// group's snapshot (`503`). Nothing of the request was proposed.
     GroupRestarting = "GROUP_RESTARTING", "the stream's group is restarting; retry";
     /// The write may or may not have applied: resolve it by its key.
     OutcomeUnknown = "OUTCOME_UNKNOWN", "the write's outcome is unknown; repeat it with its key";

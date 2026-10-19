@@ -9,12 +9,12 @@
 //! reaches OpenRaft through objects the engine handed it: the state machine
 //! with the snapshot builders it creates, the log store with the readers it
 //! hands out, and the network factory with the clients it creates. The
-//! snapshot installs the engine admits outside OpenRaft join them
-//! ([`WorkAdmission`]). Each of them holds a [`WorkToken`], so the engine
+//! snapshot installs and the snapshot GC passes the engine admits outside
+//! OpenRaft join them ([`WorkAdmission`]). Each of them holds a [`WorkToken`], so the engine
 //! knows the work ended once every token is gone, and [`OpenRaftWork::stop`]
 //! waits for that. A shutdown that returns leaves nothing of the engine
-//! running: no state change, no gauge update, no snapshot store or reference
-//! write, no RPC, and no handle on the group's log store, which may open
+//! running: no state change, no gauge update, no snapshot store write or
+//! delete, no RPC, and no handle on the group's log store, which may open
 //! again at once. A shutdown that gave up keeps the group closed: the WAL's
 //! [`EngineWorkLedger`] refuses to open it until that work ended.
 
@@ -70,8 +70,8 @@ type NodeOf = <UrsulaRaftTypeConfig as RaftTypeConfig>::Node;
 
 /// How long a group engine's shutdown waits for the work OpenRaft runs for
 /// it. That work only finishes what it already started: a snapshot build
-/// stops its upload, pin and housekeeping, an install its download and
-/// publication, a network client its RPC, and nothing waits on another
+/// stops its write and its GC pass, an install its download and copy, a GC
+/// pass its listing and deletes, a network client its RPC, and nothing waits on another
 /// group. Work still running after this is stuck.
 ///
 /// It is longer than the server's shutdown grace (20 s): a process that
@@ -106,7 +106,8 @@ pub(crate) enum WorkKind {
     Reader,
     /// The network factory or a client it created.
     Client,
-    /// An admitted snapshot install, or the admission itself.
+    /// An admitted snapshot install or snapshot GC pass, or the admission
+    /// itself.
     Install,
 }
 
@@ -320,6 +321,14 @@ impl WorkAdmission {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
+    }
+
+    /// Whether it still admits work: its engine has not begun to shut down.
+    pub(crate) fn is_open(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some()
     }
 
     /// Admits nothing more.

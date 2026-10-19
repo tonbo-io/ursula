@@ -494,44 +494,6 @@ mod tests {
         );
     }
 
-    /// #669: the snapshot GC grace is a quarter of the bound, at most an
-    /// hour or two installs, and never less than two installs.
-    #[test]
-    fn snapshot_gc_grace_is_a_quarter_of_the_bound_capped_at_an_hour_or_two_installs() {
-        let mut config = UrsulaConfig::default();
-        config.raft.node_id = 1;
-        assert_eq!(
-            config.raft.snapshot_gc_grace(),
-            std::time::Duration::from_secs(15 * 60)
-        );
-        config.raft.deleted_data_max_age = Some(HumanDuration::hour(8));
-        assert_eq!(
-            config.raft.snapshot_gc_grace(),
-            std::time::Duration::from_secs(60 * 60)
-        );
-        config.raft.install_snapshot_timeout = HumanDuration::sec(10);
-        config.raft.deleted_data_max_age = Some(HumanDuration::sec(80));
-        config.validate().expect("the shortest valid bound");
-        assert_eq!(
-            config.raft.snapshot_gc_grace(),
-            config
-                .raft
-                .install_snapshot_timeout
-                .as_duration()
-                .saturating_mul(2)
-        );
-        // A long install timeout lifts the cap to two installs.
-        config.raft.install_snapshot_timeout = HumanDuration::min(45);
-        config.raft.deleted_data_max_age = None;
-        config
-            .validate()
-            .expect("an unset bound follows the timeout");
-        assert_eq!(
-            config.raft.snapshot_gc_grace(),
-            std::time::Duration::from_secs(90 * 60)
-        );
-    }
-
     #[test]
     fn snapshot_pressure_batch_must_be_non_zero() {
         let mut config = UrsulaConfig::default();

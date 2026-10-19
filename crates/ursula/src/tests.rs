@@ -621,8 +621,6 @@ struct StaticGrpcTestNodeStorage {
     apply_fault: Option<(RaftGroupId, ursula_raft::apply_failure::ApplyFault)>,
     /// Where the node's snapshots go (`None`: inline, the default).
     snapshot_store: Option<ursula_runtime::SharedSnapshotStore>,
-    /// Snapshot GC grace G (`None`: the registry's default).
-    snapshot_gc_grace: Option<Duration>,
 }
 
 /// The cluster every static gRPC test node is in: peers refuse a node of
@@ -640,10 +638,7 @@ async fn spawn_static_grpc_test_node(
     raft_group_count: usize,
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
-    let registry = match storage.snapshot_gc_grace {
-        Some(gc_grace) => RaftGroupHandleRegistry::default().with_snapshot_install(1, gc_grace),
-        None => RaftGroupHandleRegistry::default(),
-    };
+    let registry = RaftGroupHandleRegistry::default();
     if storage.start_maintenance_drained {
         registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
     }
@@ -7292,7 +7287,6 @@ mod snapshot_driver {
 
     use axum::Router;
     use axum::body::Body;
-    use axum::body::Bytes;
     use axum::http::StatusCode;
     use axum::response::Response;
     use openraft::rt::WatchReceiver;
@@ -7309,7 +7303,6 @@ mod snapshot_driver {
     use ursula_raft::snapshot_cadence::SnapshotCadence;
     use ursula_runtime::AppendRequest;
     use ursula_runtime::CreateStreamRequest;
-    use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreError;
@@ -7902,10 +7895,9 @@ mod snapshot_driver {
         started: usize,
     }
 
-    /// A snapshot store whose uploads wait until the test lets them finish,
-    /// in the order they arrive, and which counts them. Its pruning of
-    /// retired snapshots, a build's last housekeeping step, waits while the
-    /// test holds it.
+    /// A snapshot store whose writes wait until the test lets them finish,
+    /// in the order they arrive, and which counts them. Its GC pass's LIST,
+    /// a build's last housekeeping step, waits while the test holds it.
     #[derive(Debug)]
     struct GatedStore {
         /// How many uploads, by arrival, may finish.
@@ -7979,12 +7971,28 @@ mod snapshot_driver {
         }
     }
 
+    /// The inline store the [`GatedStore`] stages, writes and lists with.
+    static INLINE: ursula_runtime::InlineSnapshotStore = ursula_runtime::InlineSnapshotStore;
+
     impl SnapshotStore for GatedStore {
-        fn upload<'a>(
+        fn namespace(&self, raft_group_id: RaftGroupId) -> ursula_runtime::OwnedNamespace {
+            INLINE.namespace(raft_group_id)
+        }
+
+        fn stage<'a>(
             &'a self,
-            _key: SnapshotKey,
-            bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+            raft_group_id: RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            INLINE.stage(raft_group_id, index, chunks)
+        }
+
+        /// A build's write: it waits until the test lets it finish.
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::OwnedLocation> {
             Box::pin(async move {
                 let mut ticket = 0;
                 self.uploads.send_modify(|uploads| {
@@ -8008,16 +8016,44 @@ mod snapshot_driver {
                         opendal::Error::new(opendal::ErrorKind::Unexpected, "the gate is gone"),
                     )
                 })?;
-                Ok(SnapshotLocation::Inline {
-                    bytes: bytes.to_vec(),
-                })
+                INLINE.write_staged(staged).await
             })
         }
 
-        fn download<'a>(
+        /// A GC pass's LIST: it waits while the test holds pruning.
+        fn list_own<'a>(
+            &'a self,
+            _raft_group_id: RaftGroupId,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            Box::pin(async move {
+                self.prunes
+                    .send_modify(|prunes| *prunes = prunes.saturating_add(1));
+                self.prune_held
+                    .subscribe()
+                    .wait_for(|held| !*held)
+                    .await
+                    .map(|_released| ursula_runtime::OwnListing::default())
+                    .map_err(|_closed| {
+                        ursula_runtime::SnapshotStoreError::backend(
+                            ursula_runtime::SnapshotStoreOperation::List,
+                            "test",
+                            opendal::Error::new(opendal::ErrorKind::Unexpected, "the gate is gone"),
+                        )
+                    })
+            })
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            INLINE.delete_own(object)
+        }
+
+        fn read_stored<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StoredSnapshot> {
             Box::pin(async {
                 Err(ursula_runtime::SnapshotStoreError::backend(
                     ursula_runtime::SnapshotStoreOperation::Get,
@@ -8026,35 +8062,6 @@ mod snapshot_driver {
                 ))
             })
         }
-
-        fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn prune_retired<'a>(
-            &'a self,
-            _raft_group_id: u32,
-            _current: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ursula_runtime::SnapshotPrune> {
-            Box::pin(async move {
-                self.prunes
-                    .send_modify(|prunes| *prunes = prunes.saturating_add(1));
-                self.prune_held
-                    .subscribe()
-                    .wait_for(|held| !*held)
-                    .await
-                    .map(|_released| ursula_runtime::SnapshotPrune::Unmanaged)
-                    .map_err(|_closed| {
-                        ursula_runtime::SnapshotStoreError::backend(
-                            ursula_runtime::SnapshotStoreOperation::Get,
-                            "test",
-                            opendal::Error::new(opendal::ErrorKind::Unexpected, "the gate is gone"),
-                        )
-                    })
-            })
-        }
-
-        ursula_runtime::inline_owned_snapshot_methods!();
     }
 
     /// The snapshot builds a node runs at once by default, as the server's
@@ -8750,11 +8757,13 @@ mod snapshot_driver {
         }
     }
 
-    /// An S3 snapshot store that remembers every object it uploaded, so a
-    /// test can check each one after snapshot GC ran.
+    /// An S3 snapshot store that remembers every object it wrote, so a
+    /// test can check each one after snapshot GC ran. With GC off, its
+    /// deletes fail.
     #[derive(Debug)]
     struct RecordingStore {
         inner: ursula_runtime::S3SnapshotStore,
+        gc: Gc,
         uploaded: std::sync::Mutex<Vec<SnapshotLocation>>,
     }
 
@@ -8789,71 +8798,11 @@ mod snapshot_driver {
     }
 
     impl SnapshotStore for RecordingStore {
-        fn upload<'a>(
-            &'a self,
-            key: SnapshotKey,
-            bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                let location = self.inner.upload(key, bytes).await?;
-                self.record(&location);
-                Ok(location)
-            })
-        }
-
-        fn upload_iter<'a>(
-            &'a self,
-            key: SnapshotKey,
-            chunks: ursula_runtime::SnapshotBytesIterator,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                let location = self.inner.upload_iter(key, chunks).await?;
-                self.record(&location);
-                Ok(location)
-            })
-        }
-
-        fn download<'a>(
+        fn read_stored<'a>(
             &'a self,
             location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            self.inner.download(location)
-        }
-
-        fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            self.inner.delete(location)
-        }
-
-        fn prune_retired<'a>(
-            &'a self,
-            raft_group_id: u32,
-            current: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ursula_runtime::SnapshotPrune> {
-            self.inner.prune_retired(raft_group_id, current)
-        }
-
-        fn publish_reference<'a>(
-            &'a self,
-            raft_group_id: u32,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            self.inner.publish_reference(raft_group_id, location)
-        }
-
-        fn pin_reference<'a>(
-            &'a self,
-            raft_group_id: u32,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            self.inner.pin_reference(raft_group_id, location)
-        }
-
-        fn reconcile_reference_pins<'a>(
-            &'a self,
-            raft_group_id: u32,
-            retained: &'a [SnapshotLocation],
-        ) -> SnapshotStoreFuture<'a, ()> {
-            self.inner.reconcile_reference_pins(raft_group_id, retained)
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StoredSnapshot> {
+            self.inner.read_stored(location)
         }
 
         fn verify_uploaded<'a>(
@@ -8882,8 +8831,13 @@ mod snapshot_driver {
         fn write_staged<'a>(
             &'a self,
             staged: ursula_runtime::StagedSnapshot,
-        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::SnapshotLocation> {
-            ursula_runtime::SnapshotStore::write_staged(&self.inner, staged)
+        ) -> ursula_runtime::SnapshotStoreFuture<'a, ursula_runtime::OwnedLocation> {
+            Box::pin(async move {
+                let location =
+                    ursula_runtime::SnapshotStore::write_staged(&self.inner, staged).await?;
+                self.record(location.location());
+                Ok(location)
+            })
         }
 
         fn list_own<'a>(
@@ -8897,52 +8851,37 @@ mod snapshot_driver {
             &'a self,
             object: ursula_runtime::OwnedObject,
         ) -> ursula_runtime::SnapshotStoreFuture<'a, ()> {
-            ursula_runtime::SnapshotStore::delete_own(&self.inner, object)
+            match self.gc {
+                Gc::On => ursula_runtime::SnapshotStore::delete_own(&self.inner, object),
+                Gc::Off => Box::pin(async move {
+                    Err(SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Delete,
+                        object.path(),
+                        opendal::Error::new(opendal::ErrorKind::Unexpected, "GC is off"),
+                    ))
+                }),
+            }
         }
     }
 
-    /// How the node's snapshot store treats an object nothing names.
+    /// Whether the node's snapshot GC deletes anything.
     #[derive(Debug, Clone, Copy)]
-    enum ObjectGrace {
-        /// Deleted once it is the GC grace old, as on a server.
-        GcGrace,
-        /// Kept for an hour: snapshot GC deletes nothing within the test.
-        Hour,
+    enum Gc {
+        On,
+        /// Every delete fails: the negative control.
+        Off,
     }
 
-    /// #669: one node with an S3 snapshot store (on a local directory)
-    /// deletes a stream that its snapshot object holds. Returns how many
-    /// uploaded objects held the marker right after the covering snapshot
-    /// and once `max_age` passed, and the node's metrics at the end.
-    async fn delete_with_s3_snapshots(
-        object_grace: ObjectGrace,
-    ) -> (usize, usize, ursula_runtime::RuntimeMetricsSnapshot) {
+    /// #669: one node with an S3 snapshot store (in memory) deletes a
+    /// stream that its snapshot object holds. Returns how many written
+    /// objects held the marker once `max_age` passed, and the node's metrics
+    /// at the end.
+    async fn delete_with_s3_snapshots(gc: Gc) -> (usize, ursula_runtime::RuntimeMetricsSnapshot) {
         let max_age = Duration::from_secs(8);
-        let gc_grace = max_age.checked_div(4).expect("a quarter");
-        // A local directory: unlike the in-memory operator, its objects
-        // carry the modification time the GC grace reads.
-        let objects = tempfile::tempdir().expect("object root");
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default()
-                .root(objects.path().to_str().expect("a UTF-8 object root")),
-        )
-        .expect("object store")
-        .finish();
         let store = Arc::new(RecordingStore {
-            inner: ursula_runtime::S3SnapshotStore::new(
-                operator,
-                ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
-                1,
-            )
-            .with_references(ursula_runtime::SnapshotReferenceConfig {
-                node_id: 1,
-                default_voters: BTreeSet::from([1]),
-                per_group_voters: BTreeMap::new(),
-            })
-            .with_gc_grace(match object_grace {
-                ObjectGrace::GcGrace => gc_grace,
-                ObjectGrace::Hour => Duration::from_secs(60 * 60),
-            }),
+            inner: ursula_runtime::S3SnapshotStore::memory_for_tests("snapshots", 1)
+                .expect("a memory store"),
+            gc,
             uploaded: std::sync::Mutex::new(Vec::new()),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -8969,7 +8908,6 @@ mod snapshot_driver {
                     ..RaftEngineConfig::default()
                 }),
                 snapshot_store: Some(store.clone()),
-                snapshot_gc_grace: Some(gc_grace),
                 ..StaticGrpcTestNodeStorage::default()
             },
         )
@@ -9052,9 +8990,8 @@ mod snapshot_driver {
             )
             .await
             .expect("snapshot the deletion within the bound");
-        // The object the covering snapshot replaced is pinned for the GC
-        // grace.
-        let pinned = store.objects_with_marker().await;
+        // The object the covering snapshot replaced goes at the node's next
+        // GC pass, once no send of it is in flight (#687).
         let deadline = deleted_at.checked_add(max_age).expect("deadline");
         let mut left = store.objects_with_marker().await;
         while left > 0 && Instant::now() < deadline {
@@ -9063,33 +9000,28 @@ mod snapshot_driver {
         }
         let metrics = node.runtime.metrics().snapshot();
         node.shutdown().await;
-        (pinned, left, metrics)
+        (left, metrics)
     }
 
     /// #669: within `raft.deleted_data_max_age` of a deletion, snapshot GC
     /// has deleted every snapshot object that held the stream, the one the
-    /// covering snapshot replaced included, which stays pinned for the GC
-    /// grace first.
+    /// covering snapshot replaced included.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn snapshot_gc_deletes_the_replaced_object_within_the_bound() {
-        let (pinned, left, metrics) = delete_with_s3_snapshots(ObjectGrace::GcGrace).await;
-        assert!(
-            pinned > 0,
-            "the object the covering snapshot replaced is pinned for the grace"
-        );
+        let (left, metrics) = delete_with_s3_snapshots(Gc::On).await;
         assert_eq!(left, 0, "snapshot objects still hold the deleted stream");
         assert!(metrics.snapshot_gc_deleted_objects > 0);
-        assert_eq!(metrics.snapshot_gc_skipped_unreferenced_voter, 0);
     }
 
-    /// The negative control: a store that keeps unnamed objects for an hour
-    /// still holds the deleted stream once the bound passed, so the check
-    /// above sees what snapshot GC deletes.
+    /// The negative control: a store whose deletes fail still holds the
+    /// deleted stream once the bound passed, so the check above sees what
+    /// snapshot GC deletes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn without_snapshot_gc_the_replaced_object_outlives_the_bound() {
-        let (_pinned, left, metrics) = delete_with_s3_snapshots(ObjectGrace::Hour).await;
+        let (left, metrics) = delete_with_s3_snapshots(Gc::Off).await;
         assert!(left > 0, "a snapshot object still holds the deleted stream");
         assert_eq!(metrics.snapshot_gc_deleted_objects, 0);
+        assert!(metrics.snapshot_gc_failed_passes > 0);
     }
 
     /// #519: past the hard limit the driver keeps as many builds in flight
@@ -10173,7 +10105,6 @@ mod leadership_shed {
 
     use axum::Json;
     use axum::Router;
-    use axum::body::Bytes;
     use axum::routing::get;
     use tokio::sync::watch;
     use tokio::time::Instant;
@@ -10185,7 +10116,6 @@ mod leadership_shed {
     use ursula_runtime::ColdStore;
     use ursula_runtime::ColdStoreHandle;
     use ursula_runtime::CreateStreamRequest;
-    use ursula_runtime::SnapshotKey;
     use ursula_runtime::SnapshotLocation;
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreFuture;
@@ -10540,24 +10470,10 @@ mod leadership_shed {
     }
 
     impl SnapshotStore for FailingProbeStore {
-        fn upload<'a>(
-            &'a self,
-            _key: SnapshotKey,
-            _bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async {
-                Err(ursula_runtime::SnapshotStoreError::backend(
-                    ursula_runtime::SnapshotStoreOperation::Put,
-                    "test",
-                    opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
-                ))
-            })
-        }
-
-        fn download<'a>(
+        fn read_stored<'a>(
             &'a self,
             _location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StoredSnapshot> {
             Box::pin(async {
                 Err(ursula_runtime::SnapshotStoreError::backend(
                     ursula_runtime::SnapshotStoreOperation::Get,
@@ -10565,10 +10481,6 @@ mod leadership_shed {
                     opendal::Error::new(opendal::ErrorKind::Unexpected, "probe-only store"),
                 ))
             })
-        }
-
-        fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
         }
 
         fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {

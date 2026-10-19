@@ -687,7 +687,8 @@ fn every_group_engine_error_answers_its_table_row() {
                 GroupInfraError::RecoveryPending { .. } => unavailable(ErrorCode::HistoryPending),
                 GroupInfraError::ApplyStopped { .. } => unavailable(ErrorCode::ApplyStopped),
                 GroupInfraError::EngineWorkOutlivedShutdown { .. }
-                | GroupInfraError::PreviousEngineWorkRunning { .. } => {
+                | GroupInfraError::PreviousEngineWorkRunning { .. }
+                | GroupInfraError::Snapshot(GroupSnapshotError::StoreUnavailable { .. }) => {
                     unavailable(ErrorCode::GroupRestarting)
                 }
                 GroupInfraError::OutcomeUnknown => unavailable(ErrorCode::OutcomeUnknown),
@@ -702,8 +703,7 @@ fn every_group_engine_error_answers_its_table_row() {
                     | GroupSnapshotError::ForeignKey { .. }
                     | GroupSnapshotError::ObjectMissing { .. }
                     | GroupSnapshotError::ObjectCorrupt { .. }
-                    | GroupSnapshotError::PointerUnreadable { .. }
-                    | GroupSnapshotError::StoreUnavailable { .. },
+                    | GroupSnapshotError::PointerUnreadable { .. },
                 )
                 | GroupInfraError::RecoveryNodeMismatch { .. }
                 | GroupInfraError::RaftGroupNotRegistered { .. }

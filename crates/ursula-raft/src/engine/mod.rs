@@ -224,8 +224,9 @@ pub struct RaftGroupEngine {
     /// is pending (#581 sections 4.3 and 4.5).
     pub(crate) history: Arc<crate::history::GroupHistory>,
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
-    /// Admits the snapshot installs peers send, each holding the engine's
-    /// token until its publication ends (#709).
+    /// Admits the snapshot installs peers send and the snapshot GC passes
+    /// the registry runs on this engine's holds, each holding the engine's
+    /// token until it ends (#709, #687).
     pub(crate) snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
     pub(crate) metadata_serial:
         Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
@@ -242,6 +243,10 @@ pub struct RaftGroupEngine {
     /// The state machine's log gauge, which also holds its applied
     /// membership (#613).
     pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
+    /// The engine's snapshot store, install coordinator and holds, which
+    /// the registry copies incoming snapshots and runs GC passes with
+    /// (#687).
+    pub(crate) snapshots: crate::registry::GroupSnapshots,
     /// The work OpenRaft runs for this engine on tasks of its own, which
     /// [`Self::shutdown`] waits for (#709).
     pub(crate) openraft_work: crate::openraft_work::OpenRaftWork,
@@ -297,11 +302,11 @@ impl EngineStopper {
         // runs after (#489).
         crate::state_machine::close_snapshot_metadata(&self.metadata_serial).await;
         // Then the worker finishes what it already received, a build stops
-        // its upload and its housekeeping, network clients stop their RPCs,
-        // and an admitted install its publication. Only once all of it ended
-        // may the WAL close or the group open again: nothing of this engine
-        // changes the group's state, its gauges, its snapshot store or
-        // references after this, sends nothing, and holds nothing of its
+        // its write and its GC pass, network clients stop their RPCs, and an
+        // admitted install or GC pass stops. Only once all of it ended may
+        // the WAL close or the group open again: nothing of this engine
+        // changes the group's state, its gauges or its snapshot objects
+        // after this, sends nothing, and holds nothing of its
         // log store (#709). A simulation's negative control skips the wait.
         if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::EngineWorkWait) {
             return result;
@@ -369,6 +374,7 @@ pub(crate) struct ForwardedReadEngine {
     pub(crate) cold_index_cache: Option<Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>>,
     pub(crate) peer_cluster: Option<crate::PeerCluster>,
     pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
+    pub(crate) snapshots: crate::registry::GroupSnapshots,
 }
 
 impl ForwardedReadEngine {
@@ -389,6 +395,7 @@ impl ForwardedReadEngine {
             read_barrier: self.read_barrier,
             peer_cluster: self.peer_cluster,
             log_gauge: self.log_gauge,
+            snapshots: self.snapshots,
             openraft_work: crate::openraft_work::OpenRaftWork::none(),
             drop_stop: std::sync::Mutex::new(DropStop::Nothing),
             work_stop_timeout: crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT,
@@ -796,9 +803,9 @@ impl RaftGroupEngine {
             placement,
             metrics,
             cold_store.clone(),
-            snapshot_store,
+            snapshot_store.clone(),
             snapshot_build,
-            snapshot_install,
+            snapshot_install.clone(),
             snapshot_record
                 .as_ref()
                 .map(|record| record.path().to_path_buf()),
@@ -814,6 +821,11 @@ impl RaftGroupEngine {
             .restore_persisted_snapshot()
             .await
             .map_err(GroupEngineError::from)?;
+        let snapshots = crate::registry::GroupSnapshots {
+            store: snapshot_store,
+            install: snapshot_install,
+            holds: state_machine.holds.clone(),
+        };
         // One page cache per group, shared by the read path and the state
         // machine: invalidations on apply (FlushCold, CompactCold, snapshot
         // install) then reach reads on every replica, followers included.
@@ -896,6 +908,7 @@ impl RaftGroupEngine {
             cold_index_cache,
             peer_cluster,
             log_gauge,
+            snapshots,
             openraft_work,
             drop_stop: std::sync::Mutex::new(drop_stop),
             work_stop_timeout,

@@ -49,10 +49,8 @@ pub enum GroupSnapshotError {
     },
     /// This node's persisted snapshot pointer cannot be used, for a reason
     /// no retry changes: its metadata file does not read, decode or become
-    /// durable, an inline pointer's body does not decode, or the store
-    /// cannot protect the object it names (a pin record that does not
-    /// decode, a store that is misconfigured). The cause is logged where it
-    /// is converted.
+    /// durable, an inline pointer's body does not decode, or the store is
+    /// misconfigured. The cause is logged where it is converted.
     #[error("raft group {raft_group_id:?}: the persisted snapshot pointer is unreadable")]
     PointerUnreadable { raft_group_id: RaftGroupId },
     /// The snapshot store did not answer `operation` on `key`. The cause is
@@ -109,8 +107,6 @@ pub enum SnapshotStoreOperation {
     List,
     /// Deleting an object.
     Delete,
-    /// Copying an object inside the store.
-    Copy,
 }
 
 impl fmt::Display for SnapshotStoreOperation {
@@ -121,38 +117,42 @@ impl fmt::Display for SnapshotStoreOperation {
             Self::Put => "PUT",
             Self::List => "LIST",
             Self::Delete => "DELETE",
-            Self::Copy => "COPY",
         })
     }
 }
 
 impl GroupSnapshotError {
-    /// See [`super::GroupEngineError::status`]. Every refusal is
-    /// persistent: a group whose snapshot does not restore answers 500 with
-    /// no `Retry-After`, as it did while these refusals were free text. An
-    /// unavailable store is named apart so that a later change can make it
-    /// retryable without a new wire variant.
+    /// See [`super::GroupEngineError::status`]. A store that did not
+    /// answer the restore at engine open is temporary: the group did not
+    /// open, so a later request opens it again, after the core's back-off
+    /// on such opens. A gateway drops its cached leader route for the group,
+    /// and the client's retry takes a fresh lookup, which may land on the
+    /// same node. Every other refusal is persistent: a group
+    /// whose snapshot does not restore answers 500 with no `Retry-After`,
+    /// since no retry changes it.
     pub fn status(&self) -> ErrorStatus {
         match self {
+            Self::StoreUnavailable { .. } => ErrorStatus::Temporary,
             Self::InvalidContent(_)
             | Self::ForeignKey { .. }
             | Self::ObjectMissing { .. }
             | Self::ObjectCorrupt { .. }
-            | Self::PointerUnreadable { .. }
-            | Self::StoreUnavailable { .. } => ErrorStatus::Persistent,
+            | Self::PointerUnreadable { .. } => ErrorStatus::Persistent,
         }
     }
 
-    /// See [`super::GroupEngineError::write_effect`]. A snapshot refusal
-    /// answers no write, so it claims nothing about one.
+    /// See [`super::GroupEngineError::write_effect`]. An unavailable store
+    /// is refused only at engine open, before a request's command could be
+    /// proposed, so nothing of it applied. Every other snapshot refusal
+    /// claims nothing about a write.
     pub fn write_effect(&self) -> WriteEffect {
         match self {
+            Self::StoreUnavailable { .. } => WriteEffect::NotProposed,
             Self::InvalidContent(_)
             | Self::ForeignKey { .. }
             | Self::ObjectMissing { .. }
             | Self::ObjectCorrupt { .. }
-            | Self::PointerUnreadable { .. }
-            | Self::StoreUnavailable { .. } => WriteEffect::Unknown,
+            | Self::PointerUnreadable { .. } => WriteEffect::Unknown,
         }
     }
 

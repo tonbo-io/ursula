@@ -12,7 +12,7 @@
 //!   the client and land anyway, LISTs can omit recent keys and repeat
 //!   deleted ones, creates honour If-None-Match, nonces come from the seed,
 //!   and a DELETE outside the deleting node's directory panics (I2). Its GC
-//!   is P3's owner pass: it keeps no reference records.
+//!   is the owner's pass: it keeps no reference records.
 //! - [`gated`]: [`GatedSnapshotStore`], which wraps a node's store and
 //!   pauses each owned-key operation before or after it acts until a test
 //!   releases it, so a test can force one order of a build against a GC
