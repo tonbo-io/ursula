@@ -189,6 +189,11 @@ MADSIM_RUNTIME_HOMES: dict[str, set[str]] = {
         # suite calls (`madsim_openraft_runtime_passes_the_openraft_runtime_suite`).
         "block_on",
     },
+    # The one test that runs two runtimes on one thread on purpose: the cold
+    # object nonce must start its sequence again with each runtime.
+    "crates/ursula-sim/src/madsim_harness/cold_object_names_tests.rs": {
+        "two_runtimes_on_one_thread",
+    },
 }
 FN_RE = re.compile(r"\bfn\s+(\w+)")
 

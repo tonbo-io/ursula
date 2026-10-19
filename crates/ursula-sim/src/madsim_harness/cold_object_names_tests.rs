@@ -1,8 +1,9 @@
 //! The nonces of new cold object names under madsim (C2a, K1). They come
-//! from a per-thread generator seeded with the run's seed, never from
-//! madsim's own generator, so a seed replays its names, two seeds name their
-//! objects apart, and the nodes of one simulation, which madsim runs on one
-//! thread, draw from one shared sequence and never share a name.
+//! from a generator seeded with the seed of the runtime that draws them,
+//! never from madsim's own generator. Its sequence starts again with each
+//! runtime, so a seed replays its names even on a thread that ran it
+//! before, and two seeds draw different names. madsim runs every node of a
+//! simulation on one thread, so the nodes draw from one sequence.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -52,7 +53,7 @@ fn two_node_names(seed: u64) -> [Vec<String>; 2] {
 }
 
 /// A seed draws the same names on every run, another seed draws others, and
-/// the two nodes of a run never share a name. Outside a runtime the names
+/// the two nodes of a run, drawing from one sequence, share no name. Outside a runtime the names
 /// are deterministic too, so a madsim build of a test that names objects
 /// without a runtime replays.
 #[test]
@@ -81,4 +82,30 @@ fn cold_object_names_follow_the_seed_replays() {
             .expect("draw names outside a runtime")
     };
     assert_eq!(outside(), outside(), "names outside a runtime replay");
+}
+
+/// Runs seed 7 twice, one runtime after the other on the calling thread,
+/// and returns the names each run draws. Only this test builds a runtime
+/// outside `run_isolated`: it needs the reuse of a thread that
+/// `run_isolated` rules out for every simulation.
+fn two_runtimes_on_one_thread() -> [Vec<[String; 4]>; 2] {
+    [(), ()].map(|()| {
+        madsim::runtime::Runtime::with_seed_and_config(7, madsim::Config::default())
+            .block_on(async { (0..DRAWS).map(|_| draw_names()).collect::<Vec<_>>() })
+    })
+}
+
+/// Two runtimes of one seed, one after the other on one thread, draw the
+/// same names: the sequence starts again with each runtime, not with each
+/// seed or thread.
+#[test]
+fn cold_object_names_restart_with_each_runtime_replays() {
+    let _guard = sim_test_guard();
+    let [first, second] = std::thread::spawn(two_runtimes_on_one_thread)
+        .join()
+        .expect("two runtimes on one thread");
+    assert_eq!(
+        first, second,
+        "the second runtime of seed 7 draws its names again"
+    );
 }

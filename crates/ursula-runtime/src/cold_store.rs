@@ -82,45 +82,70 @@ impl ColdObjectWriter {
     }
 }
 /// The nonce of every new cold object name (chunks, packs, external
-/// payloads, snapshot parts): 64 random bits in the last 16 hex digits, so
-/// two writes never share a name whatever the clocks and restarts of the
-/// nodes that draw them. Nothing parses its value. The orphan sweep, cold GC
-/// and every name predicate read only its width.
+/// payloads, snapshot parts): 64 random bits in the last 16 hex digits,
+/// after the write time in nanoseconds. Two names collide only when they
+/// share the nanosecond and the 64 random bits, whatever the clocks and
+/// restarts of the nodes that draw them. Nothing parses the nonce's value.
+/// The orphan sweep, cold GC and every name predicate read only its width.
 #[cfg(not(madsim))]
 fn cold_object_nonce() -> u64 {
     rand::random()
 }
 
-/// The nonce of every new cold object name under madsim, from a per-thread
-/// [`SplitMix64`](crate::split_mix::SplitMix64) seeded with the run's madsim
-/// seed. It never draws from madsim's own generator, so naming an object
-/// shifts no other draw of the run. madsim runs every node of a simulation
-/// on one thread, so the nodes share one sequence and draw distinct names.
-/// The harness runs each simulation on a fresh thread, and the generator is
-/// seeded again whenever the seed changes, so a seed replays its names
-/// whatever ran before it (#638). A draw outside a runtime uses seed 0, which
-/// keeps the madsim build of tests that name objects without a runtime
-/// deterministic.
+/// The nonce of every new cold object name under madsim, where the write
+/// time is 0. It comes from a [`SplitMix64`](crate::split_mix::SplitMix64)
+/// seeded with the madsim seed of the runtime that draws it, and never from
+/// madsim's own generator, so naming an object shifts no other draw of the
+/// run. The sequence starts again with each runtime, not with each seed or
+/// thread, so a seed replays its names even when a thread runs it twice
+/// (#638). madsim runs every node of a simulation on one thread, so the
+/// nodes draw from one sequence. Draws outside a runtime take a sequence of
+/// their own with seed 0, which keeps the madsim build of tests that name
+/// objects without a runtime deterministic.
 #[cfg(madsim)]
 fn cold_object_nonce() -> u64 {
     use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::sync::Weak;
+
+    use madsim::net::NetSim;
 
     use crate::split_mix::SplitMix64;
 
     /// Keeps the nonces apart from every other generator a seed feeds.
     const NONCE_SALT: u64 = 0x636f_6c64_6e6f_6e63;
 
-    std::thread_local! {
-        static NONCES: RefCell<Option<(u64, SplitMix64)>> = const { RefCell::new(None) };
+    /// A thread's nonce sequences. A runtime's sequence is keyed by the
+    /// runtime's network simulator, which madsim builds once per runtime.
+    /// The weak reference keeps that simulator's allocation, so a later
+    /// runtime's simulator never takes its address, and a pointer match is
+    /// the same runtime.
+    struct Nonces {
+        runtime: Option<(Weak<NetSim>, SplitMix64)>,
+        outside: SplitMix64,
     }
 
-    let seed = madsim::runtime::Handle::try_current().map_or(0, |handle| handle.seed());
-    NONCES.with_borrow_mut(|nonces| match nonces {
-        Some((current, rng)) if *current == seed => rng.next_u64(),
-        _ => nonces
-            .insert((seed, SplitMix64::new(seed ^ NONCE_SALT)))
-            .1
-            .next_u64(),
+    std::thread_local! {
+        static NONCES: RefCell<Nonces> = const {
+            RefCell::new(Nonces {
+                runtime: None,
+                outside: SplitMix64::new(NONCE_SALT),
+            })
+        };
+    }
+
+    let Ok(handle) = madsim::runtime::Handle::try_current() else {
+        return NONCES.with_borrow_mut(|nonces| nonces.outside.next_u64());
+    };
+    let network = madsim::plugin::simulator::<NetSim>();
+    NONCES.with_borrow_mut(|nonces| match &mut nonces.runtime {
+        Some((owner, rng)) if std::ptr::eq(owner.as_ptr(), Arc::as_ptr(&network)) => rng.next_u64(),
+        runtime => {
+            let mut rng = SplitMix64::new(handle.seed() ^ NONCE_SALT);
+            let nonce = rng.next_u64();
+            *runtime = Some((Arc::downgrade(&network), rng));
+            nonce
+        }
     })
 }
 
