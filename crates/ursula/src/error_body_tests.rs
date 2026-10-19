@@ -309,7 +309,6 @@ async fn no_message_names_the_servers_internals() {
         raft_group_id: RaftGroupId(9),
         error,
     };
-    let leader = "http://10.1.2.3:4438";
     let cases = [
         // A leadership lost after the write was proposed: its outcome is
         // unknown.
@@ -318,7 +317,6 @@ async fn no_message_names_the_servers_internals() {
                 leader: Some(KnownLeader {
                     node_id: 2,
                     term: 5,
-                    address: Some(leader.to_owned()),
                 }),
                 proposal: Proposal::MayHaveCommitted,
                 reason: LeadershipReason::SteppedDown,
@@ -331,7 +329,6 @@ async fn no_message_names_the_servers_internals() {
                 leader: Some(KnownLeader {
                     node_id: 2,
                     term: 5,
-                    address: Some(leader.to_owned()),
                 }),
                 proposal: Proposal::NotProposed,
                 reason: LeadershipReason::Follower,

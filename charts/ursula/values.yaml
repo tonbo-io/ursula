@@ -9,7 +9,7 @@ global:
     pullPolicy: IfNotPresent
   # Optional image pull secrets, rendered as `imagePullSecrets`.
   imagePullSecrets: []
-  # Kubernetes cluster DNS domain used for generated peer FQDNs, the cluster manifests and gateway upstreams. Set it before the first install: a voter whose peer URL changed refuses to start.
+  # Kubernetes cluster DNS domain used for generated peer FQDNs, the cluster manifests and gateway upstreams. A change rolls like any restart while the old domain still resolves.
   clusterDomain: cluster.local
 
 # Override the chart name portion of generated resource names.
@@ -119,8 +119,8 @@ server:
   # dial ports.cluster, leader redirects name ports.client, and the client
   # Service never exposes the cluster plane. false serves both planes on
   # ports.client, so anyone who reaches the client Service reaches Raft.
-  # Fixed at install: groups record each peer's url when they initialize, and
-  # a voter whose url changed afterwards refuses to start.
+  # A change moves every voter's cluster listener and needs every voter
+  # restarted together (OnDelete, then delete every voter pod at once).
   clusterListen: true
   # The mutating admin plane stays on pod loopback by default. A trusted
   # in-cluster operator or chaos controller may opt in to a pod-reachable bind

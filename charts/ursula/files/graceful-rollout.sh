@@ -17,8 +17,8 @@ ADMIN_PORT=${ADMIN_PORT:-4438}
 # zero-based, so node N listens on BASE + N - 1.
 FORWARD_PORT_BASE=${FORWARD_PORT_BASE:-15438}
 # Peer host parts: global.clusterDomain and the chart's headless Service. They
-# must match the chart's [[raft.peers]] urls, because learner attachment
-# persists http_url in Raft membership.
+# match the chart's [[raft.peers]] urls, so the manifest names each node as
+# its peers do.
 CLUSTER_DOMAIN=${CLUSTER_DOMAIN:-cluster.local}
 HEADLESS_SERVICE=${HEADLESS_SERVICE:-${STATEFULSET}-headless}
 
@@ -42,9 +42,8 @@ write_manifest() {
       printf '    {\n'
       printf '      "id": %s,\n' "$((ordinal + 1))"
       printf '      "admin_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
-      # Metrics use the same Pod-bound tunnel. Keep http_url as the real peer
-      # (cluster-plane) address: learner attachment persists it in Raft
-      # membership, and peers dial it.
+      # Metrics use the same Pod-bound tunnel. http_url is the node's peer
+      # (cluster-plane) address, as its [[raft.peers]] url names it.
       printf '      "metrics_url": "http://127.0.0.1:%s",\n' "$((FORWARD_PORT_BASE + ordinal))"
       printf '      "host": "%s-%s",\n' "${STATEFULSET}" "${ordinal}"
       printf '      "http_url": "http://%s-%s.%s.%s.svc.%s:%s"\n' \

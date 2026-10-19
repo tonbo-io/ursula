@@ -139,15 +139,12 @@ pub(super) async fn wait_change<T: Send + Sync>(
 /// Transport required by recovery, shared by native and simulated wiring.
 pub trait RecoveryTransport: Clone + Send + Sync + 'static {
     type Error: fmt::Debug + Send;
-    fn probe(
-        &self,
-        peer: u64,
-        address: String,
-    ) -> impl Future<Output = Option<PeerGroupLog>> + Send;
+    /// Asks `peer` with the bootstrap probe vote.
+    fn probe(&self, peer: u64) -> impl Future<Output = Option<PeerGroupLog>> + Send;
+    /// Asks `leader` for a fresh quorum barrier.
     fn barrier(
         &self,
         leader: u64,
-        address: String,
     ) -> impl Future<Output = Result<(UrsulaVote, u64), Self::Error>> + Send;
 }
 
@@ -187,9 +184,9 @@ impl RecoveryGate {
             rejoin.clone(),
             election,
             nodes.clone(),
-            move |leader, address| {
+            move |leader| {
                 let transport = barrier_transport.clone();
-                async move { transport.barrier(leader, address).await }
+                async move { transport.barrier(leader).await }
             },
             config.barrier_timeout,
             config.interval,
@@ -202,10 +199,10 @@ impl RecoveryGate {
             self.push(crate::rt::spawn(async move {
                 while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
                     let mut all_empty = true;
-                    for (peer, node) in &nodes {
+                    for peer in nodes.keys() {
                         if *peer != rejoin.node_id
                             && !matches!(
-                                transport.probe(*peer, node.addr.clone()).await,
+                                transport.probe(*peer).await,
                                 Some(PeerGroupLog::Empty | PeerGroupLog::Unprepared)
                             )
                         {
@@ -234,9 +231,9 @@ impl RecoveryGate {
                     raft,
                     rejoin,
                     nodes,
-                    move |peer, address| {
+                    move |peer| {
                         let transport = transport.clone();
-                        async move { transport.probe(peer, address).await }
+                        async move { transport.probe(peer).await }
                     },
                     config.bootstrap_interval,
                     config.bootstrap_warn_after,

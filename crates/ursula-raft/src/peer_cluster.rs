@@ -26,6 +26,7 @@
 //! changes readiness: a misconfigured node must not take its healthy peers
 //! out of service, nor hide why a node is unready.
 
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -248,6 +249,8 @@ struct PeerClusterState {
     refused: Mutex<HashMap<RefusedPeer, Instant>>,
     refusals: AtomicU64,
     unidentified_refusals: AtomicU64,
+    /// Member node ids `raft.peers` does not list, each logged once.
+    unlisted: Mutex<BTreeSet<u64>>,
 }
 
 /// What [`PeerCluster::bind`] stores: this node's identity and its
@@ -282,6 +285,33 @@ impl PeerCluster {
             .as_deref()
             .map(|bound| bound.peers.clone())
             .unwrap_or_default()
+    }
+
+    /// The cluster URL `raft.peers` lists for `node_id`, the only address
+    /// this node dials it at. A Raft member that `raft.peers` does not list
+    /// has none: nothing dials it, and the first miss for each node id is
+    /// logged.
+    pub fn cluster_url(&self, node_id: u64) -> Option<String> {
+        let bound = self.0.bound.load();
+        let url = bound
+            .as_deref()
+            .and_then(|bound| bound.peers.cluster_url(node_id))
+            .map(str::to_owned);
+        if url.is_none()
+            && self
+                .0
+                .unlisted
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(node_id)
+        {
+            tracing::warn!(
+                peer_node_id = node_id,
+                "raft.peers lists no node {node_id}, a member of a Raft group: not dialing it; \
+                 list the node in raft.peers or remove it from the group's membership"
+            );
+        }
+        url
     }
 
     pub fn identity(&self) -> Option<PeerIdentity> {
@@ -529,8 +559,14 @@ pub(crate) fn test_identity(node_id: u64) -> PeerIdentity {
 /// A node of the test cluster with no configured peers.
 #[cfg(any(test, madsim))]
 pub(crate) fn test_peer_cluster(node_id: u64) -> PeerCluster {
+    test_peer_cluster_with(node_id, PeerDirectory::default())
+}
+
+/// A node of the test cluster whose `raft.peers` is `peers`.
+#[cfg(any(test, madsim))]
+pub(crate) fn test_peer_cluster_with(node_id: u64, peers: PeerDirectory) -> PeerCluster {
     let peer_cluster = PeerCluster::default();
-    peer_cluster.bind(test_identity(node_id), PeerDirectory::default());
+    peer_cluster.bind(test_identity(node_id), peers);
     peer_cluster
 }
 

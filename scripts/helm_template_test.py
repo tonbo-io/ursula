@@ -535,7 +535,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.clusterListen=false",
                      "--set", "server.ports.cluster=4437")
 
-    def test_graceful_rollout_attaches_learners_at_the_cluster_port(self) -> None:
+    def test_graceful_rollout_names_the_cluster_port(self) -> None:
         for cluster_listen, port in (("true", "4439"), ("false", "4437")):
             with self.subTest(cluster_listen=cluster_listen):
                 rendered = render_chart(
@@ -547,8 +547,8 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
     def test_peers_manifest_and_rollout_agree_on_the_peer_host(self) -> None:
         # A long fullname makes the headless Service name truncate, and a
-        # custom domain replaces cluster.local. Learners join at the rollout
-        # manifest's http_url, so it must name the peers' own address.
+        # custom domain replaces cluster.local. The rollout manifest's
+        # http_url names each node as its peers' [[raft.peers]] urls do.
         fullname = "u" * 58
         values = (
             *NAMED, "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",

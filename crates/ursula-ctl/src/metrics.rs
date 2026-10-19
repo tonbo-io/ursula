@@ -494,60 +494,6 @@ impl MetricsClient {
             ))
         }
     }
-
-    pub async fn add_learner(
-        &self,
-        leader: &NodeInfo,
-        raft_group_id: u64,
-        target: &NodeInfo,
-    ) -> Result<()> {
-        let address = target.http_url.as_ref().ok_or_else(|| {
-            anyhow!(
-                "node {} has no public Raft/client address for learner attachment",
-                target.id
-            )
-        })?;
-        let path = format!("/__ursula/raft/{raft_group_id}/learners/{}", target.id);
-        let url = leader.admin_url.join(&path).with_context(|| {
-            format!(
-                "compose add-learner url at leader node {} for group {}",
-                leader.id, raft_group_id
-            )
-        })?;
-        if address.query().is_some() || address.fragment().is_some() {
-            bail!(
-                "node {} learner address must not contain a query or fragment",
-                target.id
-            );
-        }
-        let query = ursula_proto::admin::AddLearnerQuery {
-            addr: address.to_string(),
-            blocking: Some(false),
-        };
-        let resp = self
-            .admin_request(leader, Method::POST, url.clone())
-            .await?
-            .query(&query)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            let _: ursula_proto::admin::AddLearnerResponse =
-                serde_json::from_str(&body).context("decode admin response")?;
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "add learner at leader node {} (group {} node {}) returned {}: {}",
-                leader.id,
-                raft_group_id,
-                target.id,
-                status,
-                body
-            ))
-        }
-    }
 }
 
 /// Base URL of the read-only observations, metrics and serving readiness:
@@ -1228,33 +1174,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tunneled_metrics_do_not_replace_the_advertised_learner_address() {
+    async fn tunneled_metrics_do_not_replace_the_advertised_address() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let query = Arc::new(Mutex::new(None));
-        let received = query.clone();
-        let app = Router::new()
-            .route(
-                "/__ursula/metrics",
-                axum::routing::get(|| async {
-                    axum::Json(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
-                }),
-            )
-            .route(
-                "/__ursula/raft/0/learners/1",
-                post(
-                    move |axum::extract::Query(value): axum::extract::Query<
-                        ursula_proto::admin::AddLearnerQuery,
-                    >| async move {
-                        *received.lock().unwrap() = Some(value);
-                        axum::Json(ursula_proto::admin::AddLearnerResponse {
-                            raft_group_id: 0,
-                            node_id: 1,
-                            log_index: 7,
-                        })
-                    },
-                ),
-            );
+        let app = Router::new().route(
+            "/__ursula/metrics",
+            axum::routing::get(|| async {
+                axum::Json(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
+            }),
+        );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let tunnel = Url::parse(&format!("http://{address}")).unwrap();
         let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
@@ -1270,12 +1198,7 @@ mod tests {
         };
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         let view = client.fetch_node(&node).await.unwrap();
-        assert_eq!(view.node.http_url, Some(advertised.clone()));
-        client.add_learner(&node, 0, &node).await.unwrap();
-        let received = query.lock().unwrap();
-        let received = received.as_ref().unwrap();
-        assert_eq!(received.addr, advertised.as_str());
-        assert_eq!(received.blocking, Some(false));
+        assert_eq!(view.node.http_url, Some(advertised));
         task.abort();
     }
 

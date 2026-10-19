@@ -932,12 +932,7 @@ pub enum WriteRoute {
         early_answer: Option<ursula_stream::ProducerEarlyAnswer>,
     },
     /// Another node leads the group in `term`.
-    Follower {
-        leader_id: u64,
-        /// The leader's address in the group's membership, if known.
-        leader_address: Option<String>,
-        term: u64,
-    },
+    Follower { leader_id: u64, term: u64 },
     /// No leader of the group is known.
     NoLeader,
 }

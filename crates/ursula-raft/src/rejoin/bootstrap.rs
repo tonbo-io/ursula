@@ -92,7 +92,7 @@ pub enum GroupBootstrap {
 /// Membership bootstrap of a group's initializer whose replica holds nothing
 /// of the group. It runs `Initialize` only once every other configured voter
 /// answered that it is empty too and no leader was seen. `probe` asks one
-/// peer (`(id, address)`) with the bootstrap probe vote.
+/// peer, by node id, with the bootstrap probe vote.
 pub async fn run_group_bootstrap<P, F>(
     node_id: u64,
     raft: RaftGroupHandle,
@@ -103,14 +103,14 @@ pub async fn run_group_bootstrap<P, F>(
     warn_every: Duration,
 ) -> GroupBootstrap
 where
-    P: Fn(u64, String) -> F,
+    P: Fn(u64) -> F,
     F: Future<Output = Option<PeerGroupLog>>,
 {
     let group = rejoin.raft_group_id().0;
     let peers = nodes
-        .iter()
-        .filter(|(peer_id, _)| **peer_id != node_id)
-        .map(|(peer_id, node)| (*peer_id, node.addr.clone()))
+        .keys()
+        .copied()
+        .filter(|peer_id| *peer_id != node_id)
         .collect::<Vec<_>>();
     let mut last_probe = None;
     let mut last_warning = crate::rt::time::Instant::now();
@@ -145,12 +145,7 @@ where
         let answers = if leader_seen {
             Vec::new()
         } else {
-            futures_util::future::join_all(
-                peers
-                    .iter()
-                    .map(|(peer_id, address)| probe(*peer_id, address.clone())),
-            )
-            .await
+            futures_util::future::join_all(peers.iter().map(|peer_id| probe(*peer_id))).await
         };
         let decision = if leader_seen {
             BootstrapDecision::Rejoin

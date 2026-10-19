@@ -82,7 +82,7 @@ client_url = "http://10.0.0.1:4437"
 | `raft.wal.cache_size` | `256MiB` | Recent Raft entries kept in memory across the node, split evenly between its groups. Older entries, such as a lagging follower's catch-up, are read from disk |
 | `raft.wal.min_available_size` | `512MiB` | Reject writes and mark `/__ursula/ready` unavailable below this much free WAL-filesystem space. `0` disables the guard |
 | `raft.wal.resume_available_size` | `1GiB` | Free space required before disk-pressure admission clears. Must exceed the minimum |
-| `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node. Each entry has `node_id`, `url` (the address peers dial for the cluster plane) and `client_url` (the client-plane address leader redirects name, required with `server.cluster_listen` and `url` by default) |
+| `raft.peers` | empty | Static gRPC peer list, with one `[[raft.peers]]` entry per voter, including this node. Each entry has `node_id`, `url` (the address peers dial for the cluster plane) and `client_url` (the client-plane address leader redirects name, required with `server.cluster_listen` and `url` by default). It is the only source of peer addresses: keep it the same on every node, and change it there to move a node ([Changing a peer address](/docs/operations#changing-a-peer-address)) |
 | `raft.init_membership_per_group` | `false` | Per-group membership bootstrap. One voter per group initializes it once every configured voter reports the group empty and no leader. A replica that ever held its group never initializes it again, so keep it `true` across restarts. The Helm chart sets `true` |
 
 The Raft WAL is always the per-core disk journal. A node with `raft.peers` set

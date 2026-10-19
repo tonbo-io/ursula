@@ -16,7 +16,6 @@ mod format_epoch;
 mod health_gate;
 mod leadership;
 mod participation;
-mod peer_address;
 mod runtime;
 mod snapshot;
 mod store_health;
@@ -26,8 +25,6 @@ mod wal_disk;
 
 pub(crate) use format_epoch::check_and_stamp_format_epoch;
 pub(crate) use leadership::handoff_shutdown_leadership;
-pub use peer_address::PeerAddressChanged;
-pub(crate) use peer_address::check_own_recorded_address;
 pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;

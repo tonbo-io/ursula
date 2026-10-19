@@ -228,20 +228,10 @@ fn leadership_refusals() -> Vec<LeadershipRefusal> {
         leader: Some(KnownLeader {
             node_id: 2,
             term: 9,
-            address: Some("http://node-2:4438".to_owned()),
         }),
         proposal,
         reason: LeadershipReason::SteppedDown,
     }));
-    refusals.push(LeadershipRefusal {
-        leader: Some(KnownLeader {
-            node_id: 3,
-            term: 11,
-            address: None,
-        }),
-        proposal: Proposal::NotProposed,
-        reason: LeadershipReason::Follower,
-    });
     refusals
 }
 

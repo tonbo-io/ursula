@@ -751,6 +751,11 @@ pub enum RaftMaintenanceIssue {
     StoppedForOperator,
     JointMembership,
     IncompleteVoterSet,
+    /// The group's membership names a node that is not one of its
+    /// configured voters. No node dials a member that `raft.peers` does not
+    /// list, and the leader never removes it: an operator lists the node
+    /// again or removes it from the membership.
+    UnconfiguredMember,
     LocalReplicaNotVoter,
     MembershipNotApplied,
     LeaderUnknown,
@@ -775,7 +780,7 @@ pub struct RaftMaintenanceReport {
 
 impl RaftMaintenanceReport {
     /// Local serving eligibility; maintenance additionally requires the full
-    /// voter set and no stopped group. A group stopped by an apply failure
+    /// voter set, no member outside it, and no stopped group. A group stopped by an apply failure
     /// answers its own requests with a typed 503 while the node serves the
     /// others, so it only blocks disruption.
     pub fn serving_ready(&self) -> bool {
@@ -783,6 +788,7 @@ impl RaftMaintenanceReport {
             !matches!(
                 issue,
                 RaftMaintenanceIssue::IncompleteVoterSet
+                    | RaftMaintenanceIssue::UnconfiguredMember
                     | RaftMaintenanceIssue::JointMembership
                     | RaftMaintenanceIssue::ApplyStopped
             )
@@ -930,12 +936,6 @@ pub struct PurgeResponse {
     pub purged_index: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddLearnerResponse {
-    pub raft_group_id: u32,
-    pub node_id: u64,
-    pub log_index: u64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipResponse {
     pub raft_group_id: u32,
     #[serde(default)]
@@ -948,11 +948,6 @@ pub struct MembershipResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PurgeQuery {
     pub upto: u64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AddLearnerQuery {
-    pub addr: String,
-    pub blocking: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipQuery {
@@ -1318,6 +1313,7 @@ mod serving_readiness_tests {
         };
         for issue in [
             RaftMaintenanceIssue::IncompleteVoterSet,
+            RaftMaintenanceIssue::UnconfiguredMember,
             RaftMaintenanceIssue::JointMembership,
         ] {
             report.group_issues.insert(0, vec![issue]);

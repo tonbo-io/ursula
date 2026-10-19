@@ -563,6 +563,9 @@ async fn build_three_node_cluster_gating(
     for node_id in 1..=3 {
         nodes.insert(node_id, BasicNode::new(address(node_id)));
     }
+    let peers = crate::PeerDirectory::new(
+        (1..=3).map(|node_id| (node_id, crate::PeerEndpoints::shared(address(node_id)))),
+    );
 
     let mut engines = Vec::new();
     let mut wal_roots = Vec::new();
@@ -589,6 +592,10 @@ async fn build_three_node_cluster_gating(
             log_store,
             RaftGroupEngineOptions {
                 recovery: node_gate.clone(),
+                peer_cluster: Some(crate::peer_cluster::test_peer_cluster_with(
+                    node_id,
+                    peers.clone(),
+                )),
                 ..Default::default()
             },
         )

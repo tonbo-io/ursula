@@ -153,19 +153,19 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 
 `server.listen`, `server.cluster_listen` or `server.admin_listen` is taken. The client plane and inter-node gRPC share `server.listen` unless `server.cluster_listen` is set.
 
-### `raft group … records node … at …, but raft.peers configures …`
+### A node at a new address stays unready
 
-The node exits at startup with:
+Every node dials its peers at the `url` its own `[[raft.peers]]` lists. A node that moved, or a node whose peers still list its old address, gets no Raft traffic from the peers that list the wrong one. Its groups catch up on nothing, and `ursulactl wait` does not return. Check that `[[raft.peers]]` is the same on every node and names each node where it listens now, then restart the nodes whose list was wrong. A move of a listener, such as a new cluster port, needs every voter restarted together ([Changing a peer address](/docs/operations#changing-a-peer-address)).
+
+### `unconfigured_member`
+
+The maintenance report names `unconfigured_member` for a group whose Raft membership names a node that is not one of its configured voters, as a voter or a learner. No node dials a member that `[[raft.peers]]` does not list, and each node logs that once:
 
 ```text
-error: raft group 3 records node 2 at http://ursula-1.ursula-headless.ursula.svc.cluster.local:4437, but raft.peers configures http://ursula-1.ursula-headless.ursula.svc.cluster.local:4439: a node's Raft url (and server.cluster_listen) cannot change after its groups are initialized
+raft.peers lists no node 4, a member of a Raft group: not dialing it; list the node in raft.peers or remove it from the group's membership
 ```
 
-This is `PeerAddressChanged`. Each group records every member's Raft address when it first initializes, and peers dial that recorded address from then on. The node's own `[[raft.peers]].url` no longer matches it. The host, the port or both changed, for example because `server.cluster_listen` moved the cluster plane to another port, or because the chart's `server.clusterListen`, `server.ports.cluster` or `global.clusterDomain` changed after the first install. A node serving at the new address would get no Raft traffic, so it refuses to start.
-
-Restore the recorded address the error names and roll the node again. With the Helm chart, set `server.clusterListen`, `server.ports.cluster` and `global.clusterDomain` back to the values of the first install. Outside the chart, restore the `url` and the `server.cluster_listen` port. Every node of the cluster needs the same peer list, so revert the change on all of them.
-
-Ursula 0.8 cannot change a recorded peer address in place. To move a cluster to a new address, install a fresh cluster at that address. [Issue #633](https://github.com/tonbo-io/ursula/issues/633) tracks migrating a recorded address without a fresh install.
+The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group leader never removes such a member by itself. List the node in `[[raft.peers]]` again, or replace the group's voter set without it on the group's leader with `POST /__ursula/raft/{group}/membership?voters=` ([Admin endpoints](/docs/operations#admin-endpoints)).
 
 ### `raft WAL directory … holds data without a format marker`
 

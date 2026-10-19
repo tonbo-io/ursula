@@ -81,11 +81,6 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST ht
 # builds or a purge of it has not landed. Send it again then.
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/purge?upto=1000"
 
-# Add a learner (non-voting replica) to one group without blocking on catch-up.
-# addr is the address peers dial: the learner's cluster listener (its
-# [[raft.peers]] url), here on the chart's cluster port 4439.
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/learners/4?addr=http://node-4:4439&blocking=false"
-
 # Hand leadership of one group to another voter (used by `ursulactl drain`)
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
 
@@ -165,6 +160,18 @@ Restart one voter at a time:
 4. `ursulactl undrain --node N` lets it hold leaderships again.
 
 Do not stop another voter before `wait` returns. Two overlapping outages of a three-voter group leave it without a quorum even if the restarts were issued separately. The chart's graceful-rollout hook runs the same sequence for every pod.
+
+### Changing a peer address
+
+Raft membership names node IDs only. Every node dials its peers at the `url` its own `[[raft.peers]]` lists, and a follower redirects clients to the leader's `client_url` there. A peer's address therefore changes with the configuration, and no admin step migrates it. Keep `[[raft.peers]]` the same on every node.
+
+- **A new address behind the same name** needs no change. Name peers by DNS names that follow each node, as the chart's headless Service does.
+- **A new name that the old one still reaches** rolls like any restart. Change `[[raft.peers]]` on every node and restart the nodes one at a time ([Restarting a voter](#restarting-a-voter)).
+- **A listener that moves**, such as a new cluster port, `server.cluster_listen` turned on or off, or a host without a stable name, needs every voter restarted together. Stop every voter, change `[[raft.peers]]` on every node, and start them all. The cluster serves nothing until a quorum is up, which takes about as long as one restart. Restarting one node at a time does not work here. Until the last node restarted, some nodes cannot reach each other, and a group can lose its quorum. Rolling listener moves are tracked in [#735](https://github.com/tonbo-io/ursula/issues/735).
+
+With the chart, `server.ports.cluster` and `server.clusterListen` move every listener. Run `helm upgrade` with `server.updateStrategy=OnDelete`, then delete every voter pod at once. `global.clusterDomain` rolls like any restart while the old domain still resolves.
+
+A node that a group's membership names but `[[raft.peers]]` does not list is never dialed. Each node logs it once, and the group reports `unconfigured_member` in the maintenance report ([Troubleshooting](/docs/troubleshooting#a-node-at-a-new-address-stays-unready)).
 
 ### WAL routing configuration
 

@@ -232,7 +232,6 @@ fn group_engine_error_variants_separate_stream_infra_and_forwarding() {
         leader: Some(KnownLeader {
             node_id: 2,
             term: 3,
-            address: None,
         }),
         proposal: Proposal::MayHaveCommitted,
         reason: LeadershipReason::SteppedDown,

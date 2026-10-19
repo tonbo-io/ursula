@@ -340,7 +340,6 @@ mod tests {
                     if let Some(leader) = refusal.leader.as_mut() {
                         leader.node_id = number;
                         leader.term = maybe.unwrap_or(number);
-                        leader.address = Some(text);
                     }
                     GroupEngineError::NotLeader(refusal)
                 }

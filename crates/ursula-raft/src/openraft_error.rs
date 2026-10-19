@@ -126,7 +126,6 @@ pub(crate) fn client_write_refusal(
                 forward_reason(forward.reason, LeadershipReason::SteppedDown),
                 Proposal::NotProposed,
                 forward.leader_id,
-                forward.leader_node.as_ref(),
                 leadership,
             )
         }
@@ -136,7 +135,6 @@ pub(crate) fn client_write_refusal(
                 LeadershipReason::SteppedDown,
                 Proposal::MayHaveCommitted,
                 forward.leader_id,
-                forward.leader_node.as_ref(),
                 leadership,
             )
         }
@@ -180,7 +178,6 @@ pub(crate) fn group_engine_linearizable_read_error(
             forward_reason(forward.reason, LeadershipReason::Follower),
             Proposal::NotProposed,
             forward.leader_id,
-            forward.leader_node.as_ref(),
             leadership,
         ),
         LinearizableReadError::QuorumNotEnough(_) => {

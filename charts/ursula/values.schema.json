@@ -123,7 +123,7 @@
           "type": "string",
           "maxLength": 253,
           "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$",
-          "description": "Kubernetes cluster DNS domain used for generated peer FQDNs, the cluster manifests and gateway upstreams. Set it before the first install: a voter whose peer URL changed refuses to start."
+          "description": "Kubernetes cluster DNS domain used for generated peer FQDNs, the cluster manifests and gateway upstreams. A change rolls like any restart while the old domain still resolves."
         }
       },
       "required": [
