@@ -1030,8 +1030,8 @@ class HelmTemplateConfigTest(unittest.TestCase):
         parsed = tomllib.loads(
             render_config(*NAMED, "--set", "snapshotStore.backend=s3", "--set", "s3.bucket=bkt")
         )
-        self.assertNotIn("timeout", parsed["storage"]["snapshot"])
-        self.assertNotIn("max_retries", parsed["storage"]["snapshot"])
+        self.assertNotIn("s3_timeout", parsed["storage"]["snapshot"])
+        self.assertNotIn("s3_max_retries", parsed["storage"]["snapshot"])
 
         parsed = tomllib.loads(
             render_config(
@@ -1041,13 +1041,13 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 "--set",
                 "s3.bucket=bkt",
                 "--set",
-                "snapshotStore.requestTimeoutMs=5000",
+                "snapshotStore.s3TimeoutMs=5000",
                 "--set",
-                "snapshotStore.maxRetries=0",
+                "snapshotStore.s3MaxRetries=0",
             )
         )
-        self.assertEqual(parsed["storage"]["snapshot"]["timeout"], "5000ms")
-        self.assertEqual(parsed["storage"]["snapshot"]["max_retries"], 0)
+        self.assertEqual(parsed["storage"]["snapshot"]["s3_timeout"], "5000ms")
+        self.assertEqual(parsed["storage"]["snapshot"]["s3_max_retries"], 0)
 
     def test_cold_cache_zero_can_disable_default_cache(self) -> None:
         config = render_config(*NAMED, 

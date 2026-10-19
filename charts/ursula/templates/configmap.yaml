@@ -53,8 +53,8 @@
 {{- $coldCacheBlockSizeBytes := $coldCache.blockSizeBytes -}}
 {{- $coldCacheReadaheadBlocks := $coldCache.readaheadBlocks -}}
 {{- $snapshotDriveIntervalMs := .Values.snapshotStore.driveIntervalMs -}}
-{{- $snapshotRequestTimeoutMs := .Values.snapshotStore.requestTimeoutMs -}}
-{{- $snapshotMaxRetries := .Values.snapshotStore.maxRetries -}}
+{{- $snapshotS3TimeoutMs := .Values.snapshotStore.s3TimeoutMs -}}
+{{- $snapshotS3MaxRetries := .Values.snapshotStore.s3MaxRetries -}}
 {{- $snapshotBackend := .Values.snapshotStore.backend | default "auto" | toString -}}
 apiVersion: v1
 kind: ConfigMap
@@ -217,11 +217,11 @@ data:
 {{- if not (eq $snapshotDriveIntervalMs nil) }}
     drive_interval = "{{ $snapshotDriveIntervalMs }}ms"
 {{- end }}
-{{- if not (eq $snapshotRequestTimeoutMs nil) }}
-    timeout = "{{ $snapshotRequestTimeoutMs | int64 }}ms"
+{{- if not (eq $snapshotS3TimeoutMs nil) }}
+    s3_timeout = "{{ $snapshotS3TimeoutMs | int64 }}ms"
 {{- end }}
-{{- if not (eq $snapshotMaxRetries nil) }}
-    max_retries = {{ $snapshotMaxRetries | int64 }}
+{{- if not (eq $snapshotS3MaxRetries nil) }}
+    s3_max_retries = {{ $snapshotS3MaxRetries | int64 }}
 {{- end }}
     EOF
 

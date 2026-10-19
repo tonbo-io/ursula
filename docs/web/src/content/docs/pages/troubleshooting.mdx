@@ -98,8 +98,8 @@ the group's requests with this code at once. `open_backoff_groups` in
 the core that owns the group, so the core's other groups keep serving. A
 request that reaches the group during its first open waits for the open,
 which the store can hold until the S3 client gives up, up to 22 seconds for
-each request with the default `storage.snapshot.timeout` and
-`max_retries`. Fix the node's reachability of the
+each request with the default `storage.snapshot.s3_timeout` and
+`s3_max_retries`. Fix the node's reachability of the
 snapshot store: its endpoint, credentials and network path. The group opens
 at the first open after the store answers. A node whose store does not
 answer at startup starts anyway and keeps those groups closed until then.

@@ -1293,8 +1293,8 @@ mod s3 {
                 Operator::new(builder)
                     .map_err(|err| SnapshotStoreError::Open(Box::new(err)))?
                     .finish(),
-                snapshot.timeout.as_duration(),
-                snapshot.max_retries,
+                snapshot.s3_timeout.as_duration(),
+                snapshot.s3_max_retries,
             );
             Ok(Self::new(operator, prefix, node_id))
         }

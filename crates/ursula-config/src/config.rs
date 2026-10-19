@@ -199,9 +199,9 @@ pub struct RaftConfig {
     pub bootstrap_peer_connect: HumanDuration,
     /// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
     /// The receiver downloads the referenced object, writes its own copy of
-    /// it and checks the copy before it installs and replies, so with S3
-    /// snapshots it must cover those three requests under
-    /// `storage.snapshot.timeout` and `max_retries`
+    /// it and checks the copy before it installs and replies, so on a
+    /// cluster node with S3 snapshots it must cover those requests under
+    /// `storage.snapshot.s3_timeout` and `s3_max_retries`
     /// ([`RaftSnapshotConfig::install_copy_budget`]), or the config is
     /// refused. A node also runs a further snapshot GC pass this long after
     /// a write of its own that failed, for a PUT that lands late.
@@ -695,19 +695,21 @@ pub struct RaftSnapshotConfig {
     /// Per-attempt timeout of an S3 snapshot-store request. The snapshot
     /// store has a request budget of its own, apart from the cold store's
     /// (`storage.cold.s3.timeout`), so that a follower's copy of a snapshot
-    /// it installs, a GET, a PUT and a HEAD, fits inside
-    /// `raft.install_snapshot_timeout`
-    /// ([`RaftSnapshotConfig::install_copy_budget`]).
-    pub timeout: HumanDuration,
+    /// it installs fits inside `raft.install_snapshot_timeout`
+    /// ([`RaftSnapshotConfig::install_copy_budget`]). A PUT is one attempt
+    /// of the whole object, so this also covers a healthy GET or PUT of the
+    /// largest snapshot.
+    pub s3_timeout: HumanDuration,
     /// Retries of an S3 snapshot-store request.
-    pub max_retries: usize,
+    pub s3_max_retries: usize,
 }
 
 impl RaftSnapshotConfig {
-    /// The snapshot-store requests a follower's install copy sends one after
-    /// another: the GET of the leader's object, the PUT of its own copy and
-    /// the HEAD that checks the copy.
-    pub const INSTALL_COPY_REQUESTS: u32 = 3;
+    /// The snapshot-store requests a follower's install copy can send one
+    /// after another: the GET of the leader's object, the PUT of its own
+    /// copy, a second PUT under a new name when the first one's name is
+    /// taken, and the HEAD that checks the copy.
+    pub const INSTALL_COPY_REQUESTS: u32 = 4;
 
     /// The snapshot prefix this config names, `snapshots` when unset.
     pub fn snapshot_prefix(&self) -> SnapshotPrefix {
@@ -717,11 +719,12 @@ impl RaftSnapshotConfig {
     /// The longest one snapshot-store request can take
     /// ([`s3_operation_budget`]).
     pub fn request_budget(&self) -> Duration {
-        s3_operation_budget(self.timeout.as_duration(), self.max_retries)
+        s3_operation_budget(self.s3_timeout.as_duration(), self.s3_max_retries)
     }
 
-    /// The longest a follower's install copy can take: its three requests,
-    /// each to the end of [`Self::request_budget`]. It must fit inside
+    /// The longest a follower's install copy can take: its
+    /// [`Self::INSTALL_COPY_REQUESTS`] requests, each to the end of
+    /// [`Self::request_budget`]. It must fit inside
     /// `raft.install_snapshot_timeout`, or the leader's send ends first and
     /// the follower answers it only once the leader sends again.
     pub fn install_copy_budget(&self) -> Duration {
@@ -737,9 +740,9 @@ impl Default for RaftSnapshotConfig {
             s3_prefix: None,
             drive_interval: None,
             // 22 s per request with its retry and backoff, so a copy takes
-            // at most 66 s of the default 120 s install timeout.
-            timeout: HumanDuration::sec(10),
-            max_retries: 1,
+            // at most 88 s of the default 120 s install timeout.
+            s3_timeout: HumanDuration::sec(10),
+            s3_max_retries: 1,
         }
     }
 }
