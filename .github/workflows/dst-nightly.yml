@@ -19,6 +19,11 @@ jobs:
   deterministic-simulation-nightly:
     name: Deterministic simulation nightly
     runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    permissions:
+      actions: read
+      contents: read
+      issues: write
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -752,6 +757,28 @@ jobs:
             target/ursula-sim-runtime-raft-cold-live-write-recovery
             target/ursula-sim-result-summary
           if-no-files-found: ignore
+
+      # One issue with a stable title collects every scheduled failure. The
+      # repository is public, so the comment carries only the run link and
+      # the names of the failing steps.
+      - name: Report a scheduled failure
+        if: failure() && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: DST Nightly failing on main
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          failed="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs" \
+            --jq '[.jobs[].steps[] | select(.conclusion == "failure") | .name] | join(", ")')"
+          body="$(printf 'Run %s failed.\n\nFailing steps: %s' "$RUN_URL" "${failed:-unknown}")"
+          issue="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --search "\"$TITLE\" in:title" --limit 20 --json number,title \
+            --jq "[.[] | select(.title == \"$TITLE\")][0].number // empty")"
+          if test -n "$issue"; then
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$body"
+          fi
 
       - name: Upload simulation result summary
         if: always()

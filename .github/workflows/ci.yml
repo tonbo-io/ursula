@@ -68,6 +68,10 @@ jobs:
         with:
           rustflags: ""
 
+      # Pure Python and fast. The simulation itself runs in dst-nightly.yml.
+      - name: Audit DST guards
+        run: python3 -m scripts.dst all
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 

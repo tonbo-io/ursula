@@ -298,7 +298,7 @@ RUSTFLAGS="--cfg madsim" cargo run -p ursula-sim --bin ursula-sim -- minimize \
   --output minimized.json
 ```
 
-**DST Nightly CI** runs a comprehensive seed sweep (seeds 60-199+) with both passing and expected-failure scenarios. It is the only workflow that runs DST: pull request CI does not, so check the latest nightly run before cutting a release.
+**DST Nightly CI** runs a comprehensive seed sweep (seeds 60-199+) with both passing and expected-failure scenarios. It is the only workflow that runs DST: pull request CI runs only the `scripts.dst` audits. Before releasing, dispatch DST Nightly on the release HEAD (`gh workflow run dst-nightly.yml --ref <branch>`). The Stable Release workflow requires a successful DST Nightly run for the released commit.
 
 ### 6. Property-Based Tests
 
@@ -354,6 +354,7 @@ a successful push CI run on that branch: `main` for its own version, or
 `release/<major>.<minor>` for a patch to that line. `main` carries the next
 minor, so patches to a released line ship from its release branch (0.7.x from
 `release/0.7`). The image attestations name that branch as the source ref.
+The commit also needs a successful DST Nightly run, dispatched on that branch.
 
 GHCR holds only what tagged stable releases publish: the images, the charts,
 and nothing else. Image indexes carry no attestation manifests. Commit

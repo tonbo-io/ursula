@@ -89,6 +89,19 @@ jobs:
             --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .headBranch == "'"$branch"'" and .conclusion == "success")] | length')"
           test "$successful_ci" -ge 1
 
+          # Pull requests do not run deterministic simulation, and the
+          # nightly cron runs only on the default branch, so dispatch DST
+          # Nightly on the release HEAD and wait for it to pass first.
+          successful_dst="$(gh run list \
+            --repo "$REPOSITORY" \
+            --workflow "DST Nightly" \
+            --commit "$SOURCE_REVISION" \
+            --status success \
+            --limit 20 \
+            --json conclusion,headSha \
+            --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .conclusion == "success")] | length')"
+          test "$successful_dst" -ge 1
+
           tag="v${RELEASE_VERSION}"
           if tag_ref="$(gh api "repos/$REPOSITORY/git/ref/tags/$tag" 2>/dev/null)"; then
             tag_sha="$(jq -r .object.sha <<<"$tag_ref")"

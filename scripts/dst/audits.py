@@ -514,6 +514,11 @@ def audit_ci_shape(argv: list[str]) -> int:
     non-ignored `*_replays` simulation test."""
     argparse.ArgumentParser(prog="dst ci-shape").parse_args(argv)
 
+    path = NIGHTLY_WORKFLOW
+    if not path.exists():
+        print(f"ERROR: {rel(path)} is missing.", file=sys.stderr)
+        return 1
+
     unwired = _unwired_replay_tests()
     if unwired:
         print("ERROR: `*_replays` tests no nightly workflow filter runs:", file=sys.stderr)
@@ -526,15 +531,13 @@ def audit_ci_shape(argv: list[str]) -> int:
         return 1
 
     violations: list[str] = []
-    path = NIGHTLY_WORKFLOW
-    if path.exists():
-        text = path.read_text()
-        for m in MULTI_ELEMENT_SHAPE_RE.finditer(text):
-            line_no = text.count("\n", 0, m.start()) + 1
-            snippet = m.group(0).replace("\n", " ").strip()
-            if len(snippet) > 110:
-                snippet = snippet[:107] + "..."
-            violations.append(f"  {rel(path)}:{line_no}  {snippet}")
+    text = path.read_text()
+    for m in MULTI_ELEMENT_SHAPE_RE.finditer(text):
+        line_no = text.count("\n", 0, m.start()) + 1
+        snippet = m.group(0).replace("\n", " ").strip()
+        if len(snippet) > 110:
+            snippet = snippet[:107] + "..."
+        violations.append(f"  {rel(path)}:{line_no}  {snippet}")
 
     if violations:
         print("ERROR: multi-element strict-equality step assertions found in the nightly workflow:",

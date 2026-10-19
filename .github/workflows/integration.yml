@@ -50,7 +50,7 @@ jobs:
           rustflags: ""
 
       # Integration test targets only (`tests/*.rs` of every crate); lib and bin unit tests run
-      # in ci.yml. ursula-sim runs under madsim in ci.yml's DST job. Built before any AWS
+      # in ci.yml. ursula-sim runs under madsim in dst-nightly.yml. Built before any AWS
       # credential exists.
       - name: Build all integration targets
         run: $NO_OIDC cargo test --workspace --exclude ursula-sim --test '*' --no-run
