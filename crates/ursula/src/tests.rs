@@ -259,7 +259,7 @@ fn runtime_error_status_prefers_stream_error_code_over_message_text() {
 }
 
 #[test]
-fn runtime_error_status_does_not_parse_infra_message_as_stream_error() {
+fn an_infra_error_answers_internal_whatever_response_it_names() {
     let err = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(0),

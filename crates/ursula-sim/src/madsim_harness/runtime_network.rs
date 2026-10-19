@@ -17,6 +17,7 @@ use std::time::Duration;
 use openraft::BasicNode;
 use openraft::Config;
 use openraft::SnapshotPolicy;
+use openraft::metrics::WaitError;
 use openraft::storage::RaftLogStorage;
 use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
@@ -57,7 +58,7 @@ pub(super) enum RuntimeNetworkError {
     NoSuccessor {
         raft_group_id: RaftGroupId,
         #[source]
-        source: openraft::metrics::WaitError,
+        source: WaitError,
     },
     #[error("raft group {} names no leader after its election", .raft_group_id.0)]
     SuccessorMissing { raft_group_id: RaftGroupId },
@@ -67,6 +68,24 @@ pub(super) enum RuntimeNetworkError {
     NoLogStore { node_id: u64 },
     #[error(transparent)]
     Engine(#[from] GroupEngineError),
+}
+
+/// A wait of `raft_group_id` for its first leader that did not see one, as
+/// the Raft engine's factory converts it.
+fn leader_wait_error(raft_group_id: RaftGroupId, error: WaitError) -> GroupEngineError {
+    match error {
+        WaitError::Timeout(..) => {
+            tracing::warn!(raft_group_id = raft_group_id.0, %error, "the group observed no expected leader in time");
+            GroupEngineError::Infra(GroupInfraError::LeaderWaitTimedOut {
+                raft_group_id,
+                timeout_ms: u64::try_from(LEADER_WAIT.as_millis()).unwrap_or(u64::MAX),
+            })
+        }
+        WaitError::ShuttingDown => {
+            tracing::debug!(%error, "owner Raft operation stopped");
+            GroupEngineError::Infra(GroupInfraError::OwnerStopped)
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -395,7 +414,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 election_timeout_max_ms: config.election_timeout_max,
             };
             let config = Arc::new(config.validate().map_err(|err| {
-                tracing::warn!(error = %err, "invalid OpenRaft config");
+                tracing::error!(error = %err, "OpenRaft refused the group's Raft config");
                 GroupEngineError::Infra(invalid_config)
             })?);
             let mut nodes = BTreeMap::new();
@@ -444,13 +463,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 .wait(Some(LEADER_WAIT))
                 .metrics(|metrics| metrics.current_leader.is_some(), "leader elected")
                 .await
-                .map_err(|err| {
-                    tracing::warn!(error = %err, "the runtime raft group elected no leader");
-                    GroupEngineError::Infra(GroupInfraError::LeaderWaitTimedOut {
-                        raft_group_id: placement.raft_group_id,
-                        timeout_ms: u64::try_from(LEADER_WAIT.as_millis()).unwrap_or(u64::MAX),
-                    })
-                })?;
+                .map_err(|err| leader_wait_error(placement.raft_group_id, err))?;
             let leader_id = leader_metrics.current_leader.expect("leader id");
             leaders
                 .lock()

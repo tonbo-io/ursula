@@ -86,6 +86,7 @@ use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::Proposal;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::ResponseKind;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
@@ -1277,7 +1278,12 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
         }
         "internal" => {
             node.create(path, TEXT, b"").await;
-            node.fail_next_write(GroupEngineError::Infra(GroupInfraError::OwnerStopped));
+            node.fail_next_write(GroupEngineError::Infra(
+                GroupInfraError::UnexpectedResponse {
+                    expected: ResponseKind::Append,
+                    actual: ResponseKind::Missing,
+                },
+            ));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
         "cold-store-failed" => {

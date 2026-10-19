@@ -201,12 +201,12 @@ fn runtime_error_status_classifies_retryable_and_permanent_errors() {
     };
     assert_eq!(conflict.status(), ErrorStatus::Permanent);
 
-    let internal = RuntimeError::GroupEngine {
+    let outcome_unknown = RuntimeError::GroupEngine {
         core_id: CoreId(0),
         raft_group_id: RaftGroupId(0),
         error: GroupEngineError::Infra(GroupInfraError::OutcomeUnknown),
     };
-    assert_eq!(internal.status(), ErrorStatus::Persistent);
+    assert_eq!(outcome_unknown.status(), ErrorStatus::Persistent);
 }
 
 #[test]
@@ -2394,6 +2394,119 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
         .expect_err("the reclaimed cold chunk is no longer readable");
 }
 
+/// Publishes two 4-byte cold chunks, `{name}-0` and `{name}-4`, over the
+/// first 8 bytes of `stream`, in its live cold generation.
+async fn flush_two_chunks(
+    runtime: &ShardRuntime,
+    cold_store: &ColdStore,
+    stream: &BucketStreamId,
+    name: &str,
+) {
+    for (start, end, payload) in [(0, 4, b"abcd".as_slice()), (4, 8, b"efgh".as_slice())] {
+        let chunk = ColdChunkRef {
+            start_offset: start,
+            end_offset: end,
+            s3_path: format!("{}/chunks/{name}-{start}.bin", stream.stream_id),
+            object_size: 4,
+            ..Default::default()
+        };
+        cold_store
+            .write_chunk(&chunk.s3_path, payload)
+            .await
+            .expect("write input chunk");
+        runtime
+            .flush_cold(FlushColdRequest {
+                cold_generation: live_cold_generation(runtime, stream).await,
+                stream_id: stream.clone(),
+                chunk,
+            })
+            .await
+            .expect("flush input chunk");
+    }
+}
+
+/// A compaction pass whose input chunks are no longer in the stream's cold
+/// index (the stream was recreated and its new index holds other chunks)
+/// deletes the replacement it wrote and goes on with the next stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_cold_compaction_deletes_its_replacement_and_goes_on() {
+    let cold_store = Arc::new(memory_cold_store());
+    let runtime = spawn_with_cold_store(RuntimeConfig::new(2, 8), cold_store.clone());
+    let stale_group = RaftGroupId(1);
+    let live_group = RaftGroupId(2);
+    let stale = stream_on_group(&runtime, stale_group, "stale-compact");
+    let live = stream_on_group(&runtime, live_group, "live-compact");
+    for stream in [&stale, &live] {
+        create_stream(&runtime, stream).await;
+        append_bytes(&runtime, stream, b"abcdefgh").await;
+        flush_two_chunks(&runtime, &cold_store, stream, "old").await;
+    }
+    for group in [stale_group, live_group] {
+        runtime
+            .repair_cold_index_group_once(group, 16)
+            .await
+            .expect("repair step");
+    }
+    assert_eq!(runtime.compaction_debt_pages(), 2);
+
+    // The recorded debt names the stale stream's first incarnation. Its
+    // second one indexes other chunks over the same offsets.
+    let stale_generation = live_cold_generation(&runtime, &stale).await;
+    runtime
+        .delete_stream(DeleteStreamRequest {
+            stream_id: stale.clone(),
+            now_ms: 0,
+            if_incarnation: None,
+        })
+        .await
+        .expect("delete stream");
+    create_stream(&runtime, &stale).await;
+    append_bytes(&runtime, &stale, b"abcdefgh").await;
+    flush_two_chunks(&runtime, &cold_store, &stale, "new").await;
+    assert_ne!(
+        live_cold_generation(&runtime, &stale).await,
+        stale_generation
+    );
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = events.clone();
+    cold_store.set_observer(move |event| {
+        observed.lock().expect("event mutex").push(event);
+    });
+    assert_eq!(
+        runtime
+            .compact_cold_once(8, 16, 2, 0)
+            .await
+            .expect("a stale input does not stop the pass"),
+        1
+    );
+
+    let stale_dir = crate::cold_store::cold_chunk_dir(&stale, stale_generation);
+    let events = events.lock().expect("event mutex");
+    let written = events
+        .iter()
+        .find_map(|event| match event {
+            ColdStoreEvent::WriteChunkComplete { path, .. } if path.starts_with(&stale_dir) => {
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .expect("the stale stream's replacement was written");
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            ColdStoreEvent::DeleteChunkComplete { path } if *path == written
+        )),
+        "the stale replacement was not deleted: {events:?}"
+    );
+    drop(events);
+    let read = runtime
+        .read_stream(read_req(live, 0, 8))
+        .await
+        .expect("read compacted stream");
+    assert_eq!(read.payload, b"abcdefgh");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
     let cold_store = Arc::new(memory_cold_store());
@@ -3615,7 +3728,7 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
     assert_eq!(err, RuntimeError::GroupEngine {
         core_id: placement.core_id,
         raft_group_id: placement.raft_group_id,
-        error: proposal_rejected(),
+        error: outcome_unknown(),
     });
     assert_eq!(runtime.metrics().snapshot().accepted_appends, 0);
 }
@@ -4525,9 +4638,9 @@ impl GroupEngineFactory for FailingFactory {
 
 struct FailingEngine;
 
-/// What every operation of [`FailingEngine`] answers: a proposal whose
-/// outcome is unknown.
-fn proposal_rejected() -> GroupEngineError {
+/// What every operation of [`FailingEngine`] answers: a write whose outcome
+/// is unknown.
+fn outcome_unknown() -> GroupEngineError {
     GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
 }
 
@@ -4550,7 +4663,7 @@ impl GroupEngine for FailingEngine {
         _placement: ShardPlacement,
         _admission: ColdWriteAdmission,
     ) -> GroupCreateStreamFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn head_stream<'a>(
@@ -4558,7 +4671,7 @@ impl GroupEngine for FailingEngine {
         _request: HeadStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupHeadStreamFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn read_stream<'a>(
@@ -4566,7 +4679,7 @@ impl GroupEngine for FailingEngine {
         _request: ReadStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupReadStreamFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn touch_stream_access<'a>(
@@ -4576,7 +4689,7 @@ impl GroupEngine for FailingEngine {
         _renew_ttl: bool,
         _placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn close_stream<'a>(
@@ -4584,7 +4697,7 @@ impl GroupEngine for FailingEngine {
         _request: CloseStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupCloseStreamFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn delete_stream<'a>(
@@ -4592,7 +4705,7 @@ impl GroupEngine for FailingEngine {
         _request: DeleteStreamRequest,
         _placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn append<'a>(
@@ -4601,18 +4714,18 @@ impl GroupEngine for FailingEngine {
         _placement: ShardPlacement,
         _admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn snapshot<'a>(&'a mut self, _placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 
     fn install_snapshot<'a>(
         &'a mut self,
         _snapshot: GroupSnapshot,
     ) -> GroupInstallSnapshotFuture<'a> {
-        Box::pin(async { Err(proposal_rejected()) })
+        Box::pin(async { Err(outcome_unknown()) })
     }
 }
 
