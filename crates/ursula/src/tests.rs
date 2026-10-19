@@ -10,7 +10,6 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
-use openraft::EmptyNode;
 use openraft::RaftNetworkV2;
 use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
@@ -4789,7 +4788,7 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .expect("late learner group");
     let learner_added = leader_raft
         // The leader takes node 3's address from `raft.peers`.
-        .add_learner(3, EmptyNode {}, true)
+        .add_learner(3, true)
         .await
         .expect("add late learner over gRPC");
     late_learner
