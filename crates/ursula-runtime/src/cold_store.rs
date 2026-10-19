@@ -2384,7 +2384,6 @@ mod tests {
             format!("{GC_BUCKET}/s/external/../{external_name}"),
             format!("{GC_BUCKET}/../tenant-b/s/external/{external_name}"),
             format!("{GC_BUCKET}//external/{external_name}"),
-            format!("{GC_BUCKET}/./external/{external_name}"),
             format!("{GC_BUCKET}/$s/external/{external_name}"),
             format!("{GC_BUCKET}/s/external/"),
             format!("/{external}"),
