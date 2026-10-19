@@ -54,7 +54,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use ursula_shard::RaftGroupId;
 
-use super::SplitMix64;
 use super::invariants::SnapshotStoreView;
 use super::invariants::StoreDelete;
 use super::invariants::ViewObject;
@@ -79,6 +78,7 @@ use crate::snapshot_store::SnapshotStoreFuture;
 use crate::snapshot_store::StagedObject;
 use crate::snapshot_store::StagedSnapshot;
 use crate::snapshot_store::StoredSnapshot;
+use crate::split_mix::SplitMix64;
 
 /// The zstd level of staged objects, as the S3 store compresses them.
 const ZSTD_LEVEL: i32 = 3;

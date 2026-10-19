@@ -11,7 +11,7 @@
     "path": "crates/ursula-runtime/src/cold_store.rs",
     "snippet_contains": "SystemTime::now()",
     "reason": "already-cfg-gated",
-    "plan": "no action: cold_object_unix_nanos() is split: cfg(not(madsim)) calls SystemTime::now(), cfg(madsim) returns 0. Under cfg(madsim) the per-thread object sequence keeps names unique within a run, and a run's fresh thread numbers its objects from zero (#638)."
+    "plan": "no action: cold_object_unix_nanos() is split: cfg(not(madsim)) calls SystemTime::now(), cfg(madsim) returns 0. Under cfg(madsim) cold_object_nonce() draws from a SplitMix64 seeded with the madsim seed, one sequence per runtime, never from madsim's own generator, so a seed replays its names (#638)."
   },
   {
     "category": "system_time_now",

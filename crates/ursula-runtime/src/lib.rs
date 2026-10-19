@@ -38,6 +38,9 @@
 //! - `snapshot_harness` (madsim, tests and `test-support` only): a faulty
 //!   in-memory snapshot store, a store wrapper with named gates, and the
 //!   checkers of the snapshot ownership invariants I1 to I5 (#687).
+//! - `split_mix` (madsim, tests and `test-support` only): the seeded
+//!   generator of the snapshot store harness and of the cold object nonces
+//!   under madsim.
 
 mod admission;
 pub mod cold_index;
@@ -63,6 +66,8 @@ mod rt;
 mod runtime;
 mod s3_sse;
 mod snapshot_store;
+#[cfg(any(madsim, test, feature = "test-support"))]
+mod split_mix;
 pub mod tidy_worker;
 mod trace;
 
