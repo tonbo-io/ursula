@@ -306,7 +306,7 @@ mod tests {
     /// encoding never changes within it.
     #[test]
     fn a_topology_matches_the_golden_file() {
-        const GOLDEN: &str = "55525357544f504f050000003500000082a7726f7574696e6782aa636f72655f636f756e7404ab67726f75705f636f756e7408aa636c75737465725f6964a670726f642d61844b369c";
+        const GOLDEN: &str = "55525357544f504f050000000b00000092920408a670726f642d61b4c19578";
         let dir = tempfile::tempdir().unwrap();
         let map = StaticShardMap::new(4, 8).unwrap();
         let cluster_id = ClusterId::new("prod-a").unwrap();

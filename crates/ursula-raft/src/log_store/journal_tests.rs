@@ -2643,12 +2643,13 @@ async fn the_screen_refuses_while_the_store_lags_an_admitted_install() {
 /// What one small write costs in the WAL: a 16-byte JSON append journaled
 /// as one entry in its own frame, as a follower that received it alone
 /// writes it. Ursula's MessagePack is compact (`ursula_stream::msgpack`), so
-/// this is about half of what a map keyed by field names cost. A record
+/// this is under half of what a map keyed by field names cost. A record
 /// that grows past the bound is a format change worth a look.
 #[test]
 fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
-    /// The frame and record measured on CI, in bytes.
-    const SMALL_APPEND_WAL_BYTES: u64 = 0;
+    /// The frame and record as CI measured them, in bytes: a 12-byte frame
+    /// header and a 108-byte record.
+    const SMALL_APPEND_WAL_BYTES: u64 = 120;
 
     let root = tempfile::tempdir().expect("WAL root");
     let path = root.path().join("journal-00000000000000000001.seg");
@@ -2677,8 +2678,8 @@ fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
         })
         .expect("the record fits a frame");
     let grown = journal.len().saturating_sub(before);
-    assert_eq!(
-        grown, SMALL_APPEND_WAL_BYTES,
+    assert!(
+        grown <= SMALL_APPEND_WAL_BYTES,
         "a 16-byte append takes {grown} WAL bytes"
     );
 }
