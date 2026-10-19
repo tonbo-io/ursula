@@ -404,18 +404,10 @@ pub(crate) struct CoreFileLogWriter {
     groups: Arc<Mutex<CoreGroups>>,
     group_cache_bytes: u64,
     worker: Option<WriterWorker>,
-    /// Closes once the worker has stopped and released the journal's lock,
-    /// whoever stops it.
+    /// Closes once the worker has stopped, whoever stops it.
     exited: WriterExited,
-}
-
-/// What a writer's worker drops when it ends, in this order: the journal's
-/// lock, then the exit signal, so a writer that sees the signal closed finds
-/// the journal free.
-#[derive(Debug)]
-struct WorkerExit {
+    /// Released after the worker has stopped (see `Drop`).
     _lock: DiskLock,
-    _exited: crate::rt::sync::watch::Sender<()>,
 }
 
 /// Every group of a core: its log, and what the metadata file recorded for
@@ -807,10 +799,7 @@ impl CoreFileLogWriter {
             maintenance: Vec::new(),
         };
         let (exited_tx, exited) = crate::rt::sync::watch::channel(());
-        let worker = spawn_core_file_log_writer(Box::new(journal), rx, WorkerExit {
-            _lock: lock,
-            _exited: exited_tx,
-        })?;
+        let worker = spawn_core_file_log_writer(Box::new(journal), rx, exited_tx)?;
         Ok(Arc::new(Self {
             #[cfg(madsim)]
             pause,
@@ -822,6 +811,7 @@ impl CoreFileLogWriter {
             group_cache_bytes: cache_bytes,
             worker: Some(worker),
             exited,
+            _lock: lock,
         }))
     }
 
@@ -1037,7 +1027,7 @@ fn writer_name(dir: &Path) -> String {
 fn spawn_core_file_log_writer(
     journal: Box<CoreJournal>,
     rx: mpsc::UnboundedReceiver<CoreWriterRequest>,
-    exit: WorkerExit,
+    exited: crate::rt::sync::watch::Sender<()>,
 ) -> Result<WriterWorker, CoreJournalError> {
     let spawn_error = |source| CoreJournalError::SpawnWriter {
         source: Arc::new(source),
@@ -1053,7 +1043,7 @@ fn spawn_core_file_log_writer(
             runtime.block_on(tokio::task::unconstrained(run_core_file_log_writer(
                 journal, rx,
             )));
-            drop(exit);
+            drop(exited);
         })
         .map_err(spawn_error)
 }
@@ -1063,12 +1053,12 @@ fn spawn_core_file_log_writer(
 fn spawn_core_file_log_writer(
     journal: Box<CoreJournal>,
     rx: mpsc::UnboundedReceiver<CoreWriterRequest>,
-    exit: WorkerExit,
+    exited: crate::rt::sync::watch::Sender<()>,
 ) -> Result<WriterWorker, CoreJournalError> {
-    // An aborted task drops `exit` with its future.
+    // An aborted task drops `exited` with its future.
     Ok(crate::rt::spawn(async move {
         run_core_file_log_writer(journal, rx).await;
-        drop(exit);
+        drop(exited);
     }))
 }
 
