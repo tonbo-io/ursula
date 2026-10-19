@@ -152,7 +152,6 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::RecoveryPlanFenced { .. }
         | GroupInfraError::OwnerStopped
         | GroupInfraError::Internal { .. }
-        | GroupInfraError::ProtoDecode { .. }
         | GroupInfraError::UnexpectedResponse { .. }
         | GroupInfraError::MissingStreamId { .. }
         | GroupInfraError::Unsupported { .. }

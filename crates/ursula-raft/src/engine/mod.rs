@@ -27,21 +27,29 @@ use openraft::RaftNetworkFactory;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
 use ursula_runtime::AdvanceRetentionRequest;
+use ursula_runtime::AdvanceRetentionResponse;
 use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
+use ursula_runtime::AppendResponse;
 use ursula_runtime::BootstrapStreamRequest;
 use ursula_runtime::CloseStreamRequest;
+use ursula_runtime::CloseStreamResponse;
 use ursula_runtime::ColdIndexPageCache;
+use ursula_runtime::ColdOperation;
 use ursula_runtime::ColdOrphanSweepPlan;
 use ursula_runtime::ColdOrphanSweepRequest;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CompactColdRequest;
+use ursula_runtime::CompactColdResponse;
 use ursula_runtime::CreateStreamExternalRequest;
 use ursula_runtime::CreateStreamRequest;
+use ursula_runtime::CreateStreamResponse;
 use ursula_runtime::DeleteStreamRequest;
+use ursula_runtime::DeleteStreamResponse;
 use ursula_runtime::FlushColdRequest;
+use ursula_runtime::FlushColdResponse;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupAckColdGcFuture;
 use ursula_runtime::GroupAdvanceRetentionFuture;
@@ -59,6 +67,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupFlushColdFuture;
 use ursula_runtime::GroupHeadStreamFuture;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::GroupInstallSnapshotFuture;
 use ursula_runtime::GroupPlanColdFlushFuture;
 use ursula_runtime::GroupPlanColdGcFuture;
@@ -91,11 +100,13 @@ use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::Proposal;
 use ursula_runtime::PublishSnapshotRequest;
+use ursula_runtime::PublishSnapshotResponse;
 use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RepairColdIndexRequest;
 use ursula_runtime::RepairColdIndexResponse;
+use ursula_runtime::ResponseKind;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::StreamErrorCode;
@@ -105,6 +116,7 @@ use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
 use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
+use ursula_runtime::cold_store_failure;
 use ursula_runtime::collect_retained_cold_objects;
 use ursula_runtime::default_snapshot_store;
 use ursula_runtime::expiry_sweep;
@@ -125,9 +137,9 @@ use crate::forward::LeaderRoute;
 use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
-use crate::forward::group_engine_client_write_error;
 use crate::forward::leadership_refusal;
 use crate::forward::write_result_from_raft_response;
+use crate::openraft_error;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
@@ -277,7 +289,7 @@ impl EngineStopper {
             .raft
             .shutdown()
             .await
-            .map_err(|err| GroupEngineError::new(format!("shutdown OpenRaft group: {err}")));
+            .map_err(crate::owner::owner_stopped);
         // OpenRaft's shutdown leaves its state-machine worker and the
         // snapshot builds it spawned running, so the publication closes
         // here: a publication already running ends first, since
@@ -474,17 +486,13 @@ impl RaftGroupEngine {
     where
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
-        let config = Arc::new(
-            Config {
-                cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-                heartbeat_interval: 10,
-                election_timeout_min: 30,
-                election_timeout_max: 60,
-                ..Default::default()
-            }
-            .validate()
-            .map_err(|err| GroupEngineError::new(format!("invalid OpenRaft config: {err}")))?,
-        );
+        let config = Arc::new(openraft_error::validated_config(Config {
+            cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
+            heartbeat_interval: 10,
+            election_timeout_min: 30,
+            election_timeout_max: 60,
+            ..Default::default()
+        })?);
         Self::new_single_node(
             placement,
             1,
@@ -621,7 +629,7 @@ impl RaftGroupEngine {
                     Box::pin(async move { release.notified().await })
                 })
                 .await
-                .map_err(|err| GroupEngineError::new(format!("hold the worker: {err}")))?;
+                .map_err(crate::owner::owner_stopped)?;
             return Err(GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::LeaderWaitTimedOut {
                     raft_group_id: self.placement.raft_group_id,
@@ -629,21 +637,26 @@ impl RaftGroupEngine {
                 },
             ));
         }
-        let initialized = self.raft.is_initialized().await.map_err(|err| {
-            GroupEngineError::new(format!("check OpenRaft initialization: {err}"))
-        })?;
+        let raft_group_id = self.placement.raft_group_id;
+        let initialized = self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(crate::owner::owner_stopped)?;
         if !initialized {
             let mut nodes = BTreeMap::new();
             nodes.insert(node_id, node);
-            self.raft.initialize(nodes).await.map_err(|err| {
-                GroupEngineError::new(format!("initialize OpenRaft group: {err}"))
-            })?;
+            self.raft
+                .initialize(nodes)
+                .await
+                .map_err(|err| openraft_error::initialize_error(raft_group_id, err))?;
         }
+        let timeout = Duration::from_secs(2);
         self.raft
-            .wait(Some(Duration::from_secs(2)))
+            .wait(Some(timeout))
             .current_leader(node_id, "single-node OpenRaft group should elect itself")
             .await
-            .map_err(|err| GroupEngineError::new(format!("wait for OpenRaft leadership: {err}")))?;
+            .map_err(|err| openraft_error::leader_wait_error(raft_group_id, timeout, err))?;
         Ok(())
     }
 
@@ -846,7 +859,7 @@ impl RaftGroupEngine {
             apply_health
                 .check(placement.raft_group_id)
                 .err()
-                .unwrap_or_else(|| GroupEngineError::new(format!("create OpenRaft group: {err}")))
+                .unwrap_or_else(|| crate::owner::owner_stopped(&err))
         })?;
         // From here the Raft runs: the group opens again only once its work
         // ended, whether this engine starts or not (#709).
@@ -914,16 +927,18 @@ impl RaftGroupEngine {
         &self,
         nodes: BTreeMap<u64, BasicNode>,
     ) -> Result<(), GroupEngineError> {
-        let initialized = self.raft.is_initialized().await.map_err(|err| {
-            GroupEngineError::new(format!("check OpenRaft initialization: {err}"))
-        })?;
+        let initialized = self
+            .raft
+            .is_initialized()
+            .await
+            .map_err(crate::owner::owner_stopped)?;
         if initialized {
             return Ok(());
         }
         self.raft
             .initialize(nodes)
             .await
-            .map_err(|err| GroupEngineError::new(format!("initialize OpenRaft group: {err}")))
+            .map_err(|err| openraft_error::initialize_error(self.placement.raft_group_id, err))
     }
 
     pub async fn wait_for_current_leader(
@@ -936,7 +951,9 @@ impl RaftGroupEngine {
             .current_leader(node_id, "OpenRaft group should observe expected leader")
             .await
             .map(|_| ())
-            .map_err(|err| GroupEngineError::new(format!("wait for OpenRaft leadership: {err}")))
+            .map_err(|err| {
+                openraft_error::leader_wait_error(self.placement.raft_group_id, timeout, err)
+            })
     }
 
     pub fn raft_handle(&self) -> Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine> {
@@ -1044,12 +1061,7 @@ impl RaftGroupEngine {
         &self,
     ) -> Result<ursula_runtime::GroupSnapshot, GroupEngineError> {
         self.with_applied_state(move |state_machine| {
-            Box::pin(async move {
-                state_machine
-                    .group_snapshot()
-                    .await
-                    .map_err(|err| GroupEngineError::new(format!("group snapshot: {err}")))
-            })
+            Box::pin(async move { state_machine.group_snapshot().await })
         })
         .await?
     }
@@ -1094,16 +1106,21 @@ impl RaftGroupEngine {
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
         crate::forward::refuse_unless_leader(&self.raft)?;
+        let GroupWriteCommand::Stream(stream_command) = &command;
+        let expected = ResponseKind::answering(stream_command);
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             // Once submitted, a group that stops may already have committed
             // the command and applies it after repair: the outcome is unknown.
             Err(err) => {
                 let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
-                return Err(group_engine_client_write_error(err, &leadership));
+                return Err(openraft_error::group_engine_client_write_error(
+                    err,
+                    &leadership,
+                ));
             }
         };
-        write_result_from_raft_response(response.data)?
+        write_result_from_raft_response(response.data, expected)?
     }
 
     pub(crate) async fn forward_write_to_leader_if_follower(
@@ -1145,7 +1162,7 @@ impl RaftGroupEngine {
         self.raft
             .with_state_machine(f)
             .await
-            .map_err(|err| GroupEngineError::new(format!("OpenRaft state-machine access: {err}")))
+            .map_err(crate::owner::owner_stopped)
     }
 
     /// Run faulty code from now on, as a deployment of a buggy binary does.
@@ -1208,23 +1225,16 @@ impl RaftGroupEngine {
         {
             return Ok(None);
         }
-        let response = match self
-            .write(GroupWriteCommand::Stream(
+        let response = TouchStreamAccessResponse::try_from(
+            self.write(GroupWriteCommand::Stream(
                 StreamCommand::TouchStreamAccess {
                     stream_id: stream_id.clone(),
                     now_ms,
                     renew_ttl,
                 },
             ))
-            .await?
-        {
-            GroupWriteResponse::TouchStreamAccess(response) => response,
-            other => {
-                return Err(GroupEngineError::new(format!(
-                    "unexpected touch stream access write response: {other:?}"
-                )));
-            }
-        };
+            .await?,
+        )?;
         if response.expired {
             return Err(GroupEngineError::stream(
                 StreamErrorCode::StreamNotFound,
@@ -1424,23 +1434,13 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupCreateStreamFuture<'a> {
         if admission.max_hot_bytes_per_group.is_none() {
             return Box::pin(async move {
-                match self.write(GroupWriteCommand::from(request)).await? {
-                    GroupWriteResponse::CreateStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected create stream write response: {other:?}"
-                    ))),
-                }
+                CreateStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
             });
         }
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::CreateStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected create stream write response: {other:?}"
-                    ))),
-                };
+                return CreateStreamResponse::try_from(response);
             }
             self.with_state_machine({
                 let request = request.clone();
@@ -1453,12 +1453,7 @@ impl GroupEngine for RaftGroupEngine {
                 }
             })
             .await??;
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected create stream write response: {other:?}"
-                ))),
-            }
+            CreateStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -1470,12 +1465,7 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             // The state keeps the initial payload as a direct reference
             // (F14g), so the engine writes no page entry before proposing.
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::CreateStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected external create stream write response: {other:?}"
-                ))),
-            }
+            CreateStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -1815,21 +1805,11 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::PublishSnapshot(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected publish snapshot write response: {other:?}"
-                    ))),
-                };
+                return PublishSnapshotResponse::try_from(response);
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::PublishSnapshot(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected publish snapshot write response: {other:?}"
-                ))),
-            }
+            PublishSnapshotResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -1841,21 +1821,11 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::AdvanceRetention(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected advance retention write response: {other:?}"
-                    ))),
-                };
+                return AdvanceRetentionResponse::try_from(response);
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::AdvanceRetention(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected advance retention write response: {other:?}"
-                ))),
-            }
+            AdvanceRetentionResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -1870,19 +1840,9 @@ impl GroupEngine for RaftGroupEngine {
                 .forward_write_to_leader_if_follower(command.clone())
                 .await?
             {
-                return match response {
-                    GroupWriteResponse::ImportGroupState(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected group state import response: {other:?}"
-                    ))),
-                };
+                return ursula_runtime::ImportGroupStateResponse::try_from(response);
             }
-            match self.write(command).await? {
-                GroupWriteResponse::ImportGroupState(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected group state import response: {other:?}"
-                ))),
-            }
+            ursula_runtime::ImportGroupStateResponse::try_from(self.write(command).await?)
         })
     }
 
@@ -1898,19 +1858,9 @@ impl GroupEngine for RaftGroupEngine {
                 .forward_write_to_leader_if_follower(command.clone())
                 .await?
             {
-                return match response {
-                    GroupWriteResponse::TidyStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected tidy stream write response: {other:?}"
-                    ))),
-                };
+                return ursula_runtime::TidyStreamResponse::try_from(response);
             }
-            match self.write(command).await? {
-                GroupWriteResponse::TidyStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected tidy stream write response: {other:?}"
-                ))),
-            }
+            ursula_runtime::TidyStreamResponse::try_from(self.write(command).await?)
         })
     }
 
@@ -1950,7 +1900,14 @@ impl GroupEngine for RaftGroupEngine {
                         object,
                     )
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    .map_err(|err| {
+                        cold_store_failure(
+                            ColdOperation::IndexExternalObject {
+                                stream_id: candidate.stream_id.clone(),
+                            },
+                            err,
+                        )
+                    })?;
                     report.page_entries_clipped =
                         report.page_entries_clipped.saturating_add(clipped);
                 }
@@ -1961,16 +1918,15 @@ impl GroupEngine for RaftGroupEngine {
                     stream_id: candidate.stream_id,
                     refs: candidate.refs,
                 });
-                match self.write(command).await {
-                    Ok(GroupWriteResponse::OffloadColdRefs(response)) => {
+                match self
+                    .write(command)
+                    .await
+                    .and_then(ursula_runtime::OffloadStreamColdRefsResponse::try_from)
+                {
+                    Ok(response) => {
                         report.streams = report.streams.saturating_add(1);
                         report.refs_offloaded =
                             report.refs_offloaded.saturating_add(response.removed);
-                    }
-                    Ok(other) => {
-                        return Err(GroupEngineError::new(format!(
-                            "unexpected offload cold refs write response: {other:?}"
-                        )));
                     }
                     Err(err) if err.code().is_some() => {
                         report.rejected = report.rejected.saturating_add(1);
@@ -2086,21 +2042,16 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupTouchStreamAccessFuture<'a> {
         Box::pin(async move {
-            match self
-                .write(GroupWriteCommand::Stream(
+            TouchStreamAccessResponse::try_from(
+                self.write(GroupWriteCommand::Stream(
                     StreamCommand::TouchStreamAccess {
                         stream_id,
                         now_ms,
                         renew_ttl,
                     },
                 ))
-                .await?
-            {
-                GroupWriteResponse::TouchStreamAccess(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected touch stream access write response: {other:?}"
-                ))),
-            }
+                .await?,
+            )
         })
     }
 
@@ -2156,21 +2107,11 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::CloseStream(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected close stream write response: {other:?}"
-                    ))),
-                };
+                return CloseStreamResponse::try_from(response);
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::CloseStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected close stream write response: {other:?}"
-                ))),
-            }
+            CloseStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -2180,12 +2121,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a> {
         Box::pin(async move {
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::DeleteStream(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected delete stream write response: {other:?}"
-                ))),
-            }
+            DeleteStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -2210,17 +2146,12 @@ impl GroupEngine for RaftGroupEngine {
                 };
                 return forward_purge_bucket_to_leader(&route, self.placement, bucket_id).await;
             }
-            match self
-                .write(GroupWriteCommand::Stream(StreamCommand::PurgeBucket {
+            ursula_runtime::PurgeBucketResponse::try_from(
+                self.write(GroupWriteCommand::Stream(StreamCommand::PurgeBucket {
                     bucket_id,
                 }))
-                .await?
-            {
-                GroupWriteResponse::PurgeBucket(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected purge bucket write response: {other:?}"
-                ))),
-            }
+                .await?,
+            )
         })
     }
 
@@ -2230,17 +2161,12 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async move {
-            match self
-                .write(GroupWriteCommand::Stream(StreamCommand::AckColdGc {
+            ursula_runtime::AckColdGcResponse::try_from(
+                self.write(GroupWriteCommand::Stream(StreamCommand::AckColdGc {
                     up_to_seq,
                 }))
-                .await?
-            {
-                GroupWriteResponse::AckColdGc(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected ack cold gc write response: {other:?}"
-                ))),
-            }
+                .await?,
+            )
         })
     }
 
@@ -2251,18 +2177,13 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupDeferColdGcFuture<'a> {
         Box::pin(async move {
-            match self
-                .write(GroupWriteCommand::Stream(StreamCommand::DeferColdGc {
+            ursula_runtime::DeferColdGcResponse::try_from(
+                self.write(GroupWriteCommand::Stream(StreamCommand::DeferColdGc {
                     seq,
                     not_before_ms,
                 }))
-                .await?
-            {
-                GroupWriteResponse::DeferColdGc(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected defer cold gc write response: {other:?}"
-                ))),
-            }
+                .await?,
+            )
         })
     }
 
@@ -2347,7 +2268,7 @@ impl GroupEngine for RaftGroupEngine {
             let (report, compaction_pages) =
                 repair_cold_index_streams(&store, self.cold_index_cache.as_deref(), &inputs)
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                    .map_err(|err| cold_store_failure(ColdOperation::RepairIndex, err))?;
             // F14f: reclaim objects wholly below each visited stream's
             // retained offset once the retention grace has passed.
             if !retention_targets.is_empty() {
@@ -2449,9 +2370,13 @@ impl GroupEngine for RaftGroupEngine {
                 .map(|slot| {
                     slot?;
                     match responses.next() {
-                        Some(Ok(GroupWriteResponse::Append(response))) => Ok(response),
-                        Some(Err(error)) => Err(error),
-                        _ => Err(GroupEngineError::new("missing append batch response")),
+                        Some(response) => AppendResponse::try_from(response?),
+                        None => Err(GroupEngineError::Infra(
+                            GroupInfraError::UnexpectedResponse {
+                                expected: ResponseKind::Append,
+                                actual: ResponseKind::Missing,
+                            },
+                        )),
                     }
                 })
                 .collect()
@@ -2466,24 +2391,14 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::Append(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected external append write response: {other:?}"
-                    ))),
-                };
+                return AppendResponse::try_from(response);
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
             // F5: commit first, index after. Apply keeps the locator in
             // state and the offload pass writes the page entry once the
             // append committed.
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected external append write response: {other:?}"
-                ))),
-            }
+            AppendResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -2496,12 +2411,7 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             let command = GroupWriteCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
-                return match response {
-                    GroupWriteResponse::Append(response) => Ok(response),
-                    other => Err(GroupEngineError::new(format!(
-                        "unexpected append write response: {other:?}"
-                    ))),
-                };
+                return AppendResponse::try_from(response);
             }
             if admission.max_hot_bytes_per_group.is_some() {
                 self.with_state_machine({
@@ -2516,12 +2426,7 @@ impl GroupEngine for RaftGroupEngine {
                 })
                 .await??;
             }
-            match self.write(GroupWriteCommand::from(request)).await? {
-                GroupWriteResponse::Append(response) => Ok(response),
-                other => Err(GroupEngineError::new(format!(
-                    "unexpected append write response: {other:?}"
-                ))),
-            }
+            AppendResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
         })
     }
 
@@ -2554,7 +2459,14 @@ impl GroupEngine for RaftGroupEngine {
                     &request.chunk,
                 )
                 .await
-                .map_err(|err| GroupEngineError::new(err.to_string()))?;
+                .map_err(|err| {
+                    cold_store_failure(
+                        ColdOperation::IndexFlushedChunk {
+                            stream_id: request.stream_id.clone(),
+                        },
+                        err,
+                    )
+                })?;
                 // The clip rule may have removed stale entries that a cached
                 // page still holds.
                 if clipped_entries(&rollback) > 0
@@ -2564,14 +2476,9 @@ impl GroupEngine for RaftGroupEngine {
                 }
                 index_rollback = Some((store, rollback));
             }
+            let stream_id = request.stream_id.clone();
             let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
-                Ok(GroupWriteResponse::FlushCold(response)) => (Ok(response), false),
-                Ok(other) => (
-                    Err(GroupEngineError::new(format!(
-                        "unexpected flush cold write response: {other:?}"
-                    ))),
-                    false,
-                ),
+                Ok(response) => (FlushColdResponse::try_from(response), false),
                 Err(err) => {
                     // F14e: a refusal before proposal means the write was never
                     // proposed (RT1: only an entry OpenRaft appended and then
@@ -2587,9 +2494,7 @@ impl GroupEngine for RaftGroupEngine {
                 rollback_cold_index_pages(&store, rollback)
                     .await
                     .map_err(|err| {
-                        GroupEngineError::new(format!(
-                            "rollback cold index after flush rejection: {err}"
-                        ))
+                        cold_store_failure(ColdOperation::RollbackIndex { stream_id }, err)
                     })?;
             }
             result
@@ -2621,7 +2526,7 @@ impl GroupEngine for RaftGroupEngine {
                         &request.replacement,
                     )
                     .await
-                    .map_err(|err| GroupEngineError::new(err.to_string()))?
+                    .map_err(|err| index_compacted(&request.stream_id, err))?
                 } else {
                     let Some(rollback) =
                         replace_cold_chunk_index_pages_with_rollback_in_generation(
@@ -2632,24 +2537,21 @@ impl GroupEngine for RaftGroupEngine {
                             &request.replacement,
                         )
                         .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))?
+                        .map_err(|err| index_compacted(&request.stream_id, err))?
                     else {
-                        return Err(GroupEngineError::new(
-                            "cold compaction input no longer matches the cold index",
+                        return Err(GroupEngineError::Infra(
+                            GroupInfraError::ColdCompactionStale {
+                                stream_id: request.stream_id.clone(),
+                            },
                         ));
                     };
                     rollback
                 };
                 index_rollback = Some((store, rollback));
             }
+            let stream_id = request.stream_id.clone();
             let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
-                Ok(GroupWriteResponse::CompactCold(response)) => (Ok(response), false),
-                Ok(other) => (
-                    Err(GroupEngineError::new(format!(
-                        "unexpected compact cold write response: {other:?}"
-                    ))),
-                    false,
-                ),
+                Ok(response) => (CompactColdResponse::try_from(response), false),
                 Err(err) => {
                     // A refusal before proposal means the write was never
                     // proposed (RT1). A typed stream error was committed but the
@@ -2665,9 +2567,7 @@ impl GroupEngine for RaftGroupEngine {
                 rollback_cold_index_pages(&store, rollback)
                     .await
                     .map_err(|err| {
-                        GroupEngineError::new(format!(
-                            "rollback cold index after compaction failure: {err}"
-                        ))
+                        cold_store_failure(ColdOperation::RollbackIndex { stream_id }, err)
                     })?;
             }
             result
@@ -2677,12 +2577,7 @@ impl GroupEngine for RaftGroupEngine {
     fn snapshot<'a>(&'a mut self, _placement: ShardPlacement) -> GroupSnapshotFuture<'a> {
         Box::pin(async move {
             self.with_state_machine(move |state_machine| {
-                Box::pin(async move {
-                    state_machine
-                        .group_snapshot()
-                        .await
-                        .map_err(|err| GroupEngineError::new(err.to_string()))
-                })
+                Box::pin(async move { state_machine.group_snapshot().await })
             })
             .await?
         })
@@ -2703,6 +2598,16 @@ impl GroupEngine for RaftGroupEngine {
     fn shutdown<'a>(&'a mut self) -> ursula_runtime::GroupShutdownFuture<'a> {
         Box::pin(async move { RaftGroupEngine::shutdown(self).await })
     }
+}
+
+/// A cold-index write of a compaction's replacement chunk that failed.
+fn index_compacted(stream_id: &BucketStreamId, err: io::Error) -> GroupEngineError {
+    cold_store_failure(
+        ColdOperation::IndexCompactedChunk {
+            stream_id: stream_id.clone(),
+        },
+        err,
+    )
 }
 
 pub(crate) fn group_engine_io_error(err: ursula_runtime::GroupEngineError) -> io::Error {

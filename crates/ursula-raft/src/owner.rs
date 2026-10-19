@@ -490,7 +490,7 @@ impl OwnerTrigger {
 
 /// Keep the transport classification structured while recording the original fatal cause.
 pub(crate) fn owner_stopped(error: impl std::fmt::Display) -> GroupEngineError {
-    tracing::debug!(%error, "owner Raft operation stopped");
+    tracing::warn!(%error, "owner Raft operation stopped");
     GroupEngineError::Infra(ursula_runtime::GroupInfraError::OwnerStopped)
 }
 

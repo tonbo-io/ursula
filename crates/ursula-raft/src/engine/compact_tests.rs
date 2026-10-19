@@ -1,19 +1,24 @@
-//! Raft-engine regression test for `CompactCold` with all-shared inputs
-//! (bounded-stream-state F2, Raft branch): direct shared-to-exclusive
-//! compaction.
+//! Raft-engine tests of the cold-index writes around `FlushCold` and
+//! `CompactCold`: the regression test for `CompactCold` with all-shared
+//! inputs (bounded-stream-state F2, Raft branch, direct shared-to-exclusive
+//! compaction), and the error a failed cold-index write answers.
 
 use std::sync::Arc;
 
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdChunkRef;
+use ursula_runtime::ColdOperation;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::CompactColdRequest;
 use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::FlushColdRequest;
 use ursula_runtime::FollowerRead;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeConfig;
+use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::load_cold_chunks_from_pages;
 use ursula_shard::BucketStreamId;
@@ -144,4 +149,71 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
         .await
         .expect("read compacted stream");
     assert_eq!(read.payload, b"aaaa");
+}
+
+/// A cold-index write that fails in object storage is the cold tier's
+/// failure, naming its operation (`502 COLD_STORE_FAILED`), as on a single
+/// node.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_cold_index_write_is_a_cold_store_error() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn_raft_with_cold_store(RuntimeConfig::new(1, 1), cold_store.clone());
+    let stream = BucketStreamId::new("raft-cold-index", "unreadable-page");
+    create_and_append(&runtime, &stream, b"abcdefgh").await;
+    let chunk = |start: u64, end: u64| ColdChunkRef {
+        start_offset: start,
+        end_offset: end,
+        s3_path: format!("{stream}/chunks/{start:020}.bin"),
+        object_size: end - start,
+        ..Default::default()
+    };
+    let flush = |chunk: ColdChunkRef, payload: &'static [u8]| {
+        let runtime = &runtime;
+        let cold_store = &cold_store;
+        let stream = &stream;
+        async move {
+            cold_store
+                .write_chunk(&chunk.s3_path, payload)
+                .await
+                .expect("write chunk");
+            runtime
+                .flush_cold(FlushColdRequest {
+                    cold_generation: cold_generation(runtime, stream).await,
+                    stream_id: stream.clone(),
+                    chunk,
+                })
+                .await
+        }
+    };
+    flush(chunk(0, 4), b"abcd")
+        .await
+        .expect("index the first chunk");
+    // The stream's only page no longer decodes, so indexing the next chunk
+    // in it fails.
+    let pages = cold_store
+        .list_cold_index_pages()
+        .await
+        .expect("list pages");
+    for key in pages.iter().filter(|key| key.stream_id == stream) {
+        cold_store
+            .write_chunk(&key.path(), b"not a cold index page")
+            .await
+            .expect("overwrite the page");
+    }
+
+    let err = flush(chunk(4, 8), b"efgh")
+        .await
+        .expect_err("an undecodable page fails the index write");
+    assert!(
+        matches!(
+            &err,
+            RuntimeError::GroupEngine {
+                error: GroupEngineError::Infra(GroupInfraError::ColdStore {
+                    operation: ColdOperation::IndexFlushedChunk { stream_id },
+                }),
+                ..
+            } if *stream_id == stream
+        ),
+        "{err:?}"
+    );
 }

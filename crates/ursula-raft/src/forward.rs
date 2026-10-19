@@ -5,12 +5,14 @@ use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 use openraft::BasicNode;
 use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
+use ursula_runtime::AnswerProblem;
 use ursula_runtime::ErrorChain;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::ForwardFailure;
@@ -28,10 +30,12 @@ use ursula_runtime::Proposal;
 use ursula_runtime::PurgeBucketResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::ResponseKind;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
 use crate::GroupLeadership;
+use crate::codec::WireDecodeError;
 use crate::codec::decode_wire;
 use crate::codec::encode_wire;
 use crate::format_epoch::observe_outbound_status;
@@ -87,7 +91,7 @@ pub(crate) async fn forward_read_stream_to_leader(
     placement: ShardPlacement,
     request: ReadStreamRequest,
 ) -> Result<ReadStreamResponse, GroupEngineError> {
-    let read = read_stream_read_v1(&request)?;
+    let read = read_stream_read_v1(&request);
     forward_typed_read_to_leader(
         &route,
         placement,
@@ -108,22 +112,21 @@ pub(crate) fn head_stream_read_v1(
     }
 }
 
-/// The wire form of a forwarded read.
+/// The wire form of a forwarded read. A `max_len` beyond `u64` asks for
+/// everything either way, so it saturates.
 pub(crate) fn read_stream_read_v1(
     request: &ReadStreamRequest,
-) -> Result<raft_internal_proto::ReadStreamReadV1, GroupEngineError> {
-    let max_len = u64::try_from(request.max_len)
-        .map_err(|_overflow| GroupEngineError::new("read max_len does not fit u64"))?;
-    Ok(raft_internal_proto::ReadStreamReadV1 {
+) -> raft_internal_proto::ReadStreamReadV1 {
+    raft_internal_proto::ReadStreamReadV1 {
         offset: request.offset,
-        max_len,
+        max_len: u64::try_from(request.max_len).unwrap_or(u64::MAX),
         leader_only: request.leader_only,
         follower: match request.follower {
             FollowerRead::Prefix => raft_internal_proto::FollowerReadV1::Prefix,
             FollowerRead::Immutable => raft_internal_proto::FollowerReadV1::Immutable,
         }
         .into(),
-    })
+    }
 }
 
 /// Forward one leader-only read to the leader over gRPC and decode the
@@ -135,17 +138,41 @@ async fn forward_typed_read_to_leader<T>(
     placement: ShardPlacement,
     stream_id: BucketStreamId,
     now_ms: u64,
-    what: &str,
+    what: &'static str,
     read: raft_internal_proto::group_read_request_v1::Read,
 ) -> Result<T, GroupEngineError>
 where
     T: DeserializeOwned,
 {
     let response = forward_group_read_to_leader(route, placement, stream_id, now_ms, read).await?;
-    if response.ok {
-        decode_wire(&response.payload, what)
+    forwarded_answer(
+        ForwardedRpc::GroupRead,
+        response.ok,
+        &response.payload,
+        what,
+    )
+}
+
+/// A forwarded RPC's answer: the leader's response when `ok`, else the
+/// leader's error, which keeps its type. An answer that does not decode is
+/// [`AnswerProblem::Undecodable`]; the decode error is logged here.
+fn forwarded_answer<T: DeserializeOwned>(
+    rpc: ForwardedRpc,
+    ok: bool,
+    payload: &[u8],
+    what: &'static str,
+) -> Result<T, GroupEngineError> {
+    let undecodable = |error: WireDecodeError| {
+        tracing::warn!(%rpc, error = %ErrorChain(&error), "forwarded answer does not decode");
+        GroupEngineError::Infra(GroupInfraError::ForwardedAnswerInvalid {
+            rpc,
+            problem: AnswerProblem::Undecodable,
+        })
+    };
+    if ok {
+        decode_wire(payload, what).map_err(undecodable)
     } else {
-        Err(decode_wire::<GroupEngineError>(&response.payload, what)?)
+        Err(decode_wire::<GroupEngineError>(payload, what).map_err(undecodable)?)
     }
 }
 
@@ -205,28 +232,21 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     )
     .await
     .map_err(ForwardError::into_engine_error)?;
-    let mut results = response.results.into_iter();
-    let result = results
-        .next()
-        .ok_or_else(|| GroupEngineError::new("forward group write returned no result"))?;
-    if results.next().is_some() {
-        return Err(GroupEngineError::new(
-            "forward group write returned more than one result",
-        ));
-    }
-    if result.ok {
-        match decode_wire(&result.payload, "bucket purge response")? {
-            GroupWriteResponse::PurgeBucket(response) => Ok(response),
-            other => Err(GroupEngineError::new(format!(
-                "unexpected forwarded bucket purge response: {other:?}"
-            ))),
-        }
-    } else {
-        Err(decode_wire::<GroupEngineError>(
-            &result.payload,
-            "bucket purge error",
-        )?)
-    }
+    let [result] = <[_; 1]>::try_from(response.results).map_err(|results| {
+        GroupEngineError::Infra(GroupInfraError::ForwardedAnswerInvalid {
+            rpc: ForwardedRpc::GroupWrite,
+            problem: AnswerProblem::ResultCount {
+                results: u64::try_from(results.len()).unwrap_or(u64::MAX),
+            },
+        })
+    })?;
+    let response: GroupWriteResponse = forwarded_answer(
+        ForwardedRpc::GroupWrite,
+        result.ok,
+        &result.payload,
+        "bucket purge answer",
+    )?;
+    PurgeBucketResponse::try_from(response)
 }
 
 /// Deadline of one forwarded leader RPC, connect included. It ends a call
@@ -607,6 +627,10 @@ pub(crate) async fn write_commands_on_raft(
         history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
+    let expected_kinds: Vec<ResponseKind> = commands
+        .iter()
+        .map(|GroupWriteCommand::Stream(command)| ResponseKind::answering(command))
+        .collect();
     await_first_quorum_ack(&raft).await;
     // A replica that lost the leadership during the admits refuses every
     // command here, before proposing any, as `write` does.
@@ -617,13 +641,16 @@ pub(crate) async fn write_commands_on_raft(
         tracing::warn!(%error, "Raft batch submission stopped");
         GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
     })?;
-    let responses = stream.map_ok(|result| match result {
-        Ok(response) => write_result_from_raft_response(response.response).unwrap_or_else(Err),
-        Err(err) => Err(client_write_refusal(
-            &err,
-            &GroupLeadership::of(&raft.metrics().borrow_watched()),
-        )),
-    });
+    let responses =
+        stream
+            .zip(futures_util::stream::iter(expected_kinds))
+            .map(|(result, expected)| {
+                result.map(|result| {
+                    crate::openraft_error::batch_write_result(result, expected, || {
+                        GroupLeadership::of(&raft.metrics().borrow_watched())
+                    })
+                })
+            });
     Ok(collect_batch_responses(responses, expected_responses).await)
 }
 
@@ -678,6 +705,7 @@ pub(crate) async fn await_quorum_ack_on(
 /// names the leader.
 ///
 /// [`RaftGroupEngine::write`]: crate::engine::RaftGroupEngine::write
+/// [`client_write_refusal`]: crate::openraft_error::client_write_refusal
 pub(crate) fn refuse_unless_leader(
     raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
 ) -> Result<(), GroupEngineError> {
@@ -728,125 +756,22 @@ async fn collect_batch_responses<T, E: std::fmt::Display>(
     responses
 }
 
-/// Unwraps a raft-applied response into the write outcome it carries.
+/// Unwraps a raft-applied response into the write outcome it carries. The
+/// command's response is of the kind `expected`
+/// ([`ResponseKind::answering`]); OpenRaft's answer to a blank or membership
+/// entry instead breaks an invariant.
 pub(crate) fn write_result_from_raft_response(
     response: RaftGroupResponse,
+    expected: ResponseKind,
 ) -> Result<Result<GroupWriteResponse, GroupEngineError>, GroupEngineError> {
-    match response {
-        RaftGroupResponse::Write(result) => Ok(result),
-        other @ (RaftGroupResponse::Blank | RaftGroupResponse::Membership) => Err(
-            GroupEngineError::new(format!("unexpected OpenRaft write response: {other:?}")),
-        ),
-    }
-}
-
-pub(crate) fn group_engine_client_write_error(
-    err: openraft::error::RaftError<
-        UrsulaRaftTypeConfig,
-        openraft::error::ClientWriteError<UrsulaRaftTypeConfig>,
-    >,
-    leadership: &GroupLeadership,
-) -> GroupEngineError {
-    match err.api_error() {
-        Some(refusal) => client_write_refusal(refusal, leadership),
-        None => {
-            tracing::warn!(error = %err, "Raft write response lost after submission");
-            GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
-        }
-    }
-}
-
-/// Map OpenRaft's refusal of a proposed write (RT1). OpenRaft forwards a
-/// write only before it appends the entry: on a replica that does not lead,
-/// a leader whose quorum lease expired, or one that is handing its
-/// leadership over. Nothing of the write applied, so the answer is a
-/// redirect or `NO_LEADER`. Only an entry OpenRaft appended and then
-/// discarded for another leader's log may still commit through that leader,
-/// so that refusal stays ambiguous. A normal write cannot fail a membership
-/// change or a precondition, so either is logged as a bug and answered as an
-/// unknown outcome.
-pub(crate) fn client_write_refusal(
-    err: &openraft::error::ClientWriteError<UrsulaRaftTypeConfig>,
-    leadership: &GroupLeadership,
-) -> GroupEngineError {
-    use openraft::error::ClientWriteError;
-    match err {
-        ClientWriteError::ForwardToLeader(forward) => {
-            tracing::debug!(error = %err, "OpenRaft refused a write before appending it");
-            leadership_refusal(
-                forward_reason(forward.reason, LeadershipReason::SteppedDown),
-                Proposal::NotProposed,
-                forward.leader_id,
-                forward.leader_node.as_ref(),
-                leadership,
-            )
-        }
-        ClientWriteError::LogEntryDiscarded(forward) => {
-            tracing::debug!(error = %err, "OpenRaft discarded a proposed write");
-            leadership_refusal(
-                LeadershipReason::SteppedDown,
-                Proposal::MayHaveCommitted,
-                forward.leader_id,
-                forward.leader_node.as_ref(),
-                leadership,
-            )
-        }
-        ClientWriteError::ChangeMembershipError(_) | ClientWriteError::PreconditionFailed(_) => {
-            tracing::error!(error = %err, "OpenRaft refused a normal write with a membership or precondition error");
-            GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
-        }
-    }
-}
-
-/// Why OpenRaft forwarded a request, as a leadership refusal says it.
-/// `not_leader` is the reason for a replica that does not lead.
-fn forward_reason(
-    reason: openraft::errors::ForwardReason,
-    not_leader: LeadershipReason,
-) -> LeadershipReason {
-    use openraft::errors::ForwardReason;
-    match reason {
-        ForwardReason::NotLeader => not_leader,
-        ForwardReason::LeaseExpired => LeadershipReason::QuorumUnconfirmed,
-        ForwardReason::LeadershipTransfer => LeadershipReason::LeadershipTransfer,
-    }
-}
-
-/// Map a failed ReadIndex barrier (`Raft::get_read_linearizer`). Nothing was
-/// proposed. A lost leadership forwards to the known leader (503 while it is
-/// unknown), and a leader that cannot reach a quorum answers leader-unknown
-/// (503) rather than serving a view that may miss a newer leader's
-/// acknowledged writes. A fatal error stays internal.
-///
-/// openraft's error text names internal node addresses (the quorum error
-/// lists every member), so the answer names only the reason and the full
-/// error is logged at debug level only.
-pub(crate) fn group_engine_linearizable_read_error(
-    err: openraft::error::RaftError<
-        UrsulaRaftTypeConfig,
-        openraft::error::LinearizableReadError<UrsulaRaftTypeConfig>,
-    >,
-    operation: &str,
-    leadership: &GroupLeadership,
-) -> GroupEngineError {
-    tracing::debug!("OpenRaft {operation} could not confirm leadership: {err}");
-    match err.api_error() {
-        Some(openraft::error::LinearizableReadError::ForwardToLeader(forward)) => {
-            leadership_refusal(
-                forward_reason(forward.reason, LeadershipReason::Follower),
-                Proposal::NotProposed,
-                forward.leader_id,
-                forward.leader_node.as_ref(),
-                leadership,
-            )
-        }
-        Some(openraft::error::LinearizableReadError::QuorumNotEnough(_)) => {
-            unknown_leader(LeadershipReason::QuorumUnconfirmed, Proposal::NotProposed)
-        }
-        None => GroupEngineError::new(format!(
-            "OpenRaft {operation} could not confirm leadership: {err}"
-        )),
-    }
+    let actual = match response {
+        RaftGroupResponse::Write(result) => return Ok(result),
+        RaftGroupResponse::Blank => ResponseKind::RaftBlank,
+        RaftGroupResponse::Membership => ResponseKind::RaftMembership,
+    };
+    Err(GroupEngineError::Infra(
+        GroupInfraError::UnexpectedResponse { expected, actual },
+    ))
 }
 
 /// A leadership refusal that names no leader: the answer is leader-unknown
@@ -893,6 +818,58 @@ pub(crate) fn leadership_refusal(
         reason,
     })
 }
+
+#[cfg(test)]
+mod forwarded_answer_tests {
+    use ursula_runtime::AnswerProblem;
+    use ursula_runtime::ForwardedRpc;
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::GroupInfraError;
+    use ursula_runtime::GroupWriteResponse;
+    use ursula_shard::RaftGroupId;
+
+    use super::forwarded_answer;
+    use crate::codec::encode_wire;
+
+    /// A leader's refusal keeps its type through a forward: a purge the
+    /// leader refuses while its history is pending answers `503` on the
+    /// follower as on the leader.
+    #[test]
+    fn a_forwarded_refusal_keeps_the_leaders_type() {
+        let pending = GroupEngineError::Infra(GroupInfraError::RecoveryPending {
+            raft_group_id: RaftGroupId(7),
+        });
+        let answer = forwarded_answer::<GroupWriteResponse>(
+            ForwardedRpc::GroupWrite,
+            false,
+            &encode_wire(&pending),
+            "bucket purge answer",
+        );
+        assert_eq!(answer, Err(pending));
+    }
+
+    #[test]
+    fn an_undecodable_answer_is_an_invalid_forwarded_answer() {
+        for ok in [true, false] {
+            let answer = forwarded_answer::<GroupWriteResponse>(
+                ForwardedRpc::GroupRead,
+                ok,
+                &[0xc1],
+                "read",
+            );
+            assert_eq!(
+                answer,
+                Err(GroupEngineError::Infra(
+                    GroupInfraError::ForwardedAnswerInvalid {
+                        rpc: ForwardedRpc::GroupRead,
+                        problem: AnswerProblem::Undecodable,
+                    }
+                ))
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod batch_response_tests {
     use ursula_runtime::GroupEngineError;
@@ -934,10 +911,10 @@ mod leadership_refusal_tests {
     use ursula_runtime::LeadershipRefusal;
     use ursula_runtime::Proposal;
 
-    use super::client_write_refusal;
     use super::leadership_refusal;
     use crate::GroupLeadership;
     use crate::leadership::LeaderRole;
+    use crate::openraft_error::client_write_refusal;
 
     /// Node 2's view in term 7, following `leader`.
     fn following(leader: u64) -> GroupLeadership {

@@ -29,6 +29,8 @@
 //! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
+//! - [`openraft_error`]: the one conversion from OpenRaft's errors to the
+//!   group engine's error.
 //! - [`openraft_work`]: the work OpenRaft runs for a group engine on tasks of
 //!   its own, which the engine's shutdown waits for (#709).
 //! - [`format_epoch`]: the Raft protocol (format-epoch) peer probe and the
@@ -82,6 +84,7 @@ mod in_process;
 mod log_store;
 mod maintenance;
 mod meta;
+mod openraft_error;
 mod openraft_work;
 mod peer_channel;
 mod peer_cluster;
@@ -202,6 +205,7 @@ pub use registry::SingleNodeRaftNetworkFactory;
 pub use registry::SnapshotBuildError;
 pub use registry::SnapshotGcPass;
 pub use registry::SnapshotInstallError;
+pub use rejoin::GateOpenError;
 pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
 pub use rejoin::PeerGroupLog;

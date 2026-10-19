@@ -38,6 +38,7 @@ pub use snapshot::SnapshotStoreOperation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
+use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 use ursula_stream::StreamResponse;
@@ -205,6 +206,37 @@ pub enum ResponseKind {
     RaftMembership,
     /// No answer at all.
     Missing,
+}
+
+impl ResponseKind {
+    /// The kind of response the state machine answers `command` with when
+    /// it applies it.
+    pub fn answering(command: &StreamCommand) -> Self {
+        match command {
+            StreamCommand::CreateBucket { .. } => Self::BucketCreated,
+            StreamCommand::CreateStream { .. } | StreamCommand::CreateExternal { .. } => {
+                Self::CreateStream
+            }
+            StreamCommand::Append { .. } | StreamCommand::AppendExternal { .. } => Self::Append,
+            StreamCommand::PublishSnapshot { .. }
+            | StreamCommand::PublishSnapshotExternal { .. } => Self::PublishSnapshot,
+            StreamCommand::AdvanceRetention { .. } => Self::AdvanceRetention,
+            StreamCommand::TouchStreamAccess { .. } => Self::TouchStreamAccess,
+            StreamCommand::FlushCold { .. } => Self::FlushCold,
+            StreamCommand::CompactCold { .. } => Self::CompactCold,
+            StreamCommand::Close { .. } => Self::CloseStream,
+            StreamCommand::DeleteStream { .. } => Self::DeleteStream,
+            StreamCommand::AckColdGc { .. } => Self::AckColdGc,
+            StreamCommand::DeferColdGc { .. } => Self::DeferColdGc,
+            StreamCommand::PurgeBucket { .. } => Self::PurgeBucket,
+            StreamCommand::ImportSnapshot { .. } => Self::ImportGroupState,
+            StreamCommand::NewHistory { .. } => Self::NewHistory,
+            StreamCommand::TidyStream { .. } => Self::TidyStream,
+            StreamCommand::OffloadColdRefs { .. } => Self::OffloadColdRefs,
+            StreamCommand::ExpireStreams { .. } => Self::ExpireStreams,
+            StreamCommand::IfIncarnation { command, .. } => Self::answering(command),
+        }
+    }
 }
 
 impl From<&StreamResponse> for ResponseKind {
@@ -521,8 +553,6 @@ pub enum GroupInfraError {
     ColdStore { operation: ColdOperation },
     #[error("{message}")]
     Internal { message: String },
-    #[error("ProtoDecode: protobuf raft payload missing {field}")]
-    ProtoDecode { field: String },
     #[error(
         "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
     )]
@@ -636,12 +666,6 @@ impl GroupInfraError {
         }
     }
 
-    pub fn proto_decode(field: impl Into<String>) -> Self {
-        Self::ProtoDecode {
-            field: field.into(),
-        }
-    }
-
     pub fn cold_backpressure(
         stream_id: BucketStreamId,
         before_group_hot_bytes: u64,
@@ -702,7 +726,6 @@ impl GroupInfraError {
             | Self::OutcomeUnknown
             | Self::ColdStore { .. }
             | Self::Internal { .. }
-            | Self::ProtoDecode { .. }
             | Self::UnexpectedResponse { .. }
             | Self::MissingStreamId { .. }
             | Self::Unsupported { .. }
@@ -751,7 +774,6 @@ impl GroupInfraError {
             | Self::OutcomeUnknown
             | Self::ColdStore { .. }
             | Self::Internal { .. }
-            | Self::ProtoDecode { .. }
             | Self::UnexpectedResponse { .. }
             | Self::MissingStreamId { .. }
             | Self::BootstrapWindowNotHot { .. }
@@ -790,7 +812,6 @@ impl GroupInfraError {
             | Self::RecoveryPending { .. }
             | Self::ColdStore { .. }
             | Self::Internal { .. }
-            | Self::ProtoDecode { .. }
             | Self::ColdBackpressure { .. }
             | Self::RaftUncommittedBackpressure { .. }
             | Self::UnexpectedResponse { .. }

@@ -346,7 +346,7 @@ struct PrebuiltEngine(std::sync::Mutex<Option<RaftGroupEngine>>);
 impl GroupEngineFactory for PrebuiltEngine {
     fn create<'a>(
         &'a self,
-        _placement: ShardPlacement,
+        placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         let engine = self
@@ -355,7 +355,12 @@ impl GroupEngineFactory for PrebuiltEngine {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         Box::pin(async move {
-            let engine = engine.ok_or_else(|| GroupEngineError::new("engine handed out"))?;
+            // The one engine was handed out: the group runs nowhere else.
+            let engine = engine.ok_or(GroupEngineError::Infra(
+                GroupInfraError::RaftGroupNotRegistered {
+                    raft_group_id: placement.raft_group_id,
+                },
+            ))?;
             Ok(Box::new(engine) as Box<dyn GroupEngine>)
         })
     }

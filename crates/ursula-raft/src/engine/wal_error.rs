@@ -1,4 +1,5 @@
 //! The one conversion from native WAL sources to serializable engine errors.
+use ursula_runtime::ErrorChain;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::WalOpenFailureKind;
@@ -9,6 +10,7 @@ use crate::log_store::JournalError;
 use crate::log_store::MarkRecoveringError;
 use crate::log_store::RaftWalError;
 use crate::log_store::StateFileError;
+use crate::rejoin::GateOpenError;
 
 pub(super) fn group_open_error(
     placement: ShardPlacement,
@@ -26,6 +28,28 @@ pub(super) fn group_open_error(
     tracing::error!(core_id = placement.core_id.0, raft_group_id = placement.raft_group_id.0,
         error = %source, source = ?source, "WAL refused to open a group");
     GroupEngineError::Infra(GroupInfraError::WalOpen {
+        core_id: placement.core_id,
+        raft_group_id: placement.raft_group_id,
+        failure,
+    })
+}
+
+/// A recovery gate that did not open as the group's error. The native
+/// source is logged here and stays out of the error.
+pub(super) fn gate_open_error(
+    placement: ShardPlacement,
+    source: GateOpenError,
+) -> GroupEngineError {
+    let failure = match &source {
+        GateOpenError::StartAsFollower { source, .. }
+        | GateOpenError::DropPlan { source, .. }
+        | GateOpenError::RaisePlanVote { source, .. }
+        | GateOpenError::CutRecord { source, .. } => core_failure(source),
+        GateOpenError::CutLog { .. } => WalOpenFailureKind::Io,
+    };
+    tracing::error!(core_id = placement.core_id.0, raft_group_id = placement.raft_group_id.0,
+        error = %ErrorChain(&source), "the group's recovery gate did not open");
+    GroupEngineError::Infra(GroupInfraError::RecoveryGateOpen {
         core_id: placement.core_id,
         raft_group_id: placement.raft_group_id,
         failure,
@@ -190,6 +214,44 @@ mod tests {
                 GroupEngineError::Infra(GroupInfraError::WalOpen {
                     core_id: placement.core_id,
                     raft_group_id: placement.raft_group_id,
+                    failure
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn a_recovery_gate_that_did_not_open_names_its_failure() {
+        let placement = ShardPlacement {
+            core_id: CoreId(2),
+            shard_id: ShardId(7),
+            raft_group_id: RaftGroupId(7),
+        };
+        let raft_group_id = placement.raft_group_id;
+        let cases = [
+            (
+                GateOpenError::CutLog {
+                    raft_group_id,
+                    source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+                },
+                WalOpenFailureKind::Io,
+            ),
+            (
+                GateOpenError::StartAsFollower {
+                    raft_group_id,
+                    source: CoreJournalError::WriterStopped {
+                        journal: "journal".into(),
+                    },
+                },
+                WalOpenFailureKind::Stopped,
+            ),
+        ];
+        for (source, failure) in cases {
+            assert_eq!(
+                gate_open_error(placement, source),
+                GroupEngineError::Infra(GroupInfraError::RecoveryGateOpen {
+                    core_id: placement.core_id,
+                    raft_group_id,
                     failure
                 })
             );

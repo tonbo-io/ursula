@@ -334,9 +334,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
         GroupInfraError::Internal { .. } => GroupInfraError::Internal {
             message: "internal".to_owned(),
         },
-        GroupInfraError::ProtoDecode { .. } => GroupInfraError::ProtoDecode {
-            field: "field".to_owned(),
-        },
         GroupInfraError::ColdBackpressure { .. } => GroupInfraError::ColdBackpressure {
             stream_id: stream(),
             before_group_hot_bytes: 10,

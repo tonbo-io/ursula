@@ -310,7 +310,7 @@ impl InMemoryGroupEngine {
                 {
                     return self.group_response_from_stream(
                         refusal,
-                        answered_kind(&command),
+                        ResponseKind::answering(&command),
                         None,
                         placement,
                     );
@@ -324,7 +324,7 @@ impl InMemoryGroupEngine {
             }
             command => {
                 let stream_id = command_stream_id(&command);
-                let expected = answered_kind(&command);
+                let expected = ResponseKind::answering(&command);
                 // Commands whose pages the leader rewrote before proposing:
                 // compaction and F5 offloads (which may clip entries), plus
                 // external appends and creates (bounded-state F13). Every
@@ -2264,36 +2264,6 @@ fn command_stream_id(command: &StreamCommand) -> Option<BucketStreamId> {
         | StreamCommand::TidyStream { stream_id, .. }
         | StreamCommand::OffloadColdRefs { stream_id, .. } => Some(stream_id.clone()),
         StreamCommand::IfIncarnation { command, .. } => command_stream_id(command),
-    }
-}
-
-/// The kind of response the state machine answers `command` with, when it
-/// applies it.
-fn answered_kind(command: &StreamCommand) -> ResponseKind {
-    match command {
-        StreamCommand::CreateBucket { .. } => ResponseKind::BucketCreated,
-        StreamCommand::CreateStream { .. } | StreamCommand::CreateExternal { .. } => {
-            ResponseKind::CreateStream
-        }
-        StreamCommand::Append { .. } | StreamCommand::AppendExternal { .. } => ResponseKind::Append,
-        StreamCommand::PublishSnapshot { .. } | StreamCommand::PublishSnapshotExternal { .. } => {
-            ResponseKind::PublishSnapshot
-        }
-        StreamCommand::AdvanceRetention { .. } => ResponseKind::AdvanceRetention,
-        StreamCommand::TouchStreamAccess { .. } => ResponseKind::TouchStreamAccess,
-        StreamCommand::FlushCold { .. } => ResponseKind::FlushCold,
-        StreamCommand::CompactCold { .. } => ResponseKind::CompactCold,
-        StreamCommand::Close { .. } => ResponseKind::CloseStream,
-        StreamCommand::DeleteStream { .. } => ResponseKind::DeleteStream,
-        StreamCommand::AckColdGc { .. } => ResponseKind::AckColdGc,
-        StreamCommand::DeferColdGc { .. } => ResponseKind::DeferColdGc,
-        StreamCommand::PurgeBucket { .. } => ResponseKind::PurgeBucket,
-        StreamCommand::ImportSnapshot { .. } => ResponseKind::ImportGroupState,
-        StreamCommand::NewHistory { .. } => ResponseKind::NewHistory,
-        StreamCommand::TidyStream { .. } => ResponseKind::TidyStream,
-        StreamCommand::OffloadColdRefs { .. } => ResponseKind::OffloadColdRefs,
-        StreamCommand::ExpireStreams { .. } => ResponseKind::ExpireStreams,
-        StreamCommand::IfIncarnation { command, .. } => answered_kind(command),
     }
 }
 
