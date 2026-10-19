@@ -881,10 +881,12 @@ impl RuntimeMetricsInner {
         self.cold_gc_errors.fetch_add_relaxed(1);
     }
 
-    /// G1 alert: the cold GC worker refused to delete a path of a `Paths`
-    /// entry that is not an exclusive chunk, a pack or an external payload
-    /// of the entry's bucket owned by the group.
-    pub(crate) fn record_cold_gc_foreign_path_refused(&self) {
+    /// G1 alert: the cold GC worker refused a path of a `Paths` entry that
+    /// is not an exclusive chunk, a pack or an external payload of the
+    /// entry's bucket owned by the group, or a `Stream` entry whose stream
+    /// is not of the entry's bucket or is placed in another group. A pass
+    /// that runs an entry again counts its refusals again.
+    pub(crate) fn record_cold_gc_refusal(&self) {
         self.cold_gc_foreign_paths_refused.fetch_add_relaxed(1);
     }
 

@@ -1,7 +1,7 @@
 //! Bounded-state cold hygiene on the in-memory engine: F14b
 //! `DeferColdGc` in the GC worker, F14i retention grace for dropped pack
 //! slices, the `FlushCold` incarnation check, apply-time cold-index page
-//! invalidation, and the G1 guard on the paths a `Paths` entry deletes.
+//! invalidation, and the G1 guard on what a cold GC entry deletes.
 
 use std::sync::Arc;
 
@@ -713,5 +713,91 @@ async fn g1_snapshot_body_and_delete_producers_queue_only_accepted_paths() {
     assert_eq!(
         runtime.metrics().snapshot().cold_gc_foreign_paths_refused,
         0
+    );
+}
+
+/// G1: a `Stream` entry as a corrupt backup could restore it into group 1,
+/// naming a stream of group 2 at its live generation, once under the
+/// stream's own bucket and once under another bucket. Group 1's state does
+/// not hold the stream, so its live generation does not protect it there.
+/// The worker refuses both entries, deletes none of the stream's chunks or
+/// pages, counts each refusal and acknowledges the entries.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn g1_cold_gc_refuses_a_stream_entry_for_another_group_or_bucket() {
+    let cold_store = Arc::new(ColdStore::memory().expect("memory cold store"));
+    let runtime = spawn(cold_store.clone());
+    let group = RaftGroupId(1);
+    let owner = RaftGroupId(2);
+    let victim = stream_on_group(&runtime, owner, "victim");
+    create(&runtime, &victim).await;
+    append(&runtime, &victim, b"abcd").await;
+    flush_exclusive(&runtime, &victim, 4).await;
+    let generation = runtime
+        .snapshot_group(owner)
+        .await
+        .expect("snapshot owner")
+        .stream_snapshot
+        .streams
+        .into_iter()
+        .find(|entry| entry.metadata.stream_id == victim)
+        .expect("victim entry")
+        .cold_index_generation;
+    let page = ColdIndexPageKey {
+        stream_id: victim.clone(),
+        generation,
+        page_id: 0,
+    };
+    let store = ColdStoreColdIndexPageStore::new(cold_store.clone());
+    let chunks = load_cold_chunks_from_pages(&store, std::slice::from_ref(&page))
+        .await
+        .expect("load pages");
+    assert_eq!(chunks.len(), 1);
+
+    let mut snapshot = runtime.snapshot_group(group).await.expect("snapshot group");
+    assert!(snapshot.stream_snapshot.pending_cold_gc.is_empty());
+    let first = snapshot.stream_snapshot.next_cold_gc_seq;
+    let mut seq = first;
+    for bucket_id in [victim.bucket_id.clone(), "otherbucket".to_owned()] {
+        snapshot.stream_snapshot.pending_cold_gc.push(ColdGcEntry {
+            seq,
+            bucket_id,
+            not_before_ms: 0,
+            target: ColdGcTarget::Stream(victim.clone()),
+            cold_generation: Some(generation),
+            defer_attempts: 0,
+        });
+        seq = seq.checked_add(1).expect("next seq");
+    }
+    snapshot.stream_snapshot.next_cold_gc_seq = seq;
+    runtime
+        .install_group_snapshot(snapshot)
+        .await
+        .expect("install the edited snapshot");
+
+    assert_eq!(
+        runtime
+            .run_cold_gc_group_once(group, 16)
+            .await
+            .expect("cold gc pass"),
+        2
+    );
+    for chunk in &chunks {
+        assert!(
+            object_exists(&cold_store, &chunk.s3_path).await,
+            "deleted {}",
+            chunk.s3_path
+        );
+    }
+    assert!(
+        object_exists(&cold_store, &page.path()).await,
+        "deleted the page"
+    );
+    assert_eq!(read(&runtime, &victim, 16).await, b"abcd");
+    let metrics = runtime.metrics().snapshot();
+    assert_eq!(metrics.cold_gc_foreign_paths_refused, 2);
+    assert_eq!(metrics.cold_gc_errors, 0);
+    assert!(
+        pending_gc(&runtime, group).await.is_empty(),
+        "the entries are acknowledged"
     );
 }

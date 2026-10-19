@@ -8975,10 +8975,16 @@ mod snapshot_driver {
     /// G1 (#687): a backup export is the group's applied stream state, so a
     /// node with S3 snapshots exports a group whose backup names no key
     /// under the snapshot prefix, though its snapshot object exists.
+    ///
+    /// This is a tripwire, not a proof: it fails if an export ever starts
+    /// to carry snapshot keys, so that cold GC would see them in a restored
+    /// backup. The cold GC guard is what keeps such a key from being
+    /// deleted.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_backup_export_names_no_snapshot_object() {
+        const PREFIX: &str = "g1-export-snapshots";
         let store = Arc::new(RecordingStore {
-            inner: ursula_runtime::S3SnapshotStore::memory_for_tests("snapshots", 1)
+            inner: ursula_runtime::S3SnapshotStore::memory_for_tests(PREFIX, 1)
                 .expect("a memory store"),
             gc: Gc::On,
             uploaded: std::sync::Mutex::new(Vec::new()),
@@ -9051,7 +9057,8 @@ mod snapshot_driver {
             })
             .collect::<Vec<_>>();
         assert!(
-            keys.iter().any(|key| key.starts_with("snapshots/node-1/")),
+            keys.iter()
+                .any(|key| key.starts_with(&format!("{PREFIX}/node-1/"))),
             "the group has an S3 snapshot object: {keys:?}"
         );
 
@@ -9074,10 +9081,11 @@ mod snapshot_driver {
                 .any(|entry| entry.metadata.stream_id == stream_id),
             "the backup holds the stream"
         );
+        let prefix_dir = format!("{PREFIX}/");
         for needle in keys
             .iter()
             .map(String::as_bytes)
-            .chain([b"snapshots/".as_slice()])
+            .chain([prefix_dir.as_bytes()])
         {
             assert!(
                 !body.windows(needle.len()).any(|window| window == needle),
