@@ -1616,6 +1616,12 @@ fn a_crash_between_the_plans_event_and_its_record_removal_keeps_one_history() {
                 cluster.append(group, 4).await;
             }
             cluster.verify_reads().await;
+            // The page cache writes the streams back, so the power loss
+            // gates every replica without taking the streams the test
+            // writes to at its end.
+            for wal in cluster.wals.values() {
+                wal.write_back();
+            }
             for node_id in NODES {
                 cluster.stop_node(node_id).await;
             }
