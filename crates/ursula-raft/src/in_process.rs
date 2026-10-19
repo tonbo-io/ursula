@@ -286,6 +286,55 @@ pub enum InProcessRaftNetworkEvent {
         matched_index: u64,
         target_gate: Option<RecoveryGateStatus>,
     },
+    /// A full snapshot reached its target, which reads the object `key`
+    /// names, if its pointer names one, while the RPC runs. The sender
+    /// holds that object until [`Self::FullSnapshotEnded`] (#687).
+    FullSnapshotStarted {
+        source: Option<u64>,
+        target: u64,
+        key: Option<String>,
+    },
+    /// The full snapshot of the matching [`Self::FullSnapshotStarted`]
+    /// returned or was cancelled. It is sent before the sender's hold on
+    /// the object drops.
+    FullSnapshotEnded {
+        source: Option<u64>,
+        target: u64,
+        key: Option<String>,
+    },
+}
+
+/// Sends [`InProcessRaftNetworkEvent::FullSnapshotEnded`] when the RPC of a
+/// full snapshot returns or is cancelled.
+struct FullSnapshotWindow {
+    policy: InProcessRaftNetworkPolicy,
+    source: Option<u64>,
+    target: u64,
+    key: Option<String>,
+}
+
+impl Drop for FullSnapshotWindow {
+    fn drop(&mut self) {
+        self.policy
+            .notify(InProcessRaftNetworkEvent::FullSnapshotEnded {
+                source: self.source,
+                target: self.target,
+                key: self.key.take(),
+            });
+    }
+}
+
+/// The object key the encoded pointer of a full snapshot names, if it
+/// names one.
+fn sent_object_key(pointer_bytes: &[u8]) -> Option<String> {
+    match ursula_runtime::SnapshotPointer::decode(pointer_bytes)
+        .ok()?
+        .location
+    {
+        ursula_runtime::SnapshotLocation::S3 { key, .. } => Some(key),
+        ursula_runtime::SnapshotLocation::Inline { .. }
+        | ursula_runtime::SnapshotLocation::Local { .. } => None,
+    }
 }
 
 type InProcessRaftNetworkObserver = Arc<dyn Fn(InProcessRaftNetworkEvent) + Send + Sync>;
@@ -774,6 +823,21 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         // object gone once the sender replaced it (#687).
         let UrsulaSnapshot { meta, snapshot } = snapshot;
         let (pointer_bytes, _lease) = snapshot.into_parts();
+        let key = sent_object_key(&pointer_bytes);
+        self.policy
+            .notify(InProcessRaftNetworkEvent::FullSnapshotStarted {
+                source: self.source,
+                target: self.target,
+                key: key.clone(),
+            });
+        // Dropped before the lease, so the send's window ends while the
+        // sender still holds the object.
+        let _window = FullSnapshotWindow {
+            policy: self.policy.clone(),
+            source: self.source,
+            target: self.target,
+            key,
+        };
         let snapshot = UrsulaSnapshot {
             meta,
             snapshot: crate::types::SnapshotData::new(pointer_bytes),

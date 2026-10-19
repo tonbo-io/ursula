@@ -11,8 +11,8 @@
 //!   exists.
 //! - I2 ([`check_no_foreign_delete`]): no node deletes outside its own
 //!   directory.
-//! - I3 ([`check_committed_reads_found`]): no restore and no committed
-//!   install sees `NotFound`.
+//! - I3 ([`check_committed_reads_found`]): no restore, no committed
+//!   install and no read inside a send's RPC sees `NotFound`.
 //! - I4 ([`check_superseded_without_marker`]): past the bound, no object
 //!   that no node names holds the marker, orphans included.
 //! - I5 ([`check_quiet_prefixes`]): once quiet, each node's directory
@@ -98,6 +98,9 @@ pub enum CommittedReadPurpose {
     Restore,
     /// A snapshot install the node committed.
     CommittedInstall,
+    /// A read of the object a send names, inside the send's RPC, while its
+    /// sender holds the object.
+    SentObject,
 }
 
 impl fmt::Display for CommittedReadPurpose {
@@ -105,6 +108,7 @@ impl fmt::Display for CommittedReadPurpose {
         f.write_str(match self {
             Self::Restore => "restore",
             Self::CommittedInstall => "committed install",
+            Self::SentObject => "read of an object a send holds",
         })
     }
 }
@@ -197,7 +201,8 @@ pub fn check_no_foreign_delete(view: &SnapshotStoreView) -> Result<(), SnapshotI
     }
 }
 
-/// I3: no restore and no committed install read `NotFound`.
+/// I3: no restore, no committed install and no read inside a send's RPC
+/// read `NotFound`.
 pub fn check_committed_reads_found<'r>(
     reads: impl IntoIterator<Item = &'r CommittedRead>,
 ) -> Result<(), SnapshotInvariantViolation> {

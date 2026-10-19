@@ -945,3 +945,67 @@ async fn the_memory_store_is_a_shared_snapshot_store() {
     store.verify_uploaded(&location).await.unwrap();
     assert_eq!(store.download(&location).await.unwrap(), b"shared");
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_get_that_finds_nothing_inside_a_send_window_is_logged() {
+    let bucket = MemorySnapshotBucket::new(1, prefix(), SnapshotStoreFaults::none());
+    let sender = bucket.store(1);
+    let receiver = bucket.store(2);
+    let (_, written) = build(&sender, 1, b"sent").await;
+    let location = written.unwrap();
+    let key = key_of(&location);
+    for object in sender.list_own(GROUP).await.unwrap().owned {
+        sender.delete_own(object).await.unwrap();
+    }
+
+    // Outside any window, a missing object logs only the GET.
+    assert!(matches!(
+        receiver.read_stored(&location).await,
+        Err(SnapshotStoreError::NotFound { .. })
+    ));
+    // Inside a window of a send to another node, too.
+    bucket.send_started(3, &key);
+    assert!(matches!(
+        receiver.read_stored(&location).await,
+        Err(SnapshotStoreError::NotFound { .. })
+    ));
+    bucket.send_ended(3, &key);
+    // Inside a window of a send to the reader, the GET breaks I3.
+    bucket.send_started(2, &key);
+    assert!(matches!(
+        receiver.read_stored(&location).await,
+        Err(SnapshotStoreError::NotFound { .. })
+    ));
+    bucket.send_ended(2, &key);
+    assert!(matches!(
+        receiver.read_stored(&location).await,
+        Err(SnapshotStoreError::NotFound { .. })
+    ));
+
+    let gets: Vec<SnapshotStoreEvent> = bucket
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                SnapshotStoreEvent::Get { node_id: 2, .. }
+                    | SnapshotStoreEvent::SentObjectMissing { .. }
+            )
+        })
+        .collect();
+    let missing = SnapshotStoreEvent::Get {
+        node_id: 2,
+        path: key.clone(),
+        found: false,
+    };
+    assert_eq!(gets, vec![
+        missing.clone(),
+        missing.clone(),
+        missing.clone(),
+        SnapshotStoreEvent::SentObjectMissing {
+            node_id: 2,
+            path: key,
+        },
+        missing,
+    ]);
+}

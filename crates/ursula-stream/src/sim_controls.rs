@@ -125,6 +125,36 @@ pub enum Defence {
     /// OpenRaft treats that conflict as a bug and its debug assertion
     /// reports it.
     FollowerRewind,
+    /// A node holds each snapshot object it writes, a build's or an install
+    /// copy's, from before its PUT (R2 of #687). Off, the lease is taken once
+    /// the PUT answered, before the HEAD, so a GC pass whose LIST shows the
+    /// PUT and whose read of the holds falls in the PUT's answer may delete
+    /// the object the build then commits.
+    LeaseBeforePut,
+    /// A GC pass reads the holds after its LIST returned (R4 of #687). Off,
+    /// it reads them before the LIST, so an object leased and written while
+    /// the LIST runs is listed but not held, and the pass deletes it.
+    HoldsAfterList,
+    /// A follower that installs a peer's snapshot writes its own copy and
+    /// commits the copy (R5 of #687). Off, the install commits the sender's
+    /// pointer, uncopied, so the follower names an object that only its
+    /// sender holds and deletes.
+    InstallCopy,
+    /// A send holds the object it names until its RPC returns (R6 of #687).
+    /// Off, the snapshot a send reads carries no lease, so the sender's next
+    /// build and the pass after it may delete the object while the
+    /// receiver still reads it.
+    SendHold,
+    /// A node's GC passes delete every object of its own directory that
+    /// nothing holds (#687). Off, a pass lists and deletes nothing, so every
+    /// replaced object stays.
+    SnapshotGc,
+    /// No GC pass runs on a group's holds before its restore ended, so the
+    /// holds name the restored object when the first pass reads them (R4 of
+    /// #687). Off, the restore marks the holds restored first and runs the
+    /// pass that owes before it reads the pointer, so the pass finds the
+    /// persisted object unheld and deletes it.
+    NoPassBeforeRestore,
 }
 
 #[cfg(madsim)]
@@ -134,8 +164,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 26]> = const { Cell::new([false; 26]) };
-        static FIRED: Cell<[u64; 26]> = const { Cell::new([0; 26]) };
+        static OFF: Cell<[bool; 32]> = const { Cell::new([false; 32]) };
+        static FIRED: Cell<[u64; 32]> = const { Cell::new([0; 32]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -166,6 +196,12 @@ mod switches {
             Defence::ExpirySweep => 23,
             Defence::EngineWorkWait => 24,
             Defence::FollowerRewind => 25,
+            Defence::LeaseBeforePut => 26,
+            Defence::HoldsAfterList => 27,
+            Defence::InstallCopy => 28,
+            Defence::SendHold => 29,
+            Defence::SnapshotGc => 30,
+            Defence::NoPassBeforeRestore => 31,
         }
     }
 
@@ -188,7 +224,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 26]));
+        FIRED.with(|fired| fired.set([0; 32]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

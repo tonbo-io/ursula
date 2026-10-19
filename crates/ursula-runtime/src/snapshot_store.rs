@@ -436,6 +436,14 @@ impl OwnedPointer {
         })
     }
 
+    /// `pointer`, whoever owns what it names, for a simulation's negative
+    /// control of the install copy. No other build can name a foreign
+    /// object as this node's own.
+    #[cfg(madsim)]
+    pub fn unowned_for_simulation(pointer: SnapshotPointer) -> Self {
+        Self(pointer)
+    }
+
     pub fn pointer(&self) -> &SnapshotPointer {
         &self.0
     }

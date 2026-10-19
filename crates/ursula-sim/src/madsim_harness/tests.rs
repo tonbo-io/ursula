@@ -1679,6 +1679,7 @@ fn assert_schedule_corpus_covers_expected_scenarios_and_seeds() {
         (317, SimScenario::RuntimeRaftNetwork),
         (500, SimScenario::RoutingBeforeBodyUnderLeaderChurn),
         (505, SimScenario::RecoveryPlanMembershipRollback),
+        (546, SimScenario::SnapshotObjectsStayOwned),
     ];
     assert_eq!(actual, expected);
 
@@ -1813,7 +1814,7 @@ fn smoke_corpus_replays() {
     let schedule_corpus = include_str!("../../corpus/schedule-smoke.json");
     let schedule_records = serde_json::from_str::<Vec<SimScheduledRecord>>(schedule_corpus)
         .expect("deserialize schedule corpus");
-    assert_eq!(schedule_records.len(), 29);
+    assert_eq!(schedule_records.len(), 30);
     for record in schedule_records {
         assert_eq!(record.schedule, SimSchedule::generate(record.schedule.seed));
         record.assert_replays();
@@ -2036,7 +2037,7 @@ fn producer_state_matches_after_snapshot_install_mid_stream() {
 /// Seeds for a `#[test]` seed family: the PR default set, or the inclusive
 /// range `start..=end` from the environment variable `var` (the nightly
 /// sweep sets larger ranges, e.g. `AMBIGUOUS_COMPACTION_SEEDS=2000..=2039`).
-fn seeds_from_env(var: &str, default: &[u64]) -> Vec<u64> {
+pub(super) fn seeds_from_env(var: &str, default: &[u64]) -> Vec<u64> {
     std::env::var(var)
         .ok()
         .and_then(|range| {

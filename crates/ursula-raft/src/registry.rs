@@ -1830,7 +1830,10 @@ impl GroupSnapshots {
         // Only the stored bytes are copied: the decompressed body goes now.
         drop(body);
         let history = group_snapshot.stream_snapshot.history;
-        let (owned, lease) = self.copy(group, &snapshot.meta, stored).await?;
+        let (owned, lease) = match uncopied(group, &snapshot.meta, &location) {
+            Some(owned) => (owned, None),
+            None => self.copy(group, &snapshot.meta, stored).await?,
+        };
         let mut handed = owned.pointer().clone();
         let cache_key = self
             .install
@@ -1936,6 +1939,35 @@ impl GroupSnapshots {
             own_key: collided.unwrap_or_default(),
         })
     }
+}
+
+/// The negative control of the install copy (`Defence::InstallCopy`): the
+/// sender's pointer, uncopied, as the one the install commits. Only a
+/// simulation can build such a pointer, so every other build copies.
+#[cfg(madsim)]
+fn uncopied(
+    group: RaftGroupId,
+    meta: &openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    location: &SnapshotLocation,
+) -> Option<OwnedPointer> {
+    if !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::InstallCopy) {
+        return None;
+    }
+    ursula_stream::sim_controls::note_fired(ursula_stream::sim_controls::Defence::InstallCopy);
+    Some(OwnedPointer::unowned_for_simulation(SnapshotPointer {
+        snapshot_id: group_snapshot_id(group, meta.last_log_id),
+        location: location.clone(),
+    }))
+}
+
+/// Every build outside a simulation copies the snapshot it installs.
+#[cfg(not(madsim))]
+fn uncopied(
+    _group: RaftGroupId,
+    _meta: &openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    _location: &SnapshotLocation,
+) -> Option<OwnedPointer> {
+    None
 }
 
 pub(crate) fn log_progress_snapshot(

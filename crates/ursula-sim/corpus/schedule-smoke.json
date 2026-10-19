@@ -3827,5 +3827,86 @@
         ]
       }
     }
+  },
+  {
+    "schema_version": 1,
+    "schedule": {
+      "seed": 546,
+      "scenario": "snapshot_objects_stay_owned",
+      "stream": {
+        "bucket_id": "benchcmp",
+        "stream_id": "ursula-sim-schedule-546-snapshot-objects-stay-owned"
+      },
+      "fault_plan": {
+        "steps": []
+      }
+    },
+    "outcome": {
+      "seed": 546,
+      "leader_id": 3,
+      "target_node_id": null,
+      "appended_log_index": 35,
+      "trace": {
+        "events": [
+          {
+            "event": "cluster_built",
+            "seed": 546
+          },
+          {
+            "event": "leader_elected",
+            "leader_id": 3
+          },
+          {
+            "event": "fault_applied",
+            "phase": "pass_raced_a_build"
+          },
+          {
+            "event": "node_stopped",
+            "node_id": 1
+          },
+          {
+            "event": "node_restarted",
+            "node_id": 1
+          },
+          {
+            "event": "node_stopped",
+            "node_id": 1
+          },
+          {
+            "event": "node_restarted",
+            "node_id": 1
+          },
+          {
+            "event": "node_stopped",
+            "node_id": 3
+          },
+          {
+            "event": "fault_applied",
+            "phase": "power_lost"
+          },
+          {
+            "event": "node_restarted",
+            "node_id": 3
+          },
+          {
+            "event": "node_stopped",
+            "node_id": 2
+          },
+          {
+            "event": "node_restarted",
+            "node_id": 2
+          },
+          {
+            "event": "snapshot_objects_owned",
+            "puts": 42,
+            "install_reads": 3,
+            "restore_reads": 6,
+            "deletes": 38,
+            "late_puts_landed": 2,
+            "store_log_digest": "54bc8176d35f6b4acccc978c62d7ea52182438454462e58dea9dfe46c418c3cb"
+          }
+        ]
+      }
+    }
   }
 ]

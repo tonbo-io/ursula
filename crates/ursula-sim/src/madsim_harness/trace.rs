@@ -788,6 +788,21 @@ pub enum SimEvent {
         status: u16,
         next_offset: Option<u64>,
     },
+    /// Snapshot objects stayed owned (#687): I1 to I5 held through the run,
+    /// in which the store took `puts` PUTs, `install_reads` GETs of a
+    /// sender's object that found it, `restore_reads` GETs of a node's own
+    /// object, `deletes` DELETEs, and landed `late_puts_landed` PUTs after
+    /// they failed to their client. `store_log_digest` is the BLAKE3 hex
+    /// digest of the store's whole request log, so a replay compares every
+    /// request.
+    SnapshotObjectsOwned {
+        puts: u64,
+        install_reads: u64,
+        restore_reads: u64,
+        deletes: u64,
+        late_puts_landed: u64,
+        store_log_digest: String,
+    },
     InvariantFailed {
         invariant: String,
         after_event: String,

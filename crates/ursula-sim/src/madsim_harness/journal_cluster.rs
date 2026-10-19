@@ -2,8 +2,16 @@
 //! ([`JournalCluster`]), with the production recovery gate and its drivers on
 //! every replica, and the recovery tool's plan over it (#581 section 4.5).
 //! The disk, recovery and recovery-plan simulations run on it.
+//!
+//! A scenario may also give its nodes the faulty in-memory snapshot store
+//! ([`set_snapshot_store`]): one bucket every node shares, a store with
+//! gates for each node process, and the node's install timeout, so the
+//! nodes write, send, copy, restore and collect their snapshot objects as a
+//! server does (#687).
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +49,7 @@ use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::apply_failure::ApplyFault;
 #[cfg(test)]
 use ursula_raft::wal::diagnostics::GroupLogState;
+use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -50,6 +59,13 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::RuntimeMetrics;
+use ursula_runtime::SharedSnapshotStore;
+use ursula_runtime::SnapshotLocation;
+use ursula_runtime::snapshot_harness::GatedSnapshotStore;
+use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
+use ursula_runtime::snapshot_harness::NodeNames;
+use ursula_runtime::snapshot_harness::SnapshotStoreFaults;
+use ursula_runtime::snapshot_harness::SnapshotStoreGates;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -87,6 +103,102 @@ std::thread_local! {
 /// own.
 pub(super) fn set_snapshot_drivers(plan: Option<DriverPlan>) {
     SNAPSHOT_DRIVERS.with(|drivers| drivers.set(plan));
+}
+
+/// The in-memory snapshot store every node of a [`JournalCluster`] writes
+/// its snapshot objects to (#687), and the install timeout every node runs
+/// with.
+#[derive(Debug, Clone)]
+pub(super) struct SnapshotStorePlan {
+    /// The seed the bucket draws its faults, delays and nonces from.
+    pub(super) seed: u64,
+    /// The bucket's faults at the start.
+    pub(super) faults: SnapshotStoreFaults,
+    /// `raft.install_snapshot_timeout`: how long after a write that failed,
+    /// and after a restore, a group owes its second GC pass. The faults'
+    /// `late_put_delay.max` stays at or below it.
+    pub(super) install_timeout: Duration,
+}
+
+std::thread_local! {
+    /// The snapshot store the next [`JournalCluster`] on this simulation's
+    /// thread runs ([`set_snapshot_store`]).
+    static SNAPSHOT_STORE: std::cell::RefCell<Option<SnapshotStorePlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Makes the [`JournalCluster`]s this simulation's thread starts write their
+/// snapshot objects to one in-memory bucket, or keep them inline with
+/// `None`. A cluster with a store also runs the snapshot drivers
+/// ([`set_snapshot_drivers`]), whose replicas keep snapshot records.
+pub(super) fn set_snapshot_store(plan: Option<SnapshotStorePlan>) {
+    SNAPSHOT_STORE.with(|store| *store.borrow_mut() = plan);
+}
+
+/// What a [`JournalCluster`] keeps of its snapshot store.
+pub(super) struct SnapshotObjects {
+    pub(super) bucket: MemorySnapshotBucket,
+    pub(super) install_timeout: Duration,
+    /// The store of each running node process, with the process's gates. A
+    /// node that stops gets a new one when it starts again, and the work of
+    /// its stopped engines keeps the old one.
+    processes: BTreeMap<u64, GatedSnapshotStore>,
+    /// Where each replica keeps its snapshot record, by group and node,
+    /// noted while the node's WAL ran: a node that is down starts no run.
+    records: BTreeMap<(u32, u64), PathBuf>,
+}
+
+impl SnapshotObjects {
+    /// The store of `node_id`'s running process.
+    fn process(&mut self, node_id: u64) -> GatedSnapshotStore {
+        let bucket = &self.bucket;
+        self.processes
+            .entry(node_id)
+            .or_insert_with(|| {
+                GatedSnapshotStore::new(
+                    node_id,
+                    Arc::new(bucket.store(node_id)),
+                    SnapshotStoreGates::new(),
+                )
+            })
+            .clone()
+    }
+}
+
+/// A replica that did not start: its engine refused to open.
+#[derive(Debug)]
+pub(super) struct ReplicaStartRefused {
+    pub(super) group: u32,
+    pub(super) node_id: u64,
+    pub(super) error: GroupEngineError,
+}
+
+/// A node process's registry of its replicas, with the cluster's install
+/// timeout when it runs the snapshot store.
+fn node_registry(install_timeout: Option<Duration>) -> ursula_raft::RaftGroupHandleRegistry {
+    let registry = ursula_raft::RaftGroupHandleRegistry::default();
+    match install_timeout {
+        Some(install_timeout) => registry.with_snapshot_install(1, install_timeout),
+        None => registry,
+    }
+}
+
+/// The object key the snapshot record at `path` names, if the record
+/// exists and names one. A record that is missing names nothing, and any
+/// other failure to read it fails the run, so I1 never reads a node as
+/// naming nothing when its record says otherwise.
+fn named_key(path: &Path) -> Option<String> {
+    let bytes = match SimDisk::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("read the snapshot record {path:?}: {error}"),
+    };
+    let pointer = ursula_raft::persisted_snapshot_pointer(&bytes)
+        .unwrap_or_else(|error| panic!("the snapshot record {path:?} decodes: {error}"));
+    match pointer.location {
+        SnapshotLocation::S3 { key, .. } => Some(key),
+        SnapshotLocation::Inline { .. } | SnapshotLocation::Local { .. } => None,
+    }
 }
 
 /// The cluster's nodes.
@@ -210,6 +322,9 @@ pub(super) struct JournalCluster {
     /// restarts as a node's runtime keeps its own: its heal drivers count
     /// follower log reversions there.
     pub(super) recovery_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
+    /// The snapshot store every node writes its objects to, if any
+    /// ([`set_snapshot_store`]).
+    pub(super) snapshot_objects: Option<SnapshotObjects>,
 }
 
 impl JournalCluster {
@@ -294,7 +409,32 @@ impl JournalCluster {
             config.purge_batch_size = 1;
         }
         let config = Arc::new(config.validate().expect("valid raft config"));
-        let (policy, votes, reversions) = recovery_wiring::vote_recording_network_policy();
+        let snapshot_objects = SNAPSHOT_STORE
+            .with(|store| store.borrow().clone())
+            .map(|plan| {
+                assert!(
+                    drivers.is_some(),
+                    "a cluster with a snapshot store runs the snapshot drivers"
+                );
+                SnapshotObjects {
+                    bucket: MemorySnapshotBucket::new(
+                        plan.seed,
+                        "snapshots".try_into().expect("a snapshot prefix"),
+                        plan.faults,
+                    ),
+                    install_timeout: plan.install_timeout,
+                    processes: BTreeMap::new(),
+                    records: BTreeMap::new(),
+                }
+            });
+        let install_timeout = snapshot_objects
+            .as_ref()
+            .map(|objects| objects.install_timeout);
+        let (policy, votes, reversions) = recovery_wiring::vote_recording_network_policy(
+            snapshot_objects
+                .as_ref()
+                .map(|objects| objects.bucket.clone()),
+        );
         Self {
             config,
             policy,
@@ -326,12 +466,13 @@ impl JournalCluster {
             spares,
             drivers,
             node_registries: (1..=nodes)
-                .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
+                .map(|node_id| (node_id, node_registry(install_timeout)))
                 .collect(),
             driver_tasks: BTreeMap::new(),
             recovery_registries: (1..=nodes)
                 .map(|node_id| (node_id, ursula_raft::RaftGroupHandleRegistry::default()))
                 .collect(),
+            snapshot_objects,
         }
     }
 
@@ -361,9 +502,24 @@ impl JournalCluster {
     }
 
     pub(super) async fn start_node(&mut self, node_id: u64) {
-        for group in JOURNAL_GROUPS {
-            self.start_replica(group, node_id).await;
+        if let Err(refused) = self.try_start_node(node_id).await {
+            panic!("start a journal-backed replica: {refused:?}");
         }
+    }
+
+    /// Starts every replica of `node_id`, then its snapshot driver, and
+    /// answers the first replica that refused to start.
+    pub(super) async fn try_start_node(&mut self, node_id: u64) -> Result<(), ReplicaStartRefused> {
+        for group in JOURNAL_GROUPS {
+            self.try_start_replica(group, node_id).await?;
+        }
+        self.start_driver(node_id);
+        Ok(())
+    }
+
+    /// Starts `node_id`'s snapshot driver, if the nodes run drivers and its
+    /// own does not run yet.
+    fn start_driver(&mut self, node_id: u64) {
         if let Some(drivers) = self.drivers
             && !self.driver_tasks.contains_key(&node_id)
         {
@@ -409,6 +565,18 @@ impl JournalCluster {
     /// Starts `node_id`'s replica of `group` from its log store, as the
     /// node's engine factory does.
     pub(super) async fn start_replica(&mut self, group: u32, node_id: u64) {
+        if let Err(refused) = self.try_start_replica(group, node_id).await {
+            panic!("start a journal-backed replica: {:?}", refused.error);
+        }
+    }
+
+    /// [`Self::start_replica`], answering an engine that refused to open
+    /// instead of panicking.
+    pub(super) async fn try_start_replica(
+        &mut self,
+        group: u32,
+        node_id: u64,
+    ) -> Result<(), ReplicaStartRefused> {
         let voters = recovery_wiring::configured_voters(1..=self.voters);
         let placement = group_placement(group);
         let store = self.wals[&node_id]
@@ -434,6 +602,19 @@ impl JournalCluster {
             .filter(|(faulty, _)| *faulty == group)
             .map(|(_, fault)| fault);
         options.recovery = Some(rejoin.clone());
+        if let Some(objects) = &mut self.snapshot_objects {
+            // The node process's store, and the install coordinator its
+            // replicas share, as the node's engine factory wires them.
+            let store: SharedSnapshotStore = Arc::new(objects.process(node_id));
+            let registry = &self.node_registries[&node_id];
+            registry.set_snapshot_store(Some(Arc::clone(&store)));
+            options.snapshot_store = Some(store);
+            options.snapshot_install = Some(registry.snapshot_install_coordinator());
+            objects.records.insert(
+                (group, node_id),
+                self.wals[&node_id].snapshot_metadata_path(placement),
+            );
+        }
         let options = self.wals[&node_id].recording_work(options);
         let started = RaftGroupEngine::new_node(
             placement,
@@ -454,9 +635,15 @@ impl JournalCluster {
                 if self.faulty.is_some() =>
             {
                 self.replay_stopped.insert((group, node_id), index);
-                return;
+                return Ok(());
             }
-            Err(error) => panic!("start a journal-backed replica: {error}"),
+            Err(error) => {
+                return Err(ReplicaStartRefused {
+                    group,
+                    node_id,
+                    error,
+                });
+            }
         };
         recovery_wiring::wire_recovery(
             node_id,
@@ -474,6 +661,7 @@ impl JournalCluster {
         }
         self.engines.insert((group, node_id), engine);
         self.rejoins.insert((group, node_id), rejoin);
+        Ok(())
     }
 
     /// Restarts `node_id`'s replica of `group` alone, as the node's runtime
@@ -536,9 +724,62 @@ impl JournalCluster {
             }
         }
         // The next start is a new process, with nothing of this one's
-        // build coordinator, gauges or holds.
+        // build coordinator, gauges, holds or snapshot store gates.
+        let install_timeout = self.snapshot_objects.as_mut().map(|objects| {
+            objects.processes.remove(&node_id);
+            objects.install_timeout
+        });
         self.node_registries
-            .insert(node_id, ursula_raft::RaftGroupHandleRegistry::default());
+            .insert(node_id, node_registry(install_timeout));
+    }
+
+    /// What each node's durable snapshot records name, read from the
+    /// simulated disk in one step: the object keys of the records of every
+    /// group, for every node, a stopped one included. Empty without a
+    /// snapshot store.
+    pub(super) fn snapshot_names(&self) -> Vec<NodeNames> {
+        let Some(objects) = &self.snapshot_objects else {
+            return Vec::new();
+        };
+        self.nodes()
+            .map(|node_id| {
+                NodeNames::new(
+                    node_id,
+                    objects
+                        .records
+                        .iter()
+                        .filter(|((_, node), _)| *node == node_id)
+                        .filter_map(|(_, path)| named_key(path)),
+                )
+            })
+            .collect()
+    }
+
+    /// The bucket every node writes its snapshot objects to.
+    pub(super) fn snapshot_bucket(&self) -> MemorySnapshotBucket {
+        self.snapshot_objects
+            .as_ref()
+            .expect("the cluster runs a snapshot store")
+            .bucket
+            .clone()
+    }
+
+    /// `raft.install_snapshot_timeout` of every node: zero without a
+    /// snapshot store.
+    pub(super) fn snapshot_install_timeout(&self) -> Duration {
+        self.snapshot_objects
+            .as_ref()
+            .map_or(Duration::ZERO, |objects| objects.install_timeout)
+    }
+
+    /// The gates of `node_id`'s running process's snapshot store.
+    pub(super) fn snapshot_gates(&self, node_id: u64) -> SnapshotStoreGates {
+        self.snapshot_objects
+            .as_ref()
+            .and_then(|objects| objects.processes.get(&node_id))
+            .expect("a running node process with a snapshot store")
+            .gates()
+            .clone()
     }
 
     pub(super) async fn leader(&self, group: u32) -> u64 {
@@ -797,6 +1038,10 @@ impl JournalCluster {
     /// disk would: it rejoins as a wiped node when it starts again.
     pub(super) async fn wipe_node(&mut self, node_id: u64, name: &str, tuning: JournalTuning) {
         self.stop_node(node_id).await;
+        // The lost disk held the node's snapshot records.
+        if let Some(objects) = &mut self.snapshot_objects {
+            objects.records.retain(|(_, node), _| *node != node_id);
+        }
         self.wals.insert(
             node_id,
             SimNodeWal::provision_with_tuning(name, tuning).with_group_count(JOURNAL_GROUPS.len()),

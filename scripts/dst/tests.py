@@ -4,7 +4,7 @@ Run with `python3 -m pytest scripts/dst/tests.py` from the repo root.
 
 These don't try to be a full unit-test suite — they verify:
   - every subcommand is dispatchable
-  - the 8 audits parse/scan without crashing and return a valid exit code
+  - the 9 audits parse/scan without crashing and return a valid exit code
   - shared parsing helpers don't lie about seed counts
 """
 

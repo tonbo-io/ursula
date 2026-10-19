@@ -13,6 +13,7 @@ Subcommand list (verb-first, flat namespace):
     seed-inventory      family discipline and seed budget
     failure-guards      every failure-smoke entry has fresh nightly coverage
     sim-patches         vendored madsim patches match the crate graph
+    defences            every Defence has a production site and a simulation switch
     all                 run every audit
 
   Reports (write target/ artifacts; CI uploads them):

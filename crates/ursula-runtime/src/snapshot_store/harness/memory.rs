@@ -25,6 +25,13 @@
 //! changes nothing in it, so a checker can run at any step without
 //! changing the replay.
 //!
+//! Sends. A simulation opens a window for each full snapshot it delivers
+//! ([`MemorySnapshotBucket::send_started`]) and closes it when the RPC
+//! returns ([`MemorySnapshotBucket::send_ended`]). The sender holds the sent
+//! object for the whole window, so a GET of it by the receiver that finds
+//! nothing inside one breaks I3, and the bucket logs it as
+//! [`SnapshotStoreEvent::SentObjectMissing`].
+//!
 //! A DELETE of a key outside the deleting node's own directory is a
 //! violation of invariant I2, and the store panics on it. A negative control
 //! that wants to see the damage builds its bucket with
@@ -376,6 +383,9 @@ pub enum SnapshotStoreEvent {
         operation: SnapshotStoreOperation,
         path: String,
     },
+    /// A GET of `path` by `node_id` found nothing while a send of `path` to
+    /// `node_id` was open (I3), logged right after the GET.
+    SentObjectMissing { node_id: u64, path: String },
 }
 
 #[derive(Debug, Clone)]
@@ -422,6 +432,9 @@ struct BucketState {
     events: Vec<SnapshotStoreEvent>,
     /// How many recorded foreign deletes a reader took.
     foreign_deletes_read: usize,
+    /// The open send windows by receiver and key, each with how many sends
+    /// of the key to the receiver are open.
+    sends: BTreeMap<(u64, String), usize>,
 }
 
 #[derive(Debug)]
@@ -454,6 +467,15 @@ impl Drop for Shared {
             );
         }
     }
+}
+
+/// Which bytes the objects of a view carry.
+#[derive(Debug, Clone, Copy)]
+enum ViewBytes {
+    /// Each object's logical bytes.
+    Logical,
+    /// None.
+    Empty,
 }
 
 /// The bucket every node of a test shares. Clones share it.
@@ -501,6 +523,7 @@ impl MemorySnapshotBucket {
                     changes: VecDeque::new(),
                     events: Vec::new(),
                     foreign_deletes_read: 0,
+                    sends: BTreeMap::new(),
                 }),
             }),
         }
@@ -577,6 +600,16 @@ impl MemorySnapshotBucket {
         self.state().events.clone()
     }
 
+    /// The requests the bucket served from the `start`th on, for a checker
+    /// that reads the log as it grows.
+    pub fn events_from(&self, start: usize) -> Vec<SnapshotStoreEvent> {
+        self.state()
+            .events
+            .get(start..)
+            .map(<[SnapshotStoreEvent]>::to_vec)
+            .unwrap_or_default()
+    }
+
     /// Every DELETE outside the deleting node's directory the bucket
     /// recorded. Taking them marks them read.
     pub fn foreign_deletes(&self) -> Vec<StoreDelete> {
@@ -594,6 +627,31 @@ impl MemorySnapshotBucket {
             .collect();
         state.foreign_deletes_read = deletes.len();
         deletes
+    }
+
+    /// Opens a window of a send of `path` to node `target`: its sender
+    /// holds the object until [`Self::send_ended`]. A GET of `path` by
+    /// `target` that finds nothing while a window is open is logged as
+    /// [`SnapshotStoreEvent::SentObjectMissing`].
+    pub fn send_started(&self, target: u64, path: &str) {
+        let mut state = self.state();
+        let open = state.sends.entry((target, path.to_owned())).or_insert(0);
+        *open = open.saturating_add(1);
+    }
+
+    /// Closes one window [`Self::send_started`] opened.
+    pub fn send_ended(&self, target: u64, path: &str) {
+        let mut state = self.state();
+        let key = (target, path.to_owned());
+        let left = state
+            .sends
+            .get(&key)
+            .map_or(0, |open| open.saturating_sub(1));
+        if left == 0 {
+            state.sends.remove(&key);
+        } else {
+            state.sends.insert(key, left);
+        }
     }
 
     /// Writes `bytes` at `path` with no checks, faults or delays, as
@@ -617,14 +675,28 @@ impl MemorySnapshotBucket {
     /// does not take the recorded foreign deletes
     /// ([`Self::foreign_deletes`]).
     pub fn view(&self) -> SnapshotStoreView {
+        self.view_of(ViewBytes::Logical)
+    }
+
+    /// [`Self::view`] with no object's bytes, for the checkers that read
+    /// only keys, ages and DELETEs (I1, I2 and I5): it decompresses nothing.
+    pub fn key_view(&self) -> SnapshotStoreView {
+        self.view_of(ViewBytes::Empty)
+    }
+
+    fn view_of(&self, bytes: ViewBytes) -> SnapshotStoreView {
         let now = Instant::now();
         let state = self.state();
         let objects = state
             .current_objects(now)
             .into_iter()
             .map(|(path, object)| {
-                let bytes =
-                    decode(&path, &object).unwrap_or_else(|_undecodable| object.stored.clone());
+                let bytes = match bytes {
+                    ViewBytes::Logical => {
+                        decode(&path, &object).unwrap_or_else(|_undecodable| object.stored.clone())
+                    }
+                    ViewBytes::Empty => Vec::new(),
+                };
                 let age = now.saturating_duration_since(object.landed_at);
                 (path, ViewObject { bytes, age })
             })
@@ -999,8 +1071,9 @@ fn compress(chunks: SnapshotBytesIterator) -> Result<(Vec<u8>, u64), SnapshotSto
 }
 
 /// Node `node_id`'s store on a [`MemorySnapshotBucket`]. It implements the
-/// whole [`SnapshotStore`] trait, so a simulation injects it with the
-/// registry's `set_snapshot_store`.
+/// whole [`SnapshotStore`] trait, so a simulation gives it to a node's
+/// engines as their snapshot store, as `ursula-sim`'s `JournalCluster`
+/// does, one per node process.
 ///
 /// - The owned-key methods work as the S3 store's do.
 /// - `download` is a GET, and `verify_uploaded` a HEAD.
@@ -1263,6 +1336,17 @@ impl SnapshotStore for MemorySnapshotStore {
                         path: key.clone(),
                         found: object.is_some(),
                     });
+                    if object.is_none()
+                        && state
+                            .sends
+                            .get(&(node_id, key.clone()))
+                            .is_some_and(|open| *open > 0)
+                    {
+                        state.events.push(SnapshotStoreEvent::SentObjectMissing {
+                            node_id,
+                            path: key.clone(),
+                        });
+                    }
                     object.ok_or_else(|| SnapshotStoreError::NotFound { key: key.clone() })
                 })
                 .await?;

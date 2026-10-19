@@ -3,7 +3,9 @@
 //! These cases exercise the store, the gates and the checkers, with a toy
 //! owner's pass of this file. The server's ownership protocol, its builds,
 //! sends, install copies, restores and GC passes, is tested on the same
-//! store and gates in `ursula-raft` (`snapshot_ownership_tests`):
+//! store and gates in `ursula-raft` (`snapshot_ownership_tests`), and on a
+//! cluster of journal-backed nodes in `snapshot_objects` and
+//! `engine_restart`:
 //!
 //! - `run_nodes`: three nodes share one bucket with PUT faults at rates the
 //!   seed picks and stale LISTs on. Each node builds and then runs an
