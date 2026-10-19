@@ -661,51 +661,58 @@ async fn a_backup_round_trips_through_ursulactl() {
     assert_eq!((report.groups, report.buckets, report.streams), (1, 2, 7));
 
     // A target without the source's cold objects is refused before the first
-    // import, and the refusal names each missing object.
+    // import, and each refusal names every object it found missing. The
+    // objects a missing index page references come to light once the page
+    // is there, so an operator copies what a refusal names until the
+    // restore applies.
     let target_cold: ColdStoreHandle = Arc::new(ColdStore::memory().expect("memory cold store"));
     let target = cluster(target_cold.clone());
     let (client, server) = serve(&target).await;
-    let missing = match ursula_ctl::backup::restore(&client, &store)
-        .await
-        .expect_err("the cold objects are missing")
-    {
-        BackupError::ColdObjectsMissing {
-            missing,
-            referenced,
-            sample,
-        } => {
-            assert_eq!(missing, referenced);
-            assert_eq!(
-                u64::try_from(sample.len()).expect("a count"),
+    let mut copied = std::collections::BTreeSet::new();
+    let report = loop {
+        let missing = match ursula_ctl::backup::restore(&client, &store).await {
+            Ok(report) => break report,
+            Err(BackupError::ColdObjectsMissing {
                 missing,
-                "the refusal names every missing object: {sample:?}"
-            );
-            sample
+                referenced,
+                sample,
+            }) => {
+                assert!(missing > 0 && missing <= referenced);
+                assert_eq!(
+                    u64::try_from(sample.len()).expect("a count"),
+                    missing,
+                    "the refusal names every missing object: {sample:?}"
+                );
+                sample
+            }
+            Err(other) => panic!("expected missing cold objects, got {other}"),
+        };
+        assert!(
+            copied.len() < 8,
+            "the refusals keep naming objects: {copied:?}"
+        );
+        for key in missing {
+            assert!(!copied.contains(&key), "{key} was copied before");
+            let size = source_cold
+                .object_size(&key)
+                .await
+                .expect("a source object");
+            let bytes = source_cold
+                .read_whole_object_range(&key, size, 0, usize::try_from(size).expect("a size"))
+                .await
+                .expect("read a source object");
+            target_cold
+                .write_chunk(&key, &bytes)
+                .await
+                .expect("copy a cold object");
+            copied.insert(key);
         }
-        other => panic!("expected missing cold objects, got {other}"),
     };
-    assert!(!missing.is_empty());
-
-    // Copy them, and the restore applies.
-    for key in &missing {
-        let size = source_cold.object_size(key).await.expect("a source object");
-        let bytes = source_cold
-            .read_whole_object_range(key, size, 0, usize::try_from(size).expect("a size"))
-            .await
-            .expect("read a source object");
-        target_cold
-            .write_chunk(key, &bytes)
-            .await
-            .expect("copy a cold object");
-    }
-    let report = ursula_ctl::backup::restore(&client, &store)
-        .await
-        .expect("the backup restores");
     assert_eq!(report.groups, 1);
     assert_eq!((report.buckets, report.streams), (2, 7));
     assert_eq!(
         report.cold_objects,
-        u64::try_from(missing.len()).expect("a count")
+        u64::try_from(copied.len()).expect("a count")
     );
     assert_eq!(report.imports.len(), 1);
     assert!(!report.imports[0].already);
