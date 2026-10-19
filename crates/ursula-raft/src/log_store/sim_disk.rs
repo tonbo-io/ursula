@@ -512,6 +512,22 @@ impl DiskState {
         Ok(report)
     }
 
+    /// Makes every page of the files under `prefix` durable.
+    fn write_back(&mut self, prefix: &Path) {
+        let inodes = self
+            .visible
+            .iter()
+            .filter(|(path, _)| path.starts_with(prefix))
+            .filter_map(|(_, entry)| match entry {
+                Entry::File(inode) => Some(*inode),
+                Entry::Dir => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for inode in inodes {
+            self.inode_mut(inode).sync();
+        }
+    }
+
     /// The simulated boot of the host holding `path`: one more for every
     /// power loss that covered it.
     fn boot_id(&self, path: &Path) -> String {
@@ -552,6 +568,16 @@ impl SimDisk {
     /// last `fsync`ed state. The node must already be stopped.
     pub fn power_loss_losing_unsynced(prefix: &Path) -> io::Result<SimPowerLoss> {
         io_with_disk(|state| state.power_loss(prefix, &mut || false))
+    }
+
+    /// Writes every unsynced page of the files under `prefix` back to the
+    /// disk, as a host's page cache does on its own seconds after a write,
+    /// whatever the process `fsync`s. A later power loss keeps those pages.
+    /// Directory entries keep their last `fsync`ed state. A schedule that
+    /// must keep what it wrote so far across a power loss says so with this,
+    /// instead of relying on a segment rotation to `fsync` it.
+    pub fn write_back(prefix: &Path) -> io::Result<()> {
+        with_disk(|state| state.write_back(prefix)).map_err(SimDiskError::into_io)
     }
 
     /// Arms a one-shot fault on `path`; rename faults match the destination.
