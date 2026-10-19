@@ -2956,7 +2956,6 @@ mod group_rpc_status_tests {
                 | GroupInfraError::LogBelowSnapshot { .. }
                 | GroupInfraError::RecoveryPending { .. }
                 | GroupInfraError::ColdStore { .. }
-                | GroupInfraError::Internal { .. }
                 | GroupInfraError::ColdBackpressure { .. }
                 | GroupInfraError::RaftUncommittedBackpressure { .. }
                 | GroupInfraError::UnexpectedResponse { .. }

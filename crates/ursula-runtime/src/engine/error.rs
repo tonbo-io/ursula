@@ -27,7 +27,6 @@
 pub mod samples;
 mod snapshot;
 
-use std::borrow::Cow;
 use std::fmt;
 
 use serde::Deserialize;
@@ -401,10 +400,8 @@ pub enum MembershipInitRefusal {
     NotInMembers,
 }
 
-/// Infra error variants with structured fields render their human message on
-/// demand (`message`) instead of storing a denormalized copy alongside the
-/// fields. `Internal` is the exception: it carries free-form text with no
-/// structured source, so it keeps an owned `message`.
+/// Infra error variants carry structured fields and render their human
+/// message on demand through `Display`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
     #[error(
@@ -551,8 +548,6 @@ pub enum GroupInfraError {
     /// where it is converted ([`cold_store_failure`]).
     #[error("cold tier {operation} failed")]
     ColdStore { operation: ColdOperation },
-    #[error("{message}")]
-    Internal { message: String },
     #[error(
         "ColdBackpressure: stream '{stream_id}' would raise group hot bytes from {before_group_hot_bytes} to {after_group_hot_bytes}, above limit {limit}"
     )]
@@ -660,12 +655,6 @@ pub fn cold_store_failure(operation: ColdOperation, source: impl fmt::Display) -
 }
 
 impl GroupInfraError {
-    pub fn internal(message: impl Into<String>) -> Self {
-        Self::Internal {
-            message: message.into(),
-        }
-    }
-
     pub fn cold_backpressure(
         stream_id: BucketStreamId,
         before_group_hot_bytes: u64,
@@ -685,13 +674,6 @@ impl GroupInfraError {
             current,
             incoming,
             limit,
-        }
-    }
-
-    pub fn message(&self) -> Cow<'_, str> {
-        match self {
-            Self::Internal { message } => Cow::Borrowed(message),
-            other => Cow::Owned(other.to_string()),
         }
     }
 
@@ -725,7 +707,6 @@ impl GroupInfraError {
             | Self::OwnerStopped
             | Self::OutcomeUnknown
             | Self::ColdStore { .. }
-            | Self::Internal { .. }
             | Self::UnexpectedResponse { .. }
             | Self::MissingStreamId { .. }
             | Self::Unsupported { .. }
@@ -773,7 +754,6 @@ impl GroupInfraError {
             | Self::OwnerStopped
             | Self::OutcomeUnknown
             | Self::ColdStore { .. }
-            | Self::Internal { .. }
             | Self::UnexpectedResponse { .. }
             | Self::MissingStreamId { .. }
             | Self::BootstrapWindowNotHot { .. }
@@ -811,7 +791,6 @@ impl GroupInfraError {
             | Self::LogBelowSnapshot { .. }
             | Self::RecoveryPending { .. }
             | Self::ColdStore { .. }
-            | Self::Internal { .. }
             | Self::ColdBackpressure { .. }
             | Self::RaftUncommittedBackpressure { .. }
             | Self::UnexpectedResponse { .. }
@@ -831,10 +810,6 @@ impl GroupInfraError {
 }
 
 impl GroupEngineError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self::Infra(GroupInfraError::internal(message))
-    }
-
     pub fn cold_backpressure(
         stream_id: BucketStreamId,
         before_group_hot_bytes: u64,
@@ -879,13 +854,6 @@ impl GroupEngineError {
             next_offset,
             context,
         })
-    }
-
-    pub fn message(&self) -> Cow<'_, str> {
-        match self {
-            Self::Infra(err) => err.message(),
-            Self::Stream(_) | Self::NotLeader(_) => Cow::Owned(self.to_string()),
-        }
     }
 
     pub fn code(&self) -> Option<StreamErrorCode> {

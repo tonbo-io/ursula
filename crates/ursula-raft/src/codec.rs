@@ -359,9 +359,6 @@ mod tests {
                     committed: number,
                     held: maybe,
                 }),
-                GroupEngineError::Infra(GroupInfraError::Internal { .. }) => {
-                    GroupEngineError::Infra(GroupInfraError::Internal { message: text })
-                }
                 other => other,
             }
         }

@@ -155,7 +155,6 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::LogBehindCommit { .. }
         | GroupInfraError::RecoveryPlanFenced { .. }
         | GroupInfraError::OwnerStopped
-        | GroupInfraError::Internal { .. }
         | GroupInfraError::UnexpectedResponse { .. }
         | GroupInfraError::MissingStreamId { .. }
         | GroupInfraError::Unsupported { .. }

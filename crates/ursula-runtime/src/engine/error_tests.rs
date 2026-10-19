@@ -71,7 +71,6 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             | GroupInfraError::WalOpen { .. }
             | GroupInfraError::LogBelowSnapshot { .. }
             | GroupInfraError::ColdStore { .. }
-            | GroupInfraError::Internal { .. }
             | GroupInfraError::UnexpectedResponse { .. }
             | GroupInfraError::MissingStreamId { .. }
             | GroupInfraError::BootstrapWindowNotHot { .. }
