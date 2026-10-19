@@ -456,13 +456,15 @@ runtime_metrics! {
     // `raft.deleted_data_max_age`.
     counter raft_deleted_data_oldest_age_ms;
     counter raft_deleted_data_overdue_groups;
-    // Snapshot GC (#669): the snapshot objects the node's GC passes
-    // deleted, and the passes that deleted nothing because a configured
-    // voter of the group had published no snapshot reference,
-    // and the passes that failed, which run again later.
+    // Snapshot GC (#669, #687): the snapshot objects the node's GC passes
+    // deleted from its own directory, and the passes that failed, which
+    // run again later.
     counter snapshot_gc_deleted_objects;
-    counter snapshot_gc_skipped_unreferenced_voter;
     counter snapshot_gc_failed_passes;
+    // Groups whose engine open the snapshot store did not answer, closed in
+    // open back-off until their core opens them again (#687): 1 per group
+    // while it waits.
+    sum open_backoff_groups: group per_group_open_backoff;
     // The leader's background expiry sweep (#669): the `ExpireStreams`
     // entries its passes committed, the expired streams they removed, and
     // the groups the latest pass left with expired streams for the next one.
@@ -609,6 +611,13 @@ impl RuntimeMetricsInner {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
         self.per_group_group_mailbox_depth
             .sub_saturating_at(group_index, 1);
+    }
+
+    /// Records whether `group_id` waits in open back-off.
+    pub(crate) fn record_open_backoff(&self, group_id: RaftGroupId, closed: bool) {
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        self.per_group_open_backoff
+            .store_at(group_index, u64::from(closed));
     }
 
     pub(crate) fn record_group_mailbox_full(&self, group_id: RaftGroupId) {
@@ -817,8 +826,6 @@ impl RuntimeMetricsInner {
     pub(crate) fn record_snapshot_gc(&self, sample: SnapshotGcSample) {
         self.snapshot_gc_deleted_objects
             .fetch_add_relaxed(sample.deleted);
-        self.snapshot_gc_skipped_unreferenced_voter
-            .fetch_add_relaxed(sample.skipped_unreferenced_voter);
         self.snapshot_gc_failed_passes
             .fetch_add_relaxed(sample.failed);
     }
@@ -1108,7 +1115,7 @@ mod metric_manifest_tests {
     /// The serialized field names of [`RuntimeMetricsSnapshot`] in declaration
     /// order, captured from the pre-macro hand-written struct. Metrics
     /// endpoints and `ursulactl` depend on these names staying byte-identical.
-    const EXPECTED_SNAPSHOT_KEYS: [&str; 180] = [
+    const EXPECTED_SNAPSHOT_KEYS: [&str; 181] = [
         "accepted_appends",
         "per_core_appends",
         "per_group_appends",
@@ -1273,8 +1280,9 @@ mod metric_manifest_tests {
         "raft_deleted_data_oldest_age_ms",
         "raft_deleted_data_overdue_groups",
         "snapshot_gc_deleted_objects",
-        "snapshot_gc_skipped_unreferenced_voter",
         "snapshot_gc_failed_passes",
+        "open_backoff_groups",
+        "per_group_open_backoff",
         "ttl_expiry_sweeps",
         "ttl_expiry_swept_streams",
         "ttl_expiry_sweep_due_groups",
@@ -1415,10 +1423,7 @@ mod metric_manifest_tests {
 pub struct SnapshotGcSample {
     /// The snapshot objects the passes deleted.
     pub deleted: u64,
-    /// The passes that deleted nothing because a configured voter of the
-    /// group had published no snapshot reference.
-    pub skipped_unreferenced_voter: u64,
-    /// The passes that failed, a build's prune included.
+    /// The passes that failed, a build's own pass included.
     pub failed: u64,
 }
 

@@ -45,9 +45,9 @@
 //!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
 //!   the per-group log gauges the snapshot driver reads.
-//! - [`snapshot_references`]: prepared external-pointer pins, recoverable
-//!   current-reference publication outside RaftCore, and the pins and GC
-//!   passes that delete the snapshot objects a replica replaced (#669).
+//! - [`snapshot_holds`]: what one engine incarnation of a group may still
+//!   use of its own snapshot objects, held in memory, and the GC pass that
+//!   deletes every other object in the node's directory (#687, #669).
 //! - [`history`]: history identity on a group: the leader's fence while
 //!   the group's history is pending and its obligation to propose the
 //!   history event (genesis, recovery plans).
@@ -102,7 +102,7 @@ mod sim_runtime;
 mod sim_watch;
 pub mod snapshot_cadence;
 mod snapshot_codec;
-mod snapshot_references;
+mod snapshot_holds;
 mod state_machine;
 mod telemetry;
 mod types;
@@ -233,7 +233,6 @@ pub use sim_runtime::run_isolated;
 pub use snapshot_codec::decode_group_snapshot;
 pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::BuildsChanged;
-pub use state_machine::DEFAULT_SNAPSHOT_GC_GRACE;
 pub use state_machine::GroupSnapshotWork;
 pub use state_machine::Handoff;
 pub use state_machine::PurgeBusy;

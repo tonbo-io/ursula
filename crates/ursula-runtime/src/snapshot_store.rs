@@ -16,10 +16,11 @@
 //! name without I/O, [`SnapshotStore::write_staged`] creates the object only
 //! if no object has the name, and [`SnapshotStore::list_own`] and
 //! [`SnapshotStore::delete_own`] serve the owner's GC. [`OwnedPointer`] is a
-//! pointer this node may commit.
+//! pointer this node may commit. Nothing else lives in the store: no
+//! reference or pin records, and no object any node shares. A node that
+//! installs a peer's snapshot writes its own copy before it commits it, and
+//! what a node may still use is held in its memory, never in the store.
 
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -37,35 +38,6 @@ use crate::SnapshotStoreOperation;
 
 #[cfg(any(madsim, test, feature = "test-support"))]
 pub mod harness;
-
-/// Node identities that may persist an external snapshot pointer for each
-/// group. S3 pruning is enabled only after every expected voter has published
-/// its current reference, so pruning fails closed while any voter has not.
-#[derive(Debug, Clone)]
-pub struct SnapshotReferenceConfig {
-    pub node_id: u64,
-    pub default_voters: BTreeSet<u64>,
-    pub per_group_voters: BTreeMap<u32, BTreeSet<u64>>,
-}
-
-impl SnapshotReferenceConfig {
-    fn voters_for(&self, raft_group_id: u32) -> &BTreeSet<u64> {
-        self.per_group_voters
-            .get(&raft_group_id)
-            .unwrap_or(&self.default_voters)
-    }
-}
-
-/// Identifier the store uses to derive a key/path for a snapshot blob.
-///
-/// `snapshot_id` is the openraft-provided id (group + leader + log index).
-/// Repeated builds at the same applied index may reuse it, so stores must not
-/// treat it as a unique physical-object identity.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SnapshotKey {
-    pub raft_group_id: u32,
-    pub snapshot_id: String,
-}
 
 /// Where a snapshot blob lives. Carried in [`SnapshotPointer`] over openraft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,10 +60,6 @@ pub enum SnapshotLocation {
         stored_size_bytes: u64,
         /// Compression applied to the S3 object body.
         compression: SnapshotCompression,
-        /// The object key is content-addressed and may be referenced by
-        /// several replicas or snapshot pointers. Shared objects must only be
-        /// removed by reference-aware pruning.
-        shared_object: bool,
     },
 }
 
@@ -427,15 +395,53 @@ pub enum NotOwned {
     LocalPath { path: PathBuf },
 }
 
+/// A location this node may commit, as a write made it
+/// ([`SnapshotStore::write_staged`]): inline, or the owned key its stage
+/// drew. Only a store's write builds one, from the staged snapshot itself,
+/// so it never names an object the write did not create.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedLocation(SnapshotLocation);
+
+impl OwnedLocation {
+    pub fn location(&self) -> &SnapshotLocation {
+        &self.0
+    }
+
+    pub fn into_location(self) -> SnapshotLocation {
+        self.0
+    }
+}
+
 /// A snapshot pointer this node may commit: inline, or an S3 key that
-/// parses as an [`OwnedKey`] of this node and group. It is built only by
-/// [`TryFrom`], which refuses every other pointer.
+/// parses as an [`OwnedKey`] of this node and group. A build or an install
+/// copy makes one from the [`OwnedLocation`] its write returned, and a
+/// restore parses one with [`TryFrom`], which refuses every other pointer.
 #[derive(Debug, Clone)]
 pub struct OwnedPointer(SnapshotPointer);
 
 impl OwnedPointer {
+    /// The pointer named `snapshot_id` to what a write created.
+    pub fn new(snapshot_id: String, location: OwnedLocation) -> Self {
+        Self(SnapshotPointer {
+            snapshot_id,
+            location: location.0,
+        })
+    }
+
+    /// An inline pointer, which every node may commit.
+    pub fn inline(snapshot_id: String, bytes: Vec<u8>) -> Self {
+        Self(SnapshotPointer {
+            snapshot_id,
+            location: SnapshotLocation::Inline { bytes },
+        })
+    }
+
     pub fn pointer(&self) -> &SnapshotPointer {
         &self.0
+    }
+
+    pub fn location(&self) -> &SnapshotLocation {
+        &self.0.location
     }
 
     pub fn into_pointer(self) -> SnapshotPointer {
@@ -483,7 +489,7 @@ pub struct StagedObject {
     key: OwnedKey,
     prefix: SnapshotPrefix,
     size_bytes: u64,
-    stored: Vec<u8>,
+    stored: Bytes,
 }
 
 impl StagedObject {
@@ -496,14 +502,13 @@ impl StagedObject {
         self.key.render(&self.prefix)
     }
 
-    /// The location the write creates: an S3 key that no reference shares.
+    /// The location the write creates: an owned key of this node.
     pub fn location(&self) -> SnapshotLocation {
         SnapshotLocation::S3 {
             key: self.path(),
             size_bytes: self.size_bytes,
             stored_size_bytes: self.stored.len() as u64,
             compression: SnapshotCompression::Zstd,
-            shared_object: false,
         }
     }
 }
@@ -540,6 +545,95 @@ impl Debug for StagedSnapshot {
                 .field("key", &object.key)
                 .field("location", &object.location())
                 .finish(),
+        }
+    }
+}
+
+/// A snapshot's body as its store holds it: the stored bytes, compressed or
+/// not, with the logical size and compression its pointer names
+/// ([`SnapshotStore::read_stored`]). An install copy writes these bytes as
+/// they are ([`SnapshotStore::stage_stored`]), and [`StoredSnapshot::body`]
+/// decompresses them.
+#[derive(Debug, Clone)]
+pub struct StoredSnapshot {
+    /// The object's key, for errors; `None` for an inline body.
+    key: Option<String>,
+    stored: Bytes,
+    size_bytes: u64,
+    compression: SnapshotCompression,
+}
+
+impl StoredSnapshot {
+    /// An inline body, stored uncompressed.
+    pub fn inline(bytes: Vec<u8>) -> Self {
+        let size_bytes = bytes.len() as u64;
+        Self {
+            key: None,
+            stored: Bytes::from(bytes),
+            size_bytes,
+            compression: SnapshotCompression::None,
+        }
+    }
+
+    /// The object at `location`, whose stored bytes a GET answered,
+    /// checked against the stored size the location names.
+    pub fn of_object(
+        location: &SnapshotLocation,
+        stored: Bytes,
+    ) -> Result<Self, SnapshotStoreError> {
+        let key = match location {
+            SnapshotLocation::S3 { key, .. } => key.clone(),
+            SnapshotLocation::Local { path, .. } => path.display().to_string(),
+            SnapshotLocation::Inline { bytes } => return Ok(Self::inline(bytes.clone())),
+        };
+        let expected = location.stored_size_hint();
+        if stored.len() as u64 != expected {
+            return Err(SnapshotStoreError::SizeMismatch {
+                key,
+                expected,
+                actual: stored.len() as u64,
+            });
+        }
+        Ok(Self {
+            key: Some(key),
+            stored,
+            size_bytes: location.size_hint(),
+            compression: location.compression(),
+        })
+    }
+
+    /// The decompressed body, checked against the logical size.
+    pub fn body(&self) -> Result<Vec<u8>, SnapshotStoreError> {
+        let key = || self.key.clone().unwrap_or_default();
+        let bytes = match self.compression {
+            SnapshotCompression::None => self.stored.to_vec(),
+            SnapshotCompression::Zstd => zstd::bulk::decompress(
+                &self.stored,
+                usize::try_from(self.size_bytes).map_err(|_overflow| {
+                    SnapshotStoreError::LogicalSizeUnaddressable {
+                        key: key(),
+                        size_bytes: self.size_bytes,
+                    }
+                })?,
+            )
+            .map_err(|source| SnapshotStoreError::Decompress { key: key(), source })?,
+        };
+        if bytes.len() as u64 != self.size_bytes {
+            return Err(SnapshotStoreError::LogicalSizeMismatch {
+                key: key(),
+                expected: self.size_bytes,
+                actual: bytes.len() as u64,
+            });
+        }
+        Ok(bytes)
+    }
+
+    /// The stored bytes and logical size of a body stored zstd-compressed,
+    /// which an owned object stores as it is.
+    fn into_compressed(self) -> Result<(Bytes, u64), Self> {
+        match self.compression {
+            SnapshotCompression::Zstd => Ok((self.stored, self.size_bytes)),
+            SnapshotCompression::None => Err(self),
         }
     }
 }
@@ -674,25 +768,6 @@ pub enum SnapshotStoreError {
     /// The cold tier's S3 encryption did not apply to the snapshot store.
     #[error("apply the cold tier's S3 encryption to the snapshot store")]
     Encryption(#[source] io::Error),
-    /// A key lies outside the group's namespace of the store.
-    #[error("snapshot key {key} lies outside the namespace of group {}", .raft_group_id.0)]
-    OutsideGroup {
-        raft_group_id: RaftGroupId,
-        key: String,
-    },
-    /// A reference record names another version, node or group.
-    #[error("snapshot reference record {record} is not this group's or node's")]
-    InvalidReference { record: String },
-    /// A reference record did not encode.
-    #[error("encode a snapshot reference record")]
-    ReferenceEncode(#[source] serde_json::Error),
-    /// A reference record did not decode.
-    #[error("decode snapshot reference record {record}")]
-    ReferenceDecode {
-        record: String,
-        #[source]
-        source: serde_json::Error,
-    },
     #[error("snapshot serialize: {0}")]
     Serialize(String),
     #[error("snapshot deserialize: {0}")]
@@ -762,63 +837,11 @@ impl SnapshotStoreError {
     }
 }
 
-/// What one [`SnapshotStore::prune_retired`] pass did (#669).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SnapshotPrune {
-    /// The store keeps no external objects of the group under reference
-    /// control: it is inline, or it has no voters to check.
-    Unmanaged,
-    /// A configured voter of the group has published no reference, so the
-    /// pass deleted nothing. Pruning fails closed: that voter may hold any
-    /// of the group's objects as its current snapshot.
-    VoterWithoutReference { node_id: u64 },
-    /// The pass deleted `deleted` objects.
-    Pruned { deleted: u64 },
-}
-
-impl SnapshotPrune {
-    /// The objects the pass deleted.
-    pub fn deleted(self) -> u64 {
-        match self {
-            Self::Pruned { deleted } => deleted,
-            Self::Unmanaged | Self::VoterWithoutReference { .. } => 0,
-        }
-    }
-
-    /// Whether a voter without a reference held the pass back.
-    pub fn skipped_unreferenced_voter(self) -> bool {
-        matches!(self, Self::VoterWithoutReference { .. })
-    }
-}
-
 pub type SnapshotStoreFuture<'a, T> =
     Pin<Box<dyn Future<Output = Result<T, SnapshotStoreError>> + Send + 'a>>;
 pub type SnapshotBytesIterator = Box<dyn Iterator<Item = Result<Bytes, SnapshotStoreError>> + Send>;
 
 pub trait SnapshotStore: Send + Sync + Debug {
-    /// Persist a snapshot blob and return its location. Stores own naming and
-    /// MAY ignore parts of `key` (Inline does).
-    fn upload<'a>(
-        &'a self,
-        key: SnapshotKey,
-        bytes: Bytes,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation>;
-
-    /// Persist snapshot bytes from an incremental producer.
-    fn upload_iter<'a>(
-        &'a self,
-        key: SnapshotKey,
-        chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        Box::pin(async move {
-            let mut bytes = Vec::new();
-            for chunk in chunks {
-                bytes.extend_from_slice(chunk?.as_ref());
-            }
-            self.upload(key, Bytes::from(bytes)).await
-        })
-    }
-
     /// The keys this store's node may commit for `raft_group_id`.
     fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace;
 
@@ -833,14 +856,29 @@ pub trait SnapshotStore: Send + Sync + Debug {
         chunks: SnapshotBytesIterator,
     ) -> SnapshotStoreFuture<'a, StagedSnapshot>;
 
-    /// Writes a staged snapshot and returns its location. An object is
-    /// created only if no object has its name
-    /// ([`SnapshotStoreError::NameCollision`] otherwise), and never
-    /// overwrites one.
-    fn write_staged<'a>(
+    /// Makes a body as another store holds it ready to write under a fresh
+    /// owned key, as [`Self::stage`] does: an install copy writes the stored
+    /// bytes as they are, without decompressing and compressing them again.
+    /// The default decompresses the body and stages it.
+    fn stage_stored<'a>(
         &'a self,
-        staged: StagedSnapshot,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation>;
+        raft_group_id: RaftGroupId,
+        index: u64,
+        stored: StoredSnapshot,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        Box::pin(async move {
+            let body = Bytes::from(stored.body()?);
+            self.stage(raft_group_id, index, Box::new(std::iter::once(Ok(body))))
+                .await
+        })
+    }
+
+    /// Writes a staged snapshot and returns the location it created, which
+    /// is the staged one. An object is created only if no object has its
+    /// name ([`SnapshotStoreError::NameCollision`] otherwise), and never
+    /// overwrites one.
+    fn write_staged<'a>(&'a self, staged: StagedSnapshot)
+    -> SnapshotStoreFuture<'a, OwnedLocation>;
 
     /// Lists this store's node's directory for `raft_group_id`.
     fn list_own<'a>(&'a self, raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing>;
@@ -849,62 +887,16 @@ pub trait SnapshotStore: Send + Sync + Debug {
     /// an error.
     fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()>;
 
-    /// Retrieve a snapshot blob given its location.
-    fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>>;
-
-    /// Best-effort delete; missing is not an error.
-    fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()>;
-
-    /// Deletes the retired snapshot objects of one Raft group: every object
-    /// older than the store's GC grace that `current`, no node's reference
-    /// and no node's pin names (#669). Backends may only delete objects that
-    /// cannot still be referenced by an OpenRaft snapshot pointer. It runs
-    /// whatever `current` is, an inline current included. Inline snapshots
-    /// have no external lifecycle, so the default deletes nothing.
-    fn prune_retired<'a>(
+    /// Reads the stored body at `location`, checked against its stored
+    /// size.
+    fn read_stored<'a>(
         &'a self,
-        _raft_group_id: u32,
-        _current: &'a SnapshotLocation,
-    ) -> SnapshotStoreFuture<'a, SnapshotPrune> {
-        Box::pin(async move { Ok(SnapshotPrune::Unmanaged) })
-    }
+        location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, StoredSnapshot>;
 
-    /// Publish this node's current durable pointer. External stores use these
-    /// references to prove that an object is unreachable before deleting it;
-    /// callers pin an incoming pointer before changing local metadata and
-    /// publish the current reference after that transition. The current pin
-    /// remains protected if this PUT fails or briefly lags another transition.
-    fn publish_reference<'a>(
-        &'a self,
-        _raft_group_id: u32,
-        _location: &'a SnapshotLocation,
-    ) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
-    }
-
-    /// Protect an incoming external pointer without replacing this node's
-    /// current reference. Complete before installing or publishing the pointer.
-    /// Pins use the existing reference record format so older pruners retain them.
-    /// A backend enabling external snapshot GC must implement this operation
-    /// and pin reconciliation; the no-op default is for stores without GC.
-    fn pin_reference<'a>(
-        &'a self,
-        _raft_group_id: u32,
-        _location: &'a SnapshotLocation,
-    ) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
-    }
-
-    /// Remove this node's obsolete pins, keeping both its current external
-    /// pointer and every prepared operation that could still publish a pointer.
-    /// Callers serialize this with pin creation. Startup reconciliation must
-    /// include the durable restored pointer before removing abandoned pins.
-    fn reconcile_reference_pins<'a>(
-        &'a self,
-        _raft_group_id: u32,
-        _retained: &'a [SnapshotLocation],
-    ) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
+    /// The decompressed body at `location`.
+    fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        Box::pin(async move { self.read_stored(location).await?.body() })
     }
 
     /// Lightweight liveness probe for the backend, used by the snapshot driver
@@ -916,9 +908,9 @@ pub trait SnapshotStore: Send + Sync + Debug {
         Box::pin(async move { Ok(()) })
     }
 
-    /// Verify that a freshly-uploaded snapshot is actually retrievable from
-    /// the backend. Called immediately after `upload` returns Ok, before the
-    /// new pointer is published. Catches silent partial-success modes
+    /// Verify that a freshly-written snapshot is actually retrievable from
+    /// the backend. Called immediately after `write_staged` returns Ok, before
+    /// the new pointer is published. Catches silent partial-success modes
     /// (multipart upload Init/Part Ok but Complete failed, opendal retry
     /// returning Ok on cached state, etc.) that would otherwise leave
     /// `current_snapshot` pointing at a 404. Default no-op for backends that
@@ -945,43 +937,19 @@ pub fn default_snapshot_store() -> SharedSnapshotStore {
 pub struct InlineSnapshotStore;
 
 impl SnapshotStore for InlineSnapshotStore {
-    fn upload<'a>(
+    fn read_stored<'a>(
         &'a self,
-        _key: SnapshotKey,
-        bytes: Bytes,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        Box::pin(async move {
-            Ok(SnapshotLocation::Inline {
-                bytes: bytes.to_vec(),
-            })
-        })
-    }
-
-    fn upload_iter<'a>(
-        &'a self,
-        _key: SnapshotKey,
-        chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        Box::pin(async move {
-            let bytes = collect_inline_snapshot(chunks).await?;
-            Ok(SnapshotLocation::Inline { bytes })
-        })
-    }
-
-    fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, StoredSnapshot> {
         Box::pin(async move {
             match location {
-                SnapshotLocation::Inline { bytes } => Ok(bytes.clone()),
+                SnapshotLocation::Inline { bytes } => Ok(StoredSnapshot::inline(bytes.clone())),
                 other => Err(SnapshotStoreError::UnsupportedLocation {
                     store: SnapshotBackend::Inline,
                     location: other.kind(),
                 }),
             }
         })
-    }
-
-    fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-        Box::pin(async move { Ok(()) })
     }
 
     /// Inline pointers only.
@@ -1007,10 +975,12 @@ impl SnapshotStore for InlineSnapshotStore {
     fn write_staged<'a>(
         &'a self,
         staged: StagedSnapshot,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+    ) -> SnapshotStoreFuture<'a, OwnedLocation> {
         Box::pin(async move {
             match staged {
-                StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
+                StagedSnapshot::Inline { bytes } => {
+                    Ok(OwnedLocation(SnapshotLocation::Inline { bytes }))
+                }
                 StagedSnapshot::Object(object) => Err(SnapshotStoreError::UnsupportedLocation {
                     store: SnapshotBackend::Inline,
                     location: object.location().kind(),
@@ -1054,7 +1024,7 @@ macro_rules! inline_owned_snapshot_methods {
         fn write_staged<'a>(
             &'a self,
             staged: $crate::StagedSnapshot,
-        ) -> $crate::SnapshotStoreFuture<'a, $crate::SnapshotLocation> {
+        ) -> $crate::SnapshotStoreFuture<'a, $crate::OwnedLocation> {
             static INLINE: $crate::InlineSnapshotStore = $crate::InlineSnapshotStore;
             $crate::SnapshotStore::write_staged(&INLINE, staged)
         }
@@ -1103,10 +1073,7 @@ fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, Sna
 
 #[cfg(not(madsim))]
 mod s3 {
-    use std::collections::HashSet;
     use std::io::Write;
-    use std::time::Duration;
-    use std::time::SystemTime;
 
     use bytes::Bytes;
     use opendal::ErrorKind;
@@ -1117,37 +1084,24 @@ mod s3 {
     use super::OwnListing;
     use super::OwnedDirectory;
     use super::OwnedKey;
+    use super::OwnedLocation;
     use super::OwnedNamespace;
     use super::OwnedObject;
     use super::SnapshotBackend;
     use super::SnapshotBytesIterator;
-    use super::SnapshotCompression;
-    use super::SnapshotKey;
     use super::SnapshotLocation;
     use super::SnapshotOwner;
     use super::SnapshotPrefix;
-    use super::SnapshotPrune;
-    use super::SnapshotReferenceConfig;
     use super::SnapshotStore;
     use super::SnapshotStoreConfigProblem;
     use super::SnapshotStoreError;
     use super::SnapshotStoreFuture;
     use super::StagedObject;
     use super::StagedSnapshot;
+    use super::StoredSnapshot;
     use crate::SnapshotStoreOperation;
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
-    /// The GC grace of a store built without one ([`S3SnapshotStore::with_gc_grace`]).
-    const S3_SNAPSHOT_GC_GRACE: Duration = Duration::from_secs(60 * 60);
-    const SNAPSHOT_REFERENCE_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
-
-    #[derive(serde::Deserialize, serde::Serialize)]
-    struct SnapshotReference {
-        version: u32,
-        node_id: u64,
-        raft_group_id: u32,
-        snapshot_key: Option<String>,
-    }
 
     /// How a store creates an object only if no object has its name.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1159,15 +1113,14 @@ mod s3 {
         EmulatedForTests,
     }
 
-    /// Bytes live in an opendal-managed S3 bucket under `{prefix}/group-{gid}/`.
+    /// Bytes live in an opendal-managed S3 bucket, each node's under
+    /// `{prefix}/node-{node}/`.
     pub struct S3SnapshotStore {
         operator: Operator,
         prefix: SnapshotPrefix,
         /// The node this store acts for: the owner of every object it
         /// stages, lists or deletes.
         node_id: u64,
-        references: Option<SnapshotReferenceConfig>,
-        gc_grace: Duration,
         conditional_create: ConditionalCreate,
         /// Draws the nonce of every staged object.
         nonces: fn() -> u64,
@@ -1178,8 +1131,6 @@ mod s3 {
             f.debug_struct("S3SnapshotStore")
                 .field("prefix", &self.prefix)
                 .field("node_id", &self.node_id)
-                .field("references", &self.references)
-                .field("gc_grace", &self.gc_grace)
                 .field("conditional_create", &self.conditional_create)
                 .finish_non_exhaustive()
         }
@@ -1191,16 +1142,15 @@ mod s3 {
                 operator,
                 prefix,
                 node_id,
-                references: None,
-                gc_grace: S3_SNAPSHOT_GC_GRACE,
                 conditional_create: ConditionalCreate::Required,
                 nonces: rand::random,
             }
         }
 
         /// Draws the nonces of staged objects from `nonces` instead of at
-        /// random, as a simulation does from its seed.
-        pub fn with_nonces(mut self, nonces: fn() -> u64) -> Self {
+        /// random, for a test that makes two stages draw the same name.
+        #[cfg(test)]
+        pub(crate) fn with_nonces(mut self, nonces: fn() -> u64) -> Self {
             self.nonces = nonces;
             self
         }
@@ -1213,26 +1163,25 @@ mod s3 {
             }
         }
 
-        pub fn with_references(mut self, references: SnapshotReferenceConfig) -> Self {
-            self.references = Some(references);
-            self
-        }
-
-        /// How old an object must be before pruning may delete it (#669).
-        /// A server passes `RaftConfig::snapshot_gc_grace`, a quarter of
-        /// `raft.deleted_data_max_age` capped at the longer of an hour and two
-        /// `raft.install_snapshot_timeout`s, the time a replica keeps the
-        /// object it replaced pinned. An object nobody
-        /// pins, such as the upload of a build a newer install overtook, is
-        /// then deleted once it is that old.
-        ///
-        /// An object's age is its store modification time against this
-        /// node's clock, and a build pins its upload only after the PUT
-        /// returns. Both assume that the nodes' clocks agree with the
-        /// store's, and that an upload completes, well within the grace.
-        pub fn with_gc_grace(mut self, gc_grace: Duration) -> Self {
-            self.gc_grace = gc_grace;
-            self
+        /// `stored`, zstd bytes of `size_bytes` logical bytes, staged under
+        /// a freshly drawn key of this node.
+        fn staged_object(
+            &self,
+            raft_group_id: RaftGroupId,
+            index: u64,
+            stored: Bytes,
+            size_bytes: u64,
+        ) -> StagedSnapshot {
+            StagedSnapshot::Object(StagedObject {
+                key: OwnedKey {
+                    owner: self.owner(raft_group_id),
+                    index,
+                    nonce: (self.nonces)(),
+                },
+                prefix: self.prefix.clone(),
+                size_bytes,
+                stored,
+            })
         }
 
         /// In-memory opendal operator under `prefix`, for tests. The
@@ -1248,16 +1197,13 @@ mod s3 {
             Ok(store)
         }
 
-        /// A store of node `node_id` on this store's operator and prefix.
-        #[cfg(test)]
-        pub(crate) fn sibling_for_tests(&self, node_id: u64) -> Self {
+        /// A store of node `node_id` on this store's operator and prefix, for
+        /// tests of several nodes that share one bucket.
+        #[cfg(any(test, feature = "test-support"))]
+        pub fn sibling_for_tests(&self, node_id: u64) -> Self {
             let mut sibling = Self::new(self.operator.clone(), self.prefix.clone(), node_id);
             sibling.conditional_create = self.conditional_create;
-            sibling.with_references(SnapshotReferenceConfig {
-                node_id,
-                default_voters: std::collections::BTreeSet::from([node_id]),
-                per_group_voters: std::collections::BTreeMap::new(),
-            })
+            sibling
         }
 
         #[cfg(test)]
@@ -1347,114 +1293,6 @@ mod s3 {
             Ok(Self::new(operator, prefix, node_id))
         }
 
-        fn object_key(&self, key: &SnapshotKey, digest: blake3::Hash) -> String {
-            format!(
-                "{}/group-{}/objects/{}.snap",
-                self.prefix,
-                key.raft_group_id,
-                digest.to_hex(),
-            )
-        }
-
-        fn group_prefix(&self, raft_group_id: u32) -> String {
-            format!("{}/group-{raft_group_id}/", self.prefix)
-        }
-
-        fn reference_key(&self, raft_group_id: u32, node_id: u64) -> String {
-            format!(
-                "{}references/node-{node_id}.json",
-                self.group_prefix(raft_group_id)
-            )
-        }
-
-        /// Writes a content-addressed object, or keeps the object already
-        /// under its name when its size matches.
-        async fn write_content_once(
-            &self,
-            object_key: &str,
-            stored_bytes: Vec<u8>,
-        ) -> Result<u64, SnapshotStoreError> {
-            let stored_size_bytes = stored_bytes.len() as u64;
-            if self
-                .operator
-                .info()
-                .full_capability()
-                .write_with_if_not_exists
-            {
-                match self
-                    .operator
-                    .write_with(object_key, stored_bytes)
-                    .if_not_exists(true)
-                    .await
-                {
-                    Ok(_) => {}
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            ErrorKind::AlreadyExists | ErrorKind::ConditionNotMatch
-                        ) =>
-                    {
-                        let metadata =
-                            self.operator.stat(object_key).await.map_err(|stat_error| {
-                                SnapshotStoreError::backend(
-                                    SnapshotStoreOperation::Head,
-                                    object_key,
-                                    stat_error,
-                                )
-                            })?;
-                        if metadata.content_length() != stored_size_bytes {
-                            return Err(SnapshotStoreError::SizeMismatch {
-                                key: object_key.to_owned(),
-                                expected: stored_size_bytes,
-                                actual: metadata.content_length(),
-                            });
-                        }
-                    }
-                    Err(err) => {
-                        return Err(SnapshotStoreError::backend(
-                            SnapshotStoreOperation::Put,
-                            object_key,
-                            err,
-                        ));
-                    }
-                }
-            } else {
-                // The production S3 backend supports conditional creation. This
-                // fallback keeps capability-limited test backends useful.
-                match self.operator.stat(object_key).await {
-                    Ok(metadata) => {
-                        if metadata.content_length() != stored_size_bytes {
-                            return Err(SnapshotStoreError::SizeMismatch {
-                                key: object_key.to_owned(),
-                                expected: stored_size_bytes,
-                                actual: metadata.content_length(),
-                            });
-                        }
-                    }
-                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => {
-                        self.operator
-                            .write(object_key, stored_bytes)
-                            .await
-                            .map_err(|write_error| {
-                                SnapshotStoreError::backend(
-                                    SnapshotStoreOperation::Put,
-                                    object_key,
-                                    write_error,
-                                )
-                            })?;
-                    }
-                    Err(err) => {
-                        return Err(SnapshotStoreError::backend(
-                            SnapshotStoreOperation::Head,
-                            object_key,
-                            err,
-                        ));
-                    }
-                }
-            }
-            Ok(stored_size_bytes)
-        }
-
         /// Creates `key` only if no object has the name: a found object is
         /// a [`SnapshotStoreError::NameCollision`], never reused or
         /// overwritten. A backend that cannot create conditionally is
@@ -1462,7 +1300,7 @@ mod s3 {
         async fn create_object(
             &self,
             key: &str,
-            stored_bytes: Vec<u8>,
+            stored_bytes: Bytes,
         ) -> Result<(), SnapshotStoreError> {
             if self
                 .operator
@@ -1517,23 +1355,6 @@ mod s3 {
                 },
             }
         }
-
-        /// `key` checked against group `raft_group_id`'s namespace of the
-        /// reference protocol.
-        fn group_object<'k>(
-            &self,
-            raft_group_id: u32,
-            key: &'k str,
-        ) -> Result<&'k str, SnapshotStoreError> {
-            if key.starts_with(&self.group_prefix(raft_group_id)) && key.ends_with(".snap") {
-                Ok(key)
-            } else {
-                Err(SnapshotStoreError::OutsideGroup {
-                    raft_group_id: RaftGroupId(raft_group_id),
-                    key: key.to_owned(),
-                })
-            }
-        }
     }
 
     fn compress_snapshot_chunks(
@@ -1565,162 +1386,7 @@ mod s3 {
             .map_err(SnapshotStoreError::Encoder)?
     }
 
-    /// Compresses `chunks` and hashes the result, both off the async worker,
-    /// for a content-addressed object.
-    async fn compress_and_hash_off_worker(
-        chunks: SnapshotBytesIterator,
-    ) -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
-        tokio::task::spawn_blocking(
-            move || -> Result<(Vec<u8>, u64, blake3::Hash), SnapshotStoreError> {
-                let (stored, size_bytes) = compress_snapshot_chunks(chunks)?;
-                let digest = blake3::hash(&stored);
-                Ok((stored, size_bytes, digest))
-            },
-        )
-        .await
-        .map_err(SnapshotStoreError::Encoder)?
-    }
-
     impl SnapshotStore for S3SnapshotStore {
-        fn pin_reference<'a>(
-            &'a self,
-            raft_group_id: u32,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let (Some(references), SnapshotLocation::S3 { key, .. }) =
-                    (&self.references, location)
-                else {
-                    return Ok(());
-                };
-                self.group_object(raft_group_id, key)?;
-                let pin_key = format!(
-                    "{}references/pins/{}/{}.json",
-                    self.group_prefix(raft_group_id),
-                    references.node_id,
-                    blake3::hash(key.as_bytes()).to_hex(),
-                );
-                let record = serde_json::to_vec(&SnapshotReference {
-                    version: SNAPSHOT_REFERENCE_VERSION,
-                    node_id: references.node_id,
-                    raft_group_id,
-                    snapshot_key: Some(key.clone()),
-                })
-                .map_err(SnapshotStoreError::ReferenceEncode)?;
-                self.operator.write(&pin_key, record).await.map_err(|err| {
-                    SnapshotStoreError::backend(SnapshotStoreOperation::Put, &pin_key, err)
-                })
-            })
-        }
-
-        fn reconcile_reference_pins<'a>(
-            &'a self,
-            raft_group_id: u32,
-            retained: &'a [SnapshotLocation],
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let Some(references) = &self.references else {
-                    return Ok(());
-                };
-                let prefix = format!(
-                    "{}references/pins/{}/",
-                    self.group_prefix(raft_group_id),
-                    references.node_id
-                );
-                let retained: HashSet<_> = retained
-                    .iter()
-                    .filter_map(|location| match location {
-                        SnapshotLocation::S3 { key, .. } => Some(key.as_str()),
-                        _ => None,
-                    })
-                    .collect();
-                let entries = self
-                    .operator
-                    .list_with(&prefix)
-                    .recursive(true)
-                    .await
-                    .map_err(|err| {
-                        SnapshotStoreError::backend(SnapshotStoreOperation::List, &prefix, err)
-                    })?;
-                for entry in entries {
-                    if !entry.metadata().mode().is_file() || !entry.path().ends_with(".json") {
-                        continue;
-                    }
-                    let bytes = self.operator.read(entry.path()).await.map_err(|err| {
-                        SnapshotStoreError::backend(SnapshotStoreOperation::Get, entry.path(), err)
-                    })?;
-                    let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
-                        .map_err(|source| SnapshotStoreError::ReferenceDecode {
-                            record: entry.path().to_owned(),
-                            source,
-                        })?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.node_id != references.node_id
-                        || reference.raft_group_id != raft_group_id
-                    {
-                        return Err(SnapshotStoreError::InvalidReference {
-                            record: entry.path().to_owned(),
-                        });
-                    }
-                    if reference
-                        .snapshot_key
-                        .as_deref()
-                        .is_none_or(|key| !retained.contains(key))
-                    {
-                        self.operator.delete(entry.path()).await.map_err(|err| {
-                            SnapshotStoreError::backend(
-                                SnapshotStoreOperation::Delete,
-                                entry.path(),
-                                err,
-                            )
-                        })?;
-                    }
-                }
-                Ok(())
-            })
-        }
-
-        fn upload<'a>(
-            &'a self,
-            key: SnapshotKey,
-            bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                let size_bytes = bytes.len() as u64;
-                let stored_bytes = zstd::bulk::compress(&bytes, S3_SNAPSHOT_ZSTD_LEVEL)
-                    .map_err(SnapshotStoreError::Compress)?;
-                let object_key = self.object_key(&key, blake3::hash(&stored_bytes));
-                let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
-                Ok(SnapshotLocation::S3 {
-                    key: object_key,
-                    size_bytes,
-                    stored_size_bytes,
-                    compression: SnapshotCompression::Zstd,
-                    shared_object: true,
-                })
-            })
-        }
-
-        fn upload_iter<'a>(
-            &'a self,
-            key: SnapshotKey,
-            chunks: SnapshotBytesIterator,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                let (stored_bytes, size_bytes, digest) =
-                    compress_and_hash_off_worker(chunks).await?;
-                let object_key = self.object_key(&key, digest);
-                let stored_size_bytes = self.write_content_once(&object_key, stored_bytes).await?;
-                Ok(SnapshotLocation::S3 {
-                    key: object_key,
-                    size_bytes,
-                    stored_size_bytes,
-                    compression: SnapshotCompression::Zstd,
-                    shared_object: true,
-                })
-            })
-        }
-
         fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace {
             OwnedNamespace {
                 directory: Some(OwnedDirectory {
@@ -1737,28 +1403,42 @@ mod s3 {
             chunks: SnapshotBytesIterator,
         ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
             Box::pin(async move {
-                let owner = self.owner(raft_group_id);
                 let (stored, size_bytes) = compress_off_worker(chunks).await?;
-                Ok(StagedSnapshot::Object(StagedObject {
-                    key: OwnedKey {
-                        owner,
-                        index,
-                        nonce: (self.nonces)(),
-                    },
-                    prefix: self.prefix.clone(),
-                    size_bytes,
-                    stored,
-                }))
+                Ok(self.staged_object(raft_group_id, index, Bytes::from(stored), size_bytes))
+            })
+        }
+
+        /// Stages zstd bytes as they are, under a fresh name. A body stored
+        /// uncompressed is compressed first.
+        fn stage_stored<'a>(
+            &'a self,
+            raft_group_id: RaftGroupId,
+            index: u64,
+            stored: StoredSnapshot,
+        ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+            Box::pin(async move {
+                match stored.into_compressed() {
+                    Ok((stored, size_bytes)) => {
+                        Ok(self.staged_object(raft_group_id, index, stored, size_bytes))
+                    }
+                    Err(uncompressed) => {
+                        let body = Bytes::from(uncompressed.body()?);
+                        self.stage(raft_group_id, index, Box::new(std::iter::once(Ok(body))))
+                            .await
+                    }
+                }
             })
         }
 
         fn write_staged<'a>(
             &'a self,
             staged: StagedSnapshot,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+        ) -> SnapshotStoreFuture<'a, OwnedLocation> {
             Box::pin(async move {
                 match staged {
-                    StagedSnapshot::Inline { bytes } => Ok(SnapshotLocation::Inline { bytes }),
+                    StagedSnapshot::Inline { bytes } => {
+                        Ok(OwnedLocation(SnapshotLocation::Inline { bytes }))
+                    }
                     StagedSnapshot::Object(object) => {
                         if object.prefix != self.prefix || object.key.owner.node_id != self.node_id
                         {
@@ -1766,7 +1446,7 @@ mod s3 {
                                 path: object.path(),
                             });
                         }
-                        let location = object.location();
+                        let location = OwnedLocation(object.location());
                         let path = object.path();
                         self.create_object(&path, object.stored).await?;
                         Ok(location)
@@ -1828,15 +1508,12 @@ mod s3 {
             })
         }
 
-        fn download<'a>(
+        fn read_stored<'a>(
             &'a self,
             location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        ) -> SnapshotStoreFuture<'a, StoredSnapshot> {
             Box::pin(async move {
-                let SnapshotLocation::S3 {
-                    key, size_bytes, ..
-                } = location
-                else {
+                let SnapshotLocation::S3 { key, .. } = location else {
                     return Err(SnapshotStoreError::UnsupportedLocation {
                         store: SnapshotBackend::S3,
                         location: location.kind(),
@@ -1849,278 +1526,7 @@ mod s3 {
                         SnapshotStoreError::backend(SnapshotStoreOperation::Get, key, err)
                     }
                 })?;
-                let stored_bytes = buf.to_vec();
-                let expected_stored_size = location.stored_size_hint();
-                if stored_bytes.len() as u64 != expected_stored_size {
-                    return Err(SnapshotStoreError::SizeMismatch {
-                        key: key.clone(),
-                        expected: expected_stored_size,
-                        actual: stored_bytes.len() as u64,
-                    });
-                }
-                let bytes = match location.compression() {
-                    SnapshotCompression::None => stored_bytes,
-                    SnapshotCompression::Zstd => zstd::bulk::decompress(
-                        &stored_bytes,
-                        usize::try_from(*size_bytes).map_err(|_overflow| {
-                            SnapshotStoreError::LogicalSizeUnaddressable {
-                                key: key.clone(),
-                                size_bytes: *size_bytes,
-                            }
-                        })?,
-                    )
-                    .map_err(|source| SnapshotStoreError::Decompress {
-                        key: key.clone(),
-                        source,
-                    })?,
-                };
-                if bytes.len() as u64 != *size_bytes {
-                    return Err(SnapshotStoreError::LogicalSizeMismatch {
-                        key: key.clone(),
-                        expected: *size_bytes,
-                        actual: bytes.len() as u64,
-                    });
-                }
-                Ok(bytes)
-            })
-        }
-
-        fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let SnapshotLocation::S3 {
-                    key, shared_object, ..
-                } = location
-                else {
-                    return Ok(());
-                };
-                if *shared_object {
-                    return Ok(());
-                }
-                match self.operator.delete(key).await {
-                    Ok(()) => Ok(()),
-                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
-                    Err(err) => Err(SnapshotStoreError::backend(
-                        SnapshotStoreOperation::Delete,
-                        key,
-                        err,
-                    )),
-                }
-            })
-        }
-
-        /// Deletes every `.snap` object of the group older than the GC grace
-        /// that `current`, no reference record and no pin names (#669). No
-        /// count of retired objects is kept: a replica pins the object it
-        /// replaced for the grace, which covers a send of its pointer that
-        /// started before the switch. It runs with an inline `current` too.
-        ///
-        /// Fails closed: while a configured voter of the group has published
-        /// no reference, nothing is deleted, since that voter may hold any of
-        /// the group's objects. Every reference record found is honoured,
-        /// including one a node that left the cluster wrote, whose object
-        /// stays until an operator deletes that record.
-        fn prune_retired<'a>(
-            &'a self,
-            raft_group_id: u32,
-            current: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, SnapshotPrune> {
-            Box::pin(async move {
-                let Some(references) = &self.references else {
-                    return Ok(SnapshotPrune::Unmanaged);
-                };
-                let expected_voters = references.voters_for(raft_group_id);
-                if expected_voters.is_empty() {
-                    return Ok(SnapshotPrune::Unmanaged);
-                }
-                let group_prefix = self.group_prefix(raft_group_id);
-                let mut retained = HashSet::new();
-                if let SnapshotLocation::S3 { key, .. } = current {
-                    retained.insert(key.clone());
-                }
-                for node_id in expected_voters {
-                    let reference_key = self.reference_key(raft_group_id, *node_id);
-                    let reference_bytes = match self.operator.read(&reference_key).await {
-                        Ok(bytes) => bytes,
-                        Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
-                            tracing::debug!(
-                                raft_group_id,
-                                node_id,
-                                "deferring S3 snapshot pruning until every voter publishes a reference"
-                            );
-                            return Ok(SnapshotPrune::VoterWithoutReference { node_id: *node_id });
-                        }
-                        Err(error) => {
-                            return Err(SnapshotStoreError::backend(
-                                SnapshotStoreOperation::Get,
-                                reference_key,
-                                error,
-                            ));
-                        }
-                    };
-                    let reference: SnapshotReference =
-                        serde_json::from_slice(&reference_bytes.to_vec()).map_err(|source| {
-                            SnapshotStoreError::ReferenceDecode {
-                                record: reference_key.clone(),
-                                source,
-                            }
-                        })?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.node_id != *node_id
-                        || reference.raft_group_id != raft_group_id
-                    {
-                        return Err(SnapshotStoreError::InvalidReference {
-                            record: reference_key,
-                        });
-                    }
-                    if let Some(key) = reference.snapshot_key {
-                        self.group_object(raft_group_id, &key)?;
-                        retained.insert(key);
-                    }
-                }
-                let cutoff = SystemTime::now()
-                    .checked_sub(self.gc_grace)
-                    .unwrap_or(SystemTime::UNIX_EPOCH);
-                let entries = self
-                    .operator
-                    .list_with(&group_prefix)
-                    .recursive(true)
-                    .await
-                    .map_err(|error| {
-                        SnapshotStoreError::backend(
-                            SnapshotStoreOperation::List,
-                            &group_prefix,
-                            error,
-                        )
-                    })?;
-                let references_prefix = format!("{group_prefix}references/");
-                for entry in &entries {
-                    if !entry.metadata().mode().is_file()
-                        || !entry.path().starts_with(&references_prefix)
-                        || !entry.path().ends_with(".json")
-                    {
-                        continue;
-                    }
-                    let bytes = match self.operator.read(entry.path()).await {
-                        Ok(bytes) => bytes,
-                        // A pin its node released after the listing (#490):
-                        // it protects nothing any more.
-                        Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
-                            continue;
-                        }
-                        Err(error) => {
-                            return Err(SnapshotStoreError::backend(
-                                SnapshotStoreOperation::Get,
-                                entry.path(),
-                                error,
-                            ));
-                        }
-                    };
-                    let reference: SnapshotReference = serde_json::from_slice(&bytes.to_vec())
-                        .map_err(|source| SnapshotStoreError::ReferenceDecode {
-                            record: entry.path().to_owned(),
-                            source,
-                        })?;
-                    if reference.version != SNAPSHOT_REFERENCE_VERSION
-                        || reference.raft_group_id != raft_group_id
-                    {
-                        return Err(SnapshotStoreError::InvalidReference {
-                            record: entry.path().to_owned(),
-                        });
-                    }
-                    if let Some(key) = reference.snapshot_key {
-                        self.group_object(raft_group_id, &key)?;
-                        retained.insert(key);
-                    }
-                }
-                let mut deleted = 0_u64;
-                for entry in entries {
-                    if !entry.metadata().mode().is_file()
-                        || !entry.path().ends_with(".snap")
-                        || retained.contains(entry.path())
-                    {
-                        continue;
-                    }
-                    let modified = match entry.metadata().last_modified() {
-                        Some(modified) => Some(modified.into()),
-                        None => self
-                            .operator
-                            .stat(entry.path())
-                            .await
-                            .map_err(|error| {
-                                SnapshotStoreError::backend(
-                                    SnapshotStoreOperation::Head,
-                                    entry.path(),
-                                    error,
-                                )
-                            })?
-                            .last_modified()
-                            .map(Into::into)
-                            .or_else(|| self.gc_grace.is_zero().then_some(SystemTime::UNIX_EPOCH)),
-                    };
-                    if !modified.is_some_and(|modified: SystemTime| modified <= cutoff) {
-                        continue;
-                    }
-                    match self.operator.delete(entry.path()).await {
-                        Ok(()) => {}
-                        // Another replica's pass deleted it first.
-                        Err(error) if matches!(error.kind(), ErrorKind::NotFound) => {
-                            continue;
-                        }
-                        Err(error) => {
-                            return Err(SnapshotStoreError::backend(
-                                SnapshotStoreOperation::Delete,
-                                entry.path(),
-                                error,
-                            ));
-                        }
-                    }
-                    deleted = deleted.saturating_add(1);
-                }
-                if deleted > 0 {
-                    tracing::info!(
-                        raft_group_id,
-                        deleted,
-                        retained = retained.len(),
-                        "pruned unreachable S3 snapshot objects"
-                    );
-                }
-                Ok(SnapshotPrune::Pruned { deleted })
-            })
-        }
-
-        fn publish_reference<'a>(
-            &'a self,
-            raft_group_id: u32,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let Some(references) = &self.references else {
-                    return Ok(());
-                };
-                let snapshot_key = match location {
-                    SnapshotLocation::S3 { key, .. } => {
-                        Some(self.group_object(raft_group_id, key)?.to_owned())
-                    }
-                    SnapshotLocation::Inline { .. } | SnapshotLocation::Local { .. } => None,
-                };
-                let reference = serde_json::to_vec(&SnapshotReference {
-                    version: SNAPSHOT_REFERENCE_VERSION,
-                    node_id: references.node_id,
-                    raft_group_id,
-                    snapshot_key,
-                })
-                .map_err(SnapshotStoreError::ReferenceEncode)?;
-                let reference_key = self.reference_key(raft_group_id, references.node_id);
-                self.operator
-                    .write(&reference_key, reference)
-                    .await
-                    .map_err(|error| {
-                        SnapshotStoreError::backend(
-                            SnapshotStoreOperation::Put,
-                            reference_key,
-                            error,
-                        )
-                    })
+                StoredSnapshot::of_object(location, buf.to_bytes())
             })
         }
 
@@ -2178,14 +1584,12 @@ pub use s3::S3SnapshotStore;
 
 /// Pick a snapshot store from a typed `ursula_config::RaftSnapshotConfig`. Returns `None`
 /// when the backend is "inline" (the default) so callers can fall back to
-/// [`default_snapshot_store`] without instantiating anything. `gc_grace` is
-/// how old an external object must be before pruning may delete it
-/// ([`S3SnapshotStore::with_gc_grace`]).
+/// [`default_snapshot_store`] without instantiating anything. `node_id` is
+/// the node the store acts for, the owner of every object it writes.
 pub fn snapshot_store_from_config(
     cfg: &ursula_config::RaftSnapshotConfig,
     cold_cfg: &crate::ColdConfig,
-    references: SnapshotReferenceConfig,
-    gc_grace: std::time::Duration,
+    node_id: u64,
 ) -> Result<Option<SharedSnapshotStore>, SnapshotStoreError> {
     match resolved_snapshot_backend(cfg.backend, cold_cfg.backend) {
         ursula_config::RaftSnapshotBackend::Auto | ursula_config::RaftSnapshotBackend::Inline => {
@@ -2195,16 +1599,16 @@ pub fn snapshot_store_from_config(
         ursula_config::RaftSnapshotBackend::S3 => {
             // `try_new` configures the OpenDAL operator with `cold_cfg.root`, so
             // this namespace must stay relative to that root.
-            Ok(Some(Arc::new(
-                S3SnapshotStore::try_new(cold_cfg, cfg.snapshot_prefix(), references.node_id)?
-                    .with_references(references)
-                    .with_gc_grace(gc_grace),
-            )))
+            Ok(Some(Arc::new(S3SnapshotStore::try_new(
+                cold_cfg,
+                cfg.snapshot_prefix(),
+                node_id,
+            )?)))
         }
         #[cfg(madsim)]
         ursula_config::RaftSnapshotBackend::S3 => {
-            // No S3 store under madsim, so no references or grace to apply.
-            let _no_store = (references, gc_grace);
+            // No S3 store under madsim, so no node to act for.
+            let _no_store = node_id;
             Err(SnapshotStoreError::Config {
                 problem: SnapshotStoreConfigProblem::NoS3UnderSimulation,
             })
@@ -2229,25 +1633,17 @@ pub fn resolved_snapshot_backend(
 mod tests {
     use super::*;
 
-    fn test_key(raft_group_id: u32, snapshot_id: &str) -> SnapshotKey {
-        SnapshotKey {
-            raft_group_id,
-            snapshot_id: snapshot_id.to_owned(),
-        }
-    }
-
     #[tokio::test]
     async fn inline_roundtrip() {
         let store = InlineSnapshotStore;
-        let key = test_key(0, "group-0-T1-N1-100");
-        let loc = store
-            .upload(key, b"hello world".to_vec().into())
+        let staged = store
+            .stage(RaftGroupId(0), 100, body(b"hello world"))
             .await
             .unwrap();
+        let loc = store.write_staged(staged).await.unwrap().into_location();
         assert!(matches!(loc, SnapshotLocation::Inline { .. }));
         let bytes = store.download(&loc).await.unwrap();
         assert_eq!(bytes, b"hello world");
-        store.delete(&loc).await.unwrap();
     }
 
     #[cfg(not(madsim))]
@@ -2261,13 +1657,10 @@ mod tests {
             Ok(Bytes::from_static(b"snapshot"))
         }));
 
-        let location = store
-            .upload_iter(test_key(0, "offloaded"), chunks)
-            .await
-            .unwrap();
+        let staged = store.stage(RaftGroupId(0), 1, chunks).await.unwrap();
 
         assert_ne!(thread_rx.recv().unwrap(), caller);
-        assert_eq!(location, SnapshotLocation::Inline {
+        assert_eq!(staged.location(), SnapshotLocation::Inline {
             bytes: b"snapshot".to_vec()
         });
     }
@@ -2313,11 +1706,10 @@ mod tests {
                 size_bytes: 12,
             },
             SnapshotLocation::S3 {
-                key: "snapshots/group-7/a.snap".into(),
+                key: "snapshots/node-1/group-7/00000000000000000500-0000000000000001.snap".into(),
                 size_bytes: 123,
                 stored_size_bytes: 45,
                 compression: SnapshotCompression::Zstd,
-                shared_object: true,
             },
         ] {
             let pointer = SnapshotPointer {
@@ -2371,11 +1763,11 @@ mod tests {
             SnapshotPointer {
                 snapshot_id: "group-3-4-900".into(),
                 location: SnapshotLocation::S3 {
-                    key: "snapshots/group-3/abc.snap".into(),
+                    key: "snapshots/node-1/group-3/00000000000000000900-0000000000000abc.snap"
+                        .into(),
                     size_bytes: 77,
                     stored_size_bytes: 40,
                     compression: SnapshotCompression::Zstd,
-                    shared_object: true,
                 },
             },
         ];
@@ -2411,6 +1803,24 @@ mod tests {
         );
     }
 
+    /// An S3 location of format epoch 5 names its kind, key, sizes and
+    /// compression, and no `shared_object` flag: no node shares an object.
+    #[test]
+    fn an_s3_pointer_carries_no_shared_object_field() {
+        let pointer = SnapshotPointer {
+            snapshot_id: "group-3-4-900".into(),
+            location: SnapshotLocation::S3 {
+                key: "snapshots/node-1/group-3/00000000000000000900-0000000000000abc.snap".into(),
+                size_bytes: 77,
+                stored_size_bytes: 40,
+                compression: SnapshotCompression::Zstd,
+            },
+        };
+        let json = serde_json::to_value(&pointer).unwrap();
+        assert_eq!(json["location"].as_object().unwrap().len(), 5, "{json}");
+        assert!(json["location"].get("shared_object").is_none(), "{json}");
+    }
+
     #[test]
     fn pointer_encode_decode_local() {
         let pointer = SnapshotPointer {
@@ -2426,115 +1836,42 @@ mod tests {
         assert_eq!(back.location.size_hint(), 12345);
     }
 
+    /// A staged object round-trips through the store compressed, under an
+    /// owned key of the store's node.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn s3_memory_roundtrip() {
         let store = S3SnapshotStore::memory_for_tests("snapshots", 1).unwrap();
-        let key = test_key(3, "group-3-T5-N2-9876");
         let payload = b"raw snapshot bytes".repeat(64);
-        let loc = store.upload(key, payload.clone().into()).await.unwrap();
+        let staged = store
+            .stage(
+                RaftGroupId(3),
+                9876,
+                Box::new(std::iter::once(Ok(Bytes::from(payload.clone())))),
+            )
+            .await
+            .unwrap();
+        let loc = store.write_staged(staged).await.unwrap().into_location();
         match &loc {
             SnapshotLocation::S3 {
                 key,
                 size_bytes,
                 stored_size_bytes,
                 compression,
-                shared_object,
             } => {
-                assert!(key.starts_with("snapshots/group-3/objects/"));
+                assert!(key.starts_with("snapshots/node-1/group-3/00000000000000009876-"));
                 assert_eq!(*size_bytes, payload.len() as u64);
                 assert_eq!(*compression, SnapshotCompression::Zstd);
-                assert!(*shared_object);
                 assert!(*stored_size_bytes < *size_bytes);
             }
             other => panic!("expected S3 location, got {other:?}"),
         }
-        let bytes = store.download(&loc).await.unwrap();
-        assert_eq!(bytes, payload);
-        // A content-addressed object may already be referenced by another
-        // replica. Eager local cleanup must not remove it.
-        store.delete(&loc).await.unwrap();
         assert_eq!(store.download(&loc).await.unwrap(), payload);
-        store.delete(&loc).await.unwrap();
     }
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn s3_pending_pins_protect_install_and_only_retire_this_nodes_obsolete_pins() {
-        let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, []).unwrap();
-        let store = S3SnapshotStore::new(
-            operator.clone(),
-            SnapshotPrefix::try_from("snapshot-pin-gc").unwrap(),
-            1,
-        )
-        .with_references(SnapshotReferenceConfig {
-            node_id: 1,
-            default_voters: BTreeSet::from([1]),
-            per_group_voters: BTreeMap::new(),
-        })
-        .with_gc_grace(std::time::Duration::ZERO);
-        let other = S3SnapshotStore::new(
-            operator,
-            SnapshotPrefix::try_from("snapshot-pin-gc").unwrap(),
-            2,
-        )
-        .with_references(SnapshotReferenceConfig {
-            node_id: 2,
-            default_voters: BTreeSet::from([1]),
-            per_group_voters: BTreeMap::new(),
-        });
-        let old = store
-            .upload(test_key(7, "old"), b"old".to_vec().into())
-            .await
-            .unwrap();
-        let incoming = store
-            .upload(test_key(7, "incoming"), b"incoming".to_vec().into())
-            .await
-            .unwrap();
-        let abandoned = store
-            .upload(test_key(7, "abandoned"), b"abandoned".to_vec().into())
-            .await
-            .unwrap();
-        let other_pin = store
-            .upload(test_key(7, "other"), b"other".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &old).await.unwrap();
-        store.pin_reference(7, &incoming).await.unwrap();
-        store.pin_reference(7, &abandoned).await.unwrap();
-        other.pin_reference(7, &other_pin).await.unwrap();
-        // The unchanged GC reader understands these version-two records,
-        // while the primary still names the old pointer during installation
-        // or after a failed primary PUT. Zero grace makes protection explicit.
-        store.prune_retired(7, &old).await.unwrap();
-        assert_eq!(store.download(&old).await.unwrap(), b"old");
-        assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
-        assert_eq!(store.download(&abandoned).await.unwrap(), b"abandoned");
-        assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
-        store
-            .reconcile_reference_pins(7, std::slice::from_ref(&incoming))
-            .await
-            .unwrap();
-        store.prune_retired(7, &old).await.unwrap();
-        assert!(matches!(
-            store.download(&abandoned).await,
-            Err(SnapshotStoreError::NotFound { .. })
-        ));
-        assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
-        assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
-        store.publish_reference(7, &incoming).await.unwrap();
-        store.prune_retired(7, &incoming).await.unwrap();
-        assert!(matches!(
-            store.download(&old).await,
-            Err(SnapshotStoreError::NotFound { .. })
-        ));
-        assert_eq!(store.download(&incoming).await.unwrap(), b"incoming");
-        assert_eq!(store.download(&other_pin).await.unwrap(), b"other");
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_iterator_upload_is_compressed_and_offloaded() {
+    async fn s3_stage_compresses_off_the_async_worker() {
         let store = S3SnapshotStore::memory_for_tests("snapshots", 1).unwrap();
         let caller = std::thread::current().id();
         let (thread_tx, thread_rx) = std::sync::mpsc::channel();
@@ -2543,12 +1880,10 @@ mod tests {
             Ok(Bytes::from(vec![b'x'; 64 * 1024]))
         }));
 
-        let location = store
-            .upload_iter(test_key(9, "group-9-T1-N1-1"), chunks)
-            .await
-            .unwrap();
+        let staged = store.stage(RaftGroupId(9), 1, chunks).await.unwrap();
 
         assert_ne!(thread_rx.recv().unwrap(), caller);
+        let location = store.write_staged(staged).await.unwrap().into_location();
         assert_eq!(location.compression(), SnapshotCompression::Zstd);
         assert!(location.stored_size_hint() < location.size_hint());
         assert_eq!(store.download(&location).await.unwrap(), vec![
@@ -2559,39 +1894,14 @@ mod tests {
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn s3_snapshot_keys_are_content_addressed() {
-        let store = S3SnapshotStore::memory_for_tests("snapshots", 1).unwrap();
-        let key1 = test_key(4, "group-4-T18-N3-264150");
-        let key2 = test_key(4, "group-4-T18-N3-264150");
-        let key3 = test_key(4, "group-4-T18-N3-264151");
-        let loc1 = store.upload(key1, b"body1".to_vec().into()).await.unwrap();
-        let loc2 = store.upload(key2, b"body2".to_vec().into()).await.unwrap();
-        let loc3 = store.upload(key3, b"body1".to_vec().into()).await.unwrap();
-        let (k1, k2, k3) = match (&loc1, &loc2, &loc3) {
-            (
-                SnapshotLocation::S3 { key: k1, .. },
-                SnapshotLocation::S3 { key: k2, .. },
-                SnapshotLocation::S3 { key: k3, .. },
-            ) => (k1.clone(), k2.clone(), k3.clone()),
-            _ => panic!("expected S3 locations"),
-        };
-        assert_ne!(k1, k2, "different bytes must never alias");
-        assert_eq!(k1, k3, "identical bytes in one group must share an object");
-        assert_eq!(store.download(&loc1).await.unwrap(), b"body1");
-        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
-        assert_eq!(store.download(&loc3).await.unwrap(), b"body1");
-        store.delete(&loc1).await.unwrap();
-        assert_eq!(store.download(&loc3).await.unwrap(), b"body1");
-        assert_eq!(store.download(&loc2).await.unwrap(), b"body2");
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
     async fn s3_verify_uploaded_catches_missing_object() {
         let store = S3SnapshotStore::memory_for_tests("snapshots", 1).unwrap();
-        let key = test_key(2, "group-2-T1-N1-7");
-        let loc = store.upload(key, b"payload".to_vec().into()).await.unwrap();
-        // Round-trip after a real upload: must succeed.
+        let staged = store
+            .stage(RaftGroupId(2), 7, body(b"payload"))
+            .await
+            .unwrap();
+        let loc = store.write_staged(staged).await.unwrap().into_location();
+        // Round-trip after a real write: must succeed.
         store.verify_uploaded(&loc).await.unwrap();
         // Same location, after an out-of-band delete: must report missing so
         // the snapshot build path can fail fast instead of publishing a
@@ -2605,328 +1915,6 @@ mod tests {
             matches!(err, SnapshotStoreError::NotFound { .. }),
             "expected NotFound after delete, got {err:?}"
         );
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_waits_for_every_voter_and_preserves_their_references() {
-        use std::collections::BTreeMap;
-        use std::collections::BTreeSet;
-        use std::time::Duration;
-
-        let references = SnapshotReferenceConfig {
-            node_id: 1,
-            default_voters: BTreeSet::from([1, 2, 3]),
-            per_group_voters: BTreeMap::new(),
-        };
-        let store = S3SnapshotStore::memory_for_tests("snapshots", 1)
-            .unwrap()
-            .with_references(references)
-            .with_gc_grace(Duration::ZERO);
-        let retired = store
-            .upload(test_key(7, "retired"), b"retired".to_vec().into())
-            .await
-            .unwrap();
-        let node_two = store
-            .upload(test_key(7, "node-two"), b"node-two".to_vec().into())
-            .await
-            .unwrap();
-        let node_three = store
-            .upload(test_key(7, "node-three"), b"node-three".to_vec().into())
-            .await
-            .unwrap();
-        let current = store
-            .upload(test_key(7, "current"), b"current".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &current).await.unwrap();
-
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::VoterWithoutReference { node_id: 2 }
-        );
-        assert_eq!(store.download(&retired).await.unwrap(), b"retired");
-
-        for (node_id, location) in [(2, &node_two), (3, &node_three)] {
-            let SnapshotLocation::S3 { key, .. } = location else {
-                panic!("expected S3 location")
-            };
-            store
-                .write_raw_for_tests(
-                    &format!("snapshots/group-7/references/node-{node_id}.json"),
-                    serde_json::to_vec(&serde_json::json!({
-                        // References carry the format epoch.
-                        "version": ursula_stream::FORMAT_EPOCH,
-                        "node_id": node_id,
-                        "raft_group_id": 7,
-                        "snapshot_key": key,
-                    }))
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
-        }
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 1 }
-        );
-        assert!(matches!(
-            store.download(&retired).await,
-            Err(SnapshotStoreError::NotFound { .. })
-        ));
-        assert_eq!(store.download(&node_two).await.unwrap(), b"node-two");
-        assert_eq!(store.download(&node_three).await.unwrap(), b"node-three");
-        assert_eq!(store.download(&current).await.unwrap(), b"current");
-    }
-
-    #[cfg(not(madsim))]
-    fn gc_store(voters: &[u64], gc_grace: std::time::Duration) -> S3SnapshotStore {
-        S3SnapshotStore::memory_for_tests("snapshots", 1)
-            .unwrap()
-            .with_references(SnapshotReferenceConfig {
-                node_id: 1,
-                default_voters: voters.iter().copied().collect(),
-                per_group_voters: BTreeMap::new(),
-            })
-            .with_gc_grace(gc_grace)
-    }
-
-    #[cfg(not(madsim))]
-    async fn write_reference(store: &S3SnapshotStore, path: &str, node_id: u64, key: Option<&str>) {
-        store
-            .write_raw_for_tests(
-                path,
-                serde_json::to_vec(&serde_json::json!({
-                    "version": ursula_stream::FORMAT_EPOCH,
-                    "node_id": node_id,
-                    "raft_group_id": 7,
-                    "snapshot_key": key,
-                }))
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-    }
-
-    #[cfg(not(madsim))]
-    fn s3_key(location: &SnapshotLocation) -> &str {
-        let SnapshotLocation::S3 { key, .. } = location else {
-            panic!("expected S3 location")
-        };
-        key
-    }
-
-    #[cfg(not(madsim))]
-    fn is_gone(result: Result<Vec<u8>, SnapshotStoreError>) -> bool {
-        matches!(result, Err(SnapshotStoreError::NotFound { .. }))
-    }
-
-    /// #669: no count of retired objects is kept. Every object past the
-    /// grace that nothing names goes, the newest of them too.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_keeps_no_retired_object_nothing_names() {
-        let store = gc_store(&[1], std::time::Duration::ZERO);
-        let mut retired = Vec::new();
-        for id in ["first", "second", "newest-retired"] {
-            retired.push(
-                store
-                    .upload(test_key(7, id), id.as_bytes().to_vec().into())
-                    .await
-                    .unwrap(),
-            );
-        }
-        let current = store
-            .upload(test_key(7, "current"), b"current".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &current).await.unwrap();
-
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 3 }
-        );
-        for location in &retired {
-            assert!(is_gone(store.download(location).await));
-        }
-        assert_eq!(store.download(&current).await.unwrap(), b"current");
-        // A second pass finds nothing left to delete.
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 0 }
-        );
-    }
-
-    /// #669: a replica whose current snapshot is inline, after an inline
-    /// fallback, still deletes the objects it no longer uses.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_runs_while_the_current_snapshot_is_inline() {
-        let store = gc_store(&[1], std::time::Duration::ZERO);
-        let old = store
-            .upload(test_key(7, "old"), b"old".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &old).await.unwrap();
-        let inline = SnapshotLocation::Inline {
-            bytes: b"inline".to_vec(),
-        };
-        store.publish_reference(7, &inline).await.unwrap();
-
-        assert_eq!(
-            store.prune_retired(7, &inline).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 1 }
-        );
-        assert!(is_gone(store.download(&old).await));
-    }
-
-    /// #669: a pin keeps its object past the grace until its node drops it.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_spares_a_pinned_object_until_the_pin_goes() {
-        let store = gc_store(&[1], std::time::Duration::ZERO);
-        let retiring = store
-            .upload(test_key(7, "retiring"), b"retiring".to_vec().into())
-            .await
-            .unwrap();
-        let current = store
-            .upload(test_key(7, "current"), b"current".to_vec().into())
-            .await
-            .unwrap();
-        store.pin_reference(7, &retiring).await.unwrap();
-        store.pin_reference(7, &current).await.unwrap();
-        store.publish_reference(7, &current).await.unwrap();
-
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 0 }
-        );
-        assert_eq!(store.download(&retiring).await.unwrap(), b"retiring");
-        store
-            .reconcile_reference_pins(7, std::slice::from_ref(&current))
-            .await
-            .unwrap();
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 1 }
-        );
-        assert!(is_gone(store.download(&retiring).await));
-        assert_eq!(store.download(&current).await.unwrap(), b"current");
-    }
-
-    /// #669: the object a voter that is down still names stays, and so does
-    /// the one a node that left the cluster names in the reference it left.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_keeps_what_a_down_voter_or_a_departed_node_names() {
-        let store = gc_store(&[1, 2], std::time::Duration::ZERO);
-        let down = store
-            .upload(test_key(7, "down"), b"down".to_vec().into())
-            .await
-            .unwrap();
-        let departed = store
-            .upload(test_key(7, "departed"), b"departed".to_vec().into())
-            .await
-            .unwrap();
-        let retired = store
-            .upload(test_key(7, "retired"), b"retired".to_vec().into())
-            .await
-            .unwrap();
-        let current = store
-            .upload(test_key(7, "current"), b"current".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &current).await.unwrap();
-        write_reference(
-            &store,
-            "snapshots/group-7/references/node-2.json",
-            2,
-            Some(s3_key(&down)),
-        )
-        .await;
-        write_reference(
-            &store,
-            "snapshots/group-7/references/node-9.json",
-            9,
-            Some(s3_key(&departed)),
-        )
-        .await;
-
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 1 }
-        );
-        assert!(is_gone(store.download(&retired).await));
-        assert_eq!(store.download(&down).await.unwrap(), b"down");
-        assert_eq!(store.download(&departed).await.unwrap(), b"departed");
-        assert_eq!(store.download(&current).await.unwrap(), b"current");
-    }
-
-    /// #669: pruning fails closed while a configured voter has published no
-    /// reference, inline current or not.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_deletes_nothing_while_a_voter_has_no_reference() {
-        let store = gc_store(&[1, 2, 3], std::time::Duration::ZERO);
-        let retired = store
-            .upload(test_key(7, "retired"), b"retired".to_vec().into())
-            .await
-            .unwrap();
-        let current = store
-            .upload(test_key(7, "current"), b"current".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &current).await.unwrap();
-        write_reference(&store, "snapshots/group-7/references/node-3.json", 3, None).await;
-
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::VoterWithoutReference { node_id: 2 }
-        );
-        let inline = SnapshotLocation::Inline { bytes: Vec::new() };
-        assert_eq!(
-            store.prune_retired(7, &inline).await.unwrap(),
-            SnapshotPrune::VoterWithoutReference { node_id: 2 }
-        );
-        assert_eq!(store.download(&retired).await.unwrap(), b"retired");
-    }
-
-    /// #669: an object younger than the grace stays even when nothing names
-    /// it, such as the upload of a build that a newer install overtook. The
-    /// in-memory operator records no modification time, so this runs on a
-    /// local directory.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn s3_pruning_spares_an_object_younger_than_the_grace() {
-        let root = tempfile::tempdir().unwrap();
-        let operator = opendal::Operator::new(
-            opendal::services::Fs::default().root(root.path().to_str().unwrap()),
-        )
-        .unwrap()
-        .finish();
-        let store =
-            S3SnapshotStore::new(operator, SnapshotPrefix::try_from("snapshots").unwrap(), 1)
-                .with_references(SnapshotReferenceConfig {
-                    node_id: 1,
-                    default_voters: BTreeSet::from([1]),
-                    per_group_voters: BTreeMap::new(),
-                })
-                .with_gc_grace(std::time::Duration::from_secs(60 * 60));
-        let young = store
-            .upload(test_key(7, "young"), b"young".to_vec().into())
-            .await
-            .unwrap();
-        let current = store
-            .upload(test_key(7, "current"), b"current".to_vec().into())
-            .await
-            .unwrap();
-        store.publish_reference(7, &current).await.unwrap();
-
-        assert_eq!(
-            store.prune_retired(7, &current).await.unwrap(),
-            SnapshotPrune::Pruned { deleted: 0 }
-        );
-        assert_eq!(store.download(&young).await.unwrap(), b"young");
     }
 
     fn owner(node_id: u64, raft_group_id: u32) -> SnapshotOwner {
@@ -3090,13 +2078,7 @@ mod tests {
 
     #[cfg(not(madsim))]
     fn node_store(node_id: u64) -> S3SnapshotStore {
-        S3SnapshotStore::memory_for_tests("snapshots", node_id)
-            .unwrap()
-            .with_references(SnapshotReferenceConfig {
-                node_id,
-                default_voters: BTreeSet::from([node_id]),
-                per_group_voters: BTreeMap::new(),
-            })
+        S3SnapshotStore::memory_for_tests("snapshots", node_id).unwrap()
     }
 
     /// A store owns inline pointers and the keys of its own node and group,
@@ -3117,7 +2099,6 @@ mod tests {
                 size_bytes: 1,
                 stored_size_bytes: 1,
                 compression: SnapshotCompression::Zstd,
-                shared_object: false,
             },
         };
         let inline = SnapshotPointer {
@@ -3200,7 +2181,7 @@ mod tests {
             .unwrap();
         assert!(staged.key().is_none());
         assert_eq!(
-            store.write_staged(staged).await.unwrap(),
+            store.write_staged(staged).await.unwrap().into_location(),
             SnapshotLocation::Inline {
                 bytes: b"inline".to_vec()
             }
@@ -3230,7 +2211,6 @@ mod tests {
             size_bytes,
             stored_size_bytes,
             compression,
-            shared_object,
         } = &location
         else {
             panic!("expected an S3 location, got {location:?}");
@@ -3239,7 +2219,6 @@ mod tests {
         assert_eq!(*size_bytes, payload.len() as u64);
         assert!(*stored_size_bytes < *size_bytes);
         assert_eq!(*compression, SnapshotCompression::Zstd);
-        assert!(!*shared_object, "an owned object is never shared");
         assert!(
             matches!(
                 store.download(&location).await,
@@ -3247,7 +2226,10 @@ mod tests {
             ),
             "the stage wrote nothing"
         );
-        assert_eq!(store.write_staged(staged).await.unwrap(), location);
+        assert_eq!(
+            store.write_staged(staged).await.unwrap().into_location(),
+            location
+        );
         assert_eq!(store.download(&location).await.unwrap(), payload);
         store.verify_uploaded(&location).await.unwrap();
 
@@ -3269,7 +2251,7 @@ mod tests {
             .stage(RaftGroupId(7), 1, body(b"first"))
             .await
             .unwrap();
-        let location = store.write_staged(first).await.unwrap();
+        let location = store.write_staged(first).await.unwrap().into_location();
         let again = store
             .stage(RaftGroupId(7), 1, body(b"second"))
             .await
@@ -3292,13 +2274,7 @@ mod tests {
     #[tokio::test]
     async fn s3_write_staged_refuses_a_backend_without_conditional_create() {
         let operator = opendal::Operator::via_iter(opendal::Scheme::Memory, []).unwrap();
-        let store = S3SnapshotStore::new(operator, prefix("snapshots"), 1).with_references(
-            SnapshotReferenceConfig {
-                node_id: 1,
-                default_voters: BTreeSet::from([1]),
-                per_group_voters: BTreeMap::new(),
-            },
-        );
+        let store = S3SnapshotStore::new(operator, prefix("snapshots"), 1);
         let staged = store.stage(RaftGroupId(7), 1, body(b"body")).await.unwrap();
         let location = staged.location();
         let refused = store.write_staged(staged).await.unwrap_err();

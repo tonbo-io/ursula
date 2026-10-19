@@ -863,6 +863,7 @@ async fn second_engine_install_for_a_group_is_refused() {
     let (_tx, rx) = tokio::sync::mpsc::channel(1);
     let mut worker = CoreWorker {
         core_id: CoreId(0),
+        reopens: std::collections::BTreeSet::new(),
         rx,
         engine_factory: Arc::new(InMemoryGroupEngineFactory::default()),
         groups: std::collections::HashMap::new(),
@@ -4780,4 +4781,140 @@ async fn lone_small_flush_is_packed_and_small_exclusive_chunk_is_compaction_debt
         .expect("read flushed stream");
     assert_eq!(&read.payload[..100], &[b'a'; 100]);
     assert_eq!(&read.payload[100..], large.as_slice());
+}
+
+/// A factory whose opens fail as a snapshot store that does not answer the
+/// restore while `store_down` is set, counting every open.
+#[derive(Clone, Default)]
+struct UnreachableStoreFactory {
+    store_down: Arc<AtomicBool>,
+    opens: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl GroupEngineFactory for UnreachableStoreFactory {
+    fn create<'a>(
+        &'a self,
+        placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupEngineCreateFuture<'a> {
+        Box::pin(async move {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            if self.store_down.load(Ordering::SeqCst) {
+                return Err(GroupEngineError::Infra(
+                    crate::engine::GroupInfraError::Snapshot(
+                        crate::engine::GroupSnapshotError::StoreUnavailable {
+                            raft_group_id: placement.raft_group_id,
+                            key: "snapshots/node-1/group-0/00000000000000000001-0000000000000001.snap"
+                                .to_owned(),
+                            operation: crate::SnapshotStoreOperation::Get,
+                        },
+                    ),
+                ));
+            }
+            let engine: Box<dyn GroupEngine> = Box::new(InMemoryGroupEngine::started());
+            Ok(engine)
+        })
+    }
+}
+
+/// A group whose snapshot store did not answer its restore stays closed for
+/// a back-off that doubles per failed open: a request meanwhile gets the
+/// same `StoreUnavailable` at once, with no restore on the core's loop. When
+/// the wait ends the core opens the group again by itself, with no request,
+/// and an open that succeeds clears the back-off. `open_backoff_groups`
+/// counts the group while it waits.
+#[tokio::test(start_paused = true)]
+async fn a_group_whose_store_did_not_answer_its_restore_backs_off_its_reopens() {
+    let factory = UnreachableStoreFactory::default();
+    factory.store_down.store(true, Ordering::SeqCst);
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 16), factory.clone())
+        .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "store-down");
+    let refused = |result: Result<CreateStreamResponse, RuntimeError>| {
+        matches!(
+            result,
+            Err(RuntimeError::GroupEngine {
+                error: GroupEngineError::Infra(crate::engine::GroupInfraError::Snapshot(
+                    crate::engine::GroupSnapshotError::StoreUnavailable { .. }
+                )),
+                ..
+            })
+        )
+    };
+    async fn try_create(
+        runtime: &ShardRuntime,
+        stream: &BucketStreamId,
+    ) -> Result<CreateStreamResponse, RuntimeError> {
+        runtime
+            .create_stream(CreateStreamRequest::new(
+                stream.clone(),
+                "application/octet-stream",
+            ))
+            .await
+    }
+    let waiting = |runtime: &ShardRuntime| runtime.metrics().snapshot().open_backoff_groups;
+    let just_after = |wait: Duration| wait.checked_add(Duration::from_millis(1)).unwrap();
+    assert!(refused(try_create(&runtime, &stream).await));
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(waiting(&runtime), 1);
+    // Within the first wait: refused at once, no open.
+    assert!(refused(try_create(&runtime, &stream).await));
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 1);
+    // The wait ends: the core opens the group again, and it fails again.
+    tokio::time::sleep(just_after(crate::core_worker::open_backoff(1))).await;
+    assert_eq!(
+        factory.opens.load(Ordering::SeqCst),
+        2,
+        "the core reopens without a request"
+    );
+    assert_eq!(waiting(&runtime), 1);
+    // The second wait is twice the first.
+    tokio::time::sleep(just_after(crate::core_worker::open_backoff(1))).await;
+    assert!(refused(try_create(&runtime, &stream).await));
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 2);
+    factory.store_down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(crate::core_worker::open_backoff(1)).await;
+    assert_eq!(
+        factory.opens.load(Ordering::SeqCst),
+        3,
+        "the store answers again and the core opens the group"
+    );
+    assert_eq!(waiting(&runtime), 0);
+    try_create(&runtime, &stream)
+        .await
+        .expect("the open group serves");
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 3);
+}
+
+/// A snapshot store that does not answer at startup leaves the node up: the
+/// warm-up keeps the group closed in back-off instead of failing, and the
+/// core opens it once the store answers.
+#[tokio::test(start_paused = true)]
+async fn a_store_down_at_startup_leaves_the_group_in_back_off() {
+    let factory = UnreachableStoreFactory::default();
+    factory.store_down.store(true, Ordering::SeqCst);
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 16), factory.clone())
+        .expect("spawn runtime");
+    runtime
+        .warm_all_groups()
+        .await
+        .expect("the warm-up does not fail on a store that does not answer");
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 1);
+    assert_eq!(runtime.metrics().snapshot().open_backoff_groups, 1);
+    factory.store_down.store(false, Ordering::SeqCst);
+    tokio::time::sleep(
+        crate::core_worker::open_backoff(1)
+            .checked_add(Duration::from_millis(1))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(factory.opens.load(Ordering::SeqCst), 2);
+    assert_eq!(runtime.metrics().snapshot().open_backoff_groups, 0);
+    runtime
+        .create_stream(CreateStreamRequest::new(
+            BucketStreamId::new("benchcmp", "store-back"),
+            "application/octet-stream",
+        ))
+        .await
+        .expect("the reopened group serves");
 }

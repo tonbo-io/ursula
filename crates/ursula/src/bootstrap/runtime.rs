@@ -14,7 +14,6 @@ use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::SnapshotReferenceConfig;
 use ursula_runtime::snapshot_store_from_config;
 use ursula_runtime::spawn_cold_compaction_worker_if_configured;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
@@ -102,6 +101,27 @@ pub fn spawn_runtime(
     spawn_runtime_with_maintenance_drain(config, persistence, topology, false)
 }
 
+/// Warns when an install copy's GET, PUT and HEAD, each run into every
+/// timeout and backoff of the S3 client ([`ursula_runtime::s3_operation_budget`]),
+/// can take longer than `raft.install_snapshot_timeout`. The leader's send
+/// then ends first, and the follower answers it only once the leader sends
+/// the snapshot again.
+fn warn_if_a_copy_can_outlast_its_install(config: &ursula_config::UrsulaConfig) {
+    let Some(s3) = config.storage.cold.s3.as_ref() else {
+        return;
+    };
+    let copy = ursula_runtime::s3_operation_budget(s3.timeout.as_duration(), s3.max_retries)
+        .saturating_mul(3);
+    let install = config.raft.install_snapshot_timeout.as_duration();
+    if copy > install {
+        tracing::warn!(
+            copy_budget_ms = u64::try_from(copy.as_millis()).unwrap_or(u64::MAX),
+            install_snapshot_timeout_ms = u64::try_from(install.as_millis()).unwrap_or(u64::MAX),
+            "on a store that answers slowly, a follower's copy of an installed snapshot can take longer than raft.install_snapshot_timeout; raise it or lower storage.cold.s3.timeout or max_retries"
+        );
+    }
+}
+
 /// Spawn a runtime and install the operator drain fence before any Raft core
 /// or background leadership worker can observe the process.
 pub(crate) fn spawn_runtime_with_maintenance_drain(
@@ -122,30 +142,17 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             let bytes = s.as_bytes();
             if bytes == 0 { None } else { Some(bytes) }
         });
-    let default_voters = if config.raft.peers.is_empty() {
-        std::collections::BTreeSet::from([config.raft.node_id])
-    } else {
-        config.raft.peers.iter().map(|peer| peer.node_id).collect()
-    };
-    let snapshot_references = SnapshotReferenceConfig {
-        node_id: config.raft.node_id,
-        default_voters,
-        per_group_voters: config
-            .raft
-            .groups
-            .iter()
-            .map(|group| (group.raft_group_id, group.voters.iter().copied().collect()))
-            .collect(),
-    };
     let snapshot_store = snapshot_store_from_config(
         &config.storage.snapshot,
         &config.storage.cold,
-        snapshot_references,
-        config.raft.snapshot_gc_grace(),
+        config.raft.node_id,
     )
     .map_err(|err| RuntimeError::ColdStoreConfig {
         message: ursula_runtime::ErrorChain(&err).to_string(),
     })?;
+    if snapshot_store.is_some() {
+        warn_if_a_copy_can_outlast_its_install(config);
+    }
     let mut engine_config = RaftEngineConfig::from(&config.raft);
     let configured_snapshot_drive_interval_ms = config
         .storage
@@ -162,7 +169,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         .with_append_transport_budget_bytes(config.raft.append_transport_budget_bytes)
         .with_snapshot_install(
             config.raft.snapshot_install_max_concurrency,
-            config.raft.snapshot_gc_grace(),
+            config.raft.install_snapshot_timeout.as_duration(),
         );
     if start_maintenance_drained {
         registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);

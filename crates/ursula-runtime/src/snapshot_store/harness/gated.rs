@@ -38,26 +38,25 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::PoisonError;
 
-use bytes::Bytes;
 use ursula_shard::RaftGroupId;
 
 use crate::rt::sync::Notify;
 use crate::snapshot_store::OwnListing;
+use crate::snapshot_store::OwnedLocation;
 use crate::snapshot_store::OwnedNamespace;
 use crate::snapshot_store::OwnedObject;
 use crate::snapshot_store::SharedSnapshotStore;
 use crate::snapshot_store::SnapshotBytesIterator;
-use crate::snapshot_store::SnapshotKey;
 use crate::snapshot_store::SnapshotLocation;
-use crate::snapshot_store::SnapshotPrune;
 use crate::snapshot_store::SnapshotStore;
 use crate::snapshot_store::SnapshotStoreFuture;
 use crate::snapshot_store::StagedSnapshot;
+use crate::snapshot_store::StoredSnapshot;
 
 /// An operation of a [`SnapshotStore`] that has gates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StoreOp {
-    /// [`SnapshotStore::stage`].
+    /// [`SnapshotStore::stage`] and [`SnapshotStore::stage_stored`].
     Stage,
     /// [`SnapshotStore::write_staged`], the PUT.
     WriteStaged,
@@ -65,7 +64,7 @@ pub enum StoreOp {
     ListOwn,
     /// [`SnapshotStore::delete_own`], the DELETE.
     DeleteOwn,
-    /// [`SnapshotStore::download`], the GET.
+    /// [`SnapshotStore::read_stored`], the GET.
     Get,
     /// [`SnapshotStore::verify_uploaded`], the HEAD.
     Head,
@@ -450,22 +449,6 @@ fn staged_subject(staged: &StagedSnapshot) -> String {
 }
 
 impl SnapshotStore for GatedSnapshotStore {
-    fn upload<'a>(
-        &'a self,
-        key: SnapshotKey,
-        bytes: Bytes,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        self.inner.upload(key, bytes)
-    }
-
-    fn upload_iter<'a>(
-        &'a self,
-        key: SnapshotKey,
-        chunks: SnapshotBytesIterator,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-        self.inner.upload_iter(key, chunks)
-    }
-
     fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace {
         self.inner.namespace(raft_group_id)
     }
@@ -487,7 +470,7 @@ impl SnapshotStore for GatedSnapshotStore {
     fn write_staged<'a>(
         &'a self,
         staged: StagedSnapshot,
-    ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
+    ) -> SnapshotStoreFuture<'a, OwnedLocation> {
         let subject = staged_subject(&staged);
         Box::pin(self.gated(
             StoreOp::WriteStaged,
@@ -510,48 +493,29 @@ impl SnapshotStore for GatedSnapshotStore {
         Box::pin(self.gated(StoreOp::DeleteOwn, subject, self.inner.delete_own(object)))
     }
 
-    fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>> {
+    fn read_stored<'a>(
+        &'a self,
+        location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, StoredSnapshot> {
         Box::pin(self.gated(
             StoreOp::Get,
             location_subject(location),
-            self.inner.download(location),
+            self.inner.read_stored(location),
         ))
     }
 
-    fn delete<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-        self.inner.delete(location)
-    }
-
-    fn prune_retired<'a>(
+    fn stage_stored<'a>(
         &'a self,
-        raft_group_id: u32,
-        current: &'a SnapshotLocation,
-    ) -> SnapshotStoreFuture<'a, SnapshotPrune> {
-        self.inner.prune_retired(raft_group_id, current)
-    }
-
-    fn publish_reference<'a>(
-        &'a self,
-        raft_group_id: u32,
-        location: &'a SnapshotLocation,
-    ) -> SnapshotStoreFuture<'a, ()> {
-        self.inner.publish_reference(raft_group_id, location)
-    }
-
-    fn pin_reference<'a>(
-        &'a self,
-        raft_group_id: u32,
-        location: &'a SnapshotLocation,
-    ) -> SnapshotStoreFuture<'a, ()> {
-        self.inner.pin_reference(raft_group_id, location)
-    }
-
-    fn reconcile_reference_pins<'a>(
-        &'a self,
-        raft_group_id: u32,
-        retained: &'a [SnapshotLocation],
-    ) -> SnapshotStoreFuture<'a, ()> {
-        self.inner.reconcile_reference_pins(raft_group_id, retained)
+        raft_group_id: RaftGroupId,
+        index: u64,
+        stored: StoredSnapshot,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        let subject = format!("node-{}/group-{}/{index}", self.node_id, raft_group_id.0);
+        Box::pin(self.gated(
+            StoreOp::Stage,
+            subject,
+            self.inner.stage_stored(raft_group_id, index, stored),
+        ))
     }
 
     fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {

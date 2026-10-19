@@ -38,6 +38,7 @@ use ursula_runtime::ColdIndexPageCache;
 use ursula_runtime::ColdStoreColdIndexPageStore;
 use ursula_runtime::ErrorChain;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::OwnedPointer;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
@@ -60,12 +61,16 @@ use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateError;
 use crate::rejoin::RecoveryGateStatus;
 use crate::snapshot_codec::decode_group_snapshot;
+use crate::snapshot_holds::HeldWriteError;
+use crate::snapshot_holds::SnapshotHolds;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
+use crate::state_machine::group_snapshot_id;
 use crate::types::RaftGroupMetricsSnapshot;
 use crate::types::RaftLogProgressSnapshot;
 use crate::types::SnapshotData;
+use crate::types::SnapshotLease;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaSnapshot;
 
@@ -191,6 +196,8 @@ const RESTARTED_MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveGroup {
     pub(crate) apply_health: crate::apply_failure::ApplyHealth,
+    /// The engine's admission of snapshot installs and of the GC passes
+    /// that run on its holds, closed once the engine begins to shut down.
     pub(crate) snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
     pub(crate) cache: Option<GroupColdIndexCache>,
     pub(crate) barrier: Arc<ReadIndexBarrier>,
@@ -200,7 +207,25 @@ pub(crate) struct ActiveGroup {
     pub(crate) history: Arc<crate::history::GroupHistory>,
     /// The state machine's log gauge and applied membership (#613).
     pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
+    /// The engine's snapshot store, install coordinator and holds: an
+    /// incoming snapshot is copied with them, and the group's GC passes run
+    /// on them (#687).
+    pub(crate) snapshots: GroupSnapshots,
 }
+
+/// One engine incarnation's side of its group's snapshot objects: the store
+/// it writes to, the install coordinator its state machine takes copies
+/// from, and its holds. The registry copies an incoming snapshot and runs
+/// the group's GC passes with the engine's own, so a copy is held and
+/// prefetched where the engine's install finds it, and a pass reads the
+/// holds of the incarnation that runs (#687).
+#[derive(Debug, Clone)]
+pub(crate) struct GroupSnapshots {
+    pub(crate) store: SharedSnapshotStore,
+    pub(crate) install: SnapshotInstallCoordinator,
+    pub(crate) holds: Arc<SnapshotHolds>,
+}
+
 impl ActiveGroup {
     pub(crate) fn raft(&self) -> &OwnerRaftHandle {
         self.barrier.owner()
@@ -305,9 +330,6 @@ pub struct SnapshotGcPass {
     pub groups: usize,
     /// The snapshot objects the passes deleted.
     pub deleted: u64,
-    /// The passes that deleted nothing because a configured voter of the
-    /// group had published no reference.
-    pub skipped_unreferenced_voter: u64,
     /// The passes that failed, which run again later.
     pub failed: usize,
     /// The groups whose pass is due but past `max_groups` or the budget.
@@ -315,15 +337,15 @@ pub struct SnapshotGcPass {
 }
 
 /// Failure of snapshot admission, of the prefetch and copy of an incoming
-/// snapshot, of its installation, or of reference publication. It is the
-/// error of [`RaftGroupHandleRegistry::install_full_snapshot`] and is not
+/// snapshot, or of its installation. It is the error of
+/// [`RaftGroupHandleRegistry::install_full_snapshot`] and is not
 /// part of any wire form. The gRPC plane converts it once, by [`From`] into
 /// `tonic::Status`, whose code is [`SnapshotInstallError::code`].
 ///
 /// The in-process network of the tests and the simulation classifies it on
 /// its own, and does not yet back off for every refusal the gRPC plane
-/// answers `UNAVAILABLE`. Admission and publication failures stay network
-/// errors there, and so does every group refusal but a refused overwrite,
+/// answers `UNAVAILABLE`. Admission failures stay network errors there, and
+/// so does every group refusal but a refused overwrite,
 /// `Group(OwnerStopped)` among them (#725).
 #[derive(Debug, thiserror::Error)]
 pub enum SnapshotInstallError {
@@ -333,8 +355,6 @@ pub enum SnapshotInstallError {
     ShuttingDown { group: RaftGroupId },
     #[error(transparent)]
     Group(#[from] GroupEngineError),
-    #[error("publish installed snapshot reference")]
-    Publication(#[source] ursula_runtime::SnapshotStoreError),
     #[error("snapshot install task failed")]
     Task(#[source] crate::rt::task::JoinError),
     /// The node's snapshot install gate closed while the install waited for
@@ -415,7 +435,6 @@ impl SnapshotInstallError {
             Self::PointerEncode { .. } => tonic::Code::Internal,
             Self::Group(error) => crate::grpc::group_rpc_code(error),
             Self::ShuttingDown { .. }
-            | Self::Publication(_)
             | Self::Task(_)
             | Self::GateClosed { .. }
             | Self::SourceMissing { .. }
@@ -454,8 +473,8 @@ pub enum SnapshotBuildError {
 }
 
 #[derive(Debug)]
-struct PrefetchedInstallSnapshot {
-    snapshot: UrsulaSnapshot,
+pub(crate) struct PrefetchedInstallSnapshot {
+    pub(crate) snapshot: UrsulaSnapshot,
     guard: Option<PrefetchedSnapshotGuard>,
     /// The history event the snapshot's state holds, for the commit screen
     /// (#613); `None` when it is the snapshot this replica already holds.
@@ -785,6 +804,7 @@ impl RaftGroupHandleRegistry {
             barrier: engine.read_barrier.clone(),
             history: engine.history.clone(),
             log_gauge: engine.log_gauge.clone(),
+            snapshots: engine.snapshots.clone(),
             recovery: engine
                 .rejoin
                 .lock()
@@ -1064,55 +1084,80 @@ impl RaftGroupHandleRegistry {
         self.len() == 0
     }
 
-    /// Snapshot installs: at most `max_concurrency` at once, and the
-    /// snapshot GC grace G (#669), how long each group keeps the snapshot
-    /// object it replaced pinned (`RaftConfig::snapshot_gc_grace` on a
-    /// server).
+    /// Snapshot installs: at most `max_concurrency` at once, and the wait
+    /// of a group's second GC pass after a write that failed or a restore
+    /// (`raft.install_snapshot_timeout` on a server), within which a PUT the
+    /// store answered with an error lands if it lands at all (#687).
     pub fn with_snapshot_install(
         mut self,
         max_concurrency: usize,
-        gc_grace: std::time::Duration,
+        late_write: std::time::Duration,
     ) -> Self {
         self.snapshot_install =
-            SnapshotInstallCoordinator::with_gc_grace(max_concurrency, gc_grace);
+            SnapshotInstallCoordinator::with_late_write(max_concurrency, late_write);
         self
     }
 
     /// Runs the snapshot GC passes due now (#669), for at most `max_groups`
     /// groups in group order, and starts none once `budget` has passed:
-    /// each drops the pins that expired, publishes the group's current
-    /// reference and prunes the objects nothing names any more. A failed
-    /// pass runs again later, and a pass left out stays due.
+    /// each lists the node's directory for its group and deletes every
+    /// object the group no longer holds (#687). A failed pass runs again
+    /// later, and a pass left out stays due.
     pub async fn collect_snapshot_garbage(
         &self,
         max_groups: usize,
         budget: std::time::Duration,
     ) -> SnapshotGcPass {
         let started = crate::rt::time::Instant::now();
-        let due = self.snapshot_install.gc_due(started);
-        let store = self.snapshot_store();
+        // Each pass runs with the admission of the incarnation whose holds
+        // it reads, so a group that restarts meanwhile does not have its new
+        // objects deleted by the old holds (#687, #709).
+        let due: Vec<(
+            RaftGroupId,
+            GroupSnapshots,
+            Arc<crate::openraft_work::WorkAdmission>,
+        )> = self
+            .groups
+            .load()
+            .iter()
+            .filter_map(|(group, entry)| {
+                let active = entry.active()?;
+                // An engine that stopped, and whose group did not open
+                // again, owes passes no one runs: it takes no slot.
+                let due =
+                    active.snapshot_installs.is_open() && active.snapshots.holds.gc_due(started);
+                due.then(|| {
+                    (
+                        RaftGroupId(*group),
+                        active.snapshots.clone(),
+                        active.snapshot_installs.clone(),
+                    )
+                })
+            })
+            .collect();
         let mut pass = SnapshotGcPass {
             left: due.len(),
             ..SnapshotGcPass::default()
         };
-        for (group, references) in due.into_iter().take(max_groups) {
+        for (group, snapshots, admission) in due.into_iter().take(max_groups) {
             if started.elapsed() >= budget {
                 break;
             }
             let now = crate::rt::time::Instant::now();
             pass.left = pass.left.saturating_sub(1);
+            let Some(collected) = snapshots.fenced_pass(&admission, now).await else {
+                // The incarnation stopped: the next one runs its own passes.
+                continue;
+            };
             pass.groups = pass.groups.saturating_add(1);
-            match references.collect_garbage(&store, group, now).await {
-                Ok(prune) => {
-                    pass.deleted = pass.deleted.saturating_add(prune.deleted());
-                    pass.skipped_unreferenced_voter = pass
-                        .skipped_unreferenced_voter
-                        .saturating_add(u64::from(prune.skipped_unreferenced_voter()));
+            match collected {
+                Ok(collected) => {
+                    pass.deleted = pass.deleted.saturating_add(collected.deleted());
                 }
                 Err(err) => {
                     pass.failed = pass.failed.saturating_add(1);
                     tracing::warn!(
-                        raft_group_id = group,
+                        raft_group_id = group.0,
                         error = %ErrorChain(&err),
                         "snapshot GC pass failed; retrying later"
                     );
@@ -1138,7 +1183,8 @@ impl RaftGroupHandleRegistry {
             snapshot_store.unwrap_or_else(default_snapshot_store);
     }
 
-    fn snapshot_store(&self) -> SharedSnapshotStore {
+    /// The store this node's engines write their snapshot objects to.
+    pub(crate) fn snapshot_store(&self) -> SharedSnapshotStore {
         self.snapshot_store
             .lock()
             .expect("raft group snapshot store mutex")
@@ -1502,6 +1548,7 @@ impl RaftGroupHandleRegistry {
         let raft = entry.raft().clone();
         let rejoin = entry.recovery.clone();
         let history = entry.history.clone();
+        let snapshots = entry.snapshots.clone();
         let lifetime =
             entry
                 .snapshot_installs
@@ -1509,7 +1556,6 @@ impl RaftGroupHandleRegistry {
                 .ok_or(SnapshotInstallError::ShuttingDown {
                     group: raft_group_id,
                 })?;
-        let registry = self.clone();
         // The admitted task retains prefetch and permits through Raft consumption,
         // even when the RPC waiter disconnects or is canceled.
         crate::rt::spawn(async move {
@@ -1523,10 +1569,12 @@ impl RaftGroupHandleRegistry {
                         .get_snapshot()
                         .await
                         .map_err(crate::owner::owner_stopped)?;
-                    let already_current = current.as_ref().is_some_and(|current| {
-                        current.meta == snapshot.meta
-                            && current.snapshot.pointer_bytes() == snapshot.snapshot.pointer_bytes()
-                    });
+                    // Only the meta compares: this node's pointer names its
+                    // own copy, never the sender's object (#687).
+                    let already_current = current
+                        .as_ref()
+                        .is_some_and(|current| current.meta == snapshot.meta);
+                    drop(current);
                     if already_current {
                         Ok::<_, SnapshotInstallError>(PrefetchedInstallSnapshot {
                             snapshot,
@@ -1534,9 +1582,7 @@ impl RaftGroupHandleRegistry {
                             history: None,
                         })
                     } else {
-                        registry
-                            .prefetch_snapshot_for_install(raft_group_id, snapshot)
-                            .await
+                        snapshots.prefetch(raft_group_id, snapshot).await
                     }
                 })
                 .await;
@@ -1610,135 +1656,15 @@ impl RaftGroupHandleRegistry {
                         .map_err(crate::owner::owner_stopped)
                 })
                 .map_err(SnapshotInstallError::Group);
+            // A copy OpenRaft did not commit leaves the holds with its lease
+            // here, and its group owes the pass that deletes it.
             drop(_prefetch_guard);
-            // Object-store publication and its retry backoff must not monopolize
-            // the node-wide download/install budget. Keep the per-group lock
-            // and engine lifetime until publication completes.
             drop(_permit);
-            let references = registry.snapshot_install.references(raft_group_id.0);
-            // The object the install replaced is pinned for the GC grace, and
-            // the snapshot driver's next tick deletes what retired before
-            // (#669).
-            references.schedule_pass(crate::rt::time::Instant::now());
-            // A publication of an engine that is shutting down stops: the
-            // shutdown waits for this task, and the next engine publishes its
-            // own current reference (#709).
-            let publication = lifetime
-                .until_stopping(
-                    references.publish_current(&registry.snapshot_store(), raft_group_id.0),
-                )
-                .await
-                .unwrap_or(Ok(()))
-                .map_err(SnapshotInstallError::Publication);
             drop(lifetime);
-            result.and_then(|response| publication.map(|()| response))
+            result
         })
         .await
         .map_err(SnapshotInstallError::Task)?
-    }
-
-    async fn prefetch_snapshot_for_install(
-        &self,
-        raft_group_id: RaftGroupId,
-        snapshot: UrsulaSnapshot,
-    ) -> Result<PrefetchedInstallSnapshot, SnapshotInstallError> {
-        let group = raft_group_id;
-        // Kept until the prefetch returns.
-        let (pointer_bytes, _incoming_lease) = snapshot.snapshot.into_parts();
-        let pointer = SnapshotPointer::decode(&pointer_bytes)
-            .map_err(|source| SnapshotInstallError::PointerUndecodable { group, source })?;
-        let SnapshotPointer {
-            snapshot_id,
-            location,
-        } = pointer;
-        let source_key = match &location {
-            SnapshotLocation::S3 { key, .. } => key.clone(),
-            SnapshotLocation::Local { path, .. } => path.display().to_string(),
-            SnapshotLocation::Inline { bytes } => {
-                let history = decode_group_snapshot(bytes)
-                    .map_err(|source| SnapshotInstallError::Undecodable {
-                        group,
-                        snapshot_id: snapshot_id.clone(),
-                        source,
-                    })?
-                    .stream_snapshot
-                    .history;
-                return Ok(PrefetchedInstallSnapshot {
-                    snapshot: UrsulaSnapshot {
-                        meta: snapshot.meta,
-                        snapshot: SnapshotData::new(pointer_bytes),
-                    },
-                    guard: None,
-                    history: Some(history),
-                });
-            }
-        };
-
-        let snapshot_store = self.snapshot_store();
-        let reference = self
-            .snapshot_install
-            .references(raft_group_id.0)
-            .prepare(&snapshot_store, raft_group_id.0, &location)
-            .await
-            .map_err(|err| {
-                // The pins go with P3's owned objects, and this site with them.
-                GroupEngineError::new(format!(
-                    "pin incoming snapshot before install: {}",
-                    ErrorChain(&err)
-                ))
-            })?;
-        let snapshot_bytes =
-            snapshot_store
-                .download(&location)
-                .await
-                .map_err(|source| match source {
-                    ursula_runtime::SnapshotStoreError::NotFound { key } => {
-                        SnapshotInstallError::SourceMissing {
-                            group,
-                            source_key: key,
-                        }
-                    }
-                    source => SnapshotInstallError::SourceRead {
-                        group,
-                        source_key: source_key.clone(),
-                        source,
-                    },
-                })?;
-        let group_snapshot = decode_group_snapshot(&snapshot_bytes).map_err(|source| {
-            SnapshotInstallError::Undecodable {
-                group,
-                snapshot_id: snapshot_id.clone(),
-                source,
-            }
-        })?;
-        drop(snapshot_bytes);
-        let history = group_snapshot.stream_snapshot.history;
-        // Keep fallible object-store I/O outside OpenRaft's state-machine
-        // worker: a write-snapshot error there is fatal to RaftCore. Keep the
-        // original external pointer so large snapshots are not duplicated in
-        // the Raft RPC payload; install_snapshot consumes the decoded group.
-        let mut pointer = SnapshotPointer {
-            snapshot_id,
-            location,
-        };
-        let cache_key =
-            self.snapshot_install
-                .cache_prefetched(&mut pointer, group_snapshot, reference);
-        let guard = PrefetchedSnapshotGuard {
-            snapshot_install: self.snapshot_install.clone(),
-            cache_key,
-        };
-        let pointer_bytes = pointer
-            .encode_binary()
-            .map_err(|source| SnapshotInstallError::PointerEncode { group, source })?;
-        Ok(PrefetchedInstallSnapshot {
-            snapshot: UrsulaSnapshot {
-                meta: snapshot.meta,
-                snapshot: SnapshotData::new(pointer_bytes),
-            },
-            guard: Some(guard),
-            history: Some(history),
-        })
     }
 
     /// Hands a leadership transfer this node received from a leader to
@@ -1842,6 +1768,208 @@ impl RaftGroupHandleRegistry {
     }
 }
 
+impl GroupSnapshots {
+    /// A GC pass on these holds, run as work of the incarnation they belong
+    /// to: `admission` is that engine's, so the pass runs only while the
+    /// engine runs, its shutdown stops the pass and waits for it, and the
+    /// group reopens only after that (#709). `None` when the engine is
+    /// stopping or stopped. Without the fence, a pass that read an old
+    /// incarnation's holds could list a new incarnation's objects and
+    /// delete them (#687).
+    pub(crate) async fn fenced_pass(
+        &self,
+        admission: &crate::openraft_work::WorkAdmission,
+        now: crate::rt::time::Instant,
+    ) -> Option<Result<crate::snapshot_holds::SnapshotPass, crate::snapshot_holds::SnapshotGcError>>
+    {
+        let lifetime = admission.admit()?;
+        lifetime
+            .until_stopping(self.holds.collect_garbage(&self.store, now))
+            .await
+    }
+
+    /// Reads the snapshot the leader's pointer names, decodes it, and writes
+    /// this node's own copy of it, outside OpenRaft's state-machine worker,
+    /// where a failed write is fatal to RaftCore. The pointer handed to
+    /// OpenRaft names the copy, and the install commits only the copy: a
+    /// node never names another node's object durably (#687). The sender
+    /// holds its object until this RPC returns, so a read that finds it
+    /// missing is a send that already ended or a pointer that is no longer
+    /// current: the answer is `UNAVAILABLE`, and the sender's next attempt
+    /// carries its current pointer.
+    pub(crate) async fn prefetch(
+        &self,
+        raft_group_id: RaftGroupId,
+        snapshot: UrsulaSnapshot,
+    ) -> Result<PrefetchedInstallSnapshot, SnapshotInstallError> {
+        let group = raft_group_id;
+        // Kept until the prefetch returns.
+        let (pointer_bytes, _incoming_lease) = snapshot.snapshot.into_parts();
+        let pointer = SnapshotPointer::decode(&pointer_bytes)
+            .map_err(|source| SnapshotInstallError::PointerUndecodable { group, source })?;
+        let SnapshotPointer {
+            snapshot_id,
+            location,
+        } = pointer;
+        let source_key = match &location {
+            SnapshotLocation::S3 { key, .. } => key.clone(),
+            SnapshotLocation::Local { path, .. } => path.display().to_string(),
+            SnapshotLocation::Inline { bytes } => {
+                let history = decode_group_snapshot(bytes)
+                    .map_err(|source| SnapshotInstallError::Undecodable {
+                        group,
+                        snapshot_id: snapshot_id.clone(),
+                        source,
+                    })?
+                    .stream_snapshot
+                    .history;
+                return Ok(PrefetchedInstallSnapshot {
+                    snapshot: UrsulaSnapshot {
+                        meta: snapshot.meta,
+                        snapshot: SnapshotData::new(pointer_bytes),
+                    },
+                    guard: None,
+                    history: Some(history),
+                });
+            }
+        };
+
+        let source_read = |source| SnapshotInstallError::SourceRead {
+            group,
+            source_key: source_key.clone(),
+            source,
+        };
+        let stored = self
+            .store
+            .read_stored(&location)
+            .await
+            .map_err(|source| match source {
+                ursula_runtime::SnapshotStoreError::NotFound { key } => {
+                    SnapshotInstallError::SourceMissing {
+                        group,
+                        source_key: key,
+                    }
+                }
+                source => source_read(source),
+            })?;
+        let body = stored.body().map_err(source_read)?;
+        let group_snapshot =
+            decode_group_snapshot(&body).map_err(|source| SnapshotInstallError::Undecodable {
+                group,
+                snapshot_id: snapshot_id.clone(),
+                source,
+            })?;
+        // Only the stored bytes are copied: the decompressed body goes now.
+        drop(body);
+        let history = group_snapshot.stream_snapshot.history;
+        let (owned, lease) = self.copy(group, &snapshot.meta, stored).await?;
+        let mut handed = owned.pointer().clone();
+        let cache_key = self
+            .install
+            .cache_prefetched(&mut handed, group_snapshot, owned, lease);
+        let guard = PrefetchedSnapshotGuard {
+            snapshot_install: self.install.clone(),
+            cache_key,
+        };
+        let pointer_bytes = handed
+            .encode_binary()
+            .map_err(|source| SnapshotInstallError::PointerEncode { group, source })?;
+        Ok(PrefetchedInstallSnapshot {
+            snapshot: UrsulaSnapshot {
+                meta: snapshot.meta,
+                snapshot: SnapshotData::new(pointer_bytes),
+            },
+            guard: Some(guard),
+            history: Some(history),
+        })
+    }
+
+    /// Writes `stored`, the snapshot `meta` names as its sender's store
+    /// holds it, as this node's own object under a fresh name, through the
+    /// one write policy of every object a node writes
+    /// ([`SnapshotHolds::write`]): held from before its PUT and checked with
+    /// a HEAD (#687). The stored bytes go as they are, without decompressing
+    /// and compressing them again. A name collision on the node's own fresh
+    /// name is likelier its own write retried after a lost answer than
+    /// another write's: the name is not held, the write owes the passes that
+    /// delete what may have landed, and the copy runs once more under a new
+    /// name. The pointer it answers carries the snapshot's own id
+    /// ([`group_snapshot_id`]).
+    async fn copy(
+        &self,
+        group: RaftGroupId,
+        meta: &openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig>,
+        stored: ursula_runtime::StoredSnapshot,
+    ) -> Result<(OwnedPointer, Option<SnapshotLease>), SnapshotInstallError> {
+        let index = meta.last_log_id.map_or(0, |log_id| log_id.index());
+        let snapshot_id = group_snapshot_id(group, meta.last_log_id);
+        let mut collided = None;
+        for _attempt in 0..2 {
+            let staged = self
+                .store
+                .stage_stored(group, index, stored.clone())
+                .await
+                .map_err(|source| SnapshotInstallError::CopyWrite {
+                    group,
+                    own_key: self.store.namespace(group).directory().unwrap_or_default(),
+                    source,
+                })?;
+            match self.holds.write(&self.store, staged).await {
+                Ok(written) => {
+                    return Ok((
+                        OwnedPointer::new(snapshot_id, written.location),
+                        written.lease,
+                    ));
+                }
+                Err(HeldWriteError::Write {
+                    key,
+                    source: ursula_runtime::SnapshotStoreError::NameCollision { .. },
+                }) => {
+                    tracing::warn!(
+                        raft_group_id = group.0,
+                        key,
+                        "the snapshot copy's fresh name is taken, likely by its own retried \
+                         write; copying under a new name"
+                    );
+                    collided = Some(key);
+                }
+                Err(HeldWriteError::Write { key, source }) => {
+                    return Err(SnapshotInstallError::CopyWrite {
+                        group,
+                        own_key: key,
+                        source,
+                    });
+                }
+                Err(HeldWriteError::Verify {
+                    key,
+                    source:
+                        ursula_runtime::SnapshotStoreError::SizeMismatch {
+                            expected, actual, ..
+                        },
+                }) => {
+                    return Err(SnapshotInstallError::CopyVerify {
+                        group,
+                        own_key: key,
+                        expected,
+                        actual,
+                    });
+                }
+                Err(HeldWriteError::Verify { key, source }) => {
+                    return Err(SnapshotInstallError::CopyWrite {
+                        group,
+                        own_key: key,
+                        source,
+                    });
+                }
+            }
+        }
+        Err(SnapshotInstallError::NameCollision {
+            group,
+            own_key: collided.unwrap_or_default(),
+        })
+    }
+}
+
 pub(crate) fn log_progress_snapshot(
     log_id: LogIdOf<UrsulaRaftTypeConfig>,
 ) -> RaftLogProgressSnapshot {
@@ -1854,13 +1982,24 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    #[cfg(not(madsim))]
     use std::time::Duration;
 
-    use bytes::Bytes;
     use ursula_runtime::GroupSnapshot;
     use ursula_runtime::SnapshotStore;
     use ursula_runtime::SnapshotStoreError;
     use ursula_runtime::SnapshotStoreFuture;
+    use ursula_runtime::StagedSnapshot;
+    use ursula_runtime::StoredSnapshot;
+    use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
+    use ursula_runtime::snapshot_harness::MemorySnapshotStore;
+    #[cfg(not(madsim))]
+    use ursula_runtime::snapshot_harness::NodeNames;
+    use ursula_runtime::snapshot_harness::SnapshotStoreFaults;
+    #[cfg(not(madsim))]
+    use ursula_runtime::snapshot_harness::check_quiet_prefixes;
 
     use super::*;
 
@@ -1869,7 +2008,7 @@ mod tests {
     #[cfg_attr(not(madsim), tokio::test)]
     async fn registry_hands_out_the_registered_group_page_cache() {
         let check = async {
-            let (registry, engine, _root) = reference_failure_engine(Arc::default()).await;
+            let (registry, engine, _root) = install_engine(InstallStore::new()).await;
             let group = engine.placement.raft_group_id;
             let shared = registry.cold_index_cache(group).expect("registered cache");
             assert!(Arc::ptr_eq(
@@ -1879,6 +2018,10 @@ mod tests {
             assert!(Arc::ptr_eq(
                 &registry.entry(group).unwrap().barrier,
                 &engine.read_barrier
+            ));
+            assert!(Arc::ptr_eq(
+                &registry.entry(group).unwrap().snapshots.holds,
+                &engine.snapshots.holds
             ));
             assert_eq!(registry.len(), 1);
             assert!(registry.get(group).is_some());
@@ -1890,122 +2033,135 @@ mod tests {
         check.await;
     }
 
+    /// Node 1's memory store, which also serves the objects of the leader:
+    /// a GET of a key outside node 1's directory answers the test group's
+    /// snapshot body, or `NotFound` once the source vanished. Its object
+    /// writes can fail, and its GETs can pause.
     #[derive(Debug)]
-    struct StaticSnapshotStore {
-        bytes: Option<Vec<u8>>,
-    }
-
-    #[derive(Debug, Default)]
-    struct FailingReferenceStore {
-        fail_pin: std::sync::atomic::AtomicBool,
-        fail_current: std::sync::atomic::AtomicBool,
-        pins: Mutex<BTreeSet<String>>,
-        current: Mutex<Option<String>>,
-        pause_current: std::sync::atomic::AtomicBool,
-        entered_current: crate::rt::sync::Notify,
-        release_current: crate::rt::sync::Notify,
-        downloads: std::sync::atomic::AtomicUsize,
-        pause_download: std::sync::atomic::AtomicBool,
+    struct InstallStore {
+        #[cfg_attr(
+            madsim,
+            expect(dead_code, reason = "only the tests outside madsim read the bucket")
+        )]
+        bucket: MemorySnapshotBucket,
+        inner: MemorySnapshotStore,
+        fail_write: AtomicBool,
+        source_gone: AtomicBool,
+        downloads: AtomicUsize,
+        pause_download: AtomicBool,
         entered_download: crate::rt::sync::Notify,
         release_download: crate::rt::sync::Notify,
     }
 
-    impl SnapshotStore for FailingReferenceStore {
-        fn upload<'a>(
-            &'a self,
-            _key: ursula_runtime::SnapshotKey,
-            bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                Ok(SnapshotLocation::Inline {
-                    bytes: bytes.to_vec(),
-                })
+    impl InstallStore {
+        fn new() -> Arc<Self> {
+            Self::with(SnapshotStoreFaults::none(), None)
+        }
+
+        fn with(faults: SnapshotStoreFaults, nonces: Option<fn() -> u64>) -> Arc<Self> {
+            let bucket = MemorySnapshotBucket::new(
+                7,
+                ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
+                faults,
+            );
+            let inner = match nonces {
+                Some(nonces) => bucket.store(1).with_nonces(nonces),
+                None => bucket.store(1),
+            };
+            Arc::new(Self {
+                bucket,
+                inner,
+                fail_write: AtomicBool::new(false),
+                source_gone: AtomicBool::new(false),
+                downloads: AtomicUsize::new(0),
+                pause_download: AtomicBool::new(false),
+                entered_download: crate::rt::sync::Notify::new(),
+                release_download: crate::rt::sync::Notify::new(),
             })
         }
-        fn download<'a>(
+
+        #[cfg(not(madsim))]
+        /// The objects in node 1's directory.
+        fn own_keys(&self) -> BTreeSet<String> {
+            self.bucket
+                .keys()
+                .into_iter()
+                .filter(|key| key.starts_with("snapshots/node-1/"))
+                .collect()
+        }
+    }
+
+    impl SnapshotStore for InstallStore {
+        fn namespace(&self, raft_group_id: RaftGroupId) -> ursula_runtime::OwnedNamespace {
+            self.inner.namespace(raft_group_id)
+        }
+
+        fn stage<'a>(
             &'a self,
-            _location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            Box::pin(async {
+            raft_group_id: RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+            self.inner.stage(raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: StagedSnapshot,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::OwnedLocation> {
+            if self.fail_write.load(Ordering::SeqCst) {
+                return Box::pin(async {
+                    Err(SnapshotStoreError::backend(
+                        ursula_runtime::SnapshotStoreOperation::Put,
+                        "test",
+                        opendal::Error::new(opendal::ErrorKind::Unexpected, "PUT outage"),
+                    ))
+                });
+            }
+            self.inner.write_staged(staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: RaftGroupId,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            self.inner.list_own(raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.delete_own(object)
+        }
+
+        fn read_stored<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StoredSnapshot> {
+            Box::pin(async move {
                 self.downloads.fetch_add(1, Ordering::SeqCst);
                 if self.pause_download.load(Ordering::SeqCst) {
                     self.entered_download.notify_one();
                     self.release_download.notified().await;
                 }
-                Ok(group_snapshot_bytes())
-            })
-        }
-        fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-        fn pin_reference<'a>(
-            &'a self,
-            _group: u32,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                if self.fail_pin.load(Ordering::SeqCst) {
-                    return Err(ursula_runtime::SnapshotStoreError::backend(
-                        ursula_runtime::SnapshotStoreOperation::Put,
-                        "test",
-                        opendal::Error::new(
-                            opendal::ErrorKind::Unexpected,
-                            "temporary pin PUT outage",
-                        ),
-                    ));
+                let key = crate::state_machine::object_key(location).expect("an object");
+                if key.starts_with("snapshots/node-1/") {
+                    return self.inner.read_stored(location).await;
                 }
-                if let SnapshotLocation::S3 { key, .. } = location {
-                    self.pins.lock().unwrap().insert(key.clone());
+                if self.source_gone.load(Ordering::SeqCst) {
+                    return Err(SnapshotStoreError::NotFound { key });
                 }
-                Ok(())
-            })
-        }
-        fn publish_reference<'a>(
-            &'a self,
-            _group: u32,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                if self.fail_current.load(Ordering::SeqCst) {
-                    return Err(ursula_runtime::SnapshotStoreError::backend(
-                        ursula_runtime::SnapshotStoreOperation::Put,
-                        "test",
-                        opendal::Error::new(
-                            opendal::ErrorKind::Unexpected,
-                            "temporary current-reference PUT outage",
-                        ),
-                    ));
-                }
-                if self.pause_current.load(Ordering::SeqCst) {
-                    self.entered_current.notify_one();
-                    self.release_current.notified().await;
-                }
-                *self.current.lock().unwrap() = match location {
-                    SnapshotLocation::S3 { key, .. } => Some(key.clone()),
-                    _ => None,
-                };
-                Ok(())
-            })
-        }
-        fn reconcile_reference_pins<'a>(
-            &'a self,
-            _group: u32,
-            retained: &'a [SnapshotLocation],
-        ) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move {
-                let keys: BTreeSet<_> = retained
-                    .iter()
-                    .filter_map(|location| match location {
-                        SnapshotLocation::S3 { key, .. } => Some(key.clone()),
-                        _ => None,
-                    })
-                    .collect();
-                self.pins.lock().unwrap().retain(|key| keys.contains(key));
-                Ok(())
+                Ok(StoredSnapshot::inline(group_snapshot_bytes()))
             })
         }
 
-        ursula_runtime::inline_owned_snapshot_methods!();
+        fn verify_uploaded<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.verify_uploaded(location)
+        }
     }
 
     struct ReferenceWalRoot {
@@ -2020,7 +2176,7 @@ mod tests {
                 #[cfg(not(madsim))]
                 root: tempfile::tempdir().unwrap(),
                 #[cfg(madsim)]
-                root: crate::log_store::SimDisk::provision_dir("snapshot-reference").unwrap(),
+                root: crate::log_store::SimDisk::provision_dir("snapshot-install").unwrap(),
             }
         }
         fn path(&self) -> &std::path::Path {
@@ -2034,44 +2190,41 @@ mod tests {
             }
         }
     }
-    async fn reference_failure_group(
-        store: Arc<FailingReferenceStore>,
+
+    #[cfg(not(madsim))]
+    async fn install_group(
+        store: Arc<InstallStore>,
     ) -> (RaftGroupHandleRegistry, RaftGroupHandle, ReferenceWalRoot) {
-        let (registry, engine, root) = reference_failure_engine(store).await;
+        let (registry, engine, root) = install_engine(store).await;
         (registry, engine.raft_handle(), root)
     }
 
-    async fn reference_failure_engine(
-        store: Arc<FailingReferenceStore>,
+    async fn install_engine(
+        store: Arc<InstallStore>,
     ) -> (
         RaftGroupHandleRegistry,
         crate::RaftGroupEngine,
         ReferenceWalRoot,
     ) {
-        reference_failure_engine_for_group(store, RaftGroupId(7), Default::default(), None).await
+        install_engine_for_group(store, RaftGroupId(7), Default::default(), None).await
     }
 
-    /// [`reference_failure_engine_for_group`] for group 7, started with the
-    /// recovery gate `recovery`, as a node's engine factory starts it.
-    async fn gated_reference_failure_engine(
-        store: Arc<FailingReferenceStore>,
+    #[cfg(not(madsim))]
+    /// [`install_engine_for_group`] for group 7, started with the recovery
+    /// gate `recovery`, as a node's engine factory starts it.
+    async fn gated_install_engine(
+        store: Arc<InstallStore>,
         recovery: Arc<crate::GroupRejoin>,
     ) -> (
         RaftGroupHandleRegistry,
         crate::RaftGroupEngine,
         ReferenceWalRoot,
     ) {
-        reference_failure_engine_for_group(
-            store,
-            RaftGroupId(7),
-            Default::default(),
-            Some(recovery),
-        )
-        .await
+        install_engine_for_group(store, RaftGroupId(7), Default::default(), Some(recovery)).await
     }
 
-    async fn reference_failure_engine_for_group(
-        store: Arc<FailingReferenceStore>,
+    async fn install_engine_for_group(
+        store: Arc<InstallStore>,
         group: RaftGroupId,
         snapshot_install: SnapshotInstallCoordinator,
         recovery: Option<Arc<crate::GroupRejoin>>,
@@ -2129,8 +2282,9 @@ mod tests {
         (registry, engine, wal_root)
     }
 
-    fn reference_failure_snapshot() -> UrsulaSnapshot {
-        let mut snapshot = external_snapshot("reference-fault");
+    #[cfg(not(madsim))]
+    fn install_snapshot() -> UrsulaSnapshot {
+        let mut snapshot = external_snapshot("leader-object");
         let id = openraft::LogId::new(openraft::vote::RaftLeaderId::new(1, 2), 1);
         snapshot.meta.last_log_id = Some(id);
         snapshot.meta.last_membership =
@@ -2145,6 +2299,17 @@ mod tests {
         snapshot
     }
 
+    #[cfg(not(madsim))]
+    /// The pointer of `raft`'s current snapshot.
+    async fn current_pointer(raft: &RaftGroupHandle) -> SnapshotPointer {
+        let current = raft
+            .get_snapshot()
+            .await
+            .unwrap()
+            .expect("a current snapshot");
+        SnapshotPointer::decode(current.snapshot.pointer_bytes()).unwrap()
+    }
+
     /// M1 of the third #581 review: a replica holding a recovery plan takes
     /// no full snapshot and no append from a leader at or below the plan
     /// term, a leader elected before the plan, and refuses it typed. A
@@ -2152,7 +2317,7 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn a_replica_holding_a_plan_takes_no_snapshot_from_a_leader_before_it() {
-        let store = Arc::new(FailingReferenceStore::default());
+        let store = InstallStore::new();
         let gate_root = tempfile::tempdir().expect("gate WAL root");
         let gate_store = crate::log_store::RaftWal::start(
             gate_root.path(),
@@ -2174,7 +2339,7 @@ mod tests {
                 .await
                 .expect("open the gate"),
         );
-        let (registry, engine, _root) = gated_reference_failure_engine(store, gate.clone()).await;
+        let (registry, engine, _root) = gated_install_engine(store, gate.clone()).await;
         engine.publish_recovery(gate.clone(), &registry).unwrap();
         gate.hold_plan(&crate::log_store::RecoveryRecord {
             leader: 2,
@@ -2196,7 +2361,7 @@ mod tests {
                 .install_full_snapshot(
                     RaftGroupId(7),
                     crate::UrsulaVote::new_committed(term, 2),
-                    reference_failure_snapshot(),
+                    install_snapshot(),
                 )
                 .await;
             assert!(
@@ -2231,18 +2396,18 @@ mod tests {
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn queued_snapshot_cannot_switch_to_a_replacement_engine() {
-        let store = Arc::new(FailingReferenceStore::default());
-        let (registry, old, _old_root) = reference_failure_engine(store.clone()).await;
+        let store = InstallStore::new();
+        let (registry, old, _old_root) = install_engine(store.clone()).await;
         let serial = registry.snapshot_install.install_lock(7).lock_owned().await;
         let request = registry.install_full_snapshot(
             RaftGroupId(7),
             crate::UrsulaVote::new_committed(1, 2),
-            reference_failure_snapshot(),
+            install_snapshot(),
         );
         tokio::pin!(request);
         assert!(futures_util::poll!(&mut request).is_pending());
         old.shutdown().await.unwrap();
-        let (_, replacement, _new_root) = reference_failure_engine_for_group(
+        let (_, replacement, _new_root) = install_engine_for_group(
             store,
             RaftGroupId(7),
             registry.snapshot_install_coordinator(),
@@ -2268,208 +2433,174 @@ mod tests {
         replacement.shutdown().await.unwrap();
     }
 
+    /// #687: an install copies the leader's snapshot into this node's own
+    /// object and commits the copy. A copy whose write fails refuses the
+    /// install before OpenRaft takes it, answering `UNAVAILABLE`, and keeps
+    /// the Raft core running; the next attempt copies again and installs.
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn snapshot_reference_put_failures_retry_without_restarting_raft() {
-        snapshot_reference_put_failures_retry_without_restarting_raft_body().await;
-    }
-    #[cfg(madsim)]
-    #[test]
-    fn snapshot_reference_put_failures_retry_without_restarting_raft() {
-        crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
-            crate::sim_runtime::MadsimOpenRaftRuntime::scope(
-                7,
-                snapshot_reference_put_failures_retry_without_restarting_raft_body(),
+    async fn an_install_commits_its_own_copy_and_a_failed_copy_retries_without_restarting_raft() {
+        let store = InstallStore::new();
+        store.fail_write.store(true, Ordering::SeqCst);
+        let (registry, raft, _wal_root) = install_group(store.clone()).await;
+        let first = registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                install_snapshot(),
+            )
+            .await;
+        let error = first.expect_err("a failed copy refuses the install");
+        assert!(
+            matches!(&error, SnapshotInstallError::CopyWrite { group, .. } if *group == RaftGroupId(7)),
+            "{error:?}"
+        );
+        assert!(error.peer_backs_off());
+        let metrics = raft.metrics().borrow_watched().clone();
+        assert!(
+            metrics.running_state.is_ok(),
+            "a failed copy must not kill RaftCore"
+        );
+        assert!(
+            metrics.last_applied.is_none(),
+            "the copy precedes the install"
+        );
+        assert!(store.own_keys().is_empty());
+
+        store.fail_write.store(false, Ordering::SeqCst);
+        registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                install_snapshot(),
             )
             .await
-        });
-    }
-    async fn snapshot_reference_put_failures_retry_without_restarting_raft_body() {
-        for fail_pin in [true, false] {
-            let store = Arc::new(FailingReferenceStore::default());
-            store.fail_pin.store(fail_pin, Ordering::SeqCst);
-            store.fail_current.store(!fail_pin, Ordering::SeqCst);
-            let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
-            let first = registry
-                .install_full_snapshot(
-                    RaftGroupId(7),
-                    crate::types::UrsulaVote::new_committed(1, 2),
-                    reference_failure_snapshot(),
-                )
-                .await;
-            first.expect_err("a failing reference store must reject the snapshot install");
-            let metrics = raft.metrics().borrow_watched().clone();
-            assert!(
-                metrics.running_state.is_ok(),
-                "transient object-store failure must not kill RaftCore"
-            );
-            if fail_pin {
-                assert!(
-                    metrics.last_applied.is_none(),
-                    "pin failure must precede installation"
-                );
-                assert!(store.pins.lock().unwrap().is_empty());
-            } else {
-                assert_eq!(metrics.last_applied.unwrap().index(), 1);
-                assert!(store.pins.lock().unwrap().contains("reference-fault.snap"));
-                let snapshot = raft.get_snapshot().await.unwrap().unwrap();
-                let pointer = SnapshotPointer::decode(snapshot.snapshot.pointer_bytes()).unwrap();
-                assert_eq!(pointer.snapshot_id, "reference-fault");
-                assert_eq!(
-                    snapshot.snapshot.pointer_bytes(),
-                    reference_failure_snapshot().snapshot.pointer_bytes()
-                );
-                assert!(
-                    matches!(pointer.location, SnapshotLocation::S3 { .. }),
-                    "temporary reference failure must not retain a full inline snapshot"
-                );
-            }
-            let retry_started = crate::rt::time::Instant::now();
-            store.fail_pin.store(false, Ordering::SeqCst);
-            store.fail_current.store(false, Ordering::SeqCst);
-            registry
-                .install_full_snapshot(
-                    RaftGroupId(7),
-                    crate::types::UrsulaVote::new_committed(1, 2),
-                    reference_failure_snapshot(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                store.downloads.load(Ordering::SeqCst),
-                1,
-                "publication retry must reuse the installed snapshot"
-            );
-            if !fail_pin {
-                assert!(
-                    retry_started.elapsed() >= Duration::from_millis(90),
-                    "publication retry must back off"
-                );
-            }
-            assert_eq!(
-                store.current.lock().unwrap().as_deref(),
-                Some("reference-fault.snap")
-            );
-            assert_eq!(store.pins.lock().unwrap().len(), 1);
-            // Same Raft handle resumes an election and committed application.
-            raft.trigger().elect(false).await.unwrap();
-            raft.wait(Some(Duration::from_secs(2)))
-                .current_leader(1, "recovered group elects")
-                .await
-                .unwrap();
-            raft.client_write(crate::tests::genesis_command())
-                .await
-                .unwrap();
-            let response = raft
-                .client_write(ursula_runtime::GroupWriteCommand::Stream(
-                    ursula_stream::StreamCommand::CreateStream {
-                        stream_id: ursula_shard::BucketStreamId::new("after-retry", "events"),
-                        content_type: "application/octet-stream".to_owned(),
-                        initial_payload: bytes::Bytes::new(),
-                        close_after: false,
-                        stream_seq: None,
-                        stream_ttl_seconds: None,
-                        stream_expires_at_ms: None,
-                        now_ms: 0,
-                    },
-                ))
-                .await
-                .unwrap();
-            assert!(matches!(
-                response.data,
-                crate::RaftGroupResponse::Write(Ok(
-                    ursula_runtime::GroupWriteResponse::CreateStream(_)
-                ))
-            ));
-            raft.metrics()
-                .borrow_watched()
-                .running_state
-                .as_ref()
-                .expect("raft core must keep running after the snapshot retry");
-            raft.shutdown().await.unwrap();
-        }
-    }
-
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn slow_reference_publication_does_not_block_another_groups_install() {
-        let coordinator = SnapshotInstallCoordinator::new(1);
-        let slow_store = Arc::new(FailingReferenceStore::default());
-        slow_store.pause_current.store(true, Ordering::SeqCst);
-        let (slow_registry, slow_engine, _slow_root) = reference_failure_engine_for_group(
-            slow_store.clone(),
-            RaftGroupId(7),
-            coordinator.clone(),
-            None,
-        )
-        .await;
-        let (fast_registry, fast_engine, _fast_root) =
-            reference_failure_engine_for_group(Arc::default(), RaftGroupId(6), coordinator, None)
-                .await;
-        let slow = crate::rt::spawn(async move {
-            slow_registry
-                .install_full_snapshot(
-                    RaftGroupId(7),
-                    crate::types::UrsulaVote::new_committed(1, 2),
-                    reference_failure_snapshot(),
-                )
-                .await
-        });
-        slow_store.entered_current.notified().await;
-        // Cancellation must still retain the per-group publication and lifetime,
-        // but the sole node-wide install permit belongs to neither I/O nor backoff.
-        slow.abort();
-        assert!(slow.await.unwrap_err().is_cancelled());
-        let mut group = decode_group_snapshot(&group_snapshot_bytes()).unwrap();
-        group.placement.raft_group_id = RaftGroupId(6);
-        let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(group))
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap()
-            .into_iter()
-            .flat_map(|chunk| chunk.to_vec())
-            .collect();
-        let mut snapshot = reference_failure_snapshot();
-        snapshot.snapshot = SnapshotData::new(
-            SnapshotPointer {
-                snapshot_id: "reference-fault".to_owned(),
-                location: SnapshotLocation::Inline { bytes },
-            }
-            .encode_binary()
-            .unwrap(),
-        );
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            fast_registry.install_full_snapshot(
-                RaftGroupId(6),
-                crate::types::UrsulaVote::new_committed(1, 2),
-                snapshot,
-            ),
-        )
-        .await
-        .expect("another group must install while publication remains paused")
-        .unwrap();
+            .unwrap();
+        assert_eq!(store.downloads.load(Ordering::SeqCst), 2);
         assert_eq!(
-            fast_engine
-                .raft_handle()
-                .metrics()
+            raft.metrics()
                 .borrow_watched()
                 .last_applied
                 .unwrap()
                 .index(),
             1
         );
-        slow_store.pause_current.store(false, Ordering::SeqCst);
-        slow_store.release_current.notify_one();
-        slow_engine.shutdown().await.unwrap();
-        fast_engine.shutdown().await.unwrap();
+        let pointer = current_pointer(&raft).await;
+        assert_eq!(
+            pointer.snapshot_id,
+            group_snapshot_id(RaftGroupId(7), install_snapshot().meta.last_log_id)
+        );
+        let SnapshotLocation::S3 { key, .. } = &pointer.location else {
+            panic!("expected the node's own copy, got {:?}", pointer.location);
+        };
+        assert!(
+            key.starts_with("snapshots/node-1/group-7/00000000000000000001-"),
+            "{key}"
+        );
+        assert_eq!(store.own_keys(), BTreeSet::from([key.clone()]));
+        // A retry of the same snapshot needs no copy: only its meta
+        // compares, and the node's pointer names its own copy.
+        registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                install_snapshot(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.downloads.load(Ordering::SeqCst), 2);
+        assert_eq!(store.own_keys(), BTreeSet::from([key.clone()]));
+        // Same Raft handle resumes an election and committed application.
+        raft.trigger().elect(false).await.unwrap();
+        raft.wait(Some(Duration::from_secs(2)))
+            .current_leader(1, "recovered group elects")
+            .await
+            .unwrap();
+        raft.client_write(crate::tests::genesis_command())
+            .await
+            .unwrap();
+        let response = raft
+            .client_write(ursula_runtime::GroupWriteCommand::Stream(
+                ursula_stream::StreamCommand::CreateStream {
+                    stream_id: ursula_shard::BucketStreamId::new("after-retry", "events"),
+                    content_type: "application/octet-stream".to_owned(),
+                    initial_payload: bytes::Bytes::new(),
+                    close_after: false,
+                    stream_seq: None,
+                    stream_ttl_seconds: None,
+                    stream_expires_at_ms: None,
+                    now_ms: 0,
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            response.data,
+            crate::RaftGroupResponse::Write(Ok(ursula_runtime::GroupWriteResponse::CreateStream(
+                _
+            )))
+        ));
+        raft.shutdown().await.unwrap();
+    }
+
+    /// #687: the sender holds its object until the RPC returns, so a source
+    /// that is gone is a pointer that is no longer current. The install
+    /// answers `UNAVAILABLE`, installs nothing, and the next attempt, which
+    /// carries the sender's current pointer, installs.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_vanished_source_answers_unavailable_and_the_next_pointer_installs() {
+        let store = InstallStore::new();
+        store.source_gone.store(true, Ordering::SeqCst);
+        let (registry, raft, _wal_root) = install_group(store.clone()).await;
+        let error = registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                install_snapshot(),
+            )
+            .await
+            .expect_err("a vanished source refuses the install");
+        assert!(
+            matches!(
+                &error,
+                SnapshotInstallError::SourceMissing { group, source_key }
+                    if *group == RaftGroupId(7) && source_key == "leader-object.snap"
+            ),
+            "{error:?}"
+        );
+        assert_eq!(tonic::Status::from(error).code(), tonic::Code::Unavailable);
+        assert!(raft.metrics().borrow_watched().last_applied.is_none());
+        assert!(store.own_keys().is_empty(), "nothing was copied");
+
+        store.source_gone.store(false, Ordering::SeqCst);
+        let mut current = install_snapshot();
+        current.snapshot = external_snapshot("leader-current").snapshot;
+        registry
+            .install_full_snapshot(
+                RaftGroupId(7),
+                crate::types::UrsulaVote::new_committed(1, 2),
+                current,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            raft.metrics()
+                .borrow_watched()
+                .last_applied
+                .unwrap()
+                .index(),
+            1
+        );
+        raft.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn shutdown_stops_a_canceled_install_before_reopened_group_publication() {
-        let store = Arc::new(FailingReferenceStore::default());
-        store.pause_current.store(true, Ordering::SeqCst);
-        let (registry, engine, _root) = reference_failure_engine(store.clone()).await;
+    async fn shutdown_stops_a_canceled_install_before_the_reopened_group_installs() {
+        let store = InstallStore::new();
+        store.pause_download.store(true, Ordering::SeqCst);
+        let (registry, engine, _root) = install_engine(store.clone()).await;
         let request = crate::rt::spawn({
             let registry = registry.clone();
             async move {
@@ -2477,12 +2608,12 @@ mod tests {
                     .install_full_snapshot(
                         RaftGroupId(7),
                         crate::types::UrsulaVote::new_committed(1, 2),
-                        reference_failure_snapshot(),
+                        install_snapshot(),
                     )
                     .await
             }
         });
-        store.entered_current.notified().await;
+        store.entered_download.notified().await;
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
         let raft = engine.raft_handle();
@@ -2490,7 +2621,7 @@ mod tests {
         raft.wait(Some(Duration::from_secs(2)))
             .metrics(
                 |metrics| matches!(metrics.state, openraft::ServerState::Shutdown),
-                "Raft stops before the admitted install's publication ends",
+                "Raft stops before the admitted install's download ends",
             )
             .await
             .unwrap();
@@ -2501,25 +2632,29 @@ mod tests {
                     .install_full_snapshot(
                         RaftGroupId(7),
                         crate::types::UrsulaVote::new_committed(1, 2),
-                        reference_failure_snapshot(),
+                        install_snapshot(),
                     )
                     .await
             }
         });
-        // The shutdown stops the admitted install's paused publication
-        // instead of waiting for it, and returns once the task ended (#709).
+        // The shutdown stops the admitted install's paused download instead
+        // of waiting for it, and returns once the task ended (#709).
         shutdown.await.unwrap().unwrap();
         assert!(matches!(
             refused.await.unwrap().unwrap_err(),
             SnapshotInstallError::ShuttingDown { .. }
         ));
-        store.pause_current.store(false, Ordering::SeqCst);
-        store.release_current.notify_one();
-        // Reopen against the same external reference namespace. No canceled
-        // task from the retired engine may publish or reconcile behind this.
+        assert!(
+            store.own_keys().is_empty(),
+            "the stopped install copied nothing"
+        );
+        store.pause_download.store(false, Ordering::SeqCst);
+        store.release_download.notify_one();
+        // Reopen against the same store. No canceled task from the retired
+        // engine may install behind this.
         let (replacement_registry, replacement, _replacement_root) =
-            reference_failure_engine(store.clone()).await;
-        let mut snapshot = reference_failure_snapshot();
+            install_engine(store.clone()).await;
+        let mut snapshot = install_snapshot();
         snapshot.snapshot = external_snapshot("replacement").snapshot;
         replacement_registry
             .install_full_snapshot(
@@ -2529,26 +2664,36 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            store.current.lock().unwrap().as_deref(),
-            Some("replacement.snap")
-        );
-        assert!(store.pins.lock().unwrap().contains("replacement.snap"));
+        let pointer = current_pointer(&replacement.raft_handle()).await;
+        let key = crate::state_machine::object_key(&pointer.location).unwrap();
+        assert_eq!(store.own_keys(), BTreeSet::from([key]));
         replacement.shutdown().await.unwrap();
     }
+
+    #[cfg(not(madsim))]
+    /// The snapshot side of an engine of group 7 on `store`, as the
+    /// registry copies with it, whose holds are restored.
+    fn group_snapshots(store: Arc<InstallStore>) -> GroupSnapshots {
+        let install = SnapshotInstallCoordinator::default();
+        let holds = Arc::new(SnapshotHolds::new(RaftGroupId(7), install.late_write()));
+        holds.mark_restored();
+        GroupSnapshots {
+            store,
+            install,
+            holds,
+        }
+    }
+
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn duplicate_prefetch_guards_have_independent_entries() {
-        let registry = RaftGroupHandleRegistry::default();
-        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
-            bytes: Some(group_snapshot_bytes()),
-        })));
-        let first = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("same"))
+        let snapshots = group_snapshots(InstallStore::new());
+        let first = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("same"))
             .await
             .unwrap();
-        let second = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("same"))
+        let second = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("same"))
             .await
             .unwrap();
         let first_pointer =
@@ -2556,20 +2701,20 @@ mod tests {
         let second_pointer =
             SnapshotPointer::decode(second.snapshot.snapshot.pointer_bytes()).unwrap();
         assert_ne!(first_pointer.snapshot_id, second_pointer.snapshot_id);
-        drop(first);
-        assert!(
-            registry
-                .snapshot_install
-                .take_prefetched(&second_pointer)
-                .is_some()
+        assert_ne!(
+            first_pointer.location, second_pointer.location,
+            "each copy is an object of its own"
         );
+        drop(first);
+        assert!(snapshots.install.take_prefetched(&second_pointer).is_some());
     }
+
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn cancelled_snapshot_rpc_keeps_install_alive_and_serializes_duplicate() {
-        let store = Arc::new(FailingReferenceStore::default());
+        let store = InstallStore::new();
         store.pause_download.store(true, Ordering::SeqCst);
-        let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
+        let (registry, raft, _wal_root) = install_group(store.clone()).await;
         let request = crate::rt::spawn({
             let registry = registry.clone();
             async move {
@@ -2577,7 +2722,7 @@ mod tests {
                     .install_full_snapshot(
                         RaftGroupId(7),
                         crate::types::UrsulaVote::new_committed(1, 2),
-                        reference_failure_snapshot(),
+                        install_snapshot(),
                     )
                     .await
             }
@@ -2603,7 +2748,7 @@ mod tests {
             .install_full_snapshot(
                 RaftGroupId(7),
                 crate::types::UrsulaVote::new_committed(1, 2),
-                reference_failure_snapshot(),
+                install_snapshot(),
             )
             .await
             .unwrap();
@@ -2623,25 +2768,21 @@ mod tests {
             .unwrap();
         raft.shutdown().await.unwrap();
     }
+
+    /// An install OpenRaft refuses, here for a vote below the replica's,
+    /// commits nothing. Its copy leaves the holds when the install task
+    /// drops it, and the group's next GC pass deletes it (#687).
     #[cfg(not(madsim))]
     #[tokio::test]
-    async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
-        rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer_body().await;
-    }
-    #[cfg(madsim)]
-    #[test]
-    fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer() {
-        crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
-            crate::sim_runtime::MadsimOpenRaftRuntime::scope(
-                7,
-                rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer_body(),
-            )
-            .await
-        });
-    }
-    async fn rejected_snapshot_releases_its_pin_without_publishing_a_current_pointer_body() {
-        let store = Arc::new(FailingReferenceStore::default());
-        let (registry, raft, _wal_root) = reference_failure_group(store.clone()).await;
+    async fn a_refused_install_leaves_its_copy_to_the_next_pass() {
+        let store = InstallStore::new();
+        let (registry, engine, _wal_root) = install_engine(store.clone()).await;
+        let raft = engine.raft_handle();
+        // The restore's first pass, so that only what the install owes is
+        // due now.
+        registry
+            .collect_snapshot_garbage(usize::MAX, Duration::from_secs(5))
+            .await;
         raft.vote(crate::types::UrsulaVoteRequest::new(
             crate::types::UrsulaVote::new(5, 1),
             None,
@@ -2652,134 +2793,23 @@ mod tests {
             .install_full_snapshot(
                 RaftGroupId(7),
                 crate::types::UrsulaVote::new_committed(1, 2),
-                reference_failure_snapshot(),
+                install_snapshot(),
             )
             .await
             .unwrap();
         assert!(raft.metrics().borrow_watched().last_applied.is_none());
-        assert!(store.current.lock().unwrap().is_none());
-        assert!(store.pins.lock().unwrap().is_empty());
-        raft.shutdown().await.unwrap();
+        assert!(raft.get_snapshot().await.unwrap().is_none());
+        assert_eq!(store.own_keys().len(), 1, "the copy was written");
+        assert!(engine.snapshots.holds.held_keys().is_empty());
+        let pass = registry
+            .collect_snapshot_garbage(usize::MAX, Duration::from_secs(5))
+            .await;
+        assert_eq!((pass.groups, pass.deleted, pass.failed), (1, 1, 0));
+        assert!(store.own_keys().is_empty());
+        engine.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
-        lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body().await;
-    }
-    #[cfg(madsim)]
-    #[test]
-    fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned() {
-        crate::tests::check_madsim_determinism(7, madsim::Config::default(), || async {
-            crate::sim_runtime::MadsimOpenRaftRuntime::scope(
-                7,
-                lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body(
-                ),
-            )
-            .await
-        });
-    }
-    async fn lagging_reference_put_keeps_the_new_current_and_every_prepared_pointer_pinned_body() {
-        let store = Arc::new(FailingReferenceStore::default());
-        let shared: SharedSnapshotStore = store.clone();
-        let references = Arc::new(crate::snapshot_references::SnapshotReferences::new(
-            std::time::Duration::from_secs(60),
-        ));
-        let location = |id: &str| {
-            SnapshotPointer::decode(external_snapshot(id).snapshot.pointer_bytes())
-                .unwrap()
-                .location
-        };
-        let old = location("old-current");
-        let incoming = location("new-current");
-        let pending = location("pending-build");
-        let old_lease = references.prepare(&shared, 7, &old).await.unwrap();
-        references.commit_current(&old);
-        drop(old_lease);
-        let new_lease = references.prepare(&shared, 7, &incoming).await.unwrap();
-        let pending_lease = references.prepare(&shared, 7, &pending).await.unwrap();
-        store.pause_current.store(true, Ordering::SeqCst);
-        let publication = crate::rt::spawn({
-            let references = references.clone();
-            let shared = shared.clone();
-            async move { references.publish_current(&shared, 7).await }
-        });
-        store.entered_current.notified().await;
-        // Installation performs no reference I/O and can finish while the
-        // old reference PUT is still blocked outside RaftCore.
-        references.commit_current(&incoming);
-        drop(new_lease);
-        store.release_current.notify_one();
-        publication.await.unwrap().unwrap();
-        assert_eq!(
-            store.current.lock().unwrap().as_deref(),
-            Some("old-current.snap")
-        );
-        // The replaced current stays pinned while it retires (#669).
-        assert_eq!(
-            *store.pins.lock().unwrap(),
-            BTreeSet::from([
-                "new-current.snap".to_owned(),
-                "old-current.snap".to_owned(),
-                "pending-build.snap".to_owned(),
-            ])
-        );
-        store.pause_current.store(false, Ordering::SeqCst);
-        drop(pending_lease);
-        references.publish_current(&shared, 7).await.unwrap();
-        assert_eq!(
-            store.current.lock().unwrap().as_deref(),
-            Some("new-current.snap")
-        );
-        assert_eq!(
-            *store.pins.lock().unwrap(),
-            BTreeSet::from(["new-current.snap".to_owned(), "old-current.snap".to_owned()])
-        );
-        // Once its pin expires, the next publication drops it.
-        let expired = crate::rt::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs(61))
-            .unwrap();
-        assert!(references.gc_due(expired));
-        assert!(references.expire_retiring(expired));
-        references.publish_current(&shared, 7).await.unwrap();
-        assert_eq!(
-            *store.pins.lock().unwrap(),
-            BTreeSet::from(["new-current.snap".to_owned()])
-        );
-    }
-
-    impl SnapshotStore for StaticSnapshotStore {
-        fn upload<'a>(
-            &'a self,
-            _key: ursula_runtime::SnapshotKey,
-            bytes: Bytes,
-        ) -> SnapshotStoreFuture<'a, SnapshotLocation> {
-            Box::pin(async move {
-                Ok(SnapshotLocation::Inline {
-                    bytes: bytes.to_vec(),
-                })
-            })
-        }
-
-        fn download<'a>(
-            &'a self,
-            location: &'a SnapshotLocation,
-        ) -> SnapshotStoreFuture<'a, Vec<u8>> {
-            let bytes = self.bytes.clone();
-            Box::pin(async move {
-                bytes.ok_or_else(|| SnapshotStoreError::NotFound {
-                    key: crate::state_machine::object_key(location).expect("an external location"),
-                })
-            })
-        }
-
-        fn delete<'a>(&'a self, _location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, ()> {
-            Box::pin(async move { Ok(()) })
-        }
-
-        ursula_runtime::inline_owned_snapshot_methods!();
-    }
-
     fn snapshot_meta() -> openraft::alias::SnapshotMetaOf<UrsulaRaftTypeConfig> {
         openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: None,
@@ -2805,6 +2835,8 @@ mod tests {
         .collect()
     }
 
+    #[cfg(not(madsim))]
+    /// The leader's snapshot: a pointer to its object `{snapshot_id}.snap`.
     fn external_snapshot(snapshot_id: &str) -> UrsulaSnapshot {
         let pointer = SnapshotPointer {
             snapshot_id: snapshot_id.to_owned(),
@@ -2813,7 +2845,6 @@ mod tests {
                 size_bytes: 1,
                 stored_size_bytes: 1,
                 compression: ursula_runtime::SnapshotCompression::None,
-                shared_object: false,
             },
         };
         UrsulaSnapshot {
@@ -2822,61 +2853,59 @@ mod tests {
         }
     }
 
+    /// The prefetch writes the node's own copy, held until it is committed,
+    /// and hands OpenRaft a pointer to the copy with a transient id; the
+    /// cached pointer carries the snapshot's own id.
+    #[cfg(not(madsim))]
     #[tokio::test]
-    async fn prefetch_snapshot_for_install_caches_external_snapshot() {
-        let registry = RaftGroupHandleRegistry::default();
-        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
-            bytes: Some(group_snapshot_bytes()),
-        })));
-
-        let prefetched = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-a"))
+    async fn prefetch_caches_the_nodes_own_copy() {
+        let snapshots = group_snapshots(InstallStore::new());
+        let prefetched = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("snapshot-a"))
             .await
             .expect("prefetch external snapshot");
 
         let pointer =
             SnapshotPointer::decode(prefetched.snapshot.snapshot.pointer_bytes()).unwrap();
-        assert_ne!(
-            pointer.snapshot_id, "snapshot-a",
-            "each admitted handoff has its own transient token"
+        assert!(
+            pointer.snapshot_id.starts_with("install-"),
+            "each admitted handoff has its own transient token: {}",
+            pointer.snapshot_id
         );
-        assert!(matches!(pointer.location, SnapshotLocation::S3 { .. }));
-        let cached = registry
-            .snapshot_install_coordinator()
+        let key = crate::state_machine::object_key(&pointer.location).unwrap();
+        assert!(key.starts_with("snapshots/node-1/group-7/"), "{key}");
+        assert_eq!(snapshots.holds.held_keys(), BTreeSet::from([key]));
+        let cached = snapshots
+            .install
             .take_prefetched(&pointer)
             .expect("external snapshot is cached for install");
         assert_eq!(cached.snapshot.group_commit_index, 0);
+        assert_eq!(cached.pointer.pointer().snapshot_id, "group-7-empty");
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn prefetch_snapshot_for_install_installs_without_snapshot_store_download() {
-        use ursula_shard::CoreId;
-        use ursula_shard::RaftGroupId;
-        use ursula_shard::ShardId;
-
-        let registry = RaftGroupHandleRegistry::default();
-        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
-            bytes: Some(group_snapshot_bytes()),
-        })));
-
-        let prefetched = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-drop"))
+        let store = InstallStore::new();
+        let snapshots = group_snapshots(store.clone());
+        let prefetched = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("snapshot-drop"))
             .await
             .expect("prefetch external snapshot");
-        let coordinator = registry.snapshot_install_coordinator();
+        assert_eq!(store.downloads.load(Ordering::SeqCst), 1);
 
         let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
             raft_group_id: RaftGroupId(7),
         };
         let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,
             None,
             None,
-            Arc::new(StaticSnapshotStore { bytes: None }),
+            store.clone(),
             SnapshotBuildCoordinator::default(),
-            coordinator,
+            snapshots.install.clone(),
             None,
         );
         let decodes_before_install = crate::snapshot_codec::decode_calls_on_this_thread();
@@ -2889,17 +2918,18 @@ mod tests {
             crate::snapshot_codec::decode_calls_on_this_thread(),
             decodes_before_install
         );
+        assert_eq!(store.downloads.load(Ordering::SeqCst), 1);
+        // The install committed the node's own copy.
+        let key = state_machine.holds.current().expect("an object is current");
+        assert!(key.starts_with("snapshots/node-1/group-7/"), "{key}");
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn prefetch_snapshot_for_install_guard_clears_unconsumed_cache() {
-        let registry = RaftGroupHandleRegistry::default();
-        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore {
-            bytes: Some(group_snapshot_bytes()),
-        })));
-
-        let prefetched = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("snapshot-unconsumed"))
+        let snapshots = group_snapshots(InstallStore::new());
+        let prefetched = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("snapshot-unconsumed"))
             .await
             .expect("prefetch external snapshot");
         let pointer =
@@ -2907,21 +2937,23 @@ mod tests {
         drop(prefetched);
 
         assert!(
-            registry
-                .snapshot_install_coordinator()
-                .take_prefetched(&pointer)
-                .is_none(),
+            snapshots.install.take_prefetched(&pointer).is_none(),
             "unconsumed prefetched snapshot should be cleared when guard drops"
         );
+        assert!(
+            snapshots.holds.held_keys().is_empty(),
+            "the copy left the holds"
+        );
+        assert!(snapshots.holds.gc_due(crate::rt::time::Instant::now()));
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn prefetch_snapshot_for_install_keeps_prefetch_failure_outside_openraft() {
-        let registry = RaftGroupHandleRegistry::default();
-        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore { bytes: None })));
-
-        let err = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), external_snapshot("missing"))
+        let store = InstallStore::new();
+        store.source_gone.store(true, Ordering::SeqCst);
+        let err = group_snapshots(store)
+            .prefetch(RaftGroupId(7), external_snapshot("missing"))
             .await
             .expect_err("missing snapshot should fail before OpenRaft install");
 
@@ -2941,6 +2973,174 @@ mod tests {
         assert_eq!(tonic::Status::from(err).code(), tonic::Code::Unavailable);
     }
 
+    /// A copy whose fresh name is taken on the retry too is refused typed,
+    /// answering `UNAVAILABLE`. A copy whose write lands and answers a name
+    /// collision, as a create retried after a lost answer does, may be the
+    /// node's own: it is not held, and the next pass deletes what landed, so
+    /// the node's directory holds only what it names (I5).
+    #[cfg(not(madsim))]
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_name_collision_is_retried_once_and_leaves_nothing_held() {
+        // Every stage draws the same name: the second copy collides twice.
+        let store = InstallStore::with(SnapshotStoreFaults::none(), Some(|| 7));
+        let snapshots = group_snapshots(store.clone());
+        let first = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("first"))
+            .await
+            .unwrap();
+        drop(first);
+        let refused = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("first"))
+            .await
+            .expect_err("the copy's name is taken on the retry too");
+        assert!(
+            matches!(&refused, SnapshotInstallError::NameCollision { group, own_key }
+                if *group == RaftGroupId(7) && own_key.starts_with("snapshots/node-1/group-7/")),
+            "{refused:?}"
+        );
+        assert_eq!(
+            tonic::Status::from(refused).code(),
+            tonic::Code::Unavailable
+        );
+
+        let collided = InstallStore::with(
+            SnapshotStoreFaults::none()
+                .with_collided_retries(ursula_runtime::snapshot_harness::PerMille::ALWAYS),
+            None,
+        );
+        let snapshots = group_snapshots(collided.clone());
+        let refused = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("collided"))
+            .await
+            .expect_err("both writes answer a collision");
+        assert!(
+            matches!(refused, SnapshotInstallError::NameCollision { .. }),
+            "{refused:?}"
+        );
+        assert_eq!(collided.own_keys().len(), 2, "both writes landed");
+        assert!(snapshots.holds.held_keys().is_empty());
+        snapshots
+            .holds
+            .collect_garbage(&snapshots.store, crate::rt::time::Instant::now())
+            .await
+            .unwrap();
+        collided.bucket.wait_for_late_puts().await;
+        assert_eq!(
+            check_quiet_prefixes(&collided.bucket.view(), [&NodeNames::new(
+                1,
+                Vec::<String>::new()
+            )]),
+            Ok(())
+        );
+        // The second pass, an install timeout later, finds nothing more.
+        assert!(
+            snapshots.holds.gc_due(
+                crate::rt::time::Instant::now()
+                    .checked_add(snapshots.install.late_write())
+                    .unwrap()
+            )
+        );
+    }
+
+    /// A group whose engine stopped and did not open again stays registered
+    /// with holds that owe passes. It takes no GC slot: the round counts it
+    /// neither run nor left, so it neither starves live groups nor keeps
+    /// the driver ticking again at once.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_stopped_engine_that_stays_registered_takes_no_gc_slot() {
+        let store = InstallStore::new();
+        let (registry, engine, _root) = install_engine(store).await;
+        let holds = engine.snapshots.holds.clone();
+        engine.shutdown().await.unwrap();
+        holds.owe_pass(crate::rt::time::Instant::now());
+        assert!(holds.gc_due(crate::rt::time::Instant::now()));
+        let pass = registry
+            .collect_snapshot_garbage(usize::MAX, Duration::from_secs(5))
+            .await;
+        assert_eq!((pass.groups, pass.left, pass.failed), (0, 0, 0));
+    }
+
+    /// A copy whose PUT answers an error and lands later is refused with
+    /// `CopyWrite`, and owes a pass at once and another one an install
+    /// timeout later. The first pass runs before the object lands, so only
+    /// the second leaves the node's directory with what it names (I5): the
+    /// control checks I5 between the landing and the second pass.
+    #[cfg(not(madsim))]
+    #[tokio::test(start_paused = true)]
+    async fn a_copy_whose_put_lands_late_goes_at_the_second_pass() {
+        let store = InstallStore::with(
+            SnapshotStoreFaults {
+                late_put: ursula_runtime::snapshot_harness::PerMille::ALWAYS,
+                late_put_delay: ursula_runtime::snapshot_harness::DelayRange::fixed(
+                    Duration::from_secs(30),
+                ),
+                ..SnapshotStoreFaults::none()
+            },
+            None,
+        );
+        let snapshots = group_snapshots(store.clone());
+        // Both passes the restore owes, so that only the copy's own passes
+        // are owed below.
+        let late_write = snapshots.install.late_write();
+        snapshots
+            .holds
+            .collect_garbage(
+                &snapshots.store,
+                crate::rt::time::Instant::now()
+                    .checked_add(late_write)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !snapshots.holds.gc_due(
+                crate::rt::time::Instant::now()
+                    .checked_add(late_write.saturating_mul(10))
+                    .unwrap()
+            )
+        );
+        let refused = snapshots
+            .prefetch(RaftGroupId(7), external_snapshot("late"))
+            .await
+            .expect_err("the copy's PUT answered an error");
+        assert!(
+            matches!(refused, SnapshotInstallError::CopyWrite { .. }),
+            "{refused:?}"
+        );
+        let late_pass = crate::rt::time::Instant::now()
+            .checked_add(snapshots.install.late_write())
+            .unwrap();
+        snapshots
+            .holds
+            .collect_garbage(&snapshots.store, crate::rt::time::Instant::now())
+            .await
+            .unwrap();
+        assert!(
+            snapshots.holds.gc_due(late_pass),
+            "the failed copy owes its second pass"
+        );
+        store.bucket.wait_for_late_puts().await;
+        let quiet = || {
+            check_quiet_prefixes(&store.bucket.view(), [&NodeNames::new(
+                1,
+                snapshots.holds.held_keys(),
+            )])
+        };
+        assert!(
+            quiet().is_err(),
+            "control: the PUT landed after the first pass"
+        );
+        tokio::time::sleep_until(late_pass).await;
+        assert!(snapshots.holds.gc_due(crate::rt::time::Instant::now()));
+        snapshots
+            .holds
+            .collect_garbage(&snapshots.store, crate::rt::time::Instant::now())
+            .await
+            .unwrap();
+        assert_eq!(quiet(), Ok(()));
+    }
+
     /// Every install refusal's answer: its gRPC code, whether the sender
     /// backs off, and whether the in-process network makes it an
     /// unreachable target. The table is an exhaustive match, and no refusal
@@ -2956,9 +3156,9 @@ mod tests {
         fn expected(error: &SnapshotInstallError) -> (Code, bool, bool) {
             match error {
                 SnapshotInstallError::NotRegistered { .. } => (Code::NotFound, false, false),
-                SnapshotInstallError::ShuttingDown { .. }
-                | SnapshotInstallError::Publication(_)
-                | SnapshotInstallError::Task(_) => (Code::Unavailable, true, false),
+                SnapshotInstallError::ShuttingDown { .. } | SnapshotInstallError::Task(_) => {
+                    (Code::Unavailable, true, false)
+                }
                 // A group refusal answers by the group's own classification
                 // on gRPC. In-process only a refused overwrite backs off
                 // (#725).
@@ -3019,7 +3219,6 @@ mod tests {
                 },
             )),
             SnapshotInstallError::Group(GroupEngineError::Infra(GroupInfraError::OwnerStopped)),
-            SnapshotInstallError::Publication(store_error()),
             SnapshotInstallError::Task(cancelled),
             SnapshotInstallError::GateClosed { group },
             SnapshotInstallError::PointerUndecodable {
@@ -3080,10 +3279,10 @@ mod tests {
         }
     }
 
+    #[cfg(not(madsim))]
     #[tokio::test]
     async fn prefetch_snapshot_for_install_does_not_download_inline_snapshot() {
-        let registry = RaftGroupHandleRegistry::default();
-        registry.set_snapshot_store(Some(Arc::new(StaticSnapshotStore { bytes: None })));
+        let store = InstallStore::new();
         let pointer = SnapshotPointer {
             snapshot_id: "inline".to_owned(),
             location: SnapshotLocation::Inline {
@@ -3095,13 +3294,15 @@ mod tests {
             snapshot: SnapshotData::new(pointer.encode_binary().expect("encode test pointer")),
         };
 
-        let prefetched = registry
-            .prefetch_snapshot_for_install(RaftGroupId(7), snapshot)
+        let prefetched = group_snapshots(store.clone())
+            .prefetch(RaftGroupId(7), snapshot)
             .await
             .expect("inline snapshot does not touch snapshot store");
         let pointer =
             SnapshotPointer::decode(prefetched.snapshot.snapshot.pointer_bytes()).unwrap();
         assert!(matches!(pointer.location, SnapshotLocation::Inline { .. }));
+        assert_eq!(store.downloads.load(Ordering::SeqCst), 0);
+        assert!(store.own_keys().is_empty());
     }
 
     #[test]

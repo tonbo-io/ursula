@@ -1053,9 +1053,11 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let history = entry.history.clone();
             let peer_cluster = Some(self.registry.peer_cluster().clone());
             let log_gauge = entry.log_gauge.clone();
+            let snapshots = entry.snapshots.clone();
             let result = raft
                 .call(move |raft| async move {
                     let engine = crate::engine::ForwardedReadEngine {
+                        snapshots,
                         history,
                         apply_health,
                         raft,

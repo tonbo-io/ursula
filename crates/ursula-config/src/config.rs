@@ -197,9 +197,11 @@ pub struct RaftConfig {
     /// Timeout of one bootstrap probe of another voter.
     pub bootstrap_peer_connect: HumanDuration,
     /// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
-    /// The receiver downloads and installs the referenced object before
-    /// replying, so this must be comfortably above the S3 per-attempt timeout
-    /// plus retries.
+    /// The receiver downloads the referenced object, writes its own copy of
+    /// it and checks the copy before it installs and replies, so this must be
+    /// comfortably above the S3 per-attempt timeout plus retries of both the
+    /// GET and the PUT. A node also runs a further snapshot GC pass this long
+    /// after a write of its own that failed, for a PUT that lands late.
     pub install_snapshot_timeout: HumanDuration,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
     pub grpc_reconnect_after_failures: usize,
@@ -261,14 +263,16 @@ impl RaftConfig {
     /// taken for a mistake.
     pub const MAX_SNAPSHOT_BUILD_CONCURRENCY: usize = 16;
     /// `deleted_data_max_age` is at least this many `install_snapshot_timeout`s
-    /// (#669). A replica keeps the snapshot object it replaced pinned for a
-    /// quarter of the age, capped at the longer of an hour and two installs
-    /// ([`RaftConfig::snapshot_gc_grace`]), which must outlast two installs
-    /// of that object.
+    /// (#669). With `A` the age, `I` the install timeout and `D` the snapshot
+    /// drive interval, a replica snapshots a group `A/4` after a removal, and
+    /// deletes the object that snapshot replaced once no send of it is in
+    /// flight, which a send's timeout bounds by `I`, at its next GC pass,
+    /// within `D`. So the removal is gone by `A/4 + I + D`, within the age
+    /// whenever `A >= 4(I + D)/3`. Eight is a margin chosen on top of that,
+    /// not derived from it. A GC pass that fails runs again after a back-off
+    /// of its own, 30 seconds doubled per failure up to 15 minutes, which
+    /// this margin covers only for the first retries.
     pub const DELETED_DATA_MAX_AGE_INSTALLS: u32 = 8;
-    /// The snapshot GC grace is at most this ([`RaftConfig::snapshot_gc_grace`]),
-    /// unless two installs take longer.
-    pub const MAX_SNAPSHOT_GC_GRACE: std::time::Duration = std::time::Duration::from_secs(60 * 60);
     /// `deleted_data_max_age` when it is unset and the install timeout
     /// allows it.
     pub const DEFAULT_DELETED_DATA_MAX_AGE: std::time::Duration =
@@ -290,23 +294,6 @@ impl RaftConfig {
             || Self::DEFAULT_DELETED_DATA_MAX_AGE.max(self.min_deleted_data_max_age()),
             |configured| configured.as_duration(),
         )
-    }
-
-    /// Snapshot GC grace G (#669): a quarter of
-    /// [`RaftConfig::effective_deleted_data_max_age`], at most an hour or two
-    /// `install_snapshot_timeout`s, whichever is longer. A replica keeps the
-    /// snapshot object it replaced pinned for G, and the snapshot store
-    /// deletes an object nothing names once it is G old. The floor on the
-    /// max age and the cap both keep G at two installs or more.
-    pub fn snapshot_gc_grace(&self) -> std::time::Duration {
-        let two_installs = self
-            .install_snapshot_timeout
-            .as_duration()
-            .saturating_mul(2);
-        self.effective_deleted_data_max_age()
-            .checked_div(4)
-            .unwrap_or_default()
-            .min(Self::MAX_SNAPSHOT_GC_GRACE.max(two_installs))
     }
 }
 

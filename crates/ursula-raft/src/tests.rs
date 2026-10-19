@@ -6158,3 +6158,536 @@ async fn engine_shutdown_names_openraft_work_that_does_not_end() {
     drop(store);
     wal.shutdown().await.unwrap();
 }
+
+/// The memory store of node `node_id` on a fresh bucket, under the prefix
+/// `snapshots`, and the bucket (#687).
+#[cfg(not(madsim))]
+fn memory_snapshot_store(
+    node_id: u64,
+) -> (
+    ursula_runtime::snapshot_harness::MemorySnapshotBucket,
+    ursula_runtime::SharedSnapshotStore,
+) {
+    let bucket = ursula_runtime::snapshot_harness::MemorySnapshotBucket::new(
+        node_id,
+        ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
+        ursula_runtime::snapshot_harness::SnapshotStoreFaults::none(),
+    );
+    let store: ursula_runtime::SharedSnapshotStore = Arc::new(bucket.store(node_id));
+    (bucket, store)
+}
+
+/// #687: a node killed after a build wrote its object and checked it with
+/// a HEAD, and before the build synced the journal and wrote the pointer
+/// record, leaves the object and no record. The kill point is the store's
+/// gate after the HEAD. The restart restores no snapshot, opens the group,
+/// and its first GC pass deletes the object, so the node's directory holds
+/// only what it names (I5).
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_kill_after_the_object_write_before_the_pointer_record_leaves_the_object_to_the_restart()
+{
+    use ursula_runtime::snapshot_harness::Gate;
+    use ursula_runtime::snapshot_harness::GatedSnapshotStore;
+    use ursula_runtime::snapshot_harness::NodeNames;
+    use ursula_runtime::snapshot_harness::SnapshotStoreGates;
+    use ursula_runtime::snapshot_harness::StoreOp;
+    use ursula_runtime::snapshot_harness::check_quiet_prefixes;
+
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let metadata_path = wal.snapshot_metadata_path(placement());
+    let (bucket, inner) = memory_snapshot_store(1);
+    let gates = SnapshotStoreGates::new();
+    let store: ursula_runtime::SharedSnapshotStore =
+        Arc::new(GatedSnapshotStore::new(1, inner, gates.clone()));
+    let options = || RaftGroupEngineOptions {
+        snapshot_store: Some(store.clone()),
+        ..RaftGroupEngineOptions::default()
+    };
+    let engine = reopen_journal_engine_with(&wal, "kill-before-record", options()).await;
+    let checked = Gate::after(1, StoreOp::Head);
+    gates.hold(checked);
+    let mut builder = engine
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.get_snapshot_builder().await })
+        })
+        .await
+        .unwrap();
+    let building = tokio::spawn(async move { builder.build_snapshot().await });
+    tokio::time::timeout(Duration::from_secs(10), gates.wait_arrived(checked, 1))
+        .await
+        .expect("the build wrote and checked its object");
+    assert_eq!(bucket.keys().len(), 1, "the object is written");
+    // The kill: the build never syncs the journal or writes its record.
+    building.abort();
+    assert!(building.await.unwrap_err().is_cancelled());
+    gates.open(checked);
+    engine.shutdown().await.unwrap();
+    assert!(!metadata_path.exists(), "no pointer record was written");
+    assert_eq!(bucket.keys().len(), 1, "the object stays until a pass");
+
+    let reopened = reopen_journal_engine_with(&wal, "kill-before-record", options()).await;
+    let holds = reopened.snapshots.holds.clone();
+    assert_eq!(holds.current(), None);
+    assert!(holds.gc_due(crate::rt::time::Instant::now()));
+    holds
+        .collect_garbage(&store, crate::rt::time::Instant::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        check_quiet_prefixes(&bucket.view(), [&NodeNames::new(1, Vec::<String>::new())]),
+        Ok(())
+    );
+    reopened.shutdown().await.unwrap();
+    wal.shutdown().await.unwrap();
+}
+
+/// #687, #709: an engine incarnation's holds are its own. What a shut-down
+/// engine leaves running, a send's lease and a build refused at its
+/// shutdown, changes nothing in the holds of the group's next engine,
+/// which start empty and restored from the durable record alone.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shut_down_engine_changes_no_hold() {
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let (bucket, store) = memory_snapshot_store(1);
+    let options = || RaftGroupEngineOptions {
+        snapshot_store: Some(store.clone()),
+        ..RaftGroupEngineOptions::default()
+    };
+    let engine = reopen_journal_engine_with(&wal, "holds-per-incarnation", options()).await;
+    engine
+        .with_state_machine(|state_machine| {
+            Box::pin(async move {
+                state_machine
+                    .get_snapshot_builder()
+                    .await
+                    .build_snapshot()
+                    .await
+            })
+        })
+        .await
+        .unwrap()
+        .expect("a build");
+    let old_holds = engine.snapshots.holds.clone();
+    let current = old_holds.current().expect("an object is current");
+    // A send still in flight, and a build taken while the group ran.
+    let send = engine.raft_handle().get_snapshot().await.unwrap().unwrap();
+    let mut builder = engine
+        .with_state_machine(|state_machine| {
+            Box::pin(async move { state_machine.get_snapshot_builder().await })
+        })
+        .await
+        .unwrap();
+    let work = builder.work.clone();
+    let shutdown = tokio::spawn(async move { engine.shutdown().await });
+    work.stopping().await;
+    builder
+        .build_snapshot()
+        .await
+        .expect_err("a build of a stopping engine is refused");
+    drop(builder);
+    drop(work);
+    shutdown.await.unwrap().unwrap();
+
+    let reopened = reopen_journal_engine_with(&wal, "holds-per-incarnation", options()).await;
+    let holds = reopened.snapshots.holds.clone();
+    assert!(!Arc::ptr_eq(&holds, &old_holds), "a fresh incarnation");
+    assert_eq!(holds.current(), Some(current.clone()));
+    holds
+        .collect_garbage(&store, crate::rt::time::Instant::now())
+        .await
+        .unwrap();
+    let held = holds.held_keys();
+    let due = holds.gc_due(crate::rt::time::Instant::now());
+    drop(send);
+    drop(old_holds);
+    assert_eq!(holds.held_keys(), held);
+    assert_eq!(holds.gc_due(crate::rt::time::Instant::now()), due);
+    assert!(!due, "the old engine's send owes the new one no pass");
+    assert_eq!(
+        bucket.keys(),
+        BTreeSet::from([current]),
+        "the restored current object is all the directory holds"
+    );
+    reopened.shutdown().await.unwrap();
+    wal.shutdown().await.unwrap();
+}
+
+/// #687, the in-process lease handoff: the in-process network keeps the
+/// sender's lease until its RPC returns and hands the receiver the pointer
+/// only, as the gRPC network does. While a learner's install has read the
+/// leader's object, the leader replaces the object and runs its GC pass,
+/// and the object survives. Once the RPC returned, the leader's next pass
+/// deletes it, and the learner's current snapshot names its own copy.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn the_in_process_network_holds_a_sent_object_until_its_rpc_returns() {
+    use ursula_runtime::snapshot_harness::Gate;
+    use ursula_runtime::snapshot_harness::GatedSnapshotStore;
+    use ursula_runtime::snapshot_harness::SnapshotStoreGates;
+    use ursula_runtime::snapshot_harness::StoreOp;
+
+    let registry = InProcessRaftRegistry::default();
+    let config = Arc::new(
+        Config {
+            cluster_name: "ursula-lease-handoff".to_owned(),
+            heartbeat_interval: 10,
+            election_timeout_min: 500,
+            election_timeout_max: 1_000,
+            install_snapshot_timeout: 30_000,
+            max_in_snapshot_log_to_keep: 0,
+            purge_batch_size: 1,
+            replication_lag_threshold: 0,
+            snapshot_policy: SnapshotPolicy::Never,
+            ..Default::default()
+        }
+        .validate()
+        .expect("valid raft config"),
+    );
+    let bucket = ursula_runtime::snapshot_harness::MemorySnapshotBucket::new(
+        3,
+        ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
+        ursula_runtime::snapshot_harness::SnapshotStoreFaults::none(),
+    );
+    let gates = SnapshotStoreGates::new();
+    let stores: Vec<ursula_runtime::SharedSnapshotStore> = (1..=3)
+        .map(|node_id| {
+            Arc::new(GatedSnapshotStore::new(
+                node_id,
+                Arc::new(bucket.store(node_id)),
+                gates.clone(),
+            )) as ursula_runtime::SharedSnapshotStore
+        })
+        .collect();
+    let mut engines = Vec::new();
+    let mut wal_roots = Vec::new();
+    for node_id in 1..=3_u64 {
+        let (wal_root, log_store) = fresh_journal_store();
+        wal_roots.push(wal_root);
+        let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
+            placement(),
+            node_id,
+            config.clone(),
+            InProcessRaftNetworkFactory::new(registry.clone()).with_source(node_id),
+            log_store,
+            RaftGroupEngineOptions {
+                snapshot_store: Some(stores[usize::try_from(node_id - 1).unwrap()].clone()),
+                ..RaftGroupEngineOptions::default()
+            },
+        )
+        .await
+        .expect("create a node");
+        if node_id != 3 {
+            registry.register(node_id, &engine);
+        }
+        engines.push(engine);
+    }
+    engines[0]
+        .raft
+        .initialize(BTreeMap::from([
+            (1, BasicNode::new("node-1")),
+            (2, BasicNode::new("node-2")),
+        ]))
+        .await
+        .expect("initialize two voters");
+    let leader_id = engines[0]
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(|metrics| metrics.current_leader.is_some(), "a leader")
+        .await
+        .expect("a leader")
+        .current_leader
+        .expect("a leader id");
+    let leader = &engines[usize::try_from(leader_id - 1).unwrap()];
+    for engine in &engines[..2] {
+        engine
+            .raft
+            .wait(Some(Duration::from_secs(5)))
+            .current_leader(leader_id, "both voters see the leader")
+            .await
+            .expect("a shared leader");
+    }
+    wait_history(leader).await;
+    let stream_id = bsid("lease-handoff");
+    leader
+        .raft
+        .client_write(create_command(stream_id.clone()))
+        .await
+        .expect("create");
+    let written = leader
+        .raft
+        .client_write(append_command(stream_id.clone(), b"handed-off"))
+        .await
+        .expect("append");
+    leader.raft.trigger().snapshot().await.unwrap();
+    leader
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .snapshot(written.log_id, "the leader's snapshot")
+        .await
+        .unwrap();
+    leader
+        .raft
+        .trigger()
+        .purge_log(written.log_id.index())
+        .await
+        .unwrap();
+    leader
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .purged(Some(written.log_id), "the leader purged its log")
+        .await
+        .unwrap();
+    let sent = leader.snapshots.holds.current().expect("an object");
+
+    // The learner's GET of the leader's object answers, and waits there.
+    let read = Gate::after(3, StoreOp::Get);
+    gates.hold(read);
+    registry.register(3, &engines[2]);
+    leader
+        .raft
+        .add_learner(3, BasicNode::new("node-3"), false)
+        .await
+        .expect("add the learner");
+    tokio::time::timeout(Duration::from_secs(10), gates.wait_arrived(read, 1))
+        .await
+        .expect("the learner reads the sent object");
+
+    // The leader replaces the object while the send is in flight.
+    let replaced = leader
+        .raft
+        .client_write(append_command(stream_id.clone(), b"after"))
+        .await
+        .expect("append");
+    leader.raft.trigger().snapshot().await.unwrap();
+    leader
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .snapshot(replaced.log_id, "the leader's next snapshot")
+        .await
+        .unwrap();
+    assert_ne!(leader.snapshots.holds.current(), Some(sent.clone()));
+    leader
+        .snapshots
+        .holds
+        .owe_pass(crate::rt::time::Instant::now());
+    leader
+        .snapshots
+        .holds
+        .collect_garbage(
+            &stores[usize::try_from(leader_id - 1).unwrap()],
+            crate::rt::time::Instant::now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        bucket.keys().contains(&sent),
+        "the send's lease keeps the object while its RPC runs"
+    );
+
+    gates.open(read);
+    let learner = &engines[2];
+    learner
+        .raft
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .snapshot
+                    .is_some_and(|snapshot| snapshot.index >= written.log_id.index())
+            },
+            "the learner installed the snapshot",
+        )
+        .await
+        .expect("the learner installs");
+    let copy = learner
+        .snapshots
+        .holds
+        .current()
+        .expect("the learner's copy");
+    assert!(copy.starts_with("snapshots/node-3/group-0/"), "{copy}");
+
+    // Once the RPC returned, the leader's pass deletes the object.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while bucket.keys().contains(&sent) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the sent object outlives its RPC"
+        );
+        leader
+            .snapshots
+            .holds
+            .owe_pass(crate::rt::time::Instant::now());
+        leader
+            .snapshots
+            .holds
+            .collect_garbage(
+                &stores[usize::try_from(leader_id - 1).unwrap()],
+                crate::rt::time::Instant::now(),
+            )
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(bucket.keys().contains(&copy), "the learner's copy stays");
+    shutdown_all(&engines).await;
+}
+
+/// #687 B1: a GC pass that read a group's holds runs as the work of the
+/// incarnation they belong to. Once that engine shut down and the group's
+/// next engine committed a snapshot of its own, a pass on the old holds
+/// deletes nothing. The control runs the same pass without the fence: the
+/// old holds name the old current only, so the pass deletes the new one.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pass_on_a_stopped_incarnations_holds_deletes_nothing() {
+    use ursula_runtime::snapshot_harness::NodeNames;
+    use ursula_runtime::snapshot_harness::check_named_keys_exist;
+
+    async fn build(engine: &RaftGroupEngine) {
+        engine
+            .with_state_machine(|state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .get_snapshot_builder()
+                        .await
+                        .build_snapshot()
+                        .await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("a build");
+    }
+
+    for fenced in [true, false] {
+        let root = tempfile::tempdir().unwrap();
+        let wal = start_wal(root.path(), 1, 1);
+        let (bucket, store) = memory_snapshot_store(1);
+        let options = || RaftGroupEngineOptions {
+            snapshot_store: Some(store.clone()),
+            ..RaftGroupEngineOptions::default()
+        };
+        let old = reopen_journal_engine_with(&wal, "fenced-pass", options()).await;
+        build(&old).await;
+        // What a driver tick copied before the group restarted.
+        let snapshots = old.snapshots.clone();
+        let admission = old.snapshot_installs.clone();
+        old.shutdown().await.unwrap();
+
+        let new = reopen_journal_engine_with(&wal, "fenced-pass", options()).await;
+        build(&new).await;
+        let current = new.snapshots.holds.current().expect("the new current");
+        snapshots.holds.owe_pass(crate::rt::time::Instant::now());
+        if fenced {
+            assert!(
+                snapshots
+                    .fenced_pass(&admission, crate::rt::time::Instant::now())
+                    .await
+                    .is_none(),
+                "a stopped incarnation runs no pass"
+            );
+        } else {
+            snapshots
+                .holds
+                .collect_garbage(&snapshots.store, crate::rt::time::Instant::now())
+                .await
+                .unwrap();
+        }
+        let named = [NodeNames::new(1, [current.clone()])];
+        assert_eq!(
+            check_named_keys_exist(&bucket.view(), &named).is_ok(),
+            fenced,
+            "fenced {fenced}: the new incarnation's current object"
+        );
+        new.shutdown().await.unwrap();
+        wal.shutdown().await.unwrap();
+    }
+}
+
+/// #687 B1 through the driver's entry point: a round of
+/// `collect_snapshot_garbage` whose pass waits before its LIST while the
+/// group's engine shuts down is stopped with the engine, and once the next
+/// engine committed Y and the LIST is let through, Y survives.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_gc_round_held_across_a_restart_never_deletes_the_new_incarnations_object() {
+    use ursula_runtime::snapshot_harness::Gate;
+    use ursula_runtime::snapshot_harness::GatedSnapshotStore;
+    use ursula_runtime::snapshot_harness::SnapshotStoreGates;
+    use ursula_runtime::snapshot_harness::StoreOp;
+
+    async fn build(engine: &RaftGroupEngine) {
+        engine
+            .with_state_machine(|state_machine| {
+                Box::pin(async move {
+                    state_machine
+                        .get_snapshot_builder()
+                        .await
+                        .build_snapshot()
+                        .await
+                })
+            })
+            .await
+            .unwrap()
+            .expect("a build");
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let wal = start_wal(root.path(), 1, 1);
+    let (bucket, inner) = memory_snapshot_store(1);
+    let gates = SnapshotStoreGates::new();
+    let store: ursula_runtime::SharedSnapshotStore =
+        Arc::new(GatedSnapshotStore::new(1, inner, gates.clone()));
+    let options = || RaftGroupEngineOptions {
+        snapshot_store: Some(store.clone()),
+        ..RaftGroupEngineOptions::default()
+    };
+    let registry = RaftGroupHandleRegistry::default();
+    let old = reopen_journal_engine_with(&wal, "gc-round-restart", options()).await;
+    registry.register_engine(&old);
+    build(&old).await;
+
+    let before_list = Gate::before(1, StoreOp::ListOwn);
+    let listed = gates.arrived(before_list);
+    gates.hold(before_list);
+    old.snapshots
+        .holds
+        .owe_pass(crate::rt::time::Instant::now());
+    let round = tokio::spawn({
+        let registry = registry.clone();
+        async move {
+            registry
+                .collect_snapshot_garbage(usize::MAX, Duration::from_secs(60))
+                .await
+        }
+    });
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        gates.wait_arrived(before_list, listed.saturating_add(1)),
+    )
+    .await
+    .expect("the round's pass waits before its LIST");
+    // The restart: the old engine's shutdown stops the round's pass.
+    old.shutdown().await.unwrap();
+    let round = round.await.unwrap();
+    assert_eq!(round.groups, 0, "the stopped engine's pass did not run");
+
+    let new = reopen_journal_engine_with(&wal, "gc-round-restart", options()).await;
+    registry.register_engine(&new);
+    gates.open(before_list);
+    build(&new).await;
+    let current = new.snapshots.holds.current().expect("the new current");
+    registry
+        .collect_snapshot_garbage(usize::MAX, Duration::from_secs(60))
+        .await;
+    assert!(
+        bucket.keys().contains(&current),
+        "the new incarnation's current object survives"
+    );
+    new.shutdown().await.unwrap();
+    wal.shutdown().await.unwrap();
+}

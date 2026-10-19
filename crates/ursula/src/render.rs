@@ -53,6 +53,7 @@ use ursula_runtime::ClosedEpoch as StreamClosedEpoch;
 use ursula_runtime::ColdStoreInfo;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
+use ursula_runtime::GroupSnapshotError;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::ProducerAck;
 use ursula_runtime::ProducerDelivery;
@@ -126,9 +127,12 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         }
         GroupInfraError::RecoveryPending { .. } => unavailable(ErrorCode::HistoryPending),
         GroupInfraError::ApplyStopped { .. } => unavailable(ErrorCode::ApplyStopped),
-        // No engine of the group runs, so nothing was proposed.
+        // No engine of the group runs, so nothing was proposed: its
+        // previous engine is still stopping, or the snapshot store did not
+        // answer the restore at engine open.
         GroupInfraError::EngineWorkOutlivedShutdown { .. }
-        | GroupInfraError::PreviousEngineWorkRunning { .. } => {
+        | GroupInfraError::PreviousEngineWorkRunning { .. }
+        | GroupInfraError::Snapshot(GroupSnapshotError::StoreUnavailable { .. }) => {
             unavailable(ErrorCode::GroupRestarting)
         }
         GroupInfraError::OutcomeUnknown => unavailable(ErrorCode::OutcomeUnknown),
@@ -164,7 +168,13 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::RecoveryGateOpen { .. }
         | GroupInfraError::MembershipInit { .. }
         | GroupInfraError::LeaderWaitTimedOut { .. }
-        | GroupInfraError::Snapshot(_) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
+        | GroupInfraError::Snapshot(
+            GroupSnapshotError::InvalidContent(_)
+            | GroupSnapshotError::ForeignKey { .. }
+            | GroupSnapshotError::ObjectMissing { .. }
+            | GroupSnapshotError::ObjectCorrupt { .. }
+            | GroupSnapshotError::PointerUnreadable { .. },
+        ) => (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal),
     }
 }
 

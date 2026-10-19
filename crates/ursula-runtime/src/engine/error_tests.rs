@@ -52,12 +52,16 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             GroupInfraError::Snapshot(GroupSnapshotError::InvalidContent(_)) => {
                 (Persistent, Unknown, false)
             }
+            // The store did not answer the restore at engine open: no
+            // request was proposed, and the next one opens the group again.
+            GroupInfraError::Snapshot(GroupSnapshotError::StoreUnavailable { .. }) => {
+                (Temporary, NotProposed, true)
+            }
             GroupInfraError::Snapshot(
                 GroupSnapshotError::ForeignKey { .. }
                 | GroupSnapshotError::ObjectMissing { .. }
                 | GroupSnapshotError::ObjectCorrupt { .. }
-                | GroupSnapshotError::PointerUnreadable { .. }
-                | GroupSnapshotError::StoreUnavailable { .. },
+                | GroupSnapshotError::PointerUnreadable { .. },
             ) => (Persistent, Unknown, true),
             GroupInfraError::RecoveryNodeMismatch { .. }
             | GroupInfraError::RaftGroupNotRegistered { .. }

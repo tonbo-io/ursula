@@ -2449,22 +2449,32 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
-/// The S3 snapshot objects of group 0 under the snapshot prefix that hold
+/// The S3 snapshot objects of group 0 that node `node_id` owns, under
+/// `snapshots/node-{node_id}/group-0/` (#687), read through `cold_store`,
+/// whose root is the snapshot store's.
+async fn node_snapshot_objects(cold_store: &ColdStore, node_id: u64) -> Vec<String> {
+    let dir = format!("snapshots/node-{node_id}/group-0/");
+    cold_store
+        .list_file_names(&dir)
+        .await
+        .expect("list the node's snapshot objects")
+        .into_iter()
+        .filter(|name| name.ends_with(".snap"))
+        .map(|name| format!("{dir}{name}"))
+        .collect()
+}
+
+/// The S3 snapshot objects of group 0 of nodes 1 to 3 that hold
 /// [`DELETED_MARKER`], read through `cold_store`, whose root is the
 /// snapshot store's.
 async fn snapshot_objects_with_marker(cold_store: &ColdStore) -> Vec<String> {
-    let dir = "snapshots/group-0/objects/";
+    let mut objects = Vec::new();
+    for node_id in 1..=3 {
+        objects.extend(node_snapshot_objects(cold_store, node_id).await);
+    }
     let mut found = Vec::new();
-    for name in cold_store
-        .list_file_names(dir)
-        .await
-        .expect("list the snapshot objects")
-    {
-        if !name.ends_with(".snap") {
-            continue;
-        }
-        let path = format!("{dir}{name}");
-        // Another replica's GC may delete it between the listing and here.
+    for path in objects {
+        // Its node's GC may delete it between the listing and here.
         let Ok(size) = cold_store.object_size(&path).await else {
             continue;
         };
@@ -2487,8 +2497,10 @@ async fn snapshot_objects_with_marker(cold_store: &ColdStore) -> Vec<String> {
 
 /// #669, with S3 snapshots: within `raft.deleted_data_max_age` of a
 /// stream's deletion, snapshot GC has deleted every snapshot object of the
-/// group that held it, the objects each replica replaced included. The data
-/// stays hot, so only the snapshots hold it. Runs on real S3 in CI.
+/// group that held it, the objects each replica replaced included. Each node
+/// writes its objects under `snapshots/node-{id}/group-0/` and, once quiet,
+/// keeps only its current one there (#687). The data stays hot, so only the
+/// snapshots hold it. Runs on real S3 in CI.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -2584,7 +2596,7 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
         .await;
     }
     // Every replica's current snapshot object holds the stream before it
-    // goes, and every voter has published its reference.
+    // goes.
     for admin in &admins {
         let snapshot = admin_test_post(&client, format!("{admin}/__ursula/raft/0/snapshot"))
             .await
@@ -2632,27 +2644,33 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     }
     assert!(deleted_objects > 0, "snapshot GC deleted no object");
 
-    // GC never deleted what a replica still names: the object each
-    // replica's reference names exists.
+    // Once quiet, each node's directory holds only its current object: one
+    // per node, which it owns. GC never deleted what a replica names, which
+    // the restart below reads back.
+    let quiet_by = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .expect("a deadline");
     for (node_id, _) in &peers {
-        let reference_path = format!("snapshots/group-0/references/node-{node_id}.json");
-        let size = cold_store
-            .object_size(&reference_path)
-            .await
-            .unwrap_or_else(|err| panic!("node {node_id} has no snapshot reference: {err}"));
-        let bytes = cold_store
-            .read_whole_object_range(&reference_path, size, 0, usize::try_from(size).unwrap())
-            .await
-            .expect("read a snapshot reference");
-        let reference: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("a snapshot reference record");
-        let key = reference["snapshot_key"]
-            .as_str()
-            .unwrap_or_else(|| panic!("node {node_id} names no S3 snapshot: {reference}"));
-        cold_store
-            .object_size(key)
-            .await
-            .unwrap_or_else(|err| panic!("node {node_id}'s current snapshot {key} is gone: {err}"));
+        loop {
+            let objects = node_snapshot_objects(&cold_store, *node_id).await;
+            for object in &objects {
+                let owner = ursula_runtime::OwnedKey::parse(
+                    &ursula_runtime::SnapshotPrefix::try_from("snapshots").unwrap(),
+                    object,
+                )
+                .unwrap_or_else(|err| panic!("{object} is not an owned key: {err}"))
+                .owner();
+                assert_eq!(owner.node_id(), *node_id, "{object}");
+            }
+            if objects.len() == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < quiet_by,
+                "node {node_id}'s snapshot directory holds {objects:?} once quiet"
+            );
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
     }
     // A restarted replica restores its current snapshot from the store and
     // serves group 0 again.

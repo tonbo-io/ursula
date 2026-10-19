@@ -75,9 +75,8 @@ anyhow = { workspace = true }
 ursula-headers = { workspace = true, features = ["test-support"] }
 criterion = { workspace = true }
 flate2 = { workspace = true }
-# A local operator whose objects carry a modification time, for the
-# snapshot GC tests (#669).
-opendal = { workspace = true, features = ["services-fs"] }
+# The store errors that the tests' snapshot stores answer.
+opendal = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }

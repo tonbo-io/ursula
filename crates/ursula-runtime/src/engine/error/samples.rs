@@ -689,8 +689,7 @@ fn snapshot_errors() -> Vec<GroupSnapshotError> {
             Head,
             Put,
             List,
-            Delete,
-            Copy
+            Delete
         })
         .into_iter()
         // The sample above carries this operation.

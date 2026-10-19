@@ -252,8 +252,7 @@ impl HeldGroups {
 /// since), routine snapshots are held back so the driver does not push
 /// uploads into a failing store. Not once the log is over the pressure
 /// watermark, nor for a group with an overdue removal (#669): a build whose
-/// upload, verification or reference publication fails falls back to an
-/// inline snapshot, which still truncates the log and drops the removed
+/// object write or its check fails falls back to an inline snapshot, which still truncates the log and drops the removed
 /// streams, so nothing a snapshot needs depends on the store. Holding builds
 /// back there would grow the log into the node-wide 503 write gate while the
 /// store is merely throttling, or keep deleted data past its bound.
@@ -650,9 +649,10 @@ pub struct SnapshotDriveSettings {
 /// that held dead frames for a quarter of `raft.deleted_data_max_age`. After
 /// its pass a tick runs the snapshot GC passes that are due, for at most
 /// `max_groups_per_tick` groups
-/// ([`RaftGroupHandleRegistry::collect_snapshot_garbage`], #669): the object
-/// a group replaced is deleted once its pin expired, unless another replica
-/// still names it.
+/// ([`RaftGroupHandleRegistry::collect_snapshot_garbage`], #669): each lists
+/// the node's own snapshot objects of its group and deletes those the group
+/// no longer holds, such as the object it replaced once no send of it is in
+/// flight (#687).
 pub struct SnapshotDriver {
     registry: RaftGroupHandleRegistry,
     coordinator: SnapshotBuildCoordinator,
@@ -970,7 +970,6 @@ impl SnapshotDriver {
             self.metrics
                 .record_snapshot_gc(ursula_runtime::SnapshotGcSample {
                     deleted: gc.deleted,
-                    skipped_unreferenced_voter: gc.skipped_unreferenced_voter,
                     failed: u64::try_from(gc.failed).unwrap_or(u64::MAX),
                 });
             if gc.left > 0 {

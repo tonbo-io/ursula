@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -150,10 +151,51 @@ pub(crate) enum GroupSlot {
         index: u64,
         kind: ursula_proto::admin::ApplyFailureKind,
     },
+    /// The group's engine did not open because the snapshot store did not
+    /// answer its restore. Until `until`, a request gets the same refusal at
+    /// once instead of another restore on this core's loop, which a store
+    /// that does not answer holds for every group of the core. At `until`
+    /// the core opens the group again by itself, and so does a request that
+    /// comes first.
+    OpenBackoff {
+        placement: ShardPlacement,
+        error: GroupEngineError,
+        /// Failed opens in a row, which double the next wait.
+        failures: u32,
+        until: Instant,
+    },
+}
+
+/// The wait after the first open of a group that its snapshot store did
+/// not answer, doubled for each further failure in a row.
+const OPEN_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+/// The longest wait between two opens of such a group.
+const OPEN_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The wait before the next open after `failures` failed opens in a row.
+pub(crate) fn open_backoff(failures: u32) -> std::time::Duration {
+    OPEN_BACKOFF_MIN
+        .saturating_mul(2_u32.saturating_pow(failures.saturating_sub(1).min(16)))
+        .min(OPEN_BACKOFF_MAX)
+}
+
+/// Whether an engine's open failed because the snapshot store did not
+/// answer its restore, which a later open may get past.
+fn store_unavailable(error: &GroupEngineError) -> bool {
+    matches!(
+        error,
+        GroupEngineError::Infra(crate::engine::GroupInfraError::Snapshot(
+            crate::engine::GroupSnapshotError::StoreUnavailable { .. }
+        ))
+    )
 }
 
 pub(crate) struct CoreWorker {
     pub(crate) core_id: CoreId,
+    /// When each group in open back-off is due to open again, earliest
+    /// first. An entry whose group left the back-off, or whose wait was
+    /// renewed, is dropped when it comes due.
+    pub(crate) reopens: BTreeSet<(Instant, RaftGroupId)>,
     pub(crate) rx: mpsc::Receiver<Traced<CoreCommand>>,
     pub(crate) engine_factory: Arc<dyn GroupEngineFactory>,
     pub(crate) groups: HashMap<RaftGroupId, GroupSlot>,
@@ -250,14 +292,57 @@ impl Drop for WaitReadCancel {
 
 impl CoreWorker {
     pub(crate) async fn run(mut self) {
-        while let Some(Traced {
-            value: command,
-            parent,
-        }) = self.rx.recv().await
-        {
+        loop {
+            let command = match self.reopens.first().map(|(at, _)| *at) {
+                // Biased, so the branch polled first is fixed rather than
+                // drawn from tokio's thread RNG (#638). A due reopen goes
+                // first: it is ready only once its wait ended.
+                Some(at) => crate::rt::select! {
+                    biased;
+                    () = crate::rt::time::sleep_until(at) => {
+                        self.reopen_due().await;
+                        continue;
+                    }
+                    command = self.rx.recv() => command,
+                },
+                None => self.rx.recv().await,
+            };
+            let Some(Traced {
+                value: command,
+                parent,
+            }) = command
+            else {
+                return;
+            };
             // Re-establish the sender's span so on-core work links back to the
             // originating request, then dispatch under it.
             self.dispatch(command).instrument(parent).await;
+        }
+    }
+
+    /// Opens again every group whose open back-off ended, so that a replica
+    /// no request reaches does not stay closed.
+    async fn reopen_due(&mut self) {
+        let now = Instant::now();
+        while let Some(&(at, raft_group_id)) = self.reopens.first() {
+            if at > now {
+                return;
+            }
+            self.reopens.pop_first();
+            let placement = match self.groups.get(&raft_group_id) {
+                Some(GroupSlot::OpenBackoff {
+                    placement, until, ..
+                }) if *until <= now => *placement,
+                _ => continue,
+            };
+            match self.group(placement).await {
+                Ok(_mailbox) => tracing::info!(
+                    raft_group_id = placement.raft_group_id.0,
+                    "the group opened after its open back-off"
+                ),
+                // A failed open logs and backs off again.
+                Err(_logged) => {}
+            }
         }
     }
 
@@ -378,6 +463,22 @@ impl CoreWorker {
         &mut self,
         placement: ShardPlacement,
     ) -> Result<GroupMailbox, RuntimeError> {
+        let mut failures = 0;
+        if let Some(GroupSlot::OpenBackoff {
+            error,
+            failures: failed,
+            until,
+            ..
+        }) = self.groups.get(&placement.raft_group_id)
+        {
+            if Instant::now() < *until {
+                return Err(RuntimeError::group_engine(placement, error.clone()));
+            }
+            failures = *failed;
+            self.groups.remove(&placement.raft_group_id);
+            self.metrics
+                .record_open_backoff(placement.raft_group_id, false);
+        }
         if !self.groups.contains_key(&placement.raft_group_id) {
             let engine_factory = self.engine_factory.clone();
             if !engine_factory.hosts_group(placement) {
@@ -404,6 +505,10 @@ impl CoreWorker {
                             index,
                             kind,
                         });
+                    return Err(RuntimeError::group_engine(placement, error));
+                }
+                Err(error) if store_unavailable(&error) => {
+                    self.back_off_open(placement, error.clone(), failures);
                     return Err(RuntimeError::group_engine(placement, error));
                 }
                 Err(error) => return Err(RuntimeError::group_engine(placement, error)),
@@ -440,6 +545,9 @@ impl CoreWorker {
             .expect("group was just inserted")
         {
             GroupSlot::Running(mailbox) => Ok(mailbox.clone()),
+            GroupSlot::OpenBackoff { error, .. } => {
+                Err(RuntimeError::group_engine(placement, error.clone()))
+            }
             GroupSlot::ApplyStopped { term, index, kind } => Err(RuntimeError::group_engine(
                 placement,
                 crate::engine::GroupEngineError::Infra(
@@ -454,6 +562,33 @@ impl CoreWorker {
         }
     }
 
+    /// Holds the group's next open back for its next wait, after its
+    /// snapshot store did not answer the restore for the `failures + 1`th
+    /// time in a row.
+    fn back_off_open(&mut self, placement: ShardPlacement, error: GroupEngineError, failures: u32) {
+        let failures = failures.saturating_add(1);
+        let wait = open_backoff(failures);
+        tracing::warn!(
+            raft_group_id = placement.raft_group_id.0,
+            failures,
+            wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
+            "the snapshot store did not answer the group's restore; the group stays closed and answers GROUP_RESTARTING until its next open"
+        );
+        let until = Instant::now()
+            .checked_add(wait)
+            .unwrap_or_else(Instant::now);
+        self.groups
+            .insert(placement.raft_group_id, GroupSlot::OpenBackoff {
+                placement,
+                error,
+                failures,
+                until,
+            });
+        self.reopens.insert((until, placement.raft_group_id));
+        self.metrics
+            .record_open_backoff(placement.raft_group_id, true);
+    }
+
     pub(crate) async fn shutdown_group_engine(
         &mut self,
         placement: ShardPlacement,
@@ -463,6 +598,8 @@ impl CoreWorker {
             reply(response_tx, Ok(()));
             return;
         };
+        self.metrics
+            .record_open_backoff(placement.raft_group_id, false);
         self.read_barriers.remove(placement.raft_group_id);
         let GroupSlot::Running(group) = group else {
             reply(response_tx, Ok(()));
@@ -559,6 +696,11 @@ impl CoreWorker {
                             index,
                             kind,
                         });
+                }
+                // The group stays closed in back-off and the node starts:
+                // the group reopens when its wait ends.
+                Err(error) if store_unavailable(&error) => {
+                    self.back_off_open(placement, error, 0);
                 }
                 Err(error) => return Err(RuntimeError::group_engine(placement, error)),
             }

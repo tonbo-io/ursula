@@ -191,15 +191,17 @@ interval.
 All three work without the snapshot driver, and in the in-memory mode.
 
 With an S3 snapshot store, `snapshot_gc_deleted_objects` counts the snapshot
-objects the node's snapshot GC deleted, and
-`snapshot_gc_skipped_unreferenced_voter` counts the GC passes that deleted
-nothing because a configured voter of the group has never stored a snapshot
-reference. A count that keeps rising points at a voter that never came up, or
-at a voter list that names a node the cluster does not run.
+objects the node's snapshot GC deleted from its own directory.
 `snapshot_gc_failed_passes` counts the GC passes that failed, for example
 because the store refuses deletes, and a failed pass runs again later, backed
 off up to 15 minutes. Alert when it keeps rising: while GC fails, old snapshot
 objects that hold deleted streams stay in the store.
+
+`open_backoff_groups` counts the groups whose engine did not open because the
+snapshot store did not answer its restore, and `per_group_open_backoff` is 1
+for each of them. Such a group answers `GROUP_RESTARTING` until its core
+opens it again, after a wait of 1 to 30 seconds. Alert when it stays above 0:
+the node cannot read its snapshots.
 
 The OTLP collection interval defaults to 60s. For a quick check, shorten it so
 readings arrive without waiting (and without relying on the shutdown flush):

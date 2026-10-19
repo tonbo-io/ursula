@@ -768,6 +768,16 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::FullSnapshot,
         });
+        // The lease keeps the object the pointer names until this RPC
+        // returns, as the gRPC network keeps it: the receiver gets the
+        // pointer only, and an install task that outlives the RPC finds the
+        // object gone once the sender replaced it (#687).
+        let UrsulaSnapshot { meta, snapshot } = snapshot;
+        let (pointer_bytes, _lease) = snapshot.into_parts();
+        let snapshot = UrsulaSnapshot {
+            meta,
+            snapshot: crate::types::SnapshotData::new(pointer_bytes),
+        };
         // RaftCore cancels a send it no longer wants, and every send once it
         // stops, as the gRPC network honours it (#709).
         let install = std::pin::pin!(target.install_full_snapshot(group, vote, snapshot));
@@ -858,7 +868,6 @@ pub(crate) fn install_error_backs_off(error: &SnapshotInstallError) -> bool {
         SnapshotInstallError::Group(group) => refuses_overwrite(group),
         SnapshotInstallError::NotRegistered { .. }
         | SnapshotInstallError::ShuttingDown { .. }
-        | SnapshotInstallError::Publication(_)
         | SnapshotInstallError::Task(_) => false,
         SnapshotInstallError::GateClosed { .. }
         | SnapshotInstallError::PointerUndecodable { .. }

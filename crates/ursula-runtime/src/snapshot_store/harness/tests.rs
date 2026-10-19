@@ -36,7 +36,6 @@ use super::check_superseded_without_marker;
 use super::contains_marker;
 use crate::SnapshotStoreOperation;
 use crate::snapshot_store::SnapshotBytesIterator;
-use crate::snapshot_store::SnapshotKey;
 use crate::snapshot_store::SnapshotLocation;
 use crate::snapshot_store::SnapshotPrefix;
 use crate::snapshot_store::SnapshotStore;
@@ -77,7 +76,13 @@ async fn build(
 ) -> (String, Result<SnapshotLocation, SnapshotStoreError>) {
     let staged = store.stage(GROUP, index, body(bytes)).await.unwrap();
     let path = staged_path(&staged);
-    (path, store.write_staged(staged).await)
+    (
+        path,
+        store
+            .write_staged(staged)
+            .await
+            .map(super::super::OwnedLocation::into_location),
+    )
 }
 
 /// Faults with no delays, so a test sets only the one it exercises.
@@ -579,26 +584,6 @@ async fn the_opt_in_failures_answer_errors() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn a_snapshot_id_without_an_index_is_refused() {
-    let bucket = MemorySnapshotBucket::new(1, prefix(), SnapshotStoreFaults::none());
-    let refused = bucket
-        .store(1)
-        .upload(
-            SnapshotKey {
-                raft_group_id: 0,
-                snapshot_id: "group-0-empty".to_owned(),
-            },
-            Bytes::from_static(b"empty"),
-        )
-        .await;
-    assert!(matches!(
-        refused,
-        Err(SnapshotStoreError::MissingField { .. })
-    ));
-    assert!(bucket.keys().is_empty());
-}
-
-#[tokio::test(start_paused = true)]
 #[should_panic(expected = "I2: node 1 deleted")]
 async fn a_delete_outside_the_own_directory_panics() {
     let bucket = MemorySnapshotBucket::new(1, prefix(), SnapshotStoreFaults::none());
@@ -616,7 +601,7 @@ async fn an_unscoped_delete_in_node_10s_directory_panics() {
     let bucket = MemorySnapshotBucket::new(1, prefix(), SnapshotStoreFaults::none());
     let (one, ten) = (bucket.store(1), bucket.store(10));
     let location = build(&ten, 1, b"ten").await.1.unwrap();
-    one.delete(&location).await.unwrap();
+    one.delete_unscoped(&location).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -643,7 +628,7 @@ async fn a_recorded_foreign_delete_fails_the_i2_check() {
         Err(SnapshotStoreError::NotOwnedHere { .. })
     ));
     assert_eq!(bucket.keys().len(), 1, "delete_own refuses as S3's does");
-    one.delete(&location).await.unwrap();
+    one.delete_unscoped(&location).await.unwrap();
     assert!(bucket.keys().is_empty(), "an unscoped delete goes ahead");
     let path = key_of(&location);
     assert_eq!(
@@ -664,7 +649,7 @@ async fn a_recording_bucket_panics_when_its_foreign_deletes_go_unread() {
         MemorySnapshotBucket::recording_foreign_deletes(1, prefix(), SnapshotStoreFaults::none());
     let (one, two) = (bucket.store(1), bucket.store(2));
     let location = build(&two, 1, b"two").await.1.unwrap();
-    one.delete(&location).await.unwrap();
+    one.delete_unscoped(&location).await.unwrap();
 }
 
 #[tokio::test(start_paused = true)]
@@ -952,18 +937,11 @@ async fn a_build_between_a_list_and_its_answer_is_not_listed() {
 async fn the_memory_store_is_a_shared_snapshot_store() {
     let bucket = MemorySnapshotBucket::new(1, prefix(), SnapshotStoreFaults::none());
     let store: crate::snapshot_store::SharedSnapshotStore = Arc::new(bucket.store(1));
-    let location = store
-        .upload(
-            SnapshotKey {
-                raft_group_id: 0,
-                snapshot_id: "group-0-1-42".to_owned(),
-            },
-            Bytes::from_static(b"legacy"),
-        )
-        .await
-        .unwrap();
-    let key = crate::snapshot_store::OwnedKey::parse(&prefix(), &key_of(&location)).unwrap();
+    let (path, written) = build(store.as_ref(), 42, b"shared").await;
+    let location = written.unwrap();
+    assert_eq!(key_of(&location), path);
+    let key = crate::snapshot_store::OwnedKey::parse(&prefix(), &path).unwrap();
     assert_eq!((key.owner().node_id(), key.index()), (1, 42));
     store.verify_uploaded(&location).await.unwrap();
-    assert_eq!(store.download(&location).await.unwrap(), b"legacy");
+    assert_eq!(store.download(&location).await.unwrap(), b"shared");
 }
