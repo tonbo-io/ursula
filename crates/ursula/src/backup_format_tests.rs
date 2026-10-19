@@ -35,11 +35,9 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::body::to_bytes;
-use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
-use tower::ServiceExt;
 use ursula_ctl::backup::BackupClient;
 use ursula_ctl::backup::BackupError;
 use ursula_ctl::backup::BackupManifest;
@@ -58,6 +56,7 @@ use ursula_runtime::StreamSnapshot;
 
 use crate::HttpState;
 use crate::router_with_http_state;
+use crate::tests::send;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/fixtures/backup-format-4");
 
@@ -138,23 +137,6 @@ async fn serve(app: &Router) -> (BackupClient, tokio::task::JoinHandle<()>) {
     )
     .expect("backup client");
     (client, server)
-}
-
-async fn send(
-    app: &Router,
-    method: &str,
-    uri: &str,
-    headers: &[(&str, &str)],
-    body: Body,
-) -> Response {
-    let mut request = Request::builder().method(method).uri(uri);
-    for (name, value) in headers {
-        request = request.header(*name, *value);
-    }
-    app.clone()
-        .oneshot(request.body(body).expect("request"))
-        .await
-        .expect("response")
 }
 
 async fn get(app: &Router, uri: &str) -> Response {
