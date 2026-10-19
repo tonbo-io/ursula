@@ -1046,7 +1046,7 @@ mod tests {
         let _guard = sim_test_guard();
         assert_fails(
             SimScenario::RecoveryPlanSurvivorCampaigns,
-            394,
+            396,
             Controls::LEADER_LAST,
             UNPLANNED_LEADER_INVARIANT,
         );
