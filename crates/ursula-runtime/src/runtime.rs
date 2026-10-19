@@ -323,6 +323,10 @@ impl ShardRuntime {
             let worker = CoreWorker {
                 core_id,
                 reopens: BTreeSet::new(),
+                tasks: futures_util::stream::FuturesUnordered::new(),
+                open_permits: Arc::new(Semaphore::new(
+                    crate::core_worker::OPEN_CONCURRENCY_PER_CORE,
+                )),
                 rx,
                 engine_factory: engine_factory.clone(),
                 groups: HashMap::new(),
@@ -1812,31 +1816,31 @@ impl ShardRuntime {
         .await
     }
 
+    /// Opens every group's engine and waits for the opens to end. A group
+    /// whose replay stopped, or whose snapshot store did not answer its
+    /// restore, stays closed on its core and does not fail the warm-up.
     pub async fn warm_all_groups(&self) -> Result<(), RuntimeError> {
-        let mut placements_by_core = vec![Vec::new(); self.mailboxes.len()];
+        let mut responses = Vec::new();
         for raw_group_id in 0..self.shard_map.raft_group_count() {
             let placement = self.placement_for_group(RaftGroupId(raw_group_id))?;
-            placements_by_core
-                .get_mut(usize::from(placement.core_id.0))
-                .ok_or(RuntimeError::MailboxClosed {
-                    core_id: placement.core_id,
-                })?
-                .push(placement);
-        }
-        let mut responses = Vec::new();
-        for (mailbox, placements) in self.mailboxes.iter().zip(placements_by_core) {
+            let mailbox = self.mailbox(placement.core_id)?;
             let (response_tx, response_rx) = oneshot::channel();
-            self.enqueue_core_command(mailbox, CoreCommand::WarmGroups {
-                placements,
+            self.enqueue_core_command(mailbox, CoreCommand::WarmGroup {
+                placement,
                 response_tx,
             })
             .await?;
-            responses.push((mailbox.core_id, response_rx));
+            responses.push((placement.core_id, response_rx));
         }
         for (core_id, response_rx) in responses {
-            response_rx
+            match response_rx
                 .await
-                .map_err(|_dropped| RuntimeError::ResponseDropped { core_id })??;
+                .map_err(|_dropped| RuntimeError::ResponseDropped { core_id })?
+            {
+                Ok(_placement) => {}
+                Err(error) if error.leaves_group_closed() => {}
+                Err(error) => return Err(error),
+            }
         }
         Ok(())
     }

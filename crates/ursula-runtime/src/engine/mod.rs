@@ -809,6 +809,10 @@ pub trait GroupEngineFactory: Send + Sync + 'static {
         true
     }
 
+    /// Opens `placement`'s engine. A core drops the future when the
+    /// group's shutdown begins during the open (#741), so a future dropped
+    /// at any await must leave nothing running: the Raft engines await
+    /// nothing once `Raft::new` started the group's Raft.
     fn create<'a>(
         &'a self,
         placement: ShardPlacement,

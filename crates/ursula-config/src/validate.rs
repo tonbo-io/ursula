@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::config::ColdBackend;
 use crate::config::RaftConfig;
+use crate::config::RaftSnapshotBackend;
 use crate::config::UrsulaConfig;
 use crate::config::WalConfig;
 
@@ -77,6 +78,18 @@ pub enum ValidationError {
     DeletedDataMaxAgeTooShort {
         value: std::time::Duration,
         minimum: std::time::Duration,
+    },
+    /// A follower's install copy, a GET, up to two PUTs and a HEAD of the
+    /// snapshot store, each to the end of its timeout and retries, can take
+    /// longer than the install it serves. The leader's send would end first.
+    #[error(
+        "storage.snapshot.s3_timeout and storage.snapshot.s3_max_retries let a follower's \
+         install copy (a GET, up to two PUTs and a HEAD) take up to {copy_budget:?}, longer than \
+         raft.install_snapshot_timeout ({install_snapshot_timeout:?})"
+    )]
+    SnapshotCopyOutlastsInstall {
+        copy_budget: std::time::Duration,
+        install_snapshot_timeout: std::time::Duration,
     },
     #[error("{0}")]
     Other(String),
@@ -191,6 +204,7 @@ impl UrsulaConfig {
                 return Err(ValidationError::DeletedDataMaxAgeTooShort { value, minimum });
             }
         }
+        self.validate_install_copy_budget()?;
         if self.raft.snapshot_pressure_max_groups_per_tick == 0 {
             return Err(ValidationError::Other(
                 "raft.snapshot_pressure_max_groups_per_tick must be non-zero".into(),
@@ -255,6 +269,33 @@ impl UrsulaConfig {
         Ok(())
     }
 
+    /// On a node that installs snapshots through an S3 snapshot store, a
+    /// follower's install copy fits inside `raft.install_snapshot_timeout`.
+    /// The defaults leave a margin. Only a cluster node (`raft.peers` set,
+    /// the predicate the server's topology is chosen by) uses the snapshot
+    /// store: a single node keeps its snapshots inline and never copies.
+    fn validate_install_copy_budget(&self) -> Result<(), ValidationError> {
+        let cluster_node = !self.raft.peers.is_empty();
+        let s3_snapshots = self
+            .storage
+            .snapshot
+            .backend
+            .resolve(self.storage.cold.backend)
+            == RaftSnapshotBackend::S3;
+        if !(cluster_node && s3_snapshots) {
+            return Ok(());
+        }
+        let copy_budget = self.storage.snapshot.install_copy_budget();
+        let install_snapshot_timeout = self.raft.install_snapshot_timeout.as_duration();
+        if copy_budget > install_snapshot_timeout {
+            return Err(ValidationError::SnapshotCopyOutlastsInstall {
+                copy_budget,
+                install_snapshot_timeout,
+            });
+        }
+        Ok(())
+    }
+
     fn validate_peers(&self) -> Result<(), ValidationError> {
         let mut seen_ids = BTreeSet::new();
         for peer in &self.raft.peers {
@@ -306,6 +347,10 @@ impl UrsulaConfig {
             (
                 "storage.cold.compaction_gc_grace",
                 self.storage.cold.compaction_gc_grace.as_duration(),
+            ),
+            (
+                "storage.snapshot.s3_timeout",
+                self.storage.snapshot.s3_timeout.as_duration(),
             ),
         ] {
             if value.is_zero() {
@@ -531,6 +576,135 @@ mod tests {
             config.raft.effective_deleted_data_max_age(),
             std::time::Duration::from_secs(80 * 60)
         );
+    }
+
+    /// A cluster node of one peer, itself, with S3 snapshots: the node
+    /// that copies a snapshot it installs.
+    fn s3_snapshot_cluster_node() -> UrsulaConfig {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.raft.peers = vec![crate::config::RaftPeerConfig {
+            node_id: 1,
+            url: "http://127.0.0.1:4437".to_owned(),
+            client_url: None,
+        }];
+        config.raft.wal.path = Some(std::path::PathBuf::from("/var/lib/ursula/raft"));
+        config.server.cluster_id =
+            Some(ursula_headers::ClusterId::new("validate-test").expect("a valid cluster id"));
+        config.storage.cold.backend = crate::config::ColdBackend::S3;
+        config.storage.cold.s3 = Some(S3Config {
+            bucket: Some("bucket".to_owned()),
+            ..S3Config::default()
+        });
+        config
+    }
+
+    /// #742: with S3 snapshots, the defaults fit a follower's install copy
+    /// inside the default install timeout with a margin, so the node starts
+    /// with no word about it.
+    #[test]
+    fn the_default_snapshot_store_budget_fits_an_install_copy() {
+        let config = s3_snapshot_cluster_node();
+        assert_eq!(
+            config
+                .storage
+                .snapshot
+                .backend
+                .resolve(config.storage.cold.backend),
+            crate::RaftSnapshotBackend::S3
+        );
+        config.validate().expect("the defaults are valid");
+        let copy = config.storage.snapshot.install_copy_budget();
+        // A GET, two PUTs and a HEAD of 22 s each.
+        assert_eq!(copy, std::time::Duration::from_secs(88));
+        assert!(
+            copy < config.raft.install_snapshot_timeout.as_duration(),
+            "a margin within the default install timeout"
+        );
+        // The cold store's budget is its own and stays as it was.
+        let cold = config.storage.cold.s3.as_ref().unwrap();
+        assert_eq!(
+            crate::s3_operation_budget(cold.timeout.as_duration(), cold.max_retries),
+            std::time::Duration::from_secs(54)
+        );
+    }
+
+    /// #742: an explicit snapshot-store budget or install timeout that lets
+    /// the copy outlast the install is refused, naming the keys. With inline
+    /// snapshots there is no copy, and nothing is refused.
+    #[test]
+    fn an_install_copy_that_outlasts_its_install_is_refused() {
+        let mut config = s3_snapshot_cluster_node();
+        config.storage.snapshot.s3_timeout = HumanDuration::sec(10);
+        config.storage.snapshot.s3_max_retries = 3;
+        let err = config
+            .validate()
+            .expect_err("four 54 s requests outlast 120 s");
+        assert!(
+            matches!(
+                err,
+                ValidationError::SnapshotCopyOutlastsInstall {
+                    copy_budget,
+                    install_snapshot_timeout,
+                } if copy_budget == std::time::Duration::from_secs(216)
+                    && install_snapshot_timeout == std::time::Duration::from_secs(120)
+            ),
+            "{err}"
+        );
+        let message = err.to_string();
+        for key in [
+            "storage.snapshot.s3_timeout",
+            "storage.snapshot.s3_max_retries",
+            "raft.install_snapshot_timeout",
+        ] {
+            assert!(message.contains(key), "{message}");
+        }
+
+        let mut config = s3_snapshot_cluster_node();
+        config.raft.install_snapshot_timeout = HumanDuration::sec(60);
+        config.raft.deleted_data_max_age = Some(HumanDuration::min(8));
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::SnapshotCopyOutlastsInstall { .. })
+        ));
+        config.storage.snapshot.backend = crate::RaftSnapshotBackend::Inline;
+        config.validate().expect("inline snapshots copy nothing");
+    }
+
+    /// The bound counts the copy's second PUT under a new name: a budget
+    /// within three requests' worth of the install timeout but not four is
+    /// refused.
+    #[test]
+    fn an_install_copy_counts_its_retried_put() {
+        let mut config = s3_snapshot_cluster_node();
+        // 22 s per request: three fit inside 70 s, four do not.
+        config.raft.install_snapshot_timeout = HumanDuration::sec(70);
+        config.raft.deleted_data_max_age = Some(HumanDuration::min(10));
+        let request = config.storage.snapshot.request_budget();
+        assert_eq!(request, std::time::Duration::from_secs(22));
+        assert!(request.saturating_mul(3) <= config.raft.install_snapshot_timeout.as_duration());
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::SnapshotCopyOutlastsInstall { copy_budget, .. })
+                if copy_budget == std::time::Duration::from_secs(88)
+        ));
+    }
+
+    /// A single node keeps its snapshots inline whatever the backend says
+    /// and never copies one, so no snapshot-store budget refuses it. The
+    /// same config on a cluster node is refused.
+    #[test]
+    fn a_single_node_is_not_refused_for_a_copy_it_never_makes() {
+        let mut cluster = s3_snapshot_cluster_node();
+        cluster.storage.snapshot.backend = crate::RaftSnapshotBackend::S3;
+        cluster.storage.snapshot.s3_max_retries = 3;
+        assert!(matches!(
+            cluster.validate(),
+            Err(ValidationError::SnapshotCopyOutlastsInstall { .. })
+        ));
+        let mut single = cluster;
+        single.raft.peers.clear();
+        single.validate().expect("a single node copies no snapshot");
     }
 
     #[test]

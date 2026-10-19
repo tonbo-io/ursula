@@ -8,12 +8,12 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
+use ursula_config::s3_operation_budget;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_runtime::RuntimeMetricsSnapshot;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::s3_operation_budget;
 
 use crate::bootstrap::health_gate::CounterGrowth;
 use crate::bootstrap::health_gate::HealthHysteresis;

@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -198,10 +199,12 @@ pub struct RaftConfig {
     pub bootstrap_peer_connect: HumanDuration,
     /// OpenRaft's `install_snapshot_timeout` covers the whole FullSnapshot RPC.
     /// The receiver downloads the referenced object, writes its own copy of
-    /// it and checks the copy before it installs and replies, so this must be
-    /// comfortably above the S3 per-attempt timeout plus retries of both the
-    /// GET and the PUT. A node also runs a further snapshot GC pass this long
-    /// after a write of its own that failed, for a PUT that lands late.
+    /// it and checks the copy before it installs and replies, so on a
+    /// cluster node with S3 snapshots it must cover those requests under
+    /// `storage.snapshot.s3_timeout` and `s3_max_retries`
+    /// ([`RaftSnapshotConfig::install_copy_budget`]), or the config is
+    /// refused. A node also runs a further snapshot GC pass this long after
+    /// a write of its own that failed, for a PUT that lands late.
     pub install_snapshot_timeout: HumanDuration,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
     pub grpc_reconnect_after_failures: usize,
@@ -605,6 +608,35 @@ impl Default for S3Config {
     }
 }
 
+/// Backoff before the first retry of an S3 request. Each later retry waits
+/// twice as long, up to [`S3_RETRY_MAX_DELAY`], and the jitter adds a random
+/// share of up to the same delay again.
+pub const S3_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
+/// The longest backoff before a retry of an S3 request, before jitter.
+pub const S3_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+
+/// The longest one S3 request can take before its caller sees it fail, with
+/// a per-attempt `timeout` and `max_retries` retries: each of its
+/// `max_retries + 1` attempts runs into `timeout`, and each backoff before a
+/// retry runs to its jittered maximum, twice its delay.
+pub fn s3_operation_budget(timeout: Duration, max_retries: usize) -> Duration {
+    let attempts = u32::try_from(max_retries)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    let mut backoff = Duration::ZERO;
+    let mut delay = S3_RETRY_MIN_DELAY;
+    let mut retries_left = max_retries;
+    while retries_left > 0 && delay < S3_RETRY_MAX_DELAY {
+        backoff = backoff.saturating_add(delay.saturating_mul(2));
+        delay = delay.saturating_mul(2).min(S3_RETRY_MAX_DELAY);
+        retries_left = retries_left.saturating_sub(1);
+    }
+    // The delay has reached its cap: every retry left waits that long.
+    let capped_retries = u32::try_from(retries_left).unwrap_or(u32::MAX);
+    backoff = backoff.saturating_add(delay.saturating_mul(2).saturating_mul(capped_retries));
+    timeout.saturating_mul(attempts).saturating_add(backoff)
+}
+
 /// Server-side encryption mode for cold-tier S3 writes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -660,12 +692,58 @@ pub struct RaftSnapshotConfig {
     /// health. The driver always runs, so a zero interval is refused
     /// ([`crate::validate::ValidationError::ZeroSnapshotDriveInterval`]).
     pub drive_interval: Option<HumanDuration>,
+    /// Per-attempt timeout of an S3 snapshot-store request. The snapshot
+    /// store has a request budget of its own, apart from the cold store's
+    /// (`storage.cold.s3.timeout`), so that a follower's copy of a snapshot
+    /// it installs fits inside `raft.install_snapshot_timeout`
+    /// ([`RaftSnapshotConfig::install_copy_budget`]). A PUT is one attempt
+    /// of the whole object, so this also covers a healthy GET or PUT of the
+    /// largest snapshot.
+    pub s3_timeout: HumanDuration,
+    /// Retries of an S3 snapshot-store request.
+    pub s3_max_retries: usize,
 }
 
 impl RaftSnapshotConfig {
+    /// The snapshot-store requests a follower's install copy can send one
+    /// after another: the GET of the leader's object, the PUT of its own
+    /// copy, a second PUT under a new name when the first one's name is
+    /// taken, and the HEAD that checks the copy.
+    pub const INSTALL_COPY_REQUESTS: u32 = 4;
+
     /// The snapshot prefix this config names, `snapshots` when unset.
     pub fn snapshot_prefix(&self) -> SnapshotPrefix {
         self.s3_prefix.clone().unwrap_or_default()
+    }
+
+    /// The longest one snapshot-store request can take
+    /// ([`s3_operation_budget`]).
+    pub fn request_budget(&self) -> Duration {
+        s3_operation_budget(self.s3_timeout.as_duration(), self.s3_max_retries)
+    }
+
+    /// The longest a follower's install copy can take: its
+    /// [`Self::INSTALL_COPY_REQUESTS`] requests, each to the end of
+    /// [`Self::request_budget`]. It must fit inside
+    /// `raft.install_snapshot_timeout`, or the leader's send ends first and
+    /// the follower answers it only once the leader sends again.
+    pub fn install_copy_budget(&self) -> Duration {
+        self.request_budget()
+            .saturating_mul(Self::INSTALL_COPY_REQUESTS)
+    }
+}
+
+impl Default for RaftSnapshotConfig {
+    fn default() -> Self {
+        Self {
+            backend: RaftSnapshotBackend::Auto,
+            s3_prefix: None,
+            drive_interval: None,
+            // 22 s per request with its retry and backoff, so a copy takes
+            // at most 88 s of the default 120 s install timeout.
+            s3_timeout: HumanDuration::sec(10),
+            s3_max_retries: 1,
+        }
     }
 }
 
@@ -762,16 +840,6 @@ impl TryFrom<String> for SnapshotPrefix {
 impl From<SnapshotPrefix> for String {
     fn from(prefix: SnapshotPrefix) -> Self {
         prefix.0
-    }
-}
-
-impl Default for RaftSnapshotConfig {
-    fn default() -> Self {
-        Self {
-            backend: RaftSnapshotBackend::Auto,
-            s3_prefix: None,
-            drive_interval: None,
-        }
     }
 }
 
@@ -906,4 +974,32 @@ impl Default for ColdHealthConfig {
 pub struct ObservabilityConfig {
     /// Enable tokio-console integration.
     pub tokio_console: bool,
+}
+
+#[cfg(test)]
+mod s3_budget_tests {
+    use std::time::Duration;
+
+    use super::s3_operation_budget;
+
+    #[test]
+    fn s3_operation_budget_covers_every_attempt_and_jittered_backoff() {
+        let secs = Duration::from_secs;
+        assert_eq!(s3_operation_budget(secs(10), 0), secs(10));
+        // The cold defaults: four attempts of 10 s, backoffs of at most 2, 4
+        // and 8 s.
+        assert_eq!(s3_operation_budget(secs(10), 3), secs(54));
+        // The snapshot defaults: two attempts of 10 s and one backoff of at
+        // most 2 s.
+        assert_eq!(s3_operation_budget(secs(10), 1), secs(22));
+        // Nine attempts of 1 s, backoffs that double from 1 s to the 60 s
+        // cap (2+4+8+16+32+64 s), then 120 s for each of the two retries
+        // past the cap: 9 + 126 + 240 s.
+        assert_eq!(s3_operation_budget(secs(1), 8), secs(375));
+        assert_eq!(
+            s3_operation_budget(Duration::MAX, 3),
+            Duration::MAX,
+            "saturates instead of overflowing"
+        );
+    }
 }

@@ -167,14 +167,14 @@ pub(crate) struct SnapshotHolds {
     /// and after a restore, the second GC pass is owed, for a PUT that
     /// lands late.
     late_write: Duration,
-    /// What runs between a pass's read of the leases and its read of the
-    /// state, for a test that races a send and a build against the pass.
+    /// What runs within a pass's read of the holds, for a test that races a
+    /// send and a build against the pass.
     #[cfg(test)]
     seam: Mutex<Option<HeldReadSeam>>,
 }
 
-/// A test's step between a pass's read of the leases and its read of the
-/// state, and whether the pass keeps the state's guard across it.
+/// A test's step within a pass's read of the holds, and how the pass reads
+/// them around it.
 #[cfg(test)]
 pub(crate) struct HeldReadSeam {
     pub(crate) read: HeldRead,
@@ -182,7 +182,8 @@ pub(crate) struct HeldReadSeam {
 }
 
 /// How a pass reads the holds in a test: as production does, the leases
-/// under the state's guard, or, as the negative control, in two steps.
+/// under the state's guard with the step between the guard and the leases,
+/// or, as the negative control, the leases, then the step, then the state.
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldRead {
@@ -460,42 +461,49 @@ impl SnapshotHolds {
     /// of the current snapshot, and a build's lease drops only after its
     /// commit, which waits for the guard.
     pub(crate) fn held_keys(&self) -> BTreeSet<String> {
-        let state = self.state();
-        let mut held: BTreeSet<String> = self.leases.keys().into_iter().collect();
         #[cfg(test)]
-        let state = self.between_reads(state);
+        let seam = self.take_seam();
+        #[cfg(test)]
+        if let Some(HeldReadSeam {
+            read: HeldRead::TwoSteps,
+            between,
+        }) = seam
+        {
+            return self.held_keys_in_two_steps(between);
+        }
+        let state = self.state();
+        // A test's step runs here, between the guard and the read of the
+        // leases, so a production read that took the leases before the
+        // guard would miss what the step leased.
+        #[cfg(test)]
+        if let Some(HeldReadSeam { between, .. }) = seam {
+            between();
+        }
+        let mut held: BTreeSet<String> = self.leases.keys().into_iter().collect();
         held.extend(state.current.iter().cloned());
         held.extend(state.failed_candidate.iter().cloned());
         held
     }
 
-    /// Runs a test's step between the two reads of [`Self::held_keys`],
-    /// keeping the state's guard across it, or, for the negative control,
-    /// releasing it and reading the state again after the step.
+    /// The step a test set for the next read of the holds, if any.
     #[cfg(test)]
-    fn between_reads<'s>(
-        &'s self,
-        state: std::sync::MutexGuard<'s, HoldState>,
-    ) -> std::sync::MutexGuard<'s, HoldState> {
-        let seam = self
-            .seam
+    fn take_seam(&self) -> Option<HeldReadSeam> {
+        self.seam
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        let Some(seam) = seam else {
-            return state;
-        };
-        match seam.read {
-            HeldRead::OneStep => {
-                (seam.between)();
-                state
-            }
-            HeldRead::TwoSteps => {
-                drop(state);
-                (seam.between)();
-                self.state()
-            }
-        }
+            .take()
+    }
+
+    /// The negative control of [`Self::held_keys`]: the leases read first,
+    /// with no guard, then a test's step, then the state.
+    #[cfg(test)]
+    fn held_keys_in_two_steps(&self, between: Box<dyn FnOnce() + Send>) -> BTreeSet<String> {
+        let mut held: BTreeSet<String> = self.leases.keys().into_iter().collect();
+        between();
+        let state = self.state();
+        held.extend(state.current.iter().cloned());
+        held.extend(state.failed_candidate.iter().cloned());
+        held
     }
 
     /// Sets the step the next read of the holds runs between its reads.

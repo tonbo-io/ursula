@@ -408,6 +408,9 @@ pub(crate) struct CoreFileLogWriter {
     exited: WriterExited,
     /// Released after the worker has stopped (see `Drop`).
     _lock: DiskLock,
+    /// Closes once the writer is gone and its lock released: the fields drop
+    /// in order, after `Drop` joined the worker.
+    released: crate::rt::sync::watch::Sender<()>,
 }
 
 /// Every group of a core: its log, and what the metadata file recorded for
@@ -799,6 +802,7 @@ impl CoreFileLogWriter {
             maintenance: Vec::new(),
         };
         let (exited_tx, exited) = crate::rt::sync::watch::channel(());
+        let (released, _unwatched) = crate::rt::sync::watch::channel(());
         let worker = spawn_core_file_log_writer(Box::new(journal), rx, exited_tx)?;
         Ok(Arc::new(Self {
             #[cfg(madsim)]
@@ -812,12 +816,19 @@ impl CoreFileLogWriter {
             worker: Some(worker),
             exited,
             _lock: lock,
+            released,
         }))
     }
 
     /// Closes once this writer's worker has stopped.
     pub(crate) fn exited(&self) -> WriterExited {
         self.exited.clone()
+    }
+
+    /// Closes once this writer is gone and the journal's lock is free, so
+    /// a new writer of the core can take it.
+    pub(crate) fn released(&self) -> WriterExited {
+        self.released.subscribe()
     }
 
     /// The core journal's directory.

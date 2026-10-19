@@ -101,27 +101,6 @@ pub fn spawn_runtime(
     spawn_runtime_with_maintenance_drain(config, persistence, topology, false)
 }
 
-/// Warns when an install copy's GET, PUT and HEAD, each run into every
-/// timeout and backoff of the S3 client ([`ursula_runtime::s3_operation_budget`]),
-/// can take longer than `raft.install_snapshot_timeout`. The leader's send
-/// then ends first, and the follower answers it only once the leader sends
-/// the snapshot again.
-fn warn_if_a_copy_can_outlast_its_install(config: &ursula_config::UrsulaConfig) {
-    let Some(s3) = config.storage.cold.s3.as_ref() else {
-        return;
-    };
-    let copy = ursula_runtime::s3_operation_budget(s3.timeout.as_duration(), s3.max_retries)
-        .saturating_mul(3);
-    let install = config.raft.install_snapshot_timeout.as_duration();
-    if copy > install {
-        tracing::warn!(
-            copy_budget_ms = u64::try_from(copy.as_millis()).unwrap_or(u64::MAX),
-            install_snapshot_timeout_ms = u64::try_from(install.as_millis()).unwrap_or(u64::MAX),
-            "on a store that answers slowly, a follower's copy of an installed snapshot can take longer than raft.install_snapshot_timeout; raise it or lower storage.cold.s3.timeout or max_retries"
-        );
-    }
-}
-
 /// Spawn a runtime and install the operator drain fence before any Raft core
 /// or background leadership worker can observe the process.
 pub(crate) fn spawn_runtime_with_maintenance_drain(
@@ -150,9 +129,6 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     .map_err(|err| RuntimeError::ColdStoreConfig {
         message: ursula_runtime::ErrorChain(&err).to_string(),
     })?;
-    if snapshot_store.is_some() {
-        warn_if_a_copy_can_outlast_its_install(config);
-    }
     let engine_config = RaftEngineConfig::from(&config.raft);
     let snapshot_drive_interval = snapshot::resolve_snapshot_drive_interval(
         config

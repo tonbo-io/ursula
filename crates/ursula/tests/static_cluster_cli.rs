@@ -2551,7 +2551,7 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
     ));
     remove_test_path(&root);
     std::fs::create_dir_all(&root).expect("create temp root");
-    let max_age = Duration::from_secs(90);
+    let max_age = Duration::from_secs(160);
     let mut configs = Vec::new();
     let mut admins = Vec::new();
     for (node_id, port) in (1_u64..).zip(ports) {
@@ -2576,10 +2576,14 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
             &config,
             text.replace(
                 "init_membership_per_group = false\n",
-                "init_membership_per_group = false\ndeleted_data_max_age = \"90s\"\n\
-                 install_snapshot_timeout = \"10s\"\n",
+                "init_membership_per_group = false\ndeleted_data_max_age = \"160s\"\n\
+                 install_snapshot_timeout = \"20s\"\n",
             )
-            .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n"),
+            .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n")
+                // A follower's install copy, up to four snapshot-store
+                // requests of 5 s each with one retry against a flake of
+                // the real store, fits inside the 20 s install timeout.
+                + "\n[storage.snapshot]\ns3_timeout = \"1500ms\"\ns3_max_retries = 1\n",
         )
         .expect("write node config");
         admins.push(format!("http://127.0.0.1:{admin_port}"));

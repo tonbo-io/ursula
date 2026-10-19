@@ -19,6 +19,8 @@ use opendal::Operator;
 use opendal::Scheme;
 use opendal::layers::RetryLayer;
 use opendal::layers::TimeoutLayer;
+use ursula_config::S3_RETRY_MAX_DELAY;
+use ursula_config::S3_RETRY_MIN_DELAY;
 use ursula_config::config::ColdBackend;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -182,7 +184,9 @@ pub(crate) fn apply_s3_encryption_with_fetcher(
     }
 }
 
-/// Wrap an S3 (opendal) operator with timeout and bounded-retry layers.
+/// Wrap an S3 (opendal) operator with timeout and bounded-retry layers. The
+/// longest an operation can take behind them is
+/// [`ursula_config::s3_operation_budget`].
 ///
 /// 1. **Per-attempt timeout** ([`TimeoutLayer`], inner): a blackholed endpoint
 ///    — chaos `s3_unavailable`, or a "busy ESTAB" TCP socket whose future never
@@ -216,34 +220,6 @@ pub(crate) fn with_s3_resilience(
                 .with_max_times(max_retries)
                 .with_jitter(),
         )
-}
-
-/// Backoff before the first S3 retry. Each later retry waits twice as long,
-/// up to [`S3_RETRY_MAX_DELAY`], and the jitter adds a random share of up to
-/// the same delay again.
-const S3_RETRY_MIN_DELAY: Duration = Duration::from_secs(1);
-const S3_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
-
-/// The longest one S3 operation can take behind [`with_s3_resilience`]
-/// before the caller sees it fail: each of its `max_retries + 1` attempts
-/// runs into `timeout`, and each backoff before a retry runs to its jittered
-/// maximum, twice its delay.
-pub fn s3_operation_budget(timeout: Duration, max_retries: usize) -> Duration {
-    let attempts = u32::try_from(max_retries)
-        .unwrap_or(u32::MAX)
-        .saturating_add(1);
-    let mut backoff = Duration::ZERO;
-    let mut delay = S3_RETRY_MIN_DELAY;
-    let mut retries_left = max_retries;
-    while retries_left > 0 && delay < S3_RETRY_MAX_DELAY {
-        backoff = backoff.saturating_add(delay.saturating_mul(2));
-        delay = delay.saturating_mul(2).min(S3_RETRY_MAX_DELAY);
-        retries_left = retries_left.saturating_sub(1);
-    }
-    // The delay has reached its cap: every retry left waits that long.
-    let capped_retries = u32::try_from(retries_left).unwrap_or(u32::MAX);
-    backoff = backoff.saturating_add(delay.saturating_mul(2).saturating_mul(capped_retries));
-    timeout.saturating_mul(attempts).saturating_add(backoff)
 }
 
 #[derive(Clone)]
@@ -2223,7 +2199,6 @@ mod tests {
     use super::new_cold_pack_path;
     use super::new_external_payload_path;
     use super::parse_cold_index_page_path;
-    use super::s3_operation_budget;
     use super::snapshot_part_path;
     use crate::ColdConfig;
     use crate::ColdIndexPageKey;
@@ -2235,24 +2210,6 @@ mod tests {
             .as_ref()
             .map(|cache| cache.config)
             .expect("read cache")
-    }
-
-    #[test]
-    fn s3_operation_budget_covers_every_attempt_and_jittered_backoff() {
-        use std::time::Duration;
-
-        let secs = Duration::from_secs;
-        assert_eq!(s3_operation_budget(secs(10), 0), secs(10));
-        // The defaults: four attempts of 10 s, backoffs of at most 2, 4 and 8 s.
-        assert_eq!(s3_operation_budget(secs(10), 3), secs(54));
-        // Backoffs double from 1 s to the 60 s cap: 2+4+8+16+32+64 s, then
-        // 120 s for each retry past the cap.
-        assert_eq!(s3_operation_budget(secs(1), 8), secs(9 + 126 + 240));
-        assert_eq!(
-            s3_operation_budget(Duration::MAX, 3),
-            Duration::MAX,
-            "saturates instead of overflowing"
-        );
     }
 
     const GC_BUCKET: &str = "tenant-a";

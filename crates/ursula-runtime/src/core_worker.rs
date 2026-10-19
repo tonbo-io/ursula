@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use tracing::Instrument;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -81,7 +82,9 @@ use crate::rt::sync::oneshot;
 use crate::rt::time::Instant;
 use crate::trace::Traced;
 
-const WARM_GROUP_CONCURRENCY_PER_CORE: usize = 8;
+/// The opens of one core's groups that run at once, each of which may
+/// restore a snapshot from the snapshot store.
+pub(crate) const OPEN_CONCURRENCY_PER_CORE: usize = 8;
 
 #[derive(Debug, Clone)]
 pub(crate) struct CoreMailbox {
@@ -126,10 +129,6 @@ pub(crate) enum CoreCommand {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<ShardPlacement, RuntimeError>>,
     },
-    WarmGroups {
-        placements: Vec<ShardPlacement>,
-        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
-    },
     ShutdownGroupEngine {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
@@ -146,6 +145,10 @@ pub(crate) enum CoreCommand {
 /// traffic cannot turn a deterministic poison record into a restart loop.
 pub(crate) enum GroupSlot {
     Running(GroupMailbox),
+    /// The group's engine opens in a task of the core
+    /// ([`CoreWorker::tasks`]), which goes on serving its other groups. The
+    /// core installs the engine when the open ends.
+    Opening(OpeningGroup),
     ApplyStopped {
         term: u64,
         index: u64,
@@ -153,10 +156,8 @@ pub(crate) enum GroupSlot {
     },
     /// The group's engine did not open because the snapshot store did not
     /// answer its restore. Until `until`, a request gets the same refusal at
-    /// once instead of another restore on this core's loop, which a store
-    /// that does not answer holds for every group of the core. At `until`
-    /// the core opens the group again by itself, and so does a request that
-    /// comes first.
+    /// once instead of another restore. At `until` the core opens the group
+    /// again by itself, and so does a request that comes first.
     OpenBackoff {
         placement: ShardPlacement,
         error: GroupEngineError,
@@ -164,6 +165,77 @@ pub(crate) enum GroupSlot {
         failures: u32,
         until: Instant,
     },
+}
+
+/// A group whose engine opens in a task of its core.
+pub(crate) struct OpeningGroup {
+    placement: ShardPlacement,
+    cause: OpenCause,
+    /// Warm-ups that wait for the open to end.
+    warmers: Vec<oneshot::Sender<Result<ShardPlacement, RuntimeError>>>,
+    then: AfterOpen,
+}
+
+/// Why a core opens a group, which decides what a request gets meanwhile.
+pub(crate) enum OpenCause {
+    /// The group's first open since its core last ran it. A request waits
+    /// for it, up to the group mailbox's capacity, and goes to the engine
+    /// once it opened. A request past that capacity is refused at once.
+    First { parked: Vec<GroupCommand> },
+    /// An open after `failures` opens in a row that the snapshot store did
+    /// not answer. A request is refused at once, as during the back-off, so
+    /// a store that does not answer holds no request for its whole timeout.
+    Reopen { failures: u32 },
+}
+
+/// What a core does with a group's engine once its open ended.
+pub(crate) enum AfterOpen {
+    /// It installs the engine and the group serves. The open's task runs
+    /// while `_keep_open` lives, which is never sent on: dropping it drops
+    /// the open ([`OpenFailure::Dropped`]).
+    Install { _keep_open: oneshot::Sender<()> },
+    /// A shutdown of the group began during the open, which dropped the
+    /// open: an open that has not opened its engine holds no engine work.
+    /// The core answers `waiters` once the open's task ended. An engine
+    /// that opened before the task saw the shutdown never installs: the
+    /// core shuts it down and then answers `waiters`.
+    Shutdown {
+        waiters: Vec<oneshot::Sender<Result<(), RuntimeError>>>,
+    },
+}
+
+/// Why an open of a group's engine failed.
+pub(crate) enum OpenFailure {
+    /// The factory refused the engine.
+    Engine(GroupEngineError),
+    /// A shutdown of the group dropped the open before its engine opened.
+    Dropped,
+    /// The open's task ended without an answer, which its task logged.
+    Aborted,
+}
+
+/// A task of a core's own, which its loop polls with its mailbox.
+pub(crate) type CoreTask =
+    std::pin::Pin<Box<dyn std::future::Future<Output = CoreTaskDone> + Send>>;
+
+/// The end of a [`CoreTask`].
+pub(crate) enum CoreTaskDone {
+    /// The open of `placement`'s engine ended.
+    Opened {
+        placement: ShardPlacement,
+        result: Result<Box<dyn GroupEngine>, OpenFailure>,
+    },
+    /// The shutdown of an engine whose open ended after a shutdown of its
+    /// group began, which answered its waiters itself.
+    Closed,
+}
+
+/// What a request to a group meets on its core.
+enum GroupEntry {
+    Running(GroupMailbox),
+    /// The group's engine opens.
+    Opening,
+    Refused(RuntimeError),
 }
 
 /// The wait after the first open of a group that its snapshot store did
@@ -196,6 +268,12 @@ pub(crate) struct CoreWorker {
     /// first. An entry whose group left the back-off, or whose wait was
     /// renewed, is dropped when it comes due.
     pub(crate) reopens: BTreeSet<(Instant, RaftGroupId)>,
+    /// The core's own tasks: the opens of its groups' engines, and the
+    /// shutdowns of engines that opened after their group's shutdown began.
+    /// Each keeps its task's `JoinHandle`.
+    pub(crate) tasks: FuturesUnordered<CoreTask>,
+    /// The opens of this core's groups that run at once.
+    pub(crate) open_permits: Arc<Semaphore>,
     pub(crate) rx: mpsc::Receiver<Traced<CoreCommand>>,
     pub(crate) engine_factory: Arc<dyn GroupEngineFactory>,
     pub(crate) groups: HashMap<RaftGroupId, GroupSlot>,
@@ -293,25 +371,32 @@ impl Drop for WaitReadCancel {
 impl CoreWorker {
     pub(crate) async fn run(mut self) {
         loop {
-            let command = match self.reopens.first().map(|(at, _)| *at) {
-                // Biased, so the branch polled first is fixed rather than
-                // drawn from tokio's thread RNG (#638). A due reopen goes
-                // first: it is ready only once its wait ended.
-                Some(at) => crate::rt::select! {
-                    biased;
-                    () = crate::rt::time::sleep_until(at) => {
-                        self.reopen_due().await;
-                        continue;
-                    }
-                    command = self.rx.recv() => command,
-                },
-                None => self.rx.recv().await,
+            let reopen_at = self.reopens.first().map(|(at, _)| *at);
+            // Biased, so the branch polled first is fixed rather than drawn
+            // from tokio's thread RNG (#638). Neither of the first two
+            // branches waits on an open: a task's end installs or records
+            // what it opened, and a due reopen only starts a task. So the
+            // mailbox is polled again after each, whatever the store does.
+            let command = crate::rt::select! {
+                biased;
+                Some(done) = self.tasks.next(), if !self.tasks.is_empty() => {
+                    self.task_done(done).await;
+                    continue;
+                }
+                () = crate::rt::time::sleep_until(reopen_at.unwrap_or_else(Instant::now)),
+                    if reopen_at.is_some() =>
+                {
+                    self.reopen_due();
+                    continue;
+                }
+                command = self.rx.recv() => command,
             };
             let Some(Traced {
                 value: command,
                 parent,
             }) = command
             else {
+                self.drain().await;
                 return;
             };
             // Re-establish the sender's span so on-core work links back to the
@@ -320,28 +405,43 @@ impl CoreWorker {
         }
     }
 
-    /// Opens again every group whose open back-off ended, so that a replica
-    /// no request reaches does not stay closed.
-    async fn reopen_due(&mut self) {
+    /// Ends the worker's tasks once its mailbox closed: every open still
+    /// running is dropped, and an engine that opened first never installs.
+    async fn drain(&mut self) {
+        let mut opening = self
+            .groups
+            .iter()
+            .filter(|(_, slot)| matches!(slot, GroupSlot::Opening(_)))
+            .map(|(raft_group_id, _)| *raft_group_id)
+            .collect::<Vec<_>>();
+        opening.sort_unstable();
+        for raft_group_id in opening {
+            self.shut_down_opening(raft_group_id, None);
+        }
+        while let Some(done) = self.tasks.next().await {
+            self.task_done(done).await;
+        }
+    }
+
+    /// Starts the open of every group whose open back-off ended, so that a
+    /// replica no request reaches does not stay closed.
+    fn reopen_due(&mut self) {
         let now = Instant::now();
         while let Some(&(at, raft_group_id)) = self.reopens.first() {
             if at > now {
                 return;
             }
             self.reopens.pop_first();
-            let placement = match self.groups.get(&raft_group_id) {
-                Some(GroupSlot::OpenBackoff {
-                    placement, until, ..
-                }) if *until <= now => *placement,
-                _ => continue,
-            };
-            match self.group(placement).await {
-                Ok(_mailbox) => tracing::info!(
-                    raft_group_id = placement.raft_group_id.0,
-                    "the group opened after its open back-off"
-                ),
-                // A failed open logs and backs off again.
-                Err(_logged) => {}
+            if matches!(
+                self.groups.get(&raft_group_id),
+                Some(GroupSlot::OpenBackoff { until, .. }) if *until <= now
+            ) && let Err(error) = self.reopen(raft_group_id)
+            {
+                tracing::warn!(
+                    raft_group_id = raft_group_id.0,
+                    %error,
+                    "the group did not reopen after its open back-off"
+                );
             }
         }
     }
@@ -375,15 +475,7 @@ impl CoreWorker {
                 response_tx,
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
-                let response = self.group(placement).await.map(|_| placement);
-                reply(response_tx, response);
-            }
-            CoreCommand::WarmGroups {
-                placements,
-                response_tx,
-            } => {
-                let response = self.warm_groups(placements).await;
-                reply(response_tx, response);
+                self.warm_group(placement, response_tx);
             }
             CoreCommand::ShutdownGroupEngine {
                 placement,
@@ -449,117 +541,373 @@ impl CoreWorker {
         command: GroupCommand,
     ) {
         let core_id = placement.core_id;
-        match self.group(placement).await {
-            Ok(group) => {
+        match self.enter(placement) {
+            GroupEntry::Running(group) => {
                 if let Err(command) = group.send(command).await {
                     (*command).send_error(RuntimeError::MailboxClosed { core_id });
                 }
             }
-            Err(err) => command.send_error(err),
+            GroupEntry::Opening => self.park(placement, command),
+            GroupEntry::Refused(err) => command.send_error(err),
         }
     }
 
-    pub(crate) async fn group(
-        &mut self,
-        placement: ShardPlacement,
-    ) -> Result<GroupMailbox, RuntimeError> {
-        let mut failures = 0;
-        if let Some(GroupSlot::OpenBackoff {
-            error,
-            failures: failed,
-            until,
-            ..
-        }) = self.groups.get(&placement.raft_group_id)
-        {
-            if Instant::now() < *until {
-                return Err(RuntimeError::group_engine(placement, error.clone()));
-            }
-            failures = *failed;
-            self.groups.remove(&placement.raft_group_id);
-            self.metrics
-                .record_open_backoff(placement.raft_group_id, false);
-        }
-        if !self.groups.contains_key(&placement.raft_group_id) {
-            let engine_factory = self.engine_factory.clone();
-            if !engine_factory.hosts_group(placement) {
-                return Err(RuntimeError::GroupNotHosted {
-                    core_id: placement.core_id,
-                    raft_group_id: placement.raft_group_id,
-                });
-            }
-            let metrics = GroupEngineMetrics {
-                inner: self.metrics.clone(),
-            };
-            let engine = match engine_factory.create(placement, metrics).await {
-                Ok(engine) => engine,
-                Err(
-                    error @ crate::engine::GroupEngineError::Infra(
-                        crate::engine::GroupInfraError::ApplyStopped {
-                            term, index, kind, ..
-                        },
-                    ),
-                ) => {
-                    self.groups
-                        .insert(placement.raft_group_id, GroupSlot::ApplyStopped {
-                            term,
-                            index,
-                            kind,
-                        });
-                    return Err(RuntimeError::group_engine(placement, error));
-                }
-                Err(error) if store_unavailable(&error) => {
-                    self.back_off_open(placement, error.clone(), failures);
-                    return Err(RuntimeError::group_engine(placement, error));
-                }
-                Err(error) => return Err(RuntimeError::group_engine(placement, error)),
-            };
-            self.read_barriers
-                .install(placement.raft_group_id, engine.linearizable_read_barrier());
-            let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
-            let history = engine.history_watch();
-            let actor = GroupActor {
-                deferred: None,
-                placement,
-                history,
-                engine,
-                rx,
-                read_watchers: HashMap::new(),
-                metrics: self.metrics.clone(),
-                cold_write_admission: self.cold_write_admission,
-                live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
-                read_materialization: self.read_materialization.clone(),
-            };
-            crate::rt::spawn(actor.run());
-            self.groups.insert(
-                placement.raft_group_id,
-                GroupSlot::Running(GroupMailbox {
-                    group_id: placement.raft_group_id,
-                    tx,
-                    metrics: self.metrics.clone(),
-                }),
-            );
-        }
-        match self
-            .groups
-            .get(&placement.raft_group_id)
-            .expect("group was just inserted")
-        {
-            GroupSlot::Running(mailbox) => Ok(mailbox.clone()),
-            GroupSlot::OpenBackoff { error, .. } => {
-                Err(RuntimeError::group_engine(placement, error.clone()))
-            }
-            GroupSlot::ApplyStopped { term, index, kind } => Err(RuntimeError::group_engine(
-                placement,
-                crate::engine::GroupEngineError::Infra(
-                    crate::engine::GroupInfraError::ApplyStopped {
-                        raft_group_id: placement.raft_group_id,
+    /// What a request to `placement`'s group meets. A group with no engine
+    /// starts its open, and so does a group whose open back-off ended. The
+    /// open, the restore and its waits on the snapshot store included, runs
+    /// in a task of the core: the loop only starts it, and installs the
+    /// engine once it opened ([`Self::opened`]).
+    fn enter(&mut self, placement: ShardPlacement) -> GroupEntry {
+        let raft_group_id = placement.raft_group_id;
+        match self.groups.get(&raft_group_id) {
+            Some(GroupSlot::Running(mailbox)) => GroupEntry::Running(mailbox.clone()),
+            Some(GroupSlot::Opening(_)) => GroupEntry::Opening,
+            Some(GroupSlot::ApplyStopped { term, index, kind }) => {
+                GroupEntry::Refused(RuntimeError::group_engine(
+                    placement,
+                    GroupEngineError::Infra(crate::engine::GroupInfraError::ApplyStopped {
+                        raft_group_id,
                         term: *term,
                         index: *index,
                         kind: *kind,
-                    },
-                ),
-            )),
+                    }),
+                ))
+            }
+            Some(GroupSlot::OpenBackoff { error, until, .. }) if Instant::now() < *until => {
+                GroupEntry::Refused(RuntimeError::group_engine(placement, error.clone()))
+            }
+            Some(GroupSlot::OpenBackoff { .. }) => match self.reopen(raft_group_id) {
+                Ok(()) => GroupEntry::Opening,
+                Err(err) => GroupEntry::Refused(err),
+            },
+            None => match self.start_open(placement, OpenCause::First { parked: Vec::new() }) {
+                Ok(()) => GroupEntry::Opening,
+                Err(err) => GroupEntry::Refused(err),
+            },
         }
+    }
+
+    /// Holds `command` until its group's first open ends, or refuses it at
+    /// once: during a reopen, during a shutdown, or past the group mailbox's
+    /// capacity.
+    fn park(&mut self, placement: ShardPlacement, command: GroupCommand) {
+        let capacity = self.group_mailbox_capacity;
+        match self.groups.get_mut(&placement.raft_group_id) {
+            Some(GroupSlot::Opening(OpeningGroup {
+                cause: OpenCause::First { parked },
+                then: AfterOpen::Install { .. },
+                ..
+            })) if parked.len() < capacity => parked.push(command),
+            _ => command.send_error(RuntimeError::GroupOpening {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+            }),
+        }
+    }
+
+    /// Answers `response_tx` once `placement`'s group serves, or with why it
+    /// does not.
+    pub(crate) fn warm_group(
+        &mut self,
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<ShardPlacement, RuntimeError>>,
+    ) {
+        match self.enter(placement) {
+            GroupEntry::Running(_) => reply(response_tx, Ok(placement)),
+            GroupEntry::Refused(err) => reply(response_tx, Err(err)),
+            GroupEntry::Opening => match self.groups.get_mut(&placement.raft_group_id) {
+                Some(GroupSlot::Opening(OpeningGroup {
+                    warmers,
+                    then: AfterOpen::Install { .. },
+                    ..
+                })) => warmers.push(response_tx),
+                _ => reply(
+                    response_tx,
+                    Err(RuntimeError::GroupOpening {
+                        core_id: placement.core_id,
+                        raft_group_id: placement.raft_group_id,
+                    }),
+                ),
+            },
+        }
+    }
+
+    /// Starts the open of a group in open back-off, which keeps counting in
+    /// `open_backoff_groups` until the open succeeds.
+    fn reopen(&mut self, raft_group_id: RaftGroupId) -> Result<(), RuntimeError> {
+        let Some(GroupSlot::OpenBackoff {
+            placement,
+            failures,
+            ..
+        }) = self.groups.remove(&raft_group_id)
+        else {
+            return Ok(());
+        };
+        let started = self.start_open(placement, OpenCause::Reopen { failures });
+        if started.is_err() {
+            self.metrics.record_open_backoff(raft_group_id, false);
+        }
+        started
+    }
+
+    /// Starts the open of `placement`'s engine in a task of the core and
+    /// records the group as opening. The task drops the open once the
+    /// group's shutdown begins ([`AfterOpen::Install`]), whether it still
+    /// waits for its permit or for the snapshot store.
+    fn start_open(
+        &mut self,
+        placement: ShardPlacement,
+        cause: OpenCause,
+    ) -> Result<(), RuntimeError> {
+        if !self.engine_factory.hosts_group(placement) {
+            return Err(RuntimeError::GroupNotHosted {
+                core_id: placement.core_id,
+                raft_group_id: placement.raft_group_id,
+            });
+        }
+        let engine_factory = self.engine_factory.clone();
+        let metrics = GroupEngineMetrics {
+            inner: self.metrics.clone(),
+        };
+        let open_permits = self.open_permits.clone();
+        let (keep_open, dropped) = oneshot::channel::<()>();
+        let open = crate::rt::spawn(async move {
+            let open = async move {
+                let _permit = open_permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_closed| OpenFailure::Aborted)?;
+                engine_factory
+                    .create(placement, metrics)
+                    .await
+                    .map_err(OpenFailure::Engine)
+            };
+            // Biased: an engine that opened is shut down, never dropped.
+            crate::rt::select! {
+                biased;
+                opened = open => opened,
+                _dropped = dropped => Err(OpenFailure::Dropped),
+            }
+        });
+        self.tasks.push(Box::pin(async move {
+            let result = open.await.unwrap_or_else(|join_error| {
+                // A panic's payload is in the error's text.
+                tracing::error!(
+                    raft_group_id = placement.raft_group_id.0,
+                    error = %join_error,
+                    "the open of the group's engine ended without an answer; the group stays closed until a request opens it"
+                );
+                Err(OpenFailure::Aborted)
+            });
+            CoreTaskDone::Opened { placement, result }
+        }));
+        self.groups.insert(
+            placement.raft_group_id,
+            GroupSlot::Opening(OpeningGroup {
+                placement,
+                cause,
+                warmers: Vec::new(),
+                then: AfterOpen::Install {
+                    _keep_open: keep_open,
+                },
+            }),
+        );
+        Ok(())
+    }
+
+    pub(crate) async fn task_done(&mut self, done: CoreTaskDone) {
+        match done {
+            CoreTaskDone::Opened { placement, result } => self.opened(placement, result).await,
+            CoreTaskDone::Closed => {}
+        }
+    }
+
+    /// Installs the engine an open of `placement`'s group returned, or
+    /// records why it did not open, and answers what waited for the open.
+    async fn opened(
+        &mut self,
+        placement: ShardPlacement,
+        result: Result<Box<dyn GroupEngine>, OpenFailure>,
+    ) {
+        let raft_group_id = placement.raft_group_id;
+        let opening = match self.groups.remove(&raft_group_id) {
+            Some(GroupSlot::Opening(opening)) => opening,
+            // Only the end of its open moves a group out of `Opening`.
+            other => {
+                if let Some(slot) = other {
+                    self.groups.insert(raft_group_id, slot);
+                }
+                tracing::error!(
+                    raft_group_id = raft_group_id.0,
+                    "an open ended for a group that was not opening; its engine is shut down"
+                );
+                if let Ok(engine) = result {
+                    self.close_engine(placement, engine, Vec::new());
+                }
+                return;
+            }
+        };
+        let OpeningGroup {
+            placement,
+            cause,
+            warmers,
+            then,
+        } = opening;
+        if let AfterOpen::Shutdown { waiters } = then {
+            match result {
+                Ok(engine) => self.close_engine(placement, engine, waiters),
+                Err(_not_opened) => {
+                    for waiter in waiters {
+                        reply(waiter, Ok(()));
+                    }
+                }
+            }
+            return;
+        }
+        let (parked, reopen_failures) = match cause {
+            OpenCause::First { parked } => (parked, None),
+            OpenCause::Reopen { failures } => (Vec::new(), Some(failures)),
+        };
+        let error = match result {
+            Ok(engine) => {
+                self.metrics.record_open_backoff(raft_group_id, false);
+                if reopen_failures.is_some() {
+                    tracing::info!(
+                        raft_group_id = raft_group_id.0,
+                        "the group opened after its open back-off"
+                    );
+                }
+                let mailbox = self.install(placement, engine);
+                for warmer in warmers {
+                    reply(warmer, Ok(placement));
+                }
+                // The new mailbox holds the group mailbox's capacity, and no
+                // more commands parked, so none of these sends waits.
+                for command in parked {
+                    if let Err(command) = mailbox.send(command).await {
+                        (*command).send_error(RuntimeError::MailboxClosed {
+                            core_id: placement.core_id,
+                        });
+                    }
+                }
+                return;
+            }
+            Err(OpenFailure::Engine(error)) => error,
+            // Nothing of what waited was proposed: the group did not open.
+            // Only a shutdown drops an open, so `Dropped` comes with
+            // `AfterOpen::Shutdown`, answered above.
+            Err(OpenFailure::Aborted | OpenFailure::Dropped) => {
+                self.metrics.record_open_backoff(raft_group_id, false);
+                let err = RuntimeError::GroupOpening {
+                    core_id: placement.core_id,
+                    raft_group_id,
+                };
+                for warmer in warmers {
+                    reply(warmer, Err(err.clone()));
+                }
+                for command in parked {
+                    command.send_error(err.clone());
+                }
+                return;
+            }
+        };
+        if store_unavailable(&error) {
+            self.back_off_open(placement, error.clone(), reopen_failures.unwrap_or(0));
+        } else {
+            self.metrics.record_open_backoff(raft_group_id, false);
+            if let GroupEngineError::Infra(crate::engine::GroupInfraError::ApplyStopped {
+                term,
+                index,
+                kind,
+                ..
+            }) = &error
+            {
+                self.groups.insert(raft_group_id, GroupSlot::ApplyStopped {
+                    term: *term,
+                    index: *index,
+                    kind: *kind,
+                });
+            }
+            // A restore that fails logs its own error. Any other failure of
+            // a reopen no request waits for would go unseen.
+            if reopen_failures.is_some()
+                && !matches!(
+                    error,
+                    GroupEngineError::Infra(crate::engine::GroupInfraError::Snapshot(_))
+                )
+            {
+                tracing::warn!(
+                    raft_group_id = raft_group_id.0,
+                    error = %crate::error::ErrorChain(&error),
+                    "the group did not reopen after its open back-off; it stays closed until a request opens it"
+                );
+            }
+        }
+        let err = RuntimeError::group_engine(placement, error);
+        for warmer in warmers {
+            reply(warmer, Err(err.clone()));
+        }
+        for command in parked {
+            command.send_error(err.clone());
+        }
+    }
+
+    /// Shuts down an engine that opened after its group's shutdown began, in
+    /// a task of the core, and answers `waiters` with the shutdown's result.
+    fn close_engine(
+        &mut self,
+        placement: ShardPlacement,
+        mut engine: Box<dyn GroupEngine>,
+        waiters: Vec<oneshot::Sender<Result<(), RuntimeError>>>,
+    ) {
+        let close = crate::rt::spawn(async move {
+            let response = engine
+                .shutdown()
+                .await
+                .map_err(|err| RuntimeError::group_engine(placement, err));
+            for waiter in waiters {
+                reply(waiter, response.clone());
+            }
+        });
+        self.tasks.push(Box::pin(async move {
+            if close.await.is_err() {
+                tracing::error!(
+                    raft_group_id = placement.raft_group_id.0,
+                    "the shutdown of an engine that opened during its group's shutdown ended without an answer"
+                );
+            }
+            CoreTaskDone::Closed
+        }));
+    }
+
+    /// Runs `engine` as `placement`'s group: its ReadIndex barrier and its
+    /// actor.
+    fn install(&mut self, placement: ShardPlacement, engine: Box<dyn GroupEngine>) -> GroupMailbox {
+        self.read_barriers
+            .install(placement.raft_group_id, engine.linearizable_read_barrier());
+        let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
+        let history = engine.history_watch();
+        let actor = GroupActor {
+            deferred: None,
+            placement,
+            history,
+            engine,
+            rx,
+            read_watchers: HashMap::new(),
+            metrics: self.metrics.clone(),
+            cold_write_admission: self.cold_write_admission,
+            live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
+            read_materialization: self.read_materialization.clone(),
+        };
+        crate::rt::spawn(actor.run());
+        let mailbox = GroupMailbox {
+            group_id: placement.raft_group_id,
+            tx,
+            metrics: self.metrics.clone(),
+        };
+        self.groups
+            .insert(placement.raft_group_id, GroupSlot::Running(mailbox.clone()));
+        mailbox
     }
 
     /// Holds the group's next open back for its next wait, after its
@@ -589,11 +937,62 @@ impl CoreWorker {
             .record_open_backoff(placement.raft_group_id, true);
     }
 
+    /// Records a shutdown of a group whose engine opens: what waits for the
+    /// open is refused at once, and the open is dropped, so a store that
+    /// does not answer holds no shutdown. The core answers `response_tx`
+    /// once the open's task ended. An engine that opened first never
+    /// installs: the core shuts it down and then answers `response_tx`.
+    fn shut_down_opening(
+        &mut self,
+        raft_group_id: RaftGroupId,
+        response_tx: Option<oneshot::Sender<Result<(), RuntimeError>>>,
+    ) {
+        let Some(GroupSlot::Opening(opening)) = self.groups.get_mut(&raft_group_id) else {
+            if let Some(response_tx) = response_tx {
+                reply(response_tx, Ok(()));
+            }
+            return;
+        };
+        let refusal = RuntimeError::GroupOpening {
+            core_id: opening.placement.core_id,
+            raft_group_id,
+        };
+        let parked = match &mut opening.cause {
+            OpenCause::First { parked } => std::mem::take(parked),
+            OpenCause::Reopen { .. } => Vec::new(),
+        };
+        let warmers = std::mem::take(&mut opening.warmers);
+        let waiter = response_tx.into_iter();
+        match &mut opening.then {
+            // Dropping `_keep_open` drops the open.
+            then @ AfterOpen::Install { .. } => {
+                *then = AfterOpen::Shutdown {
+                    waiters: waiter.collect(),
+                }
+            }
+            AfterOpen::Shutdown { waiters } => waiters.extend(waiter),
+        }
+        self.metrics.record_open_backoff(raft_group_id, false);
+        for warmer in warmers {
+            reply(warmer, Err(refusal.clone()));
+        }
+        for command in parked {
+            command.send_error(refusal.clone());
+        }
+    }
+
     pub(crate) async fn shutdown_group_engine(
         &mut self,
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     ) {
+        if matches!(
+            self.groups.get(&placement.raft_group_id),
+            Some(GroupSlot::Opening(_))
+        ) {
+            self.shut_down_opening(placement.raft_group_id, Some(response_tx));
+            return;
+        }
         let Some(group) = self.groups.remove(&placement.raft_group_id) else {
             reply(response_tx, Ok(()));
             return;
@@ -615,6 +1014,9 @@ impl CoreWorker {
         }
     }
 
+    /// Installs `engine` for a group the core does not run, for a
+    /// simulation or a test that builds its engine itself.
+    #[cfg(any(test, madsim))]
     pub(crate) async fn install_group_engine(
         &mut self,
         placement: ShardPlacement,
@@ -626,85 +1028,7 @@ impl CoreWorker {
                 raft_group_id: placement.raft_group_id,
             });
         }
-        self.read_barriers
-            .install(placement.raft_group_id, engine.linearizable_read_barrier());
-        let (tx, rx) = mpsc::channel(self.group_mailbox_capacity);
-        let history = engine.history_watch();
-        let actor = GroupActor {
-            deferred: None,
-            placement,
-            history,
-            engine,
-            rx,
-            read_watchers: HashMap::new(),
-            metrics: self.metrics.clone(),
-            cold_write_admission: self.cold_write_admission,
-            live_read_max_waiters_per_core: self.live_read_max_waiters_per_core,
-            read_materialization: self.read_materialization.clone(),
-        };
-        crate::rt::spawn(actor.run());
-        self.groups.insert(
-            placement.raft_group_id,
-            GroupSlot::Running(GroupMailbox {
-                group_id: placement.raft_group_id,
-                tx,
-                metrics: self.metrics.clone(),
-            }),
-        );
-        Ok(())
-    }
-
-    async fn warm_groups(&mut self, placements: Vec<ShardPlacement>) -> Result<(), RuntimeError> {
-        let placements = placements
-            .into_iter()
-            .filter(|placement| !self.groups.contains_key(&placement.raft_group_id))
-            .collect::<Vec<_>>();
-        let engine_factory = self.engine_factory.clone();
-        let metrics = self.metrics.clone();
-        let core_id = self.core_id;
-        let mut engines = futures_util::stream::iter(placements)
-            .map(|placement| {
-                let engine_factory = engine_factory.clone();
-                let metrics = metrics.clone();
-                async move {
-                    debug_assert_eq!(placement.core_id, core_id);
-                    if !engine_factory.hosts_group(placement) {
-                        return Err(RuntimeError::GroupNotHosted {
-                            core_id: placement.core_id,
-                            raft_group_id: placement.raft_group_id,
-                        });
-                    }
-                    let engine = engine_factory
-                        .create(placement, GroupEngineMetrics { inner: metrics })
-                        .await;
-                    Ok((placement, engine))
-                }
-            })
-            .buffer_unordered(WARM_GROUP_CONCURRENCY_PER_CORE);
-        while let Some(engine) = engines.next().await {
-            let (placement, engine) = engine?;
-            match engine {
-                Ok(engine) => self.install_group_engine(placement, engine).await?,
-                Err(crate::engine::GroupEngineError::Infra(
-                    crate::engine::GroupInfraError::ApplyStopped {
-                        term, index, kind, ..
-                    },
-                )) => {
-                    self.groups
-                        .insert(placement.raft_group_id, GroupSlot::ApplyStopped {
-                            term,
-                            index,
-                            kind,
-                        });
-                }
-                // The group stays closed in back-off and the node starts:
-                // the group reopens when its wait ends.
-                Err(error) if store_unavailable(&error) => {
-                    self.back_off_open(placement, error, 0);
-                }
-                Err(error) => return Err(RuntimeError::group_engine(placement, error)),
-            }
-        }
+        self.install(placement, engine);
         Ok(())
     }
 

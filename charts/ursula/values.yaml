@@ -343,6 +343,15 @@ snapshotStore:
   # Optional snapshot driver interval in milliseconds, at least 1. Leave null for the runtime
   # default (5s with S3 snapshots, 1s inline). The driver always runs.
   driveIntervalMs: null
+  # Optional per-attempt timeout of an S3 snapshot-store request in milliseconds, rendered as
+  # storage.snapshot.s3_timeout. Leave null for Ursula's default (10 seconds). A PUT sends the
+  # whole object in one attempt, so this must also cover a healthy PUT of the largest snapshot.
+  s3TimeoutMs: null
+  # Optional retries of an S3 snapshot-store request, rendered as storage.snapshot.s3_max_retries.
+  # Leave null for Ursula's default (1). A follower's install copy, up to four requests with this
+  # timeout and these retries, must fit inside the 120 second install timeout, or the server
+  # refuses to start.
+  s3MaxRetries: null
 
 gateway:
   # Enable the gateway Deployment and Service. The gateway is the default

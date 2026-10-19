@@ -78,6 +78,14 @@ pub enum RuntimeError {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
     },
+    /// The group's engine opens on its core, a shutdown of the group began
+    /// during the open, or the open ended without an answer. The request
+    /// was refused before anything was proposed.
+    #[error("core {} is opening the engine of raft group {}", .core_id.0, .raft_group_id.0)]
+    GroupOpening {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+    },
     #[error("core {} mailbox is closed", .core_id.0)]
     MailboxClosed { core_id: CoreId },
     #[error("core {} dropped append response", .core_id.0)]
@@ -134,11 +142,27 @@ impl RuntimeError {
         }
     }
 
+    /// Whether a group whose open answered this stays closed on its core
+    /// while the node serves its other groups: its replay stopped, or its
+    /// snapshot store did not answer its restore and the core reopens it
+    /// after a back-off.
+    pub fn leaves_group_closed(&self) -> bool {
+        matches!(self, Self::GroupEngine {
+            error: GroupEngineError::Infra(
+                crate::engine::GroupInfraError::ApplyStopped { .. }
+                    | crate::engine::GroupInfraError::Snapshot(
+                        crate::engine::GroupSnapshotError::StoreUnavailable { .. }
+                    )
+            ),
+            ..
+        })
+    }
+
     pub fn status(&self) -> ErrorStatus {
         match self {
-            Self::LiveReadBackpressure { .. } | Self::GroupNotHosted { .. } => {
-                ErrorStatus::Temporary
-            }
+            Self::LiveReadBackpressure { .. }
+            | Self::GroupNotHosted { .. }
+            | Self::GroupOpening { .. } => ErrorStatus::Temporary,
             Self::GroupEngine { error, .. } => error.status(),
             Self::GroupAlreadyInstalled { .. } => ErrorStatus::Persistent,
             Self::GroupRestartAborted { .. }

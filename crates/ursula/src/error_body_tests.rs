@@ -740,3 +740,18 @@ fn every_group_engine_error_answers_its_table_row() {
         assert_eq!(crate::render::runtime_error_answer(&err), row, "{err:?}");
     }
 }
+
+/// #741: a request that reaches a group while its engine reopens is refused
+/// before proposal with `503 GROUP_RESTARTING`, as the back-off before it.
+#[test]
+fn a_group_whose_engine_opens_answers_group_restarting() {
+    let err = ursula_runtime::RuntimeError::GroupOpening {
+        core_id: ursula_shard::CoreId(0),
+        raft_group_id: ursula_shard::RaftGroupId(0),
+    };
+    assert_eq!(
+        crate::render::runtime_error_answer(&err),
+        (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::GroupRestarting)
+    );
+    assert_eq!(err.status(), ursula_runtime::ErrorStatus::Temporary);
+}

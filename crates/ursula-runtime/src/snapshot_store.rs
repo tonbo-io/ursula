@@ -1228,14 +1228,16 @@ mod s3 {
             })
         }
 
-        /// Build an S3 snapshot store from a [`ColdConfig`].
-        /// Snapshot blobs share the cold bucket/credentials and use `prefix`
-        /// (defaults to `snapshots`) for separation.
+        /// Build an S3 snapshot store from a [`ColdConfig`] and the
+        /// snapshot config. Snapshot blobs share the cold bucket and
+        /// credentials, and use the snapshot config's prefix (`snapshots`
+        /// by default) and its own request timeout and retries.
         pub fn try_new(
             config: &crate::ColdConfig,
-            prefix: SnapshotPrefix,
+            snapshot: &ursula_config::RaftSnapshotConfig,
             node_id: u64,
         ) -> Result<Self, SnapshotStoreError> {
+            let prefix = snapshot.snapshot_prefix();
             let config_problem = |problem| SnapshotStoreError::Config { problem };
             let s3 = config
                 .s3
@@ -1283,12 +1285,16 @@ mod s3 {
             // posture (#149).
             let (builder, _encryption) = crate::cold_store::apply_s3_encryption(builder, s3)
                 .map_err(SnapshotStoreError::Encryption)?;
+            // The snapshot store's own request budget, which keeps a
+            // follower's install copy inside `raft.install_snapshot_timeout`
+            // (`RaftSnapshotConfig::install_copy_budget`), not the cold
+            // store's.
             let operator = crate::cold_store::with_s3_resilience(
                 Operator::new(builder)
                     .map_err(|err| SnapshotStoreError::Open(Box::new(err)))?
                     .finish(),
-                s3.timeout.as_duration(),
-                s3.max_retries,
+                snapshot.s3_timeout.as_duration(),
+                snapshot.s3_max_retries,
             );
             Ok(Self::new(operator, prefix, node_id))
         }
@@ -1600,9 +1606,7 @@ pub fn snapshot_store_from_config(
             // `try_new` configures the OpenDAL operator with `cold_cfg.root`, so
             // this namespace must stay relative to that root.
             Ok(Some(Arc::new(S3SnapshotStore::try_new(
-                cold_cfg,
-                cfg.snapshot_prefix(),
-                node_id,
+                cold_cfg, cfg, node_id,
             )?)))
         }
         #[cfg(madsim)]

@@ -526,6 +526,8 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | `snapshotStore.backend` | `auto` | OpenRaft snapshot backend: `auto` (S3 with cold storage, inline otherwise), `inline` or `s3`. Rendered as `storage.snapshot.backend` in the generated config. |
 | `snapshotStore.prefix` | `snapshots` | Snapshot object suffix rendered as `storage.snapshot.s3_prefix`; resolved against `storage.cold.root` when present, otherwise against the S3 bucket root for S3 snapshots. |
 | `snapshotStore.driveIntervalMs` | `null` | Optional snapshot driver interval in milliseconds, at least `1`. Renders `storage.snapshot.drive_interval`. Omitted, the driver ticks every 5 seconds with external stores and every second inline. The driver always runs, so `0` is refused. |
+| `snapshotStore.s3TimeoutMs` | `null` | Optional per-attempt timeout of an S3 snapshot-store request in milliseconds. Renders `storage.snapshot.s3_timeout`. Omitted keeps the server's default of 10 seconds. A PUT sends the whole object in one attempt, so this must also cover a healthy PUT of the largest snapshot. A follower's install copy, up to four requests under this timeout and `snapshotStore.s3MaxRetries`, must fit inside the install snapshot timeout, or the server refuses to start. |
+| `snapshotStore.s3MaxRetries` | `null` | Optional retries of an S3 snapshot-store request. Renders `storage.snapshot.s3_max_retries`. Omitted keeps the server's default of 1. |
 
 ### Gateway
 

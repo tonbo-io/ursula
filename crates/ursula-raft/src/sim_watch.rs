@@ -241,6 +241,15 @@ impl<T> Receiver<T> {
         }
     }
 
+    /// Whether a value this receiver has not seen was sent, or an error
+    /// once every sender is gone, as tokio's `has_changed`.
+    pub fn has_changed(&self) -> Result<bool, error::RecvError> {
+        if self.shared.closed() {
+            return Err(error::RecvError(()));
+        }
+        Ok(self.shared.version.load(Ordering::SeqCst) != self.seen)
+    }
+
     pub fn borrow(&self) -> Ref<'_, T> {
         Ref(self.shared.read())
     }
