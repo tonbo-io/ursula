@@ -81,6 +81,8 @@ use super::run_snapshot_catch_up_inner;
 use super::run_with_madsim;
 use super::runtime_interleaving_plan_from_fault_plan;
 use super::runtime_raft_network_workload_plan_from_fault_plan;
+use super::snapshot_objects::Controls as SnapshotObjectsControls;
+use super::snapshot_objects::run_snapshot_objects_inner;
 use super::write_keys::Controls;
 use super::write_keys::run_idle_expiry_cannot_reopen_an_epoch_inner;
 use super::write_keys::run_producer_repeats_are_exactly_once_inner;
@@ -309,7 +311,26 @@ impl ThreeNodeRaftSim {
                     EngineRestartControls::default(),
                 )
             }
+            SimScenario::SnapshotObjectsStayOwned => {
+                Self::run_snapshot_objects_with_controls_report(
+                    config,
+                    SnapshotObjectsControls::default(),
+                )
+            }
         }
+    }
+
+    /// Runs the snapshot-ownership scenario (#687) with `controls`.
+    pub(super) fn run_snapshot_objects_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: SnapshotObjectsControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        report_of(
+            SimScenario::SnapshotObjectsStayOwned,
+            seed,
+            run_snapshot_objects_inner(config, controls),
+        )
     }
 
     /// Runs the engine-restart scenario (#709) with `controls`.

@@ -244,6 +244,8 @@ pub use state_machine::SNAPSHOT_HANDOFF_WAIT;
 pub use state_machine::SnapshotBuildCoordinator;
 pub use state_machine::SnapshotPermitError;
 pub use state_machine::SnapshotStartError;
+#[cfg(any(madsim, feature = "test-support"))]
+pub use state_machine::persisted_snapshot_pointer;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;

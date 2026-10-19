@@ -1720,13 +1720,24 @@ fn leased_current(
     current_snapshot: &Mutex<Option<CurrentSnapshot>>,
     holds: &Arc<SnapshotHolds>,
 ) -> Option<UrsulaSnapshot> {
+    // The negative control sends the object unheld.
+    let unheld = ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::SendHold);
     let slot = current_snapshot.lock().expect("snapshot mutex");
-    slot.as_ref().map(|current| UrsulaSnapshot {
-        meta: current.meta.clone(),
-        snapshot: SnapshotData::with_lease(
-            current.pointer_bytes.clone(),
-            current.object.as_deref().map(|key| holds.lease(key)),
-        ),
+    slot.as_ref().map(|current| {
+        if unheld && current.object.is_some() {
+            ursula_stream::sim_controls::note_fired(ursula_stream::sim_controls::Defence::SendHold);
+        }
+        UrsulaSnapshot {
+            meta: current.meta.clone(),
+            snapshot: SnapshotData::with_lease(
+                current.pointer_bytes.clone(),
+                current
+                    .object
+                    .as_deref()
+                    .filter(|_| !unheld)
+                    .map(|key| holds.lease(key)),
+            ),
+        }
     })
 }
 
@@ -1779,6 +1790,15 @@ struct PersistedSnapshot {
     meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     #[serde(with = "serde_bytes")]
     pointer_bytes: Vec<u8>,
+}
+
+/// The pointer of a group's snapshot record (`group-N.snapshot.json`),
+/// decoded as a restore decodes it, for tests and simulations that check
+/// which object a node's durable metadata names (#687).
+#[cfg(any(test, madsim, feature = "test-support"))]
+pub fn persisted_snapshot_pointer(bytes: &[u8]) -> Result<SnapshotPointer, SnapshotStoreError> {
+    let persisted = decode_snapshot_envelope::<PersistedSnapshot>(bytes)?;
+    SnapshotPointer::decode(&persisted.pointer_bytes)
 }
 
 impl RaftGroupStateMachine {
@@ -1888,9 +1908,38 @@ impl RaftGroupStateMachine {
     /// process left in the node's directory, and another one install
     /// timeout later. Restore writes nothing to the store.
     pub(crate) async fn restore_persisted_snapshot(&mut self) -> Result<(), SnapshotRestoreError> {
+        if ursula_stream::sim_controls::off(
+            ursula_stream::sim_controls::Defence::NoPassBeforeRestore,
+        ) {
+            return self.restore_after_a_pass().await;
+        }
         self.restore_snapshot_record().await?;
         self.holds.mark_restored();
         Ok(())
+    }
+
+    /// The negative control of [`Self::restore_persisted_snapshot`]: the
+    /// holds are marked restored before the restore, and the pass that owes
+    /// runs on them, naming nothing yet, before the pointer is read. No
+    /// production path runs a pass on a group's holds before its restore
+    /// ended, so this tests the restore gate's order.
+    async fn restore_after_a_pass(&mut self) -> Result<(), SnapshotRestoreError> {
+        ursula_stream::sim_controls::note_fired(
+            ursula_stream::sim_controls::Defence::NoPassBeforeRestore,
+        );
+        self.holds.mark_restored();
+        if let Err(error) = self
+            .holds
+            .collect_garbage(&self.snapshot_store, Instant::now())
+            .await
+        {
+            tracing::warn!(
+                raft_group_id = self.placement.raft_group_id.0,
+                error = %ErrorChain(&error),
+                "snapshot GC pass before the restore failed"
+            );
+        }
+        self.restore_snapshot_record().await
     }
 
     async fn restore_snapshot_record(&mut self) -> Result<(), SnapshotRestoreError> {
@@ -3120,7 +3169,11 @@ mod tests {
         let binary = std::fs::read(&metadata_path).expect("persisted record");
         let persisted =
             decode_snapshot_envelope::<PersistedSnapshot>(&binary).expect("decode binary record");
-        SnapshotPointer::decode(&persisted.pointer_bytes).expect("binary pointer");
+        let pointer = SnapshotPointer::decode(&persisted.pointer_bytes).expect("binary pointer");
+        // The simulations' decoder reads the pointer as the restore does.
+        let decoded = persisted_snapshot_pointer(&binary).expect("decode the record's pointer");
+        assert_eq!(decoded.snapshot_id, pointer.snapshot_id);
+        assert_eq!(decoded.location, pointer.location);
 
         let mut restored = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
             placement,

@@ -342,6 +342,10 @@ fn generate_engine_restart_leaves_no_work(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::EngineRestartLeavesNoWork)
 }
 
+fn generate_snapshot_objects_stay_owned(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::SnapshotObjectsStayOwned)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -481,6 +485,20 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 1029,
         kind: "engine-restart-leaves-no-work",
         generate: generate_engine_restart_leaves_no_work,
+    },
+    SeedFamily {
+        name: "snapshot-objects-stay-owned",
+        start: 546,
+        end: 549,
+        kind: "snapshot-objects-stay-owned",
+        generate: generate_snapshot_objects_stay_owned,
+    },
+    SeedFamily {
+        name: "snapshot-objects-stay-owned-extended",
+        start: 1030,
+        end: 1061,
+        kind: "snapshot-objects-stay-owned",
+        generate: generate_snapshot_objects_stay_owned,
     },
     SeedFamily {
         name: "deleted-data-after-expiry",

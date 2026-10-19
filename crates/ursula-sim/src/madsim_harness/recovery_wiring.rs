@@ -16,6 +16,7 @@ use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::UrsulaVote;
+use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
 use ursula_shard::ShardPlacement;
 
 use crate::madsim_harness::SimTrace;
@@ -276,9 +277,12 @@ impl ReversionLog {
 }
 
 /// A simulated network that traces as `sim_network_policy` does and also
-/// records every vote answer and every conflict below a matched index.
-pub(super) fn vote_recording_network_policy() -> (InProcessRaftNetworkPolicy, VoteLog, ReversionLog)
-{
+/// records every vote answer and every conflict below a matched index. With
+/// `sends`, it opens a window in that bucket for each full snapshot it
+/// delivers, while its sender holds the object it names (I3 of #687).
+pub(super) fn vote_recording_network_policy(
+    sends: Option<MemorySnapshotBucket>,
+) -> (InProcessRaftNetworkPolicy, VoteLog, ReversionLog) {
     let policy = InProcessRaftNetworkPolicy::default();
     let votes = VoteLog::default();
     let reversions = ReversionLog::default();
@@ -310,6 +314,25 @@ pub(super) fn vote_recording_network_policy() -> (InProcessRaftNetworkPolicy, Vo
                 matched_index: *matched_index,
                 target_gate: *target_gate,
             }),
+            // The windows in which a sender holds a sent object, for I3.
+            InProcessRaftNetworkEvent::FullSnapshotStarted {
+                target,
+                key: Some(key),
+                ..
+            } => {
+                if let Some(bucket) = &sends {
+                    bucket.send_started(*target, key);
+                }
+            }
+            InProcessRaftNetworkEvent::FullSnapshotEnded {
+                target,
+                key: Some(key),
+                ..
+            } => {
+                if let Some(bucket) = &sends {
+                    bucket.send_ended(*target, key);
+                }
+            }
             _ => {}
         }
         if let Some(event) = sim_event_from_network_event(event) {

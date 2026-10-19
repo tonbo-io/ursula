@@ -674,6 +674,8 @@ EXPECTED_FAMILIES = {
     "deleted-data-across-segments-extended",
     "deleted-data-after-expiry-extended",
     "engine-restart-leaves-no-work-extended",
+    "snapshot-objects-stay-owned",
+    "snapshot-objects-stay-owned-extended",
 }
 EXPECTED_RANGES = {"60..=199", "503..=504"}
 
@@ -838,6 +840,87 @@ def audit_failure_guards(argv: list[str]) -> int:
 
 
 # =============================================================================
+# 9. defences: every defence a negative control turns off is real
+# =============================================================================
+
+SIM_CONTROLS = ROOT / "crates/ursula-stream/src/sim_controls.rs"
+SIM_CRATE = ROOT / "crates/ursula-sim"
+# `Defence::X`, also as `ursula_stream::sim_controls::Defence::X`.
+DEFENCE_NAME_RE = re.compile(r"\bDefence::([A-Z][A-Za-z0-9]*)\b")
+# `set_off(Defence::X, ...)`, the path qualified or not, across lines.
+DEFENCE_SET_OFF_RE = re.compile(
+    r"\bset_off\(\s*(?:[a-z_]+::)*Defence::([A-Z][A-Za-z0-9]*)\s*,"
+)
+
+
+def _defence_variants() -> list[str]:
+    text = SIM_CONTROLS.read_text()
+    body = text.split("pub enum Defence {", 1)[1].split("\n}", 1)[0]
+    return re.findall(r"^    ([A-Z][A-Za-z0-9]*),\s*$", body, re.MULTILINE)
+
+
+def _is_test_file(path: Path) -> bool:
+    return path.name == "tests.rs" or path.stem.endswith("_tests") or "/tests/" in str(path)
+
+
+def _production_code(text: str) -> str:
+    """`text` without its comment lines and without everything from its
+    first `#[cfg(test)]` module on, which by convention ends a file."""
+    cut = re.search(r"^#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*mod ", text, re.MULTILINE)
+    if cut:
+        text = text[: cut.start()]
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("//")
+    )
+
+
+def audit_defences(argv: list[str]) -> int:
+    """Every `Defence` variant is named in production code (outside comments
+    and test modules), where a
+    switch can turn it off, and a simulation turns it off with `set_off`, so
+    no negative control switches a defence that does nothing and no defence
+    goes without its control."""
+    argparse.ArgumentParser(prog="dst defences").parse_args(argv)
+    variants = _defence_variants()
+    production: set[str] = set()
+    switched: set[str] = set()
+    for path in sorted((ROOT / "crates").rglob("*.rs")):
+        if "/target/" in str(path) or path == SIM_CONTROLS:
+            continue
+        text = path.read_text()
+        if SIM_CRATE in path.parents:
+            switched.update(DEFENCE_SET_OFF_RE.findall(text))
+        elif not _is_test_file(path):
+            production.update(DEFENCE_NAME_RE.findall(_production_code(text)))
+    errors = [
+        f"Defence::{name} is named in no production code outside ursula-sim"
+        for name in variants
+        if name not in production
+    ] + [
+        f"Defence::{name} is switched off by no simulation (`set_off` in ursula-sim)"
+        for name in variants
+        if name not in switched
+    ]
+    if not variants:
+        errors.append(f"no `Defence` variants parsed from {rel(SIM_CONTROLS)}")
+    slots = re.findall(r"Defence::([A-Z][A-Za-z0-9]*) => (\d+),", SIM_CONTROLS.read_text())
+    if sorted(name for name, _ in slots) != sorted(variants):
+        errors.append("the switches' `slot` arms do not name every `Defence` variant once")
+    if sorted(int(slot) for _, slot in slots) != list(range(len(variants))):
+        errors.append("the switches' slots are not 0 to the variant count less one")
+    arrays = set(re.findall(r"\[(?:bool|u64|false|0); (\d+)\]", SIM_CONTROLS.read_text()))
+    if arrays != {str(len(variants))}:
+        errors.append(f"the switch arrays hold {sorted(arrays)} slots for {len(variants)} variants")
+    if errors:
+        print("DST defences audit failed:", file=sys.stderr)
+        for error in errors:
+            print(f"- {error}", file=sys.stderr)
+        return 1
+    print(f"OK: all {len(variants)} defences have a production site and a simulation switch.")
+    return 0
+
+
+# =============================================================================
 # meta: run every audit
 # =============================================================================
 
@@ -892,6 +975,7 @@ AUDITS: dict[str, callable] = {
     "seed-inventory": audit_seed_inventory,
     "failure-guards": audit_failure_guards,
     "sim-patches": audit_sim_patches,
+    "defences": audit_defences,
 }
 
 

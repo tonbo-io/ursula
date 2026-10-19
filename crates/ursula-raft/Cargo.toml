@@ -82,6 +82,8 @@ harness = false
 # Lets other crates' tests run deterministic apply bugs. Never enable it in a
 # shipped build.
 fault-injection = []
+# Lets other crates' tests read what a node's snapshot record names.
+test-support = []
 
 [lints]
 workspace = true

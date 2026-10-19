@@ -163,6 +163,7 @@ pub enum SimScenario {
     RecoveryPlanMembershipRollback,
     DeletedDataLeavesWithinBound,
     EngineRestartLeavesNoWork,
+    SnapshotObjectsStayOwned,
 }
 
 #[derive(Clone)]
@@ -215,6 +216,7 @@ impl SimScenario {
             Self::RecoveryPlanMembershipRollback => "recovery-plan-membership-rollback",
             Self::DeletedDataLeavesWithinBound => "deleted-data-leaves-within-bound",
             Self::EngineRestartLeavesNoWork => "engine-restart-leaves-no-work",
+            Self::SnapshotObjectsStayOwned => "snapshot-objects-stay-owned",
         }
     }
 }
@@ -295,6 +297,9 @@ impl SimSchedule {
         if ROUTING_BEFORE_BODY_SEEDS.contains(&seed) {
             return Self::for_scenario(seed, SimScenario::RoutingBeforeBodyUnderLeaderChurn);
         }
+        if SNAPSHOT_OBJECTS_SEEDS.contains(&seed) {
+            return Self::for_scenario(seed, SimScenario::SnapshotObjectsStayOwned);
+        }
         let scenario = match seed % 12 {
             0 => SimScenario::NoFaultBaseline,
             1 => SimScenario::PartitionHeal,
@@ -355,6 +360,7 @@ pub const RUNTIME_RAFT_SNAPSHOT_INSTALL_SEEDS: std::ops::RangeInclusive<u64> = 1
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_SEEDS: std::ops::RangeInclusive<u64> = 137..=156;
 pub const HTTP_PROTOCOL_SURFACE_RANDOMIZED_SEEDS: std::ops::RangeInclusive<u64> = 277..=296;
 pub const ROUTING_BEFORE_BODY_SEEDS: std::ops::RangeInclusive<u64> = 500..=504;
+pub const SNAPSHOT_OBJECTS_SEEDS: std::ops::RangeInclusive<u64> = 546..=549;
 pub const RUNTIME_RAFT_NETWORK_PARTITION_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 212..=216;
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_COLD_READ_FAILURE_SEEDS: std::ops::RangeInclusive<u64> =
     322..=326;
@@ -569,6 +575,8 @@ mod membership_rollback;
 mod recovery_wiring;
 mod routing;
 mod runtime_network;
+mod snapshot_checks;
+mod snapshot_objects;
 mod write_keys;
 use http::run_http_live_limit_protocol_surface_inner;
 use http::run_http_live_protocol_surface_inner;

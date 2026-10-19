@@ -382,7 +382,7 @@ impl SnapshotHolds {
         store: &SharedSnapshotStore,
         staged: StagedSnapshot,
     ) -> Result<HeldWrite, HeldWriteError> {
-        let (key, lease) = match &staged {
+        let key = match &staged {
             StagedSnapshot::Object(object) => {
                 let key = object.path();
                 // An `OwnedLocation` names no group, so the group of the
@@ -393,23 +393,37 @@ impl SnapshotHolds {
                         key,
                     });
                 }
-                let lease = self.lease(&key);
-                (key, Some(lease))
+                Some(key)
             }
-            StagedSnapshot::Inline { .. } => (String::new(), None),
+            StagedSnapshot::Inline { .. } => None,
         };
+        // The negative control takes the lease once the PUT answered.
+        let lease_after_put = key.is_some()
+            && ursula_stream::sim_controls::off(
+                ursula_stream::sim_controls::Defence::LeaseBeforePut,
+            );
+        let mut lease = key
+            .as_deref()
+            .filter(|_| !lease_after_put)
+            .map(|key| self.lease(key));
         let late = LateWrite {
-            holds: lease.is_some().then_some(self.as_ref()),
+            holds: key.is_some().then_some(self.as_ref()),
         };
         let location =
             store
                 .write_staged(staged)
                 .await
                 .map_err(|source| HeldWriteError::Write {
-                    key: key.clone(),
+                    key: key.clone().unwrap_or_default(),
                     source,
                 })?;
-        if lease.is_some() {
+        if let Some(key) = key {
+            if lease_after_put {
+                ursula_stream::sim_controls::note_fired(
+                    ursula_stream::sim_controls::Defence::LeaseBeforePut,
+                );
+                lease = Some(self.lease(&key));
+            }
             store
                 .verify_uploaded(location.location())
                 .await
@@ -599,6 +613,13 @@ impl SnapshotHolds {
                 return Ok(SnapshotPass::NotRestored);
             }
             state.passes.take_due(now);
+            // The negative control: a pass that lists and deletes nothing.
+            if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::SnapshotGc) {
+                ursula_stream::sim_controls::note_fired(
+                    ursula_stream::sim_controls::Defence::SnapshotGc,
+                );
+                return Ok(SnapshotPass::Collected { deleted: 0 });
+            }
         }
         let pass = self.pass(store).await;
         let failures = {
@@ -619,13 +640,25 @@ impl SnapshotHolds {
     }
 
     async fn pass(&self, store: &SharedSnapshotStore) -> Result<SnapshotPass, SnapshotGcError> {
+        // The negative control reads the holds before the LIST.
+        let held_before_list =
+            ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::HoldsAfterList)
+                .then(|| self.held_keys());
         let listing = store
             .list_own(self.group)
             .await
             .map_err(SnapshotGcError::List)?;
         // Read after the LIST returned: an object whose PUT the LIST shows
         // was held before that PUT was sent.
-        let held = self.held_keys();
+        let held = match held_before_list {
+            Some(held) => {
+                ursula_stream::sim_controls::note_fired(
+                    ursula_stream::sim_controls::Defence::HoldsAfterList,
+                );
+                held
+            }
+            None => self.held_keys(),
+        };
         if !listing.foreign.is_empty() {
             tracing::warn!(
                 raft_group_id = self.group.0,

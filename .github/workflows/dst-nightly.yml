@@ -33,7 +33,7 @@ jobs:
         with:
           rustflags: ""
 
-      - name: Audit DST guards (all 8 audits) + write seed/nondet reports
+      - name: Audit DST guards (all 9 audits) + write seed/nondet reports
         run: |
           mkdir -p target
           python3 -m scripts.dst all
@@ -178,7 +178,9 @@ jobs:
             --seed-family deleted-data-after-expiry \
             --seed-family deleted-data-after-expiry-extended \
             --seed-family engine-restart-leaves-no-work \
-            --seed-family engine-restart-leaves-no-work-extended
+            --seed-family engine-restart-leaves-no-work-extended \
+            --seed-family snapshot-objects-stay-owned \
+            --seed-family snapshot-objects-stay-owned-extended
 
       # Bounded-state DST default seeds (bounded-stream-state DST invariants): producer
       # state across a mid-stream snapshot install (F3, Invariant 12; fixed seed), external

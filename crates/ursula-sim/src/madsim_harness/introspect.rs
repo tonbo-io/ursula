@@ -304,9 +304,10 @@ pub(super) fn cold_store_operation_name(operation: ColdStoreOperation) -> &'stat
     }
 }
 
-/// The trace event of a network event. Vote answers and conflicts below a
-/// matched index are not traced: the recovery-gate scenarios observe them
-/// directly, and recorded traces stay as they were.
+/// The trace event of a network event. Vote answers, conflicts below a
+/// matched index and the windows of full snapshots are not traced: the
+/// scenarios that need them observe them directly, and recorded traces stay
+/// as they were.
 pub(super) fn sim_event_from_network_event(event: InProcessRaftNetworkEvent) -> Option<SimEvent> {
     Some(match event {
         InProcessRaftNetworkEvent::PolicyChanged { action } => {
@@ -350,7 +351,9 @@ pub(super) fn sim_event_from_network_event(event: InProcessRaftNetworkEvent) -> 
             kind: network_rpc_kind_name(kind).to_owned(),
         },
         InProcessRaftNetworkEvent::VoteAnswered { .. }
-        | InProcessRaftNetworkEvent::ConflictBelowMatching { .. } => return None,
+        | InProcessRaftNetworkEvent::ConflictBelowMatching { .. }
+        | InProcessRaftNetworkEvent::FullSnapshotStarted { .. }
+        | InProcessRaftNetworkEvent::FullSnapshotEnded { .. } => return None,
     })
 }
 
