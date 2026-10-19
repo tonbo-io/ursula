@@ -340,20 +340,34 @@ mod tests {
                     }
                 },
             ));
-            let log = prop_oneof![
-                Just(GroupLogState::Empty),
-                Just(GroupLogState::Initialized),
-                Just(GroupLogState::Recovering),
+            // Every log state and every cut, behind matches with no wildcard.
+            let states = [
+                GroupLogState::Empty,
+                GroupLogState::Initialized,
+                GroupLogState::Recovering,
             ];
-            let cut = prop_oneof![
-                Just(PlanCut::NoCut),
-                (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(|(term, node_id, index)| {
-                    PlanCut::Pending {
-                        keep: openraft::LogId::new(LeaderId::new(term, node_id), index),
+            for state in states {
+                match state {
+                    GroupLogState::Empty
+                    | GroupLogState::Initialized
+                    | GroupLogState::Recovering => {}
+                }
+            }
+            let log = proptest::sample::select(states.to_vec());
+            let cut = (0..3_u8, any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(kind, term, node_id, index)| {
+                    let cut = match kind {
+                        0 => PlanCut::NoCut,
+                        1 => PlanCut::Pending {
+                            keep: openraft::LogId::new(LeaderId::new(term, node_id), index),
+                        },
+                        _ => PlanCut::Done,
+                    };
+                    match cut {
+                        PlanCut::NoCut | PlanCut::Pending { .. } | PlanCut::Done => cut,
                     }
-                }),
-                Just(PlanCut::Done),
-            ];
+                },
+            );
             let recovery =
                 proptest::option::of((any::<u64>(), any::<u64>(), any::<u64>(), cut).prop_map(
                     |(leader, point, leader_term, cut)| RecoveryRecord {

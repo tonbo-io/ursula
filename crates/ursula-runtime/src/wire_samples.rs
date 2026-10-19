@@ -100,7 +100,7 @@ fn producer() -> ProducerRequest {
         producer_epoch: 2,
         producer_seq: 3,
         digest: Some(Bytes::from_static(&[0xd1; 32])),
-        content_fault: i32::from(ContentFaultV1::ContentFaultDigestMismatch),
+        content_fault: i32::from(ContentFaultV1::ContentFaultMissingContentType),
     }
 }
 
@@ -168,9 +168,19 @@ fn producer_ack(delivery: ProducerDelivery) -> ProducerAck {
 /// Every [`StreamCommand`] variant once, in the [`GroupWriteCommand`] a
 /// Raft entry carries.
 pub fn group_write_commands() -> Vec<GroupWriteCommand> {
-    stream_commands()
-        .into_iter()
-        .map(GroupWriteCommand::Stream)
+    // One witness per variant, each standing for its family.
+    let witnesses = every!(GroupWriteCommand {
+        GroupWriteCommand::Stream(_) => GroupWriteCommand::Stream(StreamCommand::AckColdGc {
+            up_to_seq: 21,
+        }),
+    });
+    witnesses
+        .iter()
+        .flat_map(|witness| match witness {
+            GroupWriteCommand::Stream(_) => {
+                stream_commands().into_iter().map(GroupWriteCommand::Stream)
+            }
+        })
         .collect()
 }
 
@@ -324,9 +334,9 @@ fn small_stream_snapshot() -> StreamSnapshot {
         erased_buckets: Vec::new(),
         streams: Vec::new(),
         pending_cold_gc: Vec::new(),
-        next_cold_gc_seq: 0,
+        next_cold_gc_seq: 1,
         bucket_usage: Vec::new(),
-        last_created_at_ms: 0,
+        last_created_at_ms: 2,
         history: None,
     }
 }
@@ -828,18 +838,66 @@ fn vary_command_by(command: StreamCommand, mask: &mut Mask) -> StreamCommand {
             command: Box::new(vary_command_by(*command, mask)),
         },
         // No `Option` in these.
-        command @ (StreamCommand::CreateBucket { .. }
-        | StreamCommand::TouchStreamAccess { .. }
-        | StreamCommand::FlushCold { .. }
-        | StreamCommand::CompactCold { .. }
-        | StreamCommand::DeleteStream { .. }
-        | StreamCommand::PurgeBucket { .. }
-        | StreamCommand::AckColdGc { .. }
-        | StreamCommand::DeferColdGc { .. }
-        | StreamCommand::NewHistory { .. }
-        | StreamCommand::TidyStream { .. }
-        | StreamCommand::ExpireStreams { .. }
-        | StreamCommand::OffloadColdRefs { .. }) => command,
+        StreamCommand::CreateBucket { bucket_id } => StreamCommand::CreateBucket { bucket_id },
+        StreamCommand::TouchStreamAccess {
+            stream_id,
+            now_ms,
+            renew_ttl,
+        } => StreamCommand::TouchStreamAccess {
+            stream_id,
+            now_ms,
+            renew_ttl,
+        },
+        StreamCommand::FlushCold {
+            stream_id,
+            chunk,
+            cold_generation,
+        } => StreamCommand::FlushCold {
+            stream_id,
+            chunk,
+            cold_generation,
+        },
+        StreamCommand::CompactCold {
+            stream_id,
+            old_chunks,
+            replacement,
+            gc_not_before_ms,
+        } => StreamCommand::CompactCold {
+            stream_id,
+            old_chunks,
+            replacement,
+            gc_not_before_ms,
+        },
+        StreamCommand::DeleteStream { stream_id, now_ms } => {
+            StreamCommand::DeleteStream { stream_id, now_ms }
+        }
+        StreamCommand::PurgeBucket { bucket_id } => StreamCommand::PurgeBucket { bucket_id },
+        StreamCommand::AckColdGc { up_to_seq } => StreamCommand::AckColdGc { up_to_seq },
+        StreamCommand::DeferColdGc { seq, not_before_ms } => {
+            StreamCommand::DeferColdGc { seq, not_before_ms }
+        }
+        StreamCommand::NewHistory {
+            history,
+            now_ms,
+            previous,
+            kept,
+            leader,
+        } => StreamCommand::NewHistory {
+            history,
+            now_ms,
+            previous,
+            kept,
+            leader,
+        },
+        StreamCommand::TidyStream { stream_id, now_ms } => {
+            StreamCommand::TidyStream { stream_id, now_ms }
+        }
+        StreamCommand::ExpireStreams { now_ms, limit } => {
+            StreamCommand::ExpireStreams { now_ms, limit }
+        }
+        StreamCommand::OffloadColdRefs { stream_id, refs } => {
+            StreamCommand::OffloadColdRefs { stream_id, refs }
+        }
     }
 }
 
@@ -862,62 +920,213 @@ fn vary_ack(ack: Option<ProducerAck>, mask: &mut Mask) -> Option<ProducerAck> {
 pub fn vary_response(response: GroupWriteResponse, mask: u64) -> GroupWriteResponse {
     let mask = &mut Mask(mask);
     match response {
-        GroupWriteResponse::CreateStream(response) => {
-            GroupWriteResponse::CreateStream(CreateStreamResponse {
-                hot_backlog: mask.keep(response.hot_backlog),
-                ..response
-            })
-        }
-        GroupWriteResponse::Append(response) => GroupWriteResponse::Append(AppendResponse {
-            producer: vary_ack(response.producer, mask),
-            ..response
+        GroupWriteResponse::CreateStream(CreateStreamResponse {
+            placement,
+            next_offset,
+            closed,
+            already_exists,
+            group_commit_index,
+            incarnation,
+            hot_backlog,
+        }) => GroupWriteResponse::CreateStream(CreateStreamResponse {
+            placement,
+            next_offset,
+            closed,
+            already_exists,
+            group_commit_index,
+            incarnation,
+            hot_backlog: mask.keep(hot_backlog),
         }),
-        GroupWriteResponse::PublishSnapshot(response) => {
-            GroupWriteResponse::PublishSnapshot(PublishSnapshotResponse {
-                hot_backlog: mask.keep(response.hot_backlog),
-                ..response
-            })
-        }
-        GroupWriteResponse::AdvanceRetention(response) => {
-            GroupWriteResponse::AdvanceRetention(AdvanceRetentionResponse {
-                hot_backlog: mask.keep(response.hot_backlog),
-                ..response
-            })
-        }
-        GroupWriteResponse::FlushCold(response) => {
-            GroupWriteResponse::FlushCold(FlushColdResponse {
-                hot_backlog: mask.keep(response.hot_backlog),
-                ..response
-            })
-        }
-        GroupWriteResponse::CloseStream(response) => {
-            GroupWriteResponse::CloseStream(CloseStreamResponse {
-                producer: vary_ack(response.producer, mask),
-                ..response
-            })
-        }
-        GroupWriteResponse::DeleteStream(response) => {
-            GroupWriteResponse::DeleteStream(DeleteStreamResponse {
-                hot_backlog: mask.keep(response.hot_backlog),
-                ..response
-            })
-        }
-        GroupWriteResponse::DeferColdGc(response) => {
-            GroupWriteResponse::DeferColdGc(DeferColdGcResponse {
-                new_seq: mask.keep(response.new_seq),
-                ..response
-            })
-        }
-        // No `Option` in these.
-        response @ (GroupWriteResponse::TouchStreamAccess(_)
-        | GroupWriteResponse::CompactCold(_)
-        | GroupWriteResponse::AckColdGc(_)
-        | GroupWriteResponse::PurgeBucket(_)
-        | GroupWriteResponse::ImportGroupState(_)
-        | GroupWriteResponse::NewHistory(_)
-        | GroupWriteResponse::TidyStream(_)
-        | GroupWriteResponse::OffloadColdRefs(_)
-        | GroupWriteResponse::ExpireStreams(_)) => response,
+        GroupWriteResponse::Append(AppendResponse {
+            placement,
+            start_offset,
+            next_offset,
+            stream_append_count,
+            group_commit_index,
+            closed,
+            producer,
+            stream_hot_bytes,
+            group_hot_bytes,
+            incarnation,
+        }) => GroupWriteResponse::Append(AppendResponse {
+            placement,
+            start_offset,
+            next_offset,
+            stream_append_count,
+            group_commit_index,
+            closed,
+            producer: vary_ack(producer, mask),
+            stream_hot_bytes,
+            group_hot_bytes,
+            incarnation,
+        }),
+        GroupWriteResponse::PublishSnapshot(PublishSnapshotResponse {
+            placement,
+            snapshot_offset,
+            snapshot_digest,
+            group_commit_index,
+            incarnation,
+            hot_backlog,
+        }) => GroupWriteResponse::PublishSnapshot(PublishSnapshotResponse {
+            placement,
+            snapshot_offset,
+            snapshot_digest,
+            group_commit_index,
+            incarnation,
+            hot_backlog: mask.keep(hot_backlog),
+        }),
+        GroupWriteResponse::AdvanceRetention(AdvanceRetentionResponse {
+            placement,
+            retained_offset,
+            group_commit_index,
+            incarnation,
+            hot_backlog,
+        }) => GroupWriteResponse::AdvanceRetention(AdvanceRetentionResponse {
+            placement,
+            retained_offset,
+            group_commit_index,
+            incarnation,
+            hot_backlog: mask.keep(hot_backlog),
+        }),
+        GroupWriteResponse::TouchStreamAccess(TouchStreamAccessResponse {
+            placement,
+            changed,
+            expired,
+            group_commit_index,
+        }) => GroupWriteResponse::TouchStreamAccess(TouchStreamAccessResponse {
+            placement,
+            changed,
+            expired,
+            group_commit_index,
+        }),
+        GroupWriteResponse::FlushCold(FlushColdResponse {
+            placement,
+            hot_start_offset,
+            group_commit_index,
+            hot_backlog,
+        }) => GroupWriteResponse::FlushCold(FlushColdResponse {
+            placement,
+            hot_start_offset,
+            group_commit_index,
+            hot_backlog: mask.keep(hot_backlog),
+        }),
+        GroupWriteResponse::CompactCold(CompactColdResponse {
+            placement,
+            compacted_chunks,
+            compacted_bytes,
+            group_commit_index,
+        }) => GroupWriteResponse::CompactCold(CompactColdResponse {
+            placement,
+            compacted_chunks,
+            compacted_bytes,
+            group_commit_index,
+        }),
+        GroupWriteResponse::CloseStream(CloseStreamResponse {
+            placement,
+            next_offset,
+            group_commit_index,
+            producer,
+            incarnation,
+        }) => GroupWriteResponse::CloseStream(CloseStreamResponse {
+            placement,
+            next_offset,
+            group_commit_index,
+            producer: vary_ack(producer, mask),
+            incarnation,
+        }),
+        GroupWriteResponse::DeleteStream(DeleteStreamResponse {
+            placement,
+            group_commit_index,
+            expired,
+            hot_backlog,
+        }) => GroupWriteResponse::DeleteStream(DeleteStreamResponse {
+            placement,
+            group_commit_index,
+            expired,
+            hot_backlog: mask.keep(hot_backlog),
+        }),
+        GroupWriteResponse::AckColdGc(AckColdGcResponse {
+            placement,
+            removed,
+            group_commit_index,
+        }) => GroupWriteResponse::AckColdGc(AckColdGcResponse {
+            placement,
+            removed,
+            group_commit_index,
+        }),
+        GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
+            placement,
+            removed_streams,
+            pending_cold_gc_entries,
+            group_commit_index,
+        }) => GroupWriteResponse::PurgeBucket(PurgeBucketResponse {
+            placement,
+            removed_streams,
+            pending_cold_gc_entries,
+            group_commit_index,
+        }),
+        GroupWriteResponse::ImportGroupState(ImportGroupStateResponse {
+            placement,
+            buckets,
+            streams,
+            group_commit_index,
+            history,
+            already,
+        }) => GroupWriteResponse::ImportGroupState(ImportGroupStateResponse {
+            placement,
+            buckets,
+            streams,
+            group_commit_index,
+            history,
+            already,
+        }),
+        GroupWriteResponse::NewHistory(NewHistoryResponse {
+            placement,
+            history,
+            group_commit_index,
+        }) => GroupWriteResponse::NewHistory(NewHistoryResponse {
+            placement,
+            history,
+            group_commit_index,
+        }),
+        GroupWriteResponse::TidyStream(TidyStreamResponse {
+            placement,
+            debt_remaining,
+            group_commit_index,
+        }) => GroupWriteResponse::TidyStream(TidyStreamResponse {
+            placement,
+            debt_remaining,
+            group_commit_index,
+        }),
+        GroupWriteResponse::DeferColdGc(DeferColdGcResponse {
+            placement,
+            new_seq,
+            group_commit_index,
+        }) => GroupWriteResponse::DeferColdGc(DeferColdGcResponse {
+            placement,
+            new_seq: mask.keep(new_seq),
+            group_commit_index,
+        }),
+        GroupWriteResponse::OffloadColdRefs(OffloadStreamColdRefsResponse {
+            placement,
+            removed,
+            remaining,
+            group_commit_index,
+        }) => GroupWriteResponse::OffloadColdRefs(OffloadStreamColdRefsResponse {
+            placement,
+            removed,
+            remaining,
+            group_commit_index,
+        }),
+        GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
+            placement,
+            removed,
+            group_commit_index,
+        }) => GroupWriteResponse::ExpireStreams(ExpireStreamsResponse {
+            placement,
+            removed,
+            group_commit_index,
+        }),
     }
 }
 

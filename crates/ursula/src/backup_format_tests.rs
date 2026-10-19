@@ -661,14 +661,14 @@ async fn a_backup_round_trips_through_ursulactl() {
     assert_eq!((report.groups, report.buckets, report.streams), (1, 2, 7));
 
     // A target without the source's cold objects is refused before the first
-    // import, and each refusal names every object it found missing. The
-    // objects a missing index page references come to light once the page
-    // is there, so an operator copies what a refusal names until the
-    // restore applies.
+    // import, and each refusal names objects it found missing. The objects a
+    // missing index page references come to light once the page is there,
+    // so an operator copies what a refusal names until the restore applies.
     let target_cold: ColdStoreHandle = Arc::new(ColdStore::memory().expect("memory cold store"));
     let target = cluster(target_cold.clone());
     let (client, server) = serve(&target).await;
     let mut copied = std::collections::BTreeSet::new();
+    let mut round = 0_usize;
     let report = loop {
         let missing = match ursula_ctl::backup::restore(&client, &store).await {
             Ok(report) => break report,
@@ -677,19 +677,24 @@ async fn a_backup_round_trips_through_ursulactl() {
                 referenced,
                 sample,
             }) => {
+                if round == 0 {
+                    assert_eq!(missing, referenced, "the target holds no cold object");
+                }
                 assert!(missing > 0 && missing <= referenced);
+                // `ursulactl` names at most five missing objects.
                 assert_eq!(
                     u64::try_from(sample.len()).expect("a count"),
-                    missing,
-                    "the refusal names every missing object: {sample:?}"
+                    missing.min(5),
+                    "{sample:?}"
                 );
                 sample
             }
             Err(other) => panic!("expected missing cold objects, got {other}"),
         };
+        round = round.saturating_add(1);
         assert!(
-            copied.len() < 8,
-            "the refusals keep naming objects: {copied:?}"
+            round <= 4,
+            "restore round {round} still refused: {missing:?}"
         );
         for key in missing {
             assert!(!copied.contains(&key), "{key} was copied before");

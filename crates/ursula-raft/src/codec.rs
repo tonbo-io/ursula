@@ -109,6 +109,26 @@ mod tests {
     type Entry = EntryOf<UrsulaRaftTypeConfig>;
     type TransferLeaderError = openraft::raft::TransferLeaderError<UrsulaRaftTypeConfig>;
 
+    /// `[(name, value), ...]` for one named value per listed pattern, which
+    /// must cover every variant of `$ty`: the patterns form a match with no
+    /// wildcard, and each value must match its own pattern. A new variant
+    /// does not compile until it has a sample.
+    macro_rules! every {
+        ($ty:ty { $($pattern:pat => $name:literal: $value:expr),+ $(,)? }) => {{
+            let samples: Vec<(&'static str, $ty)> = vec![$({
+                let value: $ty = $value;
+                assert!(matches!(&value, $pattern), "{} is a sample of another variant", $name);
+                ($name, value)
+            }),+];
+            for (_, value) in &samples {
+                match value {
+                    $($pattern => {})+
+                }
+            }
+            samples
+        }};
+    }
+
     /// What the persisted-envelopes fixture says produced it.
     const ENVELOPES_PRODUCER: &str =
         "rmp_serde::to_vec_named, format epoch 5, openraft 0.10.0-alpha.37";
@@ -158,9 +178,9 @@ mod tests {
                 erased_buckets: Vec::new(),
                 streams: Vec::new(),
                 pending_cold_gc: Vec::new(),
-                next_cold_gc_seq: 0,
+                next_cold_gc_seq: 1,
                 bucket_usage: Vec::new(),
-                last_created_at_ms: 0,
+                last_created_at_ms: 2,
                 history,
             }),
             history: std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).expect("non-zero"),
@@ -310,8 +330,11 @@ mod tests {
         );
 
         // One pointer of every location.
-        let pointers = [
+        let pointers = every!(ursula_runtime::SnapshotPointer {
             ursula_runtime::SnapshotPointer {
+                location: ursula_runtime::SnapshotLocation::Inline { .. },
+                ..
+            } => "snapshot_pointer_inline": ursula_runtime::SnapshotPointer {
                 snapshot_id: crate::state_machine::group_snapshot_id(
                     ursula_shard::RaftGroupId(3),
                     Some(log_id(6, 1, 17)),
@@ -321,6 +344,9 @@ mod tests {
                 },
             },
             ursula_runtime::SnapshotPointer {
+                location: ursula_runtime::SnapshotLocation::Local { .. },
+                ..
+            } => "snapshot_pointer_local": ursula_runtime::SnapshotPointer {
                 snapshot_id: crate::state_machine::group_snapshot_id(
                     ursula_shard::RaftGroupId(4),
                     None,
@@ -330,21 +356,20 @@ mod tests {
                     size_bytes: 512,
                 },
             },
-            s3_pointer(),
-        ];
-        for pointer in &pointers {
-            let name = match &pointer.location {
-                ursula_runtime::SnapshotLocation::Inline { .. } => "snapshot_pointer_inline",
-                ursula_runtime::SnapshotLocation::Local { .. } => "snapshot_pointer_local",
-                ursula_runtime::SnapshotLocation::S3 { .. } => "snapshot_pointer",
-            };
+            ursula_runtime::SnapshotPointer {
+                location: ursula_runtime::SnapshotLocation::S3 { .. },
+                ..
+            } => "snapshot_pointer": s3_pointer(),
+        });
+        for (name, pointer) in &pointers {
             add(samples, name, pointer);
         }
 
         // One record of every kind in the journal of core 1.
-        let records = [
-            RaftGroupLogRecord::SaveCommitted(Some(log_id(7, 2, 18))),
-            RaftGroupLogRecord::Append(vec![
+        let records = every!(RaftGroupLogRecord {
+            RaftGroupLogRecord::SaveCommitted(_) => "journal_save_committed":
+                RaftGroupLogRecord::SaveCommitted(Some(log_id(7, 2, 18))),
+            RaftGroupLogRecord::Append(_) => "journal_append": RaftGroupLogRecord::Append(vec![
                 normal(19, StreamCommand::Append {
                     stream_id: ursula_shard::BucketStreamId::new("tenant", "orders"),
                     content_type: Some("text/plain".to_owned()),
@@ -359,32 +384,28 @@ mod tests {
                     payload: openraft::EntryPayload::Blank,
                 },
             ]),
-            RaftGroupLogRecord::FrozenAppend(Box::new(crate::log_store::FrozenAppend {
-                archive: crate::log_store::ArchiveRef {
-                    id: crate::log_store::ArchiveId {
-                        group_id: 7,
-                        segment: 3,
-                        offset: 4096,
-                        first_index: 17,
-                        last_index: 19,
-                        content_hash: [0xe1; 32],
+            RaftGroupLogRecord::FrozenAppend(_) => "journal_frozen_append":
+                RaftGroupLogRecord::FrozenAppend(Box::new(crate::log_store::FrozenAppend {
+                    archive: crate::log_store::ArchiveRef {
+                        id: crate::log_store::ArchiveId {
+                            group_id: 7,
+                            segment: 3,
+                            offset: 4096,
+                            first_index: 17,
+                            last_index: 19,
+                            content_hash: [0xe1; 32],
+                        },
+                        bytes: 8192,
+                        checksum: 0xdead_beef,
                     },
-                    bytes: 8192,
-                    checksum: 0xdead_beef,
-                },
-                log_ids: vec![log_id(7, 2, 17), log_id(7, 2, 19)],
-            })),
-            RaftGroupLogRecord::TruncateAfter(Some(log_id(6, 3, 16))),
-            RaftGroupLogRecord::Purge(log_id(5, 4, 15)),
-        ];
-        for record in records {
-            let name = match &record {
-                RaftGroupLogRecord::SaveCommitted(_) => "journal_save_committed",
-                RaftGroupLogRecord::Append(_) => "journal_append",
-                RaftGroupLogRecord::FrozenAppend(_) => "journal_frozen_append",
-                RaftGroupLogRecord::TruncateAfter(_) => "journal_truncate_after",
-                RaftGroupLogRecord::Purge(_) => "journal_purge",
-            };
+                    log_ids: vec![log_id(7, 2, 17), log_id(7, 2, 19)],
+                })),
+            RaftGroupLogRecord::TruncateAfter(_) => "journal_truncate_after":
+                RaftGroupLogRecord::TruncateAfter(Some(log_id(6, 3, 16))),
+            RaftGroupLogRecord::Purge(_) => "journal_purge":
+                RaftGroupLogRecord::Purge(log_id(5, 4, 15)),
+        });
+        for (name, record) in records {
             add(samples, name, &CoreJournalRecord {
                 group_id: 7,
                 record,
@@ -405,25 +426,21 @@ mod tests {
                 leader_commit: Some(log_id(7, 2, 17)),
             },
         );
-        for response in [
-            crate::types::UrsulaAppendEntriesResponse::Success,
-            crate::types::UrsulaAppendEntriesResponse::PartialSuccess(Some(log())),
-            crate::types::UrsulaAppendEntriesResponse::Conflict,
-            crate::types::UrsulaAppendEntriesResponse::HigherVote(openraft::Vote::new_committed(
-                9, 4,
-            )),
-        ] {
-            let name = match &response {
-                openraft::raft::AppendEntriesResponse::Success => "append_entries_success",
-                openraft::raft::AppendEntriesResponse::PartialSuccess(_) => {
-                    "append_entries_partial_success"
-                }
-                openraft::raft::AppendEntriesResponse::Conflict => "append_entries_conflict",
-                openraft::raft::AppendEntriesResponse::HigherVote(_) => {
-                    "append_entries_higher_vote"
-                }
-            };
-            add(samples, name, &response);
+        let responses = every!(crate::types::UrsulaAppendEntriesResponse {
+            openraft::raft::AppendEntriesResponse::Success => "append_entries_success":
+                openraft::raft::AppendEntriesResponse::Success,
+            openraft::raft::AppendEntriesResponse::PartialSuccess(_) =>
+                "append_entries_partial_success":
+                openraft::raft::AppendEntriesResponse::PartialSuccess(Some(log())),
+            openraft::raft::AppendEntriesResponse::Conflict => "append_entries_conflict":
+                openraft::raft::AppendEntriesResponse::Conflict,
+            openraft::raft::AppendEntriesResponse::HigherVote(_) => "append_entries_higher_vote":
+                openraft::raft::AppendEntriesResponse::HigherVote(openraft::Vote::new_committed(
+                    9, 4,
+                )),
+        });
+        for (name, response) in &responses {
+            add(samples, name, response);
         }
         add(samples, "vote_request", &crate::types::UrsulaVoteRequest {
             vote: openraft::Vote::new(8, 3),
@@ -453,24 +470,21 @@ mod tests {
                 Some(log()),
             ),
         );
-        let responses: [openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>; 3] = [
-            Ok(()),
-            Err(TransferLeaderError::VoteChanged {
-                expected: vote(),
-                actual: openraft::Vote::new_committed(8, 3),
-            }),
-            Err(TransferLeaderError::LogNotFlushed {
-                expected: Some(log()),
-                actual: Some(log_id(6, 3, 16)),
-            }),
-        ];
-        for response in responses {
-            let name = match &response {
-                Ok(()) => "transfer_leader_ok",
-                Err(TransferLeaderError::VoteChanged { .. }) => "transfer_leader_vote_changed",
-                Err(TransferLeaderError::LogNotFlushed { .. }) => "transfer_leader_log_not_flushed",
-            };
-            add(samples, name, &response);
+        let responses = every!(openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig> {
+            Ok(()) => "transfer_leader_ok": Ok(()),
+            Err(TransferLeaderError::VoteChanged { .. }) => "transfer_leader_vote_changed":
+                Err(TransferLeaderError::VoteChanged {
+                    expected: vote(),
+                    actual: openraft::Vote::new_committed(8, 3),
+                }),
+            Err(TransferLeaderError::LogNotFlushed { .. }) => "transfer_leader_log_not_flushed":
+                Err(TransferLeaderError::LogNotFlushed {
+                    expected: Some(log()),
+                    actual: Some(log_id(6, 3, 16)),
+                }),
+        });
+        for (name, response) in &responses {
+            add(samples, name, response);
         }
 
         // A backup snapshot with a value in every field.

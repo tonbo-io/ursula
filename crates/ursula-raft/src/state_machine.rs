@@ -2966,6 +2966,8 @@ mod tests {
         metadata.await.unwrap().unwrap();
     }
 
+    use super::*;
+
     /// Golden bytes: the snapshot record (`group-N.snapshot.json`) is part
     /// of the epoch-5 format, so its encoding never changes within it.
     #[cfg(not(madsim))]
@@ -3002,7 +3004,6 @@ mod tests {
         assert_eq!(persisted.meta, meta);
         assert_eq!(persisted.pointer_bytes, pointer_bytes);
     }
-    use super::*;
 
     #[cfg(not(madsim))]
     fn test_log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
