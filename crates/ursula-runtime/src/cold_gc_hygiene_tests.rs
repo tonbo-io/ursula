@@ -135,11 +135,11 @@ async fn assert_pending_paths_pass_the_guard(runtime: &ShardRuntime, group: Raft
             continue;
         };
         for path in paths {
-            if let Err(refusal) = check_cold_gc_path(group, &entry, path, |stream| {
+            let refusal = check_cold_gc_path(group, &entry, path, |stream| {
                 runtime.locate(stream).raft_group_id
-            }) {
-                panic!("a producer queued a path the guard refuses: {refusal}");
-            }
+            })
+            .err();
+            assert_eq!(refusal, None, "a producer queued a path the guard refuses");
             checked = checked.saturating_add(1);
         }
     }
