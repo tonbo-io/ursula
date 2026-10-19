@@ -7,7 +7,6 @@ mod external_index_after_commit_tests;
 mod factory;
 #[cfg(all(test, not(madsim)))]
 mod history_pending_cold_tests;
-pub(crate) mod openraft_error;
 #[cfg(all(test, not(madsim)))]
 mod test_support;
 mod wal_error;
@@ -140,6 +139,7 @@ use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
 use crate::forward::leadership_refusal;
 use crate::forward::write_result_from_raft_response;
+use crate::openraft_error;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
@@ -1106,6 +1106,8 @@ impl RaftGroupEngine {
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
         crate::forward::refuse_unless_leader(&self.raft)?;
+        let GroupWriteCommand::Stream(stream_command) = &command;
+        let expected = ResponseKind::answering(stream_command);
         let response = match self.raft.client_write(command).await {
             Ok(response) => response,
             // Once submitted, a group that stops may already have committed
@@ -1118,7 +1120,7 @@ impl RaftGroupEngine {
                 ));
             }
         };
-        write_result_from_raft_response(response.data)?
+        write_result_from_raft_response(response.data, expected)?
     }
 
     pub(crate) async fn forward_write_to_leader_if_follower(

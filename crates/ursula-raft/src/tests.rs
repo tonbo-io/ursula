@@ -79,6 +79,7 @@ use ursula_runtime::Proposal;
 use ursula_runtime::ReadSnapshotRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
+use ursula_runtime::ResponseKind;
 use ursula_runtime::RouteWriteRequest;
 #[cfg(not(madsim))]
 use ursula_runtime::RuntimeConfig;
@@ -750,8 +751,11 @@ fn raft_group_write_response_round_trips_through_wire_codec() {
         decode_wire(&encoded, "group write response").expect("decode wire response");
     assert_eq!(decoded, response);
 
-    match write_result_from_raft_response(RaftGroupResponse::Write(Ok(decoded)))
-        .expect("domain response")
+    match write_result_from_raft_response(
+        RaftGroupResponse::Write(Ok(decoded)),
+        ResponseKind::CreateStream,
+    )
+    .expect("domain response")
     {
         Ok(GroupWriteResponse::CreateStream(response)) => {
             assert_eq!(response.next_offset, 5);
@@ -1587,7 +1591,8 @@ async fn single_node_openraft_group_applies_client_writes() {
         .await
         .expect("create stream through openraft");
     assert!(matches!(
-        write_result_from_raft_response(created.data).expect("decode create response"),
+        write_result_from_raft_response(created.data, ResponseKind::CreateStream)
+            .expect("decode create response"),
         Ok(GroupWriteResponse::CreateStream(_))
     ));
 
@@ -1595,7 +1600,9 @@ async fn single_node_openraft_group_applies_client_writes() {
         .client_write(append_command(stream_id, b"payload"))
         .await
         .expect("append through openraft");
-    match write_result_from_raft_response(appended.data).expect("decode append response") {
+    match write_result_from_raft_response(appended.data, ResponseKind::Append)
+        .expect("decode append response")
+    {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
             assert_eq!(response.stream_append_count, 1);
@@ -1660,7 +1667,9 @@ async fn three_node_openraft_group_replicates_group_writes() {
         .await
         .expect("append through elected leader");
     let appended_log_index = appended.log_id.index();
-    match write_result_from_raft_response(appended.data).expect("decode append response") {
+    match write_result_from_raft_response(appended.data, ResponseKind::Append)
+        .expect("decode append response")
+    {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
             assert_eq!(response.next_offset, 10);
@@ -1854,7 +1863,9 @@ async fn deposed_leader_refuses_linearizable_reads() {
         .client_write(append_command(stream_id.clone(), b"after"))
         .await
         .expect("append acknowledged by the new leader");
-    match write_result_from_raft_response(acked.data).expect("decode append response") {
+    match write_result_from_raft_response(acked.data, ResponseKind::Append)
+        .expect("decode append response")
+    {
         Ok(GroupWriteResponse::Append(response)) => assert_eq!(response.next_offset, 11),
         other => panic!("unexpected append response: {other:?}"),
     }
@@ -2441,7 +2452,9 @@ async fn writes_are_routed_before_their_body() {
         .await
         .expect("append through the leader");
     let index = appended.log_id.index();
-    let incarnation = match write_result_from_raft_response(appended.data).expect("decode") {
+    let incarnation = match write_result_from_raft_response(appended.data, ResponseKind::Append)
+        .expect("decode")
+    {
         Ok(GroupWriteResponse::Append(response)) => response.incarnation,
         other => panic!("unexpected append response: {other:?}"),
     };
@@ -2660,7 +2673,9 @@ fn madsim_three_node_openraft_group_strict_replay_append_response_probe() {
                 .client_write(append_command(stream_id, b"simulated"))
                 .await
                 .expect("append through simulated leader");
-            match write_result_from_raft_response(appended.data).expect("decode append response") {
+            match write_result_from_raft_response(appended.data, ResponseKind::Append)
+                .expect("decode append response")
+            {
                 Ok(GroupWriteResponse::Append(response)) => {
                     assert_eq!(response.start_offset, 0);
                     assert_eq!(response.next_offset, 9);
@@ -2836,7 +2851,9 @@ async fn append_madsim_stream(
         .client_write(append_command(stream_id.clone(), b"simulated"))
         .await
         .expect("append through simulated leader");
-    match write_result_from_raft_response(appended.data).expect("decode append response") {
+    match write_result_from_raft_response(appended.data, ResponseKind::Append)
+        .expect("decode append response")
+    {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 0);
             assert_eq!(response.next_offset, 9);
@@ -2854,7 +2871,8 @@ async fn create_stream_via_raft(engine: &RaftGroupEngine, stream_id: ursula_shar
         .await
         .expect("create stream through leader");
     assert!(matches!(
-        write_result_from_raft_response(created.data).expect("decode create response"),
+        write_result_from_raft_response(created.data, ResponseKind::CreateStream)
+            .expect("decode create response"),
         Ok(GroupWriteResponse::CreateStream(_))
     ));
 }
@@ -2891,7 +2909,9 @@ fn run_madsim_three_node_raft_with_policy_once(
                 .await
                 .expect("append through simulated leader");
             let appended_log_index = appended.log_id.index();
-            match write_result_from_raft_response(appended.data).expect("decode append response") {
+            match write_result_from_raft_response(appended.data, ResponseKind::Append)
+                .expect("decode append response")
+            {
                 Ok(GroupWriteResponse::Append(response)) => {
                     assert_eq!(response.start_offset, 0);
                     assert_eq!(response.next_offset, 9);
@@ -3154,7 +3174,8 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     let appended_log_id = appended.log_id;
     let appended_log_index = appended_log_id.index();
     assert!(matches!(
-        write_result_from_raft_response(appended.data).expect("decode append response"),
+        write_result_from_raft_response(appended.data, ResponseKind::Append)
+            .expect("decode append response"),
         Ok(GroupWriteResponse::Append(_))
     ));
 

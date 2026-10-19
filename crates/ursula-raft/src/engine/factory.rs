@@ -227,7 +227,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
-            let config = Arc::new(super::openraft_error::validated_config(
+            let config = Arc::new(crate::openraft_error::validated_config(
                 self.raft_config(placement),
             )?);
             let log_store = self
@@ -538,7 +538,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             // yielded and only a process restart recovers it).
             raft_config.snapshot_policy =
                 snapshot_policy(&self.engine_config, placement, self.node_id);
-            let config = Arc::new(super::openraft_error::validated_config(raft_config)?);
+            let config = Arc::new(crate::openraft_error::validated_config(raft_config)?);
             let transport = self
                 .transports
                 .lock()

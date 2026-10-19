@@ -5,6 +5,7 @@ use std::sync::MutexGuard;
 use std::sync::PoisonError;
 use std::time::Duration;
 
+use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 use openraft::BasicNode;
 use openraft::Raft;
@@ -626,6 +627,10 @@ pub(crate) async fn write_commands_on_raft(
         history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
+    let expected_kinds: Vec<ResponseKind> = commands
+        .iter()
+        .map(|GroupWriteCommand::Stream(command)| ResponseKind::answering(command))
+        .collect();
     await_first_quorum_ack(&raft).await;
     // A replica that lost the leadership during the admits refuses every
     // command here, before proposing any, as `write` does.
@@ -636,13 +641,16 @@ pub(crate) async fn write_commands_on_raft(
         tracing::warn!(%error, "Raft batch submission stopped");
         GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
     })?;
-    let responses = stream.map_ok(|result| match result {
-        Ok(response) => write_result_from_raft_response(response.response).unwrap_or_else(Err),
-        Err(err) => Err(crate::engine::openraft_error::client_write_refusal(
-            &err,
-            &GroupLeadership::of(&raft.metrics().borrow_watched()),
-        )),
-    });
+    let responses =
+        stream
+            .zip(futures_util::stream::iter(expected_kinds))
+            .map(|(result, expected)| {
+                result.map(|result| {
+                    crate::openraft_error::batch_write_result(result, expected, || {
+                        GroupLeadership::of(&raft.metrics().borrow_watched())
+                    })
+                })
+            });
     Ok(collect_batch_responses(responses, expected_responses).await)
 }
 
@@ -697,7 +705,7 @@ pub(crate) async fn await_quorum_ack_on(
 /// names the leader.
 ///
 /// [`RaftGroupEngine::write`]: crate::engine::RaftGroupEngine::write
-/// [`client_write_refusal`]: crate::engine::openraft_error::client_write_refusal
+/// [`client_write_refusal`]: crate::openraft_error::client_write_refusal
 pub(crate) fn refuse_unless_leader(
     raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
 ) -> Result<(), GroupEngineError> {
@@ -748,9 +756,13 @@ async fn collect_batch_responses<T, E: std::fmt::Display>(
     responses
 }
 
-/// Unwraps a raft-applied response into the write outcome it carries.
+/// Unwraps a raft-applied response into the write outcome it carries. The
+/// command's response is of the kind `expected`
+/// ([`ResponseKind::answering`]); OpenRaft's answer to a blank or membership
+/// entry instead breaks an invariant.
 pub(crate) fn write_result_from_raft_response(
     response: RaftGroupResponse,
+    expected: ResponseKind,
 ) -> Result<Result<GroupWriteResponse, GroupEngineError>, GroupEngineError> {
     let actual = match response {
         RaftGroupResponse::Write(result) => return Ok(result),
@@ -758,10 +770,7 @@ pub(crate) fn write_result_from_raft_response(
         RaftGroupResponse::Membership => ResponseKind::RaftMembership,
     };
     Err(GroupEngineError::Infra(
-        GroupInfraError::UnexpectedResponse {
-            expected: ResponseKind::GroupWrite,
-            actual,
-        },
+        GroupInfraError::UnexpectedResponse { expected, actual },
     ))
 }
 
@@ -904,8 +913,8 @@ mod leadership_refusal_tests {
 
     use super::leadership_refusal;
     use crate::GroupLeadership;
-    use crate::engine::openraft_error::client_write_refusal;
     use crate::leadership::LeaderRole;
+    use crate::openraft_error::client_write_refusal;
 
     /// Node 2's view in term 7, following `leader`.
     fn following(leader: u64) -> GroupLeadership {

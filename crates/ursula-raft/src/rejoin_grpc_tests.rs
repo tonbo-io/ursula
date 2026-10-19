@@ -1126,7 +1126,8 @@ async fn lagging_follower_reads_acknowledged_cursor_over_grpc() {
         .client_write(append_command(stream_id.clone(), b"-ACK"))
         .await
         .unwrap();
-    match write_result_from_raft_response(acked.data).unwrap() {
+    match write_result_from_raft_response(acked.data, ursula_runtime::ResponseKind::Append).unwrap()
+    {
         Ok(GroupWriteResponse::Append(response)) => {
             assert_eq!(response.start_offset, 14);
             assert_eq!(response.next_offset, 18);

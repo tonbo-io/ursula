@@ -4,9 +4,11 @@
 //! node addresses (a quorum error lists every member). Each conversion here
 //! logs the native error once and answers with the variant a caller acts
 //! on: a leadership refusal for a forward, `OutcomeUnknown` for a write
-//! whose answer was lost, and the setup variants for a group that does not
-//! start. A Raft core that stopped (`Fatal`) is `OwnerStopped`, through
-//! [`owner_stopped`], the conversion every owner call uses.
+//! whose answer was lost (a core that stopped after it took the write
+//! included), and the setup variants for a group that does not start. A
+//! core that stopped before anything was asked of it (`Fatal`) is
+//! `OwnerStopped`, through [`owner_stopped`], the conversion every owner
+//! call uses.
 
 use std::time::Duration;
 
@@ -17,16 +19,20 @@ use openraft::error::LinearizableReadError;
 use openraft::error::RaftError;
 use openraft::errors::ForwardReason;
 use openraft::metrics::WaitError;
+use openraft::raft::WriteResult;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
+use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::MembershipInitRefusal;
 use ursula_runtime::Proposal;
+use ursula_runtime::ResponseKind;
 use ursula_shard::RaftGroupId;
 
 use crate::GroupLeadership;
 use crate::forward::leadership_refusal;
 use crate::forward::unknown_leader;
+use crate::forward::write_result_from_raft_response;
 use crate::owner::owner_stopped;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -157,25 +163,42 @@ fn forward_reason(reason: ForwardReason, not_leader: LeadershipReason) -> Leader
 /// (503) rather than serving a view that may miss a newer leader's
 /// acknowledged writes. A stopped core is the stopped owner.
 ///
-/// The answer names only the reason; the full error is logged at debug
-/// level only.
+/// The answer names only the reason; a refusal is logged at debug level
+/// only.
 pub(crate) fn group_engine_linearizable_read_error(
     err: RaftError<C, LinearizableReadError<C>>,
     operation: &'static str,
     leadership: &GroupLeadership,
 ) -> GroupEngineError {
-    tracing::debug!("OpenRaft {operation} could not confirm leadership: {err}");
-    match &err {
-        RaftError::APIError(LinearizableReadError::ForwardToLeader(forward)) => leadership_refusal(
+    let refusal = match err {
+        RaftError::Fatal(fatal) => return owner_stopped(fatal),
+        RaftError::APIError(refusal) => refusal,
+    };
+    tracing::debug!("OpenRaft {operation} could not confirm leadership: {refusal}");
+    match &refusal {
+        LinearizableReadError::ForwardToLeader(forward) => leadership_refusal(
             forward_reason(forward.reason, LeadershipReason::Follower),
             Proposal::NotProposed,
             forward.leader_id,
             forward.leader_node.as_ref(),
             leadership,
         ),
-        RaftError::APIError(LinearizableReadError::QuorumNotEnough(_)) => {
+        LinearizableReadError::QuorumNotEnough(_) => {
             unknown_leader(LeadershipReason::QuorumUnconfirmed, Proposal::NotProposed)
         }
-        RaftError::Fatal(fatal) => owner_stopped(fatal),
+    }
+}
+
+/// One answer of a batch write ([`crate::forward::write_commands_on_raft`]):
+/// the state machine's outcome of a command whose response is of the kind
+/// `expected`, or OpenRaft's refusal of it as `leadership` sees it.
+pub(crate) fn batch_write_result(
+    result: WriteResult<C>,
+    expected: ResponseKind,
+    leadership: impl FnOnce() -> GroupLeadership,
+) -> Result<GroupWriteResponse, GroupEngineError> {
+    match result {
+        Ok(response) => write_result_from_raft_response(response.response, expected)?,
+        Err(refusal) => Err(client_write_refusal(&refusal, &leadership())),
     }
 }

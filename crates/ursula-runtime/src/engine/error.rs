@@ -38,6 +38,7 @@ pub use snapshot::SnapshotStoreOperation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
+use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
 use ursula_stream::StreamResponse;
@@ -199,14 +200,43 @@ pub enum ResponseKind {
     BucketCreated,
     BucketAlreadyExists,
     StreamError,
-    /// Any group write's answer, which a normal Raft entry gets.
-    GroupWrite,
     /// OpenRaft's answer to a blank entry.
     RaftBlank,
     /// OpenRaft's answer to a membership entry.
     RaftMembership,
     /// No answer at all.
     Missing,
+}
+
+impl ResponseKind {
+    /// The kind of response the state machine answers `command` with when
+    /// it applies it.
+    pub fn answering(command: &StreamCommand) -> Self {
+        match command {
+            StreamCommand::CreateBucket { .. } => Self::BucketCreated,
+            StreamCommand::CreateStream { .. } | StreamCommand::CreateExternal { .. } => {
+                Self::CreateStream
+            }
+            StreamCommand::Append { .. } | StreamCommand::AppendExternal { .. } => Self::Append,
+            StreamCommand::PublishSnapshot { .. }
+            | StreamCommand::PublishSnapshotExternal { .. } => Self::PublishSnapshot,
+            StreamCommand::AdvanceRetention { .. } => Self::AdvanceRetention,
+            StreamCommand::TouchStreamAccess { .. } => Self::TouchStreamAccess,
+            StreamCommand::FlushCold { .. } => Self::FlushCold,
+            StreamCommand::CompactCold { .. } => Self::CompactCold,
+            StreamCommand::Close { .. } => Self::CloseStream,
+            StreamCommand::DeleteStream { .. } => Self::DeleteStream,
+            StreamCommand::AckColdGc { .. } => Self::AckColdGc,
+            StreamCommand::DeferColdGc { .. } => Self::DeferColdGc,
+            StreamCommand::PurgeBucket { .. } => Self::PurgeBucket,
+            StreamCommand::ImportSnapshot { .. } => Self::ImportGroupState,
+            StreamCommand::NewHistory { .. } => Self::NewHistory,
+            StreamCommand::TidyStream { .. } => Self::TidyStream,
+            StreamCommand::OffloadColdRefs { .. } => Self::OffloadColdRefs,
+            StreamCommand::ExpireStreams { .. } => Self::ExpireStreams,
+            StreamCommand::IfIncarnation { command, .. } => Self::answering(command),
+        }
+    }
 }
 
 impl From<&StreamResponse> for ResponseKind {

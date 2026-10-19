@@ -574,10 +574,8 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
             .unwrap()
             .downcast_ref::<crate::apply_failure::ApplyError>(),
         Some(crate::apply_failure::ApplyError::InvariantViolation(
-            ursula_runtime::GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::UnexpectedResponse { .. }
-            )
-        ))
+            ursula_runtime::GroupEngineError::Infra(injected)
+        )) if *injected == crate::apply_failure::ApplyFault::INJECTED_INVARIANT_VIOLATION
     ));
     assert_eq!(state.last_applied_log_id.unwrap().index(), 1);
     assert_eq!(

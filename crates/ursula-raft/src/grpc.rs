@@ -249,7 +249,7 @@ pub(crate) enum RecoveryProbeError {
     Transport(#[from] RPCError<UrsulaRaftTypeConfig>),
     #[error("recovery RPC: {0}")]
     Rpc(#[from] tonic::Status),
-    #[error("recovery payload: {0}")]
+    #[error("recovery payload: {}", ErrorChain(.0))]
     Payload(#[from] crate::codec::WireDecodeError),
     #[error("recovery peer does not report itself as committed leader")]
     NotLeader,

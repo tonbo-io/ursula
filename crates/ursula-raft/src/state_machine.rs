@@ -2108,10 +2108,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                                 index,
                             }) if index == entry.log_id.index() => {
                                 return Err(GroupEngineError::Infra(
-                                    ursula_runtime::GroupInfraError::UnexpectedResponse {
-                                        expected: ursula_runtime::ResponseKind::Append,
-                                        actual: ursula_runtime::ResponseKind::Missing,
-                                    },
+                                    crate::apply_failure::ApplyFault::INJECTED_INVARIANT_VIOLATION,
                                 ));
                             }
                             Some(crate::apply_failure::ApplyFault::PanicAfterMutation {

@@ -491,7 +491,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
             BucketCreated,
             BucketAlreadyExists,
             StreamError,
-            GroupWrite,
             RaftBlank,
             RaftMembership,
             Missing,

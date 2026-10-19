@@ -33,8 +33,8 @@ use ursula_runtime::Proposal;
 use ursula_runtime::ReadIndexFuture;
 
 use crate::GroupLeadership;
-use crate::engine::openraft_error::group_engine_linearizable_read_error;
 use crate::forward::unknown_leader;
+use crate::openraft_error::group_engine_linearizable_read_error;
 use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
 

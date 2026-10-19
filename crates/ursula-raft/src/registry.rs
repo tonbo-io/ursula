@@ -3012,7 +3012,12 @@ mod tests {
                     raft_group_id: group,
                 },
             )),
-            SnapshotInstallError::Group(GroupEngineError::new("internal")),
+            SnapshotInstallError::Group(GroupEngineError::Infra(
+                GroupInfraError::UnexpectedResponse {
+                    expected: ursula_runtime::ResponseKind::Append,
+                    actual: ursula_runtime::ResponseKind::Missing,
+                },
+            )),
             SnapshotInstallError::Group(GroupEngineError::Infra(GroupInfraError::OwnerStopped)),
             SnapshotInstallError::Publication(store_error()),
             SnapshotInstallError::Task(cancelled),

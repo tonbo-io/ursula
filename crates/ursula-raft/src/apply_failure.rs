@@ -76,3 +76,15 @@ pub enum ApplyFault {
     PanicAfterMutation { index: u64 },
     InvariantAfterMutation { index: u64 },
 }
+
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+impl ApplyFault {
+    /// The invariant violation [`ApplyFault::InvariantAfterMutation`]
+    /// injects: an applied `Append` that answered nothing, which no correct
+    /// apply returns.
+    pub const INJECTED_INVARIANT_VIOLATION: ursula_runtime::GroupInfraError =
+        ursula_runtime::GroupInfraError::UnexpectedResponse {
+            expected: ursula_runtime::ResponseKind::Append,
+            actual: ursula_runtime::ResponseKind::Missing,
+        };
+}
