@@ -12,6 +12,7 @@ use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use ursula_runtime::AnswerProblem;
+use ursula_runtime::CommittedLeader;
 use ursula_runtime::ErrorChain;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::ForwardFailure;
@@ -608,6 +609,50 @@ pub(crate) fn validate_proposal(command: &GroupWriteCommand) -> Result<(), Group
     ))
 }
 
+/// The leadership a proposal must still be appended under (F14j).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProposalFence {
+    /// Any leadership: the command names no object this node uploaded.
+    Unfenced,
+    /// The committed leader the proposal's upload, or its pass, was
+    /// planned under. OpenRaft appends the proposal only while it is the
+    /// group's committed leader.
+    Leadership(CommittedLeader),
+}
+
+/// The committed leader OpenRaft must still find when it takes `command`
+/// under `fence`, if any. A command that names as new an object this node
+/// uploaded ([`ursula_runtime::uploaded_object`]) but carries no fence is a
+/// bug of its proposer: it is refused before proposal and logged, so its
+/// uploader deletes the object rather than commit it under another
+/// leadership. Both the single write and the batch path ask here.
+pub(crate) fn proposal_leader(
+    command: &GroupWriteCommand,
+    fence: ProposalFence,
+) -> Result<Option<CommittedLeader>, GroupEngineError> {
+    // A negative control turns the fence off: every upload proposes under
+    // any leadership.
+    if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::UploadFence) {
+        return Ok(None);
+    }
+    let GroupWriteCommand::Stream(command) = command;
+    match (fence, ursula_runtime::uploaded_object(command)) {
+        (ProposalFence::Leadership(leader), _) => Ok(Some(leader)),
+        (ProposalFence::Unfenced, None) => Ok(None),
+        (ProposalFence::Unfenced, Some(object)) => {
+            tracing::error!(
+                object,
+                "an upload command reached the Raft engine without its leadership fence and \
+                 was refused before proposal"
+            );
+            Err(unknown_leader(
+                LeadershipReason::Follower,
+                Proposal::NotProposed,
+            ))
+        }
+    }
+}
+
 /// Proposes `commands` as one batch. `history` is the group's history on
 /// this replica: a leader whose history is pending admits none of them
 /// (#581 section 4.5).
@@ -634,10 +679,17 @@ pub(crate) async fn write_commands_on_raft(
     if let Err(refused) = refuse_unless_leader(&raft) {
         return Ok(vec![Err(refused); expected_responses]);
     }
-    let stream = raft.client_write_many(commands).await.map_err(|error| {
-        tracing::warn!(%error, "Raft batch submission stopped");
-        GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
-    })?;
+    // A batch carries no fence, so an upload command in it refuses the
+    // batch before anything of it is proposed.
+    for command in &commands {
+        proposal_leader(command, ProposalFence::Unfenced)?;
+    }
+    // The submission fails only when RaftCore is gone and hands the batch
+    // back unsent: nothing of it was proposed, as for a single write.
+    let stream = raft
+        .client_write_many(commands)
+        .await
+        .map_err(crate::openraft_error::write_not_submitted)?;
     let responses =
         stream
             .zip(futures_util::stream::iter(expected_kinds))

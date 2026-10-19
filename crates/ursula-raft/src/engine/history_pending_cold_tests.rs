@@ -25,6 +25,7 @@ use ursula_runtime::load_cold_chunks_from_pages;
 use ursula_shard::BucketStreamId;
 
 use super::test_support::JournalRuntime;
+use super::test_support::leader_upload;
 use super::test_support::spawn_journal_runtime_published;
 use crate::RaftGroupHandleRegistry;
 use crate::history::GroupHistory;
@@ -191,6 +192,7 @@ async fn a_compaction_refused_for_a_pending_history_deletes_its_upload_and_goes_
                     cold_generation: cold_generation(&runtime, stream).await,
                     stream_id: stream.clone(),
                     chunk: chunk.clone(),
+                    upload: leader_upload(&runtime, stream).await,
                 })
                 .await
                 .expect("flush input chunk");

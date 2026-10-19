@@ -108,7 +108,8 @@ pub enum LeadershipReason {
     /// The replica's own leadership check found that it does not lead.
     Follower,
     /// OpenRaft found that the replica no longer leads: it refused the
-    /// command before appending it, or discarded it after it took it.
+    /// command before appending it (a leadership fence's refusal included),
+    /// discarded it after it took it, or had stopped before it took it.
     SteppedDown,
     /// The leader is handing its leadership to another replica. The target
     /// does not lead yet, so the refusal names no leader.

@@ -155,6 +155,12 @@ pub enum Defence {
     /// pass that owes before it reads the pointer, so the pass finds the
     /// persisted object unheld and deletes it.
     NoPassBeforeRestore,
+    /// A proposal that names a cold object its leader uploaded is appended
+    /// only under the committed leader the upload was planned under, and
+    /// one without a fence is refused (F14j). Off, it is proposed under any
+    /// leadership, so an upload that waited across a re-election commits
+    /// under the next one.
+    UploadFence,
 }
 
 #[cfg(madsim)]
@@ -164,8 +170,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 32]> = const { Cell::new([false; 32]) };
-        static FIRED: Cell<[u64; 32]> = const { Cell::new([0; 32]) };
+        static OFF: Cell<[bool; 33]> = const { Cell::new([false; 33]) };
+        static FIRED: Cell<[u64; 33]> = const { Cell::new([0; 33]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -202,6 +208,7 @@ mod switches {
             Defence::SendHold => 29,
             Defence::SnapshotGc => 30,
             Defence::NoPassBeforeRestore => 31,
+            Defence::UploadFence => 32,
         }
     }
 
@@ -224,7 +231,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 32]));
+        FIRED.with(|fired| fired.set([0; 33]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

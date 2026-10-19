@@ -47,6 +47,9 @@ use crate::cold_store::is_cold_chunk_file_name;
 use crate::cold_store::is_external_payload_file_name;
 use crate::cold_store::new_cold_chunk_path_in_generation;
 use crate::cold_store::new_cold_pack_path;
+use crate::cold_uploads::ProposedUpload;
+use crate::cold_uploads::UploadFence;
+use crate::cold_uploads::upload_not_leading;
 use crate::command::GroupSnapshot;
 use crate::core_worker::CoreCommand;
 use crate::core_worker::CoreMailbox;
@@ -491,19 +494,34 @@ impl ShardRuntime {
         response
     }
 
-    /// Whether the local replica of the stream's group currently leads, by
-    /// its own view. Unlike `open_live_read` this takes no
-    /// quorum round trip; it gates background leader-side work only.
-    async fn accepts_local_writes(&self, stream_id: &BucketStreamId) -> Result<bool, RuntimeError> {
-        let placement = self.shard_map.locate(stream_id);
+    /// The leadership a cold upload of `placement`'s group planned now is
+    /// fenced to (F14j), or `None` while the local replica does not lead, by
+    /// its own view. It takes no quorum round trip: OpenRaft checks the
+    /// fence again when it takes the upload's proposal. Background
+    /// leader-side uploads take it after their plan and before their PUT.
+    pub async fn cold_upload_fence(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<Option<UploadFence>, RuntimeError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.group_rpc(
             placement,
             None,
-            GroupCommand::AcceptsLocalWrites { response_tx },
+            GroupCommand::UploadFence { response_tx },
             response_rx,
         )
         .await
+    }
+
+    /// [`Self::cold_upload_fence`], refusing an upload whose replica does
+    /// not lead, as its proposal would be.
+    async fn require_cold_upload_fence(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<UploadFence, RuntimeError> {
+        self.cold_upload_fence(placement)
+            .await?
+            .ok_or_else(|| RuntimeError::group_engine(placement, upload_not_leading()))
     }
 
     /// Confirms a read index for `placement`'s group before a linearizable
@@ -642,6 +660,19 @@ impl ShardRuntime {
         &self,
         candidate: ColdFlushCandidate,
     ) -> Result<FlushColdResponse, RuntimeError> {
+        let fence = self
+            .require_cold_upload_fence(self.shard_map.locate(&candidate.stream_id))
+            .await?;
+        self.flush_cold_candidate_under(candidate, fence).await
+    }
+
+    /// Flushes `candidate` into an exclusive chunk whose proposal is fenced
+    /// to `fence`, taken before the chunk's PUT (F14j).
+    async fn flush_cold_candidate_under(
+        &self,
+        candidate: ColdFlushCandidate,
+        fence: UploadFence,
+    ) -> Result<FlushColdResponse, RuntimeError> {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Err(RuntimeError::ColdStoreConfig {
                 message: "cold backend must be configured before flushing cold chunks".to_owned(),
@@ -685,6 +716,7 @@ impl ShardRuntime {
                 stream_id: candidate.stream_id,
                 chunk,
                 cold_generation: candidate.cold_generation,
+                upload: ProposedUpload::new(fence),
             })
             .await;
         match publish {
@@ -702,10 +734,11 @@ impl ShardRuntime {
             }
             Err(err) => {
                 // F14e: a flush that applied nothing (a typed stream error,
-                // such as a stale candidate, or a refusal before proposal)
-                // definitely did not commit, and the engine rolled back or
-                // never wrote its page entry, so nothing references the
-                // chunk. Any other failure is ambiguous and keeps the chunk.
+                // such as a stale candidate, or a refusal before proposal,
+                // its leadership fence's included) definitely did not
+                // commit, and the engine rolled back or never wrote its page
+                // entry, so nothing references the chunk. Any other failure
+                // is ambiguous and keeps the chunk.
                 if err.applied_nothing()
                     && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
                 {
@@ -724,6 +757,13 @@ impl ShardRuntime {
         &self,
         candidates: Vec<ColdFlushCandidate>,
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
+        let Some(first) = candidates.first() else {
+            return Ok(Vec::new());
+        };
+        // One plan, one group: its uploads are fenced to one leadership.
+        let fence = self
+            .require_cold_upload_fence(self.shard_map.locate(&first.stream_id))
+            .await?;
         // A bucket is the physical erasure domain. Keep encounter order while
         // partitioning one Raft group's flush plan so no pack can retain bytes
         // for a purged bucket merely because another bucket is still live.
@@ -748,11 +788,11 @@ impl ShardRuntime {
                 .first()
                 .is_some_and(|candidate| candidate.payload.len() < EXCLUSIVE_FLUSH_MIN_BYTES);
             if batch.len() > 1 || small_single {
-                responses.extend(self.flush_cold_candidates_pack(batch).await?);
+                responses.extend(self.flush_cold_candidates_pack(batch, fence).await?);
                 continue;
             }
             let candidate = batch.pop().expect("single-candidate batch");
-            match self.flush_cold_candidate(candidate).await {
+            match self.flush_cold_candidate_under(candidate, fence).await {
                 Ok(response) => responses.push(response),
                 Err(err) if is_stale_cold_flush_candidate_error(&err) => {}
                 Err(err) => return Err(err),
@@ -764,6 +804,7 @@ impl ShardRuntime {
     async fn flush_cold_candidates_pack(
         &self,
         candidates: Vec<ColdFlushCandidate>,
+        fence: UploadFence,
     ) -> Result<Vec<FlushColdResponse>, RuntimeError> {
         let Some(cold_store) = self.cold_store.as_ref() else {
             return Err(RuntimeError::ColdStoreConfig {
@@ -806,6 +847,8 @@ impl ShardRuntime {
             payload.extend_from_slice(&candidate.payload);
         }
         let path = new_cold_pack_path(&first.stream_id.bucket_id, placement.raft_group_id.0);
+        // The pack's slices are proposals of one upload.
+        let upload = ProposedUpload::new(fence);
         let upload_started_at = Instant::now();
         let object_size = match cold_store.write_chunk(&path, &payload).await {
             Ok(object_size) => object_size,
@@ -841,6 +884,7 @@ impl ShardRuntime {
                         payload_digest: candidate.payload_digest,
                     },
                     cold_generation: candidate.cold_generation,
+                    upload: upload.clone(),
                 })
                 .await;
             match publish {
@@ -851,6 +895,15 @@ impl ShardRuntime {
                     responses.push(response);
                 }
                 Err(err) if is_stale_cold_flush_candidate_error(&err) => {}
+                // A definite refusal, such as the pack's leadership fence:
+                // the remaining slices are not proposed. If no slice was
+                // published, nothing references the pack.
+                Err(err) if err.applied_nothing() => {
+                    if published == 0 {
+                        delete_rejected_pack(cold_store, &path).await;
+                    }
+                    return Err(err);
+                }
                 // A transport or leadership error may happen after the Raft
                 // commit became durable. Never delete the pack on an
                 // ambiguous response; a later orphan sweep may prove it
@@ -863,14 +916,8 @@ impl ShardRuntime {
         // references the pack. Cleanup is best effort, as for an exclusive
         // chunk: a failed delete leaves an orphan for the sweep (F14h), and
         // since F14c this path also carries lone small candidates.
-        if published == 0
-            && let Err(cleanup_err) = cold_store.delete_chunk(&path).await
-        {
-            tracing::warn!(
-                path = %path,
-                error = %cleanup_err,
-                "failed to remove the pack of a rejected cold flush"
-            );
+        if published == 0 {
+            delete_rejected_pack(cold_store, &path).await;
         }
         Ok(responses)
     }
@@ -1194,12 +1241,16 @@ impl ShardRuntime {
             let Some(((stream_id, generation), stream_pages)) = pages_by_stream.next() else {
                 break;
             };
-            // Only the local Raft leader may publish a replacement. A plain
-            // leadership check: compaction gains no quorum round trip, and the
+            // Only the local Raft leader may publish a replacement, fenced to
+            // the leadership it leads in now (F14j). A plain leadership
+            // check: compaction gains no quorum round trip, and the
             // replacement's own commit is what proves leadership.
-            if !self.accepts_local_writes(&stream_id).await.unwrap_or(false) {
+            let Ok(Some(fence)) = self
+                .cold_upload_fence(self.shard_map.locate(&stream_id))
+                .await
+            else {
                 continue;
-            }
+            };
             let chunks = load_cold_chunks_from_pages(&store, &stream_pages)
                 .await
                 .map_err(|err| RuntimeError::ColdStoreIo {
@@ -1275,6 +1326,7 @@ impl ShardRuntime {
                     old_chunks,
                     replacement,
                     gc_not_before_ms,
+                    upload: ProposedUpload::new(fence),
                 })
                 .await;
             if let Err(err) = compact_result {
@@ -1942,6 +1994,18 @@ impl ShardRuntime {
             .map(CoreMailbox::capacity)
             .collect::<Vec<_>>();
         RuntimeMailboxSnapshot { depths, capacities }
+    }
+}
+
+/// Deletes the pack of a flush none of whose slices was published. Best
+/// effort: a failed delete leaves an orphan for the sweep (F14h).
+async fn delete_rejected_pack(cold_store: &ColdStoreHandle, path: &str) {
+    if let Err(cleanup_err) = cold_store.delete_chunk(path).await {
+        tracing::warn!(
+            path = %path,
+            error = %cleanup_err,
+            "failed to remove the pack of a rejected cold flush"
+        );
     }
 }
 

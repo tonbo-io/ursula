@@ -478,6 +478,8 @@ Cold GC deletes a path a queued entry names only if it lies in the entry's own n
 
 The check is on the namespace, not on liveness. It does not prove that nothing references an object of the right shape in the group's own namespace. Ursula's own entries are safe because each one is queued only after the state drops its references, and every object name is unique.
 
+A leader proposes an object it uploaded only in the leadership it uploaded it in. When that leadership ends between the upload and the proposal, even by a re-election of the same node, the proposal is refused before anything of it is written and the leader deletes the object at once. Objects of writes whose outcome is unknown stay until the orphan sweep finds them unreferenced and more than a day old.
+
 ### Incomplete multipart uploads
 
 Ursula writes large cold objects with S3 multipart uploads. A crash or shutdown in the middle of a cold write leaves an incomplete upload behind. Ursula never aborts these uploads, and S3 bills for their uploaded parts until they are aborted. Snapshot commits from parts make long cold writes more common, so these leftovers show up more often.

@@ -1,10 +1,12 @@
 //! One replica's view of its group's leadership, taken from one borrow of
-//! its Raft metrics. The front door routes writes by it and the engine
-//! routes writes and names the leader's term in its forward hints by it,
-//! so both decide by one policy.
+//! its Raft metrics. The front door routes writes by it, the engine routes
+//! writes and names the leader's term in its forward hints by it, and both
+//! fence cold uploads by it (F14j), so all decide by one policy.
 
 use openraft::RaftMetrics;
 use openraft::ServerState;
+use ursula_runtime::CommittedLeader;
+use ursula_runtime::UploadFence;
 use ursula_runtime::WriteRoute;
 
 use crate::types::UrsulaRaftTypeConfig;
@@ -52,10 +54,14 @@ impl GroupLeadership {
     }
 
     /// Where this view sends a write: here when this replica leads (with
-    /// no early answer yet), to the leader it knows, or nowhere.
+    /// no early answer yet, and the fence of the write's cold upload), to
+    /// the leader it knows, or nowhere.
     pub fn write_route(self) -> WriteRoute {
         match self.role {
-            LeaderRole::Leads => WriteRoute::Leader { early_answer: None },
+            LeaderRole::Leads => WriteRoute::Leader {
+                early_answer: None,
+                fence: UploadFence::Leader(self.committed_leader()),
+            },
             LeaderRole::Follows { leader_id } => WriteRoute::Follower {
                 leader_id,
                 term: self.term,
@@ -67,6 +73,22 @@ impl GroupLeadership {
     /// This replica leads the group.
     pub fn leads(&self) -> bool {
         matches!(self.role, LeaderRole::Leads)
+    }
+
+    /// The fence of a cold upload this replica plans now (F14j): its
+    /// committed leader id, `(term, node)`, while it leads. A leader's vote
+    /// is committed for its own term and node, which is the leader id
+    /// OpenRaft checks `with_leader` against. A view that lags OpenRaft's
+    /// names a leadership that already ended, so a lag only ever gets the
+    /// upload refused, never appended under another leadership.
+    pub fn upload_fence(&self) -> Option<UploadFence> {
+        self.leads()
+            .then(|| UploadFence::Leader(self.committed_leader()))
+    }
+
+    /// This replica as the committed leader of this view's term.
+    fn committed_leader(&self) -> CommittedLeader {
+        CommittedLeader::new(self.term, self.node_id)
     }
 
     /// The term in which this view knows `leader` leads, if it names it.

@@ -490,6 +490,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                     object_size: 4,
                     ..Default::default()
                 },
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             },
             placement,
         )
@@ -702,6 +703,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
                     object_size: 4,
                     ..Default::default()
                 },
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             },
             placement,
         )
@@ -723,6 +725,7 @@ async fn stale_cold_flush_rolls_back_index_page_entry() {
                     object_size: 4,
                     ..Default::default()
                 },
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             },
             placement,
         )
@@ -785,6 +788,7 @@ async fn failed_cold_compaction_publish_rolls_back_index_replacement() {
                 old_chunks: vec![first.clone(), second.clone()],
                 replacement,
                 gc_not_before_ms: 0,
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             },
             placement,
         )
@@ -824,6 +828,7 @@ async fn stale_cold_compaction_input_is_refused_before_proposal() {
                 old_chunks: vec![chunk(0, 4, 4, "first"), chunk(4, 8, 4, "second")],
                 replacement: chunk(0, 8, 8, "replacement"),
                 gc_not_before_ms: 0,
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             },
             placement,
         )
@@ -935,6 +940,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             stream_expires_at_ms: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("create external stream");
@@ -958,6 +964,7 @@ async fn external_payload_index_pages_are_not_kept_in_snapshot_memory() {
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("append external payload");
@@ -1812,6 +1819,7 @@ async fn flush_cold_publishes_chunk_metadata_on_owner_group() {
                 object_size: 4,
                 ..Default::default()
             },
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("flush cold");
@@ -2306,6 +2314,7 @@ async fn cold_gc_worker_physically_reclaims_deleted_stream_chunks() {
             cold_generation: live_cold_generation(&runtime, &stream).await,
             stream_id: stream.clone(),
             chunk: chunk.clone(),
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("flush cold");
@@ -2381,6 +2390,7 @@ async fn purge_report_proves_cold_gc_queue_is_empty_only_after_reclamation() {
             cold_generation: live_cold_generation(&runtime, &stream).await,
             stream_id: stream,
             chunk: chunk.clone(),
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("flush cold");
@@ -2433,6 +2443,7 @@ async fn flush_two_chunks(
                 cold_generation: live_cold_generation(runtime, stream).await,
                 stream_id: stream.clone(),
                 chunk,
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             })
             .await
             .expect("flush input chunk");
@@ -2552,6 +2563,7 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
                 cold_generation: live_cold_generation(&runtime, &stream).await,
                 stream_id: stream.clone(),
                 chunk,
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             })
             .await
             .expect("flush input chunk");
@@ -4060,6 +4072,10 @@ struct BlockingReadEngine {
 }
 
 impl GroupEngine for BlockingReadEngine {
+    fn upload_fence(&self) -> Option<crate::cold_uploads::UploadFence> {
+        Some(crate::cold_uploads::UploadFence::Unreplicated)
+    }
+
     fn route_write<'a>(
         &'a mut self,
         request: RouteWriteRequest,
@@ -4260,12 +4276,22 @@ impl GroupEngine for BlockingReadEngine {
 }
 
 impl GroupEngine for RecordingEngine {
+    fn upload_fence(&self) -> Option<crate::cold_uploads::UploadFence> {
+        self.accepts_local_writes
+            .then_some(crate::cold_uploads::UploadFence::Unreplicated)
+    }
+
     fn route_write<'a>(
         &'a mut self,
         _request: RouteWriteRequest,
         _placement: ShardPlacement,
     ) -> GroupRouteWriteFuture<'a> {
-        Box::pin(async { Ok(WriteRoute::Leader { early_answer: None }) })
+        Box::pin(async {
+            Ok(WriteRoute::Leader {
+                early_answer: None,
+                fence: crate::cold_uploads::UploadFence::Unreplicated,
+            })
+        })
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
@@ -4513,6 +4539,10 @@ struct BlockingFirstCreateEngine {
 }
 
 impl GroupEngine for BlockingFirstCreateEngine {
+    fn upload_fence(&self) -> Option<crate::cold_uploads::UploadFence> {
+        Some(crate::cold_uploads::UploadFence::Unreplicated)
+    }
+
     fn route_write<'a>(
         &'a mut self,
         request: RouteWriteRequest,
@@ -4634,12 +4664,21 @@ fn outcome_unknown() -> GroupEngineError {
 }
 
 impl GroupEngine for FailingEngine {
+    fn upload_fence(&self) -> Option<crate::cold_uploads::UploadFence> {
+        Some(crate::cold_uploads::UploadFence::Unreplicated)
+    }
+
     fn route_write<'a>(
         &'a mut self,
         _request: RouteWriteRequest,
         _placement: ShardPlacement,
     ) -> GroupRouteWriteFuture<'a> {
-        Box::pin(async { Ok(WriteRoute::Leader { early_answer: None }) })
+        Box::pin(async {
+            Ok(WriteRoute::Leader {
+                early_answer: None,
+                fence: crate::cold_uploads::UploadFence::Unreplicated,
+            })
+        })
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {

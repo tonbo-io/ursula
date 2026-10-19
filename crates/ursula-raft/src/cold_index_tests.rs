@@ -298,6 +298,9 @@ async fn stale_flush_leaves_no_page_entry() {
                 cold_generation: generation,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 4, "benchcmp/raft-stale-flush/chunks/live.bin"),
+                upload: ursula_runtime::ProposedUpload::new(
+                    engine.upload_fence().expect("the engine leads"),
+                ),
             },
             placement(),
         )
@@ -315,6 +318,9 @@ async fn stale_flush_leaves_no_page_entry() {
                 cold_generation: generation,
                 stream_id: stream_id.clone(),
                 chunk: chunk(0, 2, "benchcmp/raft-stale-flush/chunks/stale.bin"),
+                upload: ursula_runtime::ProposedUpload::new(
+                    engine.upload_fence().expect("the engine leads"),
+                ),
             },
             placement(),
         )
@@ -397,6 +403,9 @@ async fn raft_read_path_shares_the_page_cache_that_apply_invalidates() {
                     cold_generation: generation,
                     stream_id: stream_id.clone(),
                     chunk: chunk(start, end, path),
+                    upload: ursula_runtime::ProposedUpload::new(
+                        engine.upload_fence().expect("the engine leads"),
+                    ),
                 },
                 placement(),
             )

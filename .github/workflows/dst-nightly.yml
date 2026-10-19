@@ -203,6 +203,17 @@ jobs:
           RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
             external_locators_survive --nocapture
 
+      # Cold uploads stay fenced (bounded-stream-state F14j, Invariant 13): an
+      # upload proposes only under the leadership that planned it, across
+      # re-elections of the uploader and leader changes. The range is a
+      # superset of the default seeds.
+      - name: Run cold upload fence scenarios (nightly range)
+        env:
+          COLD_UPLOAD_FENCE_SEEDS: "1..=64"
+        run: |
+          RUSTFLAGS="--cfg madsim" cargo test -p ursula-sim --lib -- \
+            cold_uploads_stay_fenced_under_leader_churn --nocapture
+
       # Journal segments: rotation, purge and the rewrite of a quiet group's
       # entries while nodes crash, a purge that stays durable when the
       # segments it freed are deleted before a power loss, and a follower that

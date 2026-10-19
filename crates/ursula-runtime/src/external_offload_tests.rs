@@ -95,6 +95,7 @@ async fn append_external(
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await;
     (path, result)

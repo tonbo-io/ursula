@@ -45,6 +45,7 @@ use ursula_stream::BucketUsageSnapshot;
 use ursula_stream::ColdFlushCandidate;
 use ursula_stream::ColdGcPlanEntry;
 
+use crate::cold_uploads::UploadFence;
 use crate::command::GroupSnapshot;
 use crate::metrics::RaftSnapshotBuildSample;
 use crate::metrics::RuntimeMetricsInner;
@@ -323,6 +324,15 @@ pub trait GroupEngine: Send + 'static {
     fn accepts_local_writes(&self) -> bool {
         true
     }
+
+    /// The leadership a cold upload this replica plans now is fenced to
+    /// (F14j), or `None` while it does not lead. An engine without
+    /// replication leads in one leadership for as long as it runs. A view
+    /// that lags OpenRaft's names a leadership that already ended, whose
+    /// proposals OpenRaft refuses, so a lag only ever refuses an upload.
+    /// Every engine names it: a default could give a replicated engine a
+    /// fence it does not hold.
+    fn upload_fence(&self) -> Option<UploadFence>;
 
     /// The group's ReadIndex barrier, which the runtime calls before it
     /// queues a linearizable read (D10). `None` (the default) keeps

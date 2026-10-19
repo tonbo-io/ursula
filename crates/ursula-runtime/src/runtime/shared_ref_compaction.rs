@@ -14,9 +14,11 @@
 //!    read cache, write one exclusive chunk, and publish `CompactCold` with
 //!    `gc_not_before = now + compaction_gc_grace`. Releasing a pack's last
 //!    ref queues it for GC after the grace.
-//! 4. **Failures.** A definite rejection (typed stream error or a redirect
-//!    before proposal) rolls the page entry back in the engine, and the
-//!    driver deletes the replacement. An ambiguous outcome keeps both; the
+//! 4. **Failures.** A definite rejection (typed stream error, a redirect
+//!    before proposal, or a refusal by the leadership fence the pass took
+//!    after its plan, F14j) rolls the page entry back in the engine, and the
+//!    driver deletes the replacement. A leadership refusal also ends the
+//!    group's pass, since every later run would be refused too. An ambiguous outcome keeps both; the
 //!    orphan sweep (F14h) reclaims the replacement if nothing references it,
 //!    and a retried compaction's page write clips the earlier entry.
 
@@ -32,13 +34,21 @@ use crate::cold_refs::SharedRefCompactionConfig;
 use crate::cold_refs::SharedRefCompactionReport;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::new_cold_chunk_path_in_generation;
+use crate::cold_uploads::ProposedUpload;
+use crate::cold_uploads::UploadFence;
 use crate::error::RuntimeError;
 use crate::request::CompactColdRequest;
 
 /// What happened to one planned run.
 enum SharedRunOutcome {
-    Compacted { slices: u64, bytes: u64 },
+    Compacted {
+        slices: u64,
+        bytes: u64,
+    },
     Rejected,
+    /// Refused because the leadership the pass was planned under ended
+    /// (F14j): every later run of the pass would be refused too.
+    NotLeading,
     Ambiguous,
 }
 
@@ -66,6 +76,15 @@ impl ShardRuntime {
             })
             .await?;
         report.candidates = u64::try_from(candidates.len()).unwrap_or(u64::MAX);
+        if candidates.is_empty() {
+            return Ok(report);
+        }
+        // The pass's replacements are fenced to the leadership it was
+        // planned under (F14j). A replica that no longer leads uploads none.
+        let placement = self.placement_for_group(raft_group_id)?;
+        let Some(fence) = self.cold_upload_fence(placement).await? else {
+            return Ok(report);
+        };
         for candidate in candidates {
             self.repair_cold_index(raft_group_id, RepairColdIndexRequest {
                 after: None,
@@ -81,6 +100,7 @@ impl ShardRuntime {
                     candidate.cold_generation,
                     candidate.run,
                     config.gc_grace_ms,
+                    fence,
                 )
                 .await;
             match outcome {
@@ -91,6 +111,12 @@ impl ShardRuntime {
                 }
                 Ok(SharedRunOutcome::Rejected) => {
                     report.rejected = report.rejected.saturating_add(1);
+                }
+                // The pass's fence no longer holds: reading, uploading and
+                // deleting the remaining runs would only be refused again.
+                Ok(SharedRunOutcome::NotLeading) => {
+                    report.rejected = report.rejected.saturating_add(1);
+                    break;
                 }
                 Ok(SharedRunOutcome::Ambiguous) => {
                     report.ambiguous = report.ambiguous.saturating_add(1);
@@ -145,6 +171,7 @@ impl ShardRuntime {
         generation: u64,
         run: Vec<ColdChunkRef>,
         gc_grace_ms: u64,
+        fence: UploadFence,
     ) -> Result<SharedRunOutcome, RuntimeError> {
         let (Some(first), Some(last)) = (run.first(), run.last()) else {
             tracing::warn!(stream = %stream_id, "shared-ref compaction run is empty");
@@ -204,6 +231,7 @@ impl ShardRuntime {
                 old_chunks: run,
                 replacement,
                 gc_not_before_ms: unix_time_ms().saturating_add(gc_grace_ms),
+                upload: ProposedUpload::new(fence),
             })
             .await;
         match result {
@@ -237,7 +265,11 @@ impl ShardRuntime {
                     error = %err,
                     "shared-ref compaction rejected"
                 );
-                Ok(SharedRunOutcome::Rejected)
+                if err.not_leader().is_some() {
+                    Ok(SharedRunOutcome::NotLeading)
+                } else {
+                    Ok(SharedRunOutcome::Rejected)
+                }
             }
             Err(err) => {
                 tracing::warn!(

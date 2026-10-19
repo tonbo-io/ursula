@@ -26,7 +26,9 @@ use ursula_runtime::BootstrapStreamResponse;
 use ursula_runtime::ColdSnapshotBody;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::ExternalPayloadRef;
+use ursula_runtime::ProposedUpload;
 use ursula_runtime::SnapshotDigest;
+use ursula_runtime::UploadFence;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 
@@ -56,12 +58,14 @@ fn body_read_error(err: impl std::fmt::Display) -> Response {
 /// Bodies below the staging threshold (the smaller of
 /// `runtime.external_payload_min_size` and the request limit) stay inline;
 /// larger ones go to a new object under the stream's external prefix when
-/// cold snapshots are enabled.
+/// cold snapshots are enabled, whose upload is fenced to `fence`, the
+/// leadership that admitted the publish (F14j).
 pub(crate) async fn receive_snapshot_body(
     state: &HttpState,
     stream_id: &BucketStreamId,
     content_type: &str,
     body: Body,
+    fence: UploadFence,
 ) -> Result<SnapshotUpload, Response> {
     // F16: publishes stage their body in the cold tier whenever a cold
     // store is configured.
@@ -120,6 +124,7 @@ pub(crate) async fn receive_snapshot_body(
             object_size,
         },
         digest: digest.finalize(),
+        upload: ProposedUpload::new(fence),
     }))
 }
 

@@ -364,6 +364,7 @@ async fn f2_rejected_external_append_under_a_packed_trickle_reads_correctly_afte
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect_err("a regressed stream seq rejects the external append");
@@ -398,6 +399,7 @@ async fn f2_rejected_external_append_under_a_packed_trickle_reads_correctly_afte
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("committed external append");
@@ -471,6 +473,7 @@ async fn f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace() 
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("committed external append");

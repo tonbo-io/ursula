@@ -25,6 +25,7 @@ use ursula_shard::RaftGroupId;
 use ursula_stream::ObjectPayloadRef;
 
 use super::test_support::JournalRuntime;
+use super::test_support::leader_upload;
 use super::test_support::spawn_journal_runtime;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
@@ -77,6 +78,7 @@ async fn append_external(
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: leader_upload(runtime, stream_id).await,
         })
         .await;
     (path, result.is_ok())

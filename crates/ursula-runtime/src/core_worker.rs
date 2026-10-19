@@ -19,6 +19,7 @@ use crate::cold_index::RepairColdIndexRequest;
 use crate::cold_index::RepairColdIndexResponse;
 use crate::cold_refs::ColdOrphanSweepPlan;
 use crate::cold_refs::ColdOrphanSweepRequest;
+use crate::cold_uploads::UploadFence;
 use crate::command::GroupSnapshot;
 use crate::engine::GroupEngine;
 use crate::engine::GroupEngineError;
@@ -1417,12 +1418,13 @@ impl CoreWorker {
         })
     }
 
-    /// Plain leadership check with no quorum round trip, for background
-    /// leader-side work (cold compaction) that does not serve a client read.
-    pub(crate) async fn accepts_local_writes(
+    /// The leadership a cold upload planned now is fenced to (F14j), by the
+    /// engine's own view with no quorum round trip, for background
+    /// leader-side uploads (flushes and compactions).
+    pub(crate) async fn upload_fence(
         group: &mut Box<dyn GroupEngine>,
-    ) -> Result<bool, RuntimeError> {
-        Ok(group.accepts_local_writes())
+    ) -> Result<Option<UploadFence>, RuntimeError> {
+        Ok(group.upload_fence())
     }
 
     pub(crate) fn cancel_read_watcher(

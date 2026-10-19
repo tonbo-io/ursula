@@ -1,6 +1,8 @@
 #[cfg(all(test, not(madsim)))]
 mod cold_drivers_tests;
 #[cfg(all(test, not(madsim)))]
+mod cold_upload_fence_tests;
+#[cfg(all(test, not(madsim)))]
 mod compact_tests;
 #[cfg(all(test, not(madsim)))]
 mod external_index_after_commit_tests;
@@ -23,6 +25,8 @@ use openraft::Config;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
+use openraft::impls::ProgressResponder;
+use openraft::impls::leader_id_adv::LeaderId;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
 use ursula_runtime::AdvanceRetentionRequest;
@@ -98,6 +102,7 @@ use ursula_runtime::LinearizableReadBarrier;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::Proposal;
+use ursula_runtime::ProposedUpload;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::PublishSnapshotResponse;
 use ursula_runtime::ReadEnd;
@@ -113,6 +118,7 @@ use ursula_runtime::TidyStreamsPass;
 use ursula_runtime::TidyStreamsRequest;
 use ursula_runtime::TidyStreamsResponse;
 use ursula_runtime::TouchStreamAccessResponse;
+use ursula_runtime::UploadFence;
 use ursula_runtime::WriteRoute;
 use ursula_runtime::clipped_entries;
 use ursula_runtime::cold_store_failure;
@@ -133,6 +139,7 @@ use ursula_stream::StreamReadPlan;
 
 use crate::GroupLeadership;
 use crate::forward::LeaderRoute;
+use crate::forward::ProposalFence;
 use crate::forward::forward_head_stream_to_leader;
 use crate::forward::forward_purge_bucket_to_leader;
 use crate::forward::forward_read_stream_to_leader;
@@ -957,6 +964,20 @@ impl RaftGroupEngine {
             })
     }
 
+    /// Starts a new term with this leader's own campaign: it steps down to
+    /// `target`, another node, and campaigns at once, as a stalled
+    /// leadership transfer's step-down does. A single-voter group, or
+    /// a campaign the other voters grant, re-elects this node in a new term,
+    /// as a fault that ends a leadership without moving it.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub async fn step_down_and_campaign(
+        &self,
+        target: u64,
+    ) -> Result<crate::StepDown, crate::StepDownError> {
+        let vote = self.raft.metrics().borrow_watched().vote;
+        crate::owner::step_down_and_campaign(&self.raft, vote, target).await
+    }
+
     pub fn raft_handle(&self) -> Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine> {
         self.raft.clone()
     }
@@ -1097,9 +1118,52 @@ impl RaftGroupEngine {
         .await
     }
 
+    /// Proposes `command`, which names no object this node uploaded, under
+    /// any leadership. An upload command goes through
+    /// [`Self::write_upload`], and one proposed here is refused (F14j).
     pub(crate) async fn write(
         &self,
         command: GroupWriteCommand,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        self.propose(command, ProposalFence::Unfenced).await
+    }
+
+    /// Proposes `command`, which names the object of `upload` as new, only
+    /// under the leadership `upload` is fenced to (F14j). OpenRaft refuses
+    /// it before it appends anything once that leadership ended, a
+    /// re-election of this node included, and the refusal says that nothing
+    /// was proposed, so the uploader deletes its object.
+    pub(crate) async fn write_upload(
+        &self,
+        command: GroupWriteCommand,
+        upload: &ProposedUpload,
+    ) -> Result<GroupWriteResponse, GroupEngineError> {
+        let fence = match upload.fence() {
+            UploadFence::Leader(leader) => {
+                #[cfg(madsim)]
+                {
+                    let GroupWriteCommand::Stream(stream_command) = &command;
+                    if let Some(object) = ursula_runtime::uploaded_object(stream_command) {
+                        ursula_runtime::cold_uploads::fence_ledger::note_proposed(object, leader);
+                    }
+                }
+                ProposalFence::Leadership(leader)
+            }
+            // A Raft group has no leadership without replication: the
+            // proposal guard refuses the upload as unfenced.
+            UploadFence::Unreplicated => ProposalFence::Unfenced,
+        };
+        self.propose(command, fence).await
+    }
+
+    /// The one path a command of this engine takes to OpenRaft. The checks
+    /// before the submission refuse it with nothing proposed. A submission
+    /// that does not reach RaftCore proposed nothing either. One that
+    /// reached it and lost its answer has an unknown outcome.
+    async fn propose(
+        &self,
+        command: GroupWriteCommand,
+        fence: ProposalFence,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         // Refused before proposal: nothing was written.
         self.apply_health.check(self.placement.raft_group_id)?;
@@ -1107,21 +1171,33 @@ impl RaftGroupEngine {
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
         crate::forward::refuse_unless_leader(&self.raft)?;
+        let expected_leader = crate::forward::proposal_leader(&command, fence)?;
         let GroupWriteCommand::Stream(stream_command) = &command;
         let expected = ResponseKind::answering(stream_command);
-        let response = match self.raft.client_write(command).await {
-            Ok(response) => response,
-            // Once submitted, a group that stops may already have committed
-            // the command and applies it after repair: the outcome is unknown.
-            Err(err) => {
-                let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
-                return Err(openraft_error::group_engine_client_write_error(
-                    err,
-                    &leadership,
-                ));
-            }
+        let (responder, complete) = ProgressResponder::<UrsulaRaftTypeConfig, _>::complete_only();
+        let request = self.raft.write(command).responder(responder);
+        let request = match expected_leader {
+            Some(leader) => request.with_leader(LeaderId {
+                term: leader.term(),
+                node_id: leader.node_id(),
+            }),
+            None => request,
         };
-        write_result_from_raft_response(response.data, expected)?
+        // The send fails only when RaftCore is gone, and then it hands the
+        // message back unsent: nothing was proposed.
+        request.await.map_err(openraft_error::write_not_submitted)?;
+        // RaftCore took the command: a group that stops now may already
+        // have committed it, and applies it after repair.
+        let answer = complete
+            .await
+            .map_err(|_closed| openraft_error::write_answer_lost())?;
+        match answer {
+            Ok(response) => write_result_from_raft_response(response.data, expected)?,
+            Err(refusal) => Err(openraft_error::client_write_refusal(
+                &refusal,
+                &GroupLeadership::of(&self.raft.metrics().borrow_watched()),
+            )),
+        }
     }
 
     pub(crate) async fn forward_write_to_leader_if_follower(
@@ -1414,6 +1490,10 @@ impl GroupEngine for RaftGroupEngine {
         self.raft.is_leader()
     }
 
+    fn upload_fence(&self) -> Option<UploadFence> {
+        GroupLeadership::of(&self.raft.metrics().borrow_watched()).upload_fence()
+    }
+
     fn history_watch(&self) -> Option<ursula_runtime::HistoryWatch> {
         Some(self.history.subscribe())
     }
@@ -1461,7 +1541,11 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             // The state keeps the initial payload as a direct reference
             // (F14g), so the engine writes no page entry before proposing.
-            CreateStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            let upload = request.upload.clone();
+            CreateStreamResponse::try_from(
+                self.write_upload(GroupWriteCommand::from(request), &upload)
+                    .await?,
+            )
         })
     }
 
@@ -1486,21 +1570,24 @@ impl GroupEngine for RaftGroupEngine {
         Box::pin(async move {
             // The one leadership policy the front door routes by too.
             let route = GroupLeadership::of(&self.raft.metrics().borrow_watched()).write_route();
-            if !matches!(route, WriteRoute::Leader { .. }) {
+            let WriteRoute::Leader { fence, .. } = route else {
                 return Ok(route);
-            }
+            };
             // Only the leader answers early (#581 section 2.5). Applied
             // entries are committed, so a leader that was deposed a moment
             // ago still answers truly under the request's token.
             let Some(early) = request.early_answer_request() else {
-                return Ok(WriteRoute::Leader { early_answer: None });
+                return Ok(route);
             };
             let early_answer = self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move { state_machine.engine.producer_early_answer_now(&early) })
                 })
                 .await?;
-            Ok(WriteRoute::Leader { early_answer })
+            Ok(WriteRoute::Leader {
+                early_answer,
+                fence,
+            })
         })
     }
 
@@ -1805,7 +1892,14 @@ impl GroupEngine for RaftGroupEngine {
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            PublishSnapshotResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            let response = match request.cold_body.as_ref().map(|body| body.upload.clone()) {
+                Some(upload) => {
+                    self.write_upload(GroupWriteCommand::from(request), &upload)
+                        .await?
+                }
+                None => self.write(GroupWriteCommand::from(request)).await?,
+            };
+            PublishSnapshotResponse::try_from(response)
         })
     }
 
@@ -1871,9 +1965,11 @@ impl GroupEngine for RaftGroupEngine {
             let Some(cold_store) = self.cold_store.clone() else {
                 return Ok(report);
             };
-            if !self.raft.is_leader() {
+            // A pass planned under one leadership acts only under it, as
+            // the uploads do (F14j).
+            let Some(UploadFence::Leader(leader)) = self.upload_fence() else {
                 return Ok(report);
-            }
+            };
             let candidates = self
                 .with_state_machine(move |state_machine| {
                     Box::pin(async move {
@@ -1915,7 +2011,7 @@ impl GroupEngine for RaftGroupEngine {
                     refs: candidate.refs,
                 });
                 match self
-                    .write(command)
+                    .propose(command, ProposalFence::Leadership(leader))
                     .await
                     .and_then(ursula_runtime::OffloadStreamColdRefsResponse::try_from)
                 {
@@ -2393,7 +2489,11 @@ impl GroupEngine for RaftGroupEngine {
             // F5: commit first, index after. Apply keeps the locator in
             // state and the offload pass writes the page entry once the
             // append committed.
-            AppendResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            let upload = request.upload.clone();
+            AppendResponse::try_from(
+                self.write_upload(GroupWriteCommand::from(request), &upload)
+                    .await?,
+            )
         })
     }
 
@@ -2472,7 +2572,11 @@ impl GroupEngine for RaftGroupEngine {
                 index_rollback = Some((store, rollback));
             }
             let stream_id = request.stream_id.clone();
-            let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
+            let upload = request.upload.clone();
+            let (result, rollback_safe) = match self
+                .write_upload(GroupWriteCommand::from(request), &upload)
+                .await
+            {
                 Ok(response) => (FlushColdResponse::try_from(response), false),
                 Err(err) => {
                     // F14e: a refusal before proposal means the write was never
@@ -2545,7 +2649,11 @@ impl GroupEngine for RaftGroupEngine {
                 index_rollback = Some((store, rollback));
             }
             let stream_id = request.stream_id.clone();
-            let (result, rollback_safe) = match self.write(GroupWriteCommand::from(request)).await {
+            let upload = request.upload.clone();
+            let (result, rollback_safe) = match self
+                .write_upload(GroupWriteCommand::from(request), &upload)
+                .await
+            {
                 Ok(response) => (CompactColdResponse::try_from(response), false),
                 Err(err) => {
                     // A refusal before proposal means the write was never

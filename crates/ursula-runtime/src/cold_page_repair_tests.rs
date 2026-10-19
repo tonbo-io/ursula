@@ -92,6 +92,7 @@ fn append_external_req(
         producer: None,
         now_ms: 0,
         if_incarnation: None,
+        upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
     }
 }
 
@@ -244,6 +245,7 @@ async fn d3_flush_clips_the_page_entry_of_a_rejected_external_append() {
                     object_size: 8,
                     ..Default::default()
                 },
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             },
             placement,
         )
@@ -594,6 +596,7 @@ fn create_external_req(
         stream_expires_at_ms: None,
         now_ms: 0,
         if_incarnation: None,
+        upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
     }
 }
 
@@ -700,6 +703,7 @@ async fn retention_gc_never_touches_the_boundary_page() {
                         object_size: 4,
                         ..Default::default()
                     },
+                    upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
                 },
                 placement,
             )

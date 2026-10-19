@@ -594,6 +594,10 @@ struct FlakyPublishEngine {
 }
 
 impl GroupEngine for FlakyPublishEngine {
+    fn upload_fence(&self) -> Option<ursula_runtime::UploadFence> {
+        self.inner.upload_fence()
+    }
+
     fn route_write<'a>(
         &'a mut self,
         request: RouteWriteRequest,

@@ -411,6 +411,7 @@ async fn retention_reclaims_external_payloads_still_held_in_state() {
                 producer: None,
                 now_ms: 0,
                 if_incarnation: None,
+                upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
             })
             .await
             .expect("append external");
@@ -663,6 +664,7 @@ async fn g1_snapshot_body_and_delete_producers_queue_only_accepted_paths() {
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("append external");
@@ -689,6 +691,7 @@ async fn g1_snapshot_body_and_delete_producers_queue_only_accepted_paths() {
                         object_size: 5,
                     },
                     digest: digest.to_owned(),
+                    upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
                 }),
                 now_ms: 0,
                 expected_incarnation: None,

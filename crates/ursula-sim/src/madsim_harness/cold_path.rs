@@ -159,6 +159,7 @@ async fn cold_path_publish(
         end_offset: setup.candidate.end_offset,
     });
 
+    let upload = super::leader_upload(&setup.engines[setup.leader_index]);
     let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
@@ -171,6 +172,7 @@ async fn cold_path_publish(
                     object_size,
                     ..Default::default()
                 },
+                upload,
             },
             placement(),
         )
@@ -494,6 +496,7 @@ pub(super) async fn run_cold_write_delay_inner(
         end_offset: setup.candidate.end_offset,
     });
 
+    let upload = super::leader_upload(&setup.engines[setup.leader_index]);
     let flushed = setup.engines[setup.leader_index]
         .flush_cold(
             FlushColdRequest {
@@ -506,6 +509,7 @@ pub(super) async fn run_cold_write_delay_inner(
                     object_size,
                     ..Default::default()
                 },
+                upload,
             },
             placement(),
         )

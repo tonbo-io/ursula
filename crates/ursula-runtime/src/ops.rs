@@ -208,11 +208,11 @@ macro_rules! runtime_operations {
                 handle { call route_write(engine, request, placement) }
                 client { pub stream fn route_write }
             }
-            op AcceptsLocalWrites {
+            op UploadFence {
                 fields {}
-                reply { response_tx: bool }
+                reply { response_tx: Option<UploadFence> }
                 guard { none }
-                handle { call accepts_local_writes(engine) }
+                handle { call upload_fence(engine) }
                 client { none }
             }
             op CloseStream {
