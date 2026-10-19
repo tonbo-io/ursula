@@ -3,7 +3,6 @@
 //! a sender. Jobs are polled concurrently so a waiting write cannot prevent
 //! the AppendEntries or vote that lets it complete.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -12,8 +11,8 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
-use openraft::BasicNode;
 use openraft::ChangeMembers;
+use openraft::EmptyNode;
 use openraft::RaftMetrics;
 use openraft::error::ClientWriteError;
 use openraft::error::Fatal;
@@ -333,12 +332,11 @@ impl OwnerRaftHandle {
     pub async fn add_learner(
         &self,
         id: u64,
-        node: BasicNode,
         blocking: bool,
     ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
         // A new leader proposes only once a quorum acknowledged it.
         crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
-        self.call(move |raft| async move { raft.add_learner(id, node, blocking).await })
+        self.call(move |raft| async move { raft.add_learner(id, EmptyNode {}, blocking).await })
             .await?
     }
     /// Makes `voters` the group's voter set and removes every learner
@@ -372,7 +370,7 @@ impl OwnerRaftHandle {
     }
     pub async fn initialize(
         &self,
-        members: BTreeMap<u64, BasicNode>,
+        members: BTreeSet<u64>,
     ) -> Result<(), RaftError<C, InitializeError<C>>> {
         self.call(move |raft| async move { raft.initialize(members).await })
             .await?

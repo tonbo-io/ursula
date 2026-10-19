@@ -1438,11 +1438,7 @@ async fn never_fsync_syncs_membership_without_syncing_each_data_batch() {
     assert_eq!(core.metrics.snapshot().wal_fsyncs, before_data);
     let membership = openraft::Membership::new(
         vec![std::collections::BTreeSet::from([1, 2, 3])],
-        std::collections::BTreeMap::from([
-            (1, openraft::BasicNode::default()),
-            (2, openraft::BasicNode::default()),
-            (3, openraft::BasicNode::default()),
-        ]),
+        std::collections::BTreeSet::from([1, 2, 3]),
     )
     .unwrap();
     let membership_entry = Entry::new(log_id(3), EntryPayload::Membership(membership));
@@ -1968,10 +1964,9 @@ async fn append_is_readable_before_the_writer_runs_and_flush_orders_truncate() {
 
 #[tokio::test]
 async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     use std::time::Duration;
 
-    use openraft::BasicNode;
     use openraft::rt::WatchReceiver;
 
     use super::writer::CoreWriteOp;
@@ -1993,10 +1988,10 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
         .unwrap(),
     );
     let mut engines = Vec::new();
-    let mut members = BTreeMap::new();
+    let mut members = BTreeSet::new();
     for (index, (core, writer)) in cores.iter().zip(&writers).enumerate() {
         let id = u64::try_from(index).unwrap().saturating_add(1);
-        members.insert(id, BasicNode::new(format!("node-{id}")));
+        members.insert(id);
         let engine = RaftGroupEngine::new_node_with_log_store_and_network(
             placement(0),
             id,

@@ -7,7 +7,7 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use futures_util::future::join_all;
-use openraft::BasicNode;
+use openraft::EmptyNode;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftMetrics;
@@ -83,7 +83,7 @@ pub struct SingleNodeRaftNetwork;
 impl RaftNetworkFactory<UrsulaRaftTypeConfig> for SingleNodeRaftNetworkFactory {
     type Network = SingleNodeRaftNetwork;
 
-    async fn new_client(&mut self, _target: u64, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, _target: u64, _node: &EmptyNode) -> Self::Network {
         SingleNodeRaftNetwork
     }
 }
@@ -132,7 +132,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
 impl RaftNetworkFactory<MetaRaftTypeConfig> for SingleNodeRaftNetworkFactory {
     type Network = SingleNodeRaftNetwork;
 
-    async fn new_client(&mut self, _target: u64, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, _target: u64, _node: &EmptyNode) -> Self::Network {
         SingleNodeRaftNetwork
     }
 }
@@ -2260,7 +2260,7 @@ mod tests {
                 Some(id),
                 openraft::Membership::new(
                     vec![BTreeSet::from([1])],
-                    BTreeMap::from([(1, openraft::BasicNode::new("local"))]),
+                    BTreeMap::from([(1, openraft::EmptyNode {})]),
                 )
                 .unwrap(),
             );

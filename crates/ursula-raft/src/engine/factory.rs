@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::Config;
 use openraft::SnapshotPolicy;
 use ursula_runtime::ColdStoreHandle;
@@ -204,7 +203,6 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                 RaftGroupEngine::new_single_node_observed(
                     placement,
                     SINGLE_NODE_ID,
-                    BasicNode::new("local"),
                     config,
                     log_store,
                     RaftGroupEngineOptions {
@@ -354,17 +352,9 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
-    fn peer_nodes(&self) -> BTreeMap<u64, BasicNode> {
-        self.peers
-            .iter()
-            .map(|(node_id, endpoints)| (node_id, BasicNode::new(endpoints.cluster_url())))
-            .collect()
-    }
-
-    fn peer_nodes_for_group(
-        &self,
-        raft_group_id: RaftGroupId,
-    ) -> Result<BTreeMap<u64, BasicNode>, GroupEngineError> {
+    /// The node ids that make up `raft_group_id`'s voters: its configured
+    /// voters, or every peer when no per-group voters are configured.
+    fn group_voters(&self, raft_group_id: RaftGroupId) -> Result<BTreeSet<u64>, GroupEngineError> {
         let refused = |problem| {
             GroupEngineError::Infra(GroupInfraError::StaticMembership {
                 raft_group_id,
@@ -372,7 +362,7 @@ impl StaticGrpcRaftGroupEngineFactory {
             })
         };
         let voters = if self.per_group_voters.is_empty() {
-            return Ok(self.peer_nodes());
+            return Ok(self.peers.node_ids().collect());
         } else {
             self.per_group_voters
                 .get(&raft_group_id)
@@ -382,14 +372,15 @@ impl StaticGrpcRaftGroupEngineFactory {
             return Err(refused(StaticMembershipProblem::NoVoters));
         }
 
-        let mut nodes = BTreeMap::new();
-        for node_id in voters {
-            let address = self.peers.cluster_url(*node_id).ok_or_else(|| {
-                refused(StaticMembershipProblem::VoterWithoutPeer { node_id: *node_id })
-            })?;
-            nodes.insert(*node_id, BasicNode::new(address));
+        if let Some(node_id) = voters
+            .iter()
+            .find(|node_id| !self.peers.contains(**node_id))
+        {
+            return Err(refused(StaticMembershipProblem::VoterWithoutPeer {
+                node_id: *node_id,
+            }));
         }
-        Ok(nodes)
+        Ok(voters.clone())
     }
 
     fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Option<Vec<u64>> {
@@ -460,7 +451,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     },
                 }));
             }
-            let nodes = self.peer_nodes_for_group(placement.raft_group_id)?;
+            let voters = self.group_voters(placement.raft_group_id)?;
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
             let store = self
@@ -556,7 +547,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 &engine,
                 rejoin,
                 &self.registry,
-                nodes,
+                voters,
                 crate::recovery_transport::GrpcRecoveryTransport {
                     transport,
                     placement,
@@ -598,11 +589,6 @@ mod tests {
     use super::*;
 
     #[cfg(not(madsim))]
-    fn peer_ids(nodes: BTreeMap<u64, BasicNode>) -> Vec<u64> {
-        nodes.keys().copied().collect()
-    }
-
-    #[cfg(not(madsim))]
     fn per_group_voters(groups: &[(u32, &[u64])]) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
         groups
             .iter()
@@ -642,15 +628,15 @@ mod tests {
         let factory = factory_for_node(1, &wal_root);
 
         assert_eq!(
-            peer_ids(factory.peer_nodes_for_group(RaftGroupId(0)).unwrap()),
-            vec![1, 2, 3]
+            factory.group_voters(RaftGroupId(0)).unwrap(),
+            BTreeSet::from([1, 2, 3])
         );
         assert_eq!(
-            peer_ids(factory.peer_nodes_for_group(RaftGroupId(1)).unwrap()),
-            vec![2, 3, 4]
+            factory.group_voters(RaftGroupId(1)).unwrap(),
+            BTreeSet::from([2, 3, 4])
         );
         let err = factory
-            .peer_nodes_for_group(RaftGroupId(2))
+            .group_voters(RaftGroupId(2))
             .expect_err("partial per-group voter config must not fall back to all peers");
         assert_eq!(
             err,

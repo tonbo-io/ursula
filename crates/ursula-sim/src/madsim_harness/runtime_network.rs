@@ -10,11 +10,11 @@
 //! built over it routes writes through the production leadership view.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::Config;
 use openraft::SnapshotPolicy;
 use openraft::metrics::WaitError;
@@ -444,13 +444,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 tracing::error!(error = %err, "OpenRaft refused the group's Raft config");
                 GroupEngineError::Infra(invalid_config)
             })?);
-            let mut nodes = BTreeMap::new();
-            for node_id in 1..=3 {
-                nodes.insert(
-                    node_id,
-                    BasicNode::new(format!("runtime-raft-node-{node_id}")),
-                );
-            }
+            let nodes = BTreeSet::from([1, 2, 3]);
 
             let mut engines = Vec::new();
             let mut wals = BTreeMap::new();

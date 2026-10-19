@@ -108,7 +108,7 @@ mod tests {
     fn epoch5_persisted_envelopes_are_stable() {
         // Named MessagePack (rmp_serde::to_vec_named) of the OpenRaft types
         // that format epoch 5 writes to disk and sends to peers: Vote, LogId,
-        // a joint StoredMembership with a learner and node addresses, a
+        // a joint StoredMembership with a learner, each node an empty map, a
         // membership Entry, and SnapshotMeta (snapshot record and transfer).
         // The SnapshotMeta bytes are the map {last_log_id, last_membership,
         // snapshot_id} over the LogId and StoredMembership bytes. OpenRaft
@@ -137,8 +137,8 @@ mod tests {
             [2, 3].into_iter().collect(),
         ]);
         assert_eq!(
-            membership.membership().get_node(&4).unwrap().addr,
-            "learner4"
+            membership.membership().learner_ids().collect::<Vec<_>>(),
+            vec![4]
         );
         let entry: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "entry");
         assert_eq!(entry.log_id, log);

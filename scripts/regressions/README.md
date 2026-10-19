@@ -53,10 +53,10 @@ Alpha28 includes this fix as well as the stale-inflight-ACK fix above.
 The Ursula codec test `epoch5_persisted_envelopes_are_stable` pins the named
 MessagePack bytes of format epoch 5 in
 `crates/ursula-raft/src/fixtures/persisted-envelopes-epoch5.json`. It checks
-Vote, LogId, joint StoredMembership (including a learner and addresses), a
-membership Entry and SnapshotMeta, then requires byte-identical re-encoding.
-The first four were generated with published alpha21, and alpha28 and alpha37
-encode them identically. Alpha37 writes SnapshotMeta's `snapshot_id` empty and
-ignores it on read, so the fixture's SnapshotMeta carries an empty id. It does
-not assert that later OpenRaft releases or mixed-version cluster operation are
+Vote, LogId, joint StoredMembership (including a learner), a membership Entry
+and SnapshotMeta, then requires byte-identical re-encoding. Membership names
+each member with OpenRaft's `EmptyNode`, which named MessagePack writes as an
+empty map. Alpha37 writes SnapshotMeta's `snapshot_id` empty and ignores it on
+read, so the fixture's SnapshotMeta carries an empty id. It does not assert
+that later OpenRaft releases or mixed-version cluster operation are
 compatible.

@@ -587,14 +587,7 @@ async fn recovery_publication_keeps_one_gate_bound_to_one_engine() {
         ))
     ));
     // A refused rebind must not disable the unrelated engine's elections.
-    other
-        .raft
-        .initialize(std::collections::BTreeMap::from([(
-            1,
-            BasicNode::new("local"),
-        )]))
-        .await
-        .unwrap();
+    other.raft.initialize(BTreeSet::from([1])).await.unwrap();
     other
         .raft
         .wait(Some(Duration::from_secs(5)))
@@ -680,11 +673,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         wal_roots.push(wal_root);
     }
     list_fixture_peers(&registries, &endpoints);
-    let nodes = endpoints
-        .iter()
-        .enumerate()
-        .map(|(index, endpoint)| (u64::try_from(index).unwrap() + 1, BasicNode::new(endpoint)))
-        .collect::<BTreeMap<_, _>>();
+    let nodes = (1..=u64::try_from(endpoints.len()).unwrap()).collect::<BTreeSet<_>>();
     // This fixture represents an initial bootstrap after proving every voter
     // empty.
     for gate in &gates {
@@ -1102,10 +1091,7 @@ async fn three_replicas_led_by_the_second(cluster_name: &str) -> ThreeReplicas {
         wal_roots.push(wal_root);
     }
     list_fixture_peers(&registries, &endpoints);
-    let nodes = (1_u64..)
-        .zip(&endpoints)
-        .map(|(id, endpoint)| (id, BasicNode::new(endpoint)))
-        .collect::<BTreeMap<_, _>>();
+    let nodes = (1..=u64::try_from(endpoints.len()).unwrap()).collect::<BTreeSet<_>>();
     for gate in &gates {
         gate.establish_vote_floor(UrsulaVote::new(0, 0))
             .await
@@ -1732,7 +1718,7 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
         1,
         first.raft_handle(),
         first_gate,
-        BTreeMap::from([(1, BasicNode::new("one")), (2, BasicNode::new("two"))]),
+        BTreeSet::from([1, 2]),
         move |_id| {
             let peer = peer.clone();
             let observations = observations.clone();

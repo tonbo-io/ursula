@@ -7,8 +7,8 @@ use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::ChangeMembers;
+use openraft::EmptyNode;
 use openraft::RaftMetrics;
 use openraft::ServerState;
 use openraft::alias::LogIdOf;
@@ -226,11 +226,10 @@ struct PlanInputs {
 pub(crate) async fn run_rejoin_heal(
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
-    configured: BTreeMap<u64, BasicNode>,
+    configured: BTreeSet<u64>,
     interval: Duration,
     reversions: FollowerLogReversions,
 ) {
-    let configured_ids = configured.keys().copied().collect::<BTreeSet<_>>();
     // The log id of the joint config seen on the previous tick, if any.
     let mut last_joint = None;
     let mut last_attempt = None;
@@ -275,7 +274,7 @@ pub(crate) async fn run_rejoin_heal(
                     .is_none_or(|(previous, at)| previous != inputs || at.elapsed() >= interval);
             let step = if due {
                 planned = Some((inputs, crate::rt::time::Instant::now()));
-                let mut view = heal_view(&current, &configured_ids);
+                let mut view = heal_view(&current, &configured);
                 let joint = (!view.uniform).then_some(inputs.membership);
                 if joint != last_joint {
                     joint_since = crate::rt::time::Instant::now();
@@ -322,17 +321,12 @@ pub(crate) async fn run_rejoin_heal(
             "recovery: restoring the group's configured voters"
         );
         let result = match &step {
-            HealStep::AddLearner { target } => {
-                let Some(node) = configured.get(target).cloned() else {
-                    continue;
-                };
-                crate::rt::time::timeout(
-                    REJOIN_HEAL_STEP_TIMEOUT,
-                    raft.add_learner(*target, node, false),
-                )
-                .await
-                .map(|result| result.map(|_| ()).map_err(|err| err.to_string()))
-            }
+            HealStep::AddLearner { target } => crate::rt::time::timeout(
+                REJOIN_HEAL_STEP_TIMEOUT,
+                raft.add_learner(*target, EmptyNode {}, false),
+            )
+            .await
+            .map(|result| result.map(|_| ()).map_err(|err| err.to_string())),
             HealStep::Promote { voters, .. } => crate::rt::time::timeout(
                 REJOIN_HEAL_STEP_TIMEOUT,
                 raft.change_membership(voters.clone(), false),

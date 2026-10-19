@@ -1,11 +1,10 @@
 //! Empty-group bootstrap decisions and driver.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
 
@@ -97,7 +96,7 @@ pub async fn run_group_bootstrap<P, F>(
     node_id: u64,
     raft: RaftGroupHandle,
     rejoin: Arc<GroupRejoin>,
-    nodes: BTreeMap<u64, BasicNode>,
+    nodes: BTreeSet<u64>,
     probe: P,
     interval: Duration,
     warn_every: Duration,
@@ -108,7 +107,7 @@ where
 {
     let group = rejoin.raft_group_id().0;
     let peers = nodes
-        .keys()
+        .iter()
         .copied()
         .filter(|peer_id| *peer_id != node_id)
         .collect::<Vec<_>>();

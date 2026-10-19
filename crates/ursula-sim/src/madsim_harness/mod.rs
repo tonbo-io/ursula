@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
@@ -12,7 +11,6 @@ use axum::body::to_bytes;
 use axum::http::HeaderValue;
 use axum::http::Request as HttpRequest;
 use axum::http::StatusCode;
-use openraft::BasicNode;
 use openraft::Config;
 use openraft::SnapshotPolicy;
 use serde::Deserialize;
@@ -1870,10 +1868,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         .validate()
         .expect("valid raft config"),
     );
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
+    let nodes = BTreeSet::from([1, 2, 3]);
 
     let mut engines = Vec::new();
     let mut wals = Vec::new();
@@ -1962,12 +1957,8 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
         engines.push(engine);
     }
 
-    let mut initial_nodes = BTreeMap::new();
-    for node_id in 1..=2 {
-        initial_nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
     engines[0]
-        .initialize_membership(initial_nodes)
+        .initialize_membership(BTreeSet::from([1, 2]))
         .await
         .expect("initialize simulated two-voter raft group");
     let leader_metrics = engines[0]
@@ -2013,10 +2004,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .validate()
         .expect("valid raft config"),
     );
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
+    let nodes = BTreeSet::from([1, 2, 3]);
 
     let mut engines = Vec::new();
     let mut wals = Vec::new();

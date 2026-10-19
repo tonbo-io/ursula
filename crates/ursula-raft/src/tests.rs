@@ -17,8 +17,8 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 use futures_util::stream;
-use openraft::BasicNode;
 use openraft::Config;
+use openraft::EmptyNode;
 use openraft::Entry;
 use openraft::EntryPayload;
 use openraft::LogId;
@@ -309,15 +309,9 @@ fn raft_wire_encoding_is_byte_stable_across_round_trips() {
     let membership = openraft::Membership::new(
         vec![BTreeSet::from([1u64, 2, 3])],
         BTreeMap::from([
-            (1u64, BasicNode {
-                addr: "node-1:4437".to_owned(),
-            }),
-            (2u64, BasicNode {
-                addr: "node-2:4437".to_owned(),
-            }),
-            (3u64, BasicNode {
-                addr: "node-3:4437".to_owned(),
-            }),
+            (1u64, EmptyNode {}),
+            (2u64, EmptyNode {}),
+            (3u64, EmptyNode {}),
         ]),
     )
     .expect("valid membership");
@@ -559,10 +553,7 @@ async fn build_three_node_cluster_gating(
     // OpenRaft also uses election_timeout_min as the vote RPC deadline.
     // Leave room for concurrent tests fsyncing votes on the same executor host.
     let config = raft_config(cluster_name, 500, 1_000);
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(address(node_id)));
-    }
+    let nodes = BTreeSet::from([1, 2, 3]);
     let peers = crate::PeerDirectory::new(
         (1..=3).map(|node_id| (node_id, crate::PeerEndpoints::shared(address(node_id)))),
     );
@@ -1236,14 +1227,9 @@ fn single_node_meta_raft_applies_node_registration() {
 async fn single_node_meta_raft_applies_node_registration_body() {
     let config = raft_config("ursula-meta-single-node-test", 30, 60);
     let mut log_store = MetaTestLogStore::shared();
-    let handle = MetaRaftHandle::new_single_node_with_log_store(
-        1,
-        BasicNode::new("meta-local"),
-        config,
-        log_store.clone(),
-    )
-    .await
-    .expect("create single-node meta raft handle");
+    let handle = MetaRaftHandle::new_single_node_with_log_store(1, config, log_store.clone())
+        .await
+        .expect("create single-node meta raft handle");
 
     let registered = handle
         .write(ControlCommand::RegisterNode {
@@ -1313,14 +1299,10 @@ fn meta_raft_handle_registers_initial_data_nodes() {
 }
 async fn meta_raft_handle_registers_initial_data_nodes_body() {
     let config = raft_config("ursula-meta-initial-data-nodes-test", 30, 60);
-    let handle = MetaRaftHandle::new_single_node_with_log_store(
-        1,
-        BasicNode::new("meta-local"),
-        config,
-        MetaTestLogStore::shared(),
-    )
-    .await
-    .expect("create single-node meta raft handle");
+    let handle =
+        MetaRaftHandle::new_single_node_with_log_store(1, config, MetaTestLogStore::shared())
+            .await
+            .expect("create single-node meta raft handle");
 
     handle
         .register_initial_data_nodes(
@@ -1376,14 +1358,10 @@ fn meta_raft_handle_rejects_invalid_initial_data_nodes() {
 }
 async fn meta_raft_handle_rejects_invalid_initial_data_nodes_body() {
     let config = raft_config("ursula-meta-invalid-initial-data-nodes-test", 30, 60);
-    let handle = MetaRaftHandle::new_single_node_with_log_store(
-        1,
-        BasicNode::new("meta-local"),
-        config,
-        MetaTestLogStore::shared(),
-    )
-    .await
-    .expect("create single-node meta raft handle");
+    let handle =
+        MetaRaftHandle::new_single_node_with_log_store(1, config, MetaTestLogStore::shared())
+            .await
+            .expect("create single-node meta raft handle");
 
     let err = handle
         .register_initial_data_nodes(
@@ -1430,14 +1408,10 @@ async fn meta_raft_handle_rejects_registration_during_an_operation_with_a_typed_
     use ursula_control::OperationCommand;
     use ursula_control::OperationOutcome;
     let config = raft_config("ursula-meta-operation-active-test", 30, 60);
-    let handle = MetaRaftHandle::new_single_node_with_log_store(
-        1,
-        BasicNode::new("meta-local"),
-        config,
-        MetaTestLogStore::shared(),
-    )
-    .await
-    .expect("create single-node meta raft handle");
+    let handle =
+        MetaRaftHandle::new_single_node_with_log_store(1, config, MetaTestLogStore::shared())
+            .await
+            .expect("create single-node meta raft handle");
     let registration = |node_id: u64, host: &str| {
         MetaNodeRegistration::new(
             node_id,
@@ -1579,9 +1553,7 @@ async fn single_node_openraft_group_applies_client_writes() {
     .await
     .expect("create single-node raft group");
 
-    let mut nodes = BTreeMap::new();
-    nodes.insert(1, BasicNode::new("local"));
-    raft.initialize(nodes)
+    raft.initialize(BTreeSet::from([1]))
         .await
         .expect("initialize single-node raft group");
     raft.wait(Some(Duration::from_secs(2)))
@@ -1664,7 +1636,7 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
         leader.read_barrier.owner().clone(),
         gate,
         RaftGroupHandleRegistry::default().election_policy(),
-        BTreeMap::from([(4, BasicNode::new("node-4"))]),
+        BTreeSet::from([4]),
         move |candidate| {
             let recorded = recorded.clone();
             let rounds = rounds.clone();
@@ -1706,7 +1678,7 @@ async fn replacing_the_voters_removes_learners_outside_them() {
     let leader = &engines[usize::try_from(leader_id).unwrap() - 1];
     leader
         .raft
-        .add_learner(4, BasicNode::new("node-4"), false)
+        .add_learner(4, EmptyNode {}, false)
         .await
         .expect("add a learner configuration does not list");
     assert_eq!(
@@ -3138,10 +3110,7 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
 ) -> (InProcessRaftRegistry, Vec<RaftGroupEngine>, u64) {
     let registry = InProcessRaftRegistry::default();
     let config = raft_config("ursula-madsim-three-node-test", 50, 100);
-    let mut nodes = BTreeMap::new();
-    for node_id in 1..=3 {
-        nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
+    let nodes = BTreeSet::from([1, 2, 3]);
 
     let mut engines = Vec::new();
     for node_id in 1..=3 {
@@ -3236,13 +3205,9 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         engines.push(engine);
     }
 
-    let mut initial_nodes = BTreeMap::new();
-    for node_id in 1..=2 {
-        initial_nodes.insert(node_id, BasicNode::new(format!("node-{node_id}")));
-    }
     engines[0]
         .raft
-        .initialize(initial_nodes)
+        .initialize(BTreeSet::from([1, 2]))
         .await
         .expect("initialize two-node raft group");
     let leader_metrics = engines[0]
@@ -3321,7 +3286,7 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
         Duration::from_secs(5),
         engines[leader_index]
             .raft
-            .add_learner(3, BasicNode::new("node-3"), true),
+            .add_learner(3, EmptyNode {}, true),
     )
     .await
     .expect("lagging learner catch-up finishes within the existing apply budget")
@@ -3505,7 +3470,6 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         let mut engine = RaftGroupEngine::new_single_node_with_log_store(
             placement(),
             1,
-            BasicNode::new("local"),
             single_node_config(),
             open_core_journal_store(root.path()).expect("open durable log store"),
         )
@@ -3533,7 +3497,6 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
     let mut recovered = RaftGroupEngine::new_single_node_with_log_store(
         placement(),
         1,
-        BasicNode::new("local"),
         single_node_config(),
         open_core_journal_store(root.path()).expect("reopen durable log store"),
     )
@@ -3578,7 +3541,6 @@ async fn a_new_group_starts_with_one_genesis_history_event() {
         let mut engine = RaftGroupEngine::new_single_node_with_log_store(
             placement(),
             1,
-            BasicNode::new("local"),
             single_node_config(),
             open_core_journal_store(root.path()).expect("open durable log store"),
         )
@@ -3622,7 +3584,6 @@ async fn a_new_group_starts_with_one_genesis_history_event() {
     let recovered = RaftGroupEngine::new_single_node_with_log_store(
         placement(),
         1,
-        BasicNode::new("local"),
         single_node_config(),
         open_core_journal_store(root.path()).expect("reopen durable log store"),
     )
@@ -3903,7 +3864,6 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
     let started = RaftGroupEngine::new_single_node(
         placement(),
         1,
-        BasicNode::new("local"),
         raft_config("failed-start", 30, 60),
         store,
         RaftGroupEngineOptions {
@@ -3953,7 +3913,6 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
     let engine = RaftGroupEngine::new_single_node(
         placement(),
         1,
-        BasicNode::new("local"),
         raft_config("dropped-engine", 30, 60),
         store,
         RaftGroupEngineOptions {
@@ -5022,7 +4981,6 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
     let engine = RaftGroupEngine::new_single_node(
         placement(),
         1,
-        BasicNode::new("local"),
         raft_config("changed-proof", 30, 60),
         store,
         Default::default(),
@@ -5557,7 +5515,6 @@ async fn reopen_journal_engine_with(
     RaftGroupEngine::new_single_node(
         placement(),
         1,
-        BasicNode::new("local"),
         raft_config(cluster_name, 30, 60),
         store,
         RaftGroupEngineOptions {
@@ -6030,11 +5987,7 @@ async fn queue_state_machine_work(
             last_log_id: Some(installed_id),
             last_membership: openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
                 Some(installed_id),
-                openraft::Membership::new(
-                    vec![BTreeSet::from([1])],
-                    BTreeMap::from([(1, BasicNode::new("local"))]),
-                )
-                .unwrap(),
+                openraft::Membership::new(vec![BTreeSet::from([1])], BTreeSet::from([1])).unwrap(),
             ),
         },
         snapshot: crate::types::SnapshotData::new(pointer.encode_binary().unwrap()),
@@ -6147,7 +6100,6 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
     let engine = RaftGroupEngine::new_single_node(
         placement(),
         1,
-        BasicNode::new("local"),
         raft_config("queued-work-reopened", 30, 60),
         reopened,
         RaftGroupEngineOptions {
@@ -6490,10 +6442,7 @@ async fn the_in_process_network_holds_a_sent_object_until_its_rpc_returns() {
     }
     engines[0]
         .raft
-        .initialize(BTreeMap::from([
-            (1, BasicNode::new("node-1")),
-            (2, BasicNode::new("node-2")),
-        ]))
+        .initialize(BTreeSet::from([1, 2]))
         .await
         .expect("initialize two voters");
     let leader_id = engines[0]
@@ -6552,7 +6501,7 @@ async fn the_in_process_network_holds_a_sent_object_until_its_rpc_returns() {
     registry.register(3, &engines[2]);
     leader
         .raft
-        .add_learner(3, BasicNode::new("node-3"), false)
+        .add_learner(3, EmptyNode {}, false)
         .await
         .expect("add the learner");
     tokio::time::timeout(Duration::from_secs(10), gates.wait_arrived(read, 1))

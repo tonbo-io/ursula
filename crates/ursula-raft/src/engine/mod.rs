@@ -11,7 +11,7 @@ mod history_pending_cold_tests;
 mod test_support;
 mod wal_error;
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::io;
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,7 +19,6 @@ use std::time::Duration;
 pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::RaftEngineConfig;
 pub use factory::StaticGrpcRaftGroupEngineFactory;
-use openraft::BasicNode;
 use openraft::Config;
 use openraft::OptionalSend;
 use openraft::Raft;
@@ -500,22 +499,13 @@ impl RaftGroupEngine {
             election_timeout_max: 60,
             ..Default::default()
         })?);
-        Self::new_single_node(
-            placement,
-            1,
-            BasicNode::new("local"),
-            config,
-            log_store,
-            options,
-        )
-        .await
+        Self::new_single_node(placement, 1, config, log_store, options).await
     }
 
     #[cfg(any(test, madsim))]
     pub async fn new_single_node_with_log_store<LS>(
         placement: ShardPlacement,
         node_id: u64,
-        node: BasicNode,
         config: Arc<Config>,
         log_store: LS,
     ) -> Result<Self, GroupEngineError>
@@ -523,7 +513,7 @@ impl RaftGroupEngine {
         LS: RaftLogStorage<UrsulaRaftTypeConfig>,
     {
         Self::new_single_node_with_log_store_and_metrics(
-            placement, node_id, node, config, log_store, None, None,
+            placement, node_id, config, log_store, None, None,
         )
         .await
     }
@@ -532,7 +522,6 @@ impl RaftGroupEngine {
     pub(crate) async fn new_single_node_with_log_store_and_metrics<LS>(
         placement: ShardPlacement,
         node_id: u64,
-        node: BasicNode,
         config: Arc<Config>,
         log_store: LS,
         metrics: Option<GroupEngineMetrics>,
@@ -544,7 +533,6 @@ impl RaftGroupEngine {
         Self::new_single_node(
             placement,
             node_id,
-            node,
             config,
             log_store,
             RaftGroupEngineOptions {
@@ -559,7 +547,6 @@ impl RaftGroupEngine {
     pub async fn new_single_node<LS>(
         placement: ShardPlacement,
         node_id: u64,
-        node: BasicNode,
         config: Arc<Config>,
         log_store: LS,
         options: RaftGroupEngineOptions,
@@ -570,7 +557,6 @@ impl RaftGroupEngine {
         Self::new_single_node_observed(
             placement,
             node_id,
-            node,
             config,
             log_store,
             options,
@@ -582,7 +568,6 @@ impl RaftGroupEngine {
     pub(crate) async fn new_single_node_observed<LS>(
         placement: ShardPlacement,
         node_id: u64,
-        node: BasicNode,
         config: Arc<Config>,
         log_store: LS,
         options: RaftGroupEngineOptions,
@@ -606,9 +591,9 @@ impl RaftGroupEngine {
         )
         .await?;
         #[cfg(test)]
-        let started = engine.start_single_node(node_id, node, startup_fault).await;
+        let started = engine.start_single_node(node_id, startup_fault).await;
         #[cfg(not(test))]
-        let started = engine.start_single_node(node_id, node).await;
+        let started = engine.start_single_node(node_id).await;
         match started {
             Ok(()) => Ok(engine),
             Err(error) => {
@@ -625,7 +610,6 @@ impl RaftGroupEngine {
     async fn start_single_node(
         &self,
         node_id: u64,
-        node: BasicNode,
         #[cfg(test)] startup_fault: Option<StartupFault>,
     ) -> Result<(), GroupEngineError> {
         #[cfg(test)]
@@ -651,10 +635,8 @@ impl RaftGroupEngine {
             .await
             .map_err(crate::owner::owner_stopped)?;
         if !initialized {
-            let mut nodes = BTreeMap::new();
-            nodes.insert(node_id, node);
             self.raft
-                .initialize(nodes)
+                .initialize(BTreeSet::from([node_id]))
                 .await
                 .map_err(|err| openraft_error::initialize_error(raft_group_id, err))?;
         }
@@ -923,7 +905,7 @@ impl RaftGroupEngine {
 
     /// The voter configs of the membership this replica keeps when a
     /// recovery plan cuts its log back to its committed entry (#613).
-    pub fn kept_voter_configs(&self) -> Vec<std::collections::BTreeSet<u64>> {
+    pub fn kept_voter_configs(&self) -> Vec<BTreeSet<u64>> {
         let committed = openraft::rt::WatchReceiver::borrow_watched(&self.raft.metrics())
             .local_committed
             .map(|id| id.index);
@@ -944,7 +926,7 @@ impl RaftGroupEngine {
 
     pub async fn initialize_membership(
         &self,
-        nodes: BTreeMap<u64, BasicNode>,
+        nodes: BTreeSet<u64>,
     ) -> Result<(), GroupEngineError> {
         let initialized = self
             .raft
@@ -1040,7 +1022,7 @@ impl RaftGroupEngine {
         &self,
         gate: Arc<crate::GroupRejoin>,
         registry: &crate::RaftGroupHandleRegistry,
-        nodes: BTreeMap<u64, BasicNode>,
+        nodes: BTreeSet<u64>,
         transport: T,
         config: crate::RecoveryConfig,
     ) -> Result<(), GroupEngineError> {

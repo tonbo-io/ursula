@@ -71,7 +71,6 @@ fn simulated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
             let mut engine = crate::RaftGroupEngine::new_single_node(
                 placement(),
                 1,
-                openraft::BasicNode::new("local"),
                 super::raft_config("sim-batch-capacity", 50, 100),
                 super::sim_journal_store("batch-capacity"),
                 Default::default(),

@@ -1,13 +1,11 @@
 //! Follower-side fresh quorum barrier driver.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
 
@@ -30,7 +28,7 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
     raft: OwnerRaftHandle,
     rejoin: Arc<GroupRejoin>,
     election: crate::ElectionPolicy,
-    nodes: BTreeMap<u64, BasicNode>,
+    nodes: BTreeSet<u64>,
     probe: P,
     probe_timeout: Duration,
     interval: Duration,
@@ -76,7 +74,7 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
             })
         {
             last_probe = Some((metrics.vote, crate::rt::time::Instant::now()));
-            let mut candidates = nodes.keys().copied().collect::<BTreeSet<_>>();
+            let mut candidates = nodes.clone();
             candidates.extend(
                 metrics
                     .membership_config

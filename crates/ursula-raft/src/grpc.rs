@@ -11,7 +11,7 @@ use std::time::Duration;
 use crossbeam_utils::CachePadded;
 use futures_util::Stream;
 use futures_util::StreamExt;
-use openraft::BasicNode;
+use openraft::EmptyNode;
 use openraft::OptionalSend;
 use openraft::RaftNetworkFactory;
 use openraft::RaftNetworkV2;
@@ -1227,8 +1227,8 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
     type Network = GrpcRaftNetwork;
 
     /// A client to `target` at the cluster URL `raft.peers` lists for it.
-    /// The address a membership records for the node is never read.
-    async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
+    /// Membership names node ids only.
+    async fn new_client(&mut self, target: u64, _node: &EmptyNode) -> Self::Network {
         GrpcRaftNetwork::resolve(
             self.transport.clone(),
             self.raft_group_id,
@@ -2744,8 +2744,7 @@ mod reconnect_tests {
         server.abort();
     }
 
-    /// A client dials the cluster URL `raft.peers` lists for its target,
-    /// never the address the group's membership records for the node.
+    /// A client dials the cluster URL `raft.peers` lists for its target.
     #[tokio::test]
     async fn the_factory_dials_the_address_raft_peers_lists() {
         let (endpoint, _registry, server) = spawn_append_stream_server().await;
@@ -2757,9 +2756,7 @@ mod reconnect_tests {
             ),
         ));
         let mut factory = GrpcRaftNetworkFactory::new(transport, RaftGroupId(1));
-        let mut network = factory
-            .new_client(1, &BasicNode::new("http://127.0.0.1:1"))
-            .await;
+        let mut network = factory.new_client(1, &EmptyNode {}).await;
         assert_eq!(network.endpoint(), endpoint);
         // The server hosts no group 1: the vote reached it and was answered.
         let vote = network
@@ -2777,14 +2774,13 @@ mod reconnect_tests {
     /// answers every RPC without dialing, and has no channel to rebuild.
     #[tokio::test]
     async fn a_member_raft_peers_does_not_list_is_never_dialed() {
-        let (endpoint, _registry, server) = spawn_append_stream_server().await;
         let transport = Arc::new(CoreRaftTransport::new(
             crate::peer_cluster::test_identity(2),
             crate::peer_cluster::test_peer_cluster(2),
         ));
         let mut factory = GrpcRaftNetworkFactory::new(transport.clone(), RaftGroupId(1))
             .with_reconnect_threshold(1);
-        let mut network = factory.new_client(7, &BasicNode::new(endpoint)).await;
+        let mut network = factory.new_client(7, &EmptyNode {}).await;
         assert!(matches!(
             network.channel,
             Err(RaftChannelError::Unaddressed { node_id: 7 })
@@ -2813,7 +2809,6 @@ mod reconnect_tests {
         assert!(matches!(append, RPCError::Unreachable(_)), "{append:?}");
         assert!(transport.channels.lock().unwrap().is_empty());
         assert!(transport.sessions.lock().unwrap().is_empty());
-        server.abort();
     }
 
     /// A peer of another cluster refuses this node's votes and appends

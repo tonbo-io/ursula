@@ -276,7 +276,6 @@ fn names_internals(message: &str) -> bool {
         "s3",
         "core ",
         "raft group",
-        "BasicNode",
         "10.",
         "cluster-",
     ]

@@ -34,7 +34,7 @@ openraft::declare_raft_types!(
     pub UrsulaRaftTypeConfig:
         D = GroupWriteCommand,
         R = RaftGroupResponse,
-        Node = openraft::BasicNode,
+        Node = openraft::EmptyNode,
         AsyncRuntime = OpenRaftRuntime,
 );
 
