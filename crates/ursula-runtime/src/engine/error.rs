@@ -1,7 +1,8 @@
 //! The group engine's error, [`GroupEngineError`]: a cross-crate,
-//! serializable protocol value. It crosses the Raft RPC as named
-//! MessagePack in the answer of a forwarded `GroupRead` and `GroupWrite`, so
-//! within a minor its wire form, and that of every type it carries, is
+//! serializable protocol value. It crosses the Raft RPC as compact
+//! MessagePack (`ursula_stream::msgpack`: field order and variant names are
+//! its wire form) in the answer of a forwarded `GroupRead` and `GroupWrite`,
+//! so within a minor its wire form, and that of every type it carries, is
 //! frozen (`crates/ursula-raft/src/fixtures/group-engine-errors-epoch5.json`
 //! shows any change). It carries no free text a caller acts on: every
 //! distinction a caller acts on is a variant, and [`GroupEngineError::status`],

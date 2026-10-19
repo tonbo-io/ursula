@@ -911,8 +911,8 @@ fn snapshot_round_trip_and_restore_versus_live_differential() {
     }
 
     let snapshot = live.snapshot();
-    let encoded = serde_json::to_vec(&snapshot).unwrap();
-    let decoded: StreamSnapshot = serde_json::from_slice(&encoded).unwrap();
+    let encoded = crate::msgpack::encode(&snapshot).unwrap();
+    let decoded: StreamSnapshot = crate::msgpack::decode(&encoded).unwrap();
     assert_eq!(decoded, snapshot);
     let mut restored = StreamStateMachine::restore(decoded).unwrap();
     assert_eq!(restored.snapshot(), snapshot);
@@ -1108,9 +1108,9 @@ fn tidy_stream_command_round_trips_through_serde() {
         stream_id: sid("serde"),
         now_ms: 9,
     };
-    let encoded = serde_json::to_vec(&command).unwrap();
+    let encoded = crate::msgpack::encode(&command).unwrap();
     assert_eq!(
-        serde_json::from_slice::<StreamCommand>(&encoded).unwrap(),
+        crate::msgpack::decode::<StreamCommand>(&encoded).unwrap(),
         command
     );
     assert_eq!(command.to_string(), "tidy_stream:window/serde");

@@ -136,7 +136,7 @@ Every read is capped at `READ_MAX_RESPONSE_BYTES` = 8 MiB (`crates/ursula/src/li
 
 ### F12a to F12e: snapshot pipeline
 
-- **F12a, binary envelope.** `SnapshotPointer` and `PersistedSnapshot` are MessagePack with `serde_bytes`. Decoders refuse the old JSON envelope.
+- **F12a, binary envelope.** `SnapshotPointer` and `PersistedSnapshot` are compact MessagePack (`ursula_stream::msgpack`) with `serde_bytes`. Decoders refuse the old JSON envelope.
 - **F12b, S3 by default.** The snapshot backend `auto` (the default) picks S3 snapshots whenever the cold store is S3 and inline otherwise (`resolved_snapshot_backend`). Under madsim `auto` stays inline.
 - **F12c, no extra copies.** The frame iterator borrows the group snapshot, and install decodes once.
 - **F12d, non-blocking permit.** `try_create_snapshot_builder` try-acquires the node-wide build permit and returns `None` when it is busy, so no apply worker waits on another group's build.

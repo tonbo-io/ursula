@@ -27,7 +27,6 @@ use raft_log::RaftLog;
 use raft_log::api::raft_log_writer::RaftLogWriter;
 use raft_log::codeq::Decode;
 use raft_log::codeq::Encode;
-use raft_log::codeq::OffsetWriter;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::RwLock;
@@ -77,22 +76,30 @@ impl<C: RaftTypeConfig> Decode for MsgPackVote<C> {
     }
 }
 
+/// Encodes `value` as Ursula's WAL does ([`ursula_stream::msgpack`]), so the
+/// comparison measures the same bytes.
 fn encode_msgpack<T: Serialize>(value: &T, mut writer: impl io::Write) -> io::Result<usize> {
-    let mut offset = OffsetWriter::new(&mut writer);
-    rmp_serde::encode::write_named(&mut offset, value).map_err(|err| {
+    let bytes = ursula_stream::msgpack::encode(value).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{err}; encoding {}", type_name::<T>()),
         )
     })?;
-    Ok(offset.offset())
+    writer.write_all(&bytes)?;
+    Ok(bytes.len())
 }
 
+/// Decodes one value from `reader`. raft-log decodes several values from one
+/// reader, which [`ursula_stream::msgpack::decode`] of a whole slice cannot.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "raft-log decodes several values from one reader"
+)]
 fn decode_msgpack<T: DeserializeOwned>(reader: impl io::Read) -> io::Result<T> {
     rmp_serde::decode::from_read(reader).map_err(|err| {
         let kind = match &err {
-            rmp_serde::decode::Error::InvalidMarkerRead(io_err)
-            | rmp_serde::decode::Error::InvalidDataRead(io_err) => io_err.kind(),
+            ursula_stream::msgpack::DecodeError::InvalidMarkerRead(io_err)
+            | ursula_stream::msgpack::DecodeError::InvalidDataRead(io_err) => io_err.kind(),
             _ => io::ErrorKind::InvalidData,
         };
         io::Error::new(kind, format!("{err}; decoding {}", type_name::<T>()))

@@ -2639,3 +2639,46 @@ async fn the_screen_refuses_while_the_store_lags_an_admitted_install() {
     store.purge(log_id(100)).await.expect("purge");
     assert_eq!(gate.effective_marker(&metrics), Ok(Some(100)));
 }
+
+/// What one small write costs in the WAL: a 16-byte JSON append journaled
+/// as one entry in its own frame, as a follower that received it alone
+/// writes it. Ursula's MessagePack is compact (`ursula_stream::msgpack`), so
+/// this is about half of what a map keyed by field names cost. A record
+/// that grows past the bound is a format change worth a look.
+#[test]
+fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
+    /// The frame and record measured on CI, in bytes.
+    const SMALL_APPEND_WAL_BYTES: u64 = 0;
+
+    let root = tempfile::tempdir().expect("WAL root");
+    let path = root.path().join("journal-00000000000000000001.seg");
+    let mut journal = JournalWriter::open(&path, 1).expect("segment 1");
+    let before = journal.len();
+    let payload = br#"{"n":1234567890}"#;
+    assert_eq!(payload.len(), 16);
+    journal
+        .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
+            group_id: 3,
+            record: RaftGroupLogRecord::Append(vec![Entry::new(
+                LogId {
+                    leader_id: CommittedLeaderId::new(7, 2),
+                    index: 1_000_000,
+                },
+                EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+                    stream_id: BucketStreamId::new("tenant", "orders"),
+                    content_type: Some("application/json".to_owned()),
+                    payload: Bytes::from_static(payload),
+                    close_after: false,
+                    stream_seq: None,
+                    producer: None,
+                    now_ms: 1_700_000_000_000,
+                })),
+            )]),
+        })
+        .expect("the record fits a frame");
+    let grown = journal.len().saturating_sub(before);
+    assert_eq!(
+        grown, SMALL_APPEND_WAL_BYTES,
+        "a 16-byte append takes {grown} WAL bytes"
+    );
+}

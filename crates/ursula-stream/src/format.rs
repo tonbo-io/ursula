@@ -11,9 +11,11 @@
 //! and the per-stream epoch floor, and history identity: the group's history
 //! event, the history a producer record was claimed in, and what a stream
 //! inherited from the history before. Epoch 5 is the format of Ursula 0.9:
-//! the `ExpireStreams` command, a clock on `DeleteStream`, and writes that
-//! remove only the stream they name. A binary reads exactly one epoch: it refuses data and peers from any other
-//! epoch loudly, before it writes anything, and it does not convert them.
+//! the `ExpireStreams` command, a clock on `DeleteStream`, writes that
+//! remove only the stream they name, and compact MessagePack
+//! ([`crate::msgpack`]) for everything Ursula writes as MessagePack. A binary
+//! reads exactly one epoch: it refuses data and peers from any other epoch
+//! loudly, before it writes anything, and it does not convert them.
 //!
 //! Every version number that an earlier binary checks is set equal to
 //! [`FORMAT_EPOCH`]: the Raft WAL journal header and state files, the Raft
@@ -23,11 +25,13 @@
 //! pages carry a page version of their own.
 //!
 //! A backup carries [`BACKUP_FORMAT_VERSION`] instead. It covers the
-//! manifest, each group's `StreamSnapshot` in named MessagePack with every
+//! manifest, each group's `StreamSnapshot` in compact MessagePack with every
 //! type it contains, and the cold objects a backup references (cold-index
 //! pages and the cold key layout), in encoding and in meaning. It is the
 //! format epoch that last changed one of them, so it never exceeds
-//! [`FORMAT_EPOCH`]. Backup format 4 is written by 0.8 and 0.9.
+//! [`FORMAT_EPOCH`]. Backup format 4 is written by 0.8, backup format 5 by
+//! 0.9. From backup format 5 on, a group object's first field is its
+//! backup format.
 //!
 //! Policy:
 //!
@@ -43,9 +47,9 @@
 //! - There is no migration between epochs. Data of an older epoch moves by
 //!   `ursulactl` backup and restore when its backup format is this binary's,
 //!   and otherwise by export and re-import through the applications that own
-//!   it; neither the server nor `ursulactl` converts it. 0.9 refuses every
+//!   it. Neither the server nor `ursulactl` converts it. 0.9 refuses every
 //!   epoch-4 data directory, object-storage prefix, peer and group snapshot,
-//!   and restores epoch-4 backups.
+//!   and every backup of backup format 4.
 //! - Epoch 2 was frozen when 0.6.0 was tagged, epoch 3 when 0.7.0 was tagged,
 //!   epoch 4 when 0.8.0 was tagged. Epoch 5 is frozen when 0.9.0 is tagged.
 //!   Main builds before that tag are not supported on each other's data;
@@ -57,7 +61,7 @@ pub const FORMAT_EPOCH: u32 = 5;
 
 /// The backup format this binary reads and writes: the format epoch that last
 /// changed what a backup holds.
-pub const BACKUP_FORMAT_VERSION: u32 = 4;
+pub const BACKUP_FORMAT_VERSION: u32 = 5;
 
 const _: () = assert!(BACKUP_FORMAT_VERSION <= FORMAT_EPOCH);
 

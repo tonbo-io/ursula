@@ -9,6 +9,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // payload-heavy commands slices the receive buffer instead of copying.
         .bytes(["."])
         .boxed(".ursula.durable.v1.SnapshotFrameV1.frame.stream")
+        // The serde derives below put these messages inside replicated
+        // commands, snapshots and backups, which `ursula_stream::msgpack`
+        // writes as arrays of fields in declaration order. The order of
+        // their fields in `types.proto` is therefore part of the format,
+        // and protobuf tags do not protect it.
         .type_attribute("ProducerRequestV1", "#[derive(Eq)]")
         .type_attribute(
             "ProducerRequestV1",

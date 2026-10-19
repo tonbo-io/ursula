@@ -369,10 +369,9 @@ fresh, as a new release with new PVCs and a new `s3.prefix` (and, with cold
 storage off and S3 snapshots, a new `snapshotStore.prefix`). `helm upgrade`
 from 0.8 stops before a second voter is replaced, because the first new pod
 finds the 0.8 data on its volume and exits at startup. Recover with
-`helm rollback`. Move the data with `ursulactl backup-create` on 0.8 and
-`ursulactl restore` on 0.9, and keep the 0.8 release's `server.clusterId` and
-`raft.groupCount` on the new release. See the operations guide's "Upgrading to
-0.9".
+`helm rollback`. 0.9 does not restore 0.8 backups, and there is no backup
+migration. Move the data through your applications, and give the new release
+its own `server.clusterId`. See the operations guide's "Upgrading to 0.9".
 
 Until the operator exists, Kubernetes StatefulSet rolling updates do not
 transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.

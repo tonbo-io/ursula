@@ -13,7 +13,7 @@
 //!
 //! ```text
 //! magic (8) | u16 version | u16 zero | u32 payload length
-//!           | payload (MessagePack) | u32 CRC32 of every byte before it
+//!           | payload (compact MessagePack) | u32 CRC32 of every byte before it
 //! ```
 //!
 //! The version is the format epoch, as in the journal header.
@@ -97,13 +97,14 @@ pub enum StateFileError {
     Undecodable {
         path: PathBuf,
         #[source]
-        source: rmp_serde::decode::Error,
+        source: ursula_stream::msgpack::DecodeError,
     },
 }
 
 /// Encodes `value` as a state file of `kind`.
 pub(crate) fn encode<T: Serialize>(kind: StateFileKind, value: &T) -> Vec<u8> {
-    let payload = rmp_serde::to_vec_named(value).expect("WAL state serializes to MessagePack");
+    let payload =
+        ursula_stream::msgpack::encode(value).expect("WAL state serializes to MessagePack");
     let payload_len = u32::try_from(payload.len()).expect("a WAL state file fits in 4 GiB");
     let mut bytes = Vec::with_capacity(
         HEADER_LEN
@@ -168,7 +169,7 @@ pub(crate) fn decode<T: DeserializeOwned>(
     if [r0, r1] != [0, 0] {
         return Err(corrupt(StateFileDefect::Reserved));
     }
-    rmp_serde::from_slice(body).map_err(|source| StateFileError::Undecodable {
+    ursula_stream::msgpack::decode(body).map_err(|source| StateFileError::Undecodable {
         path: path.to_owned(),
         source,
     })
