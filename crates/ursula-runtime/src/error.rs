@@ -19,9 +19,8 @@ pub enum ErrorStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
-    /// The task that restarted or opened one group's engine ended without
-    /// finishing: the group may be stopped on this node until a request
-    /// opens it.
+    /// The task that restarted one group's engine ended without finishing:
+    /// the group may be stopped on this node until a request creates it.
     #[error("the restart of raft group {} did not finish", .raft_group_id.0)]
     GroupRestartAborted { raft_group_id: RaftGroupId },
     #[error("invalid shard runtime config: {0}")]
@@ -79,9 +78,9 @@ pub enum RuntimeError {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
     },
-    /// The group's engine opens on its core, or a shutdown of the group
-    /// began during the open. The request was refused before anything was
-    /// proposed.
+    /// The group's engine opens on its core, a shutdown of the group began
+    /// during the open, or the open ended without an answer. The request
+    /// was refused before anything was proposed.
     #[error("core {} is opening the engine of raft group {}", .core_id.0, .raft_group_id.0)]
     GroupOpening {
         core_id: CoreId,

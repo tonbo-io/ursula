@@ -190,10 +190,15 @@ pub(crate) enum OpenCause {
 
 /// What a core does with a group's engine once its open ended.
 pub(crate) enum AfterOpen {
-    /// It installs the engine and the group serves.
-    Install,
-    /// A shutdown of the group began during the open. The engine never
-    /// installs: the core shuts it down and then answers `waiters`.
+    /// It installs the engine and the group serves. The open's task runs
+    /// while `keep_open` lives: dropping it drops the open
+    /// ([`OpenFailure::Dropped`]).
+    Install { keep_open: oneshot::Sender<()> },
+    /// A shutdown of the group began during the open, which dropped the
+    /// open: an open that has not opened its engine holds no engine work.
+    /// The core answers `waiters` once the open's task ended. An engine
+    /// that opened before the task saw the shutdown never installs: the
+    /// core shuts it down and then answers `waiters`.
     Shutdown {
         waiters: Vec<oneshot::Sender<Result<(), RuntimeError>>>,
     },
@@ -203,7 +208,9 @@ pub(crate) enum AfterOpen {
 pub(crate) enum OpenFailure {
     /// The factory refused the engine.
     Engine(GroupEngineError),
-    /// The open's task ended without an answer.
+    /// A shutdown of the group dropped the open before its engine opened.
+    Dropped,
+    /// The open's task ended without an answer, which its task logged.
     Aborted,
 }
 
@@ -399,7 +406,7 @@ impl CoreWorker {
     }
 
     /// Ends the worker's tasks once its mailbox closed: every open still
-    /// running ends, and none of the engines they open installs.
+    /// running is dropped, and an engine that opened first never installs.
     async fn drain(&mut self) {
         let mut opening = self
             .groups
@@ -546,8 +553,10 @@ impl CoreWorker {
     }
 
     /// What a request to `placement`'s group meets. A group with no engine
-    /// starts its open, and so does a group whose open back-off ended. No
-    /// open runs on the core's loop.
+    /// starts its open, and so does a group whose open back-off ended. The
+    /// open, the restore and its waits on the snapshot store included, runs
+    /// in a task of the core: the loop only starts it, and installs the
+    /// engine once it opened ([`Self::opened`]).
     fn enter(&mut self, placement: ShardPlacement) -> GroupEntry {
         let raft_group_id = placement.raft_group_id;
         match self.groups.get(&raft_group_id) {
@@ -586,7 +595,7 @@ impl CoreWorker {
         match self.groups.get_mut(&placement.raft_group_id) {
             Some(GroupSlot::Opening(OpeningGroup {
                 cause: OpenCause::First { parked },
-                then: AfterOpen::Install,
+                then: AfterOpen::Install { .. },
                 ..
             })) if parked.len() < capacity => parked.push(command),
             _ => command.send_error(RuntimeError::GroupOpening {
@@ -609,7 +618,7 @@ impl CoreWorker {
             GroupEntry::Opening => match self.groups.get_mut(&placement.raft_group_id) {
                 Some(GroupSlot::Opening(OpeningGroup {
                     warmers,
-                    then: AfterOpen::Install,
+                    then: AfterOpen::Install { .. },
                     ..
                 })) => warmers.push(response_tx),
                 _ => reply(
@@ -642,7 +651,9 @@ impl CoreWorker {
     }
 
     /// Starts the open of `placement`'s engine in a task of the core and
-    /// records the group as opening.
+    /// records the group as opening. The task drops the open once the
+    /// group's shutdown begins ([`AfterOpen::Install`]), whether it still
+    /// waits for its permit or for the snapshot store.
     fn start_open(
         &mut self,
         placement: ShardPlacement,
@@ -659,20 +670,35 @@ impl CoreWorker {
             inner: self.metrics.clone(),
         };
         let open_permits = self.open_permits.clone();
+        let (keep_open, dropped) = oneshot::channel::<()>();
         let open = crate::rt::spawn(async move {
-            let _permit = open_permits
-                .acquire_owned()
-                .await
-                .map_err(|_closed| OpenFailure::Aborted)?;
-            engine_factory
-                .create(placement, metrics)
-                .await
-                .map_err(OpenFailure::Engine)
+            let open = async move {
+                let _permit = open_permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|_closed| OpenFailure::Aborted)?;
+                engine_factory
+                    .create(placement, metrics)
+                    .await
+                    .map_err(OpenFailure::Engine)
+            };
+            // Biased: an engine that opened is shut down, never dropped.
+            crate::rt::select! {
+                biased;
+                opened = open => opened,
+                _dropped = dropped => Err(OpenFailure::Dropped),
+            }
         });
         self.tasks.push(Box::pin(async move {
-            let result = open
-                .await
-                .unwrap_or_else(|_aborted| Err(OpenFailure::Aborted));
+            let result = open.await.unwrap_or_else(|join_error| {
+                // A panic's payload is in the error's text.
+                tracing::error!(
+                    raft_group_id = placement.raft_group_id.0,
+                    error = %join_error,
+                    "the open of the group's engine ended without an answer; the group stays closed until a request opens it"
+                );
+                Err(OpenFailure::Aborted)
+            });
             CoreTaskDone::Opened { placement, result }
         }));
         self.groups.insert(
@@ -681,7 +707,7 @@ impl CoreWorker {
                 placement,
                 cause,
                 warmers: Vec::new(),
-                then: AfterOpen::Install,
+                then: AfterOpen::Install { keep_open },
             }),
         );
         Ok(())
@@ -765,13 +791,15 @@ impl CoreWorker {
                 return;
             }
             Err(OpenFailure::Engine(error)) => error,
-            Err(OpenFailure::Aborted) => {
+            // Nothing of what waited was proposed: the group did not open.
+            // Only a shutdown drops an open, so `Dropped` comes with
+            // `AfterOpen::Shutdown`, answered above.
+            Err(OpenFailure::Aborted | OpenFailure::Dropped) => {
                 self.metrics.record_open_backoff(raft_group_id, false);
-                tracing::error!(
-                    raft_group_id = raft_group_id.0,
-                    "the open of the group's engine ended without an answer; the group stays closed until a request opens it"
-                );
-                let err = RuntimeError::GroupRestartAborted { raft_group_id };
+                let err = RuntimeError::GroupOpening {
+                    core_id: placement.core_id,
+                    raft_group_id,
+                };
                 for warmer in warmers {
                     reply(warmer, Err(err.clone()));
                 }
@@ -908,8 +936,10 @@ impl CoreWorker {
     }
 
     /// Records a shutdown of a group whose engine opens: what waits for the
-    /// open is refused at once, and the engine, if it opens, never
-    /// installs. The core shuts it down and then answers `response_tx`.
+    /// open is refused at once, and the open is dropped, so a store that
+    /// does not answer holds no shutdown. The core answers `response_tx`
+    /// once the open's task ended. An engine that opened first never
+    /// installs: the core shuts it down and then answers `response_tx`.
     fn shut_down_opening(
         &mut self,
         raft_group_id: RaftGroupId,
@@ -932,7 +962,8 @@ impl CoreWorker {
         let warmers = std::mem::take(&mut opening.warmers);
         let waiter = response_tx.into_iter();
         match &mut opening.then {
-            then @ AfterOpen::Install => {
+            // Dropping `keep_open` drops the open.
+            then @ AfterOpen::Install { .. } => {
                 *then = AfterOpen::Shutdown {
                     waiters: waiter.collect(),
                 }

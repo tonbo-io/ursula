@@ -5019,7 +5019,7 @@ async fn a_stalled_restore_holds_only_its_own_group() {
 /// groups in open back-off reopen in tasks of their core, both of which
 /// hang. The core keeps serving its other groups, answers the reopening
 /// groups at once with `GroupOpening` (`503 GROUP_RESTARTING`), and a
-/// shutdown of a reopening group waits for its open, after which the
+/// shutdown of a reopening group drops its open at once, after which the
 /// group opens again.
 #[tokio::test(start_paused = true)]
 async fn reopens_on_a_silent_store_never_hold_the_core() {
@@ -5081,23 +5081,22 @@ async fn reopens_on_a_silent_store_never_hold_the_core() {
         "nothing waited on the hanging reopens"
     );
 
-    let shutdown = tokio::spawn({
-        let runtime = runtime.clone();
-        let placement = runtime.locate(&first);
-        async move { runtime.shutdown_group_engine(placement).await }
-    });
-    tokio::time::sleep(Duration::from_secs(60)).await;
-    assert!(!shutdown.is_finished(), "the shutdown waits for the open");
+    // The open holds no engine work yet, so the shutdown drops it and ends
+    // with no time passing, though the store stays silent.
+    runtime
+        .shutdown_group_engine(runtime.locate(&first))
+        .await
+        .expect("the shutdown drops the open");
+    assert_eq!(
+        tokio::time::Instant::now(),
+        started,
+        "the shutdown waited on the silent store"
+    );
     append_bytes(&runtime, &serving, b"!").await;
 
-    // The store answers again: the shut-down group's engine never installs,
-    // and the other reopening group opens.
+    // The store answers again: the other reopening group opens.
     factory.store_down.store(false, Ordering::SeqCst);
-    factory.release.add_permits(2);
-    shutdown
-        .await
-        .expect("the shutdown task")
-        .expect("the shutdown ends after the open");
+    factory.release.add_permits(1);
     until(|| runtime.metrics().snapshot().open_backoff_groups == 0).await;
     try_create(second.clone())
         .await
@@ -5110,18 +5109,20 @@ async fn reopens_on_a_silent_store_never_hold_the_core() {
     assert_eq!(factory.opens(), opens.checked_add(1).unwrap());
 }
 
-/// #741: a shutdown of a group whose engine opens is answered only once the
-/// open ended, and the engine that open returns never installs. A later
-/// open installs its engine.
+/// #741: an engine that opened before its core saw the group's shutdown
+/// never installs. The core shuts it down and only then answers the
+/// shutdown. A later open installs its engine.
 #[tokio::test]
 async fn an_engine_that_opens_after_its_shutdown_began_never_installs() {
     use futures_util::StreamExt as _;
 
-    let factory = StalledStoreFactory::stalling([RaftGroupId(0)]);
+    let factory = StalledStoreFactory::stalling(std::iter::empty::<RaftGroupId>());
     let (_tx, mut worker) = core_worker(Arc::new(factory.clone()));
     let group = placement().raft_group_id;
     let (warm_tx, warm_rx) = oneshot::channel();
     worker.warm_group(placement(), warm_tx);
+    // The open's task ends with an engine before the core takes its end.
+    let opened = worker.tasks.next().await.expect("the open's end");
     assert!(matches!(
         worker.groups.get(&group),
         Some(crate::core_worker::GroupSlot::Opening(_))
@@ -5137,11 +5138,9 @@ async fn an_engine_that_opens_after_its_shutdown_began_never_installs() {
             shutdown_rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ),
-        "the open still runs"
+        "the open's end is not yet taken"
     );
 
-    factory.release.add_permits(1);
-    let opened = worker.tasks.next().await.expect("the open's end");
     worker.task_done(opened).await;
     assert!(
         !worker.groups.contains_key(&group),
@@ -5156,7 +5155,6 @@ async fn an_engine_that_opens_after_its_shutdown_began_never_installs() {
         .expect("the shutdown succeeds");
     assert!(worker.tasks.is_empty());
 
-    factory.answer(group);
     let (warm_tx, warm_rx) = oneshot::channel();
     worker.warm_group(placement(), warm_tx);
     let opened = worker.tasks.next().await.expect("the open's end");
@@ -5170,4 +5168,178 @@ async fn an_engine_that_opens_after_its_shutdown_began_never_installs() {
         Some(crate::core_worker::GroupSlot::Running(_))
     ));
     assert_eq!(factory.opens(), 2);
+}
+
+/// #741 review: a shutdown drops an open that has not opened its engine,
+/// one that waits on a silent store and one that waits for the core's
+/// open permit, so the shutdown is answered once the open's task ended,
+/// without waiting for the store. Its warm-up gets `GroupOpening`, and a
+/// later open installs the engine.
+#[tokio::test]
+async fn a_shutdown_drops_an_open_that_has_not_opened() {
+    use futures_util::StreamExt as _;
+
+    let group = placement().raft_group_id;
+    let factory = StalledStoreFactory::stalling([group]);
+    let (_tx, mut worker) = core_worker(Arc::new(factory.clone()));
+
+    // An open that waits on the store.
+    let (warm_tx, warm_rx) = oneshot::channel();
+    worker.warm_group(placement(), warm_tx);
+    until(|| factory.opens() == 1).await;
+    shut_down_opening_group(&mut worker).await;
+    assert!(matches!(
+        warm_rx.await.expect("the warm-up's answer"),
+        Err(RuntimeError::GroupOpening { .. })
+    ));
+
+    // An open that waits for the core's only open permit never reaches
+    // the factory.
+    let permit = worker
+        .open_permits
+        .clone()
+        .try_acquire_owned()
+        .expect("the core's open permit");
+    let (warm_tx, warm_rx) = oneshot::channel();
+    worker.warm_group(placement(), warm_tx);
+    tokio::task::yield_now().await;
+    shut_down_opening_group(&mut worker).await;
+    assert!(matches!(
+        warm_rx.await.expect("the warm-up's answer"),
+        Err(RuntimeError::GroupOpening { .. })
+    ));
+    assert_eq!(factory.opens(), 1);
+    drop(permit);
+
+    factory.answer(group);
+    let (warm_tx, warm_rx) = oneshot::channel();
+    worker.warm_group(placement(), warm_tx);
+    let opened = worker.tasks.next().await.expect("the open's end");
+    worker.task_done(opened).await;
+    assert_eq!(
+        warm_rx.await.expect("the warm-up's answer"),
+        Ok(placement())
+    );
+    assert_eq!(factory.opens(), 2);
+}
+
+/// Shuts down `placement()`'s opening group on `worker`, which drops its
+/// open, and checks that the shutdown is answered once the open's task
+/// ended at once.
+async fn shut_down_opening_group(worker: &mut CoreWorker) {
+    use futures_util::StreamExt as _;
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    worker.shutdown_group_engine(placement(), shutdown_tx).await;
+    let ended = tokio::time::timeout(Duration::from_secs(5), worker.tasks.next())
+        .await
+        .expect("the dropped open ends at once")
+        .expect("the open's end");
+    worker.task_done(ended).await;
+    shutdown_rx
+        .await
+        .expect("the shutdown's answer")
+        .expect("the shutdown succeeds");
+    assert!(worker.tasks.is_empty());
+    assert!(!worker.groups.contains_key(&placement().raft_group_id));
+}
+
+/// #741 review: a core whose mailbox closed while an open waits on a
+/// silent store drops the open and ends at once. What waited for the open
+/// gets `GroupOpening`.
+#[tokio::test]
+async fn a_closed_mailbox_drops_an_open_and_ends_the_core() {
+    let factory = StalledStoreFactory::stalling([placement().raft_group_id]);
+    let (tx, mut worker) = core_worker(Arc::new(factory.clone()));
+    let (warm_tx, warm_rx) = oneshot::channel();
+    worker.warm_group(placement(), warm_tx);
+    until(|| factory.opens() == 1).await;
+    drop(tx);
+    tokio::time::timeout(Duration::from_secs(5), worker.run())
+        .await
+        .expect("the core ends though its open waits on the store");
+    assert!(matches!(
+        warm_rx.await.expect("the warm-up's answer"),
+        Err(RuntimeError::GroupOpening { .. })
+    ));
+}
+
+/// #741: during a group's first open, requests wait for it up to the group
+/// mailbox's capacity, here one, and a request past it gets `GroupOpening`
+/// at once, refused before proposal. The waiting request is served once
+/// the open ends.
+#[tokio::test]
+async fn a_request_past_the_mailbox_capacity_during_an_open_is_refused() {
+    let factory = StalledStoreFactory::stalling([RaftGroupId(0)]);
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 1), factory.clone())
+        .expect("spawn runtime");
+    let create = |name: &str| {
+        let runtime = runtime.clone();
+        let stream = BucketStreamId::new("benchcmp", name);
+        async move {
+            runtime
+                .create_stream(CreateStreamRequest::new(stream, DEFAULT_CONTENT_TYPE))
+                .await
+        }
+    };
+    let parked = tokio::spawn(create("parked"));
+    // The core took the first request: it started the open and parked it.
+    until(|| factory.opens() == 1).await;
+    let refused = create("refused")
+        .await
+        .expect_err("past the group mailbox's capacity");
+    assert!(
+        matches!(refused, RuntimeError::GroupOpening {
+            raft_group_id: RaftGroupId(0),
+            ..
+        }),
+        "{refused}"
+    );
+    assert_eq!(refused.status(), ErrorStatus::Temporary);
+    assert!(!parked.is_finished());
+
+    factory.release.add_permits(1);
+    parked
+        .await
+        .expect("the parked create")
+        .expect("served once the group opened");
+}
+
+/// A factory whose open panics.
+#[derive(Debug, Clone, Copy)]
+struct PanickingFactory;
+
+impl GroupEngineFactory for PanickingFactory {
+    fn create<'a>(
+        &'a self,
+        _placement: ShardPlacement,
+        _metrics: GroupEngineMetrics,
+    ) -> GroupEngineCreateFuture<'a> {
+        Box::pin(async {
+            let opened: Option<Box<dyn GroupEngine>> = None;
+            Ok(opened.expect("the open panics"))
+        })
+    }
+}
+
+/// #741 review: an open whose task ends without an answer, here by a
+/// panic, answers what waited for it with `GroupOpening`: the group did not
+/// open, so nothing was proposed. A later request opens the group again.
+#[tokio::test]
+async fn an_aborted_open_answers_group_opening() {
+    let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 4), PanickingFactory)
+        .expect("spawn runtime");
+    let stream = BucketStreamId::new("benchcmp", "aborted-open");
+    for _ in 0..2 {
+        let err = runtime
+            .create_stream(CreateStreamRequest::new(
+                stream.clone(),
+                DEFAULT_CONTENT_TYPE,
+            ))
+            .await
+            .expect_err("the open panics");
+        assert!(matches!(err, RuntimeError::GroupOpening { .. }), "{err}");
+        assert_eq!(err.status(), ErrorStatus::Temporary);
+    }
+    assert_eq!(runtime.metrics().snapshot().open_backoff_groups, 0);
 }

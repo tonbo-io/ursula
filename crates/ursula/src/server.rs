@@ -316,7 +316,16 @@ async fn init_state(
                     if !error.leaves_group_closed() {
                         return Err(error.into());
                     }
-                    tracing::warn!(raft_group_id, %error, "the group did not open and stays closed; other groups remain available");
+                    if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
+                        error: ursula_runtime::GroupEngineError::Infra(
+                            ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                        ),
+                        ..
+                    }) {
+                        tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
+                    } else {
+                        tracing::warn!(raft_group_id, %error, "the snapshot store did not answer the group's restore; other groups remain available");
+                    }
                 }
             }
         }

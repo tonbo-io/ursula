@@ -9716,6 +9716,202 @@ mod snapshot_driver {
         assert_eq!(store.uploads().started, 2);
         node.shutdown().await;
     }
+
+    /// An S3 snapshot store in memory whose GETs wait while it is
+    /// blackholed, as a store that never answers does: a restore at a
+    /// group's open hangs on it. Counts the GETs that arrived.
+    #[derive(Debug)]
+    struct BlackholedGets {
+        inner: ursula_runtime::S3SnapshotStore,
+        blackholed: watch::Sender<bool>,
+        gets: watch::Sender<usize>,
+    }
+
+    impl SnapshotStore for BlackholedGets {
+        fn read_stored<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StoredSnapshot> {
+            Box::pin(async move {
+                self.gets.send_modify(|gets| *gets = gets.saturating_add(1));
+                self.blackholed
+                    .subscribe()
+                    .wait_for(|blackholed| !*blackholed)
+                    .await
+                    .map(drop)
+                    .expect("the store outlives its GETs");
+                self.inner.read_stored(location).await
+            })
+        }
+
+        fn verify_uploaded<'a>(
+            &'a self,
+            location: &'a SnapshotLocation,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            self.inner.verify_uploaded(location)
+        }
+
+        fn namespace(&self, raft_group_id: RaftGroupId) -> ursula_runtime::OwnedNamespace {
+            SnapshotStore::namespace(&self.inner, raft_group_id)
+        }
+
+        fn stage<'a>(
+            &'a self,
+            raft_group_id: RaftGroupId,
+            index: u64,
+            chunks: ursula_runtime::SnapshotBytesIterator,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::StagedSnapshot> {
+            SnapshotStore::stage(&self.inner, raft_group_id, index, chunks)
+        }
+
+        fn write_staged<'a>(
+            &'a self,
+            staged: ursula_runtime::StagedSnapshot,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::OwnedLocation> {
+            SnapshotStore::write_staged(&self.inner, staged)
+        }
+
+        fn list_own<'a>(
+            &'a self,
+            raft_group_id: RaftGroupId,
+        ) -> SnapshotStoreFuture<'a, ursula_runtime::OwnListing> {
+            SnapshotStore::list_own(&self.inner, raft_group_id)
+        }
+
+        fn delete_own<'a>(
+            &'a self,
+            object: ursula_runtime::OwnedObject,
+        ) -> SnapshotStoreFuture<'a, ()> {
+            SnapshotStore::delete_own(&self.inner, object)
+        }
+    }
+
+    /// A one-node cluster on `raft_log_dir` whose snapshots go to `store`.
+    async fn blackholed_store_node(
+        store: &Arc<BlackholedGets>,
+        raft_log_dir: &std::path::Path,
+        initialize_membership: bool,
+    ) -> StaticGrpcTestNode {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let peers = vec![(
+            1,
+            format!(
+                "http://127.0.0.1:{}",
+                listener.local_addr().expect("addr").port()
+            ),
+        )];
+        spawn_static_grpc_test_node(
+            1,
+            listener,
+            peers.clone(),
+            peers,
+            initialize_membership,
+            1,
+            StaticGrpcTestNodeStorage {
+                raft_log_dir: Some(raft_log_dir.to_path_buf()),
+                engine_config: Some(RaftEngineConfig {
+                    max_in_snapshot_log_to_keep: 8,
+                    ..RaftEngineConfig::default()
+                }),
+                snapshot_store: Some(store.clone()),
+                ..StaticGrpcTestNodeStorage::default()
+            },
+        )
+        .await
+    }
+
+    /// #741 review: a node shut down while a group's open waits on a
+    /// snapshot store that does not answer its restore stops at once. The
+    /// open has not started the group's Raft, so the shutdown drops it, and
+    /// the node's WAL records a clean run ([`StaticGrpcTestNode::shutdown`]
+    /// checks it).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_shutdown_during_a_blackholed_restore_ends_at_once_and_cleanly() {
+        let store = Arc::new(BlackholedGets {
+            inner: ursula_runtime::S3SnapshotStore::memory_for_tests("snapshots", 1)
+                .expect("a memory store"),
+            blackholed: watch::Sender::new(false),
+            gets: watch::Sender::new(0),
+        });
+        let raft_log_dir = tempfile::tempdir().expect("WAL root");
+
+        // A snapshot object the next open restores.
+        let node = blackholed_store_node(&store, raft_log_dir.path(), true).await;
+        tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let stream_id = BucketStreamId::new("benchcmp", "blackholed-restore");
+        let raft = node
+            .registry
+            .get(node.runtime.locate(&stream_id).raft_group_id)
+            .expect("registered group");
+        raft.wait(Some(Duration::from_secs(10)))
+            .current_leader(1, "the only voter leads")
+            .await
+            .expect("the group elects its leader");
+        node.runtime
+            .create_stream(CreateStreamRequest::new(
+                stream_id.clone(),
+                "application/octet-stream",
+            ))
+            .await
+            .expect("create the stream");
+        node.runtime
+            .append(AppendRequest::from_bytes(stream_id, b"restored".to_vec()))
+            .await
+            .expect("append a record");
+        let applied = raft.metrics().borrow_watched().last_applied;
+        let mut covered = false;
+        for _ in 0..20 {
+            raft.trigger().snapshot().await.expect("trigger a snapshot");
+            covered = raft
+                .wait(Some(Duration::from_millis(500)))
+                .metrics(
+                    |metrics| metrics.snapshot >= applied,
+                    "the snapshot covers the record",
+                )
+                .await
+                .is_ok();
+            if covered {
+                break;
+            }
+        }
+        assert!(covered, "no snapshot covers the record");
+        drop(raft);
+        node.shutdown().await;
+
+        // The store stops answering, and the group's open hangs on its
+        // restore.
+        store.blackholed.send_replace(true);
+        let gets = *store.gets.borrow();
+        let node = blackholed_store_node(&store, raft_log_dir.path(), false).await;
+        let warm = tokio::spawn({
+            let runtime = node.runtime.clone();
+            async move { runtime.warm_all_groups().await }
+        });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            store.gets.subscribe().wait_for(|arrived| *arrived > gets),
+        )
+        .await
+        .expect("the restore reaches the store")
+        .map(drop)
+        .expect("the store lives");
+        tokio::time::timeout(Duration::from_secs(10), node.shutdown())
+            .await
+            .expect("the shutdown ends though the store does not answer");
+        let warmed = warm.await.expect("the warm-up task");
+        assert!(
+            matches!(
+                warmed,
+                Err(ursula_runtime::RuntimeError::GroupOpening { .. })
+            ),
+            "{warmed:?}"
+        );
+    }
 }
 
 mod leadership_balance {
