@@ -81,6 +81,7 @@ mod tests {
     use openraft::type_config::alias::SnapshotMetaOf;
     use openraft::type_config::alias::StoredMembershipOf;
     use openraft::type_config::alias::VoteOf;
+    use openraft::vote::RaftLeaderId;
 
     use super::decode_wire;
     use super::encode_wire;
@@ -104,151 +105,423 @@ mod tests {
         assert_eq!(decoded, refusal);
     }
 
-    #[test]
-    fn epoch5_persisted_envelopes_are_stable() {
-        // Named MessagePack (rmp_serde::to_vec_named) of the OpenRaft types
-        // that format epoch 5 writes to disk and sends to peers: Vote, LogId,
-        // a joint StoredMembership with a learner, each node an empty map, a
-        // membership Entry, and SnapshotMeta (snapshot record and transfer).
-        // The SnapshotMeta bytes are the map {last_log_id, last_membership,
-        // snapshot_id} over the LogId and StoredMembership bytes. OpenRaft
-        // writes snapshot_id empty and ignores it on read: Ursula names a
-        // snapshot by its group and last log id instead. Decoding and
-        // re-encoding must reproduce each value byte for byte.
-        let fixtures: serde_json::Value =
-            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch5.json")).unwrap();
-        fn check<T: serde::de::DeserializeOwned + serde::Serialize>(
-            fixtures: &serde_json::Value,
-            name: &str,
-        ) -> T {
-            let bytes: Vec<u8> = serde_json::from_value(fixtures[name].clone()).unwrap();
-            let value: T = decode_wire(&bytes, "fixture").unwrap();
-            assert_eq!(encode_wire(&value).as_ref(), bytes.as_slice());
-            value
+    type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+    type Entry = EntryOf<UrsulaRaftTypeConfig>;
+    type TransferLeaderError = openraft::raft::TransferLeaderError<UrsulaRaftTypeConfig>;
+
+    /// `[(name, value), ...]` for one named value per listed pattern, which
+    /// must cover every variant of `$ty`: the patterns form a match with no
+    /// wildcard, and each value must match its own pattern. A new variant
+    /// does not compile until it has a sample.
+    macro_rules! every {
+        ($ty:ty { $($pattern:pat => $name:literal: $value:expr),+ $(,)? }) => {{
+            let samples: Vec<(&'static str, $ty)> = vec![$({
+                let value: $ty = $value;
+                assert!(matches!(&value, $pattern), "{} is a sample of another variant", $name);
+                ($name, value)
+            }),+];
+            for (_, value) in &samples {
+                match value {
+                    $($pattern => {})+
+                }
+            }
+            samples
+        }};
+    }
+
+    /// What the persisted-envelopes fixture says produced it.
+    const ENVELOPES_PRODUCER: &str =
+        "rmp_serde::to_vec_named, format epoch 5, openraft 0.10.0-alpha.37";
+
+    fn log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
+        openraft::LogId {
+            leader_id: LeaderId::new(term, node_id),
+            index,
         }
-        let vote: VoteOf<UrsulaRaftTypeConfig> = check(&fixtures, "vote");
-        assert_eq!(vote, openraft::Vote::new_committed(7, 2));
-        let log: LogIdOf<UrsulaRaftTypeConfig> = check(&fixtures, "log_id");
-        assert_eq!(log.index, 19);
-        let membership: StoredMembershipOf<UrsulaRaftTypeConfig> = check(&fixtures, "membership");
-        assert_eq!(membership.log_id(), &Some(log));
-        assert_eq!(membership.membership().get_joint_config(), &vec![
-            [1, 2].into_iter().collect(),
-            [2, 3].into_iter().collect(),
-        ]);
-        assert_eq!(
-            membership.membership().learner_ids().collect::<Vec<_>>(),
-            vec![4]
-        );
-        let entry: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "entry");
-        assert_eq!(entry.log_id, log);
-        assert!(
-            matches!(entry.payload, openraft::EntryPayload::Membership(m) if &m == membership.membership())
-        );
-        let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> = check(&fixtures, "snapshot_meta");
-        assert_eq!(meta.last_log_id, Some(log));
-        assert_eq!(meta.last_membership, membership);
+    }
+
+    /// The log id the envelope samples name.
+    fn log() -> LogIdOf<UrsulaRaftTypeConfig> {
+        log_id(7, 2, 19)
+    }
+
+    /// The vote the envelope samples name.
+    fn vote() -> VoteOf<UrsulaRaftTypeConfig> {
+        openraft::Vote::new_committed(7, 2)
+    }
+
+    /// A joint membership with a learner, each node an empty map.
+    fn membership() -> StoredMembershipOf<UrsulaRaftTypeConfig> {
+        StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+            Some(log()),
+            openraft::Membership::new_with_defaults(
+                vec![[1, 2].into_iter().collect(), [2, 3].into_iter().collect()],
+                [4],
+            ),
+        )
+    }
+
+    fn normal(index: u64, command: ursula_stream::StreamCommand) -> Entry {
+        Entry {
+            log_id: log_id(7, 2, index),
+            payload: openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                command,
+            )),
+        }
+    }
+
+    fn import_entry(history: Option<ursula_stream::HistoryEvent>) -> Entry {
+        normal(19, ursula_stream::StreamCommand::ImportSnapshot {
+            snapshot: Box::new(ursula_stream::StreamSnapshot {
+                format_version: ursula_stream::BACKUP_FORMAT_VERSION,
+                buckets: vec!["tenant".to_owned()],
+                erased_buckets: Vec::new(),
+                streams: Vec::new(),
+                pending_cold_gc: Vec::new(),
+                next_cold_gc_seq: 1,
+                bucket_usage: Vec::new(),
+                last_created_at_ms: 2,
+                history,
+            }),
+            history: std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).expect("non-zero"),
+            backup_digest: [0xab; 32],
+            now_ms: 1_700_000_000_000,
+        })
+    }
+
+    /// The pointer of an S3 snapshot, as `group-N.snapshot.json` and a
+    /// FullSnapshot carry it (#687): it names an object of one node's own
+    /// directory under the snapshot's own id.
+    fn s3_pointer() -> ursula_runtime::SnapshotPointer {
+        ursula_runtime::SnapshotPointer {
+            snapshot_id: crate::state_machine::group_snapshot_id(
+                ursula_shard::RaftGroupId(0),
+                Some(log()),
+            ),
+            location: ursula_runtime::SnapshotLocation::S3 {
+                key: "snapshots/node-2/group-0/00000000000000000019-0123456789abcdef.snap"
+                    .to_owned(),
+                size_bytes: 4096,
+                stored_size_bytes: 1234,
+                compression: ursula_runtime::SnapshotCompression::Zstd,
+            },
+        }
+    }
+
+    /// The MessagePack of `value`, checked to decode to an equal value and
+    /// to re-encode to the same bytes.
+    fn wire_bytes<T>(name: &str, value: &T) -> Vec<u8>
+    where T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug {
+        let bytes = encode_wire(value).to_vec();
+        let decoded: T = decode_wire(&bytes, "sample")
+            .unwrap_or_else(|error| panic!("{name} does not decode: {error}"));
+        assert_eq!(format!("{decoded:?}"), format!("{value:?}"), "{name}");
+        assert_eq!(encode_wire(&decoded).as_ref(), bytes.as_slice(), "{name}");
+        bytes
+    }
+
+    fn add<T>(samples: &mut std::collections::BTreeMap<String, Vec<u8>>, name: &str, value: &T)
+    where T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug {
+        let bytes = wire_bytes(name, value);
+        assert!(samples.insert(name.to_owned(), bytes).is_none(), "{name}");
+    }
+
+    /// [`add`] under the sample's `Debug` form.
+    fn add_by_debug<T>(samples: &mut std::collections::BTreeMap<String, Vec<u8>>, value: &T)
+    where T: serde::Serialize + serde::de::DeserializeOwned + std::fmt::Debug {
+        add(samples, &format!("{value:?}"), value);
+    }
+
+    /// Every root that format epoch 5 writes to disk or sends to a peer
+    /// apart from the replicated commands and their answers: the OpenRaft
+    /// envelopes (votes, log ids, memberships, entries, snapshot metadata
+    /// and every RPC message), each record of the WAL journal, the snapshot
+    /// pointers and a full backup snapshot.
+    fn persisted_envelopes() -> std::collections::BTreeMap<String, Vec<u8>> {
+        use ursula_stream::StreamCommand;
+
+        use crate::log_store::CoreJournalRecord;
+        use crate::log_store::RaftGroupLogRecord;
+
+        let mut envelopes = std::collections::BTreeMap::new();
+        let samples = &mut envelopes;
+        add(samples, "vote", &vote());
+        add(samples, "log_id", &log());
+        add(samples, "membership", &membership());
+        add(samples, "entry", &Entry {
+            log_id: log(),
+            payload: openraft::EntryPayload::Membership(membership().membership().clone()),
+        });
+        add(samples, "blank_entry", &Entry {
+            log_id: log_id(7, 2, 20),
+            payload: openraft::EntryPayload::Blank,
+        });
+        // The map {last_log_id, last_membership, snapshot_id}: OpenRaft
+        // writes snapshot_id empty and ignores it on read. Ursula names a
+        // snapshot by its group and last log id instead.
+        add(samples, "snapshot_meta", &SnapshotMetaOf::<
+            UrsulaRaftTypeConfig,
+        > {
+            last_log_id: Some(log()),
+            last_membership: membership(),
+        });
         // A history event (#581 section 4.3), the entry every group starts
         // with.
-        let history: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "new_history_entry");
-        assert_eq!(history.log_id, log);
-        assert!(matches!(
-            history.payload,
-            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::NewHistory {
-                    history,
-                    now_ms: 1_700_000_000_000,
-                    previous: 0,
-                    kept: 18,
-                    leader: ursula_stream::HistoryLeader {
-                        term: 7,
-                        node_id: 2,
-                    },
-                }
-            )) if history.get() == 0x0123_4567_89ab_cdef
-        ));
+        add(
+            samples,
+            "new_history_entry",
+            &normal(19, StreamCommand::NewHistory {
+                history: std::num::NonZeroU64::new(0x0123_4567_89ab_cdef).expect("non-zero"),
+                now_ms: 1_700_000_000_000,
+                previous: 0,
+                kept: 18,
+                leader: ursula_stream::HistoryLeader {
+                    term: 7,
+                    node_id: 2,
+                },
+            }),
+        );
         // A recovery plan's history event (#613): it names the history it
         // replaced and the plan's point, up to which it kept that history.
-        let recovery: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "recovery_history_entry");
-        assert_eq!(recovery.log_id, log);
-        assert!(matches!(
-            recovery.payload,
-            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::NewHistory {
-                    history,
-                    now_ms: 1_700_000_000_000,
-                    previous: 0x0123_4567_89ab_cdef,
-                    kept: 12,
-                    leader: ursula_stream::HistoryLeader {
-                        term: 7,
-                        node_id: 2,
-                    },
-                }
-            )) if history.get() == 0x0fed_cba9_8765_4321
-        ));
+        add(
+            samples,
+            "recovery_history_entry",
+            &normal(19, StreamCommand::NewHistory {
+                history: std::num::NonZeroU64::new(0x0fed_cba9_8765_4321).expect("non-zero"),
+                now_ms: 1_700_000_000_000,
+                previous: 0x0123_4567_89ab_cdef,
+                kept: 12,
+                leader: ursula_stream::HistoryLeader {
+                    term: 7,
+                    node_id: 2,
+                },
+            }),
+        );
         // An import is a history event keyed by its backup (#581 section
         // 4.4): the history id and the backup's digest are in the entry.
-        let import: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "import_snapshot_entry");
-        assert_eq!(import.log_id, log);
-        assert!(matches!(
-            import.payload,
-            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::ImportSnapshot {
-                    ref snapshot,
-                    history,
-                    backup_digest,
-                    now_ms: 1_700_000_000_000,
-                }
-            )) if history.get() == 0x0123_4567_89ab_cdef
-                && backup_digest == [0xab; 32]
-                && snapshot.buckets == ["tenant"]
-        ));
-        // A read of an expired stream writes `TouchStreamAccess`, whose
-        // apply removes that stream on every replica.
-        let touch: EntryOf<UrsulaRaftTypeConfig> = check(&fixtures, "touch_stream_access_entry");
-        assert_eq!(touch.log_id, log);
-        assert!(matches!(
-            touch.payload,
-            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::TouchStreamAccess {
-                    ref stream_id,
-                    now_ms: 1_700_000_000_000,
-                    renew_ttl: false,
-                }
-            )) if stream_id == &ursula_shard::BucketStreamId::new("tenant", "expired")
-        ));
+        add(samples, "import_snapshot_entry", &import_entry(None));
         // S4 of the fifth #613 review: a history event inside an imported
         // snapshot, as a backup taken after a recovery carries it.
-        let import: EntryOf<UrsulaRaftTypeConfig> =
-            check(&fixtures, "import_snapshot_history_entry");
-        assert!(matches!(
-            import.payload,
-            openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                ursula_stream::StreamCommand::ImportSnapshot { ref snapshot, .. }
-            )) if snapshot.history == Some(ursula_stream::HistoryEvent {
+        add(
+            samples,
+            "import_snapshot_history_entry",
+            &import_entry(Some(ursula_stream::HistoryEvent {
                 id: std::num::NonZeroU64::new(0x0fed_cba9_8765_4321).expect("non-zero"),
                 event_index: 14,
                 previous: 0x0123_4567_89ab_cdef,
                 kept: 12,
-                leader: ursula_stream::HistoryLeader { term: 7, node_id: 2 },
+                leader: ursula_stream::HistoryLeader {
+                    term: 7,
+                    node_id: 2,
+                },
                 imported: Some([0xcd; 32]),
-            })
-        ));
-        // The snapshot pointer of an S3 snapshot, as `group-N.snapshot.json`
-        // and a FullSnapshot carry it (#687): it names an object of one
-        // node's own directory and no shared object, under the snapshot's
-        // own id.
-        let pointer: ursula_runtime::SnapshotPointer = check(&fixtures, "snapshot_pointer");
-        assert_eq!(
-            pointer.snapshot_id,
-            crate::state_machine::group_snapshot_id(ursula_shard::RaftGroupId(0), Some(log))
+            })),
         );
-        assert_eq!(pointer.location, ursula_runtime::SnapshotLocation::S3 {
-            key: "snapshots/node-2/group-0/00000000000000000019-0123456789abcdef.snap".to_owned(),
-            size_bytes: 4096,
-            stored_size_bytes: 1234,
-            compression: ursula_runtime::SnapshotCompression::Zstd,
+        // A read of an expired stream writes `TouchStreamAccess`, whose
+        // apply removes that stream on every replica.
+        add(
+            samples,
+            "touch_stream_access_entry",
+            &normal(19, StreamCommand::TouchStreamAccess {
+                stream_id: ursula_shard::BucketStreamId::new("tenant", "expired"),
+                now_ms: 1_700_000_000_000,
+                renew_ttl: false,
+            }),
+        );
+
+        // One pointer of every location.
+        let pointers = every!(ursula_runtime::SnapshotPointer {
+            ursula_runtime::SnapshotPointer {
+                location: ursula_runtime::SnapshotLocation::Inline { .. },
+                ..
+            } => "snapshot_pointer_inline": ursula_runtime::SnapshotPointer {
+                snapshot_id: crate::state_machine::group_snapshot_id(
+                    ursula_shard::RaftGroupId(3),
+                    Some(log_id(6, 1, 17)),
+                ),
+                location: ursula_runtime::SnapshotLocation::Inline {
+                    bytes: vec![0x92, 0x05, 0x09],
+                },
+            },
+            ursula_runtime::SnapshotPointer {
+                location: ursula_runtime::SnapshotLocation::Local { .. },
+                ..
+            } => "snapshot_pointer_local": ursula_runtime::SnapshotPointer {
+                snapshot_id: crate::state_machine::group_snapshot_id(
+                    ursula_shard::RaftGroupId(4),
+                    None,
+                ),
+                location: ursula_runtime::SnapshotLocation::Local {
+                    path: "/var/lib/ursula/snapshots/group-4.snap".into(),
+                    size_bytes: 512,
+                },
+            },
+            ursula_runtime::SnapshotPointer {
+                location: ursula_runtime::SnapshotLocation::S3 { .. },
+                ..
+            } => "snapshot_pointer": s3_pointer(),
         });
+        for (name, pointer) in &pointers {
+            add(samples, name, pointer);
+        }
+
+        // One record of every kind in the journal of core 1.
+        let records = every!(RaftGroupLogRecord {
+            RaftGroupLogRecord::SaveCommitted(_) => "journal_save_committed":
+                RaftGroupLogRecord::SaveCommitted(Some(log_id(7, 2, 18))),
+            RaftGroupLogRecord::Append(_) => "journal_append": RaftGroupLogRecord::Append(vec![
+                normal(19, StreamCommand::Append {
+                    stream_id: ursula_shard::BucketStreamId::new("tenant", "orders"),
+                    content_type: Some("text/plain".to_owned()),
+                    payload: bytes::Bytes::from_static(b"hello"),
+                    close_after: false,
+                    stream_seq: Some("seq-1".to_owned()),
+                    producer: None,
+                    now_ms: 1_700_000_000_000,
+                }),
+                Entry {
+                    log_id: log_id(7, 2, 20),
+                    payload: openraft::EntryPayload::Blank,
+                },
+            ]),
+            RaftGroupLogRecord::FrozenAppend(_) => "journal_frozen_append":
+                RaftGroupLogRecord::FrozenAppend(Box::new(crate::log_store::FrozenAppend {
+                    archive: crate::log_store::ArchiveRef {
+                        id: crate::log_store::ArchiveId {
+                            group_id: 7,
+                            segment: 3,
+                            offset: 4096,
+                            first_index: 17,
+                            last_index: 19,
+                            content_hash: [0xe1; 32],
+                        },
+                        bytes: 8192,
+                        checksum: 0xdead_beef,
+                    },
+                    log_ids: vec![log_id(7, 2, 17), log_id(7, 2, 19)],
+                })),
+            RaftGroupLogRecord::TruncateAfter(_) => "journal_truncate_after":
+                RaftGroupLogRecord::TruncateAfter(Some(log_id(6, 3, 16))),
+            RaftGroupLogRecord::Purge(_) => "journal_purge":
+                RaftGroupLogRecord::Purge(log_id(5, 4, 15)),
+        });
+        for (name, record) in records {
+            add(samples, name, &CoreJournalRecord {
+                group_id: 7,
+                record,
+            });
+        }
+
+        // The Raft RPC messages.
+        add(
+            samples,
+            "append_entries_request",
+            &crate::types::UrsulaAppendEntriesRequest {
+                vote: vote(),
+                prev_log_id: Some(log_id(6, 3, 18)),
+                entries: vec![normal(19, StreamCommand::DeleteStream {
+                    stream_id: ursula_shard::BucketStreamId::new("tenant", "orders"),
+                    now_ms: 1_700_000_000_000,
+                })],
+                leader_commit: Some(log_id(7, 2, 17)),
+            },
+        );
+        let responses = every!(crate::types::UrsulaAppendEntriesResponse {
+            openraft::raft::AppendEntriesResponse::Success => "append_entries_success":
+                openraft::raft::AppendEntriesResponse::Success,
+            openraft::raft::AppendEntriesResponse::PartialSuccess(_) =>
+                "append_entries_partial_success":
+                openraft::raft::AppendEntriesResponse::PartialSuccess(Some(log())),
+            openraft::raft::AppendEntriesResponse::Conflict => "append_entries_conflict":
+                openraft::raft::AppendEntriesResponse::Conflict,
+            openraft::raft::AppendEntriesResponse::HigherVote(_) => "append_entries_higher_vote":
+                openraft::raft::AppendEntriesResponse::HigherVote(openraft::Vote::new_committed(
+                    9, 4,
+                )),
+        });
+        for (name, response) in &responses {
+            add(samples, name, response);
+        }
+        add(samples, "vote_request", &crate::types::UrsulaVoteRequest {
+            vote: openraft::Vote::new(8, 3),
+            last_log_id: Some(log()),
+            leadership_transfer: true,
+        });
+        add(
+            samples,
+            "vote_response",
+            &crate::types::UrsulaVoteResponse {
+                vote: openraft::Vote::new_committed(8, 3),
+                vote_granted: true,
+                last_log_id: Some(log()),
+            },
+        );
+        add(
+            samples,
+            "snapshot_response",
+            &openraft::raft::SnapshotResponse::<UrsulaRaftTypeConfig>::new(vote()),
+        );
+        add(
+            samples,
+            "transfer_leader_request",
+            &openraft::raft::TransferLeaderRequest::<UrsulaRaftTypeConfig>::new(
+                vote(),
+                3,
+                Some(log()),
+            ),
+        );
+        let responses = every!(openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig> {
+            Ok(()) => "transfer_leader_ok": Ok(()),
+            Err(TransferLeaderError::VoteChanged { .. }) => "transfer_leader_vote_changed":
+                Err(TransferLeaderError::VoteChanged {
+                    expected: vote(),
+                    actual: openraft::Vote::new_committed(8, 3),
+                }),
+            Err(TransferLeaderError::LogNotFlushed { .. }) => "transfer_leader_log_not_flushed":
+                Err(TransferLeaderError::LogNotFlushed {
+                    expected: Some(log()),
+                    actual: Some(log_id(6, 3, 16)),
+                }),
+        });
+        for (name, response) in &responses {
+            add(samples, name, response);
+        }
+
+        // A backup snapshot with a value in every field.
+        add(
+            samples,
+            "stream_snapshot",
+            &ursula_runtime::wire_samples::stream_snapshot(),
+        );
+        envelopes
+    }
+
+    /// Every root that format epoch 5 writes to disk or sends to a peer
+    /// apart from the commands and their answers ([`persisted_envelopes`])
+    /// encodes to the fixture's bytes, and decoding and re-encoding them
+    /// reproduces each value and each byte. Each sample sets every field,
+    /// and fields of one type hold distinct values, so a change of a field's
+    /// name or place changes the fixture. A change to the fixture is a
+    /// change to the format.
+    #[test]
+    fn epoch5_persisted_envelopes_are_stable() {
+        let mut actual: std::collections::BTreeMap<String, serde_json::Value> =
+            persisted_envelopes()
+                .into_iter()
+                .map(|(name, bytes)| (name, serde_json::Value::from(bytes)))
+                .collect();
+        actual.insert("producer".to_owned(), ENVELOPES_PRODUCER.into());
+        let fixture: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch5.json"))
+                .expect("the fixture parses");
+        assert!(
+            fixture == actual,
+            "the persisted envelopes differ from the fixture; the samples encode as:\n{}",
+            one_entry_per_line(&actual)
+        );
+
+        // The S3 pointer names an object of node 2's own directory (#687).
+        let pointer = s3_pointer();
         let key = crate::state_machine::object_key(&pointer.location).expect("an object");
         let owner = ursula_runtime::OwnedKey::parse(
             &ursula_runtime::SnapshotPrefix::try_from("snapshots").expect("a prefix"),
@@ -262,6 +535,48 @@ mod tests {
                 owner.index()
             ),
             (2, ursula_shard::RaftGroupId(0), 19)
+        );
+    }
+
+    /// Every replicated command, in the [`ursula_runtime::GroupWriteCommand`]
+    /// a Raft entry and a forwarded `GroupWrite` carry, every write answer
+    /// and the forwarded read answers, keyed by their `Debug` form.
+    fn commands_and_responses() -> std::collections::BTreeMap<String, Vec<u8>> {
+        use ursula_runtime::wire_samples;
+
+        let mut samples = std::collections::BTreeMap::new();
+        for command in wire_samples::group_write_commands() {
+            add_by_debug(&mut samples, &command);
+        }
+        for response in wire_samples::group_write_responses() {
+            add_by_debug(&mut samples, &response);
+        }
+        for head in wire_samples::head_stream_responses() {
+            add_by_debug(&mut samples, &head);
+        }
+        for read in wire_samples::read_stream_responses() {
+            add_by_debug(&mut samples, &read);
+        }
+        samples
+    }
+
+    /// The commands every replica applies from its log and the answers a
+    /// leader sends a follower encode to the fixture's bytes. One sample of
+    /// every variant (`ursula_runtime::wire_samples`, built behind
+    /// exhaustive matches) sets every field, and fields of one type hold
+    /// distinct values, so a change of a field's name or place changes the
+    /// fixture. A change to the fixture is a change to the format.
+    #[test]
+    fn commands_and_responses_epoch5_wire_form_is_stable() {
+        let actual = commands_and_responses();
+        let fixture: std::collections::BTreeMap<String, Vec<u8>> =
+            serde_json::from_str(include_str!("fixtures/commands-and-responses-epoch5.json"))
+                .expect("the fixture parses");
+        assert!(
+            fixture == actual,
+            "the wire form of the commands and responses differs from the fixture; the \
+             samples encode as:\n{}",
+            one_entry_per_line(&actual)
         );
     }
 
@@ -292,19 +607,21 @@ mod tests {
             fixture == actual,
             "the wire form of GroupEngineError differs from the fixture; the samples encode \
              as:\n{}",
-            one_sample_per_line(&actual)
+            one_entry_per_line(&actual)
         );
     }
 
-    /// The fixture's form: a JSON object with one sample per line.
-    fn one_sample_per_line(samples: &std::collections::BTreeMap<String, Vec<u8>>) -> String {
-        let lines: Vec<String> = samples
+    /// The form of a fixture: a JSON object with one entry per line.
+    fn one_entry_per_line<T: serde::Serialize>(
+        entries: &std::collections::BTreeMap<String, T>,
+    ) -> String {
+        let lines: Vec<String> = entries
             .iter()
-            .map(|(name, bytes)| {
+            .map(|(name, value)| {
                 format!(
                     "{}: {}",
                     serde_json::to_string(name).expect("a name renders"),
-                    serde_json::to_string(bytes).expect("bytes render")
+                    serde_json::to_string(value).expect("a value renders")
                 )
             })
             .collect();
@@ -379,6 +696,69 @@ mod tests {
                     decode_wire(&bytes, "group engine error").expect("decodes");
                 prop_assert_eq!(&decoded, &error);
                 prop_assert_eq!(encode_wire(&decoded), bytes);
+            }
+        }
+    }
+
+    /// Every sample decodes from its own bytes and re-encodes to them with
+    /// any of its `Option`s absent, inside the envelopes that carry it.
+    mod sample_round_trips {
+        use proptest::prelude::*;
+        use ursula_runtime::GroupWriteCommand;
+        use ursula_runtime::wire_samples;
+
+        use super::Entry;
+        use super::log_id;
+        use super::wire_bytes;
+        use crate::log_store::CoreJournalRecord;
+        use crate::log_store::RaftGroupLogRecord;
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(512))]
+
+            #[test]
+            fn a_command_round_trips_in_an_entry_and_a_journal_record(
+                index in any::<prop::sample::Index>(),
+                mask in any::<u64>(),
+                (term, node_id, log_index) in (any::<u64>(), any::<u64>(), any::<u64>()),
+                group_id in any::<u32>(),
+            ) {
+                let commands = wire_samples::stream_commands();
+                let command = wire_samples::vary_command(index.get(&commands).clone(), mask);
+                let entry = Entry {
+                    log_id: log_id(term, node_id, log_index),
+                    payload: openraft::EntryPayload::Normal(GroupWriteCommand::Stream(command)),
+                };
+                wire_bytes("entry", &entry);
+                wire_bytes("journal record", &CoreJournalRecord {
+                    group_id,
+                    record: RaftGroupLogRecord::Append(vec![entry]),
+                });
+            }
+
+            #[test]
+            fn an_answer_round_trips(
+                index in any::<prop::sample::Index>(),
+                mask in any::<u64>(),
+            ) {
+                let responses = wire_samples::group_write_responses();
+                wire_bytes(
+                    "write answer",
+                    &wire_samples::vary_response(index.get(&responses).clone(), mask),
+                );
+                let heads = wire_samples::head_stream_responses();
+                wire_bytes(
+                    "head answer",
+                    &wire_samples::vary_head(index.get(&heads).clone(), mask),
+                );
+            }
+
+            #[test]
+            fn a_backup_snapshot_round_trips(mask in any::<u64>()) {
+                wire_bytes(
+                    "backup snapshot",
+                    &wire_samples::vary_snapshot(wire_samples::stream_snapshot(), mask),
+                );
             }
         }
     }

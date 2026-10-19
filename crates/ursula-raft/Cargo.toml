@@ -56,7 +56,8 @@ sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 # `group_engine_error_samples`, for the wire fixture and classification
-# tables of `GroupEngineError`.
+# tables of `GroupEngineError`, and `wire_samples`, for the MessagePack
+# fixtures of the commands, responses and backup snapshot.
 ursula-runtime = { workspace = true, features = ["test-support"] }
 anyhow = { workspace = true }
 axum = { workspace = true }

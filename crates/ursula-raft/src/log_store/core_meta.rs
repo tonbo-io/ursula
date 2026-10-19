@@ -314,6 +314,101 @@ mod tests {
         assert_eq!(loaded.group(2).log, GroupLogState::Empty);
     }
 
+    /// A core metadata file decodes to the metadata it was encoded from and
+    /// re-encodes to the same bytes, whatever its groups hold.
+    mod round_trip {
+        use openraft::vote::RaftLeaderId;
+        use proptest::prelude::*;
+
+        use super::CoreMetadata;
+        use super::GroupLogState;
+        use super::GroupMetadata;
+        use super::RecoveryRecord;
+        use crate::log_store::PlanCut;
+        use crate::log_store::state_file;
+        use crate::log_store::state_file::StateFileKind;
+
+        type LeaderId = <crate::UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+
+        fn group() -> impl Strategy<Value = GroupMetadata> {
+            let vote = proptest::option::of((any::<u64>(), any::<u64>(), any::<bool>()).prop_map(
+                |(term, node_id, committed)| {
+                    if committed {
+                        openraft::Vote::new_committed(term, node_id)
+                    } else {
+                        openraft::Vote::new(term, node_id)
+                    }
+                },
+            ));
+            // Every log state and every cut, behind matches with no wildcard.
+            let states = [
+                GroupLogState::Empty,
+                GroupLogState::Initialized,
+                GroupLogState::Recovering,
+            ];
+            for state in states {
+                match state {
+                    GroupLogState::Empty
+                    | GroupLogState::Initialized
+                    | GroupLogState::Recovering => {}
+                }
+            }
+            let log = proptest::sample::select(states.to_vec());
+            let cut = (0..3_u8, any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
+                |(kind, term, node_id, index)| {
+                    let cut = match kind {
+                        0 => PlanCut::NoCut,
+                        1 => PlanCut::Pending {
+                            keep: openraft::LogId::new(LeaderId::new(term, node_id), index),
+                        },
+                        _ => PlanCut::Done,
+                    };
+                    match cut {
+                        PlanCut::NoCut | PlanCut::Pending { .. } | PlanCut::Done => cut,
+                    }
+                },
+            );
+            let recovery =
+                proptest::option::of((any::<u64>(), any::<u64>(), any::<u64>(), cut).prop_map(
+                    |(leader, point, leader_term, cut)| RecoveryRecord {
+                        leader,
+                        point,
+                        leader_term,
+                        cut,
+                    },
+                ));
+            (vote, log, recovery).prop_map(|(vote, log, recovery)| GroupMetadata {
+                vote,
+                log,
+                recovery,
+            })
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(256))]
+
+            #[test]
+            fn core_metadata_round_trips(
+                verified_epoch in any::<u64>(),
+                groups in proptest::collection::btree_map(any::<u32>(), group(), 0..4),
+            ) {
+                let metadata = CoreMetadata { verified_epoch, groups };
+                let bytes = state_file::encode(StateFileKind::CoreMetadata, &metadata);
+                let decoded: CoreMetadata = state_file::decode(
+                    StateFileKind::CoreMetadata,
+                    std::path::Path::new("journal.meta"),
+                    &bytes,
+                )
+                .expect("decodes");
+                prop_assert_eq!(&decoded, &metadata);
+                prop_assert_eq!(
+                    state_file::encode(StateFileKind::CoreMetadata, &decoded),
+                    bytes
+                );
+            }
+        }
+    }
+
     /// Golden bytes: a recovery record in a core metadata file (#581 section
     /// 4.5) is part of the epoch-5 format, so its encoding never changes.
     #[test]

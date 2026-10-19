@@ -68,6 +68,9 @@ harness = false
 # - `group_engine_error_samples`: one sample of every variant of
 #   `GroupEngineError` and of every type it carries, for the wire fixture
 #   and the error classification tables.
+# - `wire_samples`: one sample of every replicated command, write response,
+#   forwarded read response and a full backup snapshot, for the MessagePack
+#   fixtures of `ursula-raft`.
 # - `snapshot_harness`: the faulty in-memory snapshot store, the gated store
 #   wrapper and the snapshot ownership invariant checkers. A `cfg(madsim)`
 #   build has them without this feature.

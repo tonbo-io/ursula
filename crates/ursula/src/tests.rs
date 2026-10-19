@@ -56,8 +56,9 @@ fn assert_no_not_applied_headers(headers: &HeaderMap, context: &str) {
 /// Sends one HTTP request through a cloned `Router` and returns the response.
 ///
 /// The status and header expectations stay at the call site; this only folds
-/// the `Request::builder()` / `oneshot` / double-`expect` plumbing.
-async fn send(
+/// the `Request::builder()` / `oneshot` / double-`expect` plumbing. An admin
+/// mutation carries the process incarnation the node's metrics report.
+pub(crate) async fn send(
     app: &Router,
     method: &str,
     uri: &str,

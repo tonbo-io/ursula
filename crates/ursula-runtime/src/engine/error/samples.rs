@@ -39,10 +39,15 @@ use super::UnproposableCommand;
 use super::WalOpenFailureKind;
 
 /// `[value, ...]` for one value per listed pattern, which must cover every
-/// variant of `$ty`: the patterns form a match with no wildcard.
+/// variant of `$ty`: the patterns form a match with no wildcard, and each
+/// value must match its own pattern.
 macro_rules! every {
     ($ty:ty { $($pattern:pat => $value:expr),+ $(,)? }) => {{
-        let values: Vec<$ty> = vec![$($value),+];
+        let values: Vec<$ty> = vec![$({
+            let value: $ty = $value;
+            assert!(matches!(&value, $pattern), "a sample of another variant");
+            value
+        }),+];
         for value in &values {
             match value {
                 $($pattern => {})+
@@ -51,6 +56,8 @@ macro_rules! every {
         values
     }};
 }
+
+pub(crate) use every;
 
 /// [`every`] for an enum of unit variants.
 macro_rules! every_unit {
@@ -287,12 +294,12 @@ fn infra_errors() -> Vec<GroupInfraError> {
             raft_group_id: GROUP,
             snapshot: LogPosition {
                 term: 2,
-                node_id: 2,
+                node_id: 4,
                 index: 3,
             },
             held: LogPosition {
                 term: 1,
-                node_id: 1,
+                node_id: 6,
                 index: 5,
             },
         },

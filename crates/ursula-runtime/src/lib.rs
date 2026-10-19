@@ -35,6 +35,9 @@
 //!   through the dedicated `ExpireStreams` command (F0, #669).
 //! - [`key_holds`]: in-memory holds on object keys, which a deleter that
 //!   lists the store leaves alone, with a drop behaviour per set.
+//! - `wire_samples` (tests and `test-support` only): one sample of every
+//!   replicated command, write response, forwarded read response and a
+//!   fully populated backup snapshot, for the MessagePack fixtures.
 //! - `snapshot_harness` (madsim, tests and `test-support` only): a faulty
 //!   in-memory snapshot store, a store wrapper with named gates, and the
 //!   checkers of the snapshot ownership invariants I1 to I5 (#687).
@@ -70,6 +73,8 @@ mod snapshot_store;
 mod split_mix;
 pub mod tidy_worker;
 mod trace;
+#[cfg(any(test, feature = "test-support"))]
+pub mod wire_samples;
 
 pub use admission::RaftUncommittedAdmission;
 pub use cold_index::ColdIndexPage;

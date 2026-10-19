@@ -65,6 +65,12 @@ pub use file::RecoveryCutError;
 pub use file::SnapshotOrderError;
 pub use file::SnapshotRecord;
 pub use frozen::ArchiveDefect;
+#[cfg(test)]
+pub(crate) use frozen::ArchiveId;
+#[cfg(test)]
+pub(crate) use frozen::ArchiveRef;
+#[cfg(test)]
+pub(crate) use frozen::FrozenAppend;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;
 pub use journal::JournalError;
