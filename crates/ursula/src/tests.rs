@@ -13534,6 +13534,12 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         .current_leader(1, "single voter elected")
         .await
         .unwrap();
+    // The single voter leads before its vote is committed; compare votes
+    // only once it is, or the later read sees the commit as a change.
+    raft.wait(Some(Duration::from_secs(5)))
+        .metrics(|m| m.vote.is_committed(), "the leader's vote is committed")
+        .await
+        .unwrap();
     let admin = admin_router(HttpState::with_raft_registry(runtime.clone(), registry));
     let observed = raft.metrics().borrow_watched().clone();
     let self_election = |current_term: u64| {
