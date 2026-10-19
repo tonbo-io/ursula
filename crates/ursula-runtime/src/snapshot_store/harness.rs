@@ -69,28 +69,3 @@ pub fn node_directory(prefix: &super::SnapshotPrefix, node_id: u64) -> String {
 pub fn is_owned_by(prefix: &super::SnapshotPrefix, node_id: u64, path: &str) -> bool {
     super::OwnedKey::parse(prefix, path).is_ok_and(|key| key.owner().node_id() == node_id)
 }
-
-/// A small seeded generator (SplitMix64). The harness draws every fault,
-/// delay and nonce from it, never from a thread or process RNG, so a seed
-/// replays the same draws in the same order of requests.
-#[derive(Debug, Clone)]
-pub(crate) struct SplitMix64(u64);
-
-impl SplitMix64 {
-    pub(crate) fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
-    pub(crate) fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ z.wrapping_shr(30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ z.wrapping_shr(27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ z.wrapping_shr(31)
-    }
-
-    /// A draw below `bound`, or 0 when `bound` is 0.
-    pub(crate) fn below(&mut self, bound: u64) -> u64 {
-        self.next_u64().checked_rem(bound).unwrap_or(0)
-    }
-}

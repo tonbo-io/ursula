@@ -18,11 +18,11 @@
 //!
 //! `run_with_madsim` therefore runs each simulation on a fresh thread
 //! (`ursula_raft::run_isolated`). Process-wide state is not reset by a fresh
-//! thread, so it must not reach the schedule: the cold object sequence is per
-//! thread under madsim, and tokio's thread RNG, which a process-wide counter
-//! seeds, decides nothing (every sim-reachable tokio `select!` is `biased;`
-//! and the `rt` shim's `watch` is `sim_watch`, both checked by the
-//! `nondeterminism` audit).
+//! thread, so it must not reach the schedule: the cold object nonce comes
+//! from a per-thread generator seeded with the run's seed under madsim, and
+//! tokio's thread RNG, which a process-wide counter seeds, decides nothing
+//! (every sim-reachable tokio `select!` is `biased;` and the `rt` shim's
+//! `watch` is `sim_watch`, both checked by the `nondeterminism` audit).
 
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;

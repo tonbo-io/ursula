@@ -4323,6 +4323,7 @@ dependencies = [
  "dhat",
  "futures-util",
  "http",
+ "madsim",
  "madsim-tokio",
  "opendal",
  "rand 0.10.1",

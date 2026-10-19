@@ -9,6 +9,8 @@ use ursula_runtime::ProducerDelivery;
 use super::raft_scenarios::apply_barrier;
 use super::*;
 
+#[path = "cold_object_names_tests.rs"]
+mod cold_object_names_tests;
 #[path = "disk_tests.rs"]
 mod disk_tests;
 #[path = "recovery_tests.rs"]

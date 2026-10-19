@@ -187,10 +187,10 @@ impl SharedRefCompactionReport {
 /// Write time in Unix milliseconds that Ursula encodes in the names of the
 /// objects it writes, or `None` for any other name:
 ///
-/// - exclusive chunks: `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`;
-/// - packs and staged external payloads: `{nanos:032x}-{seq:016x}.bin`;
+/// - exclusive chunks: `{start:016x}-{end:016x}-{nanos:032x}-{nonce:016x}.bin`;
+/// - packs and staged external payloads: `{nanos:032x}-{nonce:016x}.bin`;
 /// - staged snapshot parts:
-///   `{stream:032x}-{incarnation:016x}-{nanos:032x}-{seq:016x}.part`.
+///   `{stream:032x}-{incarnation:016x}-{nanos:032x}-{nonce:016x}.part`.
 ///
 /// A zero timestamp (the simulator's clock) also yields `None`, so the
 /// orphan sweep never deletes an object whose age it cannot tell.

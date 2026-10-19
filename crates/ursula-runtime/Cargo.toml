@@ -12,7 +12,6 @@ description = "Per-core actor runtime for Ursula: hot ring, cold-tier flush, and
 [dependencies]
 blake3 = { workspace = true }
 bytes = { workspace = true, features = ["serde"] }
-crossbeam-utils = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 opendal = { workspace = true, features = ["services-memory", "services-s3"] }
@@ -33,6 +32,7 @@ ursula-stream = { workspace = true }
 zstd = { workspace = true }
 
 [target.'cfg(madsim)'.dependencies]
+madsim = { workspace = true }
 sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -41,6 +41,8 @@ core_affinity = { workspace = true }
 [dev-dependencies]
 dhat = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }
+# The padded atomics of the `atomic_padding` benchmark.
+crossbeam-utils = { workspace = true }
 tempfile = { workspace = true }
 # The paused clock of the snapshot store harness tests.
 tokio = { workspace = true, features = ["test-util"] }

@@ -81,46 +81,47 @@ impl ColdObjectWriter {
         }
     }
 }
-/// The sequence component of every new cold object name (chunks, packs,
-/// external payloads, snapshot parts).
+/// The nonce of every new cold object name (chunks, packs, external
+/// payloads, snapshot parts): 64 random bits in the last 16 hex digits, so
+/// two writes never share a name whatever the clocks and restarts of the
+/// nodes that draw them. Nothing parses its value. The orphan sweep, cold GC
+/// and every name predicate read only its width.
 #[cfg(not(madsim))]
-mod object_sequence {
-    use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::Ordering;
-
-    use crossbeam_utils::CachePadded;
-
-    // Keep this global atomic isolated from unrelated statics. This does not
-    // remove contention on the counter itself, but avoids accidental false
-    // sharing with adjacent data without adding a per-core sequence scheme to
-    // this low-frequency object-key path.
-    static SEQUENCE: CachePadded<AtomicU64> = CachePadded::new(AtomicU64::new(0));
-
-    pub(super) fn next() -> u64 {
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    }
+fn cold_object_nonce() -> u64 {
+    rand::random()
 }
 
-/// The sequence component of every new cold object name, per thread. madsim
-/// runs a simulation on one thread, and the harness runs each one on a fresh
-/// thread, so every run numbers its objects from zero. A process-wide counter
-/// would carry over from one run to the next and rename the objects of a
-/// later seed (#638).
+/// The nonce of every new cold object name under madsim, from a per-thread
+/// [`SplitMix64`](crate::split_mix::SplitMix64) seeded with the run's madsim
+/// seed. It never draws from madsim's own generator, so naming an object
+/// shifts no other draw of the run. madsim runs every node of a simulation
+/// on one thread, so the nodes share one sequence and draw distinct names.
+/// The harness runs each simulation on a fresh thread, and the generator is
+/// seeded again whenever the seed changes, so a seed replays its names
+/// whatever ran before it (#638). A draw outside a runtime uses seed 0, which
+/// keeps the madsim build of tests that name objects without a runtime
+/// deterministic.
 #[cfg(madsim)]
-mod object_sequence {
-    use std::cell::Cell;
+fn cold_object_nonce() -> u64 {
+    use std::cell::RefCell;
+
+    use crate::split_mix::SplitMix64;
+
+    /// Keeps the nonces apart from every other generator a seed feeds.
+    const NONCE_SALT: u64 = 0x636f_6c64_6e6f_6e63;
 
     std::thread_local! {
-        static SEQUENCE: Cell<u64> = const { Cell::new(0) };
+        static NONCES: RefCell<Option<(u64, SplitMix64)>> = const { RefCell::new(None) };
     }
 
-    pub(super) fn next() -> u64 {
-        SEQUENCE.with(|sequence| {
-            let next = sequence.get();
-            sequence.set(next.wrapping_add(1));
-            next
-        })
-    }
+    let seed = madsim::runtime::Handle::try_current().map_or(0, |handle| handle.seed());
+    NONCES.with_borrow_mut(|nonces| match nonces {
+        Some((current, rng)) if *current == seed => rng.next_u64(),
+        _ => nonces
+            .insert((seed, SplitMix64::new(seed ^ NONCE_SALT)))
+            .1
+            .next_u64(),
+    })
 }
 
 /// Applies the configured server-side encryption to an S3 builder and returns
@@ -1800,9 +1801,9 @@ pub fn new_cold_chunk_path_in_generation(
     end_offset: u64,
 ) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = object_sequence::next();
+    let nonce = cold_object_nonce();
     format!(
-        "{}{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{sequence:016x}.bin",
+        "{}{start_offset:016x}-{end_offset:016x}-{unix_nanos:032x}-{nonce:016x}.bin",
         cold_chunk_dir(stream_id, generation)
     )
 }
@@ -1819,7 +1820,7 @@ pub fn cold_external_dir(stream_id: &BucketStreamId) -> String {
 }
 
 /// Whether `name` (a file name without directory) has the form Ursula uses
-/// for exclusive chunks, `{start:016x}-{end:016x}-{nanos:032x}-{seq:016x}.bin`.
+/// for exclusive chunks, `{start:016x}-{end:016x}-{nanos:032x}-{nonce:016x}.bin`.
 pub fn is_cold_chunk_file_name(name: &str) -> bool {
     hex_fields_with_suffix(name, ".bin", &[16, 16, 32, 16])
 }
@@ -1837,7 +1838,7 @@ pub fn cold_chunk_file_range(name: &str) -> Option<(u64, u64)> {
 }
 
 /// Whether `name` has the form Ursula uses for staged external payloads,
-/// `{nanos:032x}-{seq:016x}.bin`.
+/// `{nanos:032x}-{nonce:016x}.bin`.
 pub fn is_external_payload_file_name(name: &str) -> bool {
     hex_fields_with_suffix(name, ".bin", &[32, 16])
 }
@@ -1855,9 +1856,9 @@ fn hex_fields_with_suffix(name: &str, suffix: &str, widths: &[usize]) -> bool {
 
 pub fn new_cold_pack_path(bucket_id: &str, raft_group_id: u32) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = object_sequence::next();
+    let nonce = cold_object_nonce();
     format!(
-        "{}{unix_nanos:032x}-{sequence:016x}.bin",
+        "{}{unix_nanos:032x}-{nonce:016x}.bin",
         cold_pack_dir(bucket_id, raft_group_id)
     )
 }
@@ -1881,18 +1882,18 @@ pub fn cold_chunk_prefix(stream_id: &BucketStreamId) -> String {
 
 pub fn new_external_payload_path(stream_id: &BucketStreamId) -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = object_sequence::next();
-    format!("{stream_id}/external/{unix_nanos:032x}-{sequence:016x}.bin")
+    let nonce = cold_object_nonce();
+    format!("{stream_id}/external/{unix_nanos:032x}-{nonce:016x}.bin")
 }
 
-/// A new snapshot part id (#581 section 3.1), `{nanos:032x}-{seq:016x}.part`.
+/// A new snapshot part id (#581 section 3.1), `{nanos:032x}-{nonce:016x}.part`.
 /// The `.part` suffix keeps parts apart from the `.bin` objects that state
 /// references, so a commit can name only parts, and deleting a part after
 /// its commit can never remove data.
 pub fn new_snapshot_part_id() -> String {
     let unix_nanos = cold_object_unix_nanos();
-    let sequence = object_sequence::next();
-    format!("{unix_nanos:032x}-{sequence:016x}{SNAPSHOT_PART_SUFFIX}")
+    let nonce = cold_object_nonce();
+    format!("{unix_nanos:032x}-{nonce:016x}{SNAPSHOT_PART_SUFFIX}")
 }
 
 const SNAPSHOT_PART_SUFFIX: &str = ".part";
@@ -1961,7 +1962,7 @@ pub fn snapshot_part_owner_prefix(stream_id: &BucketStreamId, incarnation: u64) 
 
 /// Whether `name` (a file name in a [`snapshot_part_dir`]) has the form of
 /// a staged part object,
-/// `{stream:032x}-{incarnation:016x}-{nanos:032x}-{seq:016x}.part`. No
+/// `{stream:032x}-{incarnation:016x}-{nanos:032x}-{nonce:016x}.part`. No
 /// replicated state ever references one.
 pub fn is_snapshot_part_object_name(name: &str) -> bool {
     hex_fields_with_suffix(name, SNAPSHOT_PART_SUFFIX, &[32, 16, 32, 16])
@@ -2182,6 +2183,8 @@ pub(crate) fn check_cold_gc_stream(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use bytes::Bytes;
     use ursula_config::config::ColdBackend;
     use ursula_shard::BucketStreamId;
@@ -2195,14 +2198,22 @@ mod tests {
     use super::ColdStore;
     use super::check_cold_gc_path;
     use super::check_cold_gc_stream;
+    use super::cold_chunk_file_range;
+    use super::is_cold_chunk_file_name;
+    use super::is_external_payload_file_name;
+    use super::is_snapshot_part_id;
+    use super::is_snapshot_part_object_name;
     use super::new_cold_chunk_path_in_generation;
     use super::new_cold_pack_path;
     use super::new_external_payload_path;
+    use super::new_snapshot_part_id;
     use super::parse_cold_index_page_path;
+    use super::snapshot_part_object_incarnation;
     use super::snapshot_part_path;
     use crate::ColdConfig;
     use crate::ColdIndexPageKey;
     use crate::ColdReadCacheParams;
+    use crate::cold_object_written_unix_ms;
 
     fn read_cache_params(store: &ColdStore) -> ColdReadCacheParams {
         store
@@ -2284,6 +2295,95 @@ mod tests {
         );
     }
 
+    /// The nonce, the last 16 hex digits of a new cold object's name.
+    fn name_nonce(path: &str) -> u64 {
+        let file_name = path.rsplit_once('/').map_or(path, |(_, name)| name);
+        let stem = file_name
+            .strip_suffix(".bin")
+            .or_else(|| file_name.strip_suffix(".part"))
+            .expect("a cold object suffix");
+        let (_, nonce) = stem.rsplit_once('-').expect("a nonce field");
+        assert_eq!(nonce.len(), 16, "{path}: the nonce keeps its width");
+        u64::from_str_radix(nonce, 16).expect("a hex nonce")
+    }
+
+    /// New cold object names end in 64 random bits (C2a, K1): no two draws
+    /// share a name or a nonce, the nonce is no counter, and the names keep
+    /// their shape: every name predicate accepts them, the write time still
+    /// parses, and G1's guard accepts them.
+    #[test]
+    fn new_cold_object_names_carry_a_random_nonce() {
+        const DRAWS: usize = 256;
+        let stream_id = BucketStreamId::new(GC_BUCKET, "s");
+        let mut names = Vec::new();
+        for _ in 0..DRAWS {
+            let chunk = new_cold_chunk_path_in_generation(&stream_id, 7, 0, 4);
+            let chunk_name = chunk
+                .rsplit_once('/')
+                .map(|(_, name)| name)
+                .expect("a name");
+            assert!(is_cold_chunk_file_name(chunk_name), "{chunk}");
+            assert_eq!(cold_chunk_file_range(chunk_name), Some((0, 4)));
+            assert!(cold_object_written_unix_ms(chunk_name).is_some(), "{chunk}");
+            assert!(matches!(
+                gc_check(GC_BUCKET, &chunk),
+                Ok(ColdGcPathKind::ExclusiveChunk { generation: 7, .. })
+            ));
+
+            let pack = new_cold_pack_path(GC_BUCKET, GC_GROUP.0);
+            let pack_name = pack.rsplit_once('/').map(|(_, name)| name).expect("a name");
+            assert!(cold_object_written_unix_ms(pack_name).is_some(), "{pack}");
+            assert_eq!(
+                gc_check(GC_BUCKET, &pack),
+                Ok(ColdGcPathKind::Pack {
+                    raft_group_id: GC_GROUP
+                })
+            );
+
+            let external = new_external_payload_path(&stream_id);
+            let external_name = external
+                .rsplit_once('/')
+                .map(|(_, name)| name)
+                .expect("a name");
+            assert!(is_external_payload_file_name(external_name), "{external}");
+            assert!(
+                cold_object_written_unix_ms(external_name).is_some(),
+                "{external}"
+            );
+            assert_eq!(
+                gc_check(GC_BUCKET, &external),
+                Ok(ColdGcPathKind::External {
+                    stream_id: stream_id.clone()
+                })
+            );
+
+            let part_id = new_snapshot_part_id();
+            assert!(is_snapshot_part_id(&part_id), "{part_id}");
+            let part = snapshot_part_path(&stream_id, GC_GROUP.0, 1, &part_id);
+            let part_name = part.rsplit_once('/').map(|(_, name)| name).expect("a name");
+            assert!(is_snapshot_part_object_name(part_name), "{part}");
+            assert_eq!(snapshot_part_object_incarnation(part_name), Some(1));
+            assert!(cold_object_written_unix_ms(part_name).is_some(), "{part}");
+
+            names.extend([chunk, pack, external, part]);
+        }
+        let nonces = names
+            .iter()
+            .map(String::as_str)
+            .map(name_nonce)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(nonces.len(), names.len(), "every draw has its own nonce");
+        assert_eq!(
+            names.iter().collect::<BTreeSet<_>>().len(),
+            names.len(),
+            "every draw has its own name"
+        );
+        assert!(
+            nonces.iter().any(|nonce| *nonce > 0xFFFF_FFFF),
+            "the nonce is random, not a counter"
+        );
+    }
+
     /// G1: a snapshot key, a page, a staged part, another bucket's object,
     /// another group's pack or stream, and malformed paths are refused with
     /// the entry's identity.
@@ -2310,7 +2410,7 @@ mod tests {
                 page_id: 0,
             }
             .path(),
-            snapshot_part_path(&stream_id, GC_GROUP.0, 1, &super::new_snapshot_part_id()),
+            snapshot_part_path(&stream_id, GC_GROUP.0, 1, &new_snapshot_part_id()),
             // Another bucket's objects.
             new_external_payload_path(&BucketStreamId::new("tenant-b", "s")),
             new_cold_pack_path("tenant-b", GC_GROUP.0),

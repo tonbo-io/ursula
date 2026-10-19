@@ -1377,7 +1377,7 @@ pub struct RepairColdIndexResponse {
 }
 
 /// Millisecond timestamp encoded in a staged external object's name
-/// (`{stream}/external/{unix_nanos:032x}-{sequence:016x}.bin`), or `None`
+/// (`{stream}/external/{unix_nanos:032x}-{nonce:016x}.bin`), or `None`
 /// when the name carries none (other layouts, or the simulator's zero clock).
 fn external_object_unix_ms(s3_path: &str) -> Option<u64> {
     let (prefix, file_name) = s3_path.rsplit_once('/')?;
