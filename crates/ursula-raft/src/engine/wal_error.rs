@@ -78,7 +78,9 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         RaftWalError::CreateDir { .. }
         | RaftWalError::Lock { .. }
         | RaftWalError::ListCores { .. } => WalOpenFailureKind::Io,
-        RaftWalError::Locked { .. } => WalOpenFailureKind::Locked,
+        RaftWalError::Locked { .. } | RaftWalError::CoreWriterStopping { .. } => {
+            WalOpenFailureKind::Locked
+        }
         RaftWalError::MarkRecovering { source, .. } => match source {
             MarkRecoveringError::Read(source) => state_failure(source),
             MarkRecoveringError::Write(source) => journal_failure(source),

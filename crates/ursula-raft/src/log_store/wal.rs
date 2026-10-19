@@ -195,6 +195,18 @@ impl RaftWal {
         if let Some(writer) = slot.writer.upgrade() {
             return Ok(writer);
         }
+        // A writer whose last handle is being dropped still holds the
+        // journal's lock until its worker exits, so a new writer would find
+        // it locked.
+        if slot
+            .exited
+            .as_ref()
+            .is_some_and(|exited| exited.has_changed().is_ok())
+        {
+            return Err(RaftWalError::CoreWriterStopping {
+                core: placement.core_id,
+            });
+        }
 
         let opening = self.node.opening();
         let writer =
@@ -234,6 +246,52 @@ impl RaftWal {
         let core_writer = self.core_writer(placement, metrics.clone())?;
         RaftGroupFileLogStore::open(placement, metrics, core_writer)
             .map_err(|source| RaftWalError::OpenGroup { placement, source })
+    }
+
+    /// Opens `placement`'s log store as [`Self::open`] does, after waiting
+    /// for the core's previous journal writer to stop when its last handle
+    /// is being dropped, as when another group of the core just failed to
+    /// open (#741).
+    pub async fn open_waiting(
+        &self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
+        loop {
+            match self.open(placement, metrics.clone()) {
+                Err(RaftWalError::CoreWriterStopping { core }) => {
+                    let mut exited = self.writer_exited(core)?;
+                    while exited.changed().await.is_ok() {}
+                }
+                opened => return opened,
+            }
+        }
+    }
+
+    /// The exit signal of `core`'s journal writer.
+    fn writer_exited(&self, core: CoreId) -> Result<WriterExited, RaftWalError> {
+        let slot = match &*self
+            .core_writers
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+        {
+            CoreWriterSlots::Running(slots) => slots.get(&core.0).cloned(),
+            CoreWriterSlots::ShutDown => {
+                return Err(RaftWalError::ShutDown {
+                    root: self.root().to_owned(),
+                });
+            }
+        };
+        let exited = slot
+            .map(|slot| {
+                slot.lock()
+                    .map_err(|_poisoned| RaftWalError::LockPoisoned)
+                    .map(|slot| slot.exited.clone())
+            })
+            .transpose()?
+            .flatten();
+        // A slot with no writer has nothing to wait for: a closed channel.
+        Ok(exited.unwrap_or_else(|| crate::rt::sync::watch::channel(()).1))
     }
 
     /// The ledger engines of this WAL's groups record their OpenRaft work in
@@ -403,6 +461,57 @@ mod tests {
             std::process::id(),
             ordinal,
         ))
+    }
+
+    /// #741: a group that opens while the core's previous writer is still
+    /// stopping, its last handle dropped and its worker not yet exited,
+    /// waits for the worker instead of finding the journal locked.
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_open_waits_for_the_previous_writer_to_stop() {
+        let root = unique_test_dir("stopping-writer-open");
+        let wal = RaftWal::start(
+            &root,
+            WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 2).expect("valid topology"),
+        )
+        .expect("start");
+        let placement = |group| ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: RaftGroupId(group),
+        };
+        let metrics = || ursula_runtime::RuntimeMetrics::new(1, 2).group_engine_metrics();
+        // A slot whose writer is gone but whose worker has not exited.
+        let (stopping, exited) = crate::rt::sync::watch::channel(());
+        {
+            let mut core_writers = wal.core_writers.lock().expect("slots");
+            let CoreWriterSlots::Running(slots) = &mut *core_writers else {
+                panic!("a started WAL is running");
+            };
+            *slots.entry(0).or_default().lock().expect("core 0") = CoreWriterState {
+                writer: Weak::new(),
+                exited: Some(exited),
+            };
+        }
+        assert!(matches!(
+            wal.open(placement(1), metrics()),
+            Err(RaftWalError::CoreWriterStopping { core: CoreId(0) })
+        ));
+        let opening = tokio::spawn({
+            let wal = wal.clone();
+            async move { wal.open_waiting(placement(1), metrics()).await }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!opening.is_finished(), "the open waits for the writer");
+        drop(stopping);
+        let store = opening
+            .await
+            .expect("the open task")
+            .expect("the open after the writer stopped");
+        drop(store);
+        wal.shutdown().await.expect("a clean shutdown");
+        crate::tests::remove_test_path(&root);
     }
 
     /// A writer whose last handle is still draining it keeps a shutdown from

@@ -194,7 +194,8 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
             )?);
             let log_store = self
                 .log_stores
-                .open(placement, metrics.clone())
+                .open_waiting(placement, metrics.clone())
+                .await
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let apply_stop_signal = log_store.apply_stop_signal();
             let snapshot_record = log_store.snapshot_record();
@@ -456,7 +457,8 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             // Raft core starts with elections disabled.
             let store = self
                 .log_stores
-                .open(placement, metrics.clone())
+                .open_waiting(placement, metrics.clone())
+                .await
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let rejoin = Arc::new(
                 GroupRejoin::durable(self.node_id, placement.raft_group_id, &store)
