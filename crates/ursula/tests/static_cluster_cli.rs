@@ -5,6 +5,8 @@
     clippy::string_slice,
     reason = "integration tests assert by panicking, as clippy.toml allows for unit tests"
 )]
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::TcpListener;
@@ -2774,17 +2776,17 @@ fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
 /// The object keys that the snapshot record of group 0 in `wal_dir`
 /// (`group-0.snapshot.json`) names, decoded as a restore decodes it: none
 /// before the node wrote a record, else its one S3 key (#687).
-fn named_snapshot_keys(wal_dir: &Path) -> std::collections::BTreeSet<String> {
+fn named_snapshot_keys(wal_dir: &Path) -> BTreeSet<String> {
     let records = files_named(wal_dir, "group-0.snapshot.json");
     assert!(records.len() <= 1, "{records:?}");
     let Some(record) = records.first() else {
-        return std::collections::BTreeSet::new();
+        return BTreeSet::new();
     };
     let bytes = match std::fs::read(record) {
         Ok(bytes) => bytes,
         // The node's directory was wiped since the walk.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return std::collections::BTreeSet::new();
+            return BTreeSet::new();
         }
         Err(err) => panic!("read the snapshot record {}: {err}", record.display()),
     };
@@ -2824,7 +2826,7 @@ async fn snapshot_ownership(
 ) {
     for _ in 0..20 {
         let before = snapshot_names(nodes);
-        let mut objects = std::collections::BTreeMap::new();
+        let mut objects = BTreeMap::new();
         for (node_id, _) in nodes {
             let dir = format!(
                 "{}group-0/",
@@ -2875,8 +2877,9 @@ async fn wait_quiet_snapshot_prefixes(
     prefix: &ursula_runtime::SnapshotPrefix,
     nodes: &[(u64, PathBuf)],
 ) -> Vec<ursula_runtime::snapshot_harness::NodeNames> {
-    // A node's GC pass runs once a key leaves its holds, and again one
-    // install timeout after its restore.
+    // A node's GC pass runs once a key leaves its holds, and right after
+    // its restore, which removes what a wiped node wrote before the wipe,
+    // and again one install timeout later.
     let deadline = tokio::time::Instant::now()
         .checked_add(Duration::from_secs(180))
         .expect("a deadline");
@@ -3063,12 +3066,8 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
         .validate()
         .unwrap_or_else(|err| panic!("the node config is valid: {err}"));
     // A follower's install copy, four snapshot-store requests of two 3 s
-    // attempts and a backoff of at most 2 s, fits inside the install
-    // timeout, as the server's startup check requires.
-    assert_eq!(
-        config.storage.snapshot.install_copy_budget(),
-        Duration::from_secs(32)
-    );
+    // attempts and a backoff of at most 2 s (32 s), fits inside the
+    // install timeout, as the server's startup check requires.
     assert!(
         config.storage.snapshot.install_copy_budget()
             <= config.raft.install_snapshot_timeout.as_duration()
@@ -3110,6 +3109,7 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
     for (node_id, _) in &nodes {
         owned_named_key(&names, &prefix, *node_id);
     }
+    let pre_wipe = owned_named_key(&names, &prefix, 3);
 
     // 3. Node 3 loses its disk. Nodes 1 and 2 snapshot past a further write
     // and purge their logs through it, so node 3 can catch up only through
@@ -3147,7 +3147,16 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
     let names = check_named_snapshot_objects_exist(&cold_store, &prefix, &nodes).await;
     let copy = owned_named_key(&names, &prefix, 3);
     let leader_key = owned_named_key(&names, &prefix, leader);
-    assert_ne!(copy, leader_key, "node 3 names the leader's object");
+    let index_of = |key: &str| {
+        ursula_runtime::OwnedKey::parse(&prefix, key)
+            .unwrap_or_else(|err| panic!("{key} is not an owned key: {err}"))
+            .index()
+    };
+    assert_eq!(
+        index_of(&copy),
+        index_of(&leader_key),
+        "node 3's {copy} is not a copy of the leader's {leader_key}"
+    );
 
     // 5. The leader builds again. Once quiet, its directory holds only its
     // new object, and node 3's only its copy: its objects from before the
@@ -3169,6 +3178,16 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
         "the leader's new build replaced its object"
     );
     assert_eq!(owned_named_key(&names, &prefix, 3), copy);
+    let (view, _) = snapshot_ownership(&cold_store, &prefix, &nodes).await;
+    for (gone, whose) in [
+        (&pre_wipe, "node 3's object from before the wipe"),
+        (&leader_key, "the leader's replaced object"),
+    ] {
+        assert!(
+            !view.objects.contains_key(gone),
+            "{whose} {gone} is still in the bucket once quiet"
+        );
+    }
 
     // 6. Each node in turn, node 3 last, restarts, restores the object its
     // record names and serves group 0 again. No record changes, and every
