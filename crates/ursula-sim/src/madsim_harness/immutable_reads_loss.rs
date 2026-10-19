@@ -150,6 +150,11 @@ pub(super) async fn accepted_loss_phase(
         .copied()
         .unwrap_or(1);
     lead_every_group(&cluster, cut_off, &context).await;
+    // The page cache writes everything so far back on every node, so the
+    // power loss below takes only what is written after the cut-off.
+    for wal in cluster.wals.values() {
+        wal.write_back();
+    }
     for node in NODES.into_iter().filter(|node| *node != cut_off) {
         cluster.policy.partition_bidirectional(cut_off, node);
     }
