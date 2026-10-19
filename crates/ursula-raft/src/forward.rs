@@ -890,7 +890,7 @@ mod batch_response_tests {
 
 #[cfg(test)]
 mod leadership_refusal_tests {
-    use openraft::BasicNode;
+    use openraft::EmptyNode;
     use ursula_runtime::GroupEngineError;
     use ursula_runtime::KnownLeader;
     use ursula_runtime::LeadershipReason;
@@ -974,9 +974,7 @@ mod leadership_refusal_tests {
         use openraft::errors::ForwardReason;
         use openraft::errors::ForwardToLeader;
 
-        let to_node_3 = |reason| {
-            ForwardToLeader::new(3, BasicNode::new("http://node-3:4438")).with_reason(reason)
-        };
+        let to_node_3 = |reason| ForwardToLeader::new(3, EmptyNode {}).with_reason(reason);
         // Node 2 while it still leads in term 7.
         let leading = GroupLeadership {
             node_id: 2,

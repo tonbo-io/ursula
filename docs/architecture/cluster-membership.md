@@ -30,8 +30,8 @@ list is never dialed: its network client answers unreachable without dialing,
 followers neither forward to it nor redirect to it, and each node logs it once
 (`PeerCluster::cluster_url` in `crates/ursula-raft/src/peer_cluster.rs`). To
 move a node, change `raft.peers` on every node and restart them. Membership
-entries still record a node address, which the heal driver writes from
-`raft.peers` when it adds a learner, but nothing reads it.
+entries, snapshot records and installed snapshots name each member by node ID
+only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 
 There is no runtime membership authority. No meta Raft group runs, and the
 server never moves a group to another node or changes its voter count. The

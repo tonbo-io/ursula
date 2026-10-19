@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::io;
 use std::io::Cursor;
@@ -8,7 +9,6 @@ use std::time::Duration;
 
 use futures_util::Stream;
 use futures_util::TryStreamExt;
-use openraft::BasicNode;
 use openraft::Config;
 use openraft::EntryPayload;
 use openraft::OptionalSend;
@@ -39,7 +39,7 @@ openraft::declare_raft_types!(
     pub MetaRaftTypeConfig:
         D = ControlCommand,
         R = ControlResponse,
-        Node = openraft::BasicNode,
+        Node = openraft::EmptyNode,
         AsyncRuntime = MetaOpenRaftRuntime,
 );
 
@@ -164,7 +164,6 @@ impl MetaRaftHandle {
 
     pub async fn new_single_node_with_log_store<LS>(
         node_id: u64,
-        node: BasicNode,
         config: Arc<Config>,
         log_store: LS,
     ) -> Result<Self, MetaRaftError>
@@ -179,9 +178,9 @@ impl MetaRaftHandle {
         )
         .await?;
 
-        let mut nodes = BTreeMap::new();
-        nodes.insert(node_id, node);
-        handle.initialize_membership(nodes).await?;
+        handle
+            .initialize_membership(BTreeSet::from([node_id]))
+            .await?;
         handle
             .wait_for_current_leader(node_id, Duration::from_secs(2))
             .await?;
@@ -189,10 +188,7 @@ impl MetaRaftHandle {
         Ok(handle)
     }
 
-    pub async fn initialize_membership(
-        &self,
-        nodes: BTreeMap<u64, BasicNode>,
-    ) -> Result<(), MetaRaftError> {
+    pub async fn initialize_membership(&self, nodes: BTreeSet<u64>) -> Result<(), MetaRaftError> {
         let initialized =
             self.raft.is_initialized().await.map_err(|err| {
                 MetaRaftError::with_source("check meta OpenRaft initialization", err)

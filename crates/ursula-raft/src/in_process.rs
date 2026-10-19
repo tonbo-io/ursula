@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use openraft::BasicNode;
+use openraft::EmptyNode;
 use openraft::OptionalSend;
 use openraft::Raft;
 use openraft::RaftNetworkFactory;
@@ -198,7 +198,7 @@ impl InProcessRaftNetworkFactory {
 impl RaftNetworkFactory<UrsulaRaftTypeConfig> for InProcessRaftNetworkFactory {
     type Network = InProcessRaftNetwork;
 
-    async fn new_client(&mut self, target: u64, _node: &BasicNode) -> Self::Network {
+    async fn new_client(&mut self, target: u64, _node: &EmptyNode) -> Self::Network {
         InProcessRaftNetwork {
             source: self.source,
             target,

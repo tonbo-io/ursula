@@ -2,12 +2,11 @@
 //! production gate, barrier driver and heal driver, wired the way the static
 //! gRPC engine factory wires them.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkEvent;
 use ursula_raft::InProcessRaftNetworkPolicy;
@@ -30,13 +29,8 @@ pub(super) const RECOVERY_DRIVER_INTERVAL: Duration = Duration::from_millis(50);
 pub(super) const RECOVERY_STALL_AFTER: Duration = Duration::from_secs(2);
 
 /// The configured voters `node_ids` of a simulated group.
-pub(super) fn configured_voters(
-    node_ids: impl IntoIterator<Item = u64>,
-) -> BTreeMap<u64, BasicNode> {
-    node_ids
-        .into_iter()
-        .map(|node_id| (node_id, BasicNode::new(format!("node-{node_id}"))))
-        .collect()
+pub(super) fn configured_voters(node_ids: impl IntoIterator<Item = u64>) -> BTreeSet<u64> {
+    node_ids.into_iter().collect()
 }
 
 #[derive(Debug)]
@@ -107,7 +101,7 @@ pub(super) fn wire_recovery(
     rejoin: &Arc<GroupRejoin>,
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
-    voters: &BTreeMap<u64, BasicNode>,
+    voters: &BTreeSet<u64>,
     recovery_registry: &RaftGroupHandleRegistry,
 ) {
     engine

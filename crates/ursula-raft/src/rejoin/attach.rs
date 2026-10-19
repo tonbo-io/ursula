@@ -1,12 +1,11 @@
 //! Recovery driver wiring, transport seam and task ownership.
 
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
-use openraft::BasicNode;
 use openraft::rt::WatchReceiver;
 
 use super::GroupRejoin;
@@ -164,7 +163,7 @@ impl RecoveryGate {
         engine: &crate::RaftGroupEngine,
         rejoin: Arc<GroupRejoin>,
         registry: &RaftGroupHandleRegistry,
-        nodes: BTreeMap<u64, BasicNode>,
+        nodes: BTreeSet<u64>,
         transport: T,
         config: RecoveryConfig,
     ) -> Result<(), ursula_runtime::GroupEngineError> {
@@ -199,7 +198,7 @@ impl RecoveryGate {
             self.push(crate::rt::spawn(async move {
                 while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
                     let mut all_empty = true;
-                    for peer in nodes.keys() {
+                    for peer in &nodes {
                         if *peer != rejoin.node_id
                             && !matches!(
                                 transport.probe(*peer).await,

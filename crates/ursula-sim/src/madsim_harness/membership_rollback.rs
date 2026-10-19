@@ -1076,11 +1076,7 @@ pub(super) async fn run_membership_rollback_inner(
     for group in JOURNAL_GROUPS {
         cluster.engines[&(group, a)]
             .raft_handle()
-            .add_learner(
-                LEARNER,
-                openraft::BasicNode::new(format!("node-{LEARNER}")),
-                true,
-            )
+            .add_learner(LEARNER, openraft::EmptyNode {}, true)
             .await
             .unwrap_or_else(|error| panic!("{context}: group {group}: add the learner: {error}"));
     }
@@ -1649,11 +1645,7 @@ async fn commit_ahead(
     for group in JOURNAL_GROUPS {
         cluster.engines[&(group, a)]
             .raft_handle()
-            .add_learner(
-                SECOND_LEARNER,
-                openraft::BasicNode::new(format!("node-{SECOND_LEARNER}")),
-                true,
-            )
+            .add_learner(SECOND_LEARNER, openraft::EmptyNode {}, true)
             .await
             .unwrap_or_else(|error| {
                 panic!("{context}: group {group}: add the second learner: {error}")
@@ -1940,11 +1932,7 @@ async fn two_recoveries(
         let leader = newest_leader(cluster, group).expect("a leader");
         cluster.engines[&(group, leader)]
             .raft_handle()
-            .add_learner(
-                SECOND_LEARNER,
-                openraft::BasicNode::new(format!("node-{SECOND_LEARNER}")),
-                true,
-            )
+            .add_learner(SECOND_LEARNER, openraft::EmptyNode {}, true)
             .await
             .unwrap_or_else(|error| {
                 panic!("{context}: group {group}: add the second learner: {error}")

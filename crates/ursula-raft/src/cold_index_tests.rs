@@ -11,8 +11,6 @@ use std::sync::Arc;
 
 use futures_util::stream;
 #[cfg(not(madsim))]
-use openraft::BasicNode;
-#[cfg(not(madsim))]
 use openraft::Config;
 use openraft::Entry;
 use openraft::EntryPayload;
@@ -119,7 +117,6 @@ async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::
     let engine = RaftGroupEngine::new_single_node_with_log_store_and_metrics(
         placement(),
         1,
-        BasicNode::new("local"),
         config,
         log_store,
         None,

@@ -73,7 +73,6 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let poisoned = RaftGroupEngine::new_single_node(
         placement(0),
         1,
-        openraft::BasicNode::new("local"),
         config.clone(),
         poisoned_log.clone(),
         RaftGroupEngineOptions {
@@ -86,7 +85,6 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let healthy = RaftGroupEngine::new_single_node(
         placement(1),
         1,
-        openraft::BasicNode::new("local"),
         config.clone(),
         wal.open(placement(1), metrics.group_engine_metrics())
             .unwrap(),
@@ -422,7 +420,6 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let recovered = RaftGroupEngine::new_single_node(
         placement(0),
         1,
-        openraft::BasicNode::new("local"),
         config,
         wal.open(placement(0), metrics.group_engine_metrics())
             .unwrap(),
@@ -645,11 +642,7 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
         }
         if !corrected {
             engines[0]
-                .initialize_membership(BTreeMap::from([
-                    (1, openraft::BasicNode::new("one")),
-                    (2, openraft::BasicNode::new("two")),
-                    (3, openraft::BasicNode::new("three")),
-                ]))
+                .initialize_membership(BTreeSet::from([1, 2, 3]))
                 .await
                 .unwrap();
         }

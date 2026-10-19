@@ -5,7 +5,6 @@
 use openraft::storage::RaftLogStorage;
 
 use super::AppendRequest;
-use super::BasicNode;
 use super::ColdWriteAdmission;
 use super::CreateStreamRequest;
 use super::Duration;
@@ -365,7 +364,7 @@ pub(super) async fn run_snapshot_catch_up_inner(
 
     registry.register(learner_id, &engines[learner_index]);
     let learner_added = leader
-        .add_learner(learner_id, BasicNode::new("node-3"), true)
+        .add_learner(learner_id, openraft::EmptyNode {}, true)
         .await
         .expect("add lagging learner");
     trace.push(SimEvent::LearnerAdded {

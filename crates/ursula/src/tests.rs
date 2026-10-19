@@ -10,7 +10,6 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
-use openraft::BasicNode;
 use openraft::RaftNetworkV2;
 use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
@@ -4788,9 +4787,8 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .get(RaftGroupId(0))
         .expect("late learner group");
     let learner_added = leader_raft
-        // The membership's address is never dialed: the leader takes node
-        // 3's from `raft.peers`.
-        .add_learner(3, BasicNode::new("http://127.0.0.1:1"), true)
+        // The leader takes node 3's address from `raft.peers`.
+        .add_learner(3, true)
         .await
         .expect("add late learner over gRPC");
     late_learner
@@ -6483,11 +6481,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                                 // Three voters, so that a plan may cut; only
                                 // this one runs.
                                 vec![std::collections::BTreeSet::from([1, 2, 3])],
-                                BTreeMap::from([
-                                    (1, openraft::BasicNode::new("local")),
-                                    (2, openraft::BasicNode::new("absent")),
-                                    (3, openraft::BasicNode::new("absent")),
-                                ]),
+                                std::collections::BTreeSet::from([1, 2, 3]),
                             )
                             .expect("membership"),
                         ),
@@ -6617,7 +6611,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             registry.get(RaftGroupId(0)).expect("registered owner"),
             gate.clone(),
             registry.election_policy(),
-            BTreeMap::new(),
+            BTreeSet::new(),
             |_leader| async { Err::<(ursula_raft::UrsulaVote, u64), _>("no leader".to_owned()) },
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(10),
