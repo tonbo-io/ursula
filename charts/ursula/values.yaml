@@ -253,6 +253,9 @@ raft:
   # keeps its own default (2 from 0.7.4, 1 before), so a pod that still runs an older image never
   # gets a setting it was not validated with.
   snapshotBuildMaxConcurrency: null
+  # Far entry backstop of the snapshot driver: a group snapshots once it applied this many entries
+  # since its last snapshot, whatever its log bytes. Unset, the server default (100000).
+  snapshotBackstopLogs: null
   # Payload-bearing log entries retained per group after snapshot coverage.
   maxInSnapshotLogToKeep: 64
   # How long, in milliseconds, a replica keeps a deleted, purged or expired stream in its current

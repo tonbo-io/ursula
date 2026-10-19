@@ -1247,6 +1247,11 @@
           "maximum": 16,
           "description": "Snapshot builds a node runs at once. The snapshot driver keeps one in flight while the node's Raft log is below its budget, and past it more, up to this many before the hard limit of twice the budget. Null keeps each server's own default (2 from 0.7.4, 1 before)."
         },
+        "snapshotBackstopLogs": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Far entry backstop of the snapshot driver, rendered as raft.snapshot_backstop_logs. A group snapshots once it applied this many entries since its last snapshot. Null keeps the server default (100000)."
+        },
         "maxInSnapshotLogToKeep": {
           "type": "integer",
           "minimum": 0,

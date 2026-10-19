@@ -558,7 +558,8 @@ Never point two clusters at one prefix, and never point a new cluster at the sou
 3. **Copy the cold objects** into the 0.9 cluster's cold root after the 0.9 nodes have written their `URSULA_FORMAT_EPOCH` marker. Skip the marker and `snapshots/` ([Copying cold objects](#copying-cold-objects)).
 4. **Restore with the 0.9 `ursulactl`.** `ursulactl restore` checks the copy against every group's references and then imports each group.
 5. **Clients** that keep state follow the new `Stream-Incarnation` of every restored stream, as after any restore.
-6. **Optionally scope credentials per node.** With an S3 snapshot store, a node writes and deletes only under `<prefix>/node-<id>/` and reads the rest of `<prefix>/`, so an IAM policy per node can enforce that.
+6. **Drop the removed snapshot settings** from the config and Helm values you carry over. Remove `raft.snapshot_logs_since_last` (Helm `raft.snapshotLogsSinceLast`) and any `storage.snapshot.drive_interval = "0s"` (Helm `snapshotStore.driveIntervalMs: 0`). 0.9 refuses both at startup, and the chart's schema refuses them at render. The snapshot driver always runs. To keep the 5,000-entry bound a 0.8 single node had, set `raft.snapshot_backstop_logs = 5000` (Helm `raft.snapshotBackstopLogs`).
+7. **Optionally scope credentials per node.** With an S3 snapshot store, a node writes and deletes only under `<prefix>/node-<id>/` and reads the rest of `<prefix>/`, so an IAM policy per node can enforce that.
 
 `helm upgrade` from 0.8 stops at the first pod. The new pod finds the 0.8 data on its volume and exits at startup, so no second voter is replaced and the refused pod writes nothing. Recover with `helm rollback`. With `OnDelete`, also delete the refused pod after the rollback so that it starts from the 0.8 template again. The 0.8 cluster and its prefix stay as they were, so they remain a way back until clients switch.
 

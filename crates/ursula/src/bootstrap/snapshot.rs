@@ -1049,6 +1049,12 @@ pub fn spawn_snapshot_driver(
     wal: Option<WalMaintenance>,
     max_groups_per_tick: usize,
 ) {
+    // Config validation refuses a zero `storage.snapshot.drive_interval`:
+    // the driver would tick without pause.
+    debug_assert!(
+        !interval.is_zero(),
+        "the snapshot drive interval is non-zero"
+    );
     let mut gate = store.map(|(store, store_gate)| {
         let default_s3 = ursula_config::S3Config::default();
         spawn_store_health_gate(

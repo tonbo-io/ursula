@@ -276,7 +276,7 @@ backend = "auto"
     }
 
     #[test]
-    fn snapshot_drive_interval_is_optional_and_never_zero() {
+    fn snapshot_drive_interval_is_optional_and_parses() {
         use crate::human::HumanDuration;
 
         let omitted: UrsulaConfig = toml::from_str(
@@ -376,6 +376,19 @@ mod load_tests {
                     crate::validate::ValidationError::ZeroSnapshotDriveInterval
                 )
             ),
+            "{err}"
+        );
+    }
+
+    /// `raft.snapshot_logs_since_last` is gone in 0.9: a config that still
+    /// sets it is refused as an unknown key.
+    #[test]
+    fn a_removed_snapshot_logs_since_last_is_refused_at_load() {
+        let tmp = temp_config(".toml", "[raft]\nsnapshot_logs_since_last = 5000\n");
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::TomlParse(_))
+                && err.to_string().contains("snapshot_logs_since_last"),
             "{err}"
         );
     }

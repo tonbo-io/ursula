@@ -345,7 +345,7 @@ to S3 snapshots on upgrade. That is the intended production setting; set
 When `snapshotStore.backend=s3`, the generated config sets
 `storage.snapshot.backend = "s3"` (with `auto` and cold storage, the same S3
 settings apply) and shares the top-level `s3` bucket/credential
-settings. The runtime drives one due group every 5 seconds by default. Set
+settings. The snapshot driver ticks every 5 seconds by default. Set
 `snapshotStore.driveIntervalMs=10000` to render
 `storage.snapshot.drive_interval = "10000ms"`. The driver always runs, so the
 schema refuses `0`.
@@ -469,6 +469,7 @@ container receives only chart-managed container settings plus explicit
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
 | `raft.snapshotPressureMaxGroupsPerTick` | `16` | Maximum groups snapshotted by one pressure pass while the node's Raft log is below its budget. Past the budget a pass starts this many for each snapshot build it keeps in flight. |
+| `raft.snapshotBackstopLogs` | `null` | Far entry backstop of the snapshot driver: a group snapshots once it applied this many entries since its last snapshot, whatever its log bytes. At least 1. Renders `raft.snapshot_backstop_logs` when set. Unset, the server default of 100,000. |
 | `raft.snapshotBuildMaxConcurrency` | `null` | Snapshot builds a node runs at once. Each holds a copy of its group's state and its compressed upload. The snapshot driver keeps one in flight while the node's Raft log is below its budget, and past it more, up to this many before the hard limit of twice the budget. Between 1 and 16. Renders `raft.snapshot_build_max_concurrency` when set. Unset, each server keeps its own default (2 from 0.7.4, 1 before), so a pod that still runs an older image keeps the setting it was validated with. |
 | `raft.maxInSnapshotLogToKeep` | `64` | Payload-bearing Raft log entries retained per group after snapshot coverage. Renders `raft.max_in_snapshot_log_to_keep`. |
 | `raft.deletedDataMaxAgeMs` | `null` | Milliseconds a replica keeps a deleted, purged or expired stream in its current Raft snapshot and its Raft log after it applies the removal. At least eight times the install snapshot timeout. Renders `raft.deleted_data_max_age` when set. Unset, each server keeps its own default, the larger of 1 hour and eight install timeouts, so a pod that still runs an older image never gets a key it does not know. |

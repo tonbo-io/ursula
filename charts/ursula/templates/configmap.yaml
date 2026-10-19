@@ -128,6 +128,9 @@ data:
 {{- if not (eq .Values.raft.snapshotBuildMaxConcurrency nil) }}
     snapshot_build_max_concurrency = {{ .Values.raft.snapshotBuildMaxConcurrency }}
 {{- end }}
+{{- if not (eq .Values.raft.snapshotBackstopLogs nil) }}
+    snapshot_backstop_logs = {{ .Values.raft.snapshotBackstopLogs | int64 }}
+{{- end }}
     max_in_snapshot_log_to_keep = {{ .Values.raft.maxInSnapshotLogToKeep }}
 {{- if not (eq .Values.raft.deletedDataMaxAgeMs nil) }}
     deleted_data_max_age = "{{ .Values.raft.deletedDataMaxAgeMs | int64 }}ms"

@@ -998,6 +998,14 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
         self.assertEqual(parsed["storage"]["snapshot"]["drive_interval"], "10000ms")
 
+    def test_snapshot_backstop_logs_renders_only_when_set(self) -> None:
+        parsed = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))
+        self.assertNotIn("snapshot_backstop_logs", parsed["raft"])
+        parsed = tomllib.loads(
+            render_config(*NAMED, "--set", "s3.bucket=bkt", "--set", "raft.snapshotBackstopLogs=5000")
+        )
+        self.assertEqual(parsed["raft"]["snapshot_backstop_logs"], 5000)
+
     def test_snapshot_drive_interval_zero_is_refused(self) -> None:
         result = subprocess.run(
             [
