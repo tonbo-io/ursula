@@ -84,7 +84,8 @@ tracing-subscriber = { workspace = true }
 # Path-only: a versionless dev-dependency is dropped from the published
 # manifest, so `ursula` publishes without waiting for `ursula-ctl`.
 ursula-ctl = { path = "../ursula-ctl" }
-ursula-raft = { workspace = true, features = ["fault-injection"] }
+# `persisted_snapshot_pointer`, which reads what a node's snapshot record names.
+ursula-raft = { workspace = true, features = ["fault-injection", "test-support"] }
 zstd = { workspace = true }
 
 [[bench]]
