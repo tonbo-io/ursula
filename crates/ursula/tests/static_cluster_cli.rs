@@ -2015,6 +2015,76 @@ async fn wait_readiness(
     }
 }
 
+/// The bytes every record of the stream the deleted-data test removes
+/// carries.
+const DELETED_MARKER: &str = "deleted-data-marker-669;";
+
+/// The `raft_groups[0]` progress of `base_url`'s metrics: last applied,
+/// snapshot and purged index.
+async fn group_zero_progress(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> (Option<u64>, Option<u64>, Option<u64>, serde_json::Value) {
+    let metrics: serde_json::Value = client
+        .get(format!("{base_url}/__ursula/metrics"))
+        .send()
+        .await
+        .expect("read metrics")
+        .json()
+        .await
+        .expect("metrics JSON");
+    let group = &metrics["raft_groups"][0];
+    let index = |key: &str| group[key].as_u64();
+    (
+        index("last_applied_index"),
+        index("snapshot_index"),
+        index("purged_index"),
+        metrics,
+    )
+}
+
+/// Every node-local snapshot file under `wal_dir` that holds
+/// [`DELETED_MARKER`].
+fn snapshot_files_with_marker(wal_dir: &Path) -> Vec<PathBuf> {
+    files_with_marker(wal_dir, |name| name.contains(".snapshot.json"))
+}
+
+/// Every file under `wal_dir`, the journal segments among them, that holds
+/// [`DELETED_MARKER`].
+fn wal_files_with_marker(wal_dir: &Path) -> Vec<PathBuf> {
+    files_with_marker(wal_dir, |_| true)
+}
+
+/// Every file under `dir` whose name `chosen` picks and that holds
+/// [`DELETED_MARKER`].
+fn files_with_marker(dir: &Path, chosen: fn(&str) -> bool) -> Vec<PathBuf> {
+    fn walk(dir: &Path, chosen: fn(&str) -> bool, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, chosen, found);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(chosen)
+                && std::fs::read(&path).is_ok_and(|bytes| {
+                    bytes
+                        .windows(DELETED_MARKER.len())
+                        .any(|window| window == DELETED_MARKER.as_bytes())
+                })
+            {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, chosen, &mut found);
+    found
+}
+
 /// #669: within `raft.deleted_data_max_age` of a stream's deletion, each
 /// replica's current snapshot no longer holds it, its Raft log is purged
 /// through that snapshot, and no file in its Raft log directory holds the

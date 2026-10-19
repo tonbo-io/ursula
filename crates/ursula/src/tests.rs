@@ -10,6 +10,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
+use openraft::BasicNode;
 use openraft::RaftNetworkV2;
 use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
