@@ -6,6 +6,8 @@
 //! simulation on one thread, so the nodes draw from one sequence.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use ursula_shard::BucketStreamId;
@@ -28,51 +30,82 @@ fn draw_names() -> [String; 4] {
     ]
 }
 
+/// What two nodes of one simulation draw: each node's names, and the order
+/// of their draws by node index.
+#[derive(Debug, PartialEq, Eq)]
+struct TwoNodeNames {
+    names: [Vec<String>; 2],
+    order: Vec<usize>,
+}
+
 /// The names two nodes of one simulation under `seed` draw, interleaved by
 /// simulated sleeps.
-fn two_node_names(seed: u64) -> [Vec<String>; 2] {
+fn two_node_names(seed: u64) -> TwoNodeNames {
     run_with_madsim(seed, async {
+        let order = Arc::new(Mutex::new(Vec::new()));
         let [a, b] = {
             let handle = madsim::runtime::Handle::current();
-            ["names-a", "names-b"].map(|name| {
-                handle.create_node().name(name).build().spawn(async {
-                    let mut names = Vec::new();
-                    for _ in 0..DRAWS {
-                        names.extend(draw_names());
-                        madsim::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    names
-                })
+            [0, 1].map(|node| {
+                let order = Arc::clone(&order);
+                handle
+                    .create_node()
+                    .name(format!("names-{node}"))
+                    .build()
+                    .spawn(async move {
+                        let mut names = Vec::new();
+                        for _ in 0..DRAWS {
+                            names.extend(draw_names());
+                            order.lock().expect("the draw order").push(node);
+                            madsim::time::sleep(Duration::from_millis(1)).await;
+                        }
+                        names
+                    })
             })
         };
-        [
+        let names = [
             a.await.expect("node a draws its names"),
             b.await.expect("node b draws its names"),
-        ]
+        ];
+        let order = order.lock().expect("the draw order").clone();
+        TwoNodeNames { names, order }
     })
 }
 
 /// A seed draws the same names on every run, another seed draws others, and
-/// the two nodes of a run, drawing from one sequence, share no name. Outside a runtime the names
-/// are deterministic too, so a madsim build of a test that names objects
-/// without a runtime replays.
+/// the two nodes of a run, whose draws interleave on one sequence, share no
+/// name. Outside a runtime the names are deterministic too, so a madsim
+/// build of a test that names objects without a runtime replays.
 #[test]
 fn cold_object_names_follow_the_seed_replays() {
     let _guard = sim_test_guard();
     let first = two_node_names(7);
     assert_eq!(two_node_names(7), first, "seed 7 draws its names again");
 
-    let [a, b] = &first;
+    assert!(
+        first
+            .order
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count()
+            > 1,
+        "the nodes' draws interleave: {:?}",
+        first.order
+    );
+    let [a, b] = &first.names;
     let a = a.iter().collect::<BTreeSet<_>>();
     let b = b.iter().collect::<BTreeSet<_>>();
-    assert_eq!(a.len(), first[0].len(), "node a never repeats a name");
-    assert_eq!(b.len(), first[1].len(), "node b never repeats a name");
+    assert_eq!(a.len(), first.names[0].len(), "node a never repeats a name");
+    assert_eq!(b.len(), first.names[1].len(), "node b never repeats a name");
     assert!(a.is_disjoint(&b), "the nodes of one run share no name");
 
     let other = two_node_names(8);
-    let seven = first.iter().flatten().collect::<BTreeSet<_>>();
+    let seven = first.names.iter().flatten().collect::<BTreeSet<_>>();
     assert!(
-        other.iter().flatten().all(|name| !seven.contains(name)),
+        other
+            .names
+            .iter()
+            .flatten()
+            .all(|name| !seven.contains(name)),
         "seed 8 names its objects apart from seed 7"
     );
 
@@ -108,4 +141,20 @@ fn cold_object_names_restart_with_each_runtime_replays() {
         first, second,
         "the second runtime of seed 7 draws its names again"
     );
+}
+
+/// Naming objects draws nothing from madsim's generator: a run that names
+/// objects and then draws from it gets the draw a run of the same seed that
+/// names nothing gets.
+#[test]
+fn cold_object_names_draw_nothing_from_madsim_rng_replays() {
+    let _guard = sim_test_guard();
+    let after_names = run_with_madsim(7, async {
+        for _ in 0..DRAWS {
+            draw_names();
+        }
+        madsim::rand::random::<u64>()
+    });
+    let alone = run_with_madsim(7, async { madsim::rand::random::<u64>() });
+    assert_eq!(after_names, alone, "naming objects shifted madsim's draws");
 }

@@ -83,9 +83,10 @@ impl ColdObjectWriter {
 }
 /// The nonce of every new cold object name (chunks, packs, external
 /// payloads, snapshot parts): 64 random bits in the last 16 hex digits,
-/// after the write time in nanoseconds. Two names collide only when they
-/// share the nanosecond and the 64 random bits, whatever the clocks and
-/// restarts of the nodes that draw them. Nothing parses the nonce's value.
+/// after the write time in nanoseconds. Whatever the clocks and restarts of
+/// the nodes that draw them, two names collide only if they share the
+/// nanosecond and draw the same 64 random bits, with probability about
+/// 2^-64 per pair. Nothing parses the nonce's value.
 /// The orphan sweep, cold GC and every name predicate read only its width.
 #[cfg(not(madsim))]
 fn cold_object_nonce() -> u64 {
@@ -2335,10 +2336,13 @@ mod tests {
     /// New cold object names end in 64 random bits (C2a, K1): no two draws
     /// share a name or a nonce, the nonce is no counter, and the names keep
     /// their shape: every name predicate accepts them, the write time still
-    /// parses, and G1's guard accepts them.
+    /// parses (outside madsim, whose write time is 0), and G1's guard
+    /// accepts them.
     #[test]
     fn new_cold_object_names_carry_a_random_nonce() {
         const DRAWS: usize = 256;
+        // madsim's write time is 0, which gives no age.
+        const WRITE_TIME: bool = cfg!(not(madsim));
         let stream_id = BucketStreamId::new(GC_BUCKET, "s");
         let mut names = Vec::new();
         for _ in 0..DRAWS {
@@ -2349,7 +2353,11 @@ mod tests {
                 .expect("a name");
             assert!(is_cold_chunk_file_name(chunk_name), "{chunk}");
             assert_eq!(cold_chunk_file_range(chunk_name), Some((0, 4)));
-            assert!(cold_object_written_unix_ms(chunk_name).is_some(), "{chunk}");
+            assert_eq!(
+                cold_object_written_unix_ms(chunk_name).is_some(),
+                WRITE_TIME,
+                "{chunk}"
+            );
             assert!(matches!(
                 gc_check(GC_BUCKET, &chunk),
                 Ok(ColdGcPathKind::ExclusiveChunk { generation: 7, .. })
@@ -2357,7 +2365,11 @@ mod tests {
 
             let pack = new_cold_pack_path(GC_BUCKET, GC_GROUP.0);
             let pack_name = pack.rsplit_once('/').map(|(_, name)| name).expect("a name");
-            assert!(cold_object_written_unix_ms(pack_name).is_some(), "{pack}");
+            assert_eq!(
+                cold_object_written_unix_ms(pack_name).is_some(),
+                WRITE_TIME,
+                "{pack}"
+            );
             assert_eq!(
                 gc_check(GC_BUCKET, &pack),
                 Ok(ColdGcPathKind::Pack {
@@ -2371,8 +2383,9 @@ mod tests {
                 .map(|(_, name)| name)
                 .expect("a name");
             assert!(is_external_payload_file_name(external_name), "{external}");
-            assert!(
+            assert_eq!(
                 cold_object_written_unix_ms(external_name).is_some(),
+                WRITE_TIME,
                 "{external}"
             );
             assert_eq!(
@@ -2388,7 +2401,11 @@ mod tests {
             let part_name = part.rsplit_once('/').map(|(_, name)| name).expect("a name");
             assert!(is_snapshot_part_object_name(part_name), "{part}");
             assert_eq!(snapshot_part_object_incarnation(part_name), Some(1));
-            assert!(cold_object_written_unix_ms(part_name).is_some(), "{part}");
+            assert_eq!(
+                cold_object_written_unix_ms(part_name).is_some(),
+                WRITE_TIME,
+                "{part}"
+            );
 
             names.extend([chunk, pack, external, part]);
         }
