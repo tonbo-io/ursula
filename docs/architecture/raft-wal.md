@@ -545,6 +545,6 @@ and injects I/O errors. Simulation therefore runs the production journal.
 - `scripts/bench_raft_wal.sh` runs the `disk_wal` criterion benchmark, comparing
   the shared per-core writer with a file per group and an upstream `raft-log`
   adapter per group, and `scripts/summarize_raft_wal.py` summarizes runs.
-- `scripts/soak_raft_wal.sh` repeats real-process three-voter replication,
-  snapshot and purge with late-learner installation, and durable restart,
+- `scripts/soak_raft_wal.sh` repeats real-process three-voter replication, a
+  voter healed from an empty WAL, and durable restart,
   recording its environment and output under `target/raft-wal-soak`.

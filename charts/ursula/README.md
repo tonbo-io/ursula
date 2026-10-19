@@ -176,8 +176,10 @@ Set `server.clusterListen=false` to serve the client and cluster planes on the
 client port, as charts before 0.8 did. Anyone who reaches the client Service can
 then send Raft traffic. Changing it, or `server.ports.cluster`, later moves
 every voter's cluster listener, which needs every voter restarted together: run
-`helm upgrade` with `server.updateStrategy=OnDelete`, then delete every voter
-pod at once. See
+that `helm upgrade` with `server.updateStrategy=OnDelete` and
+`server.gracefulRollout.enabled=false`, since the graceful-rollout job restarts
+voters one at a time. Then delete every voter pod at once, and turn the
+graceful rollout back on with the next upgrade. See
 [Changing a peer address](https://ursula.tonbo.io/docs/operations#changing-a-peer-address).
 
 A Service does not stop a pod from dialing another pod's IP. To restrict that,

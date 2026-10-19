@@ -111,7 +111,7 @@ The leader-transfer endpoint refuses with `409 Conflict` if the receiving node i
 
 The group leader keeps every group at its configured voters: if the membership endpoint drops a configured voter, the leader adds it back as a learner and promotes it again once it has caught up (see [Recovering after a host crash](#recovering-after-a-host-crash)). Membership changes are for repair, not for shrinking a group.
 
-The membership endpoint has the same leader-only contract: it answers `409 Conflict` (with the current leader's id in the body) when the receiving node does not lead the group, and `400 Bad Request` without a non-empty `voters` query parameter. On success it returns the log index at which the new voter set was committed. It replaces the whole voter set in one call, so include every node that should remain a voter.
+The membership endpoint has the same leader-only contract: it answers `409 Conflict` (with the current leader's id in the body) when the receiving node does not lead the group, and `400 Bad Request` without a non-empty `voters` query parameter. On success it returns the log index at which the new voter set was committed. It replaces the whole voter set in one call, so include every node that should remain a voter. It also removes every learner outside the new voters in the same change.
 
 ### Maintenance drain
 
@@ -169,9 +169,9 @@ Raft membership names node IDs only. Every node dials its peers at the `url` its
 - **A new name that the old one still reaches** rolls like any restart. Change `[[raft.peers]]` on every node and restart the nodes one at a time ([Restarting a voter](#restarting-a-voter)).
 - **A listener that moves**, such as a new cluster port, `server.cluster_listen` turned on or off, or a host without a stable name, needs every voter restarted together. Stop every voter, change `[[raft.peers]]` on every node, and start them all. The cluster serves nothing until a quorum is up, which takes about as long as one restart. Restarting one node at a time does not work here. Until the last node restarted, some nodes cannot reach each other, and a group can lose its quorum. Rolling listener moves are tracked in [#735](https://github.com/tonbo-io/ursula/issues/735).
 
-With the chart, `server.ports.cluster` and `server.clusterListen` move every listener. Run `helm upgrade` with `server.updateStrategy=OnDelete`, then delete every voter pod at once. `global.clusterDomain` rolls like any restart while the old domain still resolves.
+With the chart, `server.ports.cluster` and `server.clusterListen` move every listener. Run that `helm upgrade` with `server.updateStrategy=OnDelete` and `server.gracefulRollout.enabled=false`, since the graceful-rollout job restarts voters one at a time. Then delete every voter pod at once, and turn the graceful rollout back on with the next upgrade. `global.clusterDomain` rolls like any restart while the old domain still resolves.
 
-A node that a group's membership names but `[[raft.peers]]` does not list is never dialed. Each node logs it once, and the group reports `unconfigured_member` in the maintenance report ([Troubleshooting](/docs/troubleshooting#a-node-at-a-new-address-stays-unready)).
+A node that a group's membership names but `[[raft.peers]]` does not list is never dialed. Each node logs it once, and the group reports `unconfigured_member` in the maintenance report ([`unconfigured_member`](/docs/troubleshooting#unconfigured_member)).
 
 ### WAL routing configuration
 

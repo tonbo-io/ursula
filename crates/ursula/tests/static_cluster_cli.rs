@@ -731,6 +731,10 @@ async fn cli_a_cluster_port_moved_after_initialization_serves() {
     drop(children);
 
     let cluster_port = free_port();
+    assert_ne!(
+        cluster_port, port,
+        "a cluster port apart from the client port"
+    );
     let cluster_base = format!("http://127.0.0.1:{cluster_port}");
     let shared = std::fs::read_to_string(&config).expect("read node config");
     let listen = format!("listen = \"127.0.0.1:{port}\"");
@@ -836,7 +840,9 @@ async fn cli_a_node_moved_to_a_new_cluster_port_rejoins_after_a_full_restart() {
     }
     drop(children);
     let old_cluster_url = planes[2].cluster_url();
+    let old_cluster_port = planes[2].cluster;
     planes[2].cluster = free_port();
+    assert_ne!(planes[2].cluster, old_cluster_port, "a new cluster port");
     let mut children = spawn_all(&planes);
     for plane in &planes {
         wait_until_ready(&client, &plane.client_url(), &mut children).await;
@@ -856,6 +862,38 @@ async fn cli_a_node_moved_to_a_new_cluster_port_rejoins_after_a_full_restart() {
     )
     .await
     .expect("the cluster reaches its full voter sets with no admin step");
+
+    // Node 3 leads no group, so what it holds a leader sent to its new
+    // address.
+    let mut node3_leads = Vec::new();
+    for _ in 0..100 {
+        let view = ctl.fetch_node(&nodes[2]).await.expect("node 3 metrics");
+        node3_leads = view
+            .groups
+            .iter()
+            .filter(|group| group.current_leader == Some(3))
+            .map(|group| group.raft_group_id)
+            .collect::<Vec<_>>();
+        if node3_leads.is_empty() {
+            break;
+        }
+        for group in &node3_leads {
+            let transferred = admin_test_post(
+                &client,
+                format!(
+                    "http://127.0.0.1:{}/__ursula/raft/{group}/leader/transfer/1",
+                    planes[2].admin
+                ),
+            )
+            .await
+            .send()
+            .await
+            .expect("send leader transfer");
+            tracing::debug!(group, status = %transferred.status(), "leader transfer");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(node3_leads.is_empty(), "node 3 still leads {node3_leads:?}");
 
     let before = read_until_replicated(
         &client,

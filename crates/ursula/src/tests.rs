@@ -4788,7 +4788,9 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .get(RaftGroupId(0))
         .expect("late learner group");
     let learner_added = leader_raft
-        .add_learner(3, BasicNode::new(peers[2].1.clone()), true)
+        // The membership's address is never dialed: the leader takes node
+        // 3's from `raft.peers`.
+        .add_learner(3, BasicNode::new("http://127.0.0.1:1"), true)
         .await
         .expect("add late learner over gRPC");
     late_learner

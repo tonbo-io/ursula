@@ -165,7 +165,7 @@ The maintenance report names `unconfigured_member` for a group whose Raft member
 raft.peers lists no node 4, a member of a Raft group: not dialing it; list the node in raft.peers or remove it from the group's membership
 ```
 
-The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group leader never removes such a member by itself. List the node in `[[raft.peers]]` again, or replace the group's voter set without it on the group's leader with `POST /__ursula/raft/{group}/membership?voters=` ([Admin endpoints](/docs/operations#admin-endpoints)).
+The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group leader never removes such a member by itself. List the node in `[[raft.peers]]` again, or send the group's configured voters to the group's leader with `POST /__ursula/raft/{group}/membership?voters=` ([Admin endpoints](/docs/operations#admin-endpoints)). The endpoint replaces the voter set and removes every learner outside it in the same change, so a member left behind as a learner goes too.
 
 ### `raft WAL directory … holds data without a format marker`
 

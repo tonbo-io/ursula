@@ -754,7 +754,8 @@ pub enum RaftMaintenanceIssue {
     /// The group's membership names a node that is not one of its
     /// configured voters. No node dials a member that `raft.peers` does not
     /// list, and the leader never removes it: an operator lists the node
-    /// again or removes it from the membership.
+    /// again, or replaces the voter set without it through the membership
+    /// endpoint, which also removes every learner outside the new voters.
     UnconfiguredMember,
     LocalReplicaNotVoter,
     MembershipNotApplied,
@@ -780,9 +781,9 @@ pub struct RaftMaintenanceReport {
 
 impl RaftMaintenanceReport {
     /// Local serving eligibility; maintenance additionally requires the full
-    /// voter set, no member outside it, and no stopped group. A group stopped by an apply failure
-    /// answers its own requests with a typed 503 while the node serves the
-    /// others, so it only blocks disruption.
+    /// voter set, no member outside it, and no stopped group. A group
+    /// stopped by an apply failure answers its own requests with a typed
+    /// 503 while the node serves the others, so it only blocks disruption.
     pub fn serving_ready(&self) -> bool {
         let local_issue = |issue: &RaftMaintenanceIssue| {
             !matches!(

@@ -264,8 +264,8 @@ spec:
               value: {{ include "ursula.clusterPort" . | quote }}
             - name: ADMIN_PORT
               value: {{ $adminPort | quote }}
-            # Learners join at the address the manifest names, so it must be
-            # the same peer FQDN the server configuration renders.
+            # The manifest names each node by the same peer FQDN the server
+            # configuration renders.
             - name: CLUSTER_DOMAIN
               value: {{ .Values.global.clusterDomain | quote }}
             - name: HEADLESS_SERVICE

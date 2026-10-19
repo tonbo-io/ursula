@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use openraft::BasicNode;
+use openraft::ChangeMembers;
 use openraft::RaftMetrics;
 use openraft::error::ClientWriteError;
 use openraft::error::Fatal;
@@ -340,14 +341,33 @@ impl OwnerRaftHandle {
         self.call(move |raft| async move { raft.add_learner(id, node, blocking).await })
             .await?
     }
-    pub async fn change_membership(
+    /// Makes `voters` the group's voter set and removes every learner
+    /// outside it, in one joint change, so a member that configuration no
+    /// longer lists leaves with it. A configured voter removed here comes
+    /// back: the heal driver adds it as a learner again.
+    pub async fn replace_voters(
         &self,
-        members: BTreeSet<u64>,
-        retain: bool,
+        voters: BTreeSet<u64>,
     ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
         // A new leader proposes only once a quorum acknowledged it.
         crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
-        self.call(move |raft| async move { raft.change_membership(members, retain).await })
+        let learners = self
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .learner_ids()
+            .filter(|learner| !voters.contains(learner))
+            .collect::<BTreeSet<_>>();
+        let change = if learners.is_empty() {
+            ChangeMembers::ReplaceAllVoters(voters)
+        } else {
+            ChangeMembers::Batch(vec![
+                ChangeMembers::ReplaceAllVoters(voters),
+                ChangeMembers::RemoveNodes(learners),
+            ])
+        };
+        self.call(move |raft| async move { raft.change_membership(change, false).await })
             .await?
     }
     pub async fn initialize(

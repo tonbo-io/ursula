@@ -1241,7 +1241,7 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
 /// Why a Raft client to a peer has no channel. OpenRaft sees each as an
 /// unreachable peer and backs off.
 #[derive(Debug, Clone, thiserror::Error)]
-pub enum RaftChannelError {
+pub(crate) enum RaftChannelError {
     /// `raft.peers` lists no such node, so nothing dials it.
     #[error("raft.peers lists no node {node_id}: not dialing it")]
     Unaddressed { node_id: u64 },

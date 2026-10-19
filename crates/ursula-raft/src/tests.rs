@@ -1646,6 +1646,101 @@ async fn a_handoff_settles_within_the_transfer_deadline_and_one_minimum_election
     raft.shutdown().await.expect("shutdown raft group");
 }
 
+/// The recovery barrier asks the group's configured voters and the members
+/// of its effective membership, by node id, never itself.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
+    let (_registry, engines, leader_id, _wal_roots, gate) =
+        build_three_node_cluster_with_a_gated_node("barrier-candidates").await;
+    // The leader's view names members 1 to 3; configuration names node 4
+    // only. The gated node's gate keeps the driver asking every candidate.
+    let leader = &engines[usize::try_from(leader_id).unwrap() - 1];
+    let asked = Arc::new(Mutex::new(BTreeSet::new()));
+    let (rounds, mut seen) = tokio::sync::watch::channel(0_usize);
+    let rounds = Arc::new(rounds);
+    let recorded = asked.clone();
+    let barrier = tokio::spawn(crate::run_rejoin_vote_barrier(
+        leader.read_barrier.owner().clone(),
+        gate,
+        RaftGroupHandleRegistry::default().election_policy(),
+        BTreeMap::from([(4, BasicNode::new("node-4"))]),
+        move |candidate| {
+            let recorded = recorded.clone();
+            let rounds = rounds.clone();
+            async move {
+                let count = {
+                    let mut asked = recorded.lock().unwrap();
+                    asked.insert(candidate);
+                    asked.len()
+                };
+                rounds.send_replace(count);
+                Err::<(UrsulaVote, u64), _>("refused")
+            }
+        },
+        Duration::from_millis(100),
+        Duration::from_millis(10),
+        Duration::from_secs(60),
+    ));
+    tokio::time::timeout(Duration::from_secs(5), seen.wait_for(|count| *count >= 3))
+        .await
+        .expect("the driver asks every candidate")
+        .expect("the driver runs");
+    barrier.abort();
+    let expected = (1..=4)
+        .filter(|node_id| *node_id != leader_id)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(*asked.lock().unwrap(), expected);
+    shutdown_all(&engines).await;
+}
+
+/// Replacing the voter set removes every learner outside it: a node that
+/// configuration no longer lists, left behind as a learner, leaves with it,
+/// so the group does not report `unconfigured_member` forever.
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn replacing_the_voters_removes_learners_outside_them() {
+    let (_registry, engines, leader_id, _wal_roots) =
+        build_three_node_cluster("ursula-replace-voters-test", None).await;
+    let leader = &engines[usize::try_from(leader_id).unwrap() - 1];
+    leader
+        .raft
+        .add_learner(4, BasicNode::new("node-4"), false)
+        .await
+        .expect("add a learner configuration does not list");
+    assert_eq!(
+        leader
+            .raft
+            .metrics()
+            .borrow_watched()
+            .membership_config
+            .membership()
+            .learner_ids()
+            .collect::<Vec<_>>(),
+        vec![4]
+    );
+    leader
+        .read_barrier
+        .owner()
+        .replace_voters(BTreeSet::from([1, 2, 3]))
+        .await
+        .expect("replace the voter set");
+    leader
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| {
+                let membership = metrics.membership_config.membership();
+                membership.learner_ids().next().is_none()
+                    && membership.voter_ids().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2, 3])
+            },
+            "the learner left with the voter change",
+        )
+        .await
+        .expect("the voter change removes the learner");
+    shutdown_all(&engines).await;
+}
+
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn three_node_openraft_group_replicates_group_writes() {

@@ -19,9 +19,9 @@ use crate::types::UrsulaVote;
 
 /// Opens a gated replica's recovery gate from fresh outbound leader proofs.
 /// It asks the group's configured voters (`nodes`) and the members of its
-/// effective membership, by node id. The supplied probe must confirm a new post-call ReadIndex with a quorum
-/// and return that leader's committed vote and required local applied
-/// index. A replica that for `stall_after` gets no barrier and applies
+/// effective membership, by node id. The supplied probe must confirm a new
+/// post-call ReadIndex with a quorum and return that leader's committed vote
+/// and required local applied index. A replica that for `stall_after` gets no barrier and applies
 /// nothing reports its group stalled. Once the gate is open, here or through
 /// an operator, the group's election policy is refreshed and the driver
 /// returns. Transport-independent so simulation exercises the production

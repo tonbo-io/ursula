@@ -306,6 +306,14 @@ mod tests {
         assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
             RaftMaintenanceIssue::IncompleteVoterSet
         ]);
+        // Nor is the learner the leader is healing back: a configured voter.
+        let mut group = healthy(1);
+        group.voter_ids = vec![1, 2];
+        group.voter_configurations = vec![BTreeSet::from([1, 2])];
+        group.learner_ids = vec![3];
+        assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
+            RaftMaintenanceIssue::IncompleteVoterSet
+        ]);
     }
 
     #[test]

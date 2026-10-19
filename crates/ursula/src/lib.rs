@@ -2881,7 +2881,7 @@ pub(crate) async fn change_raft_membership(
             .into_response();
     }
 
-    match raft.change_membership(voters.clone(), false).await {
+    match raft.replace_voters(voters.clone()).await {
         Ok(response) => (
             StatusCode::OK,
             axum::Json(ursula_proto::admin::MembershipResponse {
@@ -5415,8 +5415,7 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 ///   to Raft, which may follow a committed entry: the write may have
 ///   applied, and its key resolves it. A read never gets it.
 fn leader_unknown_retry_response(err: RuntimeError, access: Access) -> Response {
-    // The error names the leader's address: it stays in the log, at debug,
-    // since every election answers so.
+    // The error stays in the log, at debug, since every election answers so.
     tracing::debug!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
     headers.insert(

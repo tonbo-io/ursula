@@ -120,7 +120,8 @@ server:
   # Service never exposes the cluster plane. false serves both planes on
   # ports.client, so anyone who reaches the client Service reaches Raft.
   # A change moves every voter's cluster listener and needs every voter
-  # restarted together (OnDelete, then delete every voter pod at once).
+  # restarted together: upgrade with OnDelete and gracefulRollout.enabled
+  # false, then delete every voter pod at once.
   clusterListen: true
   # The mutating admin plane stays on pod loopback by default. A trusted
   # in-cluster operator or chaos controller may opt in to a pod-reachable bind
