@@ -2201,7 +2201,7 @@ mod reconnect_tests {
         let registry = RaftGroupHandleRegistry::default();
         registry.peer_cluster().bind(
             crate::peer_cluster::test_identity(1),
-            std::collections::BTreeMap::new(),
+            crate::PeerDirectory::default(),
         );
         let service_registry = registry.clone();
         let task = tokio::spawn(async move {
@@ -2673,7 +2673,7 @@ mod reconnect_tests {
         // The server lists node 3, at loopback, among its peers.
         registry.peer_cluster().bind(
             crate::peer_cluster::test_identity(1),
-            std::collections::BTreeMap::from([(3, "http://127.0.0.1:4437".to_owned())]),
+            crate::PeerDirectory::new([(3, crate::PeerEndpoints::shared("http://127.0.0.1:4437"))]),
         );
         let other = ursula_headers::ClusterId::new("other-cluster").unwrap();
         let peer_cluster = PeerCluster::default();

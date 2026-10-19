@@ -299,10 +299,10 @@ fn group_engine_leadership_refusal_is_detected_without_matching_message() {
 fn leader_redirect_never_points_at_this_node() {
     let router = ClientWriteLeaderRouter::with_static_topology(
         Some(2),
-        [
+        crate::shared_peers([
             (1, "http://node-1/".to_owned()),
             (2, "http://node-2".to_owned()),
-        ],
+        ]),
         BTreeMap::new(),
     );
     let forward = |leader: Option<KnownLeader>| RuntimeError::GroupEngine {
@@ -351,10 +351,10 @@ fn split_planes_never_redirect_to_a_raft_address() {
     let router = || {
         ClientWriteLeaderRouter::with_static_topology(
             Some(2),
-            [
+            crate::shared_peers([
                 (1, "http://node-1:4437".to_owned()),
                 (2, "http://node-2:4437".to_owned()),
-            ],
+            ]),
             BTreeMap::new(),
         )
     };
@@ -511,11 +511,11 @@ fn query_parser_decodes_membership_and_learner_values() {
 fn static_grpc_membership_config_rejects_partial_group_voters() {
     let result = crate::bootstrap::Topology::static_cluster(
         1,
-        vec![
+        crate::shared_peers([
             (1, "http://node-1".to_owned()),
             (2, "http://node-2".to_owned()),
             (3, "http://node-3".to_owned()),
-        ],
+        ]),
         2,
         true,
         StaticGrpcRaftMembershipConfig {
@@ -678,7 +678,7 @@ async fn spawn_static_grpc_test_node(
     };
     let mut factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        factory_peers,
+        crate::shared_peers(factory_peers),
         initialize_membership,
         registry.clone(),
         log_stores.clone(),
@@ -704,7 +704,7 @@ async fn spawn_static_grpc_test_node(
             runtime.clone(),
             registry.clone(),
             Some(node_id),
-            router_peers,
+            crate::shared_peers(router_peers),
             storage.per_group_voters,
         )
         .with_configured_cluster_id(Some(static_test_cluster_id())),
@@ -1925,7 +1925,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         },
         Topology::static_cluster(
             1,
-            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
             true,
             Default::default(),
@@ -1943,10 +1943,11 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .current_leader(1, "static durable gRPC Raft group should elect node 1")
         .await
         .expect("wait for leader");
-    let app = router_with_static_raft_cluster(runtime, registry, [(
-        1,
-        "http://127.0.0.1:4477".to_owned(),
-    )]);
+    let app = router_with_static_raft_cluster(
+        runtime,
+        registry,
+        crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
+    );
 
     let response = http_put(
         &app,
@@ -2003,7 +2004,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .as_nanos()
     ));
     remove_test_path(&raft_root);
-    let peers = [(1, "http://127.0.0.1:4477".to_owned())];
+    let peers = crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]);
 
     {
         let spawned = spawn_runtime(
@@ -2011,7 +2012,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             Persistence::Raft {
                 log_dir: raft_root.as_path().into(),
             },
-            Topology::static_cluster(1, peers.to_vec(), 1, true, Default::default())
+            Topology::static_cluster(1, peers.clone(), 1, true, Default::default())
                 .expect("valid static cluster topology"),
         )
         .expect("runtime");
@@ -2069,7 +2070,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             Persistence::Raft {
                 log_dir: raft_root.as_path().into(),
             },
-            Topology::static_cluster(1, peers.to_vec(), 1, false, Default::default())
+            Topology::static_cluster(1, peers.clone(), 1, false, Default::default())
                 .expect("valid static cluster topology"),
         )
         .expect("restarted runtime");
@@ -2820,7 +2821,7 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
             node.runtime.clone(),
             node.registry.clone(),
             Some(node_id),
-            peers.clone(),
+            crate::shared_peers(peers.clone()),
             BTreeMap::new(),
         )
         .with_wal_disk_monitor(monitor.clone());
@@ -6902,11 +6903,11 @@ async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_m
         runtime,
         RaftGroupHandleRegistry::default(),
         1,
-        [
+        crate::shared_peers([
             (1, "http://localhost:4437".to_owned()),
             (2, "http://localhost:4438".to_owned()),
             (3, "http://localhost:4439".to_owned()),
-        ],
+        ]),
         BTreeMap::new(),
     );
     let app = client_router_with_admission(state, IngressAdmission::default());
@@ -7439,7 +7440,7 @@ mod snapshot_driver {
         assert!(!single.uses_snapshot_store(false));
         let cluster = Topology::static_cluster(
             1,
-            vec![(1, "http://127.0.0.1:4437".to_owned())],
+            crate::shared_peers([(1, "http://127.0.0.1:4437".to_owned())]),
             4,
             true,
             Default::default(),
@@ -8174,7 +8175,11 @@ mod snapshot_driver {
         cadence: SnapshotCadence,
         interval_ms: usize,
     ) {
-        let participation = PeerParticipation::new(1, &[], reqwest::Client::new());
+        let participation = PeerParticipation::new(
+            1,
+            &ursula_raft::PeerDirectory::default(),
+            reqwest::Client::new(),
+        );
         spawn_snapshot_driver(
             &node.runtime,
             &node.registry,
@@ -9984,13 +9989,27 @@ mod cluster_egress {
         )
     }
 
-    fn peers() -> Vec<(u64, String)> {
-        vec![
+    fn peers() -> ursula_raft::PeerDirectory {
+        crate::shared_peers([
             (1, "http://node1".to_owned()),
             (2, "http://node2".to_owned()),
             (3, "http://node3".to_owned()),
             (4, "http://node4".to_owned()),
-        ]
+        ])
+    }
+
+    /// A `[[raft.peers]]` url that ends in `/` is probed at the probe route,
+    /// not after a doubled slash.
+    #[test]
+    fn probe_urls_drop_a_trailing_slash() {
+        let peers = crate::shared_peers([
+            (1, "http://node1/".to_owned()),
+            (2, "http://node2/".to_owned()),
+            (3, "http://node3//".to_owned()),
+        ]);
+        let groups = cluster_egress_probe_groups(1, &peers, &BTreeMap::new(), &[]);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].peer_urls, vec!["http://node2", "http://node3"]);
     }
 
     #[test]
@@ -10104,12 +10123,12 @@ mod cluster_egress {
         let (node2_url, node2_task) = serve_counting_probe_peer(node2_probes.clone()).await;
         let (node3_url, node3_task) = serve_counting_probe_peer(node3_probes.clone()).await;
         let (node4_url, node4_task) = serve_counting_probe_peer(node4_probes.clone()).await;
-        let peers = vec![
+        let peers = crate::shared_peers([
             (1, "http://node1".to_owned()),
             (2, node2_url),
             (3, node3_url),
             (4, node4_url),
-        ];
+        ]);
         let per_group_voters = BTreeMap::from([
             (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
             (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
@@ -10354,7 +10373,7 @@ mod leadership_shed {
         }
 
         fn participation(&self) -> PeerParticipation {
-            PeerParticipation::new(1, &self.peers, peer_client())
+            PeerParticipation::new(1, &crate::shared_peers(self.peers.clone()), peer_client())
         }
 
         /// Node 1's participation when its leadership-shed requests to node
@@ -10367,7 +10386,7 @@ mod leadership_shed {
             let (silent_2, listener) = silent_url().await;
             let participation = PeerParticipation::new(
                 1,
-                &[self.peers[0].clone(), (2, silent_2), self.peers[2].clone()],
+                &crate::shared_peers([self.peers[0].clone(), (2, silent_2), self.peers[2].clone()]),
                 reqwest::Client::builder()
                     .timeout(Duration::from_millis(500))
                     .build()
@@ -10867,7 +10886,7 @@ mod leadership_shed {
         // while Raft still reaches both.
         let (url_2, _silent_2) = silent_url().await;
         let (url_3, _silent_3) = silent_url().await;
-        let peers = vec![cluster.peers[0].clone(), (2, url_2), (3, url_3)];
+        let peers = crate::shared_peers([cluster.peers[0].clone(), (2, url_2), (3, url_3)]);
         let participation = PeerParticipation::new(
             1,
             &peers,
@@ -11002,11 +11021,11 @@ mod leadership_shed {
         // ten only node 3 answers (no), and on the fifth neither answers.
         let stub_2 = ShedStateStub::serve(|request| matches!(request % 10, 3 | 5)).await;
         let stub_3 = ShedStateStub::serve(|request| request % 10 == 5).await;
-        let peers = vec![
+        let peers = crate::shared_peers([
             cluster.peers[0].clone(),
             (2, stub_2.url.clone()),
             (3, stub_3.url.clone()),
-        ];
+        ]);
         let participation = PeerParticipation::new(
             1,
             &peers,
@@ -13447,7 +13466,7 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         },
         Topology::static_cluster(
             1,
-            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
             true,
             Default::default(),
@@ -13518,7 +13537,7 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         },
         Topology::static_cluster(
             1,
-            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
             true,
             Default::default(),

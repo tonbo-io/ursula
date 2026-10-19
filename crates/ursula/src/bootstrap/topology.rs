@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
+use ursula_raft::PeerDirectory;
 use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_runtime::RuntimeError;
 use ursula_shard::RaftGroupId;
@@ -32,7 +32,8 @@ pub enum Topology {
     },
     StaticCluster {
         node_id: u64,
-        peers: Vec<(u64, String)>,
+        /// `raft.peers`, this node among them.
+        peers: PeerDirectory,
         raft_group_count: usize,
         initialize_membership: bool,
         membership_config: StaticGrpcRaftMembershipConfig,
@@ -63,7 +64,7 @@ impl Topology {
     /// Construct a [`Topology::StaticCluster`] with validated membership.
     pub fn static_cluster(
         node_id: u64,
-        peers: Vec<(u64, String)>,
+        peers: PeerDirectory,
         raft_group_count: usize,
         initialize_membership: bool,
         membership_config: StaticGrpcRaftMembershipConfig,
@@ -80,7 +81,7 @@ impl Topology {
 
     fn validate_static_cluster(
         raft_group_count: usize,
-        peers: &[(u64, String)],
+        peers: &PeerDirectory,
         membership_config: &StaticGrpcRaftMembershipConfig,
     ) -> Result<(), RuntimeError> {
         let per_group_voters = &membership_config.per_group_voters;
@@ -88,7 +89,6 @@ impl Topology {
             return Ok(());
         }
 
-        let peer_ids: BTreeSet<u64> = peers.iter().map(|(node_id, _)| *node_id).collect();
         let raft_group_count_u32 = u32::try_from(raft_group_count).map_err(|_overflow| {
             RuntimeError::StaticMembershipConfig {
                 message: format!("raft_group_count {raft_group_count} exceeds u32::MAX"),
@@ -108,7 +108,7 @@ impl Topology {
                 });
             }
             for voter in voters {
-                if !peer_ids.contains(voter) {
+                if !peers.contains(*voter) {
                     return Err(RuntimeError::StaticMembershipConfig {
                         message: format!(
                             "raft group {} voter {} is not present in static peer config",

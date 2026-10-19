@@ -1117,7 +1117,11 @@ mod tests {
     }
 
     fn no_peers() -> PeerParticipation {
-        PeerParticipation::new(1, &[], reqwest::Client::new())
+        PeerParticipation::new(
+            1,
+            &ursula_raft::PeerDirectory::default(),
+            reqwest::Client::new(),
+        )
     }
 
     /// Runs the snapshot driver on `store`'s runtime, with `s3` as

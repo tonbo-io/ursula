@@ -460,7 +460,7 @@ async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
     let foreign = crate::peer_cluster::PeerCluster::default();
     foreign.bind(
         crate::peer_cluster::PeerIdentity::new(9, other.clone()),
-        std::collections::BTreeMap::new(),
+        crate::PeerDirectory::default(),
     );
     let server = tokio::spawn(
         tonic::transport::Server::builder()

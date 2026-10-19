@@ -24,6 +24,7 @@ use super::RaftGroupEngineOptions;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::RaftWal;
 use crate::peer_cluster::PeerIdentity;
+use crate::peer_directory::PeerDirectory;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RECOVERY_STALL_AFTER;
@@ -153,7 +154,7 @@ impl DurableRaftGroupEngineFactory {
         // node of another cluster by the id of its WAL root.
         registry.peer_cluster().bind(
             PeerIdentity::new(SINGLE_NODE_ID, self.log_stores.cluster_id().clone()),
-            BTreeMap::new(),
+            PeerDirectory::default(),
         );
         if let Some(config) = &self.engine_config {
             registry.set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
@@ -300,7 +301,8 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     node_id: u64,
     /// This node and the cluster id of its WAL root, which its peers check.
     identity: PeerIdentity,
-    peers: BTreeMap<u64, String>,
+    /// `raft.peers`, this node among them.
+    peers: PeerDirectory,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     initialize_membership: bool,
     initialize_membership_per_group: bool,
@@ -320,22 +322,16 @@ impl StaticGrpcRaftGroupEngineFactory {
     /// id their root holds is the one this node's peers must share.
     pub fn new(
         node_id: u64,
-        peers: impl IntoIterator<Item = (u64, String)>,
+        peers: PeerDirectory,
         initialize_membership: bool,
         registry: RaftGroupHandleRegistry,
         log_stores: RaftWal,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
-        let peers = peers.into_iter().collect::<BTreeMap<_, _>>();
         let identity = PeerIdentity::new(node_id, log_stores.cluster_id().clone());
-        registry.peer_cluster().bind(
-            identity.clone(),
-            peers
-                .iter()
-                .filter(|(peer, _)| **peer != node_id)
-                .map(|(peer, url)| (*peer, url.clone()))
-                .collect(),
-        );
+        registry
+            .peer_cluster()
+            .bind(identity.clone(), peers.clone());
         Self {
             transports: Arc::default(),
             node_id,
@@ -400,7 +396,7 @@ impl StaticGrpcRaftGroupEngineFactory {
     fn peer_nodes(&self) -> BTreeMap<u64, BasicNode> {
         self.peers
             .iter()
-            .map(|(node_id, address)| (*node_id, BasicNode::new(address.clone())))
+            .map(|(node_id, endpoints)| (node_id, BasicNode::new(endpoints.cluster_url())))
             .collect()
     }
 
@@ -427,17 +423,17 @@ impl StaticGrpcRaftGroupEngineFactory {
 
         let mut nodes = BTreeMap::new();
         for node_id in voters {
-            let address = self.peers.get(node_id).ok_or_else(|| {
+            let address = self.peers.cluster_url(*node_id).ok_or_else(|| {
                 refused(StaticMembershipProblem::VoterWithoutPeer { node_id: *node_id })
             })?;
-            nodes.insert(*node_id, BasicNode::new(address.clone()));
+            nodes.insert(*node_id, BasicNode::new(address));
         }
         Ok(nodes)
     }
 
     fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Option<Vec<u64>> {
         if self.per_group_voters.is_empty() {
-            return Some(self.peers.keys().copied().collect());
+            return Some(self.peers.node_ids().collect());
         }
         self.per_group_voters
             .get(&raft_group_id)
@@ -495,7 +491,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
-            if !self.peers.contains_key(&self.node_id) {
+            if !self.peers.contains(self.node_id) {
                 return Err(GroupEngineError::Infra(GroupInfraError::StaticMembership {
                     raft_group_id: placement.raft_group_id,
                     problem: StaticMembershipProblem::NodeWithoutPeer {
@@ -661,12 +657,12 @@ mod tests {
     ) -> StaticGrpcRaftGroupEngineFactory {
         StaticGrpcRaftGroupEngineFactory::new(
             node_id,
-            [
-                (1, "http://node-1".to_owned()),
-                (2, "http://node-2".to_owned()),
-                (3, "http://node-3".to_owned()),
-                (4, "http://node-4".to_owned()),
-            ],
+            PeerDirectory::new((1..=4).map(|node_id| {
+                (
+                    node_id,
+                    crate::PeerEndpoints::shared(format!("http://node-{node_id}")),
+                )
+            })),
             true,
             RaftGroupHandleRegistry::default(),
             RaftWal::start(

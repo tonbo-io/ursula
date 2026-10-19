@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use ursula_config::config::ColdBackend;
 use ursula_raft::JournalTuning;
+use ursula_raft::PeerDirectory;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
@@ -424,7 +425,7 @@ fn spawn_static_cluster(
     cold_store: Option<ColdStoreHandle>,
     storage: GroupStorage,
     node_id: u64,
-    peers: Vec<(u64, String)>,
+    peers: PeerDirectory,
     _raft_group_count: usize,
     initialize_membership: bool,
     membership_config: StaticGrpcRaftMembershipConfig,
@@ -440,7 +441,7 @@ fn spawn_static_cluster(
     let raft_wal = Some(log_stores.clone());
     let mut factory = ursula_raft::StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        peers.clone(),
+        peers,
         initialize_membership,
         registry.clone(),
         log_stores,

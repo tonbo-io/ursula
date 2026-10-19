@@ -26,7 +26,6 @@
 //! changes readiness: a misconfigured node must not take its healthy peers
 //! out of service, nor hide why a node is unready.
 
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::net::SocketAddr;
@@ -43,6 +42,7 @@ use tonic::service::Interceptor;
 use ursula_headers::ClusterId;
 
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
+use crate::peer_directory::PeerDirectory;
 use crate::rt::time::Instant;
 
 /// The format epoch that introduced cluster ids on Raft RPCs: a sender that
@@ -240,14 +240,22 @@ impl RefusedPeer {
 
 #[derive(Debug, Default)]
 struct PeerClusterState {
-    identity: arc_swap::ArcSwapOption<PeerIdentity>,
-    /// `raft.peers`: node id to URL, the peers readiness lists.
-    peers: arc_swap::ArcSwap<BTreeMap<u64, String>>,
+    /// This node's identity and `raft.peers`, bound together once a WAL
+    /// opens, so a reader sees both or neither.
+    bound: arc_swap::ArcSwapOption<Bound>,
     /// Last refusal of each refused peer, at most
     /// [`PEER_CLUSTER_MISMATCH_CAP`].
     refused: Mutex<HashMap<RefusedPeer, Instant>>,
     refusals: AtomicU64,
     unidentified_refusals: AtomicU64,
+}
+
+/// What [`PeerCluster::bind`] stores: this node's identity and its
+/// configured peers, this node among them.
+#[derive(Debug)]
+struct Bound {
+    identity: PeerIdentity,
+    peers: PeerDirectory,
 }
 
 /// This node's side of the cluster check, shared by its registry, its
@@ -257,16 +265,31 @@ struct PeerClusterState {
 pub struct PeerCluster(Arc<PeerClusterState>);
 
 impl PeerCluster {
-    /// Binds this node's identity and its configured peers (`raft.peers`,
-    /// node id to URL). The engine factory binds the identity of the WAL it
-    /// opens groups over, before any group starts.
-    pub fn bind(&self, identity: PeerIdentity, peers: BTreeMap<u64, String>) {
-        self.0.peers.store(Arc::new(peers));
-        self.0.identity.store(Some(Arc::new(identity)));
+    /// Binds this node's identity and its configured peers (`raft.peers`).
+    /// The engine factory binds the identity of the WAL it opens groups
+    /// over, before any group starts.
+    pub fn bind(&self, identity: PeerIdentity, peers: PeerDirectory) {
+        self.0
+            .bound
+            .store(Some(Arc::new(Bound { identity, peers })));
+    }
+
+    /// The configured peers last bound, this node among them.
+    pub fn directory(&self) -> PeerDirectory {
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .map(|bound| bound.peers.clone())
+            .unwrap_or_default()
     }
 
     pub fn identity(&self) -> Option<PeerIdentity> {
-        self.0.identity.load().as_deref().cloned()
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .map(|bound| bound.identity.clone())
     }
 
     /// The interceptor a Raft gRPC server checks every request with.
@@ -282,8 +305,8 @@ impl PeerCluster {
         remote: Option<SocketAddr>,
         now: Instant,
     ) -> Result<(), PeerClusterError> {
-        let identity = self.0.identity.load();
-        let Some(local) = identity.as_deref() else {
+        let bound = self.0.bound.load();
+        let Some(local) = bound.as_deref().map(|bound| &bound.identity) else {
             return Err(PeerClusterError::NoLocalCluster);
         };
         let ip = remote.map(|remote| remote.ip());
@@ -424,7 +447,9 @@ impl PeerCluster {
 
     /// [`Self::mismatches`] as of `now`.
     pub(crate) fn mismatches_at(&self, now: Instant) -> Vec<PeerClusterMismatch> {
-        let peers = self.0.peers.load();
+        let bound = self.0.bound.load();
+        let peers = bound.as_deref().map(|bound| &bound.peers);
+        let local = bound.as_deref().map(|bound| bound.identity.node_id());
         let mut mismatches = self
             .lock()
             .iter()
@@ -440,7 +465,10 @@ impl PeerCluster {
                     cluster_id,
                     ip,
                 } => {
-                    let url = peers.get(node_id)?;
+                    if Some(*node_id) == local {
+                        return None;
+                    }
+                    let url = peers?.cluster_url(*node_id)?;
                     let matches_address = match (url_ip(url), ip) {
                         (Some(configured), Some(ip)) => configured == *ip,
                         _ => true,
@@ -502,7 +530,7 @@ pub(crate) fn test_identity(node_id: u64) -> PeerIdentity {
 #[cfg(any(test, madsim))]
 pub(crate) fn test_peer_cluster(node_id: u64) -> PeerCluster {
     let peer_cluster = PeerCluster::default();
-    peer_cluster.bind(test_identity(node_id), BTreeMap::new());
+    peer_cluster.bind(test_identity(node_id), PeerDirectory::default());
     peer_cluster
 }
 
@@ -521,7 +549,6 @@ impl Interceptor for ClusterCheck {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::net::SocketAddr;
     use std::time::Duration;
 
@@ -538,6 +565,8 @@ mod tests {
     use super::refusing_cluster;
     use super::url_ip;
     use crate::format_epoch::is_protocol_mismatch;
+    use crate::peer_directory::PeerDirectory;
+    use crate::peer_directory::PeerEndpoints;
     use crate::rt::time::Instant;
 
     fn cluster(id: &str) -> ClusterId {
@@ -553,9 +582,12 @@ mod tests {
     /// 10.0.0.1 to 10.0.0.3.
     fn bound(node_id: u64, id: &str) -> PeerCluster {
         let peer_cluster = PeerCluster::default();
-        let peers = (1..=3)
-            .map(|peer| (peer, format!("http://10.0.0.{peer}:4437")))
-            .collect::<BTreeMap<_, _>>();
+        let peers = PeerDirectory::new((1..=3).map(|peer| {
+            (
+                peer,
+                PeerEndpoints::shared(format!("http://10.0.0.{peer}:4437")),
+            )
+        }));
         peer_cluster.bind(PeerIdentity::new(node_id, cluster(id)), peers);
         peer_cluster
     }

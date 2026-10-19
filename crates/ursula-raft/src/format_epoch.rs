@@ -210,7 +210,7 @@ mod tests {
         let registry = RaftGroupHandleRegistry::default();
         registry
             .peer_cluster()
-            .bind(identity, std::collections::BTreeMap::new());
+            .bind(identity, crate::PeerDirectory::default());
         tokio::spawn(async move {
             tonic::transport::Server::builder()
                 .add_service(crate::grpc::raft_grpc_service(registry))

@@ -224,7 +224,12 @@ impl Cluster {
         runtime_config.threading = RuntimeThreading::HostedTokio;
         let runtime = ShardRuntime::spawn_with_engine_factory(runtime_config, factory.clone())
             .expect("spawn hosted runtime over a three-node raft group");
-        let peers = (1..=3).map(|node_id| (node_id, format!("http://runtime-raft-node-{node_id}")));
+        let peers = ursula_raft::PeerDirectory::new((1..=3).map(|node_id| {
+            (
+                node_id,
+                ursula_raft::PeerEndpoints::shared(format!("http://runtime-raft-node-{node_id}")),
+            )
+        }));
         let now_ms = Arc::new(AtomicU64::new(1_000));
         // The front door routes writes through the leadership view of the
         // replica the runtime hosts, as a node's own registry does.

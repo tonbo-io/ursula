@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use ursula_raft::LeadershipShedReason;
+use ursula_raft::PeerDirectory;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_shard::RaftGroupId;
 
@@ -137,7 +138,7 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
 pub(crate) async fn handoff_shutdown_leadership(
     registry: &RaftGroupHandleRegistry,
     node_id: u64,
-    peers: &[(u64, String)],
+    peers: &PeerDirectory,
 ) -> usize {
     registry.mark_leadership_shed(LeadershipShedReason::MaintenanceDrain);
     let led_groups: HashSet<_> = registry

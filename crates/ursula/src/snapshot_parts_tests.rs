@@ -1817,7 +1817,7 @@ async fn a_new_raft_term_lists_the_stream_again() {
         },
         Topology::static_cluster(
             1,
-            vec![(1, "http://127.0.0.1:4477".to_owned())],
+            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
             true,
             Default::default(),
