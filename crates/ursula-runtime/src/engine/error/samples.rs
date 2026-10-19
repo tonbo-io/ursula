@@ -331,9 +331,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
         GroupInfraError::ColdStore { .. } => GroupInfraError::ColdStore {
             operation: ColdOperation::RepairIndex,
         },
-        GroupInfraError::Internal { .. } => GroupInfraError::Internal {
-            message: "internal".to_owned(),
-        },
         GroupInfraError::ColdBackpressure { .. } => GroupInfraError::ColdBackpressure {
             stream_id: stream(),
             before_group_hot_bytes: 10,

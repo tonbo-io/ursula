@@ -718,7 +718,6 @@ fn every_group_engine_error_answers_its_table_row() {
                 | GroupInfraError::LogBehindCommit { .. }
                 | GroupInfraError::RecoveryPlanFenced { .. }
                 | GroupInfraError::OwnerStopped
-                | GroupInfraError::Internal { .. }
                 | GroupInfraError::UnexpectedResponse { .. }
                 | GroupInfraError::MissingStreamId { .. }
                 | GroupInfraError::Unsupported { .. }

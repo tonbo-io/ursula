@@ -64,7 +64,7 @@ pub enum RuntimeError {
         "core {} raft group {} operation failed: {}",
         .core_id.0,
         .raft_group_id.0,
-        .error.message()
+        .error
     )]
     GroupEngine {
         core_id: CoreId,
