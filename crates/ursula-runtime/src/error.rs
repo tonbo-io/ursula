@@ -71,6 +71,13 @@ pub enum RuntimeError {
         raft_group_id: RaftGroupId,
         error: GroupEngineError,
     },
+    /// The core already runs an engine for the group: a second install is
+    /// refused, and the running engine stays.
+    #[error("core {} already runs an engine for raft group {}", .core_id.0, .raft_group_id.0)]
+    GroupAlreadyInstalled {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+    },
     #[error("core {} mailbox is closed", .core_id.0)]
     MailboxClosed { core_id: CoreId },
     #[error("core {} dropped append response", .core_id.0)]
@@ -133,6 +140,7 @@ impl RuntimeError {
                 ErrorStatus::Temporary
             }
             Self::GroupEngine { error, .. } => error.status(),
+            Self::GroupAlreadyInstalled { .. } => ErrorStatus::Persistent,
             Self::GroupRestartAborted { .. }
             | Self::InvalidConfig(_)
             | Self::InvalidRaftGroup { .. }

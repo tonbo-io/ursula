@@ -5498,7 +5498,8 @@ fn refused_before_proposal(err: &RuntimeError) -> bool {
         | RuntimeError::MailboxClosed { .. }
         | RuntimeError::ResponseDropped { .. }
         | RuntimeError::GroupRestartAborted { .. }
-        | RuntimeError::SpawnCoreThread { .. } => false,
+        | RuntimeError::SpawnCoreThread { .. }
+        | RuntimeError::GroupAlreadyInstalled { .. } => false,
     }
 }
 

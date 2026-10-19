@@ -92,6 +92,7 @@ pub(crate) fn runtime_error_answer(err: &RuntimeError) -> (StatusCode, ErrorCode
         | RuntimeError::MailboxClosed { .. }
         | RuntimeError::ResponseDropped { .. }
         | RuntimeError::SpawnCoreThread { .. }
+        | RuntimeError::GroupAlreadyInstalled { .. }
         | RuntimeError::GroupRestartAborted { .. } => {
             (StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal)
         }

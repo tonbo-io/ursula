@@ -25,12 +25,14 @@ use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::GroupInfraError;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::KnownLeader;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::PlanGroupColdFlushRequest;
 use ursula_runtime::Proposal;
+use ursula_runtime::ResponseKind;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::StreamErrorCode;
@@ -257,11 +259,14 @@ fn runtime_error_status_prefers_stream_error_code_over_message_text() {
 }
 
 #[test]
-fn runtime_error_status_does_not_parse_infra_message_as_stream_error() {
+fn an_infra_error_answers_internal_whatever_response_it_names() {
     let err = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(0),
-        error: GroupEngineError::new("misleading infra message says StreamGone"),
+        error: GroupEngineError::Infra(GroupInfraError::UnexpectedResponse {
+            expected: ResponseKind::Append,
+            actual: ResponseKind::StreamError,
+        }),
     };
 
     assert_eq!(
