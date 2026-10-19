@@ -191,9 +191,9 @@ pub(crate) enum OpenCause {
 /// What a core does with a group's engine once its open ended.
 pub(crate) enum AfterOpen {
     /// It installs the engine and the group serves. The open's task runs
-    /// while `keep_open` lives: dropping it drops the open
-    /// ([`OpenFailure::Dropped`]).
-    Install { keep_open: oneshot::Sender<()> },
+    /// while `_keep_open` lives, which is never sent on: dropping it drops
+    /// the open ([`OpenFailure::Dropped`]).
+    Install { _keep_open: oneshot::Sender<()> },
     /// A shutdown of the group began during the open, which dropped the
     /// open: an open that has not opened its engine holds no engine work.
     /// The core answers `waiters` once the open's task ended. An engine
@@ -707,7 +707,9 @@ impl CoreWorker {
                 placement,
                 cause,
                 warmers: Vec::new(),
-                then: AfterOpen::Install { keep_open },
+                then: AfterOpen::Install {
+                    _keep_open: keep_open,
+                },
             }),
         );
         Ok(())
@@ -962,7 +964,7 @@ impl CoreWorker {
         let warmers = std::mem::take(&mut opening.warmers);
         let waiter = response_tx.into_iter();
         match &mut opening.then {
-            // Dropping `keep_open` drops the open.
+            // Dropping `_keep_open` drops the open.
             then @ AfterOpen::Install { .. } => {
                 *then = AfterOpen::Shutdown {
                     waiters: waiter.collect(),

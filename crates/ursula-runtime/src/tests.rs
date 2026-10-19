@@ -5315,11 +5315,12 @@ impl GroupEngineFactory for PanickingFactory {
         _placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async {
-            let opened: Option<Box<dyn GroupEngine>> = None;
-            Ok(opened.expect("the open panics"))
-        })
+        Box::pin(async { panicking_open() })
     }
+}
+
+fn panicking_open() -> Result<Box<dyn GroupEngine>, GroupEngineError> {
+    panic!("the open panics")
 }
 
 /// #741 review: an open whose task ends without an answer, here by a
