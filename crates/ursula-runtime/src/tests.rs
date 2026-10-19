@@ -5312,15 +5312,17 @@ struct PanickingFactory;
 impl GroupEngineFactory for PanickingFactory {
     fn create<'a>(
         &'a self,
-        _placement: ShardPlacement,
+        placement: ShardPlacement,
         _metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async { panicking_open() })
+        Box::pin(async move {
+            // Every group's open panics.
+            if placement.raft_group_id.0 < u32::MAX {
+                panic!("the open of group {} panics", placement.raft_group_id.0);
+            }
+            Err(outcome_unknown())
+        })
     }
-}
-
-fn panicking_open() -> Result<Box<dyn GroupEngine>, GroupEngineError> {
-    panic!("the open panics")
 }
 
 /// #741 review: an open whose task ends without an answer, here by a
