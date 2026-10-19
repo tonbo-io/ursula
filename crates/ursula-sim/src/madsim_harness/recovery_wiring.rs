@@ -141,14 +141,10 @@ struct InProcessRecoveryTransport {
 
 impl ursula_raft::RecoveryTransport for InProcessRecoveryTransport {
     type Error = RecoveryProbeError;
-    async fn probe(&self, peer: u64, _address: String) -> Option<PeerGroupLog> {
+    async fn probe(&self, peer: u64) -> Option<PeerGroupLog> {
         in_process_probe(&self.registry, &self.policy, self.node_id, peer).await
     }
-    async fn barrier(
-        &self,
-        leader: u64,
-        _address: String,
-    ) -> Result<(UrsulaVote, u64), Self::Error> {
+    async fn barrier(&self, leader: u64) -> Result<(UrsulaVote, u64), Self::Error> {
         in_process_barrier(&self.registry, &self.policy, self.node_id, leader).await
     }
 }

@@ -21,12 +21,14 @@ pub struct NodeInfo {
     /// outside the host point it at your own tunnel (for example a
     /// `kubectl port-forward` local port).
     pub admin_url: Url,
-    /// Address shown in reports. Defaults to the admin URL's host.
+    /// Address shown in reports. Defaults to the host of `http_url`, else to
+    /// the admin URL's host.
     pub host: String,
-    /// Advertised Raft address for learner attachment and survivor handoff:
-    /// the node's peer `url`, on its cluster listener when it sets
-    /// `server.cluster_listen`. Never read for metrics or readiness, since a
-    /// cluster listener serves neither.
+    /// Advertised Raft address: the node's peer `url`, on its cluster
+    /// listener when it sets `server.cluster_listen`. Its host is the default
+    /// `host`, and it is part of a pinned plan. Nodes take each other's addresses
+    /// from `raft.peers`, never from it. Never read for metrics or
+    /// readiness, since a cluster listener serves neither.
     #[serde(default)]
     pub http_url: Option<Url>,
     /// The node's client-plane URL (its `server.listen`, `client_url` in

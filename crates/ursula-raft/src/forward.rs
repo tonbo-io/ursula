@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
-use openraft::BasicNode;
 use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
@@ -50,13 +49,14 @@ use crate::state_machine::RaftGroupStateMachine;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
 
-/// Where a follower forwards a leader RPC: the leader, and this node's side
-/// of the cluster-id check, which stamps the call and records a refusal.
+/// Where a follower forwards a leader RPC: the leader, the cluster URL
+/// `raft.peers` lists for it, and this node's side of the cluster-id check,
+/// which stamps the call and records a refusal.
 #[derive(Debug, Clone)]
 pub(crate) struct LeaderRoute {
-    pub(crate) peer_cluster: Option<PeerCluster>,
+    pub(crate) peer_cluster: PeerCluster,
     pub(crate) leader_id: u64,
-    pub(crate) leader: BasicNode,
+    pub(crate) address: String,
 }
 
 #[tracing::instrument(
@@ -395,12 +395,9 @@ async fn call_leader<Req, Resp, Fut>(
 where
     Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
 {
-    let address = route.leader.addr.as_str();
-    let Some((peer_cluster, identity)) = route
-        .peer_cluster
-        .as_ref()
-        .and_then(|peer_cluster| Some((peer_cluster, peer_cluster.identity()?)))
-    else {
+    let address = route.address.as_str();
+    let peer_cluster = &route.peer_cluster;
+    let Some(identity) = peer_cluster.identity() else {
         return Err(ForwardError::NoIdentity { rpc });
     };
     let started = crate::rt::time::Instant::now();
@@ -715,19 +712,10 @@ pub(crate) fn refuse_unless_leader(
     if leadership.leads() {
         return Ok(());
     }
-    let leader_id = metrics.current_leader;
-    let leader_node = leader_id.and_then(|leader| {
-        metrics
-            .membership_config
-            .membership()
-            .get_node(&leader)
-            .cloned()
-    });
     Err(leadership_refusal(
         LeadershipReason::Follower,
         Proposal::NotProposed,
-        leader_id,
-        leader_node.as_ref(),
+        metrics.current_leader,
         &leadership,
     ))
 }
@@ -794,7 +782,6 @@ pub(crate) fn leadership_refusal(
     reason: LeadershipReason,
     proposal: Proposal,
     leader_id: Option<u64>,
-    leader_node: Option<&BasicNode>,
     leadership: &GroupLeadership,
 ) -> GroupEngineError {
     // If the reported leader is *this* node, leadership is in a transient
@@ -809,7 +796,6 @@ pub(crate) fn leadership_refusal(
             Some(KnownLeader {
                 node_id,
                 term: leadership.term_of(node_id)?,
-                address: leader_node.map(|node| node.addr.clone()),
             })
         });
     GroupEngineError::NotLeader(LeadershipRefusal {
@@ -921,10 +907,7 @@ mod leadership_refusal_tests {
         GroupLeadership {
             node_id: 2,
             term: 7,
-            role: LeaderRole::Follows {
-                leader_id: leader,
-                leader_address: None,
-            },
+            role: LeaderRole::Follows { leader_id: leader },
         }
     }
 
@@ -944,7 +927,6 @@ mod leadership_refusal_tests {
             LeadershipReason::Follower,
             Proposal::NotProposed,
             leader_id,
-            Some(&BasicNode::new("http://node-3:4438")),
             leadership,
         ))
     }
@@ -979,7 +961,6 @@ mod leadership_refusal_tests {
             Some(KnownLeader {
                 node_id: 3,
                 term: 7,
-                address: Some("http://node-3:4438".to_owned()),
             })
         );
     }

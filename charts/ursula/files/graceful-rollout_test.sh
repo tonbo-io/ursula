@@ -454,9 +454,8 @@ for replicas in 1 3 5; do
   rm -f "${MANIFEST}"
 done
 
-# The chart passes its cluster domain and headless Service name. A manifest
-# naming another host would attach learners at an address peers cannot resolve
-# and the next start refuses as PeerAddressChanged.
+# The chart passes its cluster domain and headless Service name, so the
+# manifest names each node as its [[raft.peers]] url does.
 (
   REPLICAS=3
   CLUSTER_DOMAIN=corp.example

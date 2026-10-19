@@ -578,6 +578,7 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
             node_id,
             client: free_port(),
             cluster: free_port(),
+            admin: free_port(),
         })
         .collect();
     let wal_root = tempfile::tempdir().expect("WAL root");
@@ -705,11 +706,11 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
     drop(children);
 }
 
-/// A node whose groups recorded its Raft url at their initialization refuses
-/// to start once that url moved to a new cluster port, since its peers would
-/// keep dialing the recorded one.
+/// A node whose cluster plane moved to a new port after its groups were
+/// initialized starts and serves: peer addresses come from `raft.peers`
+/// only, so nothing holds the old one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_refuses_a_cluster_port_moved_after_initialization() {
+async fn cli_a_cluster_port_moved_after_initialization_serves() {
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI cluster-port test");
@@ -725,11 +726,16 @@ async fn cli_refuses_a_cluster_port_moved_after_initialization() {
     let mut children = vec![spawn_child(command, "shared-port".to_owned())];
     let client = reqwest::Client::new();
     wait_until_ready(&client, &base, &mut children).await;
-    put_until_created(&client, &format!("{base}/moved/port")).await;
+    put_with_body_until_created(&client, &format!("{base}/moved/port"), "before-the-move").await;
     sigterm_and_wait_for_clean_exit(&mut children[0]).await;
     drop(children);
 
     let cluster_port = free_port();
+    assert_ne!(
+        cluster_port, port,
+        "a cluster port apart from the client port"
+    );
+    let cluster_base = format!("http://127.0.0.1:{cluster_port}");
     let shared = std::fs::read_to_string(&config).expect("read node config");
     let listen = format!("listen = \"127.0.0.1:{port}\"");
     let peer_url = format!("url = \"{base}\"");
@@ -744,33 +750,194 @@ async fn cli_refuses_a_cluster_port_moved_after_initialization() {
         )
         .replace(
             &peer_url,
-            &format!("url = \"http://127.0.0.1:{cluster_port}\"\nclient_url = \"{base}\""),
+            &format!("url = \"{cluster_base}\"\nclient_url = \"{base}\""),
         );
     std::fs::write(&config, split).expect("write split-plane config");
     let mut command = Command::new(binary);
     command.arg("server").arg("--config").arg(&config);
-    let mut moved = spawn_child(command, "moved-port".to_owned());
-    let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_secs(60))
-        .unwrap();
-    let status = loop {
-        if let Some(status) = moved.child.try_wait().expect("poll child") {
-            break status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "a moved cluster port must refuse to start: {}",
-            child_report(&moved)
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut children = vec![spawn_child(command, "moved-port".to_owned())];
+    wait_until_ready(&client, &base, &mut children).await;
+    let payload =
+        read_until_replicated(&client, &format!("{base}/moved/port?offset=0&max_bytes=64")).await;
+    assert_eq!(payload, b"before-the-move");
+    let shed = client
+        .get(format!("{cluster_base}/__ursula/leadership-shed"))
+        .send()
+        .await
+        .expect("request leadership-shed state on the new cluster port");
+    assert_eq!(shed.status(), reqwest::StatusCode::OK);
+    sigterm_and_wait_for_clean_exit(&mut children[0]).await;
+}
+
+/// A node whose cluster port moved rejoins its cluster once every voter
+/// restarted with the new `raft.peers`, with no admin step: every peer
+/// dials the address its own configuration lists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_node_moved_to_a_new_cluster_port_rejoins_after_a_full_restart() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping CLI peer-move test");
+        return;
     };
-    assert!(!status.success(), "{}", child_report(&moved));
-    let stderr = child_stderr_tail(&moved);
+    let mut planes: Vec<SplitPlanePorts> = (1_u64..=3)
+        .map(|node_id| SplitPlanePorts {
+            node_id,
+            client: free_port(),
+            cluster: free_port(),
+            admin: free_port(),
+        })
+        .collect();
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let spawn_all = |planes: &[SplitPlanePorts]| {
+        vec![
+            spawn_split_plane_node(binary, planes, 2, false, wal_root.path()),
+            spawn_split_plane_node(binary, planes, 3, false, wal_root.path()),
+            spawn_split_plane_node(binary, planes, 1, true, wal_root.path()),
+        ]
+    };
+    let client = reqwest::Client::new();
+    let mut children = spawn_all(&planes);
+    for plane in &planes {
+        wait_until_ready(&client, &plane.client_url(), &mut children).await;
+    }
+    put_with_body_until_created(
+        &client,
+        &format!("{}/moved/before", planes[0].client_url()),
+        "before-the-move",
+    )
+    .await;
+    let replicated = read_until_replicated(
+        &client,
+        &format!(
+            "{}/moved/before?offset=0&max_bytes=64",
+            planes[2].client_url()
+        ),
+    )
+    .await;
+    assert_eq!(replicated, b"before-the-move");
+
+    // Stop every voter, move node 3's cluster port, start them all.
+    for child in &children {
+        let status = Command::new("kill")
+            .arg("-TERM")
+            .arg(child.child.id().to_string())
+            .status()
+            .expect("send SIGTERM");
+        assert!(status.success());
+    }
+    for child in &mut children {
+        let deadline = std::time::Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .unwrap();
+        while child.child.try_wait().expect("poll child").is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a stopped voter did not exit: {}",
+                child_report(child)
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    drop(children);
+    let old_cluster_url = planes[2].cluster_url();
+    let old_cluster_port = planes[2].cluster;
+    planes[2].cluster = free_port();
+    assert_ne!(planes[2].cluster, old_cluster_port, "a new cluster port");
+    let mut children = spawn_all(&planes);
+    for plane in &planes {
+        wait_until_ready(&client, &plane.client_url(), &mut children).await;
+    }
+    let nodes = planes
+        .iter()
+        .map(|plane| ctl_node(plane.node_id, plane.admin, &plane.cluster_url()))
+        .collect::<Vec<_>>();
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(2)).unwrap();
+    ursula_ctl::wait_cluster_ready(
+        "every voter after the move",
+        &nodes,
+        &ctl,
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        0,
+    )
+    .await
+    .expect("the cluster reaches its full voter sets with no admin step");
+
+    // Node 3 leads no group, so what it holds a leader sent to its new
+    // address.
+    let mut node3_leads = Vec::new();
+    for _ in 0..100 {
+        let view = ctl.fetch_node(&nodes[2]).await.expect("node 3 metrics");
+        node3_leads = view
+            .groups
+            .iter()
+            .filter(|group| group.current_leader == Some(3))
+            .map(|group| group.raft_group_id)
+            .collect::<Vec<_>>();
+        if node3_leads.is_empty() {
+            break;
+        }
+        for group in &node3_leads {
+            let transferred = admin_test_post(
+                &client,
+                format!(
+                    "http://127.0.0.1:{}/__ursula/raft/{group}/leader/transfer/1",
+                    planes[2].admin
+                ),
+            )
+            .await
+            .send()
+            .await
+            .expect("send leader transfer");
+            tracing::debug!(group, status = %transferred.status(), "leader transfer");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(node3_leads.is_empty(), "node 3 still leads {node3_leads:?}");
+
+    let before = read_until_replicated(
+        &client,
+        &format!(
+            "{}/moved/before?offset=0&max_bytes=64",
+            planes[2].client_url()
+        ),
+    )
+    .await;
+    assert_eq!(before, b"before-the-move");
+    put_with_body_until_created(
+        &client,
+        &format!("{}/moved/after", planes[0].client_url()),
+        "after-the-move",
+    )
+    .await;
+    let after = read_until_replicated(
+        &client,
+        &format!(
+            "{}/moved/after?offset=0&max_bytes=64",
+            planes[2].client_url()
+        ),
+    )
+    .await;
+    assert_eq!(after, b"after-the-move");
+
+    let shed = client
+        .get(format!(
+            "{}/__ursula/leadership-shed",
+            planes[2].cluster_url()
+        ))
+        .send()
+        .await
+        .expect("request leadership-shed state on the new cluster port");
+    assert_eq!(shed.status(), reqwest::StatusCode::OK);
     assert!(
-        stderr.contains(&format!("records node 1 at {base}"))
-            && stderr.contains("cannot change after its groups are initialized"),
-        "{stderr}"
+        client
+            .get(format!("{old_cluster_url}/__ursula/leadership-shed"))
+            .send()
+            .await
+            .is_err(),
+        "nothing serves the old cluster port"
     );
+    drop(children);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1884,157 +2051,6 @@ async fn wait_readiness(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_static_grpc_raft_log_dir_installs_snapshot_for_late_learner() {
-    let _guard = static_cluster_cli_test_guard().await;
-    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        tracing::warn!(
-            "CARGO_BIN_EXE_ursula is not set; skipping CLI durable late learner smoke test"
-        );
-        return;
-    };
-    let ports = [free_port(), free_port(), free_port()];
-    let peers: Vec<(u64, String)> = ports
-        .iter()
-        .zip(1_u64..)
-        .map(|(port, node_id)| (node_id, format!("http://127.0.0.1:{port}")))
-        .collect();
-    let initial_peers = peers[..2].to_vec();
-    let root = std::env::temp_dir().join(format!(
-        "ursula-cli-durable-late-learner-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("system time after unix epoch")
-            .as_nanos()
-    ));
-    remove_test_path(&root);
-    std::fs::create_dir_all(&root).expect("create temp root");
-
-    let node1_config = root.join("node-1.toml");
-    let node2_config = root.join("node-2.toml");
-    let node3_config = root.join("node-3.toml");
-    let node1_admin_port = write_cluster_config(
-        &node1_config,
-        ports[0],
-        1,
-        1,
-        &initial_peers,
-        true,
-        &root.join("node-1-log"),
-    );
-    let node1_admin = format!("http://127.0.0.1:{node1_admin_port}");
-    write_cluster_config(
-        &node2_config,
-        ports[1],
-        2,
-        1,
-        &initial_peers,
-        false,
-        &root.join("node-2-log"),
-    );
-    write_cluster_config(
-        &node3_config,
-        ports[2],
-        3,
-        1,
-        &peers,
-        false,
-        &root.join("node-3-log"),
-    );
-
-    let mut children = vec![
-        spawn_node_with_cluster_config(binary, &node2_config),
-        spawn_node_with_cluster_config(binary, &node1_config),
-    ];
-
-    let client = reqwest::Client::new();
-    wait_until_ready(&client, &peers[0].1, &mut children).await;
-    wait_until_ready(&client, &peers[1].1, &mut children).await;
-    put_until_created(
-        &client,
-        &format!("{}/benchcmp/cli-late-learner", peers[0].1),
-    )
-    .await;
-    post_until_no_content(
-        &client,
-        &format!("{}/benchcmp/cli-late-learner", peers[0].1),
-        "cli-late-learner-payload",
-    )
-    .await;
-    let follower_payload = read_until_replicated(
-        &client,
-        &format!(
-            "{}/benchcmp/cli-late-learner?offset=0&max_bytes=64",
-            peers[1].1
-        ),
-    )
-    .await;
-    assert_eq!(follower_payload, b"cli-late-learner-payload");
-
-    let snapshot = admin_test_post(&client, format!("{node1_admin}/__ursula/raft/0/snapshot"))
-        .await
-        .send()
-        .await
-        .expect("trigger leader snapshot");
-    assert_eq!(snapshot.status(), reqwest::StatusCode::OK);
-    let snapshot_body = snapshot.text().await.expect("snapshot response body");
-    let snapshot_body: serde_json::Value =
-        serde_json::from_str(&snapshot_body).expect("parse snapshot response");
-    let snapshot_index = snapshot_body
-        .get("snapshot_index")
-        .and_then(serde_json::Value::as_u64)
-        .expect("snapshot index");
-
-    let purge = admin_purge(
-        &client,
-        format!("{node1_admin}/__ursula/raft/0/purge?upto={snapshot_index}"),
-    )
-    .await;
-    assert_eq!(purge.status(), reqwest::StatusCode::OK);
-
-    children.push(spawn_node_with_cluster_config(binary, &node3_config));
-    wait_until_ready(&client, &peers[2].1, &mut children).await;
-
-    let add_learner = admin_test_post(
-        &client,
-        format!(
-            "{node1_admin}/__ursula/raft/0/learners/3?addr={}",
-            peers[2].1
-        ),
-    )
-    .await
-    .send()
-    .await
-    .expect("add late learner");
-    assert_eq!(add_learner.status(), reqwest::StatusCode::OK);
-
-    wait_metrics_contains(
-        &client,
-        &peers[2].1,
-        &format!("\"snapshot_index\":{snapshot_index}"),
-    )
-    .await;
-    wait_metrics_contains_all(&client, &peers[2].1, &[
-        format!("\"snapshot_index\":{snapshot_index}"),
-        "\"learner_ids\":[3]".to_owned(),
-    ])
-    .await;
-
-    let late_payload = read_until_replicated(
-        &client,
-        &format!(
-            "{}/benchcmp/cli-late-learner?offset=0&max_bytes=64",
-            peers[2].1
-        ),
-    )
-    .await;
-    assert_eq!(late_payload, b"cli-late-learner-payload");
-
-    drop(children);
-    std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
 /// The bytes every record of the stream the deleted-data test removes
@@ -4509,6 +4525,7 @@ struct SplitPlanePorts {
     node_id: u64,
     client: u16,
     cluster: u16,
+    admin: u16,
 }
 
 impl SplitPlanePorts {
@@ -4536,7 +4553,7 @@ fn spawn_split_plane_node(
         .iter()
         .find(|plane| plane.node_id == node_id)
         .expect("node in planes");
-    let admin_port = free_port();
+    let admin_port = own.admin;
     let mut config = format!(
         r#"[server]
 listen = "127.0.0.1:{client}"
@@ -4919,48 +4936,6 @@ async fn read_until_matches(client: &reqwest::Client, url: &str, expected: &[u8]
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("replicated payload at {url} did not converge: {last:?}");
-}
-
-async fn wait_metrics_contains(client: &reqwest::Client, base_url: &str, needle: &str) -> String {
-    let mut last = String::new();
-    for _ in 0..100 {
-        if let Ok(response) = client
-            .get(format!("{base_url}/__ursula/metrics"))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            last = response.text().await.expect("metrics body");
-            if last.contains(needle) {
-                return last;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("metrics from {base_url} did not contain {needle}: {last}");
-}
-
-async fn wait_metrics_contains_all(
-    client: &reqwest::Client,
-    base_url: &str,
-    needles: &[String],
-) -> String {
-    let mut last = String::new();
-    for _ in 0..100 {
-        if let Ok(response) = client
-            .get(format!("{base_url}/__ursula/metrics"))
-            .send()
-            .await
-            && response.status().is_success()
-        {
-            last = response.text().await.expect("metrics body");
-            if needles.iter().all(|needle| last.contains(needle)) {
-                return last;
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("metrics from {base_url} did not contain all {needles:?}: {last}");
 }
 
 async fn flush_stream_until_cold_hot_bytes_zero(

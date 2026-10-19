@@ -940,7 +940,6 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
             let token = node.create(path, TEXT, b"").await;
             node.route(Some(WriteRoute::Follower {
                 leader_id: 2,
-                leader_address: Some(node.url.clone()),
                 term: 7,
             }));
             let answer = node
@@ -1546,7 +1545,6 @@ async fn a_parts_commit_never_redirects_after_its_body() {
             leader: Some(KnownLeader {
                 node_id: 2,
                 term: 7,
-                address: Some(node.url.clone()),
             }),
             proposal: Proposal::NotProposed,
             reason: LeadershipReason::Follower,
@@ -1571,11 +1569,7 @@ async fn only_a_write_answers_outcome_unknown_for_a_forward() {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: ursula_shard::RaftGroupId(0),
         error: GroupEngineError::NotLeader(LeadershipRefusal {
-            leader: leader.map(|node_id| KnownLeader {
-                node_id,
-                term: 7,
-                address: Some(node.url.clone()),
-            }),
+            leader: leader.map(|node_id| KnownLeader { node_id, term: 7 }),
             proposal: Proposal::MayHaveCommitted,
             reason: LeadershipReason::SteppedDown,
         }),

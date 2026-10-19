@@ -90,8 +90,6 @@ pub struct LeadershipRefusal {
 pub struct KnownLeader {
     pub node_id: u64,
     pub term: u64,
-    /// The leader's Raft address, when the refusing replica knew it.
-    pub address: Option<String>,
 }
 
 /// Whether a refused command may have been proposed.

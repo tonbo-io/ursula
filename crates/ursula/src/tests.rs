@@ -10,6 +10,7 @@ use std::time::Instant;
 use axum::body::Body;
 use axum::body::to_bytes;
 use axum::http::Request;
+use openraft::BasicNode;
 use openraft::RaftNetworkV2;
 use openraft::error::ReplicationClosed;
 use openraft::network::RPCOption;
@@ -314,13 +315,7 @@ fn leader_redirect_never_points_at_this_node() {
             reason: LeadershipReason::Follower,
         }),
     };
-    let known = |node_id| {
-        Some(KnownLeader {
-            node_id,
-            term: 7,
-            address: None,
-        })
-    };
+    let known = |node_id| Some(KnownLeader { node_id, term: 7 });
 
     assert!(
         router
@@ -343,21 +338,19 @@ fn leader_redirect_never_points_at_this_node() {
     );
 }
 
-// A leader that `[[raft.peers]]` does not name has only its Raft address in
-// the refusal. With split planes that address is a cluster listener, so no
-// redirect names it, and the leader-router and `leader_url` both give up.
+// A leader that `[[raft.peers]]` does not list has no address: no redirect
+// names it, whatever plane its Raft listener serves, and the leader router
+// and `leader_url` both give up.
 #[test]
-fn split_planes_never_redirect_to_a_raft_address() {
-    let router = || {
-        ClientWriteLeaderRouter::with_static_topology(
-            Some(2),
-            crate::shared_peers([
-                (1, "http://node-1:4437".to_owned()),
-                (2, "http://node-2:4437".to_owned()),
-            ]),
-            BTreeMap::new(),
-        )
-    };
+fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
+    let router = ClientWriteLeaderRouter::with_static_topology(
+        Some(2),
+        crate::shared_peers([
+            (1, "http://node-1:4437".to_owned()),
+            (2, "http://node-2:4437".to_owned()),
+        ]),
+        BTreeMap::new(),
+    );
     let unlisted = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
@@ -365,27 +358,16 @@ fn split_planes_never_redirect_to_a_raft_address() {
             leader: Some(KnownLeader {
                 node_id: 9,
                 term: 7,
-                address: Some("http://node-9:4439".to_owned()),
             }),
             proposal: Proposal::NotProposed,
             reason: LeadershipReason::Follower,
         }),
     };
 
-    let shared = router()
-        .redirect_response(&unlisted, "/b/s")
-        .expect("a shared plane redirects to the Raft address");
-    assert_eq!(shared.headers()[LOCATION], "http://node-9:4439/b/s");
-
-    let split = router().with_planes(PeerPlanes::Split);
-    assert!(split.redirect_response(&unlisted, "/b/s").is_none());
-    assert!(
-        split
-            .leader_url(9, Some("http://node-9:4439"), "/b/s")
-            .is_none()
-    );
+    assert!(router.redirect_response(&unlisted, "/b/s").is_none());
+    assert!(router.leader_url(9, "/b/s").is_none());
     assert_eq!(
-        split.leader_url(1, Some("http://node-1:4439"), "/b/s"),
+        router.leader_url(1, "/b/s"),
         Some("http://node-1:4437/b/s".to_owned())
     );
     // Without a redirect the refusal is one of an unknown leader, which the
@@ -2120,15 +2102,23 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
 }
 
 /// A transport that sends as a node of `registry`'s cluster.
-fn peer_transport(registry: &RaftGroupHandleRegistry) -> Arc<ursula_raft::CoreRaftTransport> {
+/// A transport of `registry`'s node whose `raft.peers` lists node
+/// `node_id` at `url`.
+fn peer_transport(
+    registry: &RaftGroupHandleRegistry,
+    node_id: u64,
+    url: &str,
+) -> Arc<ursula_raft::CoreRaftTransport> {
     let identity = registry
         .peer_cluster()
         .identity()
         .expect("the engine factory bound the registry's cluster");
-    Arc::new(ursula_raft::CoreRaftTransport::new(
-        identity,
-        ursula_raft::PeerCluster::default(),
-    ))
+    let peer_cluster = ursula_raft::PeerCluster::default();
+    peer_cluster.bind(
+        identity.clone(),
+        ursula_raft::PeerDirectory::new([(node_id, ursula_raft::PeerEndpoints::shared(url))]),
+    );
+    Arc::new(ursula_raft::CoreRaftTransport::new(identity, peer_cluster))
 }
 
 #[tokio::test]
@@ -2193,10 +2183,9 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
     assert!(!observed.maintenance_fence_uncertain);
 
     let mut network = ursula_raft::GrpcRaftNetwork::new(
-        peer_transport(&registry),
+        peer_transport(&registry, 1, &format!("http://{addr}")),
         RaftGroupId(0),
         1,
-        format!("http://{addr}"),
     );
     let vote_request =
         ursula_raft::UrsulaVoteRequest::new(ursula_raft::UrsulaVote::new(2, 1), None);
@@ -2206,10 +2195,9 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .expect("send vote over gRPC Raft network");
 
     let mut missing_group = ursula_raft::GrpcRaftNetwork::new(
-        peer_transport(&registry),
+        peer_transport(&registry, 1, &format!("http://{addr}")),
         RaftGroupId(1),
         1,
-        format!("http://{addr}"),
     );
     let err = missing_group
         .vote(
@@ -4259,10 +4247,9 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .expect("build leader snapshot");
     let vote = ursula_raft::UrsulaVote::new(1, 1);
     let mut snapshot_network = ursula_raft::GrpcRaftNetwork::new(
-        peer_transport(&nodes[0].registry),
+        peer_transport(&nodes[0].registry, 2, &peers[1].1),
         RaftGroupId(0),
         2,
-        peers[1].1.clone(),
     );
     let _: SnapshotResponse<UrsulaRaftTypeConfig> = snapshot_network
         .full_snapshot(
@@ -4653,17 +4640,21 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
             format!("http://{}", listener3.local_addr().expect("node 3 addr")),
         ),
     ];
-    let initial_peers = peers[..2].to_vec();
+    // Every node lists all three in `raft.peers`, as a deployment does. The
+    // group's configured voters are 1 and 2: the leader never adds node 3
+    // by itself, so the test adds it.
+    let two_voters = BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2]))]);
     let mut nodes = vec![
         spawn_static_grpc_test_node(
             1,
             listener1,
-            initial_peers.clone(),
+            peers.clone(),
             peers.clone(),
             true,
             1,
             StaticGrpcTestNodeStorage {
                 raft_log_dir: raft_root.as_ref().map(|root| root.join("node-1")),
+                per_group_voters: two_voters.clone(),
                 ..Default::default()
             },
         )
@@ -4671,12 +4662,13 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         spawn_static_grpc_test_node(
             2,
             listener2,
-            initial_peers.clone(),
+            peers.clone(),
             peers.clone(),
             false,
             1,
             StaticGrpcTestNodeStorage {
                 raft_log_dir: raft_root.as_ref().map(|root| root.join("node-2")),
+                per_group_voters: two_voters,
                 ..Default::default()
             },
         )
@@ -4796,7 +4788,9 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .get(RaftGroupId(0))
         .expect("late learner group");
     let learner_added = leader_raft
-        .add_learner(3, BasicNode::new(peers[2].1.clone()), true)
+        // The membership's address is never dialed: the leader takes node
+        // 3's from `raft.peers`.
+        .add_learner(3, BasicNode::new("http://127.0.0.1:1"), true)
         .await
         .expect("add late learner over gRPC");
     late_learner
@@ -6624,9 +6618,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             gate.clone(),
             registry.election_policy(),
             BTreeMap::new(),
-            |_leader, _address| async {
-                Err::<(ursula_raft::UrsulaVote, u64), _>("no leader".to_owned())
-            },
+            |_leader| async { Err::<(ursula_raft::UrsulaVote, u64), _>("no leader".to_owned()) },
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(50),

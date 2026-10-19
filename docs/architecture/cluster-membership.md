@@ -20,6 +20,19 @@ reservation accepts only that voter set (`Reservation::validate` in
 `crates/ursula-ctl/src/reservation.rs`), and the chart requires
 `server.replicaCount = 3` for both.
 
+`raft.peers` is the only source of peer addresses, and Raft membership is the
+electorate. Every reader of a peer address takes it from one `PeerDirectory`
+built from `raft.peers` (`crates/ursula-raft/src/peer_directory.rs`): the Raft
+network client, leader forwarding, recovery probes, the egress probe, the
+leadership-shed polls and leader redirects. Membership and recovery code deal in
+node IDs only. A node that a group's membership names but `raft.peers` does not
+list is never dialed: its network client answers unreachable without dialing,
+followers neither forward to it nor redirect to it, and each node logs it once
+(`PeerCluster::cluster_url` in `crates/ursula-raft/src/peer_cluster.rs`). To
+move a node, change `raft.peers` on every node and restart them. Membership
+entries still record a node address, which the heal driver writes from
+`raft.peers` when it adds a learner, but nothing reads it.
+
 There is no runtime membership authority. No meta Raft group runs, and the
 server never moves a group to another node or changes its voter count. The
 configured voter set is the target that the heal driver restores
@@ -78,7 +91,6 @@ The admin plane binds `server.admin_listen`, which is pod loopback by default
 | Route | Purpose |
 | --- | --- |
 | `POST /__ursula/raft/{group}/membership?voters=` | Change the voter set. Only the leader accepts it, others answer `409`. |
-| `POST /__ursula/raft/{group}/learners/{node}?addr=` | Add a learner. |
 | `POST /__ursula/raft/{group}/leader/transfer/{node}` | Transfer leadership. |
 | `GET /__ursula/raft/{group}/quorum` | Confirm a fresh quorum prefix for this group. |
 | `POST /__ursula/raft/{group}/self-election` | Start an election on this replica while its term is unchanged. |
@@ -104,9 +116,11 @@ with `URSULA_START_MAINTENANCE_DRAINED=true` starts with the mark set.
 Readiness and maintenance eligibility are two answers from one report
 (`check_raft_maintenance` in `crates/ursula-raft/src/maintenance.rs`). The
 report compares local replicas against the configured inventory and lists
-issues per group, such as `incomplete_voter_set`, `joint_membership`,
-`apply_lag` or `apply_stopped`. `GET /__ursula/ready` uses `serving_ready()`,
-which ignores incomplete voter sets, joint membership and stopped apply, so
+issues per group, such as `incomplete_voter_set`, `unconfigured_member` (a
+member that is not a configured voter, which the leader never removes),
+`joint_membership`, `apply_lag` or `apply_stopped`. `GET /__ursula/ready` uses
+`serving_ready()`, which ignores incomplete voter sets, unconfigured members,
+joint membership and stopped apply, so
 healthy survivors keep serving while a peer catches up. Maintenance tooling uses
 `ready()`, which requires no issue at all, so a second disruption waits for
 full redundancy. The readiness body includes the full report.

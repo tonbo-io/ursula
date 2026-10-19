@@ -174,9 +174,13 @@ leader redirects name. The admin plane stays on pod loopback
 
 Set `server.clusterListen=false` to serve the client and cluster planes on the
 client port, as charts before 0.8 did. Anyone who reaches the client Service can
-then send Raft traffic. Choose before the first install and keep it: groups
-record each peer's Raft URL when they initialize, and a voter whose URL changed
-afterwards refuses to start.
+then send Raft traffic. Changing it, or `server.ports.cluster`, later moves
+every voter's cluster listener, which needs every voter restarted together: run
+that `helm upgrade` with `server.updateStrategy=OnDelete` and
+`server.gracefulRollout.enabled=false`, since the graceful-rollout job restarts
+voters one at a time. Then delete every voter pod at once, and turn the
+graceful rollout back on with the next upgrade. See
+[Changing a peer address](https://ursula.tonbo.io/docs/operations#changing-a-peer-address).
 
 A Service does not stop a pod from dialing another pod's IP. To restrict that,
 enable the NetworkPolicy on a CNI that enforces it:
@@ -385,7 +389,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `global.image.tag` | `""` | Image tag. Empty uses the chart `appVersion`. |
 | `global.image.pullPolicy` | `IfNotPresent` | Kubernetes image pull policy for server, gateway, and test pods. |
 | `global.imagePullSecrets` | `[]` | Optional image pull secret references rendered into server, gateway, and test pods. |
-| `global.clusterDomain` | `cluster.local` | Kubernetes cluster DNS domain used for generated peer FQDNs, the Helm test's cluster manifest, the graceful-rollout manifest and gateway upstreams. Set it before the first install: groups record each peer's Raft URL when they initialize, and a voter whose URL changed afterwards refuses to start. |
+| `global.clusterDomain` | `cluster.local` | Kubernetes cluster DNS domain used for generated peer FQDNs, the Helm test's cluster manifest, the graceful-rollout manifest and gateway upstreams. A change rolls like any restart while the old domain still resolves. |
 
 ### Cluster And Naming
 
@@ -419,7 +423,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.onDeleteMigration.image` | `registry.k8s.io/kubectl:v1.33.3` | Kubectl image used by the Helm pre-upgrade migration when switching an existing StatefulSet to `OnDelete`. |
 | `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, the headless peer Service, the gateway upstreams and leader redirects (each peer's `client_url`) target this port. With `server.clusterListen=false` the generated Raft peer URLs target it too. |
 | `server.ports.cluster` | `4439` | Cluster-plane (Raft gRPC) process port, used when `server.clusterListen=true`. The generated Raft peer URLs and the headless peer Service target it. The client Service never exposes it. Must differ from `server.ports.client` and the `server.adminListen` port. |
-| `server.clusterListen` | `true` | Serve the cluster plane on `server.ports.cluster` (`server.cluster_listen`) instead of sharing the client port. With `false`, anyone who reaches the client Service reaches Raft. Choose it before the first install: groups record each peer's Raft URL when they initialize, and a voter whose URL changed afterwards refuses to start. |
+| `server.clusterListen` | `true` | Serve the cluster plane on `server.ports.cluster` (`server.cluster_listen`) instead of sharing the client port. With `false`, anyone who reaches the client Service reaches Raft. A change moves every voter's cluster listener and needs every voter restarted together. |
 | `server.adminListen` | `127.0.0.1:4438` | Mutating admin-plane listen address. Keep the loopback default for normal deployments and use `kubectl port-forward`; a trusted in-cluster operator may opt in to `0.0.0.0:4438`. The chart never exposes this port through a Service. |
 | `server.clusterId` | `""` | The deployment's id (`server.cluster_id`), sent as `Ursula-Cluster-Id` on every `HEAD`. Required for every install, a single replica included, since the chart always renders the peer list, and rendering fails without it: name the environment and the region, such as `prod-us-east-1`, and give every deployment one client can reach its own. A node refuses to start when its WAL holds another id, so keep the old id when a restore replaces a deployment. |
 | `server.service.enabled` | `true` | Render the internal client Service. |

@@ -442,6 +442,56 @@ async fn a_forwarded_read_waiting_on_a_silent_leader_does_not_hold_the_group_act
     shutdown_all(&engines).await;
 }
 
+/// A follower whose `raft.peers` does not list the leader forwards nothing
+/// to it: it refuses naming the leader in its term, which the client plane
+/// answers without a redirect, since it has no address for it either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_forwards_nothing_to_a_leader_raft_peers_does_not_list() {
+    let (mut engines, leader_index, stream_id, _wal_roots) =
+        cluster_advertising("forward-unlisted-leader", "http://127.0.0.1:1").await;
+    let leader_id = u64::try_from(leader_index).unwrap() + 1;
+    let follower_index = (leader_index + 1) % 3;
+    let follower_id = u64::try_from(follower_index).unwrap() + 1;
+    let follower = &mut engines[follower_index];
+    wait_for_leader(follower).await;
+    follower
+        .peer_cluster
+        .as_ref()
+        .expect("a gRPC replica")
+        .bind(
+            crate::peer_cluster::test_identity(follower_id),
+            crate::PeerDirectory::new([(
+                follower_id,
+                crate::PeerEndpoints::shared("http://127.0.0.1:1"),
+            )]),
+        );
+    assert!(follower.leader_route().await.is_none());
+
+    let read = follower
+        .read_stream(
+            ReadStreamRequest {
+                leader_only: true,
+                ..read_req(stream_id.clone(), 64)
+            },
+            placement(),
+        )
+        .await
+        .expect_err("a follower serves no leader-only read");
+    assert!(
+        matches!(
+            read.not_leader(),
+            Some(LeadershipRefusal {
+                leader: Some(ursula_runtime::KnownLeader { node_id, .. }),
+                proposal: Proposal::NotProposed,
+                reason: LeadershipReason::Follower,
+            }) if *node_id == leader_id
+        ),
+        "{read:?}"
+    );
+
+    shutdown_all(&engines).await;
+}
+
 /// A follower's forwards to a leader of another cluster (a node replaced at
 /// the leader's address with another `server.cluster_id`) are refused
 /// before anything runs there. The client gets the retryable 503 of a

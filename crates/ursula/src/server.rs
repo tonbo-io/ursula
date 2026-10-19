@@ -342,15 +342,6 @@ async fn init_state(
         }
     }
 
-    // Peers dial the address a group recorded at its initialization, so a
-    // node whose Raft url moved since (such as a new cluster port) would
-    // serve Raft where no peer dials it.
-    if let Some(registry) = spawned.raft_registry.as_ref()
-        && let Some(own) = raft_peers.cluster_url(config.raft.node_id)
-    {
-        crate::bootstrap::check_own_recorded_address(registry, config.raft.node_id, own).await?;
-    }
-
     let state = if raft_peers.is_empty() {
         match spawned.raft_registry {
             Some(registry) => HttpState::with_raft_registry(runtime, registry),
@@ -370,13 +361,7 @@ async fn init_state(
             per_group_voters,
         )
     };
-    let planes = if config.server.cluster_listen.is_some() {
-        crate::PeerPlanes::Split
-    } else {
-        crate::PeerPlanes::Shared
-    };
     let mut state = state
-        .with_peer_planes(planes)
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
         .with_configured_cluster_id(config.server.cluster_id.clone())

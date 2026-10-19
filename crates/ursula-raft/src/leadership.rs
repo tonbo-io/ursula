@@ -15,11 +15,7 @@ pub enum LeaderRole {
     /// This replica is the leader (`ServerState::Leader`).
     Leads,
     /// Another node leads the group.
-    Follows {
-        leader_id: u64,
-        /// The leader's address in the group's membership.
-        leader_address: Option<String>,
-    },
+    Follows { leader_id: u64 },
     /// No leader is known, or this replica is between roles.
     Unknown,
 }
@@ -44,14 +40,7 @@ impl GroupLeadership {
             LeaderRole::Leads
         } else {
             match metrics.current_leader {
-                Some(leader_id) if leader_id != metrics.id => LeaderRole::Follows {
-                    leader_id,
-                    leader_address: metrics
-                        .membership_config
-                        .membership()
-                        .get_node(&leader_id)
-                        .map(|node| node.addr.clone()),
-                },
+                Some(leader_id) if leader_id != metrics.id => LeaderRole::Follows { leader_id },
                 _ => LeaderRole::Unknown,
             }
         };
@@ -67,12 +56,8 @@ impl GroupLeadership {
     pub fn write_route(self) -> WriteRoute {
         match self.role {
             LeaderRole::Leads => WriteRoute::Leader { early_answer: None },
-            LeaderRole::Follows {
+            LeaderRole::Follows { leader_id } => WriteRoute::Follower {
                 leader_id,
-                leader_address,
-            } => WriteRoute::Follower {
-                leader_id,
-                leader_address,
                 term: self.term,
             },
             LeaderRole::Unknown => WriteRoute::NoLeader,

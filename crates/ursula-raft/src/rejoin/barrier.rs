@@ -1,6 +1,7 @@
 //! Follower-side fresh quorum barrier driver.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -17,9 +18,10 @@ use crate::owner::OwnerRaftHandle;
 use crate::types::UrsulaVote;
 
 /// Opens a gated replica's recovery gate from fresh outbound leader proofs.
-/// The supplied probe must confirm a new post-call ReadIndex with a quorum
-/// and return that leader's committed vote and required local applied
-/// index. A replica that for `stall_after` gets no barrier and applies
+/// It asks the group's configured voters (`nodes`) and the members of its
+/// effective membership, by node id. The supplied probe must confirm a new
+/// post-call ReadIndex with a quorum and return that leader's committed vote
+/// and required local applied index. A replica that for `stall_after` gets no barrier and applies
 /// nothing reports its group stalled. Once the gate is open, here or through
 /// an operator, the group's election policy is refreshed and the driver
 /// returns. Transport-independent so simulation exercises the production
@@ -34,7 +36,7 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
     interval: Duration,
     stall_after: Duration,
 ) where
-    P: Fn(u64, String) -> F,
+    P: Fn(u64) -> F,
     F: Future<Output = Result<(UrsulaVote, u64), E>>,
     E: fmt::Debug,
 {
@@ -74,21 +76,20 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
             })
         {
             last_probe = Some((metrics.vote, crate::rt::time::Instant::now()));
-            let mut candidates = nodes.clone();
+            let mut candidates = nodes.keys().copied().collect::<BTreeSet<_>>();
             candidates.extend(
                 metrics
                     .membership_config
                     .membership()
                     .nodes()
-                    .map(|(id, node)| (*id, node.clone())),
+                    .map(|(id, _)| *id),
             );
             candidates.remove(&metrics.id);
-            for (leader_id, node) in candidates {
+            for leader_id in candidates {
                 if !rejoin.needs_vote_floor() && metrics.current_leader != Some(leader_id) {
                     continue;
                 }
-                let outcome =
-                    crate::rt::time::timeout(probe_timeout, probe(leader_id, node.addr)).await;
+                let outcome = crate::rt::time::timeout(probe_timeout, probe(leader_id)).await;
                 match outcome {
                     Ok(Ok((leader, index))) => {
                         if rejoin.needs_vote_floor() {

@@ -174,9 +174,39 @@ impl RaftInternal for RecoveryTestService {
     }
 }
 
+/// `raft.peers` of a fixture whose node `i + 1` serves at `endpoints[i]`.
+fn fixture_peers(endpoints: &[String]) -> crate::PeerDirectory {
+    crate::PeerDirectory::new(
+        (1_u64..)
+            .zip(endpoints)
+            .map(|(id, endpoint)| (id, crate::PeerEndpoints::shared(endpoint.as_str()))),
+    )
+}
+
+/// Lists `endpoints` as the `raft.peers` of every node of `registries`
+/// (node `i + 1` holds `registries[i]`).
+fn list_fixture_peers(registries: &[RaftGroupHandleRegistry], endpoints: &[String]) {
+    for (id, registry) in (1_u64..).zip(registries) {
+        registry.peer_cluster().bind(
+            crate::peer_cluster::test_identity(id),
+            fixture_peers(endpoints),
+        );
+    }
+}
+
+/// A transport that probes the fixture nodes at `endpoints`.
+fn probe_transport(endpoints: &[String]) -> Arc<crate::grpc::CoreRaftTransport> {
+    Arc::new(crate::grpc::CoreRaftTransport::new(
+        crate::peer_cluster::test_identity(0),
+        crate::peer_cluster::test_peer_cluster_with(0, fixture_peers(endpoints)),
+    ))
+}
+
 /// A replica of node `id` on a fresh, empty WAL, as a new node or one that
 /// lost its disk starts: its gate is closed with the group's history
 /// unknown. The returned directory holds the WAL and must outlive the store.
+/// It dials its peers at the `raft.peers` that `registry`'s peer cluster
+/// lists ([`list_fixture_peers`]).
 async fn new_recovery_engine(
     id: u64,
     config: Arc<Config>,
@@ -204,16 +234,28 @@ async fn new_recovery_engine(
             .await
             .expect("open the gate"),
     );
+    let peer_cluster = registry.peer_cluster().clone();
+    if peer_cluster.identity().is_none() {
+        peer_cluster.bind(
+            crate::peer_cluster::test_identity(id),
+            crate::PeerDirectory::default(),
+        );
+    }
+    let transport = Arc::new(crate::grpc::CoreRaftTransport::new(
+        crate::peer_cluster::test_identity(id),
+        peer_cluster.clone(),
+    ));
     // The gate goes in as the node's engine factory hands it over, so the
     // group runs with log reversion allowed.
     let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
         placement(),
         id,
         config,
-        GrpcRaftNetworkFactory::new(Arc::default(), placement().raft_group_id),
+        GrpcRaftNetworkFactory::new(transport, placement().raft_group_id),
         store.clone(),
         RaftGroupEngineOptions {
             recovery: Some(gate.clone()),
+            peer_cluster: Some(peer_cluster),
             ..Default::default()
         },
     )
@@ -325,20 +367,20 @@ async fn retry_transient<T>(
     }
 }
 
-/// A fresh quorum proof from leader `leader_id` at `endpoint`, retried as a
-/// recovery driver retries it ([`probe_attempt_error`]).
+/// A fresh quorum proof from leader `leader_id` of the fixture nodes at
+/// `endpoints`, retried as a recovery driver retries it
+/// ([`probe_attempt_error`]).
 async fn fresh_proof(
     step: &str,
     replicas: &[ReplicaWatch],
     leader_id: u64,
-    endpoint: &str,
+    endpoints: &[String],
 ) -> (UrsulaVote, u64) {
     retry_transient(step, replicas, async |remaining| {
         probe_rejoin_vote_barrier(
-            Arc::default(),
+            probe_transport(endpoints),
             placement(),
             leader_id,
-            endpoint,
             PROBE_TIMEOUT.min(remaining),
         )
         .await
@@ -637,6 +679,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         gates.push(gate);
         wal_roots.push(wal_root);
     }
+    list_fixture_peers(&registries, &endpoints);
     let nodes = endpoints
         .iter()
         .enumerate()
@@ -687,7 +730,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         "fresh explicit barrier",
         &replica_watches(&engines, &services),
         2,
-        &endpoints[1],
+        &endpoints,
     )
     .await;
     assert!(proof.1 >= baseline.log_id.index());
@@ -790,19 +833,23 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             .store(reject_barrier, Ordering::SeqCst);
         assert!(
             probe_rejoin_vote_barrier(
-                Arc::default(),
+                probe_transport(&endpoints),
                 placement(),
                 2,
-                &endpoints[1],
                 Duration::from_millis(150)
             )
             .await
             .is_err(),
             "an unreachable quorum cannot confirm a fresh proof"
         );
-        crate::confirm_quorum_prefix(placement(), 2, &endpoints[1], Duration::from_millis(150))
-            .await
-            .expect_err("a stale or unsupported peer cannot confirm a quorum prefix");
+        crate::confirm_quorum_prefix(
+            probe_transport(&endpoints),
+            placement(),
+            2,
+            Duration::from_millis(150),
+        )
+        .await
+        .expect_err("a stale or unsupported peer cannot confirm a quorum prefix");
     }
     // Reconnect healthy C first. B still owns the ACKed suffix; A still only
     // has the old prefix, so a successful fresh proof alone cannot open A.
@@ -818,7 +865,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     // Peers without the explicit protocol fail closed; no HEAD bridge remains.
     services[1].reject_barrier.store(true, Ordering::SeqCst);
     let unsupported =
-        probe_rejoin_vote_barrier(Arc::default(), placement(), 2, &endpoints[1], PROBE_TIMEOUT)
+        probe_rejoin_vote_barrier(probe_transport(&endpoints), placement(), 2, PROBE_TIMEOUT)
             .await
             .expect_err("unsupported recovery protocol is refused");
     assert!(
@@ -833,7 +880,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             "fresh recovery proof",
             &replica_watches(&engines, &services),
             2,
-            &endpoints[1],
+            &endpoints,
         )
         .await;
         assert!(proof.1 >= acked.log_id.index());
@@ -842,9 +889,9 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
             &replica_watches(&engines, &services),
             async |remaining| {
                 crate::confirm_quorum_prefix(
+                    probe_transport(&endpoints),
                     placement(),
                     2,
-                    &endpoints[1],
                     PROBE_TIMEOUT.min(remaining),
                 )
                 .await
@@ -936,7 +983,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     engines[2].raft.runtime_config().tick(true);
     services[1].reject_barrier.store(true, Ordering::SeqCst);
     assert!(
-        probe_rejoin_vote_barrier(Arc::default(), placement(), 2, &endpoints[1], PROBE_TIMEOUT)
+        probe_rejoin_vote_barrier(probe_transport(&endpoints), placement(), 2, PROBE_TIMEOUT)
             .await
             .is_err(),
         "an unsupported peer cannot supply a fresh proof"
@@ -949,10 +996,9 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         &replica_watches(&engines, &services),
         async |remaining| {
             probe_rejoin_vote_barrier(
-                Arc::default(),
+                probe_transport(&endpoints),
                 placement(),
                 3,
-                &endpoints[2],
                 PROBE_TIMEOUT.min(remaining),
             )
             .await
@@ -1035,6 +1081,7 @@ async fn three_replicas_led_by_the_second(cluster_name: &str) -> ThreeReplicas {
         .validate()
         .unwrap(),
     );
+    let mut registries = Vec::new();
     let mut endpoints = Vec::new();
     let mut services = Vec::new();
     let mut servers = Vec::new();
@@ -1048,11 +1095,13 @@ async fn three_replicas_led_by_the_second(cluster_name: &str) -> ThreeReplicas {
         endpoints.push(endpoint);
         servers.push(server);
         let (engine, _, gate, wal_root) = new_recovery_engine(id, config.clone(), &registry).await;
+        registries.push(registry);
         services.push(service);
         engines.push(engine);
         gates.push(gate);
         wal_roots.push(wal_root);
     }
+    list_fixture_peers(&registries, &endpoints);
     let nodes = (1_u64..)
         .zip(&endpoints)
         .map(|(id, endpoint)| (id, BasicNode::new(endpoint)))
@@ -1684,7 +1733,7 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
         first.raft_handle(),
         first_gate,
         BTreeMap::from([(1, BasicNode::new("one")), (2, BasicNode::new("two"))]),
-        move |_id, _address| {
+        move |_id| {
             let peer = peer.clone();
             let observations = observations.clone();
             async move {

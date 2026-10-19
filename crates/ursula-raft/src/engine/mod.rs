@@ -698,7 +698,8 @@ impl RaftGroupEngine {
     }
 
     /// [`Self::new_node_with_log_store_and_network`] with `options`, on a
-    /// node of the test cluster.
+    /// node of the test cluster with no configured peers unless `options`
+    /// names its peer cluster.
     #[cfg(any(test, madsim))]
     pub async fn new_node_with_log_store_network_and_options<NF, LS>(
         placement: ShardPlacement,
@@ -720,7 +721,12 @@ impl RaftGroupEngine {
             network_factory,
             log_store,
             RaftGroupEngineOptions {
-                peer_cluster: Some(crate::peer_cluster::test_peer_cluster(node_id)),
+                peer_cluster: Some(
+                    options
+                        .peer_cluster
+                        .clone()
+                        .unwrap_or_else(|| crate::peer_cluster::test_peer_cluster(node_id)),
+                ),
                 ..options
             },
         )
@@ -1322,7 +1328,6 @@ impl RaftGroupEngine {
             LeadershipReason::Follower,
             Proposal::NotProposed,
             self.raft.current_leader().await,
-            None,
             &leadership,
         )
     }
@@ -1393,21 +1398,17 @@ impl RaftGroupEngine {
             .map_or(0, |log_id| log_id.index())
     }
 
-    /// Where this follower forwards a leader RPC, when it knows the leader.
+    /// Where this follower forwards a leader RPC, when it knows the leader
+    /// and `raft.peers` lists it. A leader that `raft.peers` does not list
+    /// gets nothing forwarded and no redirect.
     pub(crate) async fn leader_route(&self) -> Option<LeaderRoute> {
         let leader_id = self.raft.current_leader().await?;
-        let leader = self
-            .raft
-            .metrics()
-            .borrow_watched()
-            .membership_config
-            .membership()
-            .get_node(&leader_id)
-            .cloned()?;
+        let peer_cluster = self.peer_cluster.clone()?;
+        let address = peer_cluster.cluster_url(leader_id)?;
         Some(LeaderRoute {
-            peer_cluster: self.peer_cluster.clone(),
+            peer_cluster,
             leader_id,
-            leader,
+            address,
         })
     }
 }
@@ -2153,7 +2154,6 @@ impl GroupEngine for RaftGroupEngine {
                         LeadershipReason::Follower,
                         Proposal::NotProposed,
                         leader_id,
-                        None,
                         &leadership,
                     ));
                 };

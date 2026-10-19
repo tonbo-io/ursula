@@ -93,7 +93,6 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
-pub use bootstrap::PeerAddressChanged;
 pub use bootstrap::Persistence;
 pub use bootstrap::SnapshotDriveSettings;
 pub use bootstrap::SnapshotDriver;
@@ -103,7 +102,6 @@ pub use bootstrap::Topology;
 pub use bootstrap::spawn_runtime;
 use chrono::DateTime;
 use futures_util::stream;
-use openraft::BasicNode;
 use openraft::error::Fatal;
 use openraft::rt::WatchReceiver;
 use tower::ServiceBuilder;
@@ -773,18 +771,6 @@ impl HttpState {
         self.wal_disk.clone()
     }
 
-    /// Tells the leader router whether peers' Raft addresses serve their
-    /// client plane ([`PeerPlanes`]).
-    #[must_use]
-    pub fn with_peer_planes(mut self, planes: PeerPlanes) -> Self {
-        let fields = self.fields_mut();
-        fields.client_write_router = fields
-            .client_write_router
-            .take()
-            .map(|router| router.with_planes(planes));
-        self
-    }
-
     /// Apply runtime-level config (memory monitor, payload threshold) derived
     /// from the typed configuration.  Replaces the hard-coded defaults set by
     /// the constructors.
@@ -882,24 +868,13 @@ impl Drop for AbortOnDrop {
 /// redirect. `peers` is the node's `raft.peers`, whose client URLs
 /// ([`PeerDirectory::client_url`]) are each node's `client_url`,
 /// or its Raft `url` when the node serves both planes on `server.listen`.
-/// Clients and gateways must be able to reach these URLs.
+/// Clients and gateways must be able to reach these URLs. A leader that
+/// `raft.peers` does not list is never a redirect target.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: PeerDirectory,
     node_id: Option<u64>,
     per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
-    planes: PeerPlanes,
-}
-
-/// Whether a node's Raft address also serves its client plane, which decides
-/// if a leader hint's Raft address may be a redirect target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PeerPlanes {
-    /// The planes share `server.listen`: a Raft address is a client URL.
-    Shared,
-    /// The cluster plane listens on `server.cluster_listen`: a Raft address
-    /// serves no client route, so only a configured `client_url` is a target.
-    Split,
 }
 
 impl ClientWriteLeaderRouter {
@@ -916,55 +891,34 @@ impl ClientWriteLeaderRouter {
             peers,
             node_id: node_id.into(),
             per_group_voters: Arc::new(per_group_voters),
-            planes: PeerPlanes::Shared,
         }
     }
 
-    /// The router of a node whose peers serve their planes as `planes` says.
-    #[must_use]
-    pub fn with_planes(mut self, planes: PeerPlanes) -> Self {
-        self.planes = planes;
-        self
-    }
-
-    /// The base URL of `leader_id`: its configured client URL, else, while
-    /// the planes share a listener, the Raft `address` of the leader hint.
-    /// `None` for this node itself, and for a leader with no client URL, which
+    /// The client URL `raft.peers` lists for `leader_id`. `None` for this
+    /// node itself, and for a leader that `raft.peers` does not list, which
     /// the caller answers with a retryable `503`.
-    fn peer_base(&self, leader_id: u64, address: Option<&str>) -> Option<String> {
+    fn peer_base(&self, leader_id: u64) -> Option<&str> {
         if Some(leader_id) == self.node_id {
             return None;
         }
-        let address = match self.planes {
-            PeerPlanes::Shared => address,
-            PeerPlanes::Split => None,
-        };
-        let base = self.peers.client_url(leader_id).or(address)?;
-        // The directory's URLs carry no trailing `/`, but a membership
-        // address may.
-        Some(base.trim_end_matches('/').to_owned())
+        self.peers.client_url(leader_id)
     }
 
     /// The URL of `request_target` on `leader_id`, the target of a routing
     /// redirect (#581 section 6.1).
-    pub(crate) fn leader_url(
-        &self,
-        leader_id: u64,
-        address: Option<&str>,
-        request_target: &str,
-    ) -> Option<String> {
-        self.peer_base(leader_id, address)
+    pub(crate) fn leader_url(&self, leader_id: u64, request_target: &str) -> Option<String> {
+        self.peer_base(leader_id)
             .map(|base| format!("{base}{request_target}"))
     }
 
     /// A node that hosts a replica of `raft_group_id`, other than this one.
-    fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<String> {
+    fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<&str> {
         let voters = self.per_group_voters.get(&raft_group_id)?;
         voters
             .iter()
             .copied()
             .filter(|node_id| Some(*node_id) != self.node_id)
-            .find_map(|node_id| self.peers.client_url(node_id).map(str::to_owned))
+            .find_map(|node_id| self.peers.client_url(node_id))
     }
 
     /// The redirect for `err`, typed through `ursula-headers`: to the
@@ -973,7 +927,8 @@ impl ClientWriteLeaderRouter {
     /// of the group, to one that does ([`RoutingAnswer::NotHosted`]). `None`
     /// for a refusal that names no leader, or one with no address: the
     /// caller answers a retryable `503` instead, so no redirect lacks the
-    /// group, or the leader and its term.
+    /// group, or the leader and its term. A leader that `raft.peers` does
+    /// not list has no address.
     fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
         let (base, answer) = match err {
             RuntimeError::GroupNotHosted { raft_group_id, .. } => (
@@ -988,14 +943,11 @@ impl ClientWriteLeaderRouter {
                 ..
             } => {
                 let leader = error.not_leader()?.leader.as_ref()?;
-                (
-                    self.peer_base(leader.node_id, leader.address.as_deref())?,
-                    RoutingAnswer::NotLeader {
-                        leader: ursula_headers::NodeId::from_u64(leader.node_id),
-                        group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
-                        term: ursula_headers::RaftTerm::from_u64(leader.term),
-                    },
-                )
+                (self.peer_base(leader.node_id)?, RoutingAnswer::NotLeader {
+                    leader: ursula_headers::NodeId::from_u64(leader.node_id),
+                    group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
+                    term: ursula_headers::RaftTerm::from_u64(leader.term),
+                })
             }
             _ => return None,
         };
@@ -1347,10 +1299,6 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             "/__ursula/raft/{raft_group_id}/membership",
             post(change_raft_membership),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/learners/{node_id}",
-            post(add_raft_learner),
         )
         .route(
             "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
@@ -2892,64 +2840,16 @@ pub(crate) async fn trigger_raft_purge(
         .into_response()
 }
 
-pub(crate) async fn add_raft_learner(
-    State(state): State<HttpState>,
-    Path((raft_group_id, node_id)): Path<(u64, u64)>,
-    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::AddLearnerQuery>,
-) -> Response {
-    if query.addr.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "addr query parameter is required").into_response();
-    }
-    let address = query.addr;
-    let blocking = query.blocking.unwrap_or(true);
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
-        Err(response) => return *response,
-    };
-    match raft
-        .add_learner(node_id, BasicNode::new(address.clone()), blocking)
-        .await
-    {
-        Ok(response) => (
-            StatusCode::OK,
-            axum::Json(ursula_proto::admin::AddLearnerResponse {
-                raft_group_id: raft_group_id.0,
-                node_id,
-                log_index: response.log_id.index(),
-            }),
-        )
-            .into_response(),
-        Err(err) => match err.api_error() {
-            // Refused before anything was appended: retry on the leader.
-            Some(openraft::error::ClientWriteError::ForwardToLeader(forward)) => {
-                membership_forward_response("add raft learner", forward.leader_id)
-            }
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("add raft learner: {err}"),
-            )
-                .into_response(),
-        },
-    }
-}
-
-/// The answer to a membership request OpenRaft refused before appending it:
-/// `409` naming the leader when one is known, else `503` with
-/// `Retry-After`, as while a new leader waits for its quorum.
-fn membership_forward_response(operation: &str, leader: Option<u64>) -> Response {
-    match leader {
-        Some(leader) => (
-            StatusCode::CONFLICT,
-            format!("{operation}: not the leader; node {leader} leads"),
-        )
-            .into_response(),
-        None => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [(axum::http::header::RETRY_AFTER, "1")],
-            format!("{operation}: no leader with a live quorum; retry"),
-        )
-            .into_response(),
-    }
+/// The answer to a membership request OpenRaft refused before appending it
+/// while no leader is known: `503` with `Retry-After`, as while a new leader
+/// waits for its quorum.
+fn membership_no_leader_response(operation: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(axum::http::header::RETRY_AFTER, "1")],
+        format!("{operation}: no leader with a live quorum; retry"),
+    )
+        .into_response()
 }
 
 pub(crate) async fn change_raft_membership(
@@ -2981,7 +2881,7 @@ pub(crate) async fn change_raft_membership(
             .into_response();
     }
 
-    match raft.change_membership(voters.clone(), false).await {
+    match raft.replace_voters(voters.clone()).await {
         Ok(response) => (
             StatusCode::OK,
             axum::Json(ursula_proto::admin::MembershipResponse {
@@ -3010,7 +2910,7 @@ pub(crate) async fn change_raft_membership(
                         }),
                     )
                         .into_response(),
-                    None => membership_forward_response("change raft membership", None),
+                    None => membership_no_leader_response("change raft membership"),
                 }
             }
             _ => (
@@ -5515,8 +5415,7 @@ fn is_forward_to_leader(err: &RuntimeError) -> bool {
 ///   to Raft, which may follow a committed entry: the write may have
 ///   applied, and its key resolves it. A read never gets it.
 fn leader_unknown_retry_response(err: RuntimeError, access: Access) -> Response {
-    // The error names the leader's address: it stays in the log, at debug,
-    // since every election answers so.
+    // The error stays in the log, at debug, since every election answers so.
     tracing::debug!(error = %err, "no leader of the group is known");
     let mut headers = HeaderMap::new();
     headers.insert(

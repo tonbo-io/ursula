@@ -87,6 +87,15 @@ pub fn check_raft_maintenance(
         if &voters != expected || !group.learner_ids.is_empty() {
             issues.push(Issue::IncompleteVoterSet);
         }
+        // The leader heals a missing configured voter by itself, but never
+        // removes a member configuration does not list.
+        if voters
+            .iter()
+            .chain(&group.learner_ids)
+            .any(|member| !expected.contains(member))
+        {
+            issues.push(Issue::UnconfiguredMember);
+        }
         let applied = group.last_applied.map(|id| id.index);
         if group.maintenance.membership_log_index.is_none()
             || applied < group.maintenance.membership_log_index
@@ -270,6 +279,41 @@ mod tests {
             node_id: 1,
         });
         assert!(report(&[healthy(0), new]).ready());
+    }
+
+    /// A member that configuration does not list blocks maintenance but not
+    /// serving: the leader never removes it, and nothing dials it.
+    #[test]
+    fn an_unconfigured_member_blocks_maintenance_but_not_serving() {
+        for (voters, learners) in [(vec![1, 2, 3, 4], vec![]), (vec![1, 2, 3], vec![4])] {
+            let mut group = healthy(1);
+            group.voter_ids = voters.clone();
+            group.voter_configurations = vec![voters.iter().copied().collect()];
+            group.learner_ids = learners;
+            let report = report(&[healthy(0), group]);
+            assert_eq!(report.group_issues[&1], vec![
+                RaftMaintenanceIssue::IncompleteVoterSet,
+                RaftMaintenanceIssue::UnconfiguredMember,
+            ]);
+            assert!(report.serving_ready());
+            assert!(!report.ready());
+        }
+        // A configured voter missing from the membership is healed by the
+        // leader: it is no unconfigured member.
+        let mut group = healthy(1);
+        group.voter_ids = vec![1, 2];
+        group.voter_configurations = vec![BTreeSet::from([1, 2])];
+        assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
+            RaftMaintenanceIssue::IncompleteVoterSet
+        ]);
+        // Nor is the learner the leader is healing back: a configured voter.
+        let mut group = healthy(1);
+        group.voter_ids = vec![1, 2];
+        group.voter_configurations = vec![BTreeSet::from([1, 2])];
+        group.learner_ids = vec![3];
+        assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
+            RaftMaintenanceIssue::IncompleteVoterSet
+        ]);
     }
 
     #[test]

@@ -130,14 +130,10 @@ pub(crate) async fn route_before_body(
     };
     let group = RaftGroup::from_u32(routed.raft_group_id.0);
     match routed.route {
-        WriteRoute::Follower {
-            leader_id,
-            leader_address,
-            term,
-        } => {
-            let location = state.client_write_router().and_then(|router| {
-                router.leader_url(leader_id, leader_address.as_deref(), request_target)
-            });
+        WriteRoute::Follower { leader_id, term } => {
+            let location = state
+                .client_write_router()
+                .and_then(|router| router.leader_url(leader_id, request_target));
             HeadDecision::Answer(match location {
                 Some(location) => routing_response(
                     RoutingAnswer::NotLeader {
@@ -147,7 +143,8 @@ pub(crate) async fn route_before_body(
                     },
                     Some(&location),
                 ),
-                // No address for the leader: as good as none known.
+                // A leader that `raft.peers` does not list: as good as none
+                // known.
                 None => routing_response(RoutingAnswer::NoLeader { group }, None),
             })
         }

@@ -40,6 +40,32 @@ use ursula_shard::ShardPlacement;
 use super::MadsimScopedGroupEngine;
 use super::SimNodeWal;
 
+/// The options of node `node_id`'s simulated engine with `metrics` and
+/// `cold_store`. Its `raft.peers` lists the three nodes at the addresses
+/// their membership names, as a production node's `raft.peers` does.
+fn runtime_engine_options(
+    node_id: u64,
+    metrics: Option<GroupEngineMetrics>,
+    cold_store: Option<ColdStoreHandle>,
+) -> ursula_raft::RaftGroupEngineOptions {
+    let peer_cluster = ursula_raft::PeerCluster::default();
+    peer_cluster.bind(
+        ursula_raft::PeerIdentity::new(
+            node_id,
+            ursula_headers::ClusterId::new("ursula-test").expect("a valid cluster id"),
+        ),
+        ursula_raft::PeerDirectory::new((1..=3).map(|peer| {
+            (
+                peer,
+                ursula_raft::PeerEndpoints::shared(format!("runtime-raft-node-{peer}")),
+            )
+        })),
+    );
+    let mut options = super::sim_wal::engine_options(metrics, cold_store);
+    options.peer_cluster = Some(peer_cluster);
+    options
+}
+
 /// How long a harness step waits for the group to elect a leader.
 const LEADER_WAIT: Duration = Duration::from_secs(5);
 
@@ -363,7 +389,8 @@ impl MadsimRuntimeRaftNetworkFactory {
                 .with_source(node_id)
                 .with_policy(self.policy.clone()),
             log_store,
-            wal.recording_work(super::sim_wal::engine_options(
+            wal.recording_work(runtime_engine_options(
+                node_id,
                 Some(control.metrics),
                 self.cold_store.clone(),
             )),
@@ -446,7 +473,8 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                         .with_source(node_id)
                         .with_policy(policy.clone()),
                     log_store,
-                    wals[&node_id].recording_work(super::sim_wal::engine_options(
+                    wals[&node_id].recording_work(runtime_engine_options(
+                        node_id,
                         Some(metrics.clone()),
                         cold_store.clone(),
                     )),
