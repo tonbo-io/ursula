@@ -115,10 +115,11 @@ init_membership_per_group = false
 
 # OpenRaft's install_snapshot_timeout covers the whole FullSnapshot RPC.
 # The receiver reads the sender's object, writes its own copy, checks it
-# and installs it before replying, so this must stay above three S3
-# operations, each with its per-attempt timeout and retries. A node warns
-# at startup when it does not. It also bounds how long a sent object stays
-# held, and the second GC pass after a failed write runs this long later.
+# and installs it before replying, so this must stay above three
+# snapshot-store requests, each with storage.snapshot.timeout and
+# max_retries. A node refuses to start when it does not. It also bounds how
+# long a sent object stays held, and the second GC pass after a failed
+# write runs this long later.
 # install_snapshot_timeout = "120s"
 
 # Consecutive gRPC RPC failures before forcing a transport reconnect.
@@ -288,6 +289,13 @@ backend = "auto"
 # when present; if storage.cold.root is absent, keys are relative to the S3
 # bucket root plus this prefix. Only used when backend = "s3".
 # s3_prefix = "snapshots"
+
+# Per-attempt timeout and retries of an S3 snapshot-store request, apart
+# from [storage.cold.s3]. A follower's install copy (a GET, a PUT and a
+# HEAD) must fit inside raft.install_snapshot_timeout: 22s per request and
+# 66s per copy with the defaults.
+# timeout = "10s"
+# max_retries = 1
 
 # ------------------------------------------------------------------------------
 # [governance]  — Background governance task tuning (optional)

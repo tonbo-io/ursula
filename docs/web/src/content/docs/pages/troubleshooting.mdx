@@ -90,14 +90,16 @@ When the store does not answer that read, the open fails after the whole
 restore attempt, and the node logs `the persisted snapshot object does not
 restore` at error level with the group and the object's key, and `the
 snapshot store did not answer the group's restore` at warn level with how
-many opens failed in a row. The node then answers the group's requests with
-this code at once, and opens the group again by itself after a wait that
-doubles per failed open, from 1 second up to 30 seconds.
-`open_backoff_groups` in `/__ursula/metrics` counts the groups that wait.
-An open runs on the core that owns the group, and an open that the store
-does not answer holds that core until the S3 client gives up, up to about
-54 seconds with the default `storage.cold.s3.timeout` and `max_retries`. The
-core's other groups wait meanwhile. Fix the node's reachability of the
+many opens failed in a row. The node then holds the group closed for a wait
+that doubles per failed open, from 1 second up to 30 seconds, and opens the
+group again by itself. During the wait and during that reopen, it answers
+the group's requests with this code at once. `open_backoff_groups` in
+`/__ursula/metrics` counts the groups that wait. An open runs in a task of
+the core that owns the group, so the core's other groups keep serving. A
+request that reaches the group during its first open waits for the open,
+which the store can hold until the S3 client gives up, up to 22 seconds for
+each request with the default `storage.snapshot.timeout` and
+`max_retries`. Fix the node's reachability of the
 snapshot store: its endpoint, credentials and network path. The group opens
 at the first open after the store answers. A node whose store does not
 answer at startup starts anyway and keeps those groups closed until then.

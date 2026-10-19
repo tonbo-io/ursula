@@ -1486,6 +1486,22 @@
           ],
           "minimum": 1,
           "description": "Snapshot driver interval in milliseconds, rendered as storage.snapshot.drive_interval. The driver always runs, so 0 is refused."
+        },
+        "requestTimeoutMs": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "description": "Per-attempt timeout of an S3 snapshot-store request in milliseconds, rendered as storage.snapshot.timeout. Null keeps the server's default of 10 seconds. A follower's install copy, three requests with this timeout and maxRetries, must fit inside the install snapshot timeout, or the server refuses to start."
+        },
+        "maxRetries": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0,
+          "description": "Retries of an S3 snapshot-store request, rendered as storage.snapshot.max_retries. Null keeps the server's default of 1."
         }
       }
     },

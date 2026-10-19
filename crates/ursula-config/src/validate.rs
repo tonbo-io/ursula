@@ -5,6 +5,7 @@ use thiserror::Error;
 
 use crate::config::ColdBackend;
 use crate::config::RaftConfig;
+use crate::config::RaftSnapshotBackend;
 use crate::config::UrsulaConfig;
 use crate::config::WalConfig;
 
@@ -77,6 +78,18 @@ pub enum ValidationError {
     DeletedDataMaxAgeTooShort {
         value: std::time::Duration,
         minimum: std::time::Duration,
+    },
+    /// A follower's install copy, a GET, a PUT and a HEAD of the snapshot
+    /// store, each to the end of its timeout and retries, can take longer
+    /// than the install it serves. The leader's send would end first.
+    #[error(
+        "storage.snapshot.timeout and storage.snapshot.max_retries let a follower's install copy \
+         (a GET, a PUT and a HEAD) take up to {copy_budget:?}, longer than \
+         raft.install_snapshot_timeout ({install_snapshot_timeout:?})"
+    )]
+    SnapshotCopyOutlastsInstall {
+        copy_budget: std::time::Duration,
+        install_snapshot_timeout: std::time::Duration,
     },
     #[error("{0}")]
     Other(String),
@@ -191,6 +204,7 @@ impl UrsulaConfig {
                 return Err(ValidationError::DeletedDataMaxAgeTooShort { value, minimum });
             }
         }
+        self.validate_install_copy_budget()?;
         if self.raft.snapshot_pressure_max_groups_per_tick == 0 {
             return Err(ValidationError::Other(
                 "raft.snapshot_pressure_max_groups_per_tick must be non-zero".into(),
@@ -255,6 +269,29 @@ impl UrsulaConfig {
         Ok(())
     }
 
+    /// With S3 snapshots, a follower's install copy fits inside
+    /// `raft.install_snapshot_timeout`. The defaults leave a margin.
+    fn validate_install_copy_budget(&self) -> Result<(), ValidationError> {
+        if self
+            .storage
+            .snapshot
+            .backend
+            .resolve(self.storage.cold.backend)
+            != RaftSnapshotBackend::S3
+        {
+            return Ok(());
+        }
+        let copy_budget = self.storage.snapshot.install_copy_budget();
+        let install_snapshot_timeout = self.raft.install_snapshot_timeout.as_duration();
+        if copy_budget > install_snapshot_timeout {
+            return Err(ValidationError::SnapshotCopyOutlastsInstall {
+                copy_budget,
+                install_snapshot_timeout,
+            });
+        }
+        Ok(())
+    }
+
     fn validate_peers(&self) -> Result<(), ValidationError> {
         let mut seen_ids = BTreeSet::new();
         for peer in &self.raft.peers {
@@ -306,6 +343,10 @@ impl UrsulaConfig {
             (
                 "storage.cold.compaction_gc_grace",
                 self.storage.cold.compaction_gc_grace.as_duration(),
+            ),
+            (
+                "storage.snapshot.timeout",
+                self.storage.snapshot.timeout.as_duration(),
             ),
         ] {
             if value.is_zero() {
@@ -531,6 +572,101 @@ mod tests {
             config.raft.effective_deleted_data_max_age(),
             std::time::Duration::from_secs(80 * 60)
         );
+    }
+
+    /// #742: with S3 snapshots, the defaults fit a follower's install copy
+    /// inside the default install timeout with a margin, so the node starts
+    /// with no word about it.
+    #[test]
+    fn the_default_snapshot_store_budget_fits_an_install_copy() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.storage.cold.backend = crate::config::ColdBackend::S3;
+        config.storage.cold.s3 = Some(S3Config {
+            bucket: Some("bucket".to_owned()),
+            ..S3Config::default()
+        });
+        assert_eq!(
+            config
+                .storage
+                .snapshot
+                .backend
+                .resolve(config.storage.cold.backend),
+            crate::RaftSnapshotBackend::S3
+        );
+        config.validate().expect("the defaults are valid");
+        let copy = config.storage.snapshot.install_copy_budget();
+        assert_eq!(copy, std::time::Duration::from_secs(66));
+        assert!(
+            copy.saturating_mul(3)
+                <= config
+                    .raft
+                    .install_snapshot_timeout
+                    .as_duration()
+                    .saturating_mul(2),
+            "a margin of half the copy again"
+        );
+        // The cold store's budget is its own and stays as it was.
+        assert_eq!(
+            crate::s3_operation_budget(
+                config
+                    .storage
+                    .cold
+                    .s3
+                    .as_ref()
+                    .unwrap()
+                    .timeout
+                    .as_duration(),
+                config.storage.cold.s3.as_ref().unwrap().max_retries,
+            ),
+            std::time::Duration::from_secs(54)
+        );
+    }
+
+    /// #742: an explicit snapshot-store budget or install timeout that lets
+    /// the copy outlast the install is refused, naming the keys. With inline
+    /// snapshots there is no copy, and nothing is refused.
+    #[test]
+    fn an_install_copy_that_outlasts_its_install_is_refused() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.storage.snapshot.backend = crate::RaftSnapshotBackend::S3;
+        config.storage.snapshot.timeout = HumanDuration::sec(10);
+        config.storage.snapshot.max_retries = 3;
+        let err = config
+            .validate()
+            .expect_err("three 54 s requests outlast 120 s");
+        assert!(
+            matches!(
+                err,
+                ValidationError::SnapshotCopyOutlastsInstall {
+                    copy_budget,
+                    install_snapshot_timeout,
+                } if copy_budget == std::time::Duration::from_secs(162)
+                    && install_snapshot_timeout == std::time::Duration::from_secs(120)
+            ),
+            "{err}"
+        );
+        let message = err.to_string();
+        for key in [
+            "storage.snapshot.timeout",
+            "storage.snapshot.max_retries",
+            "raft.install_snapshot_timeout",
+        ] {
+            assert!(message.contains(key), "{message}");
+        }
+
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.storage.snapshot.backend = crate::RaftSnapshotBackend::S3;
+        config.raft.install_snapshot_timeout = HumanDuration::sec(60);
+        config.raft.deleted_data_max_age = Some(HumanDuration::min(8));
+        assert!(matches!(
+            config.validate(),
+            Err(ValidationError::SnapshotCopyOutlastsInstall { .. })
+        ));
+        config.storage.snapshot.backend = crate::RaftSnapshotBackend::Inline;
+        config.validate().expect("inline snapshots copy nothing");
     }
 
     #[test]

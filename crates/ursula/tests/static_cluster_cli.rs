@@ -2579,7 +2579,10 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
                 "init_membership_per_group = false\ndeleted_data_max_age = \"90s\"\n\
                  install_snapshot_timeout = \"10s\"\n",
             )
-            .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n"),
+            .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n")
+                // A follower's install copy, three snapshot-store requests,
+                // fits inside the 10 s install timeout.
+                + "\n[storage.snapshot]\ntimeout = \"3s\"\nmax_retries = 0\n",
         )
         .expect("write node config");
         admins.push(format!("http://127.0.0.1:{admin_port}"));

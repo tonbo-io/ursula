@@ -5380,7 +5380,7 @@ fn is_leadership_refusal(err: &RuntimeError) -> bool {
 /// [`GroupEngineError::refused_before_proposal`]: ursula_runtime::GroupEngineError::refused_before_proposal
 fn refused_before_proposal(err: &RuntimeError) -> bool {
     match err {
-        RuntimeError::GroupNotHosted { .. } => true,
+        RuntimeError::GroupNotHosted { .. } | RuntimeError::GroupOpening { .. } => true,
         RuntimeError::GroupEngine { error, .. } => error.refused_before_proposal(),
         RuntimeError::InvalidConfig(_)
         | RuntimeError::InvalidRaftGroup { .. }

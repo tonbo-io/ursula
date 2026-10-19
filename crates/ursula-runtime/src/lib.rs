@@ -123,7 +123,6 @@ pub use cold_store::new_cold_chunk_path_in_generation;
 pub use cold_store::new_cold_pack_path;
 pub use cold_store::new_external_payload_path;
 pub use cold_store::new_snapshot_part_id;
-pub use cold_store::s3_operation_budget;
 pub use cold_store::snapshot_part_dir;
 pub use cold_store::snapshot_part_object_incarnation;
 pub use cold_store::snapshot_part_owner_prefix;

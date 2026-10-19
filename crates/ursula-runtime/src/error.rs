@@ -19,8 +19,9 @@ pub enum ErrorStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RuntimeError {
-    /// The task that restarted one group's engine ended without finishing:
-    /// the group may be stopped on this node until a request creates it.
+    /// The task that restarted or opened one group's engine ended without
+    /// finishing: the group may be stopped on this node until a request
+    /// opens it.
     #[error("the restart of raft group {} did not finish", .raft_group_id.0)]
     GroupRestartAborted { raft_group_id: RaftGroupId },
     #[error("invalid shard runtime config: {0}")]
@@ -75,6 +76,14 @@ pub enum RuntimeError {
     /// refused, and the running engine stays.
     #[error("core {} already runs an engine for raft group {}", .core_id.0, .raft_group_id.0)]
     GroupAlreadyInstalled {
+        core_id: CoreId,
+        raft_group_id: RaftGroupId,
+    },
+    /// The group's engine opens on its core, or a shutdown of the group
+    /// began during the open. The request was refused before anything was
+    /// proposed.
+    #[error("core {} is opening the engine of raft group {}", .core_id.0, .raft_group_id.0)]
+    GroupOpening {
         core_id: CoreId,
         raft_group_id: RaftGroupId,
     },
@@ -134,11 +143,27 @@ impl RuntimeError {
         }
     }
 
+    /// Whether a group whose open answered this stays closed on its core
+    /// while the node serves its other groups: its replay stopped, or its
+    /// snapshot store did not answer its restore and the core reopens it
+    /// after a back-off.
+    pub fn leaves_group_closed(&self) -> bool {
+        matches!(self, Self::GroupEngine {
+            error: GroupEngineError::Infra(
+                crate::engine::GroupInfraError::ApplyStopped { .. }
+                    | crate::engine::GroupInfraError::Snapshot(
+                        crate::engine::GroupSnapshotError::StoreUnavailable { .. }
+                    )
+            ),
+            ..
+        })
+    }
+
     pub fn status(&self) -> ErrorStatus {
         match self {
-            Self::LiveReadBackpressure { .. } | Self::GroupNotHosted { .. } => {
-                ErrorStatus::Temporary
-            }
+            Self::LiveReadBackpressure { .. }
+            | Self::GroupNotHosted { .. }
+            | Self::GroupOpening { .. } => ErrorStatus::Temporary,
             Self::GroupEngine { error, .. } => error.status(),
             Self::GroupAlreadyInstalled { .. } => ErrorStatus::Persistent,
             Self::GroupRestartAborted { .. }

@@ -107,6 +107,10 @@ pub(crate) fn runtime_error_answer(err: &RuntimeError) -> (StatusCode, ErrorCode
         RuntimeError::GroupNotHosted { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
         }
+        // The group's engine opens on this node, so nothing was proposed.
+        RuntimeError::GroupOpening { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::GroupRestarting)
+        }
         RuntimeError::GroupEngine { error, .. } => match error {
             GroupEngineError::Stream(refusal) => stream_error_answer(refusal.code),
             GroupEngineError::Infra(infra) => infra_error_answer(infra),
