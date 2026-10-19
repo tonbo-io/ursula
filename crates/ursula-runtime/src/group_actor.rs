@@ -13,6 +13,7 @@ use crate::cold_index::RepairColdIndexRequest;
 use crate::cold_index::RepairColdIndexResponse;
 use crate::cold_refs::ColdOrphanSweepPlan;
 use crate::cold_refs::ColdOrphanSweepRequest;
+use crate::cold_uploads::UploadFence;
 use crate::command::GroupSnapshot;
 use crate::core_worker::CoreWorker;
 use crate::core_worker::ReadWatcher;

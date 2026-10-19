@@ -271,6 +271,7 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             stream_expires_at_ms: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("create with external payload");
@@ -286,6 +287,7 @@ async fn incarnation_scoped_stream_gc_reclaims_external_payloads() {
             producer: None,
             now_ms: 0,
             if_incarnation: None,
+            upload: crate::ProposedUpload::new(crate::UploadFence::Unreplicated),
         })
         .await
         .expect("append external payload");

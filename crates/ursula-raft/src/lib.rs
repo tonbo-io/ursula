@@ -70,9 +70,9 @@ mod owner;
 pub use leadership::GroupLeadership;
 pub use leadership::LeaderRole;
 pub use owner::OwnerRaftHandle;
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(any(test, madsim, feature = "fault-injection"))]
 pub use owner::StepDown;
-#[cfg(any(test, feature = "fault-injection"))]
+#[cfg(any(test, madsim, feature = "fault-injection"))]
 pub use owner::StepDownError;
 mod codec;
 mod election;

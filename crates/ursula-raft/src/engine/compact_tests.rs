@@ -24,6 +24,7 @@ use ursula_runtime::load_cold_chunks_from_pages;
 use ursula_shard::BucketStreamId;
 
 use super::test_support::JournalRuntime;
+use super::test_support::leader_upload;
 use super::test_support::spawn_journal_runtime;
 
 fn spawn_raft_with_cold_store(config: RuntimeConfig, cold_store: Arc<ColdStore>) -> JournalRuntime {
@@ -104,6 +105,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
             cold_generation: cold_generation(&runtime, &stream).await,
             stream_id: stream.clone(),
             chunk: slice.clone(),
+            upload: leader_upload(&runtime, &stream).await,
         })
         .await
         .expect("publish shared slice");
@@ -128,6 +130,7 @@ async fn raft_compacts_shared_slice_into_exclusive_chunk() {
             old_chunks: vec![slice],
             replacement: replacement.clone(),
             gc_not_before_ms: 0,
+            upload: leader_upload(&runtime, &stream).await,
         })
         .await
         .expect("raft engine compacts an all-shared input");
@@ -181,6 +184,7 @@ async fn a_failed_cold_index_write_is_a_cold_store_error() {
                     cold_generation: cold_generation(runtime, stream).await,
                     stream_id: stream.clone(),
                     chunk,
+                    upload: leader_upload(runtime, stream).await,
                 })
                 .await
         }

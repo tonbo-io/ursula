@@ -37,11 +37,11 @@ use ursula_headers::RaftGroup;
 use ursula_headers::RaftTerm;
 use ursula_headers::RoutingAnswer;
 use ursula_raft::GroupLeadership;
-use ursula_raft::LeaderRole;
 use ursula_runtime::EarlyAnswerQuery;
 use ursula_runtime::RouteWriteRequest;
 use ursula_runtime::RoutedWrite;
 use ursula_runtime::RuntimeError;
+use ursula_runtime::UploadFence;
 use ursula_runtime::WriteRoute;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -82,8 +82,13 @@ pub(crate) fn routed_before_body(method: &Method, route: Option<&MatchedPath>) -
 /// What a write's head decided.
 pub(crate) enum HeadDecision {
     /// This node leads the stream's group and admitted the write: read the
-    /// body, holding the permit (if admission runs) until the answer.
-    Read(Option<AdmissionPermit>),
+    /// body, holding the permit (if admission runs) until the answer. A
+    /// cold upload of the write is fenced to `fence`, the leadership that
+    /// admitted it (F14j).
+    Read {
+        permit: Option<AdmissionPermit>,
+        fence: UploadFence,
+    },
     /// The head alone decided the answer.
     Answer(Response),
 }
@@ -105,7 +110,9 @@ pub(crate) async fn route_before_body(
     // need the core.
     let viewed = leadership_view(state, raft_group_id);
     let routed = match viewed {
-        Some(WriteRoute::Leader { .. }) if early_answer.is_none() => return admit(admission),
+        Some(WriteRoute::Leader { fence, .. }) if early_answer.is_none() => {
+            return admit(admission, fence);
+        }
         Some(route @ (WriteRoute::Follower { .. } | WriteRoute::NoLeader)) => RoutedWrite {
             raft_group_id,
             route,
@@ -154,10 +161,11 @@ pub(crate) async fn route_before_body(
         // An early answer exists only for a query, which names its token.
         WriteRoute::Leader {
             early_answer: Some(answer),
+            ..
         } if let Some(incarnation) = incarnation => {
             HeadDecision::Answer(crate::early_answer_response(answer, incarnation))
         }
-        WriteRoute::Leader { .. } => admit(admission),
+        WriteRoute::Leader { fence, .. } => admit(admission, fence),
     }
 }
 
@@ -165,22 +173,55 @@ pub(crate) async fn route_before_body(
 /// without replication leads every group. `None` when the node has no
 /// replica of the group registered: it may host none, or not have started
 /// it yet, and the group's core decides.
+///
+/// A node without a Raft registry serves in-memory engines only, and its
+/// uploads are fenced to [`UploadFence::Unreplicated`]. A Raft engine behind
+/// such a front door refuses those uploads before proposing them and the
+/// uploader deletes them: the fail-safe answer, since a fence the engine
+/// supplied after the PUT would not bound the upload. A producer write with
+/// a query routes through its engine before the body and takes the engine's
+/// fence there, still before its PUT.
 fn leadership_view(state: &HttpState, raft_group_id: RaftGroupId) -> Option<WriteRoute> {
     let Some(registry) = state.raft_registry() else {
-        return Some(WriteRoute::Leader { early_answer: None });
+        return Some(WriteRoute::Leader {
+            early_answer: None,
+            fence: UploadFence::Unreplicated,
+        });
     };
     registry
         .leadership(raft_group_id)
         .map(GroupLeadership::write_route)
 }
 
-/// The Raft term in which this node leads `raft_group_id` now, by its
-/// leadership view: `0` for a node without replication, which leads every
-/// group, and `None` while it does not lead the group, a candidate
-/// included. A leader's node-local state (the staged parts it counts) is
-/// valid for one term.
+/// The leadership in which this node leads `raft_group_id` now, by its
+/// leadership view, which a cold upload it admits now is fenced to (F14j):
+/// [`UploadFence::Unreplicated`] for a node without replication, which
+/// leads every group, and `None` while it does not lead the group, a
+/// candidate included.
+pub(crate) fn upload_fence(state: &HttpState, raft_group_id: RaftGroupId) -> Option<UploadFence> {
+    registry_upload_fence(state.raft_registry(), raft_group_id)
+}
+
+/// [`upload_fence`] from a registry: [`UploadFence::Unreplicated`] without
+/// one.
+pub(crate) fn registry_upload_fence(
+    registry: Option<&ursula_raft::RaftGroupHandleRegistry>,
+    raft_group_id: RaftGroupId,
+) -> Option<UploadFence> {
+    let Some(registry) = registry else {
+        return Some(UploadFence::Unreplicated);
+    };
+    registry
+        .leadership(raft_group_id)
+        .and_then(|leadership| leadership.upload_fence())
+}
+
+/// The Raft term in which this node leads `raft_group_id` now, the term of
+/// its [`upload_fence`]: `0` for a node without replication, and `None`
+/// while it does not lead the group. A leader's node-local state (the
+/// staged parts it counts) is valid for one term.
 pub(crate) fn leader_term(state: &HttpState, raft_group_id: RaftGroupId) -> Option<u64> {
-    registry_leader_term(state.raft_registry(), raft_group_id)
+    upload_fence(state, raft_group_id).map(UploadFence::term)
 }
 
 /// [`leader_term`] from a registry: `0` without one.
@@ -188,13 +229,7 @@ pub(crate) fn registry_leader_term(
     registry: Option<&ursula_raft::RaftGroupHandleRegistry>,
     raft_group_id: RaftGroupId,
 ) -> Option<u64> {
-    let Some(registry) = registry else {
-        return Some(0);
-    };
-    registry
-        .leadership(raft_group_id)
-        .filter(|leadership| leadership.role == LeaderRole::Leads)
-        .map(|leadership| leadership.term)
+    registry_upload_fence(registry, raft_group_id).map(UploadFence::term)
 }
 
 /// The answer to a write whose node stopped leading after it routed the
@@ -207,18 +242,25 @@ pub(crate) async fn not_leading(
 ) -> Response {
     match route_before_body(state, stream_id, request_target, None, None).await {
         HeadDecision::Answer(answer) => answer,
-        HeadDecision::Read(_) => {
+        HeadDecision::Read { .. } => {
             let group = RaftGroup::from_u32(state.runtime.locate(stream_id).raft_group_id.0);
             routing_response(RoutingAnswer::NoLeader { group }, None)
         }
     }
 }
 
-/// Runs the deferred pressure checks, if admission runs.
-pub(crate) fn admit(admission: Option<DeferredAdmission>) -> HeadDecision {
+/// Runs the deferred pressure checks, if admission runs, for a write this
+/// node admits under `fence`.
+pub(crate) fn admit(admission: Option<DeferredAdmission>, fence: UploadFence) -> HeadDecision {
     match admission.map(DeferredAdmission::admit) {
-        None => HeadDecision::Read(None),
-        Some(Ok(permit)) => HeadDecision::Read(Some(permit)),
+        None => HeadDecision::Read {
+            permit: None,
+            fence,
+        },
+        Some(Ok(permit)) => HeadDecision::Read {
+            permit: Some(permit),
+            fence,
+        },
         Some(Err(refusal)) => HeadDecision::Answer(refusal.into_response()),
     }
 }

@@ -554,6 +554,8 @@ pub use self::trace::SimEvent;
 pub use self::trace::SimTrace;
 
 mod cold_path;
+#[cfg(test)]
+mod cold_upload_fence;
 mod generators;
 use cold_path::run_cold_delete_fault_inner;
 use cold_path::run_cold_live_read_inner;
@@ -837,6 +839,10 @@ struct MadsimScopedGroupEngine {
 impl GroupEngine for MadsimScopedGroupEngine {
     fn accepts_local_writes(&self) -> bool {
         self.inner.accepts_local_writes()
+    }
+
+    fn upload_fence(&self) -> Option<ursula_runtime::UploadFence> {
+        self.inner.upload_fence()
     }
 
     fn linearizable_read_barrier(&self) -> Option<Arc<dyn LinearizableReadBarrier>> {
@@ -2049,6 +2055,17 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .expect("wait for snapshot-purge simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
     (registry, engines, wals, leader_id)
+}
+
+/// An upload proposed on `engine`, fenced to the leadership it leads in now
+/// (F14j). While it does not lead, the upload has no leadership, and its
+/// proposal is refused before anything is proposed.
+pub(super) fn leader_upload(engine: &RaftGroupEngine) -> Arc<ursula_runtime::ProposedUpload> {
+    ursula_runtime::ProposedUpload::new(
+        engine
+            .upload_fence()
+            .unwrap_or(ursula_runtime::UploadFence::Unreplicated),
+    )
 }
 
 pub(super) fn placement() -> ShardPlacement {

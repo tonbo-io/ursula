@@ -463,6 +463,11 @@ async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
         .write_chunk(&path, &body)
         .await
         .context("write replacement")?;
+    let fence = rt
+        .cold_upload_fence(rt.locate(&a))
+        .await
+        .context("read the upload fence")?
+        .context("the replica leads its group")?;
     let result = rt
         .compact_cold(CompactColdRequest {
             stream_id: a.clone(),
@@ -477,6 +482,7 @@ async fn compact_on(engine: Engine) -> Result<(Value, bool)> {
                 payload_digest: blake3::hash(&body).to_hex().to_string(),
             },
             gc_not_before_ms: 0,
+            upload: ursula_runtime::ProposedUpload::new(fence),
         })
         .await;
     let (after, _) = snap(&rt).await?;

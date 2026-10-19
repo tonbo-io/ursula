@@ -71,7 +71,9 @@ use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
 use ursula_runtime::MAX_COLD_SNAPSHOT_BYTES;
+use ursula_runtime::ProposedUpload;
 use ursula_runtime::SnapshotDigest;
+use ursula_runtime::UploadFence;
 use ursula_runtime::is_snapshot_part_id;
 use ursula_runtime::new_external_payload_path;
 use ursula_runtime::new_snapshot_part_id;
@@ -506,7 +508,8 @@ fn open_unless_out_of_range(target: &PublishTarget, head: &HeadStreamResponse) -
 /// node's in-flight body budget, which the copy is charged against once it
 /// holds its slot, until the copy ends. The publish carries the incarnation
 /// the parts were found for as its precondition, so a stream recreated
-/// meanwhile is not published to.
+/// meanwhile is not published to. The copy is fenced to `fence`, the
+/// leadership this node led in after the key check (F14j).
 pub(crate) async fn commit(
     mut target: PublishTarget,
     commit: PartsCommit,
@@ -514,6 +517,7 @@ pub(crate) async fn commit(
     budget: Option<BodyBudget>,
     manifest_permit: Option<AdmissionPermit>,
     body: Body,
+    fence: UploadFence,
 ) -> Response {
     let sent_token = target.if_incarnation.is_some();
     target.if_incarnation = Some(incarnation);
@@ -572,6 +576,7 @@ pub(crate) async fn commit(
             &manifest,
             budget.as_ref(),
             sent_token,
+            fence,
         )
         .await;
         if answer.send(response).is_err() {
@@ -626,6 +631,7 @@ async fn run_commit(
     manifest: &PartsManifest,
     budget: Option<&BodyBudget>,
     sent_token: bool,
+    fence: UploadFence,
 ) -> (Response, Option<Vec<ResolvedPart>>) {
     let owner = PartOwner {
         stream_id: &target.stream_id,
@@ -663,7 +669,7 @@ async fn run_commit(
             return (PartsRefusal::Busy.into_response(), None);
         }
     };
-    let assembled = assemble(cold_store, target, &parts, commit, pieces).await;
+    let assembled = assemble(cold_store, target, &parts, commit, pieces, fence).await;
     drop(charged);
     let assembled = match assembled {
         Ok(assembled) => assembled,
@@ -789,13 +795,15 @@ async fn resolve(
 /// prefix while computing the snapshot digest, and keeps the object only
 /// when the digest is the one the commit names. Up to `pieces_in_flight`
 /// pieces are read ahead of the one hashed and written, which stay in
-/// order. A part that is gone answers [`PartsRefusal::UnknownPart`].
+/// order. A part that is gone answers [`PartsRefusal::UnknownPart`]. The
+/// copy's upload is fenced to `fence` (F14j).
 async fn assemble(
     cold_store: &ColdStoreHandle,
     target: &PublishTarget,
     parts: &[ResolvedPart],
     commit: &PartsCommit,
     pieces_in_flight: usize,
+    fence: UploadFence,
 ) -> Result<ColdSnapshotBody, PartsRefusal> {
     let path = new_external_payload_path(&target.stream_id);
     let mut digest = SnapshotDigest::new(&target.content_type);
@@ -856,6 +864,7 @@ async fn assemble(
             object_size,
         },
         digest: assembled.to_string(),
+        upload: ProposedUpload::new(fence),
     })
 }
 

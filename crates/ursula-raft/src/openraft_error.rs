@@ -3,9 +3,10 @@
 //! OpenRaft's errors are not serializable, and their text names internal
 //! node addresses (a quorum error lists every member). Each conversion here
 //! logs the native error once and answers with the variant a caller acts
-//! on: a leadership refusal for a forward, `OutcomeUnknown` for a write
-//! whose answer was lost (a core that stopped after it took the write
-//! included), and the setup variants for a group that does not start. A
+//! on: a leadership refusal for a forward and for a write that never
+//! reached a core that stopped, `OutcomeUnknown` for a write whose answer
+//! was lost (a core that stopped after it took the write included), and the
+//! setup variants for a group that does not start. A
 //! core that stopped before anything was asked of it (`Fatal`) is
 //! `OwnerStopped`, through [`owner_stopped`], the conversion every owner
 //! call uses.
@@ -17,6 +18,7 @@ use openraft::error::ClientWriteError;
 use openraft::error::InitializeError;
 use openraft::error::LinearizableReadError;
 use openraft::error::RaftError;
+use openraft::errors::Fatal;
 use openraft::errors::ForwardReason;
 use openraft::metrics::WaitError;
 use openraft::raft::WriteResult;
@@ -92,18 +94,20 @@ pub(crate) fn leader_wait_error(
     }
 }
 
-/// A write that OpenRaft refused, or whose answer was lost after it took it.
-pub(crate) fn group_engine_client_write_error(
-    err: RaftError<C, ClientWriteError<C>>,
-    leadership: &GroupLeadership,
-) -> GroupEngineError {
-    match err.api_error() {
-        Some(refusal) => client_write_refusal(refusal, leadership),
-        None => {
-            tracing::warn!(error = %err, "Raft write response lost after submission");
-            GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
-        }
-    }
+/// A write whose submission did not reach RaftCore. `Raft::write` fails
+/// only when RaftCore stopped and its queue handed the message back unsent,
+/// so nothing of the write was proposed: the replica no longer leads, and no
+/// leader is known to it.
+pub(crate) fn write_not_submitted(fatal: Fatal<C>) -> GroupEngineError {
+    tracing::warn!(error = %fatal, "Raft write not submitted: the Raft core stopped");
+    unknown_leader(LeadershipReason::SteppedDown, Proposal::NotProposed)
+}
+
+/// A write RaftCore took whose answer never came: the core stopped after it
+/// took the write, which may have committed and applies after repair.
+pub(crate) fn write_answer_lost() -> GroupEngineError {
+    tracing::warn!("Raft write response lost after submission");
+    GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
 }
 
 /// Map OpenRaft's refusal of a proposed write (RT1). OpenRaft forwards a

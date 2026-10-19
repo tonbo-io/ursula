@@ -2250,6 +2250,15 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
                 EntryPayload::Normal(command) => {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
+                    #[cfg(madsim)]
+                    {
+                        let ursula_runtime::GroupWriteCommand::Stream(stream_command) = &command;
+                        let leader = entry.log_id.committed_leader_id();
+                        ursula_runtime::cold_uploads::fence_ledger::note_applied(
+                            stream_command,
+                            ursula_runtime::CommittedLeader::new(leader.term, leader.node_id),
+                        );
+                    }
                     // What the entry removes shows in the tally around it
                     // (#669).
                     let removed_before = self.engine.removed_state();

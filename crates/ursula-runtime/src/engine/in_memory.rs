@@ -80,6 +80,7 @@ use crate::cold_refs::ColdOrphanSweepStream;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::cold_store::cold_pack_dir;
+use crate::cold_uploads::UploadFence;
 use crate::command::GroupSnapshot;
 use crate::command::GroupWriteCommand;
 use crate::request::AckColdGcResponse;
@@ -1436,6 +1437,12 @@ impl InMemoryGroupEngine {
 }
 
 impl GroupEngine for InMemoryGroupEngine {
+    /// Without replication the engine leads in one leadership for as long
+    /// as it runs.
+    fn upload_fence(&self) -> Option<UploadFence> {
+        Some(UploadFence::Unreplicated)
+    }
+
     fn create_stream<'a>(
         &'a mut self,
         request: CreateStreamRequest,
@@ -1791,6 +1798,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 early_answer: request
                     .early_answer_request()
                     .and_then(|request| self.producer_early_answer_now(&request)),
+                fence: UploadFence::Unreplicated,
             })
         })
     }

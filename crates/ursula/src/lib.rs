@@ -171,6 +171,7 @@ use ursula_runtime::LiveReadOwner;
 use ursula_runtime::PlanColdFlushRequest;
 use ursula_runtime::ProducerEarlyAnswer;
 use ursula_runtime::ProducerRequest;
+use ursula_runtime::ProposedUpload;
 use ursula_runtime::PublishSnapshotRequest;
 use ursula_runtime::ReadEnd;
 use ursula_runtime::ReadSnapshotRequest;
@@ -180,6 +181,7 @@ use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
 use ursula_runtime::StreamErrorCode;
 use ursula_runtime::StreamErrorContext;
+use ursula_runtime::UploadFence;
 use ursula_runtime::new_external_payload_path;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
@@ -3290,17 +3292,17 @@ pub(crate) async fn create_stream(
     };
     let decision =
         front_door::route_before_body(&state, &stream_id, &request_target, None, admission.0).await;
-    let _permit = match decision {
+    let (_permit, fence) = match decision {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
-        HeadDecision::Read(permit) => permit,
+        HeadDecision::Read { permit, fence } => (permit, fence),
     };
     let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
         Ok(body) => body,
         Err(err) => return unreadable_body_response(&err),
     };
-    create_stream_by_id(state, stream_id, headers, head, body).await
+    create_stream_by_id(state, stream_id, headers, head, body, fence).await
 }
 
 /// A create's head, parsed once before routing (the checks that answer
@@ -3343,12 +3345,16 @@ fn refuse_create_producer_headers(headers: &HeaderMap) -> Result<(), Box<Respons
     }
 }
 
+/// Creates the stream the head `head` and the body `body` describe. A body
+/// staged in the cold tier is fenced to `fence`, the leadership that
+/// admitted the create (F14j).
 pub(crate) async fn create_stream_by_id(
     state: HttpState,
     stream_id: BucketStreamId,
     request_headers: HeaderMap,
     head: CreateHead,
     body: Bytes,
+    fence: UploadFence,
 ) -> Response {
     let CreateHead {
         stream_ttl_seconds,
@@ -3378,7 +3384,7 @@ pub(crate) async fn create_stream_by_id(
     request.stream_ttl_seconds = stream_ttl_seconds;
     request.stream_expires_at_ms = stream_expires_at_ms;
     if should_externalize_payload(&state, request.initial_payload.len(), true) {
-        return create_stream_external_by_id(state, request).await;
+        return create_stream_external_by_id(state, request, fence).await;
     }
 
     match state.runtime.create_stream(request).await {
@@ -3396,6 +3402,7 @@ pub(crate) async fn create_stream_by_id(
 pub(crate) async fn create_stream_external_by_id(
     state: HttpState,
     mut request: CreateStreamRequest,
+    fence: UploadFence,
 ) -> Response {
     let stream_id = request.stream_id.clone();
     let content_type = request.content_type.clone();
@@ -3408,8 +3415,12 @@ pub(crate) async fn create_stream_external_by_id(
         Err(response) => return response,
     };
     let external_path = external_payload.s3_path.clone();
-    let external_request =
-        CreateStreamExternalRequest::from_create_request(request, external_payload, message_count);
+    let external_request = CreateStreamExternalRequest::from_create_request(
+        request,
+        external_payload,
+        message_count,
+        ProposedUpload::new(fence),
+    );
 
     match state.runtime.create_stream_external(external_request).await {
         Ok(response) => {
@@ -3459,17 +3470,17 @@ pub(crate) async fn append_stream(
         admission.0,
     )
     .await;
-    let _permit = match decision {
+    let (_permit, fence) = match decision {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
-        HeadDecision::Read(permit) => permit,
+        HeadDecision::Read { permit, fence } => (permit, fence),
     };
     let body = match axum::body::to_bytes(body, MAX_HTTP_BODY_BYTES).await {
         Ok(body) => body,
         Err(err) => return unreadable_body_response(&err),
     };
-    append_stream_by_id(state, stream_id, headers, head, body).await
+    append_stream_by_id(state, stream_id, headers, head, body, fence).await
 }
 
 /// An append's head, parsed once before routing (step 1 of #581 section
@@ -3599,6 +3610,7 @@ pub(crate) async fn append_stream_by_id(
     headers: HeaderMap,
     head: AppendHead,
     body: Bytes,
+    fence: UploadFence,
 ) -> Response {
     let AppendHead {
         if_incarnation,
@@ -3647,7 +3659,7 @@ pub(crate) async fn append_stream_by_id(
     request.producer = producer;
 
     if should_externalize_payload(&state, request.payload.len(), true) {
-        return append_stream_external_by_id(state, request).await;
+        return append_stream_external_by_id(state, request, fence).await;
     }
 
     match state.runtime.append(request).await {
@@ -3656,9 +3668,12 @@ pub(crate) async fn append_stream_by_id(
     }
 }
 
+/// Appends `request` with its payload staged in the cold tier, fenced to
+/// `fence`, the leadership that admitted the append (F14j).
 pub(crate) async fn append_stream_external_by_id(
     state: HttpState,
     mut request: AppendRequest,
+    fence: UploadFence,
 ) -> Response {
     let stream_id = request.stream_id.clone();
     let message_count = request.canonical_message_count();
@@ -3668,8 +3683,12 @@ pub(crate) async fn append_stream_external_by_id(
         Err(response) => return response,
     };
     let external_path = external_payload.s3_path.clone();
-    let external_request =
-        AppendExternalRequest::from_append_request(request, external_payload, message_count);
+    let external_request = AppendExternalRequest::from_append_request(
+        request,
+        external_payload,
+        message_count,
+        ProposedUpload::new(fence),
+    );
     match state.runtime.append_external(external_request).await {
         Ok(response) => {
             if response.deduplicated() {
@@ -4079,17 +4098,18 @@ pub(crate) async fn publish_snapshot(
             admission.0,
         )
         .await;
-        let _permit = match decision {
+        let (_permit, fence) = match decision {
             HeadDecision::Answer(answer) => {
                 return answer_before_body(answer, version, &headers, body).await;
             }
-            HeadDecision::Read(permit) => permit,
+            HeadDecision::Read { permit, fence } => (permit, fence),
         };
         return match cold_snapshot::receive_snapshot_body(
             &snapshot.state,
             &snapshot.stream_id,
             &snapshot.content_type,
             body,
+            fence,
         )
         .await
         {
@@ -4117,6 +4137,23 @@ pub(crate) async fn publish_snapshot(
         }
         snapshot_parts::KeyCheck::Open { incarnation } => incarnation,
     };
+    // The commit's copy is fenced to the leadership this node leads in
+    // after its key check (F14j). A node that lost the lead since routing
+    // answers as the routing does now, before the body.
+    let raft_group_id = snapshot
+        .state
+        .runtime
+        .locate(&snapshot.stream_id)
+        .raft_group_id;
+    let Some(fence) = front_door::upload_fence(&snapshot.state, raft_group_id) else {
+        let answer = front_door::not_leading(
+            &snapshot.state,
+            &snapshot.stream_id,
+            &snapshot.request_target,
+        )
+        .await;
+        return answer_before_body(answer, version, &headers, body).await;
+    };
     // The manifest is charged at most its own bound; the copy is charged
     // once it holds a copy slot.
     let budget = admission
@@ -4127,13 +4164,22 @@ pub(crate) async fn publish_snapshot(
     let admission = admission
         .0
         .map(|admission| admission.capped(manifest_bytes));
-    let manifest_permit = match front_door::admit(admission) {
+    let manifest_permit = match front_door::admit(admission, fence) {
         HeadDecision::Answer(answer) => {
             return answer_before_body(answer, version, &headers, body).await;
         }
-        HeadDecision::Read(permit) => permit,
+        HeadDecision::Read { permit, .. } => permit,
     };
-    snapshot_parts::commit(snapshot, commit, incarnation, budget, manifest_permit, body).await
+    snapshot_parts::commit(
+        snapshot,
+        commit,
+        incarnation,
+        budget,
+        manifest_permit,
+        body,
+        fence,
+    )
+    .await
 }
 
 /// The bare `{stream}/snapshot` path (the removed latest-snapshot redirect
@@ -5487,6 +5533,8 @@ mod server_metadata_tests;
 mod snapshot_parts_tests;
 #[cfg(test)]
 mod staging_cleanup_tests;
+#[cfg(test)]
+mod upload_fence_tests;
 #[cfg(test)]
 mod write_keys_tests;
 #[cfg(test)]

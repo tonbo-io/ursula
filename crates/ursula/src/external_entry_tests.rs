@@ -16,7 +16,7 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
-use crate::router;
+use crate::router_with_raft_registry;
 
 /// A body just under the request limit: `[0,0,...,0]`, whose normalized
 /// text is one `0\n` message per value, the most messages a body can hold.
@@ -96,8 +96,11 @@ async fn first_bytes(app: &Router, uri: &str) -> Vec<u8> {
 
 /// A durable single-node Raft runtime with a memory cold store, so bodies of
 /// 1 MiB or more are staged and their writes replicate as external entries.
+/// Its groups register in `registry`, whose leadership view the front door
+/// routes by and fences the staged uploads to (F14j).
 fn durable_runtime_with_cold_store(
     wal_root: &tempfile::TempDir,
+    registry: &ursula_raft::RaftGroupHandleRegistry,
 ) -> (ShardRuntime, ursula_raft::RaftWal) {
     let raft_wal = ursula_raft::RaftWal::start(
         wal_root.path(),
@@ -113,7 +116,8 @@ fn durable_runtime_with_cold_store(
         ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
             raft_wal.clone(),
             Some(cold_store.clone()),
-        ),
+        )
+        .with_registry(registry.clone()),
         Some(cold_store),
     )
     .expect("runtime");
@@ -127,8 +131,9 @@ fn wal_bytes(runtime: &ShardRuntime) -> u64 {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn external_json_writes_of_tiny_messages_make_small_entries() {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let (runtime, raft_wal) = durable_runtime_with_cold_store(&wal_root);
-    let app = router(runtime.clone());
+    let registry = ursula_raft::RaftGroupHandleRegistry::default();
+    let (runtime, raft_wal) = durable_runtime_with_cold_store(&wal_root, &registry);
+    let app = router_with_raft_registry(runtime.clone(), registry);
     let body = tiny_messages_body();
 
     // An append to an existing stream.

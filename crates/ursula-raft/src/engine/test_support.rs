@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use ursula_config::WalFsync;
 use ursula_runtime::ColdStore;
+use ursula_runtime::ProposedUpload;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
+use ursula_shard::BucketStreamId;
 
 use super::DurableRaftGroupEngineFactory;
 use crate::RaftGroupHandleRegistry;
@@ -62,4 +64,18 @@ pub(crate) fn spawn_journal_runtime_published(
         runtime,
         _wal_root: wal_root,
     }
+}
+
+/// An upload a test proposes on `runtime`'s replica of `stream_id`'s group,
+/// fenced to the leadership that replica leads in now (F14j).
+pub(crate) async fn leader_upload(
+    runtime: &ShardRuntime,
+    stream_id: &BucketStreamId,
+) -> Arc<ProposedUpload> {
+    let fence = runtime
+        .cold_upload_fence(runtime.locate(stream_id))
+        .await
+        .expect("read the upload fence")
+        .expect("the replica leads its group");
+    ProposedUpload::new(fence)
 }

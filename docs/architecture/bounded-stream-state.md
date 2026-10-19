@@ -146,17 +146,18 @@ Every read is capped at `READ_MAX_RESPONSE_BYTES` = 8 MiB (`crates/ursula/src/li
 
 The cold-index page cache is bounded by pages and by approximate bytes (`DEFAULT_COLD_INDEX_CACHE_BYTES` = 32 MiB). Its LRU deque is rebuilt from the live pages once it holds more than twice as many entries, which is amortized O(1) per lookup. One page cache per group serves reads, bootstrap and forwarded reads, so apply-time invalidation covers all of them. The cold read cache prunes idle `readers` entries by last-read generation once the map reaches max(4 × cache blocks, a fixed minimum).
 
-### F14a to F14i: cold-object hygiene
+### F14a to F14j: cold-object hygiene
 
 - **F14a, external prefix in stream GC.** Stream delete reclaims the stream incarnation's `external/` objects with its chunks and pages.
 - **F14b, GC worker.** One group's GC failure does not stop the others. `DeferColdGc` moves a failing head entry to the tail with exponential backoff, so one bad entry cannot block the FIFO.
 - **F14c, no tiny exclusive objects.** A lone flush candidate below 1 MiB is packed alone as a pack of one, and F2 bounds the resulting refs.
 - **F14d, compaction debt** (`ursula-runtime/src/runtime/compaction_debt.rs`). Paths that create small exclusive chunks record the pages they touched, at most 65,536 pages per node. The same-stream compactor drains that set and lists nothing. The F19 repair cursor refills it for idle streams after a failover.
-- **F14e, stale flushes.** On a definite rejection the Raft flush path rolls back its page entry and deletes the chunk.
+- **F14e, stale flushes.** On a definite rejection the Raft flush path rolls back its page entry and deletes the chunk. A proposal its leadership fence refuses (F14j) is a definite rejection, so every upload path deletes its object at once. A pack is deleted when none of its slices was published and every outcome so far is definite. An unknown outcome keeps it for F14h.
 - **F14f, retention GC** (`ursula-runtime/src/retention_gc.rs`). Only deployments that trim need it. The F19 repair cursor notes each stream's retained offset. Once that observation is older than the retention grace (300 s), it deletes the pages wholly below the offset that hold only entries below it, then the objects only those pages name. It never writes the boundary page, so up to about one page span (64 MiB) of objects below the offset stays per stream. Direct external refs that retention drops from state are queued for GC at apply with the same grace.
 - **F14g, incarnation-scoped objects.** Pages live under generation = incarnation and exclusive chunk names carry the incarnation. Stream GC entries carry the incarnation and delete only that incarnation's names. The worker refuses a stream entry without one and deletes nothing.
 - **F14h, orphan sweep** (`ursula-runtime/src/runtime/orphan_sweep.rs`). Every 600 s each led group sweeps up to 16 streams after its cursor, plus its pack directories at the start of a cycle, and deletes objects older than one day that no state ref, page or GC entry references. It feeds the `cold_orphan_*` counters. Deleters rely on unique names. The name of every new chunk, pack, external payload and snapshot part ends in its write time in nanoseconds and a 64-bit random nonce (`cold_store.rs`), so whatever the clocks and restarts of the nodes, two names collide only if they share the nanosecond and draw the same 64 random bits, with probability about 2^-64 per pair.
 - **F14i, retention grace.** Retention releases dropped pack slices with `RETENTION_COLD_GC_GRACE_MS` (300 s), replicated as the GC entry's not-before time, so a read planned before the retention still finds its bytes.
+- **F14j, fenced uploads** (`ursula-runtime/src/cold_uploads.rs`). A proposal that names as new an object its leader uploaded (a flushed chunk or pack, a compaction's replacement, an external payload, a snapshot body or a parts commit's copy) is appended only under the committed leader, its term and node, that admitted the upload before its PUT. The flush, compaction and shared-ref passes take that leadership after their plan, the front door at the routing check that admits the write, and a parts commit after its key check. The requests of one upload share one `ProposedUpload` that carries it, the only way an upload proposal reaches its fence, and the Raft engine hands the proposal to OpenRaft with `with_leader`. OpenRaft refuses it before it appends anything once that leadership ended, a re-election of the same node included, and the refusal says that nothing was proposed, so the uploader deletes its object (F14e). An upload command that reaches the engine without a fence, on the single or the batch path, is refused the same way and logged as an error. The leadership a leader reads from its Raft metrics can lag OpenRaft's, which only gets an upload refused. The external-locator offload (F5) is fenced the same way. So an entry that names an uploaded object commits only under the leadership that uploaded it.
 
 ### F15: tenant tombstones (known exception)
 
@@ -219,6 +220,7 @@ Each defect class is pinned by tests that drive the production entry points.
 | D4 | Stream GC after a delete and recreate deleted the new incarnation's objects | F14g | `d4_recreate_with_gc_pending_keeps_new_incarnation_objects` (ursula-runtime) |
 | D5 | Objects of ambiguous publishes leaked with no reclaim path | F14h | `f14h_orphan_sweep_reclaims_only_unreferenced_objects_after_the_grace` (ursula-runtime) |
 | D6 | Retention released dropped pack slices with no grace, failing reads planned before it | F14i | `f14i_retention_keeps_dropped_pack_slices_for_the_grace` (ursula-runtime) |
+| D7 | An upload whose write waited across a re-election of its leader was appended under the next leadership | F14j | `an_upload_proposed_after_its_leadership_ended_is_refused_before_append`, `an_upload_command_without_a_fence_is_refused` (ursula-raft), `a_pack_whose_leadership_ended_during_its_put_is_refused_and_deleted` (ursula-runtime) |
 
 ## 7. Verification
 
@@ -251,12 +253,13 @@ The formula targets (`crates/ursula-state-probe/src/formula.rs`) check per strea
 
 ### 7.3 DST invariants
 
-The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.rs` check two invariants on top of the correctness invariants in [`deterministic-simulation-testing.md`](deterministic-simulation-testing.md).
+The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.rs` and `cold_upload_fence.rs` check three invariants on top of the correctness invariants in [`deterministic-simulation-testing.md`](deterministic-simulation-testing.md).
 
 - **Invariant 11, no stale locators.** After any ambiguous external append, offload or compaction, readable bytes equal acknowledged bytes on every replica, and inputs of a compaction that never committed are not deleted. Tests: `external_locators_survive_ambiguous_commits`, `external_locators_survive_snapshot_install_with_staged_refs`, `external_locators_survive_ambiguous_compaction`.
 - **Invariant 12, identical producer state.** After the same log prefix every replica holds the same producer records and epoch floor, whether it replayed the log or installed a snapshot. Test: `producer_state_matches_after_snapshot_install_mid_stream`.
+- **Invariant 13, fenced uploads.** Across re-elections of the uploading leader and leader changes, every replica applies an entry that names an uploaded object only under the leadership the upload was fenced to (F14j), every acknowledged byte reads back on every replica, and every refused upload is deleted. Test: `cold_uploads_stay_fenced_under_leader_churn`, which drives the engines and deletes a refused upload by the rule the runtime and the front door apply. Their own delete paths are covered by their unit tests (`cold_upload_fence_tests.rs` of `ursula-runtime` and `upload_fence_tests.rs` of `ursula`). Its negative control, `negative_control_an_unfenced_upload_commits_under_a_later_leadership`, turns `Defence::UploadFence` off, and an upload that waited across its uploader's re-election commits under the later leadership.
 
-`dst-nightly.yml` runs each at its default seeds, then sweeps larger seed ranges of the `external_locators_survive` family through the `*_SEEDS` variables.
+`dst-nightly.yml` runs each at its default seeds, then sweeps larger seed ranges of the `external_locators_survive` family and of `cold_uploads_stay_fenced_under_leader_churn` through the `*_SEEDS` variables.
 
 ### 7.4 Gauges
 

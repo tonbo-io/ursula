@@ -10,6 +10,9 @@
 //! - [`cold_refs`]: value types of the shared pack-reference compaction driver
 //!   (F2), the cold orphan sweep (F14h) and the external-locator offload
 //!   (F5), and object-name age parsing.
+//! - [`cold_uploads`]: the leadership a cold upload is fenced to (F14j), the
+//!   one value its proposals reach that fence through, and the object a
+//!   command names as new.
 //! - [`cold_worker`]: background flush, compaction, GC, page-repair,
 //!   orphan-sweep and external-locator offload loops.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
@@ -50,6 +53,7 @@ pub mod cold_index;
 mod cold_references;
 mod cold_refs;
 mod cold_store;
+pub mod cold_uploads;
 pub mod cold_worker;
 mod command;
 mod core_worker;
@@ -138,6 +142,11 @@ pub use cold_store::snapshot_part_object_incarnation;
 pub use cold_store::snapshot_part_owner_prefix;
 pub use cold_store::snapshot_part_path;
 pub use cold_store::snapshot_part_stream_prefix;
+pub use cold_uploads::CommittedLeader;
+pub use cold_uploads::ProposedUpload;
+pub use cold_uploads::UploadFence;
+pub use cold_uploads::upload_not_leading;
+pub use cold_uploads::uploaded_object;
 pub use cold_worker::spawn_cold_compaction_worker_if_configured;
 pub use cold_worker::spawn_cold_flush_worker_if_configured;
 pub use cold_worker::spawn_cold_gc_worker_if_configured;
@@ -384,6 +393,8 @@ mod cold_drivers_tests;
 mod cold_gc_hygiene_tests;
 #[cfg(test)]
 mod cold_page_repair_tests;
+#[cfg(all(test, not(madsim)))]
+mod cold_upload_fence_tests;
 #[cfg(test)]
 mod external_offload_tests;
 #[cfg(test)]

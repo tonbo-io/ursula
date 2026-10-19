@@ -2276,6 +2276,13 @@ impl WriteToOpenRaft {
             max_hot_bytes_per_group: Some(1 << 20),
         };
         let append = || AppendRequest::from_bytes(stream_id.clone(), b"abc".to_vec());
+        // An upload is fenced to the leadership the engine leads in when the
+        // write starts, which its deposition ends only after the append.
+        let upload = ursula_runtime::ProposedUpload::new(
+            engine
+                .upload_fence()
+                .expect("the engine leads when the write starts"),
+        );
         match self {
             Self::Create => vec![
                 engine
@@ -2298,6 +2305,7 @@ impl WriteToOpenRaft {
                                 object_size: 3,
                             },
                             0,
+                            upload.clone(),
                         ),
                         placement(),
                     )
@@ -2348,6 +2356,7 @@ impl WriteToOpenRaft {
                             producer: None,
                             now_ms: 0,
                             if_incarnation: None,
+                            upload: upload.clone(),
                         },
                         placement(),
                     )
@@ -2557,7 +2566,8 @@ async fn writes_are_routed_before_their_body() {
         if index == leader_index {
             assert!(
                 matches!(route, WriteRoute::Leader {
-                    early_answer: Some(ProducerEarlyAnswer::Repeat(_))
+                    early_answer: Some(ProducerEarlyAnswer::Repeat(_)),
+                    ..
                 }),
                 "{route:?}"
             );

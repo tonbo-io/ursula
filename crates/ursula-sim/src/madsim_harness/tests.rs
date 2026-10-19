@@ -2076,7 +2076,12 @@ fn leader_applied_index(engine: &RaftGroupEngine) -> u64 {
         .expect("leader applied index")
 }
 
-fn external_append_request(stream: &BucketStreamId, path: &str, len: u64) -> AppendExternalRequest {
+fn external_append_request(
+    stream: &BucketStreamId,
+    path: &str,
+    len: u64,
+    upload: Arc<ursula_runtime::ProposedUpload>,
+) -> AppendExternalRequest {
     AppendExternalRequest {
         stream_id: stream.clone(),
         content_type: "application/octet-stream".to_owned(),
@@ -2091,6 +2096,7 @@ fn external_append_request(stream: &BucketStreamId, path: &str, len: u64) -> App
         producer: None,
         now_ms: 0,
         if_incarnation: None,
+        upload,
     }
 }
 
@@ -2213,7 +2219,12 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
         .write_chunk(&ambiguous_path, &ambiguous)
         .await
         .expect("stage ambiguous payload");
-    let ambiguous_request = external_append_request(&stream, &ambiguous_path, 64);
+    let ambiguous_request = external_append_request(
+        &stream,
+        &ambiguous_path,
+        64,
+        leader_upload(&engines[leader]),
+    );
     let ambiguous_committed = match variant {
         LocatorAmbiguity::UncommittedOnIsolatedLeader => {
             isolate(&policy, leader_id);
@@ -2281,9 +2292,10 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
         .expect("stage committed payload");
     let mut appended = None;
     for _ in 0..50 {
+        let upload = leader_upload(&engines[leader]);
         match engines[leader]
             .append_external(
-                external_append_request(&stream, &committed_path, 40),
+                external_append_request(&stream, &committed_path, 40, upload),
                 placement(),
             )
             .await
@@ -2434,8 +2446,12 @@ async fn external_locator_snapshot_install(seed: u64) {
             .await
             .expect("stage external payload");
         let len = u64::try_from(payload.len()).expect("len fits u64");
+        let upload = leader_upload(&engines[leader_index]);
         engines[leader_index]
-            .append_external(external_append_request(&stream, &path, len), placement())
+            .append_external(
+                external_append_request(&stream, &path, len, upload),
+                placement(),
+            )
             .await
             .expect("external append");
         acknowledged.extend_from_slice(&payload);
@@ -2640,12 +2656,14 @@ async fn ambiguous_compaction(commits: bool) {
             object_size,
             ..Default::default()
         };
+        let upload = leader_upload(&engines[leader]);
         engines[leader]
             .flush_cold(
                 FlushColdRequest {
                     cold_generation: candidate.cold_generation,
                     stream_id: stream.clone(),
                     chunk: chunk.clone(),
+                    upload,
                 },
                 placement(),
             )
@@ -2659,9 +2677,10 @@ async fn ambiguous_compaction(commits: bool) {
         .write_chunk(&external_path, &external)
         .await
         .expect("stage external payload");
+    let upload = leader_upload(&engines[leader]);
     engines[leader]
         .append_external(
-            external_append_request(&stream, &external_path, 48),
+            external_append_request(&stream, &external_path, 48, upload),
             placement(),
         )
         .await
@@ -2702,6 +2721,7 @@ async fn ambiguous_compaction(commits: bool) {
             ..Default::default()
         },
         gc_not_before_ms: u64::MAX,
+        upload: leader_upload(&engines[leader]),
     };
     apply_barrier(&engines, leader, "barrier-prefix").await;
     if commits {

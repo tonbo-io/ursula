@@ -18,6 +18,8 @@ use crate::cold_index::ColdIndexPageCache;
 use crate::cold_index::ColdStoreColdIndexPageStore;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::DEFAULT_CONTENT_TYPE;
+use crate::cold_uploads::ProposedUpload;
+use crate::cold_uploads::UploadFence;
 use crate::engine::GroupEngineError;
 use crate::engine::in_memory::InMemoryGroupEngine;
 
@@ -37,7 +39,7 @@ pub struct CreateStreamRequest {
     pub if_incarnation: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateStreamExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
@@ -51,8 +53,10 @@ pub struct CreateStreamExternalRequest {
     pub stream_expires_at_ms: Option<u64>,
     pub now_ms: u64,
     /// See [`CreateStreamRequest::if_incarnation`].
-    #[serde(default)]
     pub if_incarnation: Option<u64>,
+    /// The upload of `initial_payload`, fenced to the leadership that
+    /// admitted the create (F14j).
+    pub upload: Arc<ProposedUpload>,
 }
 
 impl CreateStreamExternalRequest {
@@ -60,6 +64,7 @@ impl CreateStreamExternalRequest {
         request: CreateStreamRequest,
         initial_payload: ExternalPayloadRef,
         message_count: u64,
+        upload: Arc<ProposedUpload>,
     ) -> Self {
         Self {
             stream_id: request.stream_id,
@@ -72,6 +77,7 @@ impl CreateStreamExternalRequest {
             stream_expires_at_ms: request.stream_expires_at_ms,
             now_ms: request.now_ms,
             if_incarnation: request.if_incarnation,
+            upload,
         }
     }
 }
@@ -473,6 +479,9 @@ pub struct PublishSnapshotRequest {
 pub struct ColdSnapshotBody {
     pub object: ExternalPayloadRef,
     pub digest: String,
+    /// The upload of `object`, fenced to the leadership that admitted the
+    /// publish (F14j).
+    pub upload: Arc<ProposedUpload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -800,6 +809,9 @@ pub struct FlushColdRequest {
     /// ([`ursula_stream::ColdFlushCandidate::cold_generation`]); see
     /// `StreamCommand::FlushCold`.
     pub cold_generation: u64,
+    /// The upload of `chunk`'s object, fenced to the leadership the flush
+    /// was planned under (F14j). The slices of one pack share it.
+    pub upload: Arc<ProposedUpload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -819,6 +831,9 @@ pub struct CompactColdRequest {
     pub old_chunks: Vec<ColdChunkRef>,
     pub replacement: ColdChunkRef,
     pub gc_not_before_ms: u64,
+    /// The upload of `replacement`'s object, fenced to the leadership the
+    /// compaction was planned under (F14j).
+    pub upload: Arc<ProposedUpload>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -930,6 +945,8 @@ pub enum WriteRoute {
     /// unless its head alone decides its answer.
     Leader {
         early_answer: Option<ursula_stream::ProducerEarlyAnswer>,
+        /// The leadership a cold upload of the write is fenced to (F14j).
+        fence: UploadFence,
     },
     /// Another node leads the group in `term`.
     Follower { leader_id: u64, term: u64 },
@@ -958,7 +975,7 @@ pub struct AppendRequest {
     pub if_incarnation: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppendExternalRequest {
     pub stream_id: BucketStreamId,
     pub content_type: String,
@@ -971,8 +988,10 @@ pub struct AppendExternalRequest {
     pub producer: Option<ProducerRequest>,
     pub now_ms: u64,
     /// See [`AppendRequest::if_incarnation`].
-    #[serde(default)]
     pub if_incarnation: Option<u64>,
+    /// The upload of `payload`, fenced to the leadership that admitted the
+    /// append (F14j).
+    pub upload: Arc<ProposedUpload>,
 }
 
 impl AppendExternalRequest {
@@ -980,6 +999,7 @@ impl AppendExternalRequest {
         request: AppendRequest,
         payload: ExternalPayloadRef,
         message_count: u64,
+        upload: Arc<ProposedUpload>,
     ) -> Self {
         Self {
             stream_id: request.stream_id,
@@ -991,6 +1011,7 @@ impl AppendExternalRequest {
             producer: request.producer,
             now_ms: request.now_ms,
             if_incarnation: request.if_incarnation,
+            upload,
         }
     }
 }

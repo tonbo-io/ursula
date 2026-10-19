@@ -875,6 +875,9 @@ mod tests {
                 producer: input.producer.clone(),
                 now_ms: input.now_ms,
                 if_incarnation: input.if_incarnation,
+                upload: ursula_runtime::ProposedUpload::new(
+                    ursula_runtime::UploadFence::Unreplicated,
+                ),
             }
             .into()
         }
@@ -891,6 +894,9 @@ mod tests {
                 stream_expires_at_ms: input.stream_expires_at_ms,
                 now_ms: input.now_ms,
                 if_incarnation: input.if_incarnation,
+                upload: ursula_runtime::ProposedUpload::new(
+                    ursula_runtime::UploadFence::Unreplicated,
+                ),
             }
             .into()
         }
