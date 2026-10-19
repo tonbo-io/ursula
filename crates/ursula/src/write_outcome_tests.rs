@@ -667,8 +667,9 @@ impl Node {
             .with_wal_disk_monitor(wal_disk.clone());
         // Peer 2 is this node itself: a redirect to it is a redirect the
         // gateway can follow, and it answers each hop with a redirect again.
-        state.fields_mut().client_write_router =
-            Some(ClientWriteLeaderRouter::new([(2, url.clone())]));
+        state.fields_mut().client_write_router = Some(ClientWriteLeaderRouter::new(
+            crate::shared_peers([(2, url.clone())]),
+        ));
         // A stream holds two staged, unused parts at most, so the third is
         // refused for the bound.
         state.set_staged_parts(crate::staged_parts::StagedParts::for_test(2, u64::MAX));

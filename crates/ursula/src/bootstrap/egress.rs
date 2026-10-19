@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use std::time::Duration;
 
 use ursula_raft::LeadershipShedReason;
+use ursula_raft::PeerDirectory;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_shard::RaftGroupId;
@@ -50,20 +51,15 @@ fn remote_peers_needed_for_quorum(total_voters: usize) -> usize {
 
 pub(crate) fn cluster_egress_probe_groups(
     node_id: u64,
-    peers: &[(u64, String)],
+    peers: &PeerDirectory,
     per_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
     snapshots: &[RaftGroupMetricsSnapshot],
 ) -> Vec<ClusterEgressProbeGroup> {
-    let peer_urls: BTreeMap<u64, String> = peers
-        .iter()
-        .map(|(node_id, url)| (*node_id, url.clone()))
-        .collect();
-
     if per_group_voters.is_empty() {
         let peer_urls: Vec<String> = peers
             .iter()
             .filter(|(id, _)| *id != node_id)
-            .map(|(_, url)| url.clone())
+            .map(|(_, endpoints)| endpoints.cluster_url().to_owned())
             .collect();
         if peer_urls.is_empty() {
             return Vec::new();
@@ -90,7 +86,7 @@ pub(crate) fn cluster_egress_probe_groups(
             let peer_urls: Vec<String> = voters
                 .iter()
                 .filter(|id| **id != node_id)
-                .filter_map(|id| peer_urls.get(id).cloned())
+                .filter_map(|id| peers.cluster_url(*id).ok().map(str::to_owned))
                 .collect();
             if peer_urls.is_empty() {
                 return None;
@@ -115,7 +111,7 @@ pub(crate) fn cluster_egress_probe_groups(
 pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
-    probe_peers: &[(u64, String)],
+    probe_peers: &PeerDirectory,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
@@ -134,7 +130,7 @@ pub fn spawn_egress_gate(
     let unhealthy_ticks = cp_cfg.unhealthy_ticks;
     let heal_ticks = cp_cfg.heal_ticks;
     let registry = registry.clone();
-    let peers = probe_peers.to_vec();
+    let peers = probe_peers.clone();
     let participation = participation.clone();
     tokio::spawn(async move {
         let interval = Duration::from_millis(

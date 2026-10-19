@@ -39,6 +39,8 @@
 //! - [`peer_cluster`]: the cluster-id check between peers: the identity
 //!   every Raft gRPC request carries, the server interceptor that refuses a
 //!   peer of another cluster, and the record readiness and metrics read.
+//! - [`peer_directory`]: where each configured peer listens (`raft.peers`),
+//!   the one source every reader of a peer address takes it from.
 //! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
 //!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
@@ -88,6 +90,7 @@ mod openraft_error;
 mod openraft_work;
 mod peer_channel;
 mod peer_cluster;
+mod peer_directory;
 mod read_index;
 mod recovery_transport;
 mod registry;
@@ -190,6 +193,9 @@ pub use peer_cluster::PeerCluster;
 pub use peer_cluster::PeerClusterError;
 pub use peer_cluster::PeerClusterMismatch;
 pub use peer_cluster::PeerIdentity;
+pub use peer_directory::PeerDirectory;
+pub use peer_directory::PeerEndpoints;
+pub use peer_directory::PeerUnknown;
 pub use registry::IncomingTransferError;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;

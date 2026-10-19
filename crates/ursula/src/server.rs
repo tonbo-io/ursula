@@ -244,12 +244,8 @@ async fn init_state(
     persistence: Persistence,
     start_maintenance_drained: bool,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
-    let raft_peers: Vec<(u64, String)> = config
-        .raft
-        .peers
-        .iter()
-        .map(|p| (p.node_id, p.url.clone()))
-        .collect();
+    // The one source of every configured peer address.
+    let raft_peers = ursula_raft::PeerDirectory::from_config(&config.raft.peers);
     if start_maintenance_drained && raft_peers.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -290,7 +286,7 @@ async fn init_state(
     // Format epoch: refuse data and peers of another epoch before anything is
     // written.
     let log_dir = persistence.log_dir().map(std::path::Path::to_path_buf);
-    crate::bootstrap::check_and_stamp_format_epoch(config, log_dir.as_deref()).await?;
+    crate::bootstrap::check_and_stamp_format_epoch(config, &raft_peers, log_dir.as_deref()).await?;
 
     let spawned = spawn_runtime_with_maintenance_drain(
         config,
@@ -333,14 +329,9 @@ async fn init_state(
     // node whose Raft url moved since (such as a new cluster port) would
     // serve Raft where no peer dials it.
     if let Some(registry) = spawned.raft_registry.as_ref()
-        && let Some(own) = config
-            .raft
-            .peers
-            .iter()
-            .find(|peer| peer.node_id == config.raft.node_id)
+        && let Ok(own) = raft_peers.cluster_url(config.raft.node_id)
     {
-        crate::bootstrap::check_own_recorded_address(registry, config.raft.node_id, &own.url)
-            .await?;
+        crate::bootstrap::check_own_recorded_address(registry, config.raft.node_id, own).await?;
     }
 
     let state = if raft_peers.is_empty() {
@@ -354,16 +345,11 @@ async fn init_state(
             .expect("static grpc topology returns registry");
         // Leader redirects send clients to a peer's client plane, which is
         // not its Raft `url` when the cluster plane listens apart.
-        let client_peers = config
-            .raft
-            .peers
-            .iter()
-            .map(|peer| (peer.node_id, peer.client_base_url().to_owned()));
         HttpState::with_static_raft_cluster_topology(
             runtime,
             registry,
             config.raft.node_id,
-            client_peers,
+            raft_peers,
             per_group_voters,
         )
     };
@@ -465,12 +451,10 @@ async fn serve(
         shutdown.clone(),
         state.raft_registry().cloned(),
         config.raft.node_id,
-        config
-            .raft
-            .peers
-            .iter()
-            .map(|peer| (peer.node_id, peer.url.clone()))
-            .collect(),
+        state
+            .client_write_router()
+            .map(|router| router.peers().clone())
+            .unwrap_or_default(),
     );
 
     // Counts the staged snapshot parts of the groups this node leads, for
@@ -624,7 +608,7 @@ fn spawn_shutdown_signal_task(
     shutdown: Arc<Notify>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
     node_id: u64,
-    peers: Vec<(u64, String)>,
+    peers: ursula_raft::PeerDirectory,
 ) {
     tokio::spawn(async move {
         shutdown_signal().await;

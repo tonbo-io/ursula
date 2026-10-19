@@ -18,6 +18,7 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
+use ursula_raft::PeerDirectory;
 use ursula_raft::PeerFormatEpoch;
 use ursula_raft::PeerIdentity;
 use ursula_runtime::format_marker::FormatEpochNamespace;
@@ -55,9 +56,11 @@ pub(crate) enum StartupGateError {
     },
 }
 
-/// `data_dir` is the Raft WAL's journal directory, if the node runs Raft.
+/// `peers` is the node's `raft.peers`. `data_dir` is the Raft WAL's journal
+/// directory, if the node runs Raft.
 pub(crate) async fn check_and_stamp_format_epoch(
     config: &ursula_config::UrsulaConfig,
+    peers: &PeerDirectory,
     data_dir: Option<&Path>,
 ) -> Result<(), StartupGateError> {
     // 1. Read-only classification. A WAL that holds another cluster id
@@ -75,7 +78,7 @@ pub(crate) async fn check_and_stamp_format_epoch(
     };
 
     // 2. Peer probe.
-    probe_peers(config).await?;
+    probe_peers(config, peers).await?;
 
     // 3. Markers: object storage first, then the directory.
     if let (Some(namespace), Some(MarkerState::Fresh)) = (&namespace, &namespace_state) {
@@ -87,12 +90,14 @@ pub(crate) async fn check_and_stamp_format_epoch(
     Ok(())
 }
 
-async fn probe_peers(config: &ursula_config::UrsulaConfig) -> Result<(), StartupGateError> {
-    let peers = config
-        .raft
-        .peers
+async fn probe_peers(
+    config: &ursula_config::UrsulaConfig,
+    peers: &PeerDirectory,
+) -> Result<(), StartupGateError> {
+    let peers = peers
         .iter()
-        .filter(|peer| peer.node_id != config.raft.node_id)
+        .filter(|(node_id, _)| *node_id != config.raft.node_id)
+        .map(|(node_id, endpoints)| (node_id, endpoints.cluster_url()))
         .collect::<Vec<_>>();
     if peers.is_empty() {
         return Ok(());
@@ -104,14 +109,16 @@ async fn probe_peers(config: &ursula_config::UrsulaConfig) -> Result<(), Startup
     };
     let identity = PeerIdentity::new(config.raft.node_id, cluster_id);
     let identity = &identity;
-    let answers = futures_util::future::join_all(peers.iter().map(|peer| async move {
-        (
-            peer,
-            ursula_raft::probe_peer_format_epoch(&peer.url, identity, PEER_PROBE_TIMEOUT).await,
-        )
-    }))
-    .await;
-    for (peer, answer) in answers {
+    let answers =
+        futures_util::future::join_all(peers.iter().map(|&(peer_id, peer_url)| async move {
+            (
+                peer_id,
+                peer_url,
+                ursula_raft::probe_peer_format_epoch(peer_url, identity, PEER_PROBE_TIMEOUT).await,
+            )
+        }))
+        .await;
+    for (peer_id, peer_url, answer) in answers {
         match answer {
             PeerFormatEpoch::Compatible => {}
             PeerFormatEpoch::OtherCluster(peer_cluster_id) => {
@@ -119,8 +126,8 @@ async fn probe_peers(config: &ursula_config::UrsulaConfig) -> Result<(), Startup
                 // from starting. The Raft plane refuses its traffic and
                 // readiness lists it under peer_cluster_mismatch.
                 tracing::error!(
-                    peer_id = peer.node_id,
-                    peer_url = %peer.url,
+                    peer_id,
+                    peer_url,
                     %peer_cluster_id,
                     local_cluster_id = %identity.cluster_id(),
                     "a configured peer is in another cluster; its Raft traffic is refused. \
@@ -131,16 +138,16 @@ async fn probe_peers(config: &ursula_config::UrsulaConfig) -> Result<(), Startup
                 // A fresh cluster starts its pods in parallel; readiness
                 // covers a peer that turns out to differ later.
                 tracing::info!(
-                    peer_id = peer.node_id,
-                    peer_url = %peer.url,
+                    peer_id,
+                    peer_url,
                     reason = %reason,
                     "format-epoch probe skipped an unreachable peer"
                 );
             }
             PeerFormatEpoch::Refused(message) => {
                 return Err(StartupGateError::PeerFormatEpoch {
-                    peer_id: peer.node_id,
-                    peer_url: peer.url.clone(),
+                    peer_id,
+                    peer_url: peer_url.to_owned(),
                     message,
                 });
             }

@@ -339,7 +339,12 @@ pub(super) async fn run_leader_read_linearizability_inner(
         .expect("spawn hosted runtime over a three-node raft group");
     // A static cluster router, as in production: a forward-to-leader error
     // with no known leader renders as 503 with Retry-After.
-    let peers = (1..=3).map(|node_id| (node_id, format!("http://runtime-raft-node-{node_id}")));
+    let peers = ursula_raft::PeerDirectory::new((1..=3).map(|node_id| {
+        (
+            node_id,
+            ursula_raft::PeerEndpoints::shared(format!("http://runtime-raft-node-{node_id}")),
+        )
+    }));
     let state = HttpState::with_static_raft_cluster(
         runtime.clone(),
         RaftGroupHandleRegistry::default(),

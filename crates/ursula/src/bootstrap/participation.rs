@@ -18,6 +18,7 @@ use std::collections::HashSet;
 
 use futures_util::future::join_all;
 use ursula_proto::admin::LeadershipShedStatus;
+use ursula_raft::PeerDirectory;
 use ursula_raft::RaftGroupHandleRegistry;
 
 use crate::bootstrap::health_gate::ShedTargets;
@@ -112,20 +113,17 @@ impl CampaignStances {
 #[derive(Debug, Clone)]
 pub(crate) struct PeerParticipation {
     node_id: u64,
-    peers: Vec<(u64, String)>,
+    /// `raft.peers`, this node among them.
+    peers: PeerDirectory,
     client: reqwest::Client,
 }
 
 impl PeerParticipation {
     /// `peers` may list this node too. `client` bounds each peer's answer.
-    pub(crate) fn new(node_id: u64, peers: &[(u64, String)], client: reqwest::Client) -> Self {
+    pub(crate) fn new(node_id: u64, peers: &PeerDirectory, client: reqwest::Client) -> Self {
         Self {
             node_id,
-            peers: peers
-                .iter()
-                .filter(|(peer_id, _)| *peer_id != node_id)
-                .cloned()
-                .collect(),
+            peers: peers.clone(),
             client,
         }
     }
@@ -146,9 +144,18 @@ impl PeerParticipation {
         // cluster at a peer's address says nothing about this one.
         let identity = registry.peer_cluster().identity();
         let local = identity.as_ref().map(ursula_raft::PeerIdentity::cluster_id);
-        let answers = join_all(self.peers.iter().map(|(peer_id, peer_url)| async move {
-            (*peer_id, self.peer_stance(*peer_id, peer_url, local).await)
-        }))
+        let answers = join_all(
+            self.peers
+                .iter()
+                .filter(|(peer_id, _)| *peer_id != self.node_id)
+                .map(|(peer_id, endpoints)| async move {
+                    (
+                        peer_id,
+                        self.peer_stance(peer_id, endpoints.cluster_url(), local)
+                            .await,
+                    )
+                }),
+        )
         .await;
         let mut by_node: BTreeMap<u64, CampaignStance> = answers.into_iter().collect();
         let own = if registry.should_campaign() {
@@ -237,6 +244,7 @@ mod tests {
     use super::CampaignStances;
     use super::PeerParticipation;
     use crate::bootstrap::health_gate::ShedTargets;
+    use crate::shared_peers;
 
     const THIS_CLUSTER: &str = "this-cluster";
 
@@ -249,7 +257,7 @@ mod tests {
         let registry = RaftGroupHandleRegistry::default();
         registry.peer_cluster().bind(
             ursula_raft::PeerIdentity::new(1, cluster(THIS_CLUSTER)),
-            std::collections::BTreeMap::new(),
+            ursula_raft::PeerDirectory::default(),
         );
         registry
     }
@@ -312,7 +320,7 @@ mod tests {
         let (foreign, foreign_task) = answering_peer_in("other-cluster", true).await;
         let participation = PeerParticipation::new(
             1,
-            &[(2, willing), (3, foreign)],
+            &shared_peers([(2, willing), (3, foreign)]),
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
                 .build()
@@ -337,12 +345,12 @@ mod tests {
         let (silent, _listener) = silent_peer().await;
         let participation = PeerParticipation::new(
             1,
-            &[
+            &shared_peers([
                 (1, "http://unused".to_owned()),
                 (2, willing),
                 (3, refusing),
                 (4, silent),
-            ],
+            ]),
             reqwest::Client::builder()
                 .timeout(Duration::from_millis(300))
                 .build()
@@ -369,6 +377,24 @@ mod tests {
 
         willing_task.abort();
         refusing_task.abort();
+    }
+
+    /// A `[[raft.peers]]` url that ends in `/` still reaches the peer's
+    /// leadership-shed route.
+    #[tokio::test]
+    async fn a_peer_url_with_a_trailing_slash_is_polled_at_its_route() {
+        let (willing, willing_task) = answering_peer(true).await;
+        let participation = PeerParticipation::new(
+            1,
+            &shared_peers([(2, format!("{willing}/"))]),
+            reqwest::Client::builder()
+                .timeout(Duration::from_millis(300))
+                .build()
+                .expect("client"),
+        );
+        let stances = participation.campaign_stances(&this_registry()).await;
+        assert_eq!(stances.of(2), Some(CampaignStance::MayCampaign));
+        willing_task.abort();
     }
 
     #[test]

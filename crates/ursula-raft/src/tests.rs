@@ -1531,12 +1531,12 @@ fn dynamic_group_hosting_allows_non_voter_warmup() {
     let registry = RaftGroupHandleRegistry::default();
     let factory = StaticGrpcRaftGroupEngineFactory::new(
         4,
-        [
-            (1, "node1".to_owned()),
-            (2, "node2".to_owned()),
-            (3, "node3".to_owned()),
-            (4, "node4".to_owned()),
-        ],
+        crate::PeerDirectory::new((1..=4).map(|node_id| {
+            (
+                node_id,
+                crate::PeerEndpoints::shared(format!("node{node_id}")),
+            )
+        })),
         false,
         registry.clone(),
         start_wal(wal_root.path(), 1, 3),
