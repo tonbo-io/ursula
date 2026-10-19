@@ -56,7 +56,8 @@ MessagePack bytes of format epoch 5 in
 Vote, LogId, joint StoredMembership (including a learner), a membership Entry
 and SnapshotMeta, then requires byte-identical re-encoding. Membership names
 each member with OpenRaft's `EmptyNode`, which named MessagePack writes as an
-empty map. Alpha37 writes SnapshotMeta's `snapshot_id` empty and ignores it on
+empty map. The three membership-bearing values were edited from the alpha37
+bytes by replacing each node's address map with that empty map. Alpha37 writes SnapshotMeta's `snapshot_id` empty and ignores it on
 read, so the fixture's SnapshotMeta carries an empty id. It does not assert
 that later OpenRaft releases or mixed-version cluster operation are
 compatible.

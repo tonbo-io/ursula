@@ -23,7 +23,7 @@ See [Upgrading to 0.9](/docs/operations#upgrading-to-09).
 
 - **Format epoch 5.** The Raft WAL journal and state files, the WAL directory and object-storage markers, group snapshots and the Raft gRPC protocol carry format epoch 5. A node refuses data and peers of another epoch.
 - **A snapshot pointer names one node's object.** The S3 location in a snapshot pointer, in `group-N.snapshot.json` and in the snapshot an install sends, no longer carries `shared_object`. A FullSnapshot receiver writes its own copy of the object the pointer names before it commits. 0.9 needs no further format epoch for it, since 0.9 already moved to epoch 5.
-- **Raft membership carries node IDs only.** Membership entries, snapshot records and the snapshots an install sends name each member with an empty node instead of its address. Backups hold no Raft membership, so backup format 4 is unchanged.
+- **Raft membership carries node IDs only.** Membership entries, snapshot records and the snapshots an install sends name each member with an empty node instead of its address. Backups hold no Raft membership.
 - **Backups have a format version of their own.** Backup format 4 is the format of 0.8 and 0.9: `format_version` 4 in `manifest.json` and in `GET /__ursula/backup/info`, and `format_epoch` 4 in every group object. It changes only when what a backup holds changes: the manifest, the group snapshots or the cold objects they reference. `ursulactl` refuses a backup or a target cluster of another backup format, such as a 0.7 backup (format 3), before the first import.
 
 ### Server

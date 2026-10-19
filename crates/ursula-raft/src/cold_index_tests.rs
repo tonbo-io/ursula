@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use futures_util::stream;
 #[cfg(not(madsim))]
-#[cfg(not(madsim))]
 use openraft::Config;
 use openraft::Entry;
 use openraft::EntryPayload;
