@@ -434,6 +434,7 @@ runtime_metrics! {
     counter cold_orphan_bytes;
     counter cold_gc_reclaimed;
     counter cold_gc_errors;
+    counter cold_gc_foreign_paths_refused;
     counter cold_flush_write_errors;
     counter cold_pressure_flush_passes;
     counter cold_pressure_flush_candidates;
@@ -880,6 +881,13 @@ impl RuntimeMetricsInner {
         self.cold_gc_errors.fetch_add_relaxed(1);
     }
 
+    /// G1 alert: the cold GC worker refused to delete a path of a `Paths`
+    /// entry that is not an exclusive chunk, a pack or an external payload
+    /// of the entry's bucket owned by the group.
+    pub(crate) fn record_cold_gc_foreign_path_refused(&self) {
+        self.cold_gc_foreign_paths_refused.fetch_add_relaxed(1);
+    }
+
     pub(crate) fn record_cold_hot_backlog(
         &self,
         group_id: RaftGroupId,
@@ -1265,6 +1273,7 @@ mod metric_manifest_tests {
         "cold_orphan_bytes",
         "cold_gc_reclaimed",
         "cold_gc_errors",
+        "cold_gc_foreign_paths_refused",
         "cold_flush_write_errors",
         "cold_pressure_flush_passes",
         "cold_pressure_flush_candidates",

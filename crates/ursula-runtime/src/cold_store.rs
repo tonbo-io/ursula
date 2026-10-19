@@ -21,7 +21,9 @@ use opendal::layers::RetryLayer;
 use opendal::layers::TimeoutLayer;
 use ursula_config::config::ColdBackend;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftGroupId;
 use ursula_stream::ColdChunkRef;
+use ursula_stream::ColdGcEntry;
 use ursula_stream::ObjectPayloadRef;
 
 use crate::ColdConfig;
@@ -1999,17 +2001,164 @@ pub fn snapshot_part_object_incarnation(name: &str) -> Option<u64> {
     u64::from_str_radix(incarnation, 16).ok()
 }
 
+/// An object a `Paths` cold GC entry may delete (G1): exactly the objects
+/// such an entry exists for, each named as its key function names it. A
+/// snapshot object, a cold-index page, a staged part or anything else is
+/// none of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColdGcPathKind {
+    /// An exclusive chunk, named by [`new_cold_chunk_path_in_generation`].
+    ExclusiveChunk {
+        stream_id: BucketStreamId,
+        generation: u64,
+    },
+    /// A pack of one Raft group, named by [`new_cold_pack_path`].
+    Pack { raft_group_id: RaftGroupId },
+    /// An external payload, named by [`new_external_payload_path`].
+    External { stream_id: BucketStreamId },
+}
+
+impl ColdGcPathKind {
+    /// What `path` is, when it is an exclusive chunk, a pack or an external
+    /// payload of bucket `bucket_id`. `None` for any other path, a path of
+    /// another bucket included. The directory must be the one the key
+    /// function builds and the file name must have the form it writes.
+    pub(crate) fn parse(bucket_id: &str, path: &str) -> Option<Self> {
+        ursula_stream::validate_bucket_id(bucket_id).ok()?;
+        let rest = path.strip_prefix(&cold_bucket_prefix(bucket_id))?;
+        let segments = rest.split('/').collect::<Vec<_>>();
+        let (name, dirs) = segments.split_last()?;
+        let kind = Self::pack(dirs)
+            .or_else(|| Self::exclusive_chunk(bucket_id, dirs))
+            .or_else(|| Self::external(bucket_id, dirs))?;
+        let named = format!("{}{name}", kind.dir(bucket_id));
+        (named == path && kind.accepts_file_name(name)).then_some(kind)
+    }
+
+    fn pack(dirs: &[&str]) -> Option<Self> {
+        let ["_packs", group] = dirs else {
+            return None;
+        };
+        let raft_group_id = RaftGroupId(u32::from_str_radix(group, 16).ok()?);
+        Some(Self::Pack { raft_group_id })
+    }
+
+    fn exclusive_chunk(bucket_id: &str, dirs: &[&str]) -> Option<Self> {
+        let [stream, "chunks", generation] = dirs else {
+            return None;
+        };
+        Some(Self::ExclusiveChunk {
+            stream_id: Self::stream_id(bucket_id, stream)?,
+            generation: u64::from_str_radix(generation, 16).ok()?,
+        })
+    }
+
+    fn external(bucket_id: &str, dirs: &[&str]) -> Option<Self> {
+        let [stream, "external"] = dirs else {
+            return None;
+        };
+        Some(Self::External {
+            stream_id: Self::stream_id(bucket_id, stream)?,
+        })
+    }
+
+    fn stream_id(bucket_id: &str, stream: &str) -> Option<BucketStreamId> {
+        let stream_id = BucketStreamId::new(bucket_id, stream);
+        ursula_stream::validate_stream_id(&stream_id).ok()?;
+        Some(stream_id)
+    }
+
+    fn dir(&self, bucket_id: &str) -> String {
+        match self {
+            Self::ExclusiveChunk {
+                stream_id,
+                generation,
+            } => cold_chunk_dir(stream_id, *generation),
+            Self::Pack { raft_group_id } => cold_pack_dir(bucket_id, raft_group_id.0),
+            Self::External { stream_id } => cold_external_dir(stream_id),
+        }
+    }
+
+    fn accepts_file_name(&self, name: &str) -> bool {
+        match self {
+            Self::ExclusiveChunk { .. } => is_cold_chunk_file_name(name),
+            // A pack is named as an external payload is (`new_cold_pack_path`).
+            Self::Pack { .. } | Self::External { .. } => is_external_payload_file_name(name),
+        }
+    }
+
+    /// The Raft group that owns the object: a pack's own group, or the
+    /// group `locate` places the stream of a chunk or an external payload in.
+    fn owner(&self, locate: impl Fn(&BucketStreamId) -> RaftGroupId) -> RaftGroupId {
+        match self {
+            Self::Pack { raft_group_id } => *raft_group_id,
+            Self::ExclusiveChunk { stream_id, .. } | Self::External { stream_id } => {
+                locate(stream_id)
+            }
+        }
+    }
+}
+
+/// Why the cold GC worker did not delete a path a `Paths` entry names (G1).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum ColdGcRefusal {
+    /// The path is not an exclusive chunk, a pack or an external payload of
+    /// the entry's bucket that the executing group owns.
+    #[error(
+        "cold GC entry {seq} of raft group {} names '{path}', which is not an exclusive chunk, \
+         pack or external payload of bucket '{bucket_id}' owned by the group, so it is not deleted",
+        .raft_group_id.0
+    )]
+    ForeignPath {
+        raft_group_id: RaftGroupId,
+        seq: u64,
+        bucket_id: String,
+        path: String,
+    },
+}
+
+/// The one check at the cold GC `Paths` delete site (G1): `path` of `entry`
+/// may be deleted by group `raft_group_id` only if it is an exclusive chunk,
+/// a pack or an external payload of the entry's own bucket, and the pack's
+/// group, or the group `locate` places the stream in, is `raft_group_id`.
+pub(crate) fn check_cold_gc_path(
+    raft_group_id: RaftGroupId,
+    entry: &ColdGcEntry,
+    path: &str,
+    locate: impl Fn(&BucketStreamId) -> RaftGroupId,
+) -> Result<ColdGcPathKind, ColdGcRefusal> {
+    ColdGcPathKind::parse(&entry.bucket_id, path)
+        .filter(|kind| kind.owner(locate) == raft_group_id)
+        .ok_or_else(|| ColdGcRefusal::ForeignPath {
+            raft_group_id,
+            seq: entry.seq,
+            bucket_id: entry.bucket_id.clone(),
+            path: path.to_owned(),
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
     use ursula_config::config::ColdBackend;
     use ursula_shard::BucketStreamId;
+    use ursula_shard::RaftGroupId;
+    use ursula_stream::ColdGcEntry;
+    use ursula_stream::ColdGcTarget;
 
+    use super::ColdGcPathKind;
+    use super::ColdGcRefusal;
     use super::ColdReadCache;
     use super::ColdStore;
+    use super::check_cold_gc_path;
+    use super::new_cold_chunk_path_in_generation;
+    use super::new_cold_pack_path;
+    use super::new_external_payload_path;
     use super::parse_cold_index_page_path;
     use super::s3_operation_budget;
+    use super::snapshot_part_path;
     use crate::ColdConfig;
+    use crate::ColdIndexPageKey;
     use crate::ColdReadCacheParams;
 
     fn read_cache_params(store: &ColdStore) -> ColdReadCacheParams {
@@ -2036,6 +2185,168 @@ mod tests {
             Duration::MAX,
             "saturates instead of overflowing"
         );
+    }
+
+    const GC_BUCKET: &str = "tenant-a";
+    const GC_GROUP: RaftGroupId = RaftGroupId(1);
+
+    fn gc_entry(bucket_id: &str) -> ColdGcEntry {
+        ColdGcEntry {
+            seq: 9,
+            bucket_id: bucket_id.to_owned(),
+            not_before_ms: 0,
+            target: ColdGcTarget::Paths(Vec::new()),
+            cold_generation: None,
+            defer_attempts: 0,
+        }
+    }
+
+    /// Streams named `elsewhere` are placed in group 2, every other in
+    /// [`GC_GROUP`].
+    fn gc_locate(stream: &BucketStreamId) -> RaftGroupId {
+        if stream.stream_id == "elsewhere" {
+            RaftGroupId(2)
+        } else {
+            GC_GROUP
+        }
+    }
+
+    fn gc_check(bucket_id: &str, path: &str) -> Result<ColdGcPathKind, ColdGcRefusal> {
+        check_cold_gc_path(GC_GROUP, &gc_entry(bucket_id), path, gc_locate)
+    }
+
+    /// G1: every object a `Paths` entry exists for passes, as its key
+    /// function names it, a stream named `_packs` included.
+    #[test]
+    fn cold_gc_guard_accepts_every_legal_shape() {
+        for stream in ["s", "_packs", "chunks", "external"] {
+            let stream_id = BucketStreamId::new(GC_BUCKET, stream);
+            assert_eq!(
+                gc_check(
+                    GC_BUCKET,
+                    &new_cold_chunk_path_in_generation(&stream_id, 7, 0, 4)
+                ),
+                Ok(ColdGcPathKind::ExclusiveChunk {
+                    stream_id: stream_id.clone(),
+                    generation: 7,
+                })
+            );
+            assert_eq!(
+                gc_check(GC_BUCKET, &new_external_payload_path(&stream_id)),
+                Ok(ColdGcPathKind::External { stream_id })
+            );
+        }
+        assert_eq!(
+            gc_check(
+                GC_BUCKET,
+                &new_cold_chunk_path_in_generation(
+                    &BucketStreamId::new(GC_BUCKET, "s"),
+                    u64::MAX,
+                    0,
+                    4
+                )
+            ),
+            Ok(ColdGcPathKind::ExclusiveChunk {
+                stream_id: BucketStreamId::new(GC_BUCKET, "s"),
+                generation: u64::MAX,
+            })
+        );
+        assert_eq!(
+            gc_check(GC_BUCKET, &new_cold_pack_path(GC_BUCKET, GC_GROUP.0)),
+            Ok(ColdGcPathKind::Pack {
+                raft_group_id: GC_GROUP
+            })
+        );
+    }
+
+    /// G1: a snapshot key, a page, a staged part, another bucket's object,
+    /// another group's pack or stream, and malformed paths are refused with
+    /// the entry's identity.
+    #[test]
+    fn cold_gc_guard_refuses_foreign_and_malformed_paths() {
+        let stream_id = BucketStreamId::new(GC_BUCKET, "s");
+        let chunk = new_cold_chunk_path_in_generation(&stream_id, 7, 0, 4);
+        let chunk_name = chunk.rsplit_once('/').expect("chunk has a directory").1;
+        let external = new_external_payload_path(&stream_id);
+        let external_name = external
+            .rsplit_once('/')
+            .expect("external has a directory")
+            .1;
+        let refused = [
+            // A snapshot object of this node, under the default prefix and
+            // under a prefix inside the bucket.
+            "snapshots/node-1/group-1/00000000000000000042-0123456789abcdef.snap".to_owned(),
+            format!("{GC_BUCKET}/node-1/group-1/00000000000000000042-0123456789abcdef.snap"),
+            format!("{GC_BUCKET}/s/node-1/group-1/{external_name}"),
+            // A cold-index page and a staged snapshot part.
+            ColdIndexPageKey {
+                stream_id: stream_id.clone(),
+                generation: 7,
+                page_id: 0,
+            }
+            .path(),
+            snapshot_part_path(&stream_id, GC_GROUP.0, 1, &super::new_snapshot_part_id()),
+            // Another bucket's objects.
+            new_external_payload_path(&BucketStreamId::new("tenant-b", "s")),
+            new_cold_pack_path("tenant-b", GC_GROUP.0),
+            new_cold_chunk_path_in_generation(&BucketStreamId::new("tenant-ab", "s"), 7, 0, 4),
+            // Another group's pack, and the objects of a stream placed in
+            // another group.
+            new_cold_pack_path(GC_BUCKET, 2),
+            new_cold_chunk_path_in_generation(
+                &BucketStreamId::new(GC_BUCKET, "elsewhere"),
+                7,
+                0,
+                4,
+            ),
+            new_external_payload_path(&BucketStreamId::new(GC_BUCKET, "elsewhere")),
+            // Malformed: a generation or group not as the key function
+            // writes it, a file name of another form, extra or missing
+            // directories, escapes and an invalid stream name.
+            format!("{GC_BUCKET}/s/chunks/7/{chunk_name}"),
+            format!("{GC_BUCKET}/s/chunks/{:016X}/{chunk_name}", u64::MAX),
+            format!("{GC_BUCKET}/s/chunks/+000000000000007/{chunk_name}"),
+            format!("{GC_BUCKET}/_packs/1/{external_name}"),
+            format!("{GC_BUCKET}/s/chunks/0000000000000007/{external_name}"),
+            format!("{GC_BUCKET}/s/external/{chunk_name}"),
+            format!("{GC_BUCKET}/s/external/object.bin"),
+            format!("{GC_BUCKET}/s/external/nested/{external_name}"),
+            format!("{GC_BUCKET}/s/{external_name}"),
+            format!("{GC_BUCKET}/{external_name}"),
+            format!("{GC_BUCKET}/s/external/../{external_name}"),
+            format!("{GC_BUCKET}/../tenant-b/s/external/{external_name}"),
+            format!("{GC_BUCKET}//external/{external_name}"),
+            format!("{GC_BUCKET}/$s/external/{external_name}"),
+            format!("{GC_BUCKET}/s/external/"),
+            format!("/{external}"),
+            format!("{GC_BUCKET}/s/chunks/0000000000000007/"),
+            GC_BUCKET.to_owned(),
+            String::new(),
+        ];
+        for path in refused {
+            assert_eq!(
+                gc_check(GC_BUCKET, &path),
+                Err(ColdGcRefusal::ForeignPath {
+                    raft_group_id: GC_GROUP,
+                    seq: 9,
+                    bucket_id: GC_BUCKET.to_owned(),
+                    path: path.clone(),
+                }),
+                "{path}"
+            );
+        }
+        // An entry of a reserved or invalid bucket deletes nothing, even a
+        // path of the matching shape.
+        for bucket in ["snapshots", "__ursula", "A"] {
+            let path = new_external_payload_path(&BucketStreamId::new(bucket, "s"));
+            assert!(
+                matches!(
+                    gc_check(bucket, &path),
+                    Err(ColdGcRefusal::ForeignPath { .. })
+                ),
+                "{path}"
+            );
+        }
     }
 
     #[test]

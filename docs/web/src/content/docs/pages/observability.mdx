@@ -197,6 +197,12 @@ because the store refuses deletes, and a failed pass runs again later, backed
 off up to 15 minutes. Alert when it keeps rising: while GC fails, old snapshot
 objects that hold deleted streams stay in the store.
 
+`cold_gc_foreign_paths_refused` counts the paths of queued cold GC entries
+that cold GC refused to delete, because they are not an exclusive chunk, a
+pack or an external payload of the entry's bucket that the group owns (see
+[Cleaning S3](/docs/operations#cleaning-s3)). It stays at 0 unless a corrupt or
+hand-edited backup was restored. Alert on any increase.
+
 `open_backoff_groups` counts the groups whose engine did not open because the
 snapshot store did not answer its restore, and `per_group_open_backoff` is 1
 for each of them. Such a group answers `GROUP_RESTARTING` until its core

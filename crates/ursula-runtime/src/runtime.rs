@@ -38,6 +38,7 @@ use crate::cold_refs::ColdOrphanSweepRequest;
 use crate::cold_store::ColdStore;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
+use crate::cold_store::check_cold_gc_path;
 use crate::cold_store::cold_chunk_dir;
 use crate::cold_store::cold_external_dir;
 use crate::cold_store::is_cold_chunk_file_name;
@@ -1339,6 +1340,26 @@ impl ShardRuntime {
                 ColdGcTarget::Paths(paths) => {
                     let mut outcome = Ok(());
                     for path in paths {
+                        // G1: only an exclusive chunk, a pack or an external
+                        // payload of the entry's bucket that this group owns.
+                        // A refused path is not deleted and does not fail the
+                        // entry, so it cannot stall the queue (F14b).
+                        if let Err(refusal) =
+                            check_cold_gc_path(raft_group_id, entry, path, |stream| {
+                                self.shard_map.locate(stream).raft_group_id
+                            })
+                        {
+                            self.metrics.record_cold_gc_foreign_path_refused();
+                            tracing::error!(
+                                raft_group_id = raft_group_id.0,
+                                seq = entry.seq,
+                                bucket = %entry.bucket_id,
+                                path = %path,
+                                error = %refusal,
+                                "cold GC refused a path outside the entry's bucket, stream or group"
+                            );
+                            continue;
+                        }
                         // Every path names one object (F14g containment).
                         if let Err(err) = cold_store.delete_chunk(path).await {
                             outcome = Err(err);
