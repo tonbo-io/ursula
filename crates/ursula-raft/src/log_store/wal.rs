@@ -200,13 +200,12 @@ impl RaftWal {
         // A writer whose last handle is being dropped still holds the
         // journal's lock until it is gone, so a new writer would find it
         // locked.
-        if slot
-            .released
-            .as_ref()
-            .is_some_and(|released| released.has_changed().is_ok())
+        if let Some(released) = &slot.released
+            && released.has_changed().is_ok()
         {
             return Err(RaftWalError::CoreWriterStopping {
                 core: placement.core_id,
+                released: released.clone(),
             });
         }
 
@@ -254,7 +253,8 @@ impl RaftWal {
     /// Opens `placement`'s log store as [`Self::open`] does, after waiting
     /// for the core's previous journal writer to stop when its last handle
     /// is being dropped, as when another group of the core just failed to
-    /// open (#741).
+    /// open (#741). The refusal carries the signal it waits on, so no
+    /// other writer's can stand in for it.
     pub async fn open_waiting(
         &self,
         placement: ShardPlacement,
@@ -262,39 +262,12 @@ impl RaftWal {
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
         loop {
             match self.open(placement, metrics.clone()) {
-                Err(RaftWalError::CoreWriterStopping { core }) => {
-                    let mut released = self.writer_released(core)?;
+                Err(RaftWalError::CoreWriterStopping { mut released, .. }) => {
                     while released.changed().await.is_ok() {}
                 }
                 opened => return opened,
             }
         }
-    }
-
-    /// The signal that `core`'s journal writer is gone and its lock free.
-    fn writer_released(&self, core: CoreId) -> Result<WriterExited, RaftWalError> {
-        let slot = match &*self
-            .core_writers
-            .lock()
-            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
-        {
-            CoreWriterSlots::Running(slots) => slots.get(&core.0).cloned(),
-            CoreWriterSlots::ShutDown => {
-                return Err(RaftWalError::ShutDown {
-                    root: self.root().to_owned(),
-                });
-            }
-        };
-        let released = slot
-            .map(|slot| {
-                slot.lock()
-                    .map_err(|_poisoned| RaftWalError::LockPoisoned)
-                    .map(|slot| slot.released.clone())
-            })
-            .transpose()?
-            .flatten();
-        // A slot with no writer has nothing to wait for: a closed channel.
-        Ok(released.unwrap_or_else(|| crate::rt::sync::watch::channel(()).1))
     }
 
     /// The ledger engines of this WAL's groups record their OpenRaft work in
@@ -500,7 +473,10 @@ mod tests {
         }
         assert!(matches!(
             wal.open(placement(1), metrics()),
-            Err(RaftWalError::CoreWriterStopping { core: CoreId(0) })
+            Err(RaftWalError::CoreWriterStopping {
+                core: CoreId(0),
+                ..
+            })
         ));
         let opening = tokio::spawn({
             let wal = wal.clone();

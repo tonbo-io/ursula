@@ -441,10 +441,13 @@ pub enum RaftWalError {
     },
     /// The last handle of the core's previous journal writer is being
     /// dropped, which joins its worker and then releases the journal's
-    /// lock. [`super::RaftWal::open_waiting`] waits for that and opens
-    /// again.
+    /// lock. [`super::RaftWal::open_waiting`] waits on `released`, which
+    /// closes once the lock is free, and opens again.
     #[error("the previous journal writer of core {:?} is still stopping", .core)]
-    CoreWriterStopping { core: ursula_shard::CoreId },
+    CoreWriterStopping {
+        core: ursula_shard::CoreId,
+        released: super::writer::WriterExited,
+    },
 }
 
 /// The run-state file, and the run state this run writes to it.
