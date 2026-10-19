@@ -3754,44 +3754,46 @@ async fn group_engine_errors_include_group_context_and_do_not_record_success_met
     assert_eq!(runtime.metrics().snapshot().accepted_appends, 0);
 }
 
+/// A core waits only on a full group mailbox, never on an open (#741). A
+/// group engine that blocks its first create fills the group's mailbox,
+/// the core waits to hand it the next command, and its own mailbox fills
+/// behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mailbox_full_events_record_owner_core_backpressure() {
-    let factory = BlockingOnceFactory::default();
+    let factory = BlockingFirstCreateEngineFactory::default();
     let runtime = ShardRuntime::spawn_with_engine_factory(test_config(1, 1, 1), factory.clone())
         .expect("spawn runtime");
+    let create = |name: &'static str| {
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            create_stream(&runtime, &BucketStreamId::new("benchcmp", name)).await
+        })
+    };
 
-    let entered = factory.entered.clone();
-    let entered_wait = entered.notified();
-    let first_runtime = runtime.clone();
-    let first = tokio::spawn(async move {
-        create_stream(
-            &first_runtime,
-            &BucketStreamId::new("benchcmp", "backpressure-1"),
-        )
+    let entered = factory.entered.notified();
+    let first = create("backpressure-1");
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered)
         .await
-    });
-    tokio::time::timeout(std::time::Duration::from_secs(1), entered_wait)
-        .await
-        .expect("first create entered blocking engine factory");
-
-    let second_runtime = runtime.clone();
-    let second = tokio::spawn(async move {
-        create_stream(
-            &second_runtime,
-            &BucketStreamId::new("benchcmp", "backpressure-2"),
-        )
-        .await
-    });
+        .expect("first create entered the blocking group engine");
+    // Fills the group mailbox.
+    let second = create("backpressure-2");
+    wait_for_eq("group mailbox depth", 1, || {
+        runtime.metrics().snapshot().group_mailbox_depth
+    })
+    .await;
+    // Holds the core, which waits for room in the group mailbox.
+    let third = create("backpressure-3");
+    wait_for_eq("group mailbox full events", 1, || {
+        runtime
+            .metrics()
+            .snapshot()
+            .per_group_group_mailbox_full_events[0]
+    })
+    .await;
+    // Fills the core mailbox.
+    let fourth = create("backpressure-4");
     wait_for_mailbox_depth(&runtime, 0, 1).await;
-
-    let third_runtime = runtime.clone();
-    let third = tokio::spawn(async move {
-        create_stream(
-            &third_runtime,
-            &BucketStreamId::new("benchcmp", "backpressure-3"),
-        )
-        .await
-    });
+    let fifth = create("backpressure-5");
     wait_for_mailbox_full_events(&runtime, 1).await;
     assert_eq!(
         runtime.metrics().snapshot().per_core_mailbox_full_events[0],
@@ -3799,9 +3801,9 @@ async fn mailbox_full_events_record_owner_core_backpressure() {
     );
 
     factory.release.notify_one();
-    first.await.expect("first task");
-    second.await.expect("second task");
-    third.await.expect("third task");
+    for task in [first, second, third, fourth, fifth] {
+        task.await.expect("create task");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -4604,40 +4606,6 @@ impl GroupEngine for BlockingFirstCreateEngine {
         snapshot: GroupSnapshot,
     ) -> GroupInstallSnapshotFuture<'a> {
         self.inner.install_snapshot(snapshot)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct BlockingOnceFactory {
-    first_create_blocks: Arc<AtomicBool>,
-    entered: Arc<Notify>,
-    release: Arc<Notify>,
-}
-
-impl Default for BlockingOnceFactory {
-    fn default() -> Self {
-        Self {
-            first_create_blocks: Arc::new(AtomicBool::new(true)),
-            entered: Arc::new(Notify::new()),
-            release: Arc::new(Notify::new()),
-        }
-    }
-}
-
-impl GroupEngineFactory for BlockingOnceFactory {
-    fn create<'a>(
-        &'a self,
-        _placement: ShardPlacement,
-        _metrics: GroupEngineMetrics,
-    ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async move {
-            if self.first_create_blocks.swap(false, Ordering::SeqCst) {
-                self.entered.notify_one();
-                self.release.notified().await;
-            }
-            let engine: Box<dyn GroupEngine> = Box::new(InMemoryGroupEngine::started());
-            Ok(engine)
-        })
     }
 }
 
