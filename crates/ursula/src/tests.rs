@@ -8972,6 +8972,130 @@ mod snapshot_driver {
         assert!(metrics.snapshot_gc_failed_passes > 0);
     }
 
+    /// G1 (#687): a backup export is the group's applied stream state, so a
+    /// node with S3 snapshots exports a group whose backup names no key
+    /// under the snapshot prefix, though its snapshot object exists.
+    ///
+    /// This is a tripwire, not a proof: it fails if an export ever starts
+    /// to carry snapshot keys, so that cold GC would see them in a restored
+    /// backup. The cold GC guard is what keeps such a key from being
+    /// deleted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_backup_export_names_no_snapshot_object() {
+        const PREFIX: &str = "g1-export-snapshots";
+        let store = Arc::new(RecordingStore {
+            inner: ursula_runtime::S3SnapshotStore::memory_for_tests(PREFIX, 1)
+                .expect("a memory store"),
+            gc: Gc::On,
+            uploaded: std::sync::Mutex::new(Vec::new()),
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let peers = vec![(
+            1,
+            format!(
+                "http://127.0.0.1:{}",
+                listener.local_addr().expect("addr").port()
+            ),
+        )];
+        let node = spawn_static_grpc_test_node(
+            1,
+            listener,
+            peers.clone(),
+            peers,
+            true,
+            2,
+            StaticGrpcTestNodeStorage {
+                snapshot_store: Some(store.clone()),
+                ..StaticGrpcTestNodeStorage::default()
+            },
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
+            .await
+            .expect("warm the groups in time")
+            .expect("warm the groups");
+        let stream_id = BucketStreamId::new("exported", "with-s3-snapshot");
+        let group = node.runtime.locate(&stream_id).raft_group_id;
+        let raft = node.registry.get(group).expect("registered group");
+        raft.wait(Some(Duration::from_secs(10)))
+            .current_leader(1, "the only voter leads")
+            .await
+            .expect("the group elects its leader");
+        node.runtime
+            .create_stream(CreateStreamRequest::new(
+                stream_id.clone(),
+                "application/octet-stream",
+            ))
+            .await
+            .expect("create the stream");
+        node.runtime
+            .append(AppendRequest::from_bytes(
+                stream_id.clone(),
+                DELETED_MARKER.to_vec(),
+            ))
+            .await
+            .expect("append a record");
+        let applied = raft.metrics().borrow_watched().last_applied;
+        raft.trigger().snapshot().await.expect("trigger a snapshot");
+        raft.wait(Some(Duration::from_secs(10)))
+            .metrics(
+                |metrics| metrics.snapshot >= applied,
+                "the snapshot covers the record",
+            )
+            .await
+            .expect("snapshot the group");
+        let keys = store
+            .uploaded
+            .lock()
+            .expect("uploads mutex")
+            .iter()
+            .filter_map(|location| match location {
+                SnapshotLocation::S3 { key, .. } => Some(key.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            keys.iter()
+                .any(|key| key.starts_with(&format!("{PREFIX}/node-1/"))),
+            "the group has an S3 snapshot object: {keys:?}"
+        );
+
+        let response = send(
+            &node.app,
+            "GET",
+            &format!("/__ursula/backup/group/{}", group.0),
+            &[],
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_bytes(response).await;
+        let backup: ursula_runtime::StreamSnapshot =
+            rmp_serde::from_slice(&body).expect("decode the backup");
+        assert!(
+            backup
+                .streams
+                .iter()
+                .any(|entry| entry.metadata.stream_id == stream_id),
+            "the backup holds the stream"
+        );
+        let prefix_dir = format!("{PREFIX}/");
+        for needle in keys
+            .iter()
+            .map(String::as_bytes)
+            .chain([prefix_dir.as_bytes()])
+        {
+            assert!(
+                !body.windows(needle.len()).any(|window| window == needle),
+                "the backup names {}",
+                String::from_utf8_lossy(needle)
+            );
+        }
+        node.shutdown().await;
+    }
+
     /// #519: past the hard limit the driver keeps as many builds in flight
     /// as the node allows, and reports the escalation. The node runs as many
     /// builds at once as the server's default config gives it: two.

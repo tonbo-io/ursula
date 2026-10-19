@@ -2513,11 +2513,19 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
     let stream = BucketStreamId::new("benchcmp", "compact-runtime");
     create_stream(&runtime, &stream).await;
     append_bytes(&runtime, &stream, b"abcdefgh").await;
-    for (start, end, payload) in [(0, 4, b"abcd".as_slice()), (4, 8, b"efgh".as_slice())] {
+    // G1: the cold GC deletes a compacted input only under the name the
+    // flush worker gives it.
+    let generation = live_cold_generation(&runtime, &stream).await;
+    let input_paths = [(0, 4), (4, 8)]
+        .map(|(start, end)| new_cold_chunk_path_in_generation(&stream, generation, start, end));
+    for ((start, end, payload), path) in [(0, 4, b"abcd".as_slice()), (4, 8, b"efgh".as_slice())]
+        .into_iter()
+        .zip(&input_paths)
+    {
         let chunk = ColdChunkRef {
             start_offset: start,
             end_offset: end,
-            s3_path: format!("benchcmp/compact-runtime/chunks/{start}.bin"),
+            s3_path: path.clone(),
             object_size: end - start,
             ..Default::default()
         };
@@ -2585,11 +2593,11 @@ async fn cold_compaction_preserves_reads_and_reclaims_inputs_after_grace() {
             .expect("reclaim compacted inputs"),
         1
     );
-    for start in [0, 4] {
+    for (start, path) in [0, 4].into_iter().zip(&input_paths) {
         let old = ColdChunkRef {
             start_offset: start,
             end_offset: start + 4,
-            s3_path: format!("benchcmp/compact-runtime/chunks/{start}.bin"),
+            s3_path: path.clone(),
             object_size: 4,
             ..Default::default()
         };

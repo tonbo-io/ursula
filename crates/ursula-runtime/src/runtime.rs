@@ -35,9 +35,12 @@ use crate::cold_index::parse_cold_index_page_file_name;
 use crate::cold_index::select_cold_chunk_compaction;
 use crate::cold_refs::ColdOrphanSweepPlan;
 use crate::cold_refs::ColdOrphanSweepRequest;
+use crate::cold_store::ColdGcRefusal;
 use crate::cold_store::ColdStore;
 use crate::cold_store::ColdStoreHandle;
 use crate::cold_store::ColdStoreInfo;
+use crate::cold_store::check_cold_gc_path;
+use crate::cold_store::check_cold_gc_stream;
 use crate::cold_store::cold_chunk_dir;
 use crate::cold_store::cold_external_dir;
 use crate::cold_store::is_cold_chunk_file_name;
@@ -136,6 +139,14 @@ pub const COLD_GC_DEFER_BACKOFF_MS: u64 = 60_000;
 
 /// Longest backoff between retries of a failing cold GC entry (one hour).
 pub const COLD_GC_DEFER_MAX_BACKOFF_MS: u64 = 60 * 60 * 1_000;
+
+/// What the cold GC worker did with an entry it acknowledges.
+enum ColdGcEntryOutcome {
+    /// Its objects are deleted, apart from any path G1 refused.
+    Reclaimed,
+    /// G1 refused the whole entry, so nothing of it is deleted.
+    Refused,
+}
 
 /// Backoff for an entry that has already been deferred `attempts` times:
 /// 1 min, 2 min, 4 min, ... capped at one hour.
@@ -1316,6 +1327,7 @@ impl ShardRuntime {
         let mut reclaimed = 0usize;
         let mut deferred = 0usize;
         let mut first_error = None;
+        let locate = |stream: &BucketStreamId| self.shard_map.locate(stream).raft_group_id;
         // Entries are FIFO by seq; the ack pops a prefix, so it never skips
         // past an object that is still present in cold storage: a failing
         // entry is either deferred (restamped behind the acked prefix) before
@@ -1326,19 +1338,39 @@ impl ShardRuntime {
                 break;
             }
             let result = match &entry.target {
+                // G1: only a stream of the entry's bucket that this group
+                // owns. A refused entry deletes nothing and is acknowledged,
+                // so it cannot stall the queue (F14b).
                 ColdGcTarget::Stream(stream_id) => {
-                    self.reclaim_stream_incarnation(
-                        cold_store,
-                        raft_group_id,
-                        max_entries,
-                        &planned_entry,
-                        stream_id,
-                    )
-                    .await
+                    match check_cold_gc_stream(raft_group_id, entry, stream_id, locate) {
+                        Ok(()) => self
+                            .reclaim_stream_incarnation(
+                                cold_store,
+                                raft_group_id,
+                                max_entries,
+                                &planned_entry,
+                                stream_id,
+                            )
+                            .await
+                            .map(|()| ColdGcEntryOutcome::Reclaimed),
+                        Err(refusal) => {
+                            self.record_cold_gc_refusal(&refusal);
+                            Ok(ColdGcEntryOutcome::Refused)
+                        }
+                    }
                 }
                 ColdGcTarget::Paths(paths) => {
-                    let mut outcome = Ok(());
+                    let mut outcome = Ok(ColdGcEntryOutcome::Reclaimed);
                     for path in paths {
+                        // G1: only an exclusive chunk, a pack or an external
+                        // payload of the entry's bucket that this group owns.
+                        // A refused path is not deleted and does not fail the
+                        // entry, so it cannot stall the queue (F14b).
+                        if let Err(refusal) = check_cold_gc_path(raft_group_id, entry, path, locate)
+                        {
+                            self.record_cold_gc_refusal(&refusal);
+                            continue;
+                        }
                         // Every path names one object (F14g containment).
                         if let Err(err) = cold_store.delete_chunk(path).await {
                             outcome = Err(err);
@@ -1349,10 +1381,13 @@ impl ShardRuntime {
                 }
             };
             match result {
-                Ok(()) => {
+                Ok(ColdGcEntryOutcome::Reclaimed) => {
                     acked_seq = Some(entry.seq);
                     reclaimed = reclaimed.saturating_add(1);
                 }
+                // Acknowledged so the queue moves on, but nothing was
+                // reclaimed.
+                Ok(ColdGcEntryOutcome::Refused) => acked_seq = Some(entry.seq),
                 Err(err) => {
                     self.metrics.record_cold_gc_error();
                     let error = RuntimeError::ColdStoreIo {
@@ -1405,6 +1440,18 @@ impl ShardRuntime {
             return Err(error);
         }
         Ok(reclaimed)
+    }
+
+    /// Counts and logs what the cold GC worker refused to delete (G1). The
+    /// refusal is a leader-local decision: the entry is still acknowledged.
+    fn record_cold_gc_refusal(&self, refusal: &ColdGcRefusal) {
+        self.metrics.record_cold_gc_refusal();
+        tracing::error!(
+            raft_group_id = refusal.raft_group_id().0,
+            seq = refusal.seq(),
+            error = %refusal,
+            "cold GC refused to delete objects outside the entry's bucket, stream or group"
+        );
     }
 
     /// Reclaims the cold objects of one removed stream incarnation (F14a,
