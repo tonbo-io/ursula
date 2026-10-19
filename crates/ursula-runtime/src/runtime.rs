@@ -1334,7 +1334,7 @@ impl ShardRuntime {
                 // owns. A refused entry deletes nothing and is acknowledged,
                 // so it cannot stall the queue (F14b).
                 ColdGcTarget::Stream(stream_id) => {
-                    match check_cold_gc_stream(raft_group_id, entry, stream_id, &locate) {
+                    match check_cold_gc_stream(raft_group_id, entry, stream_id, locate) {
                         Ok(()) => {
                             self.reclaim_stream_incarnation(
                                 cold_store,
@@ -1358,8 +1358,7 @@ impl ShardRuntime {
                         // payload of the entry's bucket that this group owns.
                         // A refused path is not deleted and does not fail the
                         // entry, so it cannot stall the queue (F14b).
-                        if let Err(refusal) =
-                            check_cold_gc_path(raft_group_id, entry, path, &locate)
+                        if let Err(refusal) = check_cold_gc_path(raft_group_id, entry, path, locate)
                         {
                             self.record_cold_gc_refusal(&refusal);
                             continue;
