@@ -302,6 +302,27 @@ mod tests {
     use crate::log_store::RUN_STATE_FILE;
     use crate::types::UrsulaRaftTypeConfig;
 
+    /// Golden bytes: the topology file is part of the epoch-5 format, so its
+    /// encoding never changes within it.
+    #[test]
+    fn a_topology_matches_the_golden_file() {
+        const GOLDEN: &str = "";
+        let dir = tempfile::tempdir().unwrap();
+        let map = StaticShardMap::new(4, 8).unwrap();
+        let cluster_id = ClusterId::new("prod-a").unwrap();
+        assert_eq!(
+            check_or_create(dir.path(), &map, Some(&cluster_id), false).unwrap(),
+            cluster_id
+        );
+        let bytes = std::fs::read(dir.path().join(TOPOLOGY_FILE)).unwrap();
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, GOLDEN);
+        assert_eq!(stored_cluster_id(dir.path()).unwrap(), Some(cluster_id));
+    }
+
     #[tokio::test]
     async fn topology_changes_are_refused_before_old_votes_can_be_reused() {
         let dir = tempfile::tempdir().unwrap();

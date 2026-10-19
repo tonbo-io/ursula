@@ -52,6 +52,8 @@ macro_rules! every {
     }};
 }
 
+pub(crate) use every;
+
 /// [`every`] for an enum of unit variants.
 macro_rules! every_unit {
     ($ty:ident { $($variant:ident),+ $(,)? }) => {
@@ -287,12 +289,12 @@ fn infra_errors() -> Vec<GroupInfraError> {
             raft_group_id: GROUP,
             snapshot: LogPosition {
                 term: 2,
-                node_id: 2,
+                node_id: 4,
                 index: 3,
             },
             held: LogPosition {
                 term: 1,
-                node_id: 1,
+                node_id: 6,
                 index: 5,
             },
         },

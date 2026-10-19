@@ -698,6 +698,38 @@ mod tests {
         BootId::new(id)
     }
 
+    /// Golden bytes: the run-state file is part of the epoch-5 format, so
+    /// its encoding never changes within it.
+    #[cfg(not(madsim))]
+    #[test]
+    fn a_run_state_matches_the_golden_file() {
+        const GOLDEN: &str = "";
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join(super::RUN_STATE_FILE);
+        let current = RunState {
+            boot_id: Some(boot("0b3f5c1e-9d2a-4e7b-8c61-a1b2c3d4e5f6")),
+            fsync: WalFsync::Always,
+            status: RunStatus::Running,
+            recovery_epoch: 4,
+        };
+        super::RunStateFile::new(path.clone(), current.clone())
+            .record(RunStatus::Poisoned, "golden")
+            .expect("record");
+        let bytes = std::fs::read(&path).expect("read");
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, GOLDEN);
+        let read = super::state_file::read::<RunState>(super::StateFileKind::RunState, &path)
+            .expect("read")
+            .expect("a run state");
+        assert_eq!(read, RunState {
+            status: RunStatus::Poisoned,
+            ..current
+        });
+    }
+
     fn previous(boot_id: Option<&str>, fsync: WalFsync, status: RunStatus) -> RunState {
         RunState {
             boot_id: boot_id.map(boot),

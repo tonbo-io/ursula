@@ -33,6 +33,8 @@ pub use error::WalOpenFailureKind;
 pub use error::WriteEffect;
 pub use error::cold_store_failure;
 #[cfg(any(test, feature = "test-support"))]
+pub(crate) use error::samples::every;
+#[cfg(any(test, feature = "test-support"))]
 pub use error::samples::group_engine_errors as group_engine_error_samples;
 use serde::Deserialize;
 use serde::Serialize;

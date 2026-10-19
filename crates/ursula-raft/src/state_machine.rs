@@ -2965,6 +2965,43 @@ mod tests {
         release.send(()).unwrap();
         metadata.await.unwrap().unwrap();
     }
+
+    /// Golden bytes: the snapshot record (`group-N.snapshot.json`) is part
+    /// of the epoch-5 format, so its encoding never changes within it.
+    #[cfg(not(madsim))]
+    #[test]
+    fn a_snapshot_record_matches_the_golden_file() {
+        use openraft::vote::RaftLeaderId;
+
+        type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+        const GOLDEN: &str = "";
+        let meta = SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+            last_log_id: Some(openraft::LogId {
+                leader_id: LeaderId::new(7, 2),
+                index: 19,
+            }),
+            last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                Some(openraft::LogId {
+                    leader_id: LeaderId::new(6, 1),
+                    index: 12,
+                }),
+                openraft::Membership::new_with_defaults(vec![[1, 2, 3].into_iter().collect()], [4]),
+            ),
+        };
+        let pointer_bytes = [0x92, 0x05, 0x09];
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group-7.snapshot.json");
+        persist_snapshot_metadata(Some(&path), &meta, &pointer_bytes).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let hex = bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(hex, GOLDEN);
+        let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&bytes).unwrap();
+        assert_eq!(persisted.meta, meta);
+        assert_eq!(persisted.pointer_bytes, pointer_bytes);
+    }
     use super::*;
 
     #[cfg(not(madsim))]
