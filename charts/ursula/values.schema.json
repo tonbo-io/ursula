@@ -1236,11 +1236,6 @@
           "minimum": 0,
           "description": "Optional raft uncommitted byte cap per group; 0 disables the cap."
         },
-        "snapshotLogsSinceLast": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Committed raft log entries per group between automatic snapshots."
-        },
         "snapshotPressureMaxGroupsPerTick": {
           "type": "integer",
           "minimum": 1,
@@ -1251,6 +1246,11 @@
           "minimum": 1,
           "maximum": 16,
           "description": "Snapshot builds a node runs at once. The snapshot driver keeps one in flight while the node's Raft log is below its budget, and past it more, up to this many before the hard limit of twice the budget. Null keeps each server's own default (2 from 0.7.4, 1 before)."
+        },
+        "snapshotBackstopLogs": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "Far entry backstop of the snapshot driver, rendered as raft.snapshot_backstop_logs. A group snapshots once it applied this many entries since its last snapshot. Null keeps the server default (100000)."
         },
         "maxInSnapshotLogToKeep": {
           "type": "integer",
@@ -1484,8 +1484,8 @@
             "integer",
             "null"
           ],
-          "minimum": 0,
-          "description": "Manual snapshot driver interval in milliseconds; 0 disables the manual driver."
+          "minimum": 1,
+          "description": "Snapshot driver interval in milliseconds, rendered as storage.snapshot.drive_interval. The driver always runs, so 0 is refused."
         }
       }
     },

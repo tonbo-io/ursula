@@ -7331,8 +7331,8 @@ mod snapshot_driver {
     use crate::bootstrap::plan_purges;
     use crate::bootstrap::plan_scrub_purges;
     use crate::bootstrap::plan_snapshot_drive;
-    use crate::bootstrap::resolve_snapshot_drive_interval_ms;
-    use crate::bootstrap::single_node_cadence;
+    use crate::bootstrap::resolve_snapshot_drive_interval;
+    use crate::bootstrap::snapshot_cadence;
     use crate::bootstrap::spawn_snapshot_driver;
     use crate::bootstrap::trigger_snapshot_build;
 
@@ -7406,26 +7406,30 @@ mod snapshot_driver {
     #[test]
     fn snapshot_driver_default_interval_follows_external_store() {
         // F12e: the inline backend runs the byte-based driver too.
-        assert_eq!(resolve_snapshot_drive_interval_ms(None, false), 1_000);
-        assert_eq!(resolve_snapshot_drive_interval_ms(None, true), 5_000);
-        assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), false), 0);
-        assert_eq!(resolve_snapshot_drive_interval_ms(Some(0), true), 0);
+        let fifteen = Duration::from_secs(15);
         assert_eq!(
-            resolve_snapshot_drive_interval_ms(Some(15_000), false),
-            15_000
+            resolve_snapshot_drive_interval(None, false),
+            Duration::from_secs(1)
         );
         assert_eq!(
-            resolve_snapshot_drive_interval_ms(Some(15_000), true),
-            15_000
+            resolve_snapshot_drive_interval(None, true),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            resolve_snapshot_drive_interval(Some(fifteen), false),
+            fifteen
+        );
+        assert_eq!(
+            resolve_snapshot_drive_interval(Some(fifteen), true),
+            fifteen
         );
     }
 
     /// #669: a single node keeps its snapshots inline whatever
     /// `storage.snapshot.backend` says, so its driver ticks on the inline
-    /// default, and its entry backstop is no farther than OpenRaft's policy
-    /// took it before it ran the driver.
+    /// default, under a cluster node's cadence.
     #[test]
-    fn a_single_node_drives_inline_snapshots_with_a_near_entry_backstop() {
+    fn a_single_node_drives_inline_snapshots_under_the_cluster_cadence() {
         let single = Topology::SingleNode {
             raft_group_count: 4,
         };
@@ -7442,28 +7446,22 @@ mod snapshot_driver {
         assert!(cluster.uses_snapshot_store(true));
         assert!(!cluster.uses_snapshot_store(false));
         assert_eq!(
-            resolve_snapshot_drive_interval_ms(None, single.uses_snapshot_store(true)),
-            1_000
+            resolve_snapshot_drive_interval(None, single.uses_snapshot_store(true)),
+            Duration::from_secs(1)
         );
 
         let mut raft = ursula_config::RaftConfig::default();
-        let cadence = single_node_cadence(&raft, 64);
-        assert_eq!(cadence.backstop_entries, raft.snapshot_logs_since_last);
-        assert_eq!(cadence.backstop_entries, 5_000);
-        // The rest is a cluster node's policy.
-        let clustered = SnapshotCadence::new(
-            raft.snapshot_log_budget.as_bytes(),
-            64,
-            raft.snapshot_backstop_logs,
-        )
-        .with_deleted_data_max_age(raft.effective_deleted_data_max_age());
-        assert_eq!(cadence.floor_bytes, clustered.floor_bytes);
+        let cadence = snapshot_cadence(&raft, 64);
+        assert_eq!(cadence.backstop_entries, 100_000);
         assert_eq!(cadence.floor_bytes, 8 * MIB);
-        assert_eq!(cadence.removal_floor, clustered.removal_floor);
-        assert_eq!(clustered.backstop_entries, 100_000);
-        // A nearer configured backstop stays.
+        assert_eq!(
+            cadence.removal_floor,
+            SnapshotCadence::new(raft.snapshot_log_budget.as_bytes(), 64, 100_000)
+                .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
+                .removal_floor
+        );
         raft.snapshot_backstop_logs = 1_000;
-        assert_eq!(single_node_cadence(&raft, 64).backstop_entries, 1_000);
+        assert_eq!(snapshot_cadence(&raft, 64).backstop_entries, 1_000);
     }
 
     #[test]
@@ -8079,17 +8077,15 @@ mod snapshot_driver {
         appends: &[usize],
         permits: usize,
     ) -> (StaticGrpcTestNode, Vec<BucketStreamId>) {
-        // The driver snapshots, not OpenRaft's entry policy.
-        node_with_permits(store, appends, permits, 100).await
+        node_with_permits(store, appends, permits).await
     }
 
-    /// [`loaded_node`] whose engine expects a snapshot driver every
-    /// `drive_interval_ms` (0: none, so OpenRaft's entry policy runs).
+    /// [`loaded_node`]: its groups take no snapshot of OpenRaft's own, and
+    /// none runs until a test drives one.
     async fn node_with_permits(
         store: &Arc<GatedStore>,
         appends: &[usize],
         permits: usize,
-        drive_interval_ms: u64,
     ) -> (StaticGrpcTestNode, Vec<BucketStreamId>) {
         assert_eq!(appends.len(), group_count());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -8108,7 +8104,6 @@ mod snapshot_driver {
             group_count(),
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
-                    snapshot_drive_interval_ms: drive_interval_ms,
                     snapshot_build_max_concurrency: permits,
                     ..RaftEngineConfig::default()
                 }),
@@ -8171,16 +8166,16 @@ mod snapshot_driver {
     /// Runs the production snapshot driver of `node` with `cadence`, a pass
     /// every 100 ms.
     fn drive(node: &StaticGrpcTestNode, store: &Arc<GatedStore>, cadence: SnapshotCadence) {
-        drive_every(node, store, cadence, 100);
+        drive_every(node, store, cadence, Duration::from_millis(100));
     }
 
     /// Runs the production snapshot driver of `node` with `cadence`, a pass
-    /// every `interval_ms` unless the driver's pressure re-tick comes first.
+    /// every `interval` unless the driver's pressure re-tick comes first.
     fn drive_every(
         node: &StaticGrpcTestNode,
         store: &Arc<GatedStore>,
         cadence: SnapshotCadence,
-        interval_ms: usize,
+        interval: Duration,
     ) {
         let participation = PeerParticipation::new(
             1,
@@ -8196,7 +8191,7 @@ mod snapshot_driver {
                 participation: &participation,
             })),
             LogWriteGate::RefuseAtHardLimit,
-            interval_ms,
+            interval,
             cadence,
             None,
             16,
@@ -8284,11 +8279,9 @@ mod snapshot_driver {
     }
 
     /// A single node with Raft over a fresh WAL root, its snapshot driver at
-    /// `drive_interval`, `raft.deleted_data_max_age` of 8 s and OpenRaft
+    /// the default interval, `raft.deleted_data_max_age` of 8 s and OpenRaft
     /// keeping 8 entries below a snapshot.
-    fn single_node(
-        drive_interval: Option<ursula_config::HumanDuration>,
-    ) -> (
+    fn single_node() -> (
         crate::bootstrap::SpawnedRuntime,
         tempfile::TempDir,
         Duration,
@@ -8299,7 +8292,6 @@ mod snapshot_driver {
         config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(8));
         config.raft.max_in_snapshot_log_to_keep = 8;
         config.raft.wal.segment_size = ursula_config::HumanSize::kib(64);
-        config.storage.snapshot.drive_interval = drive_interval;
         let spawned = crate::bootstrap::spawn_runtime(
             &config,
             crate::bootstrap::Persistence::Raft {
@@ -8376,7 +8368,7 @@ mod snapshot_driver {
     /// of them answer 404.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_single_node_scrubs_deleted_and_expired_streams_within_the_bound() {
-        let (spawned, root, max_age) = single_node(None);
+        let (spawned, root, max_age) = single_node();
         let runtime = spawned.runtime.clone();
         let registry = spawned.raft_registry.clone().expect("a Raft registry");
         tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
@@ -8574,34 +8566,6 @@ mod snapshot_driver {
         drop(root);
     }
 
-    /// #669: `storage.snapshot.drive_interval = "0s"` turns a single node's
-    /// driver off: nothing reports its log. Its groups still sweep an
-    /// expired stream, which needs no driver.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_single_node_without_its_driver_still_sweeps_expired_streams() {
-        let (spawned, root, max_age) = single_node(Some(ursula_config::HumanDuration::sec(0)));
-        let runtime = spawned.runtime.clone();
-        let registry = spawned.raft_registry.clone().expect("a Raft registry");
-        tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
-            .await
-            .expect("warm the groups in time")
-            .expect("warm the groups");
-        let expiring = BucketStreamId::new("scrub", "expiring");
-        write_marked(&runtime, &expiring, Some(wall_ms().saturating_add(500))).await;
-        let group = runtime.locate(&expiring).raft_group_id;
-        let raft = registry.get(group).expect("registered group");
-        let until_swept = Duration::from_millis(500)
-            .saturating_add(ursula_runtime::expiry_sweep::CLOCK_GRACE)
-            .saturating_add(ursula_runtime::expiry_sweep::interval(max_age))
-            .saturating_add(Duration::from_secs(2));
-        wait_until_removed(&runtime, &raft, 1, group, until_swept).await;
-        let metrics = runtime.metrics().snapshot();
-        assert_eq!(metrics.raft_log_bytes, 0, "no driver runs");
-        assert!(metrics.ttl_expiry_sweeps >= 1);
-        drop(spawned);
-        drop(root);
-    }
-
     /// #669: the production driver snapshots a group a quarter of
     /// `raft.deleted_data_max_age` after it deleted a stream, purges its log
     /// through that snapshot, and reports the deleted data its groups hold
@@ -8627,7 +8591,6 @@ mod snapshot_driver {
             2,
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
-                    snapshot_drive_interval_ms: 100,
                     max_in_snapshot_log_to_keep: 8,
                     ..RaftEngineConfig::default()
                 }),
@@ -8645,7 +8608,7 @@ mod snapshot_driver {
             &node.registry,
             None,
             LogWriteGate::RefuseAtHardLimit,
-            100,
+            Duration::from_millis(100),
             SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
             16,
@@ -8903,7 +8866,6 @@ mod snapshot_driver {
             2,
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
-                    snapshot_drive_interval_ms: 100,
                     max_in_snapshot_log_to_keep: 8,
                     ..RaftEngineConfig::default()
                 }),
@@ -8921,7 +8883,7 @@ mod snapshot_driver {
             &node.registry,
             None,
             LogWriteGate::RefuseAtHardLimit,
-            100,
+            Duration::from_millis(100),
             SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
             16,
@@ -9146,7 +9108,7 @@ mod snapshot_driver {
         // The log at seven eighths of the budget: past the watermark.
         let cadence = SnapshotCadence::new((log / 7).saturating_mul(8), group_count(), 100_000);
         assert_eq!(cadence.pressure(log, 4), LogPressure::Watermark);
-        drive_every(&node, &store, cadence, 20_000);
+        drive_every(&node, &store, cadence, Duration::from_secs(20));
         store.wait_for_uploads(1, Duration::from_secs(30)).await;
         // The pass took group 0 first: write to the others.
         let target = (cadence.node_budget_bytes / 4).saturating_mul(7);
@@ -9224,7 +9186,7 @@ mod snapshot_driver {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_driver_skips_a_busy_group_without_waiting_for_a_slot() {
         let store = GatedStore::new();
-        let (node, _) = node_with_permits(&store, &[1; 8], 3, 0).await;
+        let (node, _) = node_with_permits(&store, &[1; 8], 3).await;
         let coordinator = node.registry.snapshot_build_coordinator();
         node.registry
             .get(RaftGroupId(0))
@@ -9332,7 +9294,7 @@ mod snapshot_driver {
         store: &Arc<GatedStore>,
         permits: usize,
     ) -> (StaticGrpcTestNode, Router) {
-        let (node, _) = node_with_permits(store, &vec![1; group_count()], permits, 0).await;
+        let (node, _) = node_with_permits(store, &vec![1; group_count()], permits).await;
         let admin = admin_router(HttpState::with_raft_registry(
             node.runtime.clone(),
             node.registry.clone(),
@@ -10527,7 +10489,7 @@ mod leadership_shed {
                 participation: &participation,
             })),
             LogWriteGate::RefuseAtHardLimit,
-            1_000,
+            Duration::from_secs(1),
             SnapshotCadence::new(1 << 30, usize::try_from(GROUPS).unwrap(), 100_000),
             None,
             16,

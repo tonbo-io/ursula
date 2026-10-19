@@ -2655,9 +2655,9 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         // (#561).
         self.build.record_built(chosen.meta.last_log_id);
         // A GC pass after each build, which deletes the object this build
-        // replaced unless a send still holds it, also on a node that runs
-        // no snapshot driver. The pass of an engine that is shutting down
-        // stops: its next incarnation runs its own (#709).
+        // replaced unless a send still holds it, without waiting for the
+        // snapshot driver's next pass. The pass of an engine that is
+        // shutting down stops: its next incarnation runs its own (#709).
         let pass = if self.work.is_stopping() {
             None
         } else {

@@ -179,21 +179,18 @@ snapshot_build_max_concurrency = 4
     #[test]
     fn raft_snapshot_log_retention_is_bounded_and_configurable() {
         let default = UrsulaConfig::default();
-        assert_eq!(default.raft.snapshot_logs_since_last, 5_000);
         assert_eq!(default.raft.snapshot_pressure_max_groups_per_tick, 16);
         assert_eq!(default.raft.max_in_snapshot_log_to_keep, 64);
 
         let config: UrsulaConfig = toml::from_str(
             r#"
 [raft]
-snapshot_logs_since_last = 20000
 snapshot_pressure_max_groups_per_tick = 32
 max_in_snapshot_log_to_keep = 128
 "#,
         )
         .expect("max_in_snapshot_log_to_keep parses");
 
-        assert_eq!(config.raft.snapshot_logs_since_last, 20_000);
         assert_eq!(config.raft.snapshot_pressure_max_groups_per_tick, 32);
         assert_eq!(config.raft.max_in_snapshot_log_to_keep, 128);
     }
@@ -279,7 +276,7 @@ backend = "auto"
     }
 
     #[test]
-    fn snapshot_drive_interval_is_optional_and_zero_is_explicit_disable() {
+    fn snapshot_drive_interval_is_optional_and_parses() {
         use crate::human::HumanDuration;
 
         let omitted: UrsulaConfig = toml::from_str(
@@ -290,19 +287,6 @@ backend = "s3"
         )
         .expect("omitted drive_interval parses");
         assert_eq!(omitted.storage.snapshot.drive_interval, None);
-
-        let disabled: UrsulaConfig = toml::from_str(
-            r#"
-[storage.snapshot]
-backend = "s3"
-drive_interval = "0s"
-"#,
-        )
-        .expect("explicit zero drive_interval parses");
-        assert_eq!(
-            disabled.storage.snapshot.drive_interval,
-            Some(HumanDuration::milli(0))
-        );
 
         let explicit: UrsulaConfig = toml::from_str(
             r#"
@@ -377,6 +361,36 @@ mod load_tests {
         let mut tmp = tempfile::NamedTempFile::with_suffix(suffix).unwrap();
         write!(tmp, "{contents}").unwrap();
         tmp
+    }
+
+    /// The snapshot driver always runs: loading a config that sets a zero
+    /// `storage.snapshot.drive_interval` fails.
+    #[test]
+    fn a_zero_snapshot_drive_interval_is_refused_at_load() {
+        let tmp = temp_config(".toml", "[storage.snapshot]\ndrive_interval = \"0s\"\n");
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                crate::ConfigError::Validation(
+                    crate::validate::ValidationError::ZeroSnapshotDriveInterval
+                )
+            ),
+            "{err}"
+        );
+    }
+
+    /// `raft.snapshot_logs_since_last` is gone in 0.9: a config that still
+    /// sets it is refused as an unknown key.
+    #[test]
+    fn a_removed_snapshot_logs_since_last_is_refused_at_load() {
+        let tmp = temp_config(".toml", "[raft]\nsnapshot_logs_since_last = 5000\n");
+        let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+        assert!(
+            matches!(err, crate::ConfigError::TomlParse(_))
+                && err.to_string().contains("snapshot_logs_since_last"),
+            "{err}"
+        );
     }
 
     fn available_cores() -> usize {

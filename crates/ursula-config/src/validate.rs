@@ -47,6 +47,13 @@ pub enum ValidationError {
     /// state, so every peer would look unable to campaign.
     #[error("governance.leadership_balance.peer_timeout must be non-zero")]
     ZeroPeerTimeout,
+    /// The snapshot driver always runs and alone takes each group's
+    /// snapshots, so it needs an interval to tick on.
+    #[error(
+        "storage.snapshot.drive_interval must be non-zero: the snapshot driver always runs and \
+         takes every Raft snapshot, so it cannot be turned off"
+    )]
+    ZeroSnapshotDriveInterval,
     /// No build could run with 0, which used to be taken as 1 without a
     /// word, and every build holds a copy of its group's state.
     #[error(
@@ -157,6 +164,14 @@ impl UrsulaConfig {
             .is_zero()
         {
             return Err(ValidationError::ZeroPeerTimeout);
+        }
+        if self
+            .storage
+            .snapshot
+            .drive_interval
+            .is_some_and(|interval| interval.as_duration().is_zero())
+        {
+            return Err(ValidationError::ZeroSnapshotDriveInterval);
         }
         self.validate_peers()?;
         if !self.raft.groups.is_empty() {
@@ -416,6 +431,30 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "governance.leadership_balance.peer_timeout must be non-zero"
+        );
+    }
+
+    /// The snapshot driver always runs: a zero interval is refused, an
+    /// unset or non-zero one is valid.
+    #[test]
+    fn the_snapshot_drive_interval_must_be_non_zero() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.validate().expect("an unset interval is valid");
+        config.storage.snapshot.drive_interval = Some(HumanDuration::sec(45));
+        config.validate().expect("a non-zero interval is valid");
+        config.storage.snapshot.drive_interval = Some(HumanDuration::milli(0));
+        let err = config
+            .validate()
+            .expect_err("a zero drive interval is refused");
+        assert!(
+            matches!(err, ValidationError::ZeroSnapshotDriveInterval),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .starts_with("storage.snapshot.drive_interval must be non-zero"),
+            "{err}"
         );
     }
 

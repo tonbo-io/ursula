@@ -127,6 +127,12 @@ init_membership_per_group = false
 # Max concurrent snapshot installs across all groups on this node.
 # snapshot_install_max_concurrency = 1
 
+# Far entry backstop of the snapshot driver: a group snapshots once it applied
+# this many entries since its last snapshot, whatever its log bytes.  The same
+# on a single node and on a cluster node.  0.8 kept a single node's groups
+# within 5000 entries; set 5000 to keep that bound.
+# snapshot_backstop_logs = 100000
+
 # How long a replica keeps a deleted, purged or expired stream in its current
 # Raft snapshot and its Raft log after it applies the removal.  Unset, the
 # larger of 1h and eight times install_snapshot_timeout.  A set value must be
@@ -267,12 +273,12 @@ backend = "none"
 #   s3      — snapshots written to S3 (shares [storage.cold.s3] credentials)
 backend = "auto"
 
-# Interval of the manual snapshot driver, which snapshots each group once
-# the Raft log it applied since its last snapshot reaches
-# max(F, 2 x that snapshot's size), F = raft.snapshot_log_budget divided by
-# twice the group count (at most 16 MiB).  Omitted: 5s with an external
-# store (whose health it probes), 1s inline.  "0s" disables the driver and
-# falls back to OpenRaft's raft.snapshot_logs_since_last entry policy.
+# Interval of the snapshot driver, which takes every Raft snapshot: it
+# snapshots each group once the Raft log it applied since its last snapshot
+# reaches max(F, 2 x that snapshot's size), F = raft.snapshot_log_budget
+# divided by twice the group count (at most 16 MiB).  Omitted: 5s with an
+# external store (whose health it probes), 1s inline.  The driver always
+# runs, so "0s" is refused at startup.
 # drive_interval = "5s"
 
 # Root directory for local snapshot store.  Required when backend = "local".
