@@ -17,6 +17,9 @@
 //!   reverts directory operations that were not `fsync`ed.
 //!   [`SimDisk::power_loss_losing_unsynced`] drops every unsynced page, for
 //!   a schedule that needs the loss to happen.
+//! - [`SimDisk::write_back`] makes every page under a prefix durable, as a
+//!   host's page cache writes pages back on its own, for a schedule that
+//!   must keep what it wrote so far across a later power loss.
 //! - [`SimDisk::inject_fault`] fails the next matching file operation. A
 //!   partial write exposes half the bytes before failing, and a rename fault
 //!   matches its destination. A failed `fsync` marks the pages clean without
