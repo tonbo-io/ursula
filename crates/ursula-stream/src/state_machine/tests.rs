@@ -837,6 +837,10 @@ fn stream_create_requires_existing_bucket_and_valid_ids() {
         machine.apply(create_cmd(stream("streams"), Create::default())),
         StreamErrorCode::InvalidStreamId,
     );
+    assert_error_code(
+        machine.apply(create_cmd(stream("."), Create::default())),
+        StreamErrorCode::InvalidStreamId,
+    );
 }
 
 #[test]

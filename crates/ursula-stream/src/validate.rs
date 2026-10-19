@@ -78,10 +78,21 @@ mod tests {
 
     #[test]
     fn stream_ids_that_are_not_one_path_segment_are_refused() {
-        for local in ["", ".", "..", "a/b", "/", "a..b", "a\0b"] {
+        for (local, reason) in [
+            ("", "must not be empty"),
+            (".", "must not be '.'"),
+            ("..", "'..'"),
+            ("a..b", "'..'"),
+            ("a/b", "'/'"),
+            ("/", "'/'"),
+            ("a\0b", "NUL"),
+        ] {
             let stream_id = BucketStreamId::new("tenant", local);
             let refusal = validate_stream_id(&stream_id).expect_err("not one path segment");
-            assert!(!refusal.is_empty(), "stream id {local:?} must be refused");
+            assert!(
+                refusal.contains(reason),
+                "stream id {local:?} refused with {refusal:?}"
+            );
         }
         validate_stream_id(&BucketStreamId::new("tenant", ".a")).expect("a leading dot is allowed");
     }
