@@ -1656,7 +1656,7 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
     // The leader's view names members 1 to 3; configuration names node 4
     // only. The gated node's gate keeps the driver asking every candidate.
     let leader = &engines[usize::try_from(leader_id).unwrap() - 1];
-    let asked = Arc::new(Mutex::new(BTreeSet::new()));
+    let asked = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
     let (rounds, mut seen) = tokio::sync::watch::channel(0_usize);
     let rounds = Arc::new(rounds);
     let recorded = asked.clone();
@@ -1700,6 +1700,7 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn replacing_the_voters_removes_learners_outside_them() {
+    use openraft::rt::WatchReceiver;
     let (_registry, engines, leader_id, _wal_roots) =
         build_three_node_cluster("ursula-replace-voters-test", None).await;
     let leader = &engines[usize::try_from(leader_id).unwrap() - 1];
