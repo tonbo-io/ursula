@@ -358,8 +358,8 @@ impl Plan {
             .filter(|node| *node != leader)
             .collect::<Vec<_>>();
         let removed = others[usize::try_from(rng.next_bounded(2)).expect("small")];
-        // Every nine consecutive seeds cover each variant, as the PR seeds
-        // 505-513 do: 505 a blackout promotion (R3, no cut), 506 a learner
+        // Every nine consecutive seeds cover each variant, as the family's
+        // seeds 505-513 do: 505 a blackout promotion (R3, no cut), 506 a learner
         // ahead (M-A), 507 a completed promotion (M1), 510 a commit ahead
         // (F3), 511 a missed removal, 512 two recoveries (A).
         let (change, loss) = match seed % 9 {
@@ -2291,7 +2291,7 @@ mod tests {
             .unwrap_or_else(|| panic!("seed {seed}: no outcome"))
     }
 
-    /// Each PR seed whose variant a review raised runs in the shape it
+    /// Each family seed whose variant a review raised runs in the shape it
     /// exists for, twice alike, and every recovery ends with a follower
     /// catching up from a snapshot through the commit screen:
     ///

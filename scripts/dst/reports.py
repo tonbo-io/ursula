@@ -16,7 +16,6 @@ from typing import Iterable
 from scripts.dst.common import (
     COVERAGE_BASELINE,
     NIGHTLY_WORKFLOW,
-    PR_WORKFLOW,
     ROOT,
     format_items,
     rel,
@@ -170,10 +169,10 @@ def report_coverage(argv: list[str]) -> int:
 
 
 # =============================================================================
-# seed-report — markdown + json snapshot of PR/nightly seed inventory
+# seed-report — markdown + json snapshot of the nightly seed inventory
 # =============================================================================
 
-WORKFLOWS = {"pr": PR_WORKFLOW, "nightly": NIGHTLY_WORKFLOW}
+WORKFLOWS = {"nightly": NIGHTLY_WORKFLOW}
 
 
 def _parse_smoke_commands(workflow: str) -> list[dict]:
@@ -219,7 +218,7 @@ def _collect_workflow(label: str, path: Path) -> dict:
 
 
 def report_seed_inventory(argv: list[str]) -> int:
-    """Snapshot of PR/nightly seed inventory as JSON + Markdown."""
+    """Snapshot of the nightly seed inventory as JSON + Markdown."""
     parser = argparse.ArgumentParser(prog="dst seed-report")
     parser.add_argument("--out-json", default="target/ursula-sim-seed-inventory/report.json")
     parser.add_argument("--out-md", default="target/ursula-sim-seed-inventory/report.md")

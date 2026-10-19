@@ -27,11 +27,11 @@ def _run_one_seed(family: str, seed: int, failure_dir: Path) -> None:
 
 
 def tool_throughput(argv: list[str]) -> int:
-    """Measure seeds/min/core so the PR/nightly budget is data-driven.
+    """Measure seeds/min/core so the nightly budget is data-driven.
 
     Wall-clocks `ursula-sim smoke --seed N` for `--measure` seeds
     (after `--warmup` warmup seeds), divides total elapsed by seed count, and
-    suggests PR (2 min) and nightly (30 min) seed budgets.
+    suggests a nightly (30 min) seed budget.
     """
     parser = argparse.ArgumentParser(prog="dst throughput")
     parser.add_argument("--family", default="",
@@ -58,7 +58,6 @@ def tool_throughput(argv: list[str]) -> int:
     elapsed_s = time.perf_counter() - started
 
     seeds_per_minute = (args.measure / elapsed_s * 60.0) if elapsed_s > 0 else 0.0
-    pr_budget_min = 2.0
     nightly_budget_min = 30.0
 
     summary = {
@@ -67,14 +66,12 @@ def tool_throughput(argv: list[str]) -> int:
         "measure": args.measure,
         "elapsed_s": round(elapsed_s, 3),
         "seeds_per_minute_per_core": round(seeds_per_minute, 2),
-        "pr_budget_minutes": pr_budget_min,
         "nightly_budget_minutes": nightly_budget_min,
-        "pr_seed_count_suggested": int(seeds_per_minute * pr_budget_min),
         "nightly_seed_count_suggested": int(seeds_per_minute * nightly_budget_min),
         "note": (
-            "Update PR_SEED_BUDGET / NIGHTLY_SEED_BUDGET in scripts/dst/audits.py "
+            "Update NIGHTLY_SEED_BUDGET in scripts/dst/audits.py "
             "(see the `CI` section of docs/architecture/deterministic-simulation-testing.md); "
-            "`dst seed-inventory` enforces the per-track seed budget."
+            "`dst seed-inventory` enforces the seed budget."
         ),
     }
 
@@ -87,7 +84,6 @@ def tool_throughput(argv: list[str]) -> int:
     print(f"elapsed:          {elapsed_s:.2f}s")
     print(f"seeds/min/core:   {seeds_per_minute:.2f}")
     print()
-    print(f"PR budget {pr_budget_min:>4.1f} min  -> {summary['pr_seed_count_suggested']:>4} seeds")
     print(f"Nightly   {nightly_budget_min:>4.1f} min  -> {summary['nightly_seed_count_suggested']:>4} seeds")
     print()
     print(summary["note"])

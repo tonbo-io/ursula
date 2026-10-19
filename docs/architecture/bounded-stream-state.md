@@ -256,7 +256,7 @@ The bounded-state seed families in `crates/ursula-sim/src/madsim_harness/tests.r
 - **Invariant 11, no stale locators.** After any ambiguous external append, offload or compaction, readable bytes equal acknowledged bytes on every replica, and inputs of a compaction that never committed are not deleted. Tests: `external_locators_survive_ambiguous_commits`, `external_locators_survive_snapshot_install_with_staged_refs`, `external_locators_survive_ambiguous_compaction`.
 - **Invariant 12, identical producer state.** After the same log prefix every replica holds the same producer records and epoch floor, whether it replayed the log or installed a snapshot. Test: `producer_state_matches_after_snapshot_install_mid_stream`.
 
-`ci.yml` runs a few seeds of each on every pull request. `dst-nightly.yml` sweeps larger seed ranges of the `external_locators_survive` family through the `*_SEEDS` variables.
+`dst-nightly.yml` runs each at its default seeds, then sweeps larger seed ranges of the `external_locators_survive` family through the `*_SEEDS` variables.
 
 ### 7.4 Gauges
 

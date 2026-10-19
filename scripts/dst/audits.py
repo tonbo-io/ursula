@@ -20,7 +20,6 @@ from scripts.dst.common import (
     HARNESS_ROOT,
     NIGHTLY_WORKFLOW,
     NONDETERMINISM_WHITELIST,
-    PR_WORKFLOW,
     ROOT,
     SCHEDULE_CORPUS,
     SMOKE_RS,
@@ -494,9 +493,9 @@ def _sim_test_filters(path: Path) -> set[str]:
 
 def _unwired_replay_tests() -> list[str]:
     """Every non-ignored `*_replays` test in the simulation harness that no
-    `cargo test -p ursula-sim` filter of the PR workflow matches. libtest
+    `cargo test -p ursula-sim` filter of the nightly workflow matches. libtest
     matches a filter against the test's path, so the file stem counts."""
-    filters = _sim_test_filters(PR_WORKFLOW)
+    filters = _sim_test_filters(NIGHTLY_WORKFLOW)
     unwired = []
     for path in sorted(HARNESS_ROOT.rglob("*.rs")):
         for m in SIM_TEST_FN_RE.finditer(path.read_text()):
@@ -510,36 +509,38 @@ def _unwired_replay_tests() -> list[str]:
 
 
 def audit_ci_shape(argv: list[str]) -> int:
-    """CI workflows must not contain multi-element strict-equality
-    jq assertions on SimFaultAction discriminants, and the PR workflow must
-    run every non-ignored `*_replays` simulation test."""
+    """The nightly workflow must not contain multi-element strict-equality
+    jq assertions on SimFaultAction discriminants, and must run every
+    non-ignored `*_replays` simulation test."""
     argparse.ArgumentParser(prog="dst ci-shape").parse_args(argv)
+
+    path = NIGHTLY_WORKFLOW
+    if not path.exists():
+        print(f"ERROR: {rel(path)} is missing.", file=sys.stderr)
+        return 1
 
     unwired = _unwired_replay_tests()
     if unwired:
-        print("ERROR: `*_replays` tests no PR workflow filter runs:", file=sys.stderr)
+        print("ERROR: `*_replays` tests no nightly workflow filter runs:", file=sys.stderr)
         for line in unwired:
             print(line, file=sys.stderr)
         print(
-            "Fix: keep the `_replays` filter in the PR DST job, or name the test so it matches.",
+            "Fix: keep the `_replays` filter in the nightly DST job, or name the test so it matches.",
             file=sys.stderr,
         )
         return 1
 
     violations: list[str] = []
-    for path in (PR_WORKFLOW, NIGHTLY_WORKFLOW):
-        if not path.exists():
-            continue
-        text = path.read_text()
-        for m in MULTI_ELEMENT_SHAPE_RE.finditer(text):
-            line_no = text.count("\n", 0, m.start()) + 1
-            snippet = m.group(0).replace("\n", " ").strip()
-            if len(snippet) > 110:
-                snippet = snippet[:107] + "..."
-            violations.append(f"  {rel(path)}:{line_no}  {snippet}")
+    text = path.read_text()
+    for m in MULTI_ELEMENT_SHAPE_RE.finditer(text):
+        line_no = text.count("\n", 0, m.start()) + 1
+        snippet = m.group(0).replace("\n", " ").strip()
+        if len(snippet) > 110:
+            snippet = snippet[:107] + "..."
+        violations.append(f"  {rel(path)}:{line_no}  {snippet}")
 
     if violations:
-        print("ERROR: multi-element strict-equality step assertions found in CI workflows:",
+        print("ERROR: multi-element strict-equality step assertions found in the nightly workflow:",
               file=sys.stderr)
         for line in violations:
             print(line, file=sys.stderr)
@@ -552,8 +553,8 @@ def audit_ci_shape(argv: list[str]) -> int:
         )
         return 1
 
-    print("OK: no multi-element strict-equality step-shape jq assertions found in CI workflows.")
-    print("OK: the PR workflow runs every `*_replays` simulation test.")
+    print("OK: no multi-element strict-equality step-shape jq assertions found in the nightly workflow.")
+    print("OK: the nightly workflow runs every `*_replays` simulation test.")
     return 0
 
 
@@ -618,7 +619,7 @@ def audit_modularity(argv: list[str]) -> int:
 # 6. seed-inventory: family discipline and seed budget
 # =============================================================================
 
-EXPECTED_PR_FAMILIES = {
+EXPECTED_FAMILIES = {
     "pipeline-smoke-http-live-waiter-corruption",
     "pipeline-smoke-http-live-sse-corruption",
     "pipeline-smoke-http-producer-retry-corruption",
@@ -655,9 +656,6 @@ EXPECTED_PR_FAMILIES = {
     "deleted-data-across-segments",
     "deleted-data-after-expiry",
     "engine-restart-leaves-no-work",
-}
-EXPECTED_PR_RANGES = {"60..=64", "137..=140"}
-EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "runtime-raft-network-randomized-extended",
     "leader-read-linearizability-extended",
     "producer-repeats-exactly-once-extended",
@@ -672,12 +670,10 @@ EXPECTED_NIGHTLY_FAMILIES = EXPECTED_PR_FAMILIES | {
     "deleted-data-after-expiry-extended",
     "engine-restart-leaves-no-work-extended",
 }
-EXPECTED_NIGHTLY_RANGES = {"60..=199", "503..=504"}
+EXPECTED_RANGES = {"60..=199", "503..=504"}
 
-# PR ≤ 2 min at the measured ~0.3 s/seed of the bundled PR sweep on the CI
-# runner; nightly ≤ 30 min at ~70 seeds/min/core conservative. See the `CI`
-# section of docs/architecture/deterministic-simulation-testing.md.
-PR_SEED_BUDGET = 240
+# Nightly ≤ 30 min at ~70 seeds/min/core conservative. See the `CI` section
+# of docs/architecture/deterministic-simulation-testing.md.
 NIGHTLY_SEED_BUDGET = 1500
 
 
@@ -738,37 +734,23 @@ def _check_expected_families(
 
 
 def audit_seed_inventory(argv: list[str]) -> int:
-    """Family discipline: PR/nightly workflows have the expected
+    """Family discipline: the nightly workflow has the expected
     families/ranges, every named family resolves to a supported handler,
-    and total seed count is within the per-track budget."""
+    and the total seed count is within budget."""
     argparse.ArgumentParser(prog="dst seed-inventory").parse_args(argv)
 
     supported = _supported_families()
-    pr_families = _workflow_families(PR_WORKFLOW)
-    pr_ranges = _workflow_ranges(PR_WORKFLOW)
-    nightly_families = _workflow_families(NIGHTLY_WORKFLOW)
-    nightly_ranges = _workflow_ranges(NIGHTLY_WORKFLOW)
+    families = _workflow_families(NIGHTLY_WORKFLOW)
+    ranges = _workflow_ranges(NIGHTLY_WORKFLOW)
 
-    errors: list[str] = []
-    errors.extend(_check_expected_families(
-        "PR", pr_families, pr_ranges, EXPECTED_PR_FAMILIES, EXPECTED_PR_RANGES, supported,
-    ))
-    errors.extend(_check_expected_families(
-        "nightly", nightly_families, nightly_ranges,
-        EXPECTED_NIGHTLY_FAMILIES, EXPECTED_NIGHTLY_RANGES, supported,
-    ))
+    errors = _check_expected_families(
+        "nightly", families, ranges, EXPECTED_FAMILIES, EXPECTED_RANGES, supported,
+    )
 
-    smoke = SMOKE_RS.read_text()
-    pr_total = _total_seeds(PR_WORKFLOW, smoke)
-    nightly_total = _total_seeds(NIGHTLY_WORKFLOW, smoke)
-    if pr_total > PR_SEED_BUDGET:
+    total = _total_seeds(NIGHTLY_WORKFLOW, SMOKE_RS.read_text())
+    if total > NIGHTLY_SEED_BUDGET:
         errors.append(
-            f"PR: total seed count {pr_total} exceeds budget {PR_SEED_BUDGET} "
-            "(re-run `dst throughput` if the runner got faster)"
-        )
-    if nightly_total > NIGHTLY_SEED_BUDGET:
-        errors.append(
-            f"nightly: total seed count {nightly_total} exceeds budget {NIGHTLY_SEED_BUDGET} "
+            f"nightly: total seed count {total} exceeds budget {NIGHTLY_SEED_BUDGET} "
             "(re-run `dst throughput` if the runner got faster)"
         )
 
@@ -779,10 +761,8 @@ def audit_seed_inventory(argv: list[str]) -> int:
         return 1
 
     print("DST seed inventory audit passed.")
-    print(f"PR families: {len(pr_families)}; ranges: {', '.join(sorted(pr_ranges))}")
-    print(f"PR total seeds: {pr_total} (budget {PR_SEED_BUDGET})")
-    print(f"nightly families: {len(nightly_families)}; ranges: {', '.join(sorted(nightly_ranges))}")
-    print(f"nightly total seeds: {nightly_total} (budget {NIGHTLY_SEED_BUDGET})")
+    print(f"nightly families: {len(families)}; ranges: {', '.join(sorted(ranges))}")
+    print(f"nightly total seeds: {total} (budget {NIGHTLY_SEED_BUDGET})")
     return 0
 
 
@@ -829,12 +809,12 @@ def _has_replay_guard(ci: str, seed: int, invariant: str) -> bool:
 
 
 def audit_failure_guards(argv: list[str]) -> int:
-    """Every failure-smoke corpus entry must have a fresh PR CI path that
+    """Every failure-smoke corpus entry must have a fresh nightly path that
     regenerates the failure, minimizes it, asserts the embedded trace,
     and replays the minimized artifact."""
     argparse.ArgumentParser(prog="dst failure-guards").parse_args(argv)
 
-    ci = PR_WORKFLOW.read_text()
+    ci = NIGHTLY_WORKFLOW.read_text()
     missing: list[str] = []
     for seed, invariant in _expected_failure_corpus():
         if not _has_minimize_guard(ci, seed, invariant):
