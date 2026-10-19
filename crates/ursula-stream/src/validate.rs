@@ -65,12 +65,37 @@ fn validate_path_segment(value: &str) -> Result<(), String> {
     if value.contains('/') || value.contains('\0') || value.contains("..") {
         return Err("stream_id must not contain '/', NUL, or '..'".to_owned());
     }
+    // `.` would put a `/./` segment into the stream's object keys.
+    if value == "." {
+        return Err("stream_id must not be '.'".to_owned());
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stream_ids_that_are_not_one_path_segment_are_refused() {
+        for (local, reason) in [
+            ("", "must not be empty"),
+            (".", "must not be '.'"),
+            ("..", "'..'"),
+            ("a..b", "'..'"),
+            ("a/b", "'/'"),
+            ("/", "'/'"),
+            ("a\0b", "NUL"),
+        ] {
+            let stream_id = BucketStreamId::new("tenant", local);
+            let refusal = validate_stream_id(&stream_id).expect_err("not one path segment");
+            assert!(
+                refusal.contains(reason),
+                "stream id {local:?} refused with {refusal:?}"
+            );
+        }
+        validate_stream_id(&BucketStreamId::new("tenant", ".a")).expect("a leading dot is allowed");
+    }
 
     #[test]
     fn snapshot_namespace_and_double_underscore_bucket_ids_are_reserved() {
