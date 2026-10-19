@@ -211,17 +211,11 @@ pub struct RaftConfig {
     /// while fewer run than the node's log calls for: one while the log is
     /// below `snapshot_log_budget`, and past it more, in even steps up to
     /// this many before the hard limit (twice the budget). Builds it started
-    /// past the budget finish after the log falls below it. With the driver
-    /// off, OpenRaft's own policy may run this many at once. Between 1 and
+    /// past the budget finish after the log falls below it. Between 1 and
     /// [`RaftConfig::MAX_SNAPSHOT_BUILD_CONCURRENCY`].
     pub snapshot_build_max_concurrency: usize,
     /// Max concurrent snapshot installs across all groups on this node.
     pub snapshot_install_max_concurrency: usize,
-    /// Committed Raft log entries per group between automatic snapshots when
-    /// the manual snapshot driver is disabled (`storage.snapshot.drive_interval
-    /// = "0s"`) and OpenRaft's own policy runs. The driver snapshots by log
-    /// bytes instead (`snapshot_log_budget`).
-    pub snapshot_logs_since_last: u64,
     /// Maximum groups snapshotted by one driver tick, including pressure
     /// passes, while the node's log is below `snapshot_log_budget`. Past it
     /// a pass starts this many for each build it keeps in flight, so it
@@ -318,7 +312,6 @@ impl Default for RaftConfig {
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 2,
             snapshot_install_max_concurrency: 1,
-            snapshot_logs_since_last: 5_000,
             snapshot_pressure_max_groups_per_tick: 16,
             snapshot_log_budget: HumanSize::gib(1),
             snapshot_backstop_logs: 100_000,
@@ -659,13 +652,13 @@ pub struct RaftSnapshotConfig {
     /// ([`SnapshotPrefix`], `snapshots` when unset). Used only when `backend`
     /// is `S3`.
     pub s3_prefix: Option<SnapshotPrefix>,
-    /// Interval for the manual snapshot driver, which snapshots each group by
-    /// Raft log bytes (bounded-stream-state F12e).
+    /// Interval of the snapshot driver, which alone takes each group's
+    /// snapshots, by Raft log bytes (bounded-stream-state F12e).
     ///
     /// When omitted, external snapshot stores use a 5s interval and inline
     /// snapshot stores 1s; only external stores gate the driver on store
-    /// health. Explicit `0s` disables the manual driver and keeps openraft's
-    /// entry-count policy (`raft.snapshot_logs_since_last`).
+    /// health. The driver always runs, so a zero interval is refused
+    /// ([`crate::validate::ValidationError::ZeroSnapshotDriveInterval`]).
     pub drive_interval: Option<HumanDuration>,
 }
 

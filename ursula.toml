@@ -267,12 +267,12 @@ backend = "none"
 #   s3      — snapshots written to S3 (shares [storage.cold.s3] credentials)
 backend = "auto"
 
-# Interval of the manual snapshot driver, which snapshots each group once
-# the Raft log it applied since its last snapshot reaches
-# max(F, 2 x that snapshot's size), F = raft.snapshot_log_budget divided by
-# twice the group count (at most 16 MiB).  Omitted: 5s with an external
-# store (whose health it probes), 1s inline.  "0s" disables the driver and
-# falls back to OpenRaft's raft.snapshot_logs_since_last entry policy.
+# Interval of the snapshot driver, which takes every Raft snapshot: it
+# snapshots each group once the Raft log it applied since its last snapshot
+# reaches max(F, 2 x that snapshot's size), F = raft.snapshot_log_budget
+# divided by twice the group count (at most 16 MiB).  Omitted: 5s with an
+# external store (whose health it probes), 1s inline.  The driver always
+# runs, so "0s" is refused at startup.
 # drive_interval = "5s"
 
 # Root directory for local snapshot store.  Required when backend = "local".

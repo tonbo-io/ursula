@@ -153,18 +153,15 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     if snapshot_store.is_some() {
         warn_if_a_copy_can_outlast_its_install(config);
     }
-    let mut engine_config = RaftEngineConfig::from(&config.raft);
-    let configured_snapshot_drive_interval_ms = config
-        .storage
-        .snapshot
-        .drive_interval
-        .as_ref()
-        .map(|interval| interval.as_duration().as_millis() as usize);
-    let snapshot_drive_interval_ms = snapshot::resolve_snapshot_drive_interval_ms(
-        configured_snapshot_drive_interval_ms,
+    let engine_config = RaftEngineConfig::from(&config.raft);
+    let snapshot_drive_interval = snapshot::resolve_snapshot_drive_interval(
+        config
+            .storage
+            .snapshot
+            .drive_interval
+            .map(|interval| interval.as_duration()),
         topology.uses_snapshot_store(snapshot_store.is_some()),
     );
-    engine_config.snapshot_drive_interval_ms = snapshot_drive_interval_ms as u64;
     let registry = RaftGroupHandleRegistry::default()
         .with_append_transport_budget_bytes(config.raft.append_transport_budget_bytes)
         .with_snapshot_install(
@@ -244,8 +241,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
     }
 
     // A single node that runs Raft drives its snapshots as a cluster node
-    // does (#669), with inline snapshots, an entry backstop no farther than
-    // OpenRaft's policy took it in 0.8.0, and no write gate.
+    // does (#669), with inline snapshots and no write gate.
     if let (Topology::SingleNode { .. }, Some(registry), Some(wal)) =
         (&topology, &spawned.raft_registry, &spawned.raft_wal)
     {
@@ -254,8 +250,8 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             registry,
             None,
             snapshot::LogWriteGate::Open,
-            snapshot_drive_interval_ms,
-            snapshot::single_node_cadence(&config.raft, topology.raft_group_count()),
+            snapshot_drive_interval,
+            snapshot::snapshot_cadence(&config.raft, topology.raft_group_count()),
             Some(wal.maintenance()),
             config.raft.snapshot_pressure_max_groups_per_tick,
         );
@@ -279,8 +275,8 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
                 })
             }),
             snapshot::LogWriteGate::RefuseAtHardLimit,
-            snapshot_drive_interval_ms,
-            snapshot::cluster_cadence(&config.raft, topology.raft_group_count()),
+            snapshot_drive_interval,
+            snapshot::snapshot_cadence(&config.raft, topology.raft_group_count()),
             spawned
                 .raft_wal
                 .as_ref()
@@ -400,13 +396,7 @@ fn spawn_singleton(
                 cold_store.clone(),
             )
             .with_registry(registry);
-            // With the driver off (`storage.snapshot.drive_interval = "0s"`)
-            // a single node runs as 0.8.0 did: OpenRaft's own snapshot
-            // policy, entries kept below a snapshot and coordinator per
-            // group.
-            if let Some(engine_config) = raft_engine_config
-                .filter(|engine_config| engine_config.snapshot_drive_interval_ms > 0)
-            {
+            if let Some(engine_config) = raft_engine_config {
                 factory = factory.with_engine_config(engine_config);
             }
             ShardRuntime::spawn_with_engine_factory_and_cold_store(

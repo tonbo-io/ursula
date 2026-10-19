@@ -1236,11 +1236,6 @@
           "minimum": 0,
           "description": "Optional raft uncommitted byte cap per group; 0 disables the cap."
         },
-        "snapshotLogsSinceLast": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Committed raft log entries per group between automatic snapshots."
-        },
         "snapshotPressureMaxGroupsPerTick": {
           "type": "integer",
           "minimum": 1,
@@ -1484,8 +1479,8 @@
             "integer",
             "null"
           ],
-          "minimum": 0,
-          "description": "Manual snapshot driver interval in milliseconds; 0 disables the manual driver."
+          "minimum": 1,
+          "description": "Snapshot driver interval in milliseconds, rendered as storage.snapshot.drive_interval. The driver always runs, so 0 is refused."
         }
       }
     },

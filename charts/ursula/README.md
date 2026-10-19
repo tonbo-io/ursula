@@ -347,7 +347,8 @@ When `snapshotStore.backend=s3`, the generated config sets
 settings apply) and shares the top-level `s3` bucket/credential
 settings. The runtime drives one due group every 5 seconds by default. Set
 `snapshotStore.driveIntervalMs=10000` to render
-`storage.snapshot.drive_interval = "10000ms"`, or `0` to disable the manual driver.
+`storage.snapshot.drive_interval = "10000ms"`. The driver always runs, so the
+schema refuses `0`.
 
 It uses the shared top-level `s3` bucket/credential settings. Runtime S3 snapshot
 keys are built under the resolved `storage.cold.root` plus
@@ -467,7 +468,6 @@ container receives only chart-managed container settings plus explicit
 | `raft.minAvailableBytes` | `536870912` | Reject writes and readiness below this many free bytes on the WAL filesystem. `0` disables the guard. |
 | `raft.resumeAvailableBytes` | `1073741824` | Free bytes required before WAL disk pressure clears; must exceed the minimum. |
 | `raft.maxUncommittedBytesPerGroup` | `null` | Optional per-group cap for raft-submitted but not-yet-applied payload bytes. Renders `raft.max_uncommitted_size_per_group` in the generated config when set; `0` disables the cap. |
-| `raft.snapshotLogsSinceLast` | `5000` | Committed log entries per group between automatic full-state snapshots. Higher values trade log memory for lower snapshot CPU and tail latency. |
 | `raft.snapshotPressureMaxGroupsPerTick` | `16` | Maximum groups snapshotted by one pressure pass while the node's Raft log is below its budget. Past the budget a pass starts this many for each snapshot build it keeps in flight. |
 | `raft.snapshotBuildMaxConcurrency` | `null` | Snapshot builds a node runs at once. Each holds a copy of its group's state and its compressed upload. The snapshot driver keeps one in flight while the node's Raft log is below its budget, and past it more, up to this many before the hard limit of twice the budget. Between 1 and 16. Renders `raft.snapshot_build_max_concurrency` when set. Unset, each server keeps its own default (2 from 0.7.4, 1 before), so a pod that still runs an older image keeps the setting it was validated with. |
 | `raft.maxInSnapshotLogToKeep` | `64` | Payload-bearing Raft log entries retained per group after snapshot coverage. Renders `raft.max_in_snapshot_log_to_keep`. |
@@ -520,7 +520,7 @@ Every server pod gets a `raft-data` PVC for its Raft WAL.
 | --- | --- | --- |
 | `snapshotStore.backend` | `auto` | OpenRaft snapshot backend: `auto` (S3 with cold storage, inline otherwise), `inline` or `s3`. Rendered as `storage.snapshot.backend` in the generated config. |
 | `snapshotStore.prefix` | `snapshots` | Snapshot object suffix rendered as `storage.snapshot.s3_prefix`; resolved against `storage.cold.root` when present, otherwise against the S3 bucket root for S3 snapshots. |
-| `snapshotStore.driveIntervalMs` | `null` | Optional manual snapshot driver interval in milliseconds. Renders `storage.snapshot.drive_interval`; omitted drives one due group every 5 seconds for external stores, and `0` disables the manual driver. |
+| `snapshotStore.driveIntervalMs` | `null` | Optional snapshot driver interval in milliseconds, at least `1`. Renders `storage.snapshot.drive_interval`. Omitted, the driver ticks every 5 seconds with external stores and every second inline. The driver always runs, so `0` is refused. |
 
 ### Gateway
 

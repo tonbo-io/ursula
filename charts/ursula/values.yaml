@@ -244,8 +244,6 @@ raft:
   resumeAvailableBytes: 1073741824
   # Optional cap for uncommitted payload bytes per group.
   maxUncommittedBytesPerGroup: null
-  # Committed log entries per group between automatic full-state snapshots.
-  snapshotLogsSinceLast: 5000
   # Maximum groups snapshotted in one pressure pass while the node's Raft log is below its budget.
   # Past the budget a pass starts this many for each snapshot build it keeps in flight.
   snapshotPressureMaxGroupsPerTick: 16
@@ -338,7 +336,8 @@ snapshotStore:
   # Snapshot object suffix rendered as storage.snapshot.s3_prefix; resolved against
   # storage.cold.root when present, otherwise against the S3 bucket root for S3 snapshots.
   prefix: snapshots
-  # Optional manual snapshot driver interval in milliseconds. Leave null for runtime default semantics.
+  # Optional snapshot driver interval in milliseconds, at least 1. Leave null for the runtime
+  # default (5s with S3 snapshots, 1s inline). The driver always runs.
   driveIntervalMs: null
 
 gateway:

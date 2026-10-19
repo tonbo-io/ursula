@@ -1125,7 +1125,7 @@ mod tests {
                 participation: &participation,
             })),
             crate::bootstrap::snapshot::LogWriteGate::RefuseAtHardLimit,
-            5_000,
+            Duration::from_secs(5),
             SnapshotCadence::new(1 << 30, 1, 100_000),
             None,
             16,

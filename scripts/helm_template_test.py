@@ -987,16 +987,36 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertEqual(parsed["storage"]["snapshot"]["backend"], "s3")
         self.assertEqual(parsed["storage"]["cold"]["s3"]["bucket"], "bkt")
 
-    def test_snapshot_drive_interval_zero_is_rendered(self) -> None:
+    def test_snapshot_drive_interval_is_rendered(self) -> None:
         config = render_config(*NAMED, 
             "--set",
-            "snapshotStore.driveIntervalMs=0",
+            "snapshotStore.driveIntervalMs=10000",
             "--set",
             "s3.bucket=bkt",
         )
         parsed = tomllib.loads(config)
 
-        self.assertEqual(parsed["storage"]["snapshot"]["drive_interval"], "0ms")
+        self.assertEqual(parsed["storage"]["snapshot"]["drive_interval"], "10000ms")
+
+    def test_snapshot_drive_interval_zero_is_refused(self) -> None:
+        result = subprocess.run(
+            [
+                "helm",
+                "template",
+                "test",
+                "charts/ursula",
+                "--set",
+                "s3.bucket=bkt",
+                "--set",
+                "snapshotStore.driveIntervalMs=0",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("driveIntervalMs", result.stderr)
 
     def test_cold_cache_zero_can_disable_default_cache(self) -> None:
         config = render_config(*NAMED, 

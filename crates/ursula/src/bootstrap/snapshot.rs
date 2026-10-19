@@ -350,39 +350,13 @@ pub(crate) enum LogWriteGate {
     Open,
 }
 
-/// The snapshot policy of a cluster node (F12e, #519, #669).
-pub(crate) fn cluster_cadence(raft: &ursula_config::RaftConfig, groups: usize) -> SnapshotCadence {
+/// The snapshot policy of a node, a single node's as a cluster node's
+/// (F12e, #519, #669).
+pub(crate) fn snapshot_cadence(raft: &ursula_config::RaftConfig, groups: usize) -> SnapshotCadence {
     SnapshotCadence::new(
         raft.snapshot_log_budget.as_bytes(),
         groups,
         raft.snapshot_backstop_logs,
-    )
-    .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
-}
-
-/// The snapshot policy of a single node (#669): a cluster node's, with its
-/// entry backstop at `raft.snapshot_logs_since_last` (5,000 by default) if
-/// that is nearer. Before the driver ran there, OpenRaft's default policy
-/// snapshotted a single node's groups every 5,000 entries, and entry count
-/// is what bounds a group's log index in memory and its replay at restart,
-/// so a group of small entries is due no later than it was then. A due group
-/// still waits for the node's build slot: below the budget the driver runs
-/// one build at a time across the node, where each group used to build on
-/// its own. Under many small appends to many groups, due groups queue and
-/// their logs grow past the backstop until a slot comes free. Below the
-/// budget that holds whatever `raft.snapshot_build_max_concurrency` says,
-/// since the setting adds builds only past it.
-/// `storage.snapshot.drive_interval = "0s"` goes back to a build per group,
-/// as in 0.8.0.
-pub(crate) fn single_node_cadence(
-    raft: &ursula_config::RaftConfig,
-    groups: usize,
-) -> SnapshotCadence {
-    SnapshotCadence::new(
-        raft.snapshot_log_budget.as_bytes(),
-        groups,
-        raft.snapshot_backstop_logs
-            .min(raft.snapshot_logs_since_last),
     )
     .with_deleted_data_max_age(raft.effective_deleted_data_max_age())
 }
@@ -443,18 +417,17 @@ fn spawn_log_pressure_monitor(
     });
 }
 
-/// Default driver interval: 5 s with an external snapshot store, whose
-/// health gate ticks on the same interval, and 1 s inline. `Some(0)`
-/// disables the driver and the store health gate, and OpenRaft's entry-count
-/// policy runs instead.
-pub(crate) fn resolve_snapshot_drive_interval_ms(
-    configured: Option<usize>,
+/// The driver interval: the configured one, which config validation keeps
+/// non-zero, else 5 s with an external snapshot store, whose health gate
+/// ticks on the same interval, and 1 s inline.
+pub(crate) fn resolve_snapshot_drive_interval(
+    configured: Option<Duration>,
     snapshot_store_configured: bool,
-) -> usize {
+) -> Duration {
     configured.unwrap_or(if snapshot_store_configured {
-        5_000
+        Duration::from_secs(5)
     } else {
-        1_000
+        Duration::from_secs(1)
     })
 }
 
@@ -1064,28 +1037,18 @@ impl SnapshotDriver {
 /// stops when the driver does. Only an external store is probed: inline
 /// snapshots depend on nothing outside the node, so the inline driver never
 /// sheds leadership. `write_gate` says whether the node refuses client
-/// writes while its log is past the hard limit. A drive interval of 0 turns
-/// the driver and the gates off, and with them the bound on how long deleted
-/// data stays (#669).
+/// writes while its log is past the hard limit. The driver alone takes every
+/// snapshot: OpenRaft's own snapshot policy is off on every group.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     store: Option<(SharedSnapshotStore, StoreGateInputs<'_>)>,
     write_gate: LogWriteGate,
-    interval_ms: usize,
+    interval: Duration,
     cadence: SnapshotCadence,
     wal: Option<WalMaintenance>,
     max_groups_per_tick: usize,
 ) {
-    if interval_ms == 0 {
-        tracing::warn!(
-            "storage.snapshot.drive_interval is 0: no snapshot driver runs, and nothing bounds \
-             how long deleted streams stay in Raft snapshots, logs and log files \
-             (raft.deleted_data_max_age)"
-        );
-        return;
-    }
-    let interval = Duration::from_millis(u64::try_from(interval_ms).unwrap_or(u64::MAX));
     let mut gate = store.map(|(store, store_gate)| {
         let default_s3 = ursula_config::S3Config::default();
         spawn_store_health_gate(

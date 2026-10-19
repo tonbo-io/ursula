@@ -46,7 +46,6 @@ pub struct RaftEngineConfig {
     pub bootstrap_peer_probe_interval: Duration,
     pub bootstrap_peer_connect: Duration,
     pub install_snapshot_timeout_ms: u64,
-    pub snapshot_drive_interval_ms: u64,
     pub grpc_reconnect_after_failures: u32,
     /// Snapshot builds the node runs at once. The server takes it from
     /// `raft.snapshot_build_max_concurrency` (2 by default). The default
@@ -57,7 +56,6 @@ pub struct RaftEngineConfig {
     /// engine built without a config, as in the tests and the simulation,
     /// keeps one build at a time and the two cannot disagree.
     pub snapshot_build_max_concurrency: usize,
-    pub snapshot_logs_since_last: u64,
     pub max_in_snapshot_log_to_keep: u64,
 }
 
@@ -68,10 +66,8 @@ impl Default for RaftEngineConfig {
             bootstrap_peer_probe_interval: Duration::from_millis(250),
             bootstrap_peer_connect: Duration::from_millis(500),
             install_snapshot_timeout_ms: 120_000,
-            snapshot_drive_interval_ms: 0,
             grpc_reconnect_after_failures: 8,
             snapshot_build_max_concurrency: 1,
-            snapshot_logs_since_last: 5_000,
             max_in_snapshot_log_to_keep: 64,
         }
     }
@@ -85,27 +81,12 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
             bootstrap_peer_connect: cfg.bootstrap_peer_connect.as_duration(),
             install_snapshot_timeout_ms: cfg.install_snapshot_timeout.as_duration().as_millis()
                 as u64,
-            snapshot_drive_interval_ms: 0, // set by caller from RaftSnapshotConfig
             grpc_reconnect_after_failures: u32::try_from(cfg.grpc_reconnect_after_failures)
                 .expect("config validation ensures grpc_reconnect_after_failures fits u32"),
             snapshot_build_max_concurrency: cfg.snapshot_build_max_concurrency,
-            snapshot_logs_since_last: cfg.snapshot_logs_since_last,
             max_in_snapshot_log_to_keep: cfg.max_in_snapshot_log_to_keep,
         }
     }
-}
-
-fn jittered_snapshot_logs_since_last(base: u64, placement: ShardPlacement, node_id: u64) -> u64 {
-    let base = base.max(1);
-    // Groups receiving a uniform workload otherwise cross the same snapshot
-    // threshold together on all replicas. Spread each group/replica over one
-    // additional base interval so snapshot CPU and memory-bandwidth work does
-    // not arrive as a node-wide burst. The mixer is deterministic because this
-    // value is operational scheduling only; it is not replicated state.
-    let seed = u64::from(placement.raft_group_id.0).wrapping_mul(0x9e37_79b9_7f4a_7c15)
-        ^ node_id.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    // `base` is at least 1, so the remainder always exists.
-    base.saturating_add(seed.checked_rem(base).unwrap_or(0))
 }
 
 /// The Raft node id of every single-node group.
@@ -121,8 +102,8 @@ pub struct DurableRaftGroupEngineFactory {
     registry: Option<RaftGroupHandleRegistry>,
     /// The node's snapshot settings, which a server sets
     /// ([`Self::with_engine_config`]). Without them each group keeps
-    /// OpenRaft's own snapshot policy and a coordinator of its own, as the
-    /// tests, benchmarks and probes that build this factory expect.
+    /// OpenRaft's default config, as the tests, benchmarks and probes that
+    /// build this factory without a snapshot driver expect.
     engine_config: Option<RaftEngineConfig>,
     /// How long an engine's shutdown waits for OpenRaft's work, for tests.
     #[cfg(test)]
@@ -169,9 +150,9 @@ impl DurableRaftGroupEngineFactory {
 
     /// Runs every group with the node's snapshot settings, as a static
     /// cluster's groups run (#669): `config.max_in_snapshot_log_to_keep`
-    /// entries below a snapshot, and the snapshot driver's policy
-    /// (`SnapshotPolicy::Never`) while `config.snapshot_drive_interval_ms`
-    /// is not 0, else OpenRaft's jittered entry count. With a registry
+    /// entries below a snapshot, and no snapshot policy of OpenRaft's own
+    /// (`SnapshotPolicy::Never`), since the snapshot driver alone takes
+    /// every snapshot (F12e). With a registry
     /// ([`Self::with_registry`], before or after this) every group shares
     /// its build and install coordinators, whose gauges the driver, the
     /// metrics and admission read, and the build coordinator gets
@@ -196,28 +177,9 @@ impl DurableRaftGroupEngineFactory {
         };
         if let Some(engine) = &self.engine_config {
             config.max_in_snapshot_log_to_keep = engine.max_in_snapshot_log_to_keep;
-            config.snapshot_policy = snapshot_policy(engine, placement, SINGLE_NODE_ID);
+            config.snapshot_policy = SnapshotPolicy::Never;
         }
         config
-    }
-}
-
-/// OpenRaft's snapshot policy for a group under `engine`: none of its own
-/// while the snapshot driver runs, so that the driver alone decides (F12e,
-/// #669), else the jittered entry count.
-fn snapshot_policy(
-    engine: &RaftEngineConfig,
-    placement: ShardPlacement,
-    node_id: u64,
-) -> SnapshotPolicy {
-    if engine.snapshot_drive_interval_ms > 0 {
-        SnapshotPolicy::Never
-    } else {
-        SnapshotPolicy::LogsSinceLast(jittered_snapshot_logs_since_last(
-            engine.snapshot_logs_since_last,
-            placement,
-            node_id,
-        ))
     }
 }
 
@@ -526,13 +488,12 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 enable_elect: self.registry.election_policy().may_campaign(Some(&rejoin)),
                 ..Default::default()
             };
-            // With the manual snapshot driver, snapshots are driver-driven and
-            // gated on S3 health; openraft must not auto-trigger its own snapshot
-            // because a build_snapshot failure during an S3 outage is fatal to
-            // the group (it kills the raft core, so leadership can no longer be
-            // yielded and only a process restart recovers it).
-            raft_config.snapshot_policy =
-                snapshot_policy(&self.engine_config, placement, self.node_id);
+            // The snapshot driver alone takes snapshots (F12e), gated on S3
+            // health. OpenRaft must not trigger its own: a build_snapshot
+            // failure during an S3 outage is fatal to the group (it kills the
+            // raft core, so leadership can no longer be yielded and only a
+            // process restart recovers it).
+            raft_config.snapshot_policy = SnapshotPolicy::Never;
             let config = Arc::new(crate::openraft_error::validated_config(raft_config)?);
             let transport = self
                 .transports
@@ -730,14 +691,12 @@ mod tests {
     #[test]
     fn engine_config_uses_bounded_snapshot_log_retention() {
         let config = ursula_config::RaftConfig {
-            snapshot_logs_since_last: 20_000,
             max_in_snapshot_log_to_keep: 128,
             ..Default::default()
         };
 
         let engine_config = RaftEngineConfig::from(&config);
 
-        assert_eq!(engine_config.snapshot_logs_since_last, 20_000);
         assert_eq!(engine_config.max_in_snapshot_log_to_keep, 128);
     }
 
@@ -761,46 +720,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn automatic_snapshot_thresholds_are_bounded_and_spread() {
-        let placement = |group_id| ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(group_id),
-            raft_group_id: RaftGroupId(group_id),
-        };
-        let base = 5_000;
-        let thresholds = (0..32)
-            .flat_map(|group_id| {
-                (1..=3).map(move |node_id| {
-                    jittered_snapshot_logs_since_last(base, placement(group_id), node_id)
-                })
-            })
-            .collect::<BTreeSet<_>>();
-
-        assert!(thresholds.iter().all(|value| *value >= base));
-        assert!(thresholds.iter().all(|value| *value < base * 2));
-        assert!(
-            thresholds.len() >= 80,
-            "group/replica thresholds should be well distributed"
-        );
-    }
-
-    #[test]
-    fn automatic_snapshot_threshold_handles_zero_base() {
-        let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
-            raft_group_id: RaftGroupId(0),
-        };
-
-        assert_eq!(jittered_snapshot_logs_since_last(0, placement, 1), 1);
-    }
-
     /// #669: a single node's groups take the node's snapshot settings once
-    /// a server sets them: the driver's policy, the configured entries kept
-    /// below a snapshot, and the registry's build coordinator with the
-    /// configured permits. Without them they keep OpenRaft's own policy, as
-    /// the tests, benchmarks and probes that build this factory expect.
+    /// a server sets them: no snapshot policy of OpenRaft's own, the
+    /// configured entries kept below a snapshot, and the registry's build
+    /// coordinator with the configured permits. Without them they keep
+    /// OpenRaft's default config, as the tests, benchmarks and probes that
+    /// build this factory expect.
     #[cfg(not(madsim))]
     #[test]
     fn a_single_node_factory_takes_the_node_snapshot_settings() {
@@ -828,7 +753,6 @@ mod tests {
         let driven = DurableRaftGroupEngineFactory::new(wal.clone())
             .with_registry(registry.clone())
             .with_engine_config(RaftEngineConfig {
-                snapshot_drive_interval_ms: 1_000,
                 snapshot_build_max_concurrency: 3,
                 ..RaftEngineConfig::default()
             });
@@ -838,27 +762,12 @@ mod tests {
         assert_eq!(registry.snapshot_build_coordinator().max_concurrency(), 3);
         // The order of the two calls does not matter.
         let registry = RaftGroupHandleRegistry::default();
-        let _config_first = DurableRaftGroupEngineFactory::new(wal.clone())
+        let _config_first = DurableRaftGroupEngineFactory::new(wal)
             .with_engine_config(RaftEngineConfig {
-                snapshot_drive_interval_ms: 1_000,
                 snapshot_build_max_concurrency: 4,
                 ..RaftEngineConfig::default()
             })
             .with_registry(registry.clone());
         assert_eq!(registry.snapshot_build_coordinator().max_concurrency(), 4);
-
-        // With the driver off, OpenRaft's jittered entry count.
-        let undriven = DurableRaftGroupEngineFactory::new(wal)
-            .with_registry(RaftGroupHandleRegistry::default())
-            .with_engine_config(RaftEngineConfig::default())
-            .raft_config(placement);
-        assert_eq!(
-            undriven.snapshot_policy,
-            SnapshotPolicy::LogsSinceLast(jittered_snapshot_logs_since_last(
-                5_000,
-                placement,
-                SINGLE_NODE_ID
-            ))
-        );
     }
 }
