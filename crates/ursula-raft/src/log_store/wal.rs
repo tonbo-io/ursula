@@ -36,6 +36,8 @@ type CoreWriterSlot = Arc<Mutex<CoreWriterState>>;
 struct CoreWriterState {
     writer: Weak<CoreFileLogWriter>,
     exited: Option<WriterExited>,
+    /// Closes once the writer is gone and the journal's lock is free.
+    released: Option<WriterExited>,
 }
 
 /// The core writers of a running WAL, by core.
@@ -196,12 +198,12 @@ impl RaftWal {
             return Ok(writer);
         }
         // A writer whose last handle is being dropped still holds the
-        // journal's lock until its worker exits, so a new writer would find
-        // it locked.
+        // journal's lock until it is gone, so a new writer would find it
+        // locked.
         if slot
-            .exited
+            .released
             .as_ref()
-            .is_some_and(|exited| exited.has_changed().is_ok())
+            .is_some_and(|released| released.has_changed().is_ok())
         {
             return Err(RaftWalError::CoreWriterStopping {
                 core: placement.core_id,
@@ -227,6 +229,7 @@ impl RaftWal {
         *slot = CoreWriterState {
             writer: Arc::downgrade(&writer),
             exited: Some(writer.exited()),
+            released: Some(writer.released()),
         };
         Ok(writer)
     }
@@ -260,16 +263,16 @@ impl RaftWal {
         loop {
             match self.open(placement, metrics.clone()) {
                 Err(RaftWalError::CoreWriterStopping { core }) => {
-                    let mut exited = self.writer_exited(core)?;
-                    while exited.changed().await.is_ok() {}
+                    let mut released = self.writer_released(core)?;
+                    while released.changed().await.is_ok() {}
                 }
                 opened => return opened,
             }
         }
     }
 
-    /// The exit signal of `core`'s journal writer.
-    fn writer_exited(&self, core: CoreId) -> Result<WriterExited, RaftWalError> {
+    /// The signal that `core`'s journal writer is gone and its lock free.
+    fn writer_released(&self, core: CoreId) -> Result<WriterExited, RaftWalError> {
         let slot = match &*self
             .core_writers
             .lock()
@@ -282,16 +285,16 @@ impl RaftWal {
                 });
             }
         };
-        let exited = slot
+        let released = slot
             .map(|slot| {
                 slot.lock()
                     .map_err(|_poisoned| RaftWalError::LockPoisoned)
-                    .map(|slot| slot.exited.clone())
+                    .map(|slot| slot.released.clone())
             })
             .transpose()?
             .flatten();
         // A slot with no writer has nothing to wait for: a closed channel.
-        Ok(exited.unwrap_or_else(|| crate::rt::sync::watch::channel(()).1))
+        Ok(released.unwrap_or_else(|| crate::rt::sync::watch::channel(()).1))
     }
 
     /// The ledger engines of this WAL's groups record their OpenRaft work in
@@ -482,8 +485,8 @@ mod tests {
             raft_group_id: RaftGroupId(group),
         };
         let metrics = || ursula_runtime::RuntimeMetrics::new(1, 2).group_engine_metrics();
-        // A slot whose writer is gone but whose worker has not exited.
-        let (stopping, exited) = crate::rt::sync::watch::channel(());
+        // A slot whose writer is gone but whose lock is not yet released.
+        let (stopping, released) = crate::rt::sync::watch::channel(());
         {
             let mut core_writers = wal.core_writers.lock().expect("slots");
             let CoreWriterSlots::Running(slots) = &mut *core_writers else {
@@ -491,7 +494,8 @@ mod tests {
             };
             *slots.entry(0).or_default().lock().expect("core 0") = CoreWriterState {
                 writer: Weak::new(),
-                exited: Some(exited),
+                exited: None,
+                released: Some(released),
             };
         }
         assert!(matches!(
