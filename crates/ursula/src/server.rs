@@ -329,7 +329,7 @@ async fn init_state(
     // node whose Raft url moved since (such as a new cluster port) would
     // serve Raft where no peer dials it.
     if let Some(registry) = spawned.raft_registry.as_ref()
-        && let Ok(own) = raft_peers.cluster_url(config.raft.node_id)
+        && let Some(own) = raft_peers.cluster_url(config.raft.node_id)
     {
         crate::bootstrap::check_own_recorded_address(registry, config.raft.node_id, own).await?;
     }
@@ -451,10 +451,6 @@ async fn serve(
         shutdown.clone(),
         state.raft_registry().cloned(),
         config.raft.node_id,
-        state
-            .client_write_router()
-            .map(|router| router.peers().clone())
-            .unwrap_or_default(),
     );
 
     // Counts the staged snapshot parts of the groups this node leads, for
@@ -608,7 +604,6 @@ fn spawn_shutdown_signal_task(
     shutdown: Arc<Notify>,
     raft_registry: Option<ursula_raft::RaftGroupHandleRegistry>,
     node_id: u64,
-    peers: ursula_raft::PeerDirectory,
 ) {
     tokio::spawn(async move {
         shutdown_signal().await;
@@ -618,6 +613,7 @@ fn spawn_shutdown_signal_task(
         tokio::select! {
             () = async {
                 if let Some(registry) = raft_registry {
+                    let peers = registry.peer_cluster().directory();
                     let result = tokio::time::timeout(
                         SHUTDOWN_HANDOFF_GRACE,
                         crate::bootstrap::handoff_shutdown_leadership(&registry, node_id, &peers),

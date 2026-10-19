@@ -195,7 +195,6 @@ pub use peer_cluster::PeerClusterMismatch;
 pub use peer_cluster::PeerIdentity;
 pub use peer_directory::PeerDirectory;
 pub use peer_directory::PeerEndpoints;
-pub use peer_directory::PeerUnknown;
 pub use registry::IncomingTransferError;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;

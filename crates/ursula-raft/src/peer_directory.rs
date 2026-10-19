@@ -5,7 +5,7 @@
 //! Every reader of a configured peer address takes it from here: the engine
 //! factory and its [`crate::PeerCluster`], the leader router, the
 //! leadership-shed polls, the egress probe, the shutdown handoff and the
-//! format-epoch probe. URLs are normalised once, without a trailing `/`, so
+//! format-epoch probe. URLs are normalized once, without a trailing `/`, so
 //! a caller appends a path to them as they are.
 
 use std::collections::BTreeMap;
@@ -25,14 +25,14 @@ impl PeerEndpoints {
     /// at `client`.
     pub fn new(cluster: impl Into<String>, client: impl Into<String>) -> Self {
         Self {
-            cluster: normalise(cluster.into()),
-            client: normalise(client.into()),
+            cluster: normalize(cluster.into()),
+            client: normalize(client.into()),
         }
     }
 
     /// A peer that serves both planes at `url` (`server.listen`).
     pub fn shared(url: impl Into<String>) -> Self {
-        let url = normalise(url.into());
+        let url = normalize(url.into());
         Self {
             client: url.clone(),
             cluster: url,
@@ -54,7 +54,7 @@ impl From<&ursula_config::RaftPeerConfig> for PeerEndpoints {
     }
 }
 
-fn normalise(mut url: String) -> String {
+fn normalize(mut url: String) -> String {
     let trimmed = url.trim_end_matches('/').len();
     url.truncate(trimmed);
     url
@@ -80,11 +80,8 @@ impl PeerDirectory {
     }
 
     /// The URL peers dial for `node_id`'s cluster plane.
-    pub fn cluster_url(&self, node_id: u64) -> Result<&str, PeerUnknown> {
-        self.0
-            .get(&node_id)
-            .map(PeerEndpoints::cluster_url)
-            .ok_or(PeerUnknown { node_id })
+    pub fn cluster_url(&self, node_id: u64) -> Option<&str> {
+        self.0.get(&node_id).map(PeerEndpoints::cluster_url)
     }
 
     /// The URL clients reach `node_id`'s client plane at.
@@ -118,20 +115,12 @@ impl PeerDirectory {
     }
 }
 
-/// `raft.peers` does not list the node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("raft.peers lists no node {node_id}")]
-pub struct PeerUnknown {
-    pub node_id: u64,
-}
-
 #[cfg(test)]
 mod tests {
     use ursula_config::RaftPeerConfig;
 
     use super::PeerDirectory;
     use super::PeerEndpoints;
-    use super::PeerUnknown;
 
     fn peer(node_id: u64, url: &str, client_url: Option<&str>) -> RaftPeerConfig {
         RaftPeerConfig {
@@ -147,21 +136,21 @@ mod tests {
             peer(1, "http://node-1:4437", None),
             peer(2, "http://node-2:4438", Some("http://node-2:4437")),
         ]);
-        assert_eq!(directory.cluster_url(1), Ok("http://node-1:4437"));
+        assert_eq!(directory.cluster_url(1), Some("http://node-1:4437"));
         assert_eq!(directory.client_url(1), Some("http://node-1:4437"));
-        assert_eq!(directory.cluster_url(2), Ok("http://node-2:4438"));
+        assert_eq!(directory.cluster_url(2), Some("http://node-2:4438"));
         assert_eq!(directory.client_url(2), Some("http://node-2:4437"));
         assert_eq!(directory.node_ids().collect::<Vec<_>>(), vec![1, 2]);
     }
 
     #[test]
-    fn trailing_slashes_are_trimmed_once() {
+    fn trailing_slashes_are_trimmed() {
         let directory = PeerDirectory::from_config(&[peer(
             1,
             "http://node-1:4438/",
             Some("http://node-1:4437//"),
         )]);
-        assert_eq!(directory.cluster_url(1), Ok("http://node-1:4438"));
+        assert_eq!(directory.cluster_url(1), Some("http://node-1:4438"));
         assert_eq!(directory.client_url(1), Some("http://node-1:4437"));
         assert_eq!(
             PeerEndpoints::shared("http://node-1:4437/"),
@@ -172,7 +161,7 @@ mod tests {
     #[test]
     fn an_unlisted_node_is_unknown() {
         let directory = PeerDirectory::new([(1, PeerEndpoints::shared("http://node-1"))]);
-        assert_eq!(directory.cluster_url(2), Err(PeerUnknown { node_id: 2 }));
+        assert_eq!(directory.cluster_url(2), None);
         assert_eq!(directory.client_url(2), None);
         assert!(!directory.contains(2));
         assert!(PeerDirectory::default().is_empty());

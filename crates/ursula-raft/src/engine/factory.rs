@@ -423,10 +423,8 @@ impl StaticGrpcRaftGroupEngineFactory {
 
         let mut nodes = BTreeMap::new();
         for node_id in voters {
-            let address = self.peers.cluster_url(*node_id).map_err(|unknown| {
-                refused(StaticMembershipProblem::VoterWithoutPeer {
-                    node_id: unknown.node_id,
-                })
+            let address = self.peers.cluster_url(*node_id).ok_or_else(|| {
+                refused(StaticMembershipProblem::VoterWithoutPeer { node_id: *node_id })
             })?;
             nodes.insert(*node_id, BasicNode::new(address));
         }

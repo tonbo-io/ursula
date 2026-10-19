@@ -920,11 +920,6 @@ impl ClientWriteLeaderRouter {
         }
     }
 
-    /// The node's `raft.peers`.
-    pub fn peers(&self) -> &PeerDirectory {
-        &self.peers
-    }
-
     /// The router of a node whose peers serve their planes as `planes` says.
     #[must_use]
     pub fn with_planes(mut self, planes: PeerPlanes) -> Self {
@@ -945,6 +940,8 @@ impl ClientWriteLeaderRouter {
             PeerPlanes::Split => None,
         };
         let base = self.peers.client_url(leader_id).or(address)?;
+        // The directory's URLs carry no trailing `/`, but a membership
+        // address may.
         Some(base.trim_end_matches('/').to_owned())
     }
 

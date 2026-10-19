@@ -240,14 +240,22 @@ impl RefusedPeer {
 
 #[derive(Debug, Default)]
 struct PeerClusterState {
-    identity: arc_swap::ArcSwapOption<PeerIdentity>,
-    /// `raft.peers`, the peers readiness lists.
-    peers: arc_swap::ArcSwap<PeerDirectory>,
+    /// This node's identity and `raft.peers`, bound together once a WAL
+    /// opens, so a reader sees both or neither.
+    bound: arc_swap::ArcSwapOption<Bound>,
     /// Last refusal of each refused peer, at most
     /// [`PEER_CLUSTER_MISMATCH_CAP`].
     refused: Mutex<HashMap<RefusedPeer, Instant>>,
     refusals: AtomicU64,
     unidentified_refusals: AtomicU64,
+}
+
+/// What [`PeerCluster::bind`] stores: this node's identity and its
+/// configured peers, this node among them.
+#[derive(Debug)]
+struct Bound {
+    identity: PeerIdentity,
+    peers: PeerDirectory,
 }
 
 /// This node's side of the cluster check, shared by its registry, its
@@ -261,17 +269,27 @@ impl PeerCluster {
     /// The engine factory binds the identity of the WAL it opens groups
     /// over, before any group starts.
     pub fn bind(&self, identity: PeerIdentity, peers: PeerDirectory) {
-        self.0.peers.store(Arc::new(peers));
-        self.0.identity.store(Some(Arc::new(identity)));
+        self.0
+            .bound
+            .store(Some(Arc::new(Bound { identity, peers })));
     }
 
     /// The configured peers last bound, this node among them.
     pub fn directory(&self) -> PeerDirectory {
-        PeerDirectory::clone(&self.0.peers.load())
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .map(|bound| bound.peers.clone())
+            .unwrap_or_default()
     }
 
     pub fn identity(&self) -> Option<PeerIdentity> {
-        self.0.identity.load().as_deref().cloned()
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .map(|bound| bound.identity.clone())
     }
 
     /// The interceptor a Raft gRPC server checks every request with.
@@ -287,8 +305,8 @@ impl PeerCluster {
         remote: Option<SocketAddr>,
         now: Instant,
     ) -> Result<(), PeerClusterError> {
-        let identity = self.0.identity.load();
-        let Some(local) = identity.as_deref() else {
+        let bound = self.0.bound.load();
+        let Some(local) = bound.as_deref().map(|bound| &bound.identity) else {
             return Err(PeerClusterError::NoLocalCluster);
         };
         let ip = remote.map(|remote| remote.ip());
@@ -429,8 +447,9 @@ impl PeerCluster {
 
     /// [`Self::mismatches`] as of `now`.
     pub(crate) fn mismatches_at(&self, now: Instant) -> Vec<PeerClusterMismatch> {
-        let peers = self.0.peers.load();
-        let local = self.0.identity.load().as_deref().map(PeerIdentity::node_id);
+        let bound = self.0.bound.load();
+        let peers = bound.as_deref().map(|bound| &bound.peers);
+        let local = bound.as_deref().map(|bound| bound.identity.node_id());
         let mut mismatches = self
             .lock()
             .iter()
@@ -449,7 +468,7 @@ impl PeerCluster {
                     if Some(*node_id) == local {
                         return None;
                     }
-                    let url = peers.cluster_url(*node_id).ok()?;
+                    let url = peers?.cluster_url(*node_id)?;
                     let matches_address = match (url_ip(url), ip) {
                         (Some(configured), Some(ip)) => configured == *ip,
                         _ => true,

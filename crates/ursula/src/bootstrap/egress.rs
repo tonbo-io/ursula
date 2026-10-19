@@ -86,7 +86,7 @@ pub(crate) fn cluster_egress_probe_groups(
             let peer_urls: Vec<String> = voters
                 .iter()
                 .filter(|id| **id != node_id)
-                .filter_map(|id| peers.cluster_url(*id).ok().map(str::to_owned))
+                .filter_map(|id| peers.cluster_url(*id).map(str::to_owned))
                 .collect();
             if peer_urls.is_empty() {
                 return None;
