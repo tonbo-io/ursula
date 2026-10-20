@@ -629,3 +629,106 @@ fn a_restart_with_a_regressed_view_creates_nothing_unconfirmed() {
     world.step(Action::Host(node(4))).unwrap();
     assert!(world.replica(node(4), GROUP).is_none());
 }
+
+/// Group 0 on `{1}` moves to `{2}`. The move's joint entry commits and its
+/// second step waits for the next settle, which appends the uniform `{2}`
+/// while node 2 is cut off on the data plane: it stays uncommitted. Node 2
+/// reconnects with its open gate, and node 1, no voter of the uniform entry
+/// but one of the committed joint config, wins with node 2's vote: its
+/// no-op commits `{2}`. Node 1 leads outside its config and waits as no
+/// member, the next settle steps it down, node 2 reports, and node 1's
+/// teardown retires its replica.
+fn an_outgoing_voter_wins_on_the_uniform_entry(world: &mut World) -> Result<(), Violation> {
+    world.request_move(GROUP, &[2])?;
+    world.drive(GROUP, &[2], DRIVE, |world| {
+        world.learners(GROUP).contains(&node(2)) && world.caught_up(GROUP, 2)
+    })?;
+    world.step(Action::DelaySecondStep(GROUP))?;
+    // Leader 1 confirms its view if it has not, then changes the voters.
+    for _ in 0..2 {
+        if !joint(world) {
+            reconcile(world, 1, false)?;
+        }
+    }
+    world.ensure(joint(world), "the joint entry of the move to {2} committed")?;
+    world.step(Action::Partition(node(2)))?;
+    world.step(Action::Settle(GROUP))?;
+    world.ensure(
+        joint(world)
+            && world
+                .raft(GROUP)
+                .is_some_and(|raft| raft.pending().is_some()),
+        "the uniform {2} is appended and uncommitted",
+    )?;
+    world.step(Action::Heal(node(2)))?;
+    world.step(Action::Campaign(GROUP, node(1)))?;
+    world.ensure(
+        world.tally().outgoing_wins > 0
+            && world.leader(GROUP) == Some(node(1))
+            && committed_on(world, &[2]),
+        "node 1 won on the uniform entry and its no-op committed {2}",
+    )?;
+    reconcile(world, 1, false)?;
+    world.ensure(
+        world.tally().not_a_member > 0,
+        "node 1 waited as no member of {2}",
+    )?;
+    world.step(Action::Settle(GROUP))?;
+    world.ensure(
+        world.leader(GROUP) == Some(node(2)),
+        "the step-down handed off to node 2",
+    )?;
+    world.drive(GROUP, &[], DRIVE, |world| world.is_stable(GROUP, &[2]))?;
+    world.finish_teardown(1, GROUP)
+}
+
+#[test]
+fn an_outgoing_voter_wins_on_the_uniform_entry_and_steps_down() {
+    let mut world = World::new(5, 1, 1);
+    let result = form_single(&mut world)
+        .and_then(|()| an_outgoing_voter_wins_on_the_uniform_entry(&mut world));
+    if let Err(violation) = result {
+        panic!("{violation}\n{}", world.history());
+    }
+}
+
+/// Every seed voter of group 0 holds an empty replica, and the group has
+/// not initialized.
+fn hosted_not_seeded(world: &mut World) -> Result<(), Violation> {
+    for id in 1..=5 {
+        world.step(Action::Host(node(id)))?;
+    }
+    let empty = [1, 2, 3].iter().all(|id| {
+        world
+            .replica(node(*id), GROUP)
+            .is_some_and(|replica| replica.log == Journal::Empty)
+    });
+    world.ensure(
+        empty && world.raft(GROUP).is_none(),
+        "the seed voters hold empty replicas of group 0",
+    )
+}
+
+/// C4: node 1, group 0's initializer, holds the bootstrap's view, and a meta
+/// plan cuts below the bootstrap before node 1's seed driver runs. Its meta
+/// replica missed the plan and holds the bootstrap at the index the plan
+/// began its history at. Confirming by index would take that view as
+/// current and initialize a group meta no longer places.
+fn a_seed_after_a_formation_cut(world: &mut World) -> Result<(), Violation> {
+    world.freeze(1)?;
+    let keep = world.boot_len.saturating_sub(1);
+    world.step(Action::MetaPlan { keep })?;
+    world.step(Action::Seed(node(1), GROUP))?;
+    world.ensure(world.raft(GROUP).is_none(), "group 0 did not initialize")
+}
+
+#[test]
+fn c4_a_seed_driver_initializes_only_from_a_view_confirmed_by_log_id() {
+    Trace {
+        rf: 3,
+        groups: 1,
+        form: hosted_not_seeded,
+        scenario: a_seed_after_a_formation_cut,
+    }
+    .negative(Rule::ConfirmByLogId, &[Invariant::C4]);
+}
