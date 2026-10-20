@@ -125,7 +125,7 @@ fn walk(from: &[u64], leader: u64, to: &[u64]) -> (Vec<StepKind>, Vec<VoterSet>)
     let uniform_voters = group
         .committed_configs
         .iter()
-        .filter_map(|config| match config {
+        .filter_map(|(_, config)| match config {
             MembershipConfig::Uniform { voters, .. } => Some(voters.clone()),
             MembershipConfig::Joint { .. } => None,
         })
@@ -753,7 +753,12 @@ mod model_semantics {
             })
             .unwrap();
         assert_eq!(
-            group.committed_configs.iter().rev().nth(1),
+            group
+                .committed_configs
+                .iter()
+                .rev()
+                .nth(1)
+                .map(|(_, config)| config),
             Some(&MembershipConfig::Joint {
                 old: voters(&[1, 2, 4]),
                 new: voters(&[1, 3, 4]),

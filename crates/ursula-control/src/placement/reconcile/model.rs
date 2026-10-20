@@ -75,15 +75,15 @@ use super::PeerGate;
 use super::ViewFreshness;
 use super::plan_membership_step;
 
-pub(super) fn node(id: u64) -> NodeId {
+pub(crate) fn node(id: u64) -> NodeId {
     NodeId::new(id)
 }
 
-pub(super) fn voters(ids: &[u64]) -> VoterSet {
+pub(crate) fn voters(ids: &[u64]) -> VoterSet {
     VoterSet::new(ids.iter().copied().map(NodeId::new).collect()).unwrap()
 }
 
-pub(super) fn ids(values: &[u64]) -> BTreeSet<NodeId> {
+pub(crate) fn ids(values: &[u64]) -> BTreeSet<NodeId> {
     values.iter().copied().map(NodeId::new).collect()
 }
 
@@ -94,7 +94,7 @@ fn majority(side: &VoterSet, counted: impl Fn(NodeId) -> bool) -> bool {
 }
 
 /// Whether every config of `config` has a live majority among `alive`.
-pub(super) fn quorum_live(config: &MembershipConfig, alive: &BTreeSet<NodeId>) -> bool {
+pub(crate) fn quorum_live(config: &MembershipConfig, alive: &BTreeSet<NodeId>) -> bool {
     config
         .voter_configs()
         .all(|side| majority(side, |node| alive.contains(&node)))
@@ -117,18 +117,18 @@ fn with_learners(config: &MembershipConfig, learners: BTreeSet<NodeId>) -> Membe
 
 /// The planner a group's leaders plan with: the real one, or a broken one a
 /// test swaps in to show that the run catches it.
-pub(super) type Planner = fn(&MembershipView, &MembershipTarget) -> MembershipStep;
+pub(crate) type Planner = fn(&MembershipView, &MembershipTarget) -> MembershipStep;
 
 /// One log entry: a membership config, or a leader's no-op.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Entry {
-    pub(super) id: RaftLogId,
-    pub(super) config: Option<MembershipConfig>,
+pub(crate) struct Entry {
+    pub(crate) id: RaftLogId,
+    pub(crate) config: Option<MembershipConfig>,
 }
 
 /// A node's recovery gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Gate {
+pub(crate) enum Gate {
     Open,
     /// Restarted after a crash: acknowledges appends, and neither votes nor
     /// campaigns.
@@ -171,24 +171,24 @@ struct StepFuture {
 
 /// A step OpenRaft refuses that no correct planner takes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Refused {
+pub(crate) enum Refused {
     /// A new voter that is no member of the effective membership.
     LearnerNotFound { node: NodeId },
 }
 
 /// A voter change OpenRaft accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Proposal {
-    pub(super) proposer: NodeId,
+pub(crate) struct Proposal {
+    pub(crate) proposer: NodeId,
     /// The effective membership it changed.
-    pub(super) from: MembershipConfig,
-    pub(super) voters: VoterSet,
+    pub(crate) from: MembershipConfig,
+    pub(crate) voters: VoterSet,
 }
 
 impl Proposal {
     /// Whether the proposer keeps itself as a voter, or is the RF 1 step:
     /// the only voter of a uniform config replaced by one other.
-    pub(super) fn keeps_proposer(&self) -> bool {
+    pub(crate) fn keeps_proposer(&self) -> bool {
         let rf1_step = matches!(
             &self.from,
             MembershipConfig::Uniform { voters, .. }
@@ -200,64 +200,64 @@ impl Proposal {
 
 /// The elections and plans a run reached.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct Elections {
+pub(crate) struct Elections {
     /// The winner held an uncommitted membership entry, which its no-op
     /// commits once a quorum holds it.
-    pub(super) pending_kept: usize,
+    pub(crate) pending_kept: usize,
     /// Another node held an uncommitted membership entry the winner lacks,
     /// which its leadership truncates.
-    pub(super) pending_truncated: usize,
+    pub(crate) pending_truncated: usize,
     /// The winner is no voter of its effective membership.
-    pub(super) outgoing: usize,
+    pub(crate) outgoing: usize,
     /// A recovery plan elected a leader.
-    pub(super) plans: usize,
+    pub(crate) plans: usize,
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct Group {
-    pub(super) alive: BTreeSet<NodeId>,
+pub(crate) struct Group {
+    pub(crate) alive: BTreeSet<NodeId>,
     /// A node cut off from every other node.
-    pub(super) cut: Option<NodeId>,
-    pub(super) logs: BTreeMap<NodeId, Vec<Entry>>,
-    pub(super) gates: BTreeMap<NodeId, Gate>,
-    pub(super) committed: MembershipConfig,
-    pub(super) committed_id: MembershipLogId,
+    pub(crate) cut: Option<NodeId>,
+    pub(crate) logs: BTreeMap<NodeId, Vec<Entry>>,
+    pub(crate) gates: BTreeMap<NodeId, Gate>,
+    pub(crate) committed: MembershipConfig,
+    pub(crate) committed_id: MembershipLogId,
     /// The index of the last committed entry.
-    pub(super) commit_index: u64,
-    pub(super) term: u64,
-    pub(super) leader: Option<NodeId>,
+    pub(crate) commit_index: u64,
+    pub(crate) term: u64,
+    pub(crate) leader: Option<NodeId>,
     /// Members the leader's metrics show matched up to its last entry.
-    pub(super) caught_up: BTreeSet<NodeId>,
-    pub(super) unlisted: BTreeSet<NodeId>,
+    pub(crate) caught_up: BTreeSet<NodeId>,
+    pub(crate) unlisted: BTreeSet<NodeId>,
     /// Whether the leader's placement view is confirmed in its leadership.
-    pub(super) confirmed: bool,
+    pub(crate) confirmed: bool,
     future: Option<StepFuture>,
     /// The target of a transfer the leader started.
-    pub(super) transferring: Option<NodeId>,
+    pub(crate) transferring: Option<NodeId>,
     /// The next second step is lost to a leadership change.
-    pub(super) drop_second_step: bool,
+    pub(crate) drop_second_step: bool,
     /// The next second step waits for the environment's next round.
-    pub(super) delay_second_step: bool,
+    pub(crate) delay_second_step: bool,
     /// Every config that committed, the first one included.
-    pub(super) committed_configs: Vec<MembershipConfig>,
+    pub(crate) committed_configs: Vec<(MembershipLogId, MembershipConfig)>,
     /// Every voter change OpenRaft accepted.
-    pub(super) proposals: Vec<Proposal>,
-    pub(super) elections: Elections,
-    pub(super) planner: Planner,
+    pub(crate) proposals: Vec<Proposal>,
+    pub(crate) elections: Elections,
+    pub(crate) planner: Planner,
 }
 
 /// One planner call of a round: the view it planned from and its step.
 #[derive(Debug, Clone)]
-pub(super) struct Planned {
-    pub(super) view: MembershipView,
-    pub(super) step: MembershipStep,
+pub(crate) struct Planned {
+    pub(crate) view: MembershipView,
+    pub(crate) step: MembershipStep,
 }
 
 impl Group {
     /// A group whose committed uniform config is `voters`, led by `leader`,
     /// with every node of `alive` live. The voters hold the config with
     /// open gates and are caught up. Every other node is `Empty`.
-    pub(super) fn new(voters: &VoterSet, leader: NodeId, alive: BTreeSet<NodeId>) -> Self {
+    pub(crate) fn new(voters: &VoterSet, leader: NodeId, alive: BTreeSet<NodeId>) -> Self {
         let committed = MembershipConfig::Uniform {
             voters: voters.clone(),
             learners: BTreeSet::new(),
@@ -294,7 +294,7 @@ impl Group {
             cut: None,
             logs,
             gates,
-            committed_configs: vec![committed.clone()],
+            committed_configs: vec![(MembershipLogId::new(id), committed.clone())],
             committed,
             committed_id: MembershipLogId::new(id),
             commit_index: 1,
@@ -312,7 +312,7 @@ impl Group {
         }
     }
 
-    pub(super) fn log(&self, node: NodeId) -> &[Entry] {
+    pub(crate) fn log(&self, node: NodeId) -> &[Entry] {
         self.logs.get(&node).map(Vec::as_slice).unwrap_or_default()
     }
 
@@ -320,7 +320,7 @@ impl Group {
         self.log(node).last().map(|entry| entry.id)
     }
 
-    pub(super) fn gate(&self, node: NodeId) -> Gate {
+    pub(crate) fn gate(&self, node: NodeId) -> Gate {
         self.gates.get(&node).copied().unwrap_or(Gate::Empty)
     }
 
@@ -359,14 +359,14 @@ impl Group {
         newest(&mut self.alive.iter().copied()).or_else(|| newest(&mut self.logs.keys().copied()))
     }
 
-    pub(super) fn effective(&self) -> &MembershipConfig {
+    pub(crate) fn effective(&self) -> &MembershipConfig {
         self.reference()
             .and_then(|node| self.membership_of(node))
             .map_or(&self.committed, |(config, _)| config)
     }
 
     /// The effective membership when it has not committed.
-    pub(super) fn pending(&self) -> Option<(&MembershipConfig, MembershipLogId)> {
+    pub(crate) fn pending(&self) -> Option<(&MembershipConfig, MembershipLogId)> {
         let (config, id) = self.reference().and_then(|node| self.membership_of(node))?;
         (id.index > self.commit_index).then_some((config, MembershipLogId::new(id)))
     }
@@ -465,7 +465,8 @@ impl Group {
             && MembershipLogId::new(id) != self.committed_id
         {
             let config = config.clone();
-            self.committed_configs.push(config.clone());
+            self.committed_configs
+                .push((MembershipLogId::new(id), config.clone()));
             self.committed = config;
             self.committed_id = MembershipLogId::new(id);
         }
@@ -567,7 +568,7 @@ impl Group {
     }
 
     /// Whether `candidate` may campaign and would collect its votes.
-    pub(super) fn can_win(&self, candidate: NodeId) -> bool {
+    pub(crate) fn can_win(&self, candidate: NodeId) -> bool {
         if !self.alive.contains(&candidate) || self.gate(candidate) != Gate::Open {
             return false;
         }
@@ -617,7 +618,7 @@ impl Group {
     }
 
     /// `candidate` campaigns, and leads when it wins.
-    pub(super) fn campaign(&mut self, candidate: NodeId) -> bool {
+    pub(crate) fn campaign(&mut self, candidate: NodeId) -> bool {
         let won = self.can_win(candidate);
         if won {
             self.win(candidate);
@@ -627,7 +628,7 @@ impl Group {
 
     /// An election when the leader is gone or cut off: the smallest node
     /// that wins leads. A cut-off leader no one replaces keeps leading.
-    pub(super) fn elect(&mut self) {
+    pub(crate) fn elect(&mut self) {
         let current = self.leader.filter(|leader| self.alive.contains(leader));
         if current.is_some_and(|leader| self.cut != Some(leader)) {
             return;
@@ -741,13 +742,13 @@ impl Group {
     }
 
     /// `node` crashes. A leader stays leader until an election replaces it.
-    pub(super) fn kill(&mut self, node: NodeId) {
+    pub(crate) fn kill(&mut self, node: NodeId) {
         self.alive.remove(&node);
     }
 
     /// `node` restarts with its log, `Recovering`, or `Empty` without one,
     /// and a leader as a follower.
-    pub(super) fn revive(&mut self, node: NodeId) {
+    pub(crate) fn revive(&mut self, node: NodeId) {
         self.alive.insert(node);
         self.caught_up.remove(&node);
         let gate = if self.log(node).is_empty() {
@@ -762,11 +763,11 @@ impl Group {
     }
 
     /// The leader is cut off from every other node.
-    pub(super) fn strand(&mut self) {
+    pub(crate) fn strand(&mut self) {
         self.cut = self.leader;
     }
 
-    pub(super) fn heal(&mut self) {
+    pub(crate) fn heal(&mut self) {
         self.cut = None;
     }
 
@@ -777,7 +778,7 @@ impl Group {
     /// leader's barrier opens gates and catches its metrics up. Every target
     /// is listed. A leader removed in this round leads through it and steps
     /// down in the next fair one.
-    pub(super) fn settle(&mut self) {
+    pub(crate) fn settle(&mut self) {
         self.step_down_removed_leader();
         self.elect();
         self.heal();
@@ -797,13 +798,13 @@ impl Group {
     /// The environment that holds catch-up, gates and listings back: a
     /// delayed second step runs and an election runs when needed, and a
     /// pending transfer stays pending.
-    pub(super) fn hold_back(&mut self) {
+    pub(crate) fn hold_back(&mut self) {
         self.sync(true);
         self.elect();
     }
 
     /// What `me` plans from.
-    pub(super) fn view(&self, me: NodeId) -> MembershipView {
+    pub(crate) fn view(&self, me: NodeId) -> MembershipView {
         let not_leading = MembershipView {
             me,
             leadership: Leadership::NotLeading,
@@ -894,7 +895,7 @@ impl Group {
     /// under its CAS: `expected` must be the effective membership's log id,
     /// committed, with no step or transfer pending, else OpenRaft answers
     /// `PreconditionFailed` or `InProgress` and nothing changes.
-    pub(super) fn execute(&mut self, step: &MembershipStep) -> Result<(), Refused> {
+    pub(crate) fn execute(&mut self, step: &MembershipStep) -> Result<(), Refused> {
         let Some(leader) = self.leader.filter(|leader| self.alive.contains(leader)) else {
             return Ok(());
         };
@@ -1003,7 +1004,7 @@ impl Group {
 
 /// The outcome of [`run`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Ended {
+pub(crate) enum Ended {
     /// The leader answered `Converged` with the target's voters.
     Converged,
     /// No convergence within the round limit.
@@ -1012,7 +1013,7 @@ pub(super) enum Ended {
 
 /// The environment's half of a round: [`Group::settle`] when `fair`, else
 /// [`Group::hold_back`].
-pub(super) fn environment(group: &mut Group, fair: bool) {
+pub(crate) fn environment(group: &mut Group, fair: bool) {
     if fair {
         group.settle();
     } else {
@@ -1023,7 +1024,7 @@ pub(super) fn environment(group: &mut Group, fair: bool) {
 /// The leader's half of a round: it plans with the group's planner and
 /// executes. `None` without a leader. A leader that crashed plans from a
 /// `NotLeading` view. A step OpenRaft refuses fails the run.
-pub(super) fn act(group: &mut Group, target: &MembershipTarget) -> Result<Option<Planned>, String> {
+pub(crate) fn act(group: &mut Group, target: &MembershipTarget) -> Result<Option<Planned>, String> {
     let Some(leader) = group.leader else {
         return Ok(None);
     };
@@ -1036,7 +1037,7 @@ pub(super) fn act(group: &mut Group, target: &MembershipTarget) -> Result<Option
 }
 
 /// One round: the environment acts, then the leader plans and executes.
-pub(super) fn round(
+pub(crate) fn round(
     group: &mut Group,
     target: &MembershipTarget,
     fair: bool,
@@ -1047,7 +1048,7 @@ pub(super) fn round(
 
 /// Runs fair rounds until the leader reports the target's voters, at most
 /// `limit` rounds, calling `check` after every round.
-pub(super) fn run(
+pub(crate) fn run(
     group: &mut Group,
     target: &MembershipTarget,
     limit: usize,

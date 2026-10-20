@@ -23,6 +23,8 @@ use ursula_proto::placement::TeardownStage;
 use ursula_shard::RaftGroupId;
 
 use super::reconcile::MembershipConfig;
+use super::rules::Rule;
+use super::rules::enforced;
 use super::state::Cluster;
 use super::state::GroupPlacement;
 use super::view::ConfirmedView;
@@ -181,6 +183,13 @@ pub fn plan_hosting(input: &HostingInput<'_>) -> HostingPlan {
         ViewInput::Unconfirmed(view) => {
             let mut plan = plan_held(view, input.me, input.local);
             let confirmed = plan_member(input.me, view, input.local);
+            if !enforced(Rule::ConfirmedCreation) {
+                for (group, admission) in &confirmed.admitted {
+                    if *admission == Admission::Create {
+                        plan.admitted.insert(*group, Admission::Create);
+                    }
+                }
+            }
             if confirmed.admitted != plan.admitted || confirmed.steps != plan.steps {
                 plan.steps.insert(0, HostingStep::ConfirmView);
             }
@@ -193,7 +202,10 @@ pub fn plan_hosting(input: &HostingInput<'_>) -> HostingPlan {
 fn plan_removed(local: &BTreeMap<RaftGroupId, LocalReplica>) -> HostingPlan {
     let mut plan = HostingPlan::default();
     for (group, replica) in local {
-        if replica.admissible() && replica.counts == Counts::Voter {
+        if replica.admissible()
+            && replica.counts == Counts::Voter
+            && enforced(Rule::RemovedCloseRule)
+        {
             plan.admitted.insert(*group, Admission::Open);
             plan.unplaced.insert(*group);
         }
@@ -488,7 +500,8 @@ impl Teardown {
     /// for changes nothing: an answer while fencing, a completion while
     /// asking, a cancel past step 0.
     pub fn advance(self, event: TeardownEvent) -> TeardownOutcome {
-        let not_member = event == TeardownEvent::Answered(Some(MembershipAnswer::NotMember));
+        let not_member = event == TeardownEvent::Answered(Some(MembershipAnswer::NotMember))
+            || (!enforced(Rule::RetireAnswer) && matches!(event, TeardownEvent::Answered(_)));
         match (self, event) {
             (Self::Asking, TeardownEvent::Cancel) => TeardownOutcome::Ended(TeardownEnd::Cancelled),
             (Self::Asking, TeardownEvent::Answered(_)) if not_member => {
