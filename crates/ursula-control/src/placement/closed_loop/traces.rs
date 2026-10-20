@@ -483,7 +483,7 @@ fn c6_f_a_history_event_drops_every_retirement() {
 #[test]
 fn c6_g_a_removed_node_keeps_a_counting_replica_open() {
     negative(
-        Rule::RemovedCloseRule,
+        Rule::RemovedNodeCloses,
         &[Invariant::C1],
         1,
         the_close_rule_and_the_sweep,

@@ -204,7 +204,7 @@ fn plan_removed(local: &BTreeMap<RaftGroupId, LocalReplica>) -> HostingPlan {
     for (group, replica) in local {
         if replica.admissible()
             && replica.counts == Counts::Voter
-            && enforced(Rule::RemovedCloseRule)
+            && enforced(Rule::RemovedNodeCloses)
         {
             plan.admitted.insert(*group, Admission::Open);
             plan.unplaced.insert(*group);

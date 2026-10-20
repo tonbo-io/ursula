@@ -29,7 +29,7 @@ pub(crate) enum Rule {
     HistoryDrop,
     /// C6(g): a removed node closes only the replicas that stopped counting
     /// as voters.
-    RemovedCloseRule,
+    RemovedNodeCloses,
     /// C6(h): a view confirms only within the barrier's history and at its
     /// log id, never by index alone.
     ConfirmByLogId,
