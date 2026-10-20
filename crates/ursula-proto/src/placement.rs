@@ -14,7 +14,9 @@
 //!   through `ursula_stream::msgpack`, which writes a struct as an array of
 //!   its fields, so field order is format: never reorder, add or remove a
 //!   field outside a format epoch. These types get wire fixtures with the
-//!   meta group's roots.
+//!   meta group's roots. No type in the replicated, persisted or RPC
+//!   MessagePack closure uses `#[serde(other)]`: an unknown variant decoding
+//!   as another would hide a format mismatch.
 //! - **Admin JSON**: the admin protocol, compatible within a minor and never
 //!   in the meta log or between nodes. [`ReplicaRole`], [`TeardownStage`],
 //!   [`WaitReason`], [`StepKind`], [`StepFailureKind`], [`StepFailure`],
