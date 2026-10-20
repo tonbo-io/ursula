@@ -6,18 +6,20 @@
 //! - **A node** has a placement view (a state of the meta log, possibly
 //!   lagging or regressed), its journal's replicas with their log state
 //!   (7.2), open state and teardowns, and the snapshot objects it holds. It
-//!   may crash, restart with an older view, be cut off on the data plane,
-//!   or believe itself removed.
+//!   may crash, restart with an older view, be cut off on the data plane
+//!   (keeping its gate, as only a restart or a lost log closes one), or
+//!   believe itself removed.
 //! - **A data group** is the abstract group of the reconciler's tests
 //!   ([`Group`]): per-node logs, a CAS on the membership log id, a joint
 //!   then a uniform entry per voter change with kept futures, lost and
 //!   delayed second steps, commits only with an acknowledging majority of
 //!   every config, elections by vote with recovery gates, an outgoing leader
 //!   elected again on its uniform entry, a leader outside the committed
-//!   config leading until its step-down, transfers, catch-up and gates. On
-//!   top of it the model keeps leaders cut off on the data plane that still
-//!   lead their own copy, step futures kept past their leadership, and data
-//!   recovery plans.
+//!   config leading until its step-down, transfers, catch-up and gates, and
+//!   data recovery plans. A node cut off on the data plane stays a member
+//!   that nobody reaches. On top of the group the model keeps the copy each
+//!   cut-off leader still leads once the others elected another, and step
+//!   futures kept past their leadership.
 //!
 //! Every [`Action`] is one step of one actor or of the adversary, and
 //! [`World::step`] checks C1 to C4 and C7 to C9 after each. C5 is
@@ -87,6 +89,7 @@ use crate::placement::membership_answer;
 use crate::placement::plan_decommission;
 use crate::placement::plan_hosting;
 use crate::placement::plan_membership_step;
+use crate::placement::reconcile::model::Cut;
 use crate::placement::reconcile::model::Group;
 use crate::placement::reconcile::model::Proposal;
 use crate::placement::reconcile::model::Refused;
@@ -455,8 +458,10 @@ pub(super) struct DataGroup {
     /// The leader's placement confirmation: the term of its leadership and
     /// the barrier's stamp.
     confirmation: Option<(u64, ConfirmedStamp)>,
-    /// Leaders cut off on the data plane, each leading its own copy of the
-    /// group, which commits nothing that needs another node.
+    /// Leaders cut off on the data plane, each with its own copy of the
+    /// group as it last led it: the copy it keeps leading once the others
+    /// elected another, which commits nothing that needs another node and
+    /// is gone when the cut heals.
     deposed: BTreeMap<NodeId, Group>,
     /// The membership steps whose futures were kept, one per planner. A
     /// kept step may run in a later leadership of its planner, which 5.5's
@@ -891,16 +896,26 @@ impl World {
             .collect()
     }
 
+    /// The nodes cut off on the data plane.
+    fn partitioned_nodes(&self) -> BTreeSet<NodeId> {
+        self.nodes
+            .iter()
+            .filter(|(_, state)| state.partitioned)
+            .map(|(node, _)| *node)
+            .collect()
+    }
+
     /// A live leader's answer about `node`, from its committed and
     /// effective memberships. `None` when no leader that holds a quorum
     /// answers.
     fn answer_about(&self, node: NodeId, group: RaftGroupId) -> Option<MembershipAnswer> {
         let raft = self.raft(group)?;
         let leader = raft.leader?;
+        let live = raft.live_from(leader);
         let holds_quorum = self.reaches(leader)
-            && raft.alive.contains(&leader)
-            && quorum_live(&raft.committed, &raft.alive)
-            && quorum_live(raft.effective(), &raft.alive);
+            && live.contains(&leader)
+            && quorum_live(&raft.committed, &live)
+            && quorum_live(raft.effective(), &live);
         holds_quorum.then(|| membership_answer(node, &raft.committed, raft.effective()))
     }
 
@@ -1230,7 +1245,13 @@ impl World {
             // A step of this node is pending: it plans nothing.
             return;
         }
-        let deposed = data.deposed.contains_key(&me);
+        // A cut-off leader plans on the real group while it still leads it,
+        // and on its copy once the others elected another.
+        let leads = data
+            .raft
+            .as_ref()
+            .is_some_and(|raft| raft.leader == Some(me));
+        let deposed = !leads && data.deposed.contains_key(&me);
         let confirmation = data.confirmation;
         let seat = if deposed {
             data.deposed.get_mut(&me)
@@ -1251,11 +1272,12 @@ impl World {
         let membership = seat.committed_id;
         let term = seat.term;
         // The leadership proof: a live leader of the real group whose
-        // committed config has a live majority.
+        // committed config has a majority it reaches.
+        let reached = seat.live_from(me);
         let proven = !deposed
             && seat.leader == Some(me)
-            && seat.alive.contains(&me)
-            && quorum_live(&seat.committed, &seat.alive);
+            && reached.contains(&me)
+            && quorum_live(&seat.committed, &reached);
         self.check_voter_change(me, group, &step, &from, &removed);
         if !deposed && matches!(step, MembershipStep::Wait(WaitReason::NotAMember)) {
             self.tally.not_a_member = self.tally.not_a_member.saturating_add(1);
@@ -1269,6 +1291,11 @@ impl World {
                     return;
                 };
                 if deposed {
+                    // The copy's leadership never ends, so its confirmation
+                    // never lapses, not even across a meta history event,
+                    // which the reconciler's would (5.6). The adversary is
+                    // stronger than the design here, and the copy's steps
+                    // reach no other node.
                     if let Some(copy) = data.deposed.get_mut(&me) {
                         copy.confirmed = true;
                     }
@@ -1444,9 +1471,10 @@ impl World {
         else {
             return;
         };
-        let reachable = self.reachable_replicas(group);
+        let members = self.members(group);
         let empty = voters.iter().all(|voter| {
-            reachable.contains(&voter)
+            members.contains(&voter)
+                && self.reaches(voter)
                 && self
                     .replica(voter, group)
                     .is_some_and(|replica| replica.log == Journal::Empty)
@@ -1454,7 +1482,7 @@ impl World {
         if !empty {
             return;
         }
-        self.initialize(me, group, &confirmed, Group::new(voters, me, reachable));
+        self.initialize(me, group, &confirmed, Group::new(voters, me, members));
     }
 
     /// The seed driver's `Initialize`. C4: the confirmed view is in the
@@ -1590,23 +1618,16 @@ impl World {
         }
     }
 
+    /// The node's groups see the cut at the next [`Self::sync`]: it stays a
+    /// member with its gate, and a leader keeps leading until another wins.
     fn partition(&mut self, node: NodeId) {
         if let Some(state) = self.nodes.get_mut(&node) {
             state.partitioned = true;
         }
-        for data in self.groups.values_mut() {
-            if let Some(raft) = data.raft.as_ref()
-                && raft.leader == Some(node)
-                && raft.alive.contains(&node)
-                && !data.deposed.contains_key(&node)
-            {
-                let mut copy = raft.clone();
-                copy.alive = BTreeSet::from([node]);
-                data.deposed.insert(node, copy);
-            }
-        }
     }
 
+    /// The node reaches the others again with the gates it had, and its
+    /// copies of the groups it led are gone.
     fn heal(&mut self, node: NodeId) {
         if let Some(state) = self.nodes.get_mut(&node) {
             state.partitioned = false;
@@ -1652,18 +1673,21 @@ impl World {
             return;
         };
         let at = at.min(last);
-        let config = raft.committed_configs[at].1.clone();
+        let (id, config) = raft.committed_configs[at].clone();
         let cuts_a_report = in_flight.iter().any(|membership| {
             raft.committed_configs
                 .iter()
                 .position(|(id, _)| id == membership)
                 .is_some_and(|position| position > at)
         });
-        raft.recover_to(config);
+        // The tool refuses a plan no reachable voter can lead. Cut-off
+        // leaders' copies and kept step futures stay: neither hears of the
+        // plan, and the plan's new membership id fails every kept CAS.
+        if raft.recover_to(id, config).is_none() {
+            return;
+        }
         if let Some(data) = self.groups.get_mut(&group) {
             data.confirmation = None;
-            data.kept.clear();
-            data.deposed.clear();
         }
         if at < floor || cuts_a_report {
             self.uncertified.insert(group);
@@ -1673,22 +1697,47 @@ impl World {
 
     // Bookkeeping after every action.
 
-    /// Every group's live members are the nodes that reach the others with
-    /// an open replica. A replica that comes back starts unmatched with
-    /// its gate closed.
+    /// Every group's live members are the nodes that run with an open
+    /// replica, and the nodes cut off on the data plane are cut off in every
+    /// group. A replica that comes back from a crash or a close starts
+    /// unmatched with its gate closed, a node reconnecting keeps its gate,
+    /// and each cut-off leader's copy follows the group while it leads it.
     fn sync(&mut self) {
+        let partitioned = self.partitioned_nodes();
         let groups: Vec<RaftGroupId> = self.groups.keys().copied().collect();
         for group in groups {
-            let reachable = self.reachable_replicas(group);
-            if let Some(raft) = self.raft_mut(group) {
-                let gone: Vec<NodeId> = raft.alive.difference(&reachable).copied().collect();
-                for node in gone {
-                    raft.kill(node);
-                }
-                let back: Vec<NodeId> = reachable.difference(&raft.alive).copied().collect();
-                for node in back {
-                    raft.revive(node);
-                }
+            let members = self.members(group);
+            let Some(data) = self.groups.get_mut(&group) else {
+                continue;
+            };
+            let Some(raft) = data.raft.as_mut() else {
+                continue;
+            };
+            let gone: Vec<NodeId> = raft.alive.difference(&members).copied().collect();
+            for node in gone {
+                raft.kill(node);
+            }
+            let back: Vec<NodeId> = members.difference(&raft.alive).copied().collect();
+            for node in back {
+                raft.revive(node);
+            }
+            let healed: Vec<NodeId> = raft
+                .cut
+                .keys()
+                .copied()
+                .filter(|node| !partitioned.contains(node))
+                .collect();
+            for node in healed {
+                raft.reconnect(node);
+            }
+            for node in &partitioned {
+                raft.isolate(*node, Cut::UntilReconnected);
+            }
+            if let Some(leader) = raft.leader
+                && partitioned.contains(&leader)
+                && raft.alive.contains(&leader)
+            {
+                data.deposed.insert(leader, raft.clone());
             }
         }
     }

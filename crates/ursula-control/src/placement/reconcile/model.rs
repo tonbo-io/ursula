@@ -54,7 +54,15 @@
 //!   it.
 //! - A leader cut off from every other node keeps leading until the others
 //!   elect one, and a live leader keeps leading after its quorum died, as
-//!   OpenRaft's do.
+//!   OpenRaft's do. A cut keeps the node's gate: only a restart or a lost
+//!   log closes it. The reconciler's adversary strands a node until the
+//!   next fair round, and the closed loop partitions one until it
+//!   reconnects it.
+//! - An operator's data recovery plan keeps a committed membership whose
+//!   entry a live, reachable voter of it holds: that voter, the one with
+//!   the newest log, leads it, its log cut after the entry, and every other
+//!   reachable member votes only for it. The tool refuses a plan no such
+//!   voter can take, or whose quorum would not commit it.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -213,11 +221,28 @@ pub(crate) struct Elections {
     pub(crate) plans: usize,
 }
 
+/// What heals a cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cut {
+    /// The environment's next fair round: the reconciler's adversary.
+    UntilRound,
+    /// Only [`Group::reconnect`]: the closed loop's data-plane partition.
+    UntilReconnected,
+}
+
+/// How often a run lost or delayed a voter change's second step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct SecondSteps {
+    pub(crate) dropped: usize,
+    pub(crate) delayed: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct Group {
     pub(crate) alive: BTreeSet<NodeId>,
-    /// A node cut off from every other node.
-    pub(crate) cut: Option<NodeId>,
+    /// Nodes cut off from every other node, each with what heals its cut.
+    /// A cut node keeps its gate.
+    pub(crate) cut: BTreeMap<NodeId, Cut>,
     pub(crate) logs: BTreeMap<NodeId, Vec<Entry>>,
     pub(crate) gates: BTreeMap<NodeId, Gate>,
     pub(crate) committed: MembershipConfig,
@@ -243,6 +268,7 @@ pub(crate) struct Group {
     /// Every voter change OpenRaft accepted.
     pub(crate) proposals: Vec<Proposal>,
     pub(crate) elections: Elections,
+    pub(crate) second_steps: SecondSteps,
     pub(crate) planner: Planner,
 }
 
@@ -291,7 +317,7 @@ impl Group {
         Self {
             caught_up: voters.to_set(),
             alive,
-            cut: None,
+            cut: BTreeMap::new(),
             logs,
             gates,
             committed_configs: vec![(MembershipLogId::new(id), committed.clone())],
@@ -308,6 +334,7 @@ impl Group {
             delay_second_step: false,
             proposals: Vec::new(),
             elections: Elections::default(),
+            second_steps: SecondSteps::default(),
             planner: plan_membership_step,
         }
     }
@@ -372,12 +399,21 @@ impl Group {
     }
 
     fn reachable(&self, from: NodeId, to: NodeId) -> bool {
-        from == to || (self.cut != Some(from) && self.cut != Some(to))
+        from == to || (!self.cut.contains_key(&from) && !self.cut.contains_key(&to))
     }
 
     /// Whether `to` is live and `from` reaches it.
     fn up(&self, from: NodeId, to: NodeId) -> bool {
         self.alive.contains(&to) && self.reachable(from, to)
+    }
+
+    /// The live nodes `from` reaches, itself included when live.
+    pub(crate) fn live_from(&self, from: NodeId) -> BTreeSet<NodeId> {
+        self.alive
+            .iter()
+            .copied()
+            .filter(|node| self.reachable(from, *node))
+            .collect()
     }
 
     fn lose_leadership(&mut self) {
@@ -521,11 +557,13 @@ impl Group {
         };
         if self.drop_second_step {
             self.drop_second_step = false;
+            self.second_steps.dropped = self.second_steps.dropped.checked_add(1).unwrap();
             self.lose_leadership();
             return;
         }
         if self.delay_second_step && !in_round {
             self.delay_second_step = false;
+            self.second_steps.delayed = self.second_steps.delayed.checked_add(1).unwrap();
             self.future = Some(StepFuture {
                 delayed: true,
                 ..future
@@ -630,7 +668,7 @@ impl Group {
     /// that wins leads. A cut-off leader no one replaces keeps leading.
     pub(crate) fn elect(&mut self) {
         let current = self.leader.filter(|leader| self.alive.contains(leader));
-        if current.is_some_and(|leader| self.cut != Some(leader)) {
+        if current.is_some_and(|leader| !self.cut.contains_key(&leader)) {
             return;
         }
         let winner = self
@@ -645,13 +683,19 @@ impl Group {
         }
     }
 
-    /// The operator's recovery plan for a group without a leader: the live
-    /// node with the newest log that may campaign leads, the smallest on a
-    /// tie, its gate opens and every other live node holding the group votes
-    /// only for it.
+    /// The operator's recovery plan for a group without a leader: the live,
+    /// uncut node with the newest log that may campaign leads, the smallest
+    /// on a tie, its gate opens and every other such node holding the group
+    /// votes only for it.
     fn accept_recovery_plan(&mut self) {
+        let reachable: Vec<NodeId> = self
+            .alive
+            .iter()
+            .copied()
+            .filter(|node| !self.cut.contains_key(node))
+            .collect();
         let mut best: Option<(RaftLogId, NodeId)> = None;
-        for node in self.alive.iter().copied() {
+        for node in reachable.iter().copied() {
             let Some((config, last)) = self
                 .membership_of(node)
                 .map(|(config, _)| config)
@@ -667,10 +711,8 @@ impl Group {
         let Some((_, leader)) = best else {
             return;
         };
-        let members: Vec<NodeId> = self
-            .alive
-            .iter()
-            .copied()
+        let members: Vec<NodeId> = reachable
+            .into_iter()
             .filter(|node| !self.log(*node).is_empty())
             .collect();
         for node in members {
@@ -749,55 +791,79 @@ impl Group {
         self.gates.insert(node, Gate::Empty);
     }
 
-    /// A data recovery plan commits `config` again in a new term: every live
-    /// node holding the group or named by `config` takes the committed log
-    /// with the plan's entry appended, its gate open, and the smallest live
-    /// voter of `config` leads, or no one. The entry's id names that leader,
-    /// else `config`'s smallest voter.
-    pub(crate) fn recover_to(&mut self, config: MembershipConfig) -> MembershipLogId {
-        let voters = config.voters();
-        let leader = voters
+    /// An operator's data recovery plan keeping the committed membership
+    /// `id`, whose config is `config`, as 7.4's tool sends it. The plan's
+    /// leader is a live voter of `config` that the tool reaches on the data
+    /// plane and whose log holds the entry `id`, the one with the newest log
+    /// (the smallest on a tie). Its log is cut after that entry, which
+    /// everything up to it committed, and the plan appends `config` again in
+    /// a new term. Its gate opens, every other reachable member holding the
+    /// group votes only for it, and it campaigns. The tool refuses, and
+    /// nothing changes, when no voter holds the entry or the plan's quorum
+    /// would not commit it.
+    pub(crate) fn recover_to(
+        &mut self,
+        id: MembershipLogId,
+        config: MembershipConfig,
+    ) -> Option<MembershipLogId> {
+        let entry = id.get();
+        let mut best: Option<(RaftLogId, NodeId)> = None;
+        for voter in config.voters() {
+            let reached = self.alive.contains(&voter) && !self.cut.contains_key(&voter);
+            let Some(last) = self
+                .last_id(voter)
+                .filter(|_| reached && self.holds(voter, entry))
+            else {
+                continue;
+            };
+            if best.is_none_or(|(best_last, _)| last > best_last) {
+                best = Some((last, voter));
+            }
+        }
+        let (_, leader) = best?;
+        let mut planned = self.clone();
+        planned.lose_leadership();
+        planned.term = planned.term.checked_add(1)?;
+        let mut log = self.log(leader).to_vec();
+        let kept = log
             .iter()
-            .copied()
-            .find(|voter| self.alive.contains(voter));
-        let named = leader
-            .or_else(|| voters.first().copied())
-            .unwrap_or(NodeId::new(0));
-        let mut log = self
-            .reference()
-            .map(|node| self.log(node).to_vec())
-            .unwrap_or_default();
-        log.truncate(usize::try_from(self.commit_index).unwrap());
-        self.lose_leadership();
-        self.term = self.term.checked_add(1).unwrap();
-        let index = u64::try_from(log.len()).unwrap().checked_add(1).unwrap();
-        let id = RaftLogId {
-            term: self.term,
-            leader: named,
-            index,
+            .position(|held| held.id == entry)?
+            .checked_add(1)?;
+        log.truncate(kept);
+        let point = u64::try_from(kept).ok()?;
+        let plan_id = RaftLogId {
+            term: planned.term,
+            leader,
+            index: point.checked_add(1)?,
         };
         log.push(Entry {
-            id,
+            id: plan_id,
             config: Some(config.clone()),
         });
-        let takers: Vec<NodeId> = self
+        planned.logs.insert(leader, log);
+        planned.commit_index = point;
+        planned.committed = config;
+        planned.committed_id = id;
+        let takers: Vec<NodeId> = planned
             .alive
             .iter()
             .copied()
-            .filter(|node| !self.log(*node).is_empty() || config.is_member(*node))
+            .filter(|node| {
+                *node != leader && !planned.cut.contains_key(node) && !planned.log(*node).is_empty()
+            })
             .collect();
+        planned.gates.insert(leader, Gate::Open);
         for node in takers {
-            self.logs.insert(node, log.clone());
-            self.gates.insert(node, Gate::Open);
+            planned.gates.insert(node, Gate::Planned { leader });
         }
-        let id = MembershipLogId::new(id);
-        self.commit_index = index;
-        self.committed_configs.push((id, config.clone()));
-        self.committed = config;
-        self.committed_id = id;
-        self.leader = leader;
-        self.caught_up = leader.into_iter().collect();
-        id
+        let plan_id = MembershipLogId::new(plan_id);
+        if !planned.campaign(leader) || planned.committed_id != plan_id {
+            return None;
+        }
+        // The plan's own election is no election the counters follow.
+        planned.elections = self.elections.clone();
+        *self = planned;
+        Some(plan_id)
     }
 
     /// `node` crashes. A leader stays leader until an election replaces it.
@@ -821,13 +887,28 @@ impl Group {
         }
     }
 
-    /// The leader is cut off from every other node.
+    /// The leader is cut off from every other node until the next fair
+    /// round.
     pub(crate) fn strand(&mut self) {
-        self.cut = self.leader;
+        if let Some(leader) = self.leader {
+            self.cut.insert(leader, Cut::UntilRound);
+        }
     }
 
+    /// `node` is cut off from every other node until `cut` heals it. It
+    /// keeps its gate, and a leader keeps leading until another wins.
+    pub(crate) fn isolate(&mut self, node: NodeId, cut: Cut) {
+        self.cut.insert(node, cut);
+    }
+
+    /// The fair round heals its cuts.
     pub(crate) fn heal(&mut self) {
-        self.cut = None;
+        self.cut.retain(|_, cut| *cut == Cut::UntilReconnected);
+    }
+
+    /// `node` reaches the others again, with the gate it had.
+    pub(crate) fn reconnect(&mut self, node: NodeId) {
+        self.cut.remove(&node);
     }
 
     /// The fair environment: a leader a past round removed steps down, an

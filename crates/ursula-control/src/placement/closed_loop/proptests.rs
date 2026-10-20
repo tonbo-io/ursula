@@ -5,10 +5,11 @@
 //! are made, and C5 must hold within a bound of fair rounds.
 //!
 //! The adversary crashes, restarts with regressed views, cuts nodes off on
-//! the data plane (whose leaders keep leading their own copy), lags meta
+//! the data plane (they keep their gates, and a cut-off leader keeps
+//! leading its own copy once the others elected another), lags meta
 //! replicas, keeps step futures past their leadership, holds reports in
-//! flight, drops and delays second steps, lets any node that would win
-//! campaign (an outgoing leader on its uniform entry included), moves
+//! flight, drops and delays second steps, lets a node that would win
+//! campaign (an outgoing voter on the uniform entry included), moves
 //! leadership and takes meta down. Each run also draws one family of
 //! operator recoveries: lifecycle changes with the decommission driver and
 //! the sweep, meta recovery plans, or data recovery plans. Combining them

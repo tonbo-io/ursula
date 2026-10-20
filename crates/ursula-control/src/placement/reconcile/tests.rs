@@ -562,6 +562,7 @@ mod model_semantics {
     use crate::placement::reconcile::Leadership;
     use crate::placement::reconcile::MembershipConfig;
     use crate::placement::reconcile::MembershipStep;
+    use crate::placement::reconcile::model::Cut;
     use crate::placement::reconcile::model::Gate;
     use crate::placement::reconcile::model::Group;
     use crate::placement::reconcile::model::Refused;
@@ -651,7 +652,7 @@ mod model_semantics {
         let mut group = group(&[1, 2, 3], 1, 4);
         let target = moving(&[1, 2, 4]);
         // 3 is cut off and misses the learner entry, which commits on 1, 2.
-        group.cut = Some(node(3));
+        group.isolate(node(3), Cut::UntilRound);
         act(&mut group, &target).unwrap();
         assert_eq!(group.committed, uniform(&[1, 2, 3], &[4]));
         group.heal();
@@ -700,7 +701,7 @@ mod model_semantics {
         group.delay_second_step = true;
         act(&mut group, &target).unwrap();
         assert!(matches!(group.committed, MembershipConfig::Joint { .. }));
-        group.cut = Some(node(2));
+        group.isolate(node(2), Cut::UntilRound);
         group.hold_back();
         assert_eq!(
             group.pending().map(|(config, _)| config.clone()),
