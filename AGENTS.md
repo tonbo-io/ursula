@@ -355,7 +355,9 @@ a successful push CI run on that branch: `main` for its own version, or
 `release/<major>.<minor>` for a patch to that line. `main` carries the next
 minor, so patches to a released line ship from its release branch (0.7.x from
 `release/0.7`). The image attestations name that branch as the source ref.
-The commit also needs a successful DST Nightly run, dispatched on that branch.
+The commit also needs a successful DST Nightly run and a successful Memory
+soak run with both the soak and the 600 s outage at their defaults, each
+dispatched on that branch (`gh workflow run memory-soak.yml --ref <branch>`).
 
 GHCR holds only what tagged stable releases publish: the images, the charts,
 and nothing else. Image indexes carry no attestation manifests. Commit
