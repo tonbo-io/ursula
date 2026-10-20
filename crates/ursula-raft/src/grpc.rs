@@ -678,15 +678,46 @@ impl GrpcRpcError {
 /// the refusing node's id in its status metadata.
 impl From<GrpcRpcError> for tonic::Status {
     fn from(error: GrpcRpcError) -> Self {
-        let mut status = tonic::Status::new(error.code, error.message);
-        if let Some(node) = error.refusing_node {
-            status.metadata_mut().insert(
-                crate::peer_cluster::NODE_ID_METADATA,
-                tonic::metadata::AsciiMetadataValue::from(node),
-            );
-        }
-        status
+        refusal_status(error.code, error.message, error.refusing_node)
     }
+}
+
+/// A refusal's status, with the refusing node of a misdelivery refusal in
+/// its `ursula-node-id` metadata, where [`crate::target::refusing_node`]
+/// reads it.
+fn refusal_status(code: tonic::Code, message: String, refusing_node: Option<u64>) -> tonic::Status {
+    let mut status = tonic::Status::new(code, message);
+    if let Some(node) = refusing_node {
+        status.metadata_mut().insert(
+            crate::peer_cluster::NODE_ID_METADATA,
+            tonic::metadata::AsciiMetadataValue::from(node),
+        );
+    }
+    status
+}
+
+/// A refused `AppendStream` item as the stream carries it: an item has no
+/// status metadata, so the misdelivery refusal's node travels in
+/// `refusing_node` (0 for none, as no node id is 0).
+pub(crate) fn stream_item_error(
+    status: &tonic::Status,
+) -> raft_internal_proto::RaftAppendStreamError {
+    raft_internal_proto::RaftAppendStreamError {
+        code: status.code() as i32,
+        message: status.message().to_owned(),
+        refusing_node: crate::target::refusing_node(status).unwrap_or(0),
+    }
+}
+
+/// The sender's status of a refused `AppendStream` item, with a misdelivery
+/// refusal's node back in its metadata, so it reads as the same refusal of
+/// a unary call does.
+fn stream_item_status(error: raft_internal_proto::RaftAppendStreamError) -> tonic::Status {
+    refusal_status(
+        tonic::Code::from_i32(error.code),
+        error.message,
+        (error.refusing_node != 0).then_some(error.refusing_node),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -852,10 +883,9 @@ async fn handle_append_stream_item(
             request_id,
             result: Some(
                 raft_internal_proto::raft_append_stream_response_item::Result::Error(
-                    raft_internal_proto::RaftAppendStreamError {
-                        code: tonic::Code::Unavailable as i32,
-                        message: "append stream concurrency guard is closed".to_owned(),
-                    },
+                    stream_item_error(&tonic::Status::unavailable(
+                        "append stream concurrency guard is closed",
+                    )),
                 ),
             ),
         };
@@ -868,20 +898,16 @@ async fn handle_append_stream_item(
                 }
                 Err(status) => Some(
                     raft_internal_proto::raft_append_stream_response_item::Result::Error(
-                        raft_internal_proto::RaftAppendStreamError {
-                            code: status.code() as i32,
-                            message: status.message().to_owned(),
-                        },
+                        stream_item_error(&status),
                     ),
                 ),
             }
         }
         None => Some(
             raft_internal_proto::raft_append_stream_response_item::Result::Error(
-                raft_internal_proto::RaftAppendStreamError {
-                    code: tonic::Code::InvalidArgument as i32,
-                    message: "append stream batch item is missing its envelope".to_owned(),
-                },
+                stream_item_error(&tonic::Status::invalid_argument(
+                    "append stream batch item is missing its envelope",
+                )),
             ),
         ),
     };
@@ -2139,10 +2165,7 @@ async fn run_append_session(
                             let result = match item.result {
                                 Some(raft_internal_proto::raft_append_stream_response_item::Result::Ack(ack)) => Ok(ack),
                                 Some(raft_internal_proto::raft_append_stream_response_item::Result::Error(error)) => {
-                                    Err(tonic::Status::new(
-                                        tonic::Code::from_i32(error.code),
-                                        error.message,
-                                    ))
+                                    Err(stream_item_status(error))
                                 }
                                 None => Err(tonic::Status::internal(
                                     "raft append stream response item is missing its result",
@@ -2789,6 +2812,141 @@ mod reconnect_tests {
             item.result,
             Some(raft_internal_proto::raft_append_stream_response_item::Result::Error(_))
         )));
+        server.abort();
+    }
+
+    /// Opens an `AppendStream` to `endpoint` whose `ursula-raft-plane`
+    /// metadata is `plane` (none for `None`), sends `envelopes` as one frame
+    /// and returns each item's refusal, in the order sent.
+    async fn refused_stream_items(
+        endpoint: &str,
+        plane: Option<&'static str>,
+        envelopes: Vec<raft_internal_proto::RaftRpcEnvelopeV1>,
+    ) -> Vec<raft_internal_proto::RaftAppendStreamError> {
+        let channel = Endpoint::from_shared(endpoint.to_owned())
+            .expect("valid endpoint")
+            .connect()
+            .await
+            .expect("connect to test server");
+        let mut client =
+            raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
+                channel,
+                crate::peer_cluster::test_identity(2),
+            );
+        let count = envelopes.len();
+        let (sender, receiver) = mpsc::channel(1);
+        sender
+            .send(raft_internal_proto::RaftAppendStreamRequest {
+                items: envelopes
+                    .into_iter()
+                    .zip(0_u64..)
+                    .map(|(envelope, request_id)| {
+                        raft_internal_proto::RaftAppendStreamRequestItem {
+                            request_id,
+                            envelope: Some(envelope),
+                        }
+                    })
+                    .collect(),
+            })
+            .await
+            .expect("send frame");
+        let mut request = tonic::Request::new(ReceiverStream::new(receiver));
+        if let Some(plane) = plane {
+            request.metadata_mut().insert(
+                crate::target::RAFT_PLANE_METADATA,
+                tonic::metadata::AsciiMetadataValue::from_static(plane),
+            );
+        }
+        let frame = client
+            .append_stream(request)
+            .await
+            .expect("open append stream")
+            .into_inner()
+            .message()
+            .await
+            .expect("read response")
+            .expect("response frame");
+        let mut items = frame.items;
+        assert_eq!(items.len(), count);
+        items.sort_by_key(|item| item.request_id);
+        items
+            .into_iter()
+            .map(|item| match item.result {
+                Some(raft_internal_proto::raft_append_stream_response_item::Result::Error(
+                    error,
+                )) => error,
+                other => panic!("item {} is not refused: {other:?}", item.request_id),
+            })
+            .collect()
+    }
+
+    /// An `AppendStream` carries the items of the one plane its
+    /// `ursula-raft-plane` metadata names. A stream that names none, an
+    /// unknown one or the meta plane has each data item refused
+    /// (`INVALID_ARGUMENT`) before the group lookup, which answers a data
+    /// stream's item for a group this node does not run `NOT_FOUND`, and a
+    /// meta stream's meta item likewise, as no node runs the meta group yet.
+    #[tokio::test]
+    async fn an_append_stream_refuses_items_of_another_plane_than_its_own() {
+        let (endpoint, _registry, server) = spawn_append_stream_server().await;
+        let data = || test_envelope(1, Vec::new().into());
+        let meta = || {
+            let mut envelope = test_envelope(0, Vec::new().into());
+            RaftTarget::Meta.stamp(1, &mut envelope);
+            envelope
+        };
+        let code =
+            |error: &raft_internal_proto::RaftAppendStreamError| tonic::Code::from_i32(error.code);
+        for plane in [None, Some("other"), Some("meta")] {
+            let errors = refused_stream_items(&endpoint, plane, vec![data(), data()]).await;
+            for error in &errors {
+                assert_eq!(
+                    code(error),
+                    tonic::Code::InvalidArgument,
+                    "{plane:?}: {error:?}"
+                );
+                assert_eq!(error.refusing_node, 0);
+            }
+        }
+        let errors = refused_stream_items(&endpoint, Some("data"), vec![data(), meta()]).await;
+        assert_eq!(errors.iter().map(code).collect::<Vec<_>>(), [
+            tonic::Code::NotFound,
+            tonic::Code::InvalidArgument
+        ]);
+        let errors = refused_stream_items(&endpoint, Some("meta"), vec![meta()]).await;
+        assert_eq!(code(&errors[0]), tonic::Code::NotFound);
+        server.abort();
+    }
+
+    /// A stream item for another node is refused as misdelivered, and the
+    /// refusal reaches the sender as that of a unary call does:
+    /// `FAILED_PRECONDITION` with the refusing node's id, which the sender
+    /// reads through `refusing_node`, and never a protocol mismatch.
+    #[tokio::test]
+    async fn a_misdelivered_stream_item_names_the_refusing_node() {
+        let (endpoint, _registry, server) = spawn_append_stream_server().await;
+        let mut misdelivered = test_envelope(1, Vec::new().into());
+        RaftTarget::Data(RaftGroupId(1)).stamp(2, &mut misdelivered);
+
+        let errors =
+            refused_stream_items(&endpoint, Some("data"), vec![misdelivered.clone()]).await;
+        assert_eq!(
+            tonic::Code::from_i32(errors[0].code),
+            tonic::Code::FailedPrecondition
+        );
+        assert_eq!(errors[0].refusing_node, 1);
+
+        let transport = Arc::new(CoreRaftTransport::default());
+        remove_shared_channel(&transport, &endpoint);
+        let status = tonic::Status::from(
+            test_network(transport, RaftGroupId(1), 2, endpoint.clone())
+                .try_append_stream(misdelivered, RPCOption::new(Duration::from_secs(2)))
+                .await
+                .expect_err("node 1 is not node 2"),
+        );
+        assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(crate::target::refusing_node(&status), Some(1));
+        assert!(!crate::format_epoch::is_protocol_mismatch(&status));
         server.abort();
     }
 

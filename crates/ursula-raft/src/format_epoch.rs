@@ -36,7 +36,9 @@
 //!
 //! A refusal of a request meant for another node is `FAILED_PRECONDITION`
 //! too, told apart by the refusing node's id in its `ursula-node-id` status
-//! metadata ([`crate::target::refusing_node`]). It is never a format-epoch
+//! metadata ([`crate::target::refusing_node`]), which an AppendStream item
+//! carries in `RaftAppendStreamError.refusing_node` and the sender turns
+//! back into that metadata. It is never a format-epoch
 //! answer: the probe reads it as unreachable, and no reader records it as a
 //! mismatch.
 

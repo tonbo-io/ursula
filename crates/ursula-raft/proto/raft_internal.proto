@@ -58,9 +58,16 @@ message RaftAppendStreamRequestItem {
   RaftRpcEnvelopeV1 envelope = 2;
 }
 
+// A refused stream item: its gRPC status code and message, and on the
+// misdelivery refusal (FAILED_PRECONDITION for a request meant for another
+// node) the refusing node's id, which a unary refusal carries as
+// `ursula-node-id` status metadata. 0 on every other refusal: node ids are
+// never 0. The sender turns it back into that metadata, so one reader
+// serves both.
 message RaftAppendStreamError {
   int32 code = 1;
   string message = 2;
+  uint64 refusing_node = 3;
 }
 
 message RaftAppendStreamResponse {

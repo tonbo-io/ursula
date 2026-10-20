@@ -110,10 +110,7 @@ impl RaftInternal for RecoveryTestService {
                         request_id: item.request_id,
                         result: Some(match result {
                             Ok(ack) => WireResult::Ack(ack),
-                            Err(err) => WireResult::Error(pb::RaftAppendStreamError {
-                                code: err.code() as i32,
-                                message: err.message().to_owned(),
-                            }),
+                            Err(err) => WireResult::Error(crate::grpc::stream_item_error(&err)),
                         }),
                     });
                 }

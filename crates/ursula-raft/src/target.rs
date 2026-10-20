@@ -12,7 +12,10 @@
 //!
 //! A request for another node is refused with `FAILED_PRECONDITION` and the
 //! refusing node's id in its [`NODE_ID_METADATA`] status metadata: the
-//! address now serves another node. The code alone already means a protocol
+//! address now serves another node. An `AppendStream` item, which has no
+//! status metadata, carries the id in its refusal's `refusing_node`, and
+//! the sender puts it back into the status metadata, so the refusal reads
+//! alike on every RPC. The code alone already means a protocol
 //! mismatch (by message text) or another cluster (by `ursula-cluster-id`
 //! metadata), so a sender reads this refusal only through
 //! [`refusing_node`], and never records it as a format-epoch mismatch.
