@@ -901,7 +901,6 @@ fn every_root_round_trips_through_messagepack_and_json() {
         leader_since_ms: 71,
         eligibility: BTreeMap::from([
             (node(1), NodeEligibility::Eligible),
-            (node(3), NodeEligibility::NotLive),
             (node(4), NodeEligibility::DiskPressure),
         ]),
         decommission_blocked: vec![

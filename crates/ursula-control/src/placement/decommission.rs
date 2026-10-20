@@ -21,18 +21,16 @@ use ursula_shard::RaftGroupId;
 
 use super::state::Cluster;
 use super::state::GroupPlacement;
-use super::state::MaintenanceAuthority;
 use super::state::Target;
 
-/// Whether a node may receive a group now, as the meta leader sees it. A
-/// node the leader has no entry for is not live.
+/// Whether a live node may receive a group now, as the meta leader sees
+/// it. A live node acknowledged the meta leader within 10 s, and a node the
+/// leader has no entry for is not live: absence is the one encoding of that.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeEligibility {
-    /// Acknowledged the meta leader within 10 s and sheds nothing for its
-    /// WAL disk.
+    /// Sheds nothing for its WAL disk.
     Eligible,
-    NotLive,
     /// Sheds leadership for WAL disk pressure.
     DiskPressure,
 }
@@ -84,15 +82,14 @@ pub fn free_slots(limit: u32, moving: u32) -> u32 {
 }
 
 /// The moves that empty decommissioning nodes now, and the groups that
-/// cannot move. A cluster under the startup reservation plans nothing.
+/// cannot move. A cluster under the startup reservation has no
+/// decommissioning node (the kernel refuses `Decommission` there), so it
+/// plans nothing.
 pub fn plan_decommission(
     cluster: &Cluster,
     eligibility: &BTreeMap<NodeId, NodeEligibility>,
 ) -> DecommissionPlan {
     let mut plan = DecommissionPlan::default();
-    if cluster.params().maintenance == MaintenanceAuthority::Reservation {
-        return plan;
-    }
     let mut slots = free_slots(
         cluster.params().max_concurrent_moves.get(),
         cluster.moving(),
@@ -165,8 +162,9 @@ pub fn plan_decommission(
 }
 
 /// The node that replaces a leaving voter of `group`, whose voters are
-/// `voters`: an active, eligible node outside them without a retirement in
-/// the group, with the fewest roles, the smallest id on a tie.
+/// `voters`: an eligible node outside them that the kernel's target check
+/// accepts (so active and without a retirement in the group), with the
+/// fewest roles, the smallest id on a tie.
 fn choose_target(
     cluster: &Cluster,
     group: RaftGroupId,
@@ -176,13 +174,11 @@ fn choose_target(
 ) -> Result<NodeId, BlockReason> {
     let qualifying: Vec<NodeId> = cluster
         .nodes()
-        .iter()
-        .filter(|(node, record)| {
-            record.lifecycle == NodeLifecycle::Active
-                && !voters.contains(**node)
-                && cluster.retirement(group, **node).is_none()
+        .keys()
+        .copied()
+        .filter(|node| {
+            !voters.contains(*node) && cluster.check_target(group, *node, voters).is_ok()
         })
-        .map(|(node, _)| *node)
         .collect();
     let mut best: Option<(usize, NodeId)> = None;
     for node in qualifying.iter().copied() {
