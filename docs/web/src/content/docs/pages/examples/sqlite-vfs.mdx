@@ -238,7 +238,7 @@ Operations changes:
 
 ## What the cluster needs
 
-- A 0.8 or later server. `HEAD` answers carry `Ursula-Protocol: 2` and `Ursula-Cluster-Id`, and the extension refuses a server without them.
+- A 0.9 server. `HEAD` answers carry `Ursula-Protocol: 2` and `Ursula-Cluster-Id`, and the extension refuses a server without them.
 - A stream URL that reaches the stream's leader by itself: a gateway, or a single node. The extension never follows a redirect.
 - A cluster id per deployment (`server.cluster_id`). The extension remembers the id each cache was built on, and refuses (`wrong_cluster`) a host name that routes it to another deployment.
 - For databases whose compressed snapshots exceed 32 MiB, a cold backend, so snapshots go up in parts, up to 1 GiB. Without one, `snapshot.error` reports the limit, the log grows, and every rebuild reads it all.
