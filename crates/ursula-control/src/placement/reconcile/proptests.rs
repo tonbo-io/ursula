@@ -494,13 +494,8 @@ fn fault() -> impl Strategy<Value = Fault> {
 }
 
 fn pick(set: &BTreeSet<NodeId>, x: u8) -> Option<NodeId> {
-    let len = set.len();
-    if len == 0 {
-        return None;
-    }
-    set.iter()
-        .nth(usize::from(x).checked_rem(len).unwrap())
-        .copied()
+    let slot = usize::from(x).checked_rem(set.len())?;
+    set.iter().nth(slot).copied()
 }
 
 /// Rounds beyond the voters still to replace that a fair run may take: a

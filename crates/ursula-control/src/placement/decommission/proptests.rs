@@ -59,7 +59,8 @@ fn check_plan(
     let moving = cluster.moving();
     // D2, D5: at most the free slots, one left to operators at a limit of
     // two or more.
-    let planned = u32::try_from(plan.moves.len()).unwrap();
+    let planned = u32::try_from(plan.moves.len())
+        .map_err(|_overflow| "D2: more moves than a u32 counts".to_owned())?;
     ensure(planned <= free_slots(limit, moving), || {
         format!("D2: {planned} moves at limit {limit} with {moving} moving")
     })?;
@@ -139,14 +140,18 @@ fn check_plan(
         ensure(best == Some(target), || {
             format!("D4: target {target}, the minimum is {best:?}")
         })?;
-        let count = load.get_mut(&target).unwrap();
-        *count = count.checked_add(1).unwrap();
+        let count = load
+            .get_mut(&target)
+            .ok_or_else(|| format!("target {target} is not a registered node"))?;
+        *count = count.saturating_add(1);
     }
     for blocked in &plan.blocked {
         ensure(seen.insert(blocked.group), || {
             format!("D3: group {} planned twice", blocked.group.0)
         })?;
-        let placement = cluster.group(blocked.group).unwrap();
+        let placement = cluster
+            .group(blocked.group)
+            .ok_or_else(|| format!("blocked group {} does not exist", blocked.group.0))?;
         let voters = placement.current_voters().to_set();
         ensure(
             voters.iter().any(|voter| decommissioning(cluster, *voter)),
