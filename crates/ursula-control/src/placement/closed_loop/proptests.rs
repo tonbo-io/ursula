@@ -20,10 +20,12 @@
 //! longer than a report takes.
 //!
 //! The tally shows the random runs, not only the traces, reach the
-//! removal and the sweep (C9), the placement CAS, the leadership proof and
-//! step 0's `NotAMember` wait. Outgoing voters' wins are counted, not
-//! asserted: one needs the leader lost between appending the uniform entry
-//! and its commit, which the reconciler's scripted model test pins.
+//! removal and the sweep (C9), the placement CAS and the leadership proof.
+//! Step 0's `NotAMember` wait and outgoing voters' wins are counted, not
+//! asserted. The wait needs a leader to plan between the commit that
+//! removes it and the next settle, which steps it down, and the fixed-seed
+//! runs reach neither: the scripted C2 trace pins the wait, and the
+//! reconciler's scripted model test the outgoing win.
 
 use std::cell::Cell;
 
@@ -313,7 +315,6 @@ fn the_closed_loop_keeps_c1_to_c9() {
     assert!(tally.sweeps > 0, "{tally:?}");
     assert!(tally.stale_reports > 0, "{tally:?}");
     assert!(tally.unproven_reports > 0, "{tally:?}");
-    assert!(tally.not_a_member > 0, "{tally:?}");
 }
 
 /// Every cluster shape forms without faults: every group initializes on
