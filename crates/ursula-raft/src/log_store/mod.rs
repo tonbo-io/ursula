@@ -50,11 +50,15 @@ mod wal;
 mod writer;
 use std::io;
 
+#[cfg(all(test, not(madsim)))]
+pub(crate) use core_meta::CoreMetadata;
 pub use core_meta::GroupLogState;
 pub use core_meta::LogGeneration;
 pub use core_meta::MarkRecoveringError;
 pub use core_meta::PlanCut;
 pub use core_meta::RecoveryRecord;
+#[cfg(all(test, not(madsim)))]
+pub(crate) use core_meta::core_metadata_path;
 #[cfg(madsim)]
 pub use disk::JournalDisk;
 #[cfg(madsim)]

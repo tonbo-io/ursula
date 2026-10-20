@@ -373,12 +373,11 @@ pub enum MarkRecoveringError {
     Write(JournalError),
 }
 
-/// A core metadata file of four groups, with every [`GroupLogState`] and
-/// every [`PlanCut`], and distinct values in the fields of one type, for the
-/// persisted-envelopes fixture. It decodes to the metadata it was encoded
-/// from and re-encodes to the same bytes.
+/// The core metadata of [`sample_file`]: five groups, with every
+/// [`GroupLogState`] and every [`PlanCut`], and distinct values in the fields
+/// of one type.
 #[cfg(test)]
-pub(crate) fn sample_file() -> Vec<u8> {
+fn sample_metadata() -> CoreMetadata {
     use openraft::vote::RaftLeaderId;
 
     type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
@@ -437,10 +436,18 @@ pub(crate) fn sample_file() -> Vec<u8> {
             }
         }
     }
-    let metadata = CoreMetadata {
+    CoreMetadata {
         verified_epoch: 5,
         groups: groups.into_iter().collect(),
-    };
+    }
+}
+
+/// A core metadata file of five groups ([`sample_metadata`]) for the
+/// persisted-envelopes fixture. It decodes to the metadata it was encoded
+/// from and re-encodes to the same bytes.
+#[cfg(test)]
+pub(crate) fn sample_file() -> Vec<u8> {
+    let metadata = sample_metadata();
     let bytes = state_file::encode(StateFileKind::CoreMetadata, &metadata);
     let decoded: CoreMetadata = state_file::decode(
         StateFileKind::CoreMetadata,
@@ -466,6 +473,20 @@ mod tests {
     use super::ReplayRecord;
     use super::core_metadata_path;
     use super::mark_core_recovering;
+    use super::sample_file;
+    use super::sample_metadata;
+
+    /// Storing core metadata writes the file as the persisted-envelopes
+    /// fixture's sample holds it ([`sample_file`]).
+    #[test]
+    fn stored_core_metadata_is_the_fixture_sample() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = core_metadata_path(dir.path());
+        let metadata = sample_metadata();
+        metadata.store(&path).expect("store");
+        assert_eq!(std::fs::read(&path).expect("read"), sample_file());
+        assert_eq!(CoreMetadata::load(&path).expect("load"), metadata);
+    }
 
     #[test]
     fn core_metadata_round_trips_votes_and_log_states() {

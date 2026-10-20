@@ -610,14 +610,9 @@ impl NodeWal {
             fsync,
             &opening,
         );
-        log_opening(
-            &root,
-            previous.as_ref(),
-            boot_id.as_ref(),
-            JournalClass::Meta,
-            META_FSYNC,
-            &meta_opening,
-        );
+        // The meta class's opening is not logged while no meta journal
+        // exists: its recovery warning would describe a log this node does
+        // not have. S1(d), which opens the meta journal, logs it again.
         // Before this run records itself, so a crash in between marks the
         // cores again on the next start.
         if let RecoveryState::Recovering { .. } = opening.recovery {

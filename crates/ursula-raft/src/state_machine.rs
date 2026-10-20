@@ -1802,7 +1802,7 @@ fn record_generation(record: Option<&crate::SnapshotRecord>) -> LogGeneration {
     record.map_or(LogGeneration::FIRST, crate::SnapshotRecord::generation)
 }
 
-/// A snapshot record of four distinct fields, for the persisted-envelopes
+/// A snapshot record of three distinct fields, for the persisted-envelopes
 /// fixture. It decodes to the record it was encoded from and re-encodes to
 /// the same bytes.
 #[cfg(test)]
@@ -3190,6 +3190,96 @@ mod tests {
             matches!(error, SnapshotRestoreError::Pointer { .. }),
             "{error}"
         );
+    }
+
+    /// A store whose core metadata names generation 1 of its group's log
+    /// hands that generation to the snapshot record: a generation-0 record,
+    /// which an earlier life of the group left, restores nothing, and a
+    /// record of generation 1 is read.
+    #[cfg(not(madsim))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_store_of_generation_one_restores_no_generation_zero_record() {
+        let placement = ShardPlacement {
+            core_id: ursula_shard::CoreId(0),
+            shard_id: ursula_shard::ShardId(0),
+            raft_group_id: RaftGroupId(0),
+        };
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let root = tempfile::tempdir().unwrap();
+        let wal = crate::log_store::RaftWal::start(
+            root.path(),
+            ursula_config::WalFsync::Always,
+            &topology,
+        )
+        .unwrap();
+        let core_dir = wal.core_dir(placement.core_id);
+        wal.shutdown().await.unwrap();
+        drop(wal);
+        std::fs::create_dir_all(&core_dir).unwrap();
+        let metadata_path = crate::log_store::core_metadata_path(&core_dir);
+        let mut metadata = crate::log_store::CoreMetadata::load(&metadata_path).unwrap();
+        assert!(metadata.adopt_generation(placement.raft_group_id.0, LogGeneration::new(1)));
+        metadata.store(&metadata_path).unwrap();
+
+        let wal = crate::log_store::RaftWal::start(
+            root.path(),
+            ursula_config::WalFsync::Always,
+            &topology,
+        )
+        .unwrap();
+        let store = wal.open(placement, metrics()).unwrap();
+        let record = store.snapshot_record();
+        assert_eq!(record.generation(), LogGeneration::new(1));
+        let path = record.path().to_path_buf();
+        let restoring = |record: crate::SnapshotRecord| {
+            let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+                placement,
+                None,
+                None,
+                default_snapshot_store(),
+                SnapshotBuildCoordinator::default(),
+                SnapshotInstallCoordinator::default(),
+                Some(record.path().to_path_buf()),
+            );
+            state_machine.snapshot_record = Some(record);
+            state_machine
+        };
+        // A pointer nothing decodes: only a restore that reads it fails.
+        let unreadable = b"not a snapshot pointer";
+        persist_snapshot_metadata(
+            Some(&path),
+            LogGeneration::FIRST,
+            &test_snapshot_meta(42),
+            unreadable,
+        )
+        .unwrap();
+        let mut restored = restoring(record.clone());
+        restored
+            .restore_persisted_snapshot()
+            .await
+            .expect("a generation-0 record restores nothing");
+        assert_eq!(restored.last_applied_log_id, None);
+        assert!(restored.current_snapshot.lock().unwrap().is_none());
+
+        persist_snapshot_metadata(
+            Some(&path),
+            LogGeneration::new(1),
+            &test_snapshot_meta(42),
+            unreadable,
+        )
+        .unwrap();
+        let error = restoring(record)
+            .restore_persisted_snapshot()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SnapshotRestoreError::Pointer { .. }),
+            "{error}"
+        );
+        drop(restored);
+        drop(store);
+        wal.shutdown().await.unwrap();
     }
 
     #[cfg(not(madsim))]
