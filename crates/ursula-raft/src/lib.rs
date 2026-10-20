@@ -3,9 +3,12 @@
 //! Module map:
 //! - [`apply_failure`]: fatal per-group application diagnostics.
 //!
-//! - [`types`]: shared `UrsulaRaftTypeConfig`, type aliases, and the
+//! - [`types`]: shared `UrsulaRaftTypeConfig`, type aliases, the
+//!   [`RaftCommand`] of every entry on either plane, and the
 //!   [`RaftGroupResponse`] applied-entry response around the canonical
 //!   `ursula_runtime` write types.
+//! - [`meta`]: the meta group's replicated types: its commands, its state
+//!   and its snapshot pointer.
 //! - [`codec`]: serde (MessagePack) wire helpers for the canonical command,
 //!   response, and error types that travel through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
@@ -84,6 +87,7 @@ mod history;
 mod in_process;
 mod log_store;
 mod maintenance;
+pub mod meta;
 mod openraft_error;
 mod openraft_work;
 mod peer_channel;
@@ -234,6 +238,7 @@ pub use state_machine::SnapshotPermitError;
 pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::persisted_snapshot_pointer;
+pub use types::RaftCommand;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;
 pub use types::RaftGroupResponse;

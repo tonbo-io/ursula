@@ -41,7 +41,6 @@ use openraft::ServerState;
 use openraft::rt::WatchReceiver;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HistoryEvent;
 use ursula_runtime::HistoryWatch;
 use ursula_shard::RaftGroupId;
@@ -51,6 +50,7 @@ use crate::log_store::RecoveryRecord;
 use crate::registry::RaftGroupHandle;
 use crate::rejoin::GroupRejoin;
 use crate::rt::sync::Notify;
+use crate::types::RaftCommand;
 use crate::types::UrsulaRaftTypeConfig;
 
 /// How long a fenced proposal or read waits for the group's history event
@@ -118,6 +118,11 @@ pub struct GroupHistory {
 }
 
 impl GroupHistory {
+    /// The group whose history this is.
+    pub(crate) fn raft_group_id(&self) -> RaftGroupId {
+        self.raft_group_id
+    }
+
     pub(crate) fn new(raft_group_id: RaftGroupId, applied: HistoryWatch) -> Arc<Self> {
         Arc::new(Self {
             raft_group_id,
@@ -265,7 +270,7 @@ impl GroupHistory {
     pub(crate) async fn admit_proposal(
         &self,
         raft: &RaftGroupHandle,
-        command: &GroupWriteCommand,
+        command: &RaftCommand,
     ) -> Result<(), GroupEngineError> {
         crate::forward::validate_proposal(command)?;
         self.admit(raft).await
@@ -346,7 +351,7 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
             // The driver looks only once the leader applied its whole log,
             // so its applied history is the one this event replaces, and at
             // the genesis every entry it applied stays.
-            let command = GroupWriteCommand::Stream(StreamCommand::NewHistory {
+            let command = RaftCommand::Stream(StreamCommand::NewHistory {
                 history: ursula_runtime::draw_history_id(),
                 now_ms: ursula_runtime::unix_time_ms(),
                 previous: history.applied().map_or(0, |event| event.id.get()),

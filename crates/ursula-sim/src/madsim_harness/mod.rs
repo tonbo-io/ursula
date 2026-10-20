@@ -28,6 +28,8 @@ use ursula_raft::InProcessRaftNetworkPolicyEvent;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::InProcessRaftRpcKind;
 use ursula_raft::MadsimOpenRaftRuntime;
+#[cfg(test)]
+use ursula_raft::RaftCommand;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupStateMachine;
 use ursula_raft::UrsulaRaftTypeConfig;
@@ -76,8 +78,6 @@ use ursula_runtime::GroupSnapshot;
 use ursula_runtime::GroupSnapshotFuture;
 use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
-#[cfg(test)]
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::LinearizableReadBarrier;

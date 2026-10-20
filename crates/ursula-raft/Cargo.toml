@@ -36,6 +36,7 @@ tracing-opentelemetry = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-config = { workspace = true }
+ursula-control = { workspace = true }
 ursula-headers = { workspace = true }
 rand = { workspace = true, features = ["thread_rng"] }
 ursula-shard = { workspace = true }
@@ -57,6 +58,9 @@ sim-tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 # tables of `GroupEngineError`, and `wire_samples`, for the MessagePack
 # fixtures of the commands, responses and backup snapshot.
 ursula-runtime = { workspace = true, features = ["test-support"] }
+# `samples`, one sample of every placement kernel root, for the MessagePack
+# fixtures of the meta group's commands, answers and state.
+ursula-control = { workspace = true, features = ["test-support"] }
 anyhow = { workspace = true }
 axum = { workspace = true }
 criterion = { workspace = true, features = ["async_tokio"] }

@@ -1803,7 +1803,7 @@ impl GroupRejoin {
                 .ok()?;
         for entry in entries {
             match entry.payload {
-                openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                openraft::EntryPayload::Normal(crate::types::RaftCommand::Stream(
                     ursula_stream::StreamCommand::NewHistory {
                         history, previous, ..
                     },
@@ -1812,7 +1812,7 @@ impl GroupRejoin {
                         current = history.get();
                     }
                 }
-                openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
+                openraft::EntryPayload::Normal(crate::types::RaftCommand::Stream(
                     ursula_stream::StreamCommand::ImportSnapshot { .. },
                 )) => return None,
                 _ => {}

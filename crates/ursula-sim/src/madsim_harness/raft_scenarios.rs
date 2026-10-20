@@ -9,11 +9,11 @@ use super::ColdWriteAdmission;
 use super::CreateStreamRequest;
 use super::Duration;
 use super::GroupEngine;
-#[cfg(test)]
-use super::GroupWriteCommand;
 use super::InProcessRaftFaultAction;
 use super::InProcessRaftFaultScript;
 use super::InProcessRaftNetworkFactory;
+#[cfg(test)]
+use super::RaftCommand;
 use super::RaftGroupEngine;
 use super::SimEvent;
 use super::SimTrace;
@@ -500,9 +500,11 @@ pub(super) async fn run_isolated_leader_pending_write_snapshot_purge_inner(
             let old_leader_raft = old_leader_raft.clone();
             async move {
                 old_leader_raft
-                    .client_write(GroupWriteCommand::from(AppendRequest::from_bytes(
-                        pending_stream,
-                        format!("pending-old-leader-{pending_id};").into_bytes(),
+                    .client_write(RaftCommand::Stream(ursula_stream::StreamCommand::from(
+                        AppendRequest::from_bytes(
+                            pending_stream,
+                            format!("pending-old-leader-{pending_id};").into_bytes(),
+                        ),
                     )))
                     .await
             }

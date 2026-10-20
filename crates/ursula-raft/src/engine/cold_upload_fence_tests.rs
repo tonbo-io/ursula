@@ -26,7 +26,6 @@ use ursula_runtime::CreateStreamRequest;
 use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::LeadershipRefusal;
 use ursula_runtime::Proposal;
@@ -41,6 +40,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 
+use crate::RaftCommand;
 use crate::RaftWal;
 use crate::StepDown;
 use crate::engine::RaftGroupEngine;
@@ -294,11 +294,11 @@ async fn an_unfenced_upload_commits_under_the_next_leadership() {
 
     let response = engine
         .raft
-        .client_write(GroupWriteCommand::from(external_append(
+        .client_write(RaftCommand::Stream(StreamCommand::from(external_append(
             &stream_id,
             &payload,
             ProposedUpload::new(before),
-        )))
+        ))))
         .await
         .expect("OpenRaft takes an unfenced write");
     let committed = response.log_id.leader_id;
@@ -313,7 +313,7 @@ async fn an_unfenced_upload_commits_under_the_next_leadership() {
 #[tokio::test]
 async fn an_upload_command_without_a_fence_is_refused() {
     let (engine, _wal_root, stream_id, payload, _cold_store) = staged_stream("r3").await;
-    let command = GroupWriteCommand::from(external_append(
+    let command = StreamCommand::from(external_append(
         &stream_id,
         &payload,
         ProposedUpload::new(UploadFence::Unreplicated),
@@ -337,7 +337,7 @@ async fn an_upload_command_without_a_fence_is_refused() {
 
     let batch =
         crate::forward::write_commands_on_raft(engine.raft_handle(), &engine.history, vec![
-            command,
+            RaftCommand::Stream(command),
         ])
         .await
         .expect_err("a batch carries no fence, so it refuses an upload");
@@ -367,9 +367,9 @@ async fn the_fence_covers_an_if_incarnation_wrapped_upload() {
     let wrapped = |upload| {
         let mut request = external_append(&stream_id, &payload, upload);
         request.if_incarnation = Some(incarnation);
-        GroupWriteCommand::from(request)
+        StreamCommand::from(request)
     };
-    let GroupWriteCommand::Stream(StreamCommand::IfIncarnation { .. }) =
+    let StreamCommand::IfIncarnation { .. } =
         wrapped(ProposedUpload::new(UploadFence::Unreplicated))
     else {
         panic!("a precondition wraps the command");

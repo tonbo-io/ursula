@@ -990,7 +990,6 @@ mod tests {
     use openraft::entry::RaftEntry;
     use openraft::vote::RaftLeaderId;
     use openraft::vote::leader_id_adv::CommittedLeaderId;
-    use ursula_runtime::GroupWriteCommand;
     use ursula_shard::BucketStreamId;
     use ursula_stream::StreamCommand;
 
@@ -1006,6 +1005,7 @@ mod tests {
     use super::ReadBudget;
     use super::SegmentId;
     use super::entry_log_bytes;
+    use crate::RaftCommand;
 
     fn log_id(term: u64, index: u64) -> GroupLogId {
         LogId {
@@ -1017,7 +1017,7 @@ mod tests {
     fn entry(term: u64, index: u64, payload: usize) -> Entry {
         Entry::new(
             log_id(term, index),
-            EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+            EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
                 stream_id: BucketStreamId::new("group-log", "test"),
                 content_type: None,
                 payload: Bytes::from(vec![u8::try_from(index % 251).unwrap_or(0); payload]),

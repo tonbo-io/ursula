@@ -15,7 +15,6 @@ use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use serde::Deserialize;
 use serde::Serialize;
-use ursula_runtime::GroupWriteCommand;
 use ursula_shard::BucketStreamId;
 use ursula_stream::StreamCommand;
 
@@ -37,6 +36,7 @@ use super::sim_disk::SimDisk;
 use super::sim_disk::SimDiskError;
 use super::sim_disk::SimDiskFault;
 use super::writer::WireCodec;
+use crate::RaftCommand;
 use crate::codec::encode_wire;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -67,7 +67,7 @@ fn entries(byte: u8) -> Vec<Entry> {
                     leader_id: CommittedLeaderId::new(5, 1),
                     index,
                 },
-                EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+                EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
                     stream_id: BucketStreamId::new("archive", "durability"),
                     content_type: None,
                     payload: Bytes::from(vec![byte; 32_768]),

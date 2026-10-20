@@ -67,7 +67,6 @@ use ursula_runtime::GroupEngineError;
 #[cfg(not(madsim))]
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupInfraError;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 #[cfg(not(madsim))]
@@ -97,6 +96,7 @@ use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::StreamCommand;
 
 use super::*;
 use crate::codec::*;
@@ -361,7 +361,7 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     let service = crate::grpc::RaftGrpcService::new(registry);
     // A data group never takes CreateBucket: the leader refuses the batch
     // before it proposes any of it.
-    let unproposable = GroupWriteCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
+    let unproposable = RaftCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
         bucket_id: "forwarded".to_owned(),
     });
     let response = service
@@ -431,14 +431,14 @@ fn create_req(stream_id: ursula_shard::BucketStreamId) -> CreateStreamRequest {
     CreateStreamRequest::new(stream_id, "application/octet-stream")
 }
 
-fn create_command(stream_id: ursula_shard::BucketStreamId) -> GroupWriteCommand {
-    GroupWriteCommand::from(create_req(stream_id))
+fn create_command(stream_id: ursula_shard::BucketStreamId) -> RaftCommand {
+    RaftCommand::Stream(StreamCommand::from(create_req(stream_id)))
 }
 
 /// A group's genesis history event, for a test that builds a log or writes
 /// to a raw Raft core: a group applies nothing before it (#581 section 4.3).
-pub(crate) fn genesis_command() -> GroupWriteCommand {
-    GroupWriteCommand::Stream(ursula_stream::StreamCommand::NewHistory {
+pub(crate) fn genesis_command() -> RaftCommand {
+    RaftCommand::Stream(ursula_stream::StreamCommand::NewHistory {
         history: std::num::NonZeroU64::new(1).expect("non-zero"),
         now_ms: 0,
         previous: 0,
@@ -450,8 +450,13 @@ pub(crate) fn genesis_command() -> GroupWriteCommand {
     })
 }
 
-fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> GroupWriteCommand {
-    GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
+fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> RaftCommand {
+    RaftCommand::Stream(append_stream_command(stream_id, payload))
+}
+
+/// The append [`append_command`] carries, as a data engine proposes it.
+fn append_stream_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> StreamCommand {
+    StreamCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
 }
 
 #[cfg(not(madsim))]
@@ -671,18 +676,18 @@ fn log_id(index: u64) -> LogId<CommittedLeaderId> {
 
 fn normal_entry(
     index: u64,
-    command: GroupWriteCommand,
+    command: RaftCommand,
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
     Entry::new(log_id(index), EntryPayload::Normal(command))
 }
 
-fn create_stream_command(name: &str) -> GroupWriteCommand {
+fn create_stream_command(name: &str) -> RaftCommand {
     create_command(bsid(name))
 }
 
 #[test]
 fn raft_group_command_round_trips_through_wire_codec() {
-    let command = GroupWriteCommand::Stream(ursula_stream::StreamCommand::Append {
+    let command = RaftCommand::Stream(ursula_stream::StreamCommand::Append {
         stream_id: bsid("shared-wire-log"),
         content_type: Some("application/octet-stream".to_owned()),
         payload: b"abcd".to_vec().into(),
@@ -699,8 +704,7 @@ fn raft_group_command_round_trips_through_wire_codec() {
     });
 
     let encoded = encode_wire(&command);
-    let decoded: GroupWriteCommand =
-        decode_wire(&encoded, "group command").expect("decode wire command");
+    let decoded: RaftCommand = decode_wire(&encoded, "group command").expect("decode wire command");
     assert_eq!(decoded, command);
 
     // Determinism: re-encoding the decoded value is byte-identical.
@@ -1381,7 +1385,7 @@ async fn a_write_right_after_an_election_is_not_refused() {
         "the write lands before the new leader's first quorum acknowledgement"
     );
     let written = engines[new_index]
-        .write(append_command(stream_id, b"after-election"))
+        .write(append_stream_command(stream_id, b"after-election"))
         .await;
     assert!(
         matches!(written, Ok(GroupWriteResponse::Append(_))),
@@ -1419,7 +1423,7 @@ async fn a_leader_past_its_lease_refuses_a_write_before_appending_it() {
         "the cut-off leader still believes it leads"
     );
     let refused = engine
-        .write(append_command(stream_id, b"past-lease"))
+        .write(append_stream_command(stream_id, b"past-lease"))
         .await
         .expect_err("a leader past its lease refuses the write");
     assert!(
@@ -1758,14 +1762,14 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     };
 
     let checked = follower
-        .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"a"))
+        .forward_write_to_leader_if_follower(append_stream_command(stream_id.clone(), b"a"))
         .await
         .expect_err("the engine's check refuses a write on a follower");
     assert!(refused_before_proposal(&checked), "{checked:?}");
     assert!(names_the_leader(&checked), "{checked:?}");
 
     let written = follower
-        .write(append_command(stream_id.clone(), b"a"))
+        .write(append_stream_command(stream_id.clone(), b"a"))
         .await
         .expect_err("the engine's check refuses a write on a follower");
     assert!(refused_before_proposal(&written), "{written:?}");
@@ -2056,7 +2060,7 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         // proposal. Running it after the hand-off would misclassify the
         // write.
         let checked = engines[index(leader_id)]
-            .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"abc"))
+            .forward_write_to_leader_if_follower(append_stream_command(stream_id.clone(), b"abc"))
             .await
             .expect_err("the deposed node follows the new leader");
         assert!(refused_before_proposal(&checked), "{write:?}: {checked:?}");
@@ -2096,7 +2100,7 @@ async fn writes_are_routed_before_their_body() {
     append.producer = Some(producer.clone());
     let appended = engines[leader_index]
         .raft
-        .client_write(GroupWriteCommand::from(append))
+        .client_write(RaftCommand::Stream(StreamCommand::from(append)))
         .await
         .expect("append through the leader");
     let index = appended.log_id.index();
@@ -3847,7 +3851,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
     };
     apply_entries(&mut sm, vec![normal_entry(
         8,
-        GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
+        RaftCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
             stream_id: deleted,
             now_ms: 0,
         }),
@@ -3857,7 +3861,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
     assert_eq!(owed(&sm), deleted_bytes);
     apply_entries(&mut sm, vec![normal_entry(
         9,
-        GroupWriteCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
+        RaftCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
             bucket_id: "removal-purged".to_owned(),
         }),
     )])
@@ -4783,7 +4787,7 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     .await
                     .unwrap();
                 let error = leader
-                    .write(append_command(stream.clone(), b"committed-poison"))
+                    .write(append_stream_command(stream.clone(), b"committed-poison"))
                     .await
                     .unwrap_err();
                 assert!(matches!(
@@ -4791,7 +4795,7 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
                 ));
                 let refused = leader
-                    .write(append_command(stream.clone(), b"after-stop"))
+                    .write(append_stream_command(stream.clone(), b"after-stop"))
                     .await
                     .unwrap_err();
                 assert!(
@@ -4824,7 +4828,7 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     .await
                     .unwrap();
                 replacement
-                    .write(append_command(stream, b"after-re-election"))
+                    .write(append_stream_command(stream, b"after-re-election"))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -4840,14 +4844,11 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
 
 /// A create of `stream_id` that expires at `expires_at_ms`.
 #[cfg(not(madsim))]
-fn expiring_create(
-    stream_id: ursula_shard::BucketStreamId,
-    expires_at_ms: u64,
-) -> GroupWriteCommand {
+fn expiring_create(stream_id: ursula_shard::BucketStreamId, expires_at_ms: u64) -> RaftCommand {
     let mut request = create_req(stream_id);
     request.stream_expires_at_ms = Some(expires_at_ms);
     request.now_ms = 1;
-    GroupWriteCommand::from(request)
+    RaftCommand::Stream(StreamCommand::from(request))
 }
 
 /// #669: a group's leader sweeps the streams that expired in it in its
@@ -4922,7 +4923,7 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
         assert!(
             matches!(
                 &entry.payload,
-                EntryPayload::Normal(GroupWriteCommand::Stream(
+                EntryPayload::Normal(RaftCommand::Stream(
                     ursula_stream::StreamCommand::ExpireStreams {
                         now_ms: 19_000,
                         limit,

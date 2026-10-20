@@ -2642,7 +2642,6 @@ mod frozen_gc_tests {
     use openraft::vote::RaftLeaderId;
     use openraft::vote::leader_id_adv::CommittedLeaderId;
     use ursula_config::WalFsync;
-    use ursula_runtime::GroupWriteCommand;
     use ursula_runtime::RuntimeMetrics;
     use ursula_shard::BucketStreamId;
     use ursula_shard::CoreId;
@@ -2657,6 +2656,7 @@ mod frozen_gc_tests {
     use super::JournalTuning;
     use super::LaggingGroups;
     use super::UrsulaRaftTypeConfig;
+    use crate::RaftCommand;
     use crate::log_store::RaftGroupFileLogStore;
     use crate::log_store::disk::JournalDisk;
     use crate::log_store::disk::JournalFile;
@@ -2683,7 +2683,7 @@ mod frozen_gc_tests {
                 leader_id: CommittedLeaderId::new(1, 1),
                 index,
             },
-            EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+            EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
                 stream_id: BucketStreamId::new("gc", "progress"),
                 content_type: None,
                 payload: Bytes::from(vec![1; 512]),

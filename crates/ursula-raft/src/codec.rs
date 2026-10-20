@@ -1,7 +1,7 @@
 //! Serde wire codec for replicated commands, responses, forwarded reads, and
 //! the openraft envelope types.
 //!
-//! The canonical types ([`ursula_runtime::GroupWriteCommand`],
+//! The canonical types ([`crate::RaftCommand`],
 //! [`ursula_runtime::GroupWriteResponse`], [`ursula_runtime::GroupEngineError`],
 //! the forwarded read responses) and openraft's own serde-capable RPC and log
 //! types travel as compact MessagePack ([`ursula_stream::msgpack`]) produced
@@ -87,6 +87,7 @@ mod tests {
 
     use super::decode_wire;
     use super::encode_wire;
+    use crate::RaftCommand;
     use crate::UrsulaRaftTypeConfig;
 
     /// A forwarded write's refusal keeps its context, so a `Stream-Seq`
@@ -166,9 +167,7 @@ mod tests {
     fn normal(index: u64, command: ursula_stream::StreamCommand) -> Entry {
         Entry {
             log_id: log_id(7, 2, index),
-            payload: openraft::EntryPayload::Normal(ursula_runtime::GroupWriteCommand::Stream(
-                command,
-            )),
+            payload: openraft::EntryPayload::Normal(RaftCommand::Stream(command)),
         }
     }
 
@@ -557,7 +556,7 @@ mod tests {
         );
     }
 
-    /// Every replicated command, in the [`ursula_runtime::GroupWriteCommand`]
+    /// Every replicated command, in the [`RaftCommand`]
     /// a Raft entry and a forwarded `GroupWrite` carry, every write answer
     /// and the forwarded read answers, keyed by their `Debug` form.
     fn commands_and_responses() -> std::collections::BTreeMap<String, Vec<u8>> {
@@ -723,12 +722,12 @@ mod tests {
     /// any of its `Option`s absent, inside the envelopes that carry it.
     mod sample_round_trips {
         use proptest::prelude::*;
-        use ursula_runtime::GroupWriteCommand;
         use ursula_runtime::wire_samples;
 
         use super::Entry;
         use super::log_id;
         use super::wire_bytes;
+        use crate::RaftCommand;
         use crate::log_store::CoreJournalRecord;
         use crate::log_store::RaftGroupLogRecord;
 
@@ -746,7 +745,7 @@ mod tests {
                 let command = wire_samples::vary_command(index.get(&commands).clone(), mask);
                 let entry = Entry {
                     log_id: log_id(term, node_id, log_index),
-                    payload: openraft::EntryPayload::Normal(GroupWriteCommand::Stream(command)),
+                    payload: openraft::EntryPayload::Normal(RaftCommand::Stream(command)),
                 };
                 wire_bytes("entry", &entry);
                 wire_bytes("journal record", &CoreJournalRecord {
@@ -789,12 +788,12 @@ mod tests {
         use proptest::prelude::*;
         use ursula_runtime::AppendExternalRequest;
         use ursula_runtime::CreateStreamExternalRequest;
-        use ursula_runtime::GroupWriteCommand;
         use ursula_shard::BucketStreamId;
         use ursula_stream::ExternalPayloadRef;
         use ursula_stream::ProducerRequest;
         use ursula_stream::StreamCommand;
 
+        use crate::RaftCommand;
         use crate::UrsulaRaftTypeConfig;
         use crate::codec::decode_wire;
         use crate::codec::encode_wire;
@@ -932,7 +931,7 @@ mod tests {
                     leader_id: CommittedLeaderId::new(term, node),
                     index,
                 },
-                payload: openraft::EntryPayload::Normal(GroupWriteCommand::Stream(command)),
+                payload: openraft::EntryPayload::Normal(RaftCommand::Stream(command)),
             }
         }
 

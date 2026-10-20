@@ -59,7 +59,6 @@ use crate::DeferColdGcResponse;
 use crate::DeleteStreamResponse;
 use crate::ExpireStreamsResponse;
 use crate::FlushColdResponse;
-use crate::GroupWriteCommand;
 use crate::GroupWriteResponse;
 use crate::HeadStreamResponse;
 use crate::ImportGroupStateResponse;
@@ -163,25 +162,6 @@ fn producer_ack(delivery: ProducerDelivery) -> ProducerAck {
         closed_epoch: Some(ClosedEpoch { epoch: 1, seq: 6 }),
         delivery,
     }
-}
-
-/// Every [`StreamCommand`] variant once, in the [`GroupWriteCommand`] a
-/// Raft entry carries.
-pub fn group_write_commands() -> Vec<GroupWriteCommand> {
-    // One witness per variant, each standing for its family.
-    let witnesses = every!(GroupWriteCommand {
-        GroupWriteCommand::Stream(_) => GroupWriteCommand::Stream(StreamCommand::AckColdGc {
-            up_to_seq: 21,
-        }),
-    });
-    witnesses
-        .iter()
-        .flat_map(|witness| match witness {
-            GroupWriteCommand::Stream(_) => {
-                stream_commands().into_iter().map(GroupWriteCommand::Stream)
-            }
-        })
-        .collect()
 }
 
 /// Every [`StreamCommand`] variant once, every `Option` present.

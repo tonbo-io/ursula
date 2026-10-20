@@ -1347,23 +1347,27 @@ async fn lagging_follower_forwards_a_gone_offset_of_a_recreated_stream() {
     let mut last = None;
     for command in [
         append_command(stream_id.clone(), b"old-prefix"),
-        GroupWriteCommand::from(ursula_runtime::PublishSnapshotRequest {
-            stream_id: stream_id.clone(),
-            snapshot_offset: 10,
-            content_type: "application/octet-stream".to_owned(),
-            payload: bytes::Bytes::from_static(b"snapshot"),
-            cold_body: None,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
-        GroupWriteCommand::from(ursula_runtime::AdvanceRetentionRequest {
-            stream_id: stream_id.clone(),
-            retained_offset: 10,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::PublishSnapshotRequest {
+                stream_id: stream_id.clone(),
+                snapshot_offset: 10,
+                content_type: "application/octet-stream".to_owned(),
+                payload: bytes::Bytes::from_static(b"snapshot"),
+                cold_body: None,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::AdvanceRetentionRequest {
+                stream_id: stream_id.clone(),
+                retained_offset: 10,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
     ] {
         last = Some(cluster.engines[1].raft.client_write(command).await.unwrap());
     }
@@ -1389,11 +1393,11 @@ async fn lagging_follower_forwards_a_gone_offset_of_a_recreated_stream() {
         .pause_replication
         .store(true, Ordering::SeqCst);
     for command in [
-        GroupWriteCommand::from(ursula_runtime::DeleteStreamRequest {
+        RaftCommand::Stream(StreamCommand::from(ursula_runtime::DeleteStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: 0,
             if_incarnation: None,
-        }),
+        })),
         create_command(stream_id.clone()),
         append_command(stream_id.clone(), b"new"),
     ] {
@@ -1460,23 +1464,27 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
     let mut last = None;
     for command in [
         append_command(stream_id.clone(), b"old-prefix-tail-bytes"),
-        GroupWriteCommand::from(ursula_runtime::PublishSnapshotRequest {
-            stream_id: stream_id.clone(),
-            snapshot_offset: 10,
-            content_type: "application/octet-stream".to_owned(),
-            payload: bytes::Bytes::from_static(b"snapshot"),
-            cold_body: None,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
-        GroupWriteCommand::from(ursula_runtime::AdvanceRetentionRequest {
-            stream_id: stream_id.clone(),
-            retained_offset: 10,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::PublishSnapshotRequest {
+                stream_id: stream_id.clone(),
+                snapshot_offset: 10,
+                content_type: "application/octet-stream".to_owned(),
+                payload: bytes::Bytes::from_static(b"snapshot"),
+                cold_body: None,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::AdvanceRetentionRequest {
+                stream_id: stream_id.clone(),
+                retained_offset: 10,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
     ] {
         last = Some(cluster.engines[1].raft.client_write(command).await.unwrap());
     }

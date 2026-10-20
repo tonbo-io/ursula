@@ -1,5 +1,3 @@
-use std::fmt;
-
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_shard::ShardPlacement;
@@ -24,29 +22,6 @@ pub struct GroupSnapshot {
     pub group_commit_index: u64,
     pub stream_snapshot: StreamSnapshot,
     pub stream_append_counts: Vec<StreamAppendCount>,
-}
-
-/// Replicated group-level write envelope around the canonical
-/// [`StreamCommand`]: one command per Raft entry. This enum (serde-encoded) is
-/// the Raft log payload; there is no separate wire mirror.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GroupWriteCommand {
-    Stream(StreamCommand),
-}
-
-impl GroupWriteCommand {
-    /// Approximate Raft-log bytes of this command (bounded-state F12e).
-    pub fn log_bytes_estimate(&self) -> u64 {
-        match self {
-            Self::Stream(command) => command.log_bytes_estimate(),
-        }
-    }
-}
-
-impl From<StreamCommand> for GroupWriteCommand {
-    fn from(command: StreamCommand) -> Self {
-        Self::Stream(command)
-    }
 }
 
 impl From<crate::request::ImportGroupStateRequest> for StreamCommand {
@@ -212,37 +187,6 @@ impl From<CompactColdRequest> for StreamCommand {
             old_chunks: request.old_chunks,
             replacement: request.replacement,
             gc_not_before_ms: request.gc_not_before_ms,
-        }
-    }
-}
-
-macro_rules! group_write_from_request {
-    ($($request:ty),+ $(,)?) => {
-        $(impl From<$request> for GroupWriteCommand {
-            fn from(request: $request) -> Self {
-                Self::Stream(StreamCommand::from(request))
-            }
-        })+
-    };
-}
-
-group_write_from_request!(
-    CreateStreamRequest,
-    CreateStreamExternalRequest,
-    AppendRequest,
-    AppendExternalRequest,
-    PublishSnapshotRequest,
-    AdvanceRetentionRequest,
-    CloseStreamRequest,
-    DeleteStreamRequest,
-    FlushColdRequest,
-    CompactColdRequest,
-);
-
-impl fmt::Display for GroupWriteCommand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Stream(command) => command.fmt(f),
         }
     }
 }

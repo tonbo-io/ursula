@@ -2349,15 +2349,27 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             let entry_bytes = crate::types::entry_log_bytes(&entry);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
-                EntryPayload::Normal(command) => {
+                // A data group never commits a meta command: the plane of
+                // every request admits only its own (`RaftTarget::admits`).
+                // One that did stops the apply.
+                EntryPayload::Normal(crate::types::RaftCommand::Meta(_)) => {
+                    return Err(self.stop_apply(
+                        entry.log_id,
+                        crate::apply_failure::ApplyError::InvariantViolation(
+                            crate::forward::invalid_raft_command(
+                                ursula_runtime::UnproposableCommand::OtherPlane,
+                            ),
+                        ),
+                    ));
+                }
+                EntryPayload::Normal(crate::types::RaftCommand::Stream(command)) => {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
                     #[cfg(madsim)]
                     {
-                        let ursula_runtime::GroupWriteCommand::Stream(stream_command) = &command;
                         let leader = entry.log_id.committed_leader_id();
                         ursula_runtime::cold_uploads::fence_ledger::note_applied(
-                            stream_command,
+                            &command,
                             ursula_runtime::CommittedLeader::new(leader.term, leader.node_id),
                         );
                     }

@@ -37,7 +37,6 @@ use ursula_runtime::FlushColdRequest;
 use ursula_runtime::FollowerRead;
 #[cfg(not(madsim))]
 use ursula_runtime::GroupEngine;
-use ursula_runtime::GroupWriteCommand;
 #[cfg(not(madsim))]
 use ursula_runtime::ReadStreamRequest;
 #[cfg(not(madsim))]
@@ -51,6 +50,7 @@ use ursula_stream::ColdChunkRef;
 use ursula_stream::ExternalPayloadRef;
 use ursula_stream::StreamCommand;
 
+use crate::RaftCommand;
 #[cfg(not(madsim))]
 use crate::RaftWal;
 #[cfg(not(madsim))]
@@ -179,7 +179,7 @@ fn normal_entry(
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
     Entry::new(
         log_id(index),
-        EntryPayload::Normal(GroupWriteCommand::from(command)),
+        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::from(command))),
     )
 }
 

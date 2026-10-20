@@ -280,8 +280,8 @@ fn placement() -> ShardPlacement {
 }
 
 #[test]
-fn group_write_command_round_trips_as_log_payload() {
-    let command = GroupWriteCommand::Stream(StreamCommand::Append {
+fn stream_command_round_trips_as_log_payload() {
+    let command = StreamCommand::Append {
         stream_id: BucketStreamId::new("benchcmp", "raft-log"),
         content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
         payload: Bytes::from_static(b"abcd"),
@@ -289,10 +289,10 @@ fn group_write_command_round_trips_as_log_payload() {
         stream_seq: None,
         producer: Some(producer("writer-1", 7, 42)),
         now_ms: 0,
-    });
+    };
 
     let encoded = serde_json::to_vec(&command).expect("encode command");
-    let decoded = serde_json::from_slice::<GroupWriteCommand>(&encoded).expect("decode command");
+    let decoded = serde_json::from_slice::<StreamCommand>(&encoded).expect("decode command");
 
     assert_eq!(decoded, command);
 }
@@ -309,7 +309,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 
     let created = engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::CreateStream {
+            StreamCommand::CreateStream {
                 stream_id: stream.clone(),
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 initial_payload: Bytes::new(),
@@ -318,7 +318,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 now_ms: 0,
-            }),
+            },
             placement,
         )
         .expect("create stream");
@@ -348,7 +348,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 
     let appended = engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::Append {
+            StreamCommand::Append {
                 stream_id: stream.clone(),
                 content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
                 payload: Bytes::from_static(b"abc"),
@@ -356,7 +356,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
-            }),
+            },
             placement,
         )
         .expect("append");
@@ -387,7 +387,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
 
     let flushed = engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::FlushCold {
+            StreamCommand::FlushCold {
                 cold_generation: engine
                     .state_machine
                     .cold_index_generation(&stream)
@@ -400,7 +400,7 @@ fn committed_write_command_is_state_machine_apply_boundary() {
                     object_size: 2,
                     ..Default::default()
                 },
-            }),
+            },
             placement,
         )
         .expect("flush cold");
@@ -448,7 +448,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
 
     engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::CreateStream {
+            StreamCommand::CreateStream {
                 stream_id: stream.clone(),
                 content_type: DEFAULT_CONTENT_TYPE.to_owned(),
                 initial_payload: Bytes::new(),
@@ -457,13 +457,13 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 stream_ttl_seconds: None,
                 stream_expires_at_ms: None,
                 now_ms: 0,
-            }),
+            },
             placement,
         )
         .expect("create stream");
     engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::Append {
+            StreamCommand::Append {
                 stream_id: stream.clone(),
                 content_type: Some(DEFAULT_CONTENT_TYPE.to_owned()),
                 payload: Bytes::from_static(b"abcdef"),
@@ -471,7 +471,7 @@ async fn cold_store_read_reassembles_cold_and_hot_segments() {
                 stream_seq: None,
                 producer: None,
                 now_ms: 0,
-            }),
+            },
             placement,
         )
         .expect("append");

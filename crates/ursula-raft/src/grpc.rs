@@ -2191,10 +2191,10 @@ mod reconnect_tests {
     use openraft::vote::RaftLeaderId;
     use tokio_stream::wrappers::TcpListenerStream;
     use tonic::transport::Endpoint;
-    use ursula_runtime::GroupWriteCommand;
     use ursula_stream::StreamCommand;
 
     use super::*;
+    use crate::RaftCommand;
 
     #[tokio::test]
     async fn different_owner_pools_never_share_peer_sessions_or_channels() {
@@ -2248,7 +2248,7 @@ mod reconnect_tests {
         });
 
         type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
-        let command = GroupWriteCommand::Stream(StreamCommand::CreateBucket {
+        let command = RaftCommand::Stream(StreamCommand::CreateBucket {
             bucket_id: "network-accounting".to_owned(),
         });
         let replication = UrsulaAppendEntriesRequest {

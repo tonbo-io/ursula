@@ -11,9 +11,12 @@ use openraft::raft::VoteResponse;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_runtime::GroupEngineError;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_shard::RaftGroupId;
+use ursula_stream::StreamCommand;
+
+use crate::meta::MetaCommand;
+use crate::meta::MetaResponse;
 
 /// Under `fsync = always`, how long the per-core journal writer waits for the
 /// next request before it writes a batch; each arrival restarts the wait
@@ -32,11 +35,49 @@ type OpenRaftRuntime = openraft::impls::TokioRuntime;
 
 openraft::declare_raft_types!(
     pub UrsulaRaftTypeConfig:
-        D = GroupWriteCommand,
+        D = RaftCommand,
         R = RaftGroupResponse,
         Node = openraft::EmptyNode,
         AsyncRuntime = OpenRaftRuntime,
 );
+
+/// The command of one Raft entry, on either plane: a data group's
+/// [`StreamCommand`] or a meta group's [`MetaCommand`]. One type config
+/// serves both planes, so the journal, the gate, the network and the codec
+/// are shared, and the plane a request names admits only its own commands
+/// (`RaftTarget::admits`).
+///
+/// A data entry encodes as the one-variant envelope of format epoch 5 did
+/// (`81 a6 "Stream" ...`): the variant keeps its name, so a data entry's
+/// bytes are unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RaftCommand {
+    Stream(StreamCommand),
+    Meta(MetaCommand),
+}
+
+impl RaftCommand {
+    /// Approximate Raft-log bytes of this command (bounded-state F12e). A
+    /// meta command counts as the fixed per-entry overhead.
+    pub fn log_bytes_estimate(&self) -> u64 {
+        match self {
+            Self::Stream(command) => command.log_bytes_estimate(),
+            Self::Meta(_) => ursula_stream::COMMAND_LOG_OVERHEAD_BYTES,
+        }
+    }
+}
+
+impl From<StreamCommand> for RaftCommand {
+    fn from(command: StreamCommand) -> Self {
+        Self::Stream(command)
+    }
+}
+
+impl From<MetaCommand> for RaftCommand {
+    fn from(command: MetaCommand) -> Self {
+        Self::Meta(command)
+    }
+}
 
 /// A group snapshot with its metadata, as the state machine, its snapshot
 /// builder and the networks hand it to OpenRaft.
@@ -107,14 +148,17 @@ pub type UrsulaVote = VoteOf<UrsulaRaftTypeConfig>;
 pub type UrsulaVoteRequest = VoteRequest<UrsulaRaftTypeConfig>;
 pub type UrsulaVoteResponse = VoteResponse<UrsulaRaftTypeConfig>;
 
-/// Raft-level response for one applied log entry. Write outcomes carry the
-/// canonical [`GroupWriteResponse`]/[`GroupEngineError`] directly; blank and
-/// membership entries have no application payload.
+/// Raft-level response for one applied log entry. A data group's write
+/// outcomes carry the canonical [`GroupWriteResponse`]/[`GroupEngineError`]
+/// directly, the meta group's its [`MetaResponse`]; blank and membership
+/// entries have no application payload. Never persisted or sent: an arm
+/// reaches the wire only as an `ursula_runtime::ResponseKind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftGroupResponse {
     Blank,
     Membership,
     Write(Result<GroupWriteResponse, GroupEngineError>),
+    Meta(MetaResponse),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

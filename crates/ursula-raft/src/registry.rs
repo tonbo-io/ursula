@@ -2468,7 +2468,7 @@ mod tests {
             .await
             .unwrap();
         let response = raft
-            .client_write(ursula_runtime::GroupWriteCommand::Stream(
+            .client_write(crate::types::RaftCommand::Stream(
                 ursula_stream::StreamCommand::CreateStream {
                     stream_id: ursula_shard::BucketStreamId::new("after-retry", "events"),
                     content_type: "application/octet-stream".to_owned(),

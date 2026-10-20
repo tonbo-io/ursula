@@ -21,10 +21,10 @@ use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use tempfile::TempDir;
 use ursula_config::WalFsync;
+use ursula_raft::RaftCommand;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
 use ursula_raft::UrsulaRaftTypeConfig;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -426,7 +426,7 @@ fn log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
 fn entry(index: u64, group_id: u32, payload_size: usize) -> EntryOf<UrsulaRaftTypeConfig> {
     EntryOf::<UrsulaRaftTypeConfig>::new(
         log_id(index),
-        EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
             stream_id: BucketStreamId::new("wal-bench", format!("stream-{group_id}")),
             content_type: Some("application/octet-stream".to_owned()),
             payload: Bytes::from(vec![7_u8; payload_size]),

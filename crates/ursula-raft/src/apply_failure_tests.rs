@@ -8,12 +8,12 @@ use std::time::Duration;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogReader;
 use openraft::vote::RaftLeaderId;
-use ursula_runtime::GroupWriteCommand;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
+use crate::RaftCommand;
 use crate::RaftGroupEngine;
 use crate::RaftGroupEngineOptions;
 use crate::RaftGroupHandleRegistry;
@@ -26,8 +26,13 @@ fn placement(group: u32) -> ShardPlacement {
     }
 }
 
-fn create_stream(name: &str) -> GroupWriteCommand {
-    GroupWriteCommand::Stream(ursula_stream::StreamCommand::CreateStream {
+fn create_stream(name: &str) -> RaftCommand {
+    RaftCommand::Stream(create_stream_command(name))
+}
+
+/// The create [`create_stream`] carries, as a data engine proposes it.
+fn create_stream_command(name: &str) -> ursula_stream::StreamCommand {
+    ursula_stream::StreamCommand::CreateStream {
         stream_id: ursula_shard::BucketStreamId::new(name, "events"),
         content_type: "application/octet-stream".to_owned(),
         initial_payload: bytes::Bytes::copy_from_slice(name.as_bytes()),
@@ -36,7 +41,7 @@ fn create_stream(name: &str) -> GroupWriteCommand {
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
         now_ms: 0,
-    })
+    }
 }
 
 #[tokio::test]
@@ -108,11 +113,9 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .unwrap();
     let poison_index = previous.index().checked_add(1).unwrap();
     let rejected = poisoned
-        .write(GroupWriteCommand::Stream(
-            ursula_stream::StreamCommand::CreateBucket {
-                bucket_id: "not-a-data-command".to_owned(),
-            },
-        ))
+        .write(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "not-a-data-command".to_owned(),
+        })
         .await
         .unwrap_err();
     assert!(matches!(
@@ -140,7 +143,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .unwrap();
     let result = crate::rt::time::timeout(
         Duration::from_secs(5),
-        poisoned.write(create_stream("poison-record")),
+        poisoned.write(create_stream_command("poison-record")),
     )
     .await
     .unwrap();
@@ -153,7 +156,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     ));
     // A later command is refused before proposal and names the failure.
     assert!(matches!(
-        poisoned.write(create_stream("after-stop")).await,
+        poisoned.write(create_stream_command("after-stop")).await,
         Err(ursula_runtime::GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::ApplyStopped { index, .. }
         )) if index == poison_index
@@ -540,10 +543,10 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
         ),
         payload: openraft::EntryPayload::Normal(command),
     };
-    let rejected = GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
+    let rejected = ursula_stream::StreamCommand::DeleteStream {
         stream_id: ursula_shard::BucketStreamId::new("absent", "absent"),
         now_ms: 0,
-    });
+    };
     let result = state
         .engine
         .apply_committed_write(rejected.clone(), placement(0));
@@ -552,7 +555,10 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
         Err(ursula_runtime::GroupEngineError::Stream(_))
     ));
     state
-        .apply(futures_util::stream::iter([Ok((entry(1, rejected), None))]))
+        .apply(futures_util::stream::iter([Ok((
+            entry(1, RaftCommand::Stream(rejected)),
+            None,
+        ))]))
         .await
         .unwrap();
     assert_eq!(state.last_applied_log_id.unwrap().index(), 1);

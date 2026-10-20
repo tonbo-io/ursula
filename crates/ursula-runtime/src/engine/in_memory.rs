@@ -82,7 +82,6 @@ use crate::cold_store::DEFAULT_CONTENT_TYPE;
 use crate::cold_store::cold_pack_dir;
 use crate::cold_uploads::UploadFence;
 use crate::command::GroupSnapshot;
-use crate::command::GroupWriteCommand;
 use crate::request::AckColdGcResponse;
 use crate::request::AdvanceRetentionRequest;
 use crate::request::AdvanceRetentionResponse;
@@ -193,25 +192,18 @@ impl InMemoryGroupEngine {
     /// records (#581 section 4.3).
     pub fn apply_committed_entry(
         &mut self,
-        command: GroupWriteCommand,
+        command: StreamCommand,
         index: u64,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
-        match command {
-            GroupWriteCommand::Stream(command) => self.apply_checked_stream_command(
-                command,
-                index,
-                placement,
-                IncarnationCheck::Absent,
-            ),
-        }
+        self.apply_checked_stream_command(command, index, placement, IncarnationCheck::Absent)
     }
 
     /// [`Self::apply_committed_entry`] for an engine without a log: the
     /// entry's index is the next commit index.
     pub fn apply_committed_write(
         &mut self,
-        command: GroupWriteCommand,
+        command: StreamCommand,
         placement: ShardPlacement,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         let index = self.commit_index.saturating_add(1);
@@ -715,7 +707,7 @@ impl InMemoryGroupEngine {
             )?;
         }
         CreateStreamResponse::try_from(
-            self.apply_committed_write(GroupWriteCommand::from(request), placement)?,
+            self.apply_committed_write(StreamCommand::from(request), placement)?,
         )
     }
 
@@ -750,7 +742,7 @@ impl InMemoryGroupEngine {
             )?;
         }
         AppendResponse::try_from(
-            self.apply_committed_write(GroupWriteCommand::from(request), placement)?,
+            self.apply_committed_write(StreamCommand::from(request), placement)?,
         )
     }
 
@@ -787,11 +779,11 @@ impl InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> Result<TouchStreamAccessResponse, GroupEngineError> {
         TouchStreamAccessResponse::try_from(self.apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::TouchStreamAccess {
+            StreamCommand::TouchStreamAccess {
                 stream_id,
                 now_ms,
                 renew_ttl,
-            }),
+            },
             placement,
         )?)
     }
@@ -1454,7 +1446,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 self.create_stream_with_admission_inner(request, placement, admission)
             });
         }
-        let command = GroupWriteCommand::from(request);
+        let command = StreamCommand::from(request);
         Box::pin(async move {
             CreateStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
@@ -1468,7 +1460,7 @@ impl GroupEngine for InMemoryGroupEngine {
         Box::pin(async move {
             // The state keeps the initial payload as a direct reference
             // (F14g), so the engine writes no page entry before proposing.
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             CreateStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
@@ -1511,7 +1503,7 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupPublishSnapshotFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             PublishSnapshotResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
@@ -1523,7 +1515,7 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupAdvanceRetentionFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             AdvanceRetentionResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
@@ -1551,7 +1543,7 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupTidyStreamFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(StreamCommand::TidyStream { stream_id, now_ms });
+            let command = StreamCommand::TidyStream { stream_id, now_ms };
             crate::request::TidyStreamResponse::try_from(
                 self.apply_committed_write(command, placement)?,
             )
@@ -1594,10 +1586,10 @@ impl GroupEngine for InMemoryGroupEngine {
                 if let Some(cache) = self.cold_index_cache.as_ref() {
                     cache.invalidate_stream(&candidate.stream_id);
                 }
-                let command = GroupWriteCommand::from(StreamCommand::OffloadColdRefs {
+                let command = StreamCommand::OffloadColdRefs {
                     stream_id: candidate.stream_id,
                     refs: candidate.refs,
-                });
+                };
                 match self.apply_committed_write(command, placement) {
                     Ok(GroupWriteResponse::OffloadColdRefs(response)) => {
                         report.streams = report.streams.saturating_add(1);
@@ -1814,7 +1806,7 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupCloseStreamFuture<'a> {
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             CloseStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
@@ -1824,7 +1816,7 @@ impl GroupEngine for InMemoryGroupEngine {
         request: DeleteStreamRequest,
         placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a> {
-        let command = GroupWriteCommand::from(request);
+        let command = StreamCommand::from(request);
         Box::pin(async move {
             DeleteStreamResponse::try_from(self.apply_committed_write(command, placement)?)
         })
@@ -1836,10 +1828,9 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
-            PurgeBucketResponse::try_from(self.apply_committed_write(
-                GroupWriteCommand::Stream(StreamCommand::PurgeBucket { bucket_id }),
-                placement,
-            )?)
+            PurgeBucketResponse::try_from(
+                self.apply_committed_write(StreamCommand::PurgeBucket { bucket_id }, placement)?,
+            )
         })
     }
 
@@ -1849,10 +1840,9 @@ impl GroupEngine for InMemoryGroupEngine {
         placement: ShardPlacement,
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async move {
-            AckColdGcResponse::try_from(self.apply_committed_write(
-                GroupWriteCommand::Stream(StreamCommand::AckColdGc { up_to_seq }),
-                placement,
-            )?)
+            AckColdGcResponse::try_from(
+                self.apply_committed_write(StreamCommand::AckColdGc { up_to_seq }, placement)?,
+            )
         })
     }
 
@@ -1864,7 +1854,7 @@ impl GroupEngine for InMemoryGroupEngine {
     ) -> GroupDeferColdGcFuture<'a> {
         Box::pin(async move {
             DeferColdGcResponse::try_from(self.apply_committed_write(
-                GroupWriteCommand::Stream(StreamCommand::DeferColdGc { seq, not_before_ms }),
+                StreamCommand::DeferColdGc { seq, not_before_ms },
                 placement,
             )?)
         })
@@ -1944,7 +1934,7 @@ impl GroupEngine for InMemoryGroupEngine {
         }
         Box::pin(async move {
             self.ensure_stream_access(&request.stream_id, request.now_ms, false, placement)?;
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             AppendResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
@@ -1959,7 +1949,7 @@ impl GroupEngine for InMemoryGroupEngine {
             // F5: commit first, index after. Apply keeps the locator in
             // state; the offload pass writes the page entry once the append
             // committed.
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             AppendResponse::try_from(self.apply_committed_write(command, placement)?)
         })
     }
@@ -2004,7 +1994,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 }
                 index_rollback = Some((store, rollback, request.stream_id.clone()));
             }
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             let result = self
                 .apply_committed_write(command, placement)
                 .and_then(FlushColdResponse::try_from);
@@ -2068,7 +2058,7 @@ impl GroupEngine for InMemoryGroupEngine {
                 };
                 index_rollback = Some((store, rollback, request.stream_id.clone()));
             }
-            let command = GroupWriteCommand::from(request);
+            let command = StreamCommand::from(request);
             let result = self
                 .apply_committed_write(command, placement)
                 .and_then(CompactColdResponse::try_from);
