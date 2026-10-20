@@ -410,9 +410,10 @@ fn check_step(
         }
         MembershipStep::TransferLeadership { to } => {
             ensure(*to != me && leader.handoff_ready.contains(to), || {
-                format!("R8: transfer to {to}, not ready")
+                format!("handoff: transfer to {to}, not ready")
             })?;
-            // R8: the smallest ready voter of the side it hands off to.
+            // The handoff goes to the smallest ready voter of the side it
+            // hands off to: an exit side (R11) or the staying voters (R9).
             let pool: Vec<BTreeSet<NodeId>> = match config {
                 MembershipConfig::Joint { old, new, .. } => [old, new]
                     .into_iter()
@@ -433,7 +434,7 @@ fn check_step(
                         .find(|node| *node != me && leader.handoff_ready.contains(node))
                         == Some(*to)
                 }),
-                || format!("R8: transfer to {to} is not the smallest ready voter"),
+                || format!("handoff: transfer to {to} is not the smallest ready voter"),
             )
         }
         MembershipStep::ConfirmView => ensure(leader.view == ViewFreshness::Unconfirmed, || {

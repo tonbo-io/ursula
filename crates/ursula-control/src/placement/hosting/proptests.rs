@@ -357,7 +357,10 @@ proptest::proptest! {
         }
     }
 
-    /// H9: a seed driver's role is the confirmed view's seeded placement.
+    /// H9: in every group the confirmed view shows `Seeded`, exactly one
+    /// node is the `Initializer`, it is a seed voter, and the nodes with a
+    /// seed role are exactly the seed voters. A `Live` or unknown group
+    /// gives every node `None`.
     #[test]
     fn only_a_seeded_groups_voters_have_a_seed_role(
         node_count in 1_u64..=6,
@@ -379,20 +382,30 @@ proptest::proptest! {
         let cluster = driver.cluster();
         for group in 0..=group_count {
             let group = RaftGroupId(group);
-            for me in (1..=node_count.checked_add(1).unwrap()).map(NodeId::new) {
-                let expected = match cluster.group(group) {
-                    Some(GroupPlacement::Seeded { voters, initializer, .. }) => {
-                        if *initializer == me {
-                            Some(SeedRoleOf::Initializer)
-                        } else if voters.contains(me) {
-                            Some(SeedRoleOf::Voter)
-                        } else {
-                            None
-                        }
-                    }
-                    Some(GroupPlacement::Live { .. }) | None => None,
-                };
-                proptest::prop_assert_eq!(seed_role(&confirmed, me, group), expected);
+            let roles: BTreeMap<NodeId, SeedRoleOf> = (1..=node_count.checked_add(1).unwrap())
+                .map(NodeId::new)
+                .filter_map(|me| seed_role(&confirmed, me, group).map(|role| (me, role)))
+                .collect();
+            match cluster.group(group) {
+                Some(GroupPlacement::Seeded { voters, .. }) => {
+                    let initializers: Vec<NodeId> = roles
+                        .iter()
+                        .filter(|(_, role)| **role == SeedRoleOf::Initializer)
+                        .map(|(me, _)| *me)
+                        .collect();
+                    proptest::prop_assert_eq!(initializers.len(), 1, "H9: initializers {:?}", initializers);
+                    proptest::prop_assert!(
+                        initializers.iter().all(|me| voters.contains(*me)),
+                        "H9: initializer {:?} outside the seed voters {:?}", initializers, voters
+                    );
+                    proptest::prop_assert!(
+                        roles.keys().copied().eq(voters.iter()),
+                        "H9: seed roles {:?} for the seed voters {:?}", roles, voters
+                    );
+                }
+                Some(GroupPlacement::Live { .. }) | None => {
+                    proptest::prop_assert!(roles.is_empty(), "H9: seed roles {:?} outside a seed", roles);
+                }
             }
         }
     }

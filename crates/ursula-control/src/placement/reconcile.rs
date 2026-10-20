@@ -89,13 +89,14 @@ impl MembershipConfig {
         }
     }
 
-    /// Whether `node` is a voter of a config.
-    pub fn is_voter(&self, node: NodeId) -> bool {
+    /// Whether `node` is a voter of a config. Outside the crate
+    /// [`membership_answer`] is the one classifier.
+    pub(crate) fn is_voter(&self, node: NodeId) -> bool {
         self.voter_configs().any(|voters| voters.contains(node))
     }
 
     /// Whether `node` is a voter or a learner.
-    pub fn is_member(&self, node: NodeId) -> bool {
+    pub(crate) fn is_member(&self, node: NodeId) -> bool {
         self.is_voter(node) || self.learners().contains(&node)
     }
 
