@@ -219,7 +219,7 @@ mod tests {
     fn the_largest_bootstrapped_cluster_is_far_within_the_bound() {
         let nodes = [1, 2, 3, 4, 5];
         let mut control = ControlPlaneState::default();
-        let mut index = 0;
+        let mut index = 0_u64;
         let mut at = || {
             index = index.saturating_add(1);
             samples::meta(1, index)

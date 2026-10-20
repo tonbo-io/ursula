@@ -61,6 +61,18 @@ pub enum MetaCommand {
     Control(ControlCommand),
 }
 
+/// The command's name in logs.
+impl std::fmt::Display for MetaCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NewHistory { history, cause, .. } => {
+                write!(f, "meta_new_history:{history:#x}:{cause:?}")
+            }
+            Self::Control(command) => write!(f, "meta_control:{command:?}"),
+        }
+    }
+}
+
 /// The meta group's state machine value, which its snapshot holds whole.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct MetaState {

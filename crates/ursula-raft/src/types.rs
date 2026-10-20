@@ -67,6 +67,16 @@ impl RaftCommand {
     }
 }
 
+/// The command's name in logs, as OpenRaft requires of an entry payload.
+impl std::fmt::Display for RaftCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stream(command) => std::fmt::Display::fmt(command, f),
+            Self::Meta(command) => std::fmt::Display::fmt(command, f),
+        }
+    }
+}
+
 impl From<StreamCommand> for RaftCommand {
     fn from(command: StreamCommand) -> Self {
         Self::Stream(command)
