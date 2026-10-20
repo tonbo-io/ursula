@@ -16,7 +16,8 @@
 //! ([`crate::msgpack`]) for everything Ursula writes as MessagePack. Epoch 6
 //! is the format of Ursula 0.10: a run state with one record per journal
 //! class, and a log generation on every Raft WAL journal record, core
-//! metadata entry and group snapshot record. A binary
+//! metadata entry and group snapshot record. The meta group's formats extend
+//! this list as they land (#768). A binary
 //! reads exactly one epoch: it refuses data and peers from any other epoch
 //! loudly, before it writes anything, and it does not convert them.
 //!
@@ -70,12 +71,16 @@ pub const BACKUP_FORMAT_VERSION: u32 = 5;
 const _: () = assert!(BACKUP_FORMAT_VERSION <= FORMAT_EPOCH);
 
 /// The text of every refusal of data of another format epoch:
-/// `{subject} {found}`, the epoch this binary reads, and that nothing converts
-/// between epochs. Messages name epochs, never the binary's own crate version.
+/// `{subject} {found}`, the epoch this binary reads, that nothing converts
+/// between epochs, and how data moves instead: by backup and restore when
+/// its backup format is this binary's, as epoch-5 data's is, and otherwise
+/// by export and re-import. Messages name epochs, never the binary's own
+/// crate version.
 pub fn format_epoch_refusal(subject: &str, found: &str) -> String {
     format!(
         "{subject} {found}; this binary reads format epoch {FORMAT_EPOCH} only and does not \
-         convert other epochs (move data by export and re-import)"
+         convert other epochs (move data by `ursulactl` backup and restore when its backup \
+         format is {BACKUP_FORMAT_VERSION}, otherwise by export and re-import)"
     )
 }
 
