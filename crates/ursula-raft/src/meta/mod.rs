@@ -15,9 +15,12 @@
 //!
 //! Module map:
 //!
+//! - [`genesis`]: the genesis probe a node sends before the meta group
+//!   forms, and its answer.
 //! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, and
 //!   the bound on its size.
 
+pub mod genesis;
 pub mod snapshot;
 
 use std::num::NonZeroU64;
