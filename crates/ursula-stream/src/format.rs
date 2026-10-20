@@ -21,10 +21,14 @@
 //! entries keep their epoch-5 bytes); the placement kernel's state, commands
 //! and answers, and the meta group's state, history event and inline
 //! snapshot record; a plane and a target node on every Raft request, the
-//! refusal of a request for another node, barrier answers that carry the
-//! leader's memberships, and the genesis probe RPC; and the group engine
-//! error without its static-membership variant and with a not-held WAL
-//! open, a control answer kind and a command of the other plane (#768). A
+//! plane of an `AppendStream` in its `ursula-raft-plane` metadata, the
+//! refusal of a request for another node and the refusing node of a refused
+//! `AppendStream` item (`RaftAppendStreamError.refusing_node`), barrier
+//! answers that carry the leader's memberships, and the genesis probe RPC;
+//! and the group engine error without its static-membership variant, with a
+//! not-held WAL open, a control answer kind and a command of the other
+//! plane, and with the closed `ApplyStopKind` in `ApplyStopped`, which no
+//! longer decodes the unknown kind epoch 5 accepted (#768). A
 //! binary reads exactly one epoch: it refuses data and peers from any other
 //! epoch loudly, before it writes anything, and it does not convert them.
 //!
