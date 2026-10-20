@@ -1,13 +1,16 @@
 //! The node's run state, and how the journals open after the run before.
 //!
 //! The run-state file at the WAL root records the run that last opened the
-//! journals: the host's boot id at the time, the run's fsync policy, and how
-//! the run ended ([`RunStatus`]). A run reads it first, decides how to read
-//! the journals ([`WalOpening::decide`], the "Startup and replay"
-//! table in docs/architecture/raft-wal.md), and durably records itself as [`RunStatus::Running`] before any
-//! journal write. A graceful shutdown records [`RunStatus::Clean`] after every
-//! journal is `fsync`ed; an I/O failure that poisons a journal writer records
-//! [`RunStatus::Poisoned`] before the process stops.
+//! journals: the host's boot id at the time, how the run ended
+//! ([`RunStatus`]), and for each class of journal ([`JournalClass`]) the
+//! fsync policy it ran and its recovery epoch ([`JournalRun`]). A run reads
+//! it first, decides how to read each class's journals
+//! ([`WalOpening::decide`], the "Startup and replay" table in
+//! docs/architecture/raft-wal.md), and durably records itself as
+//! [`RunStatus::Running`] before any journal write. A graceful shutdown
+//! records [`RunStatus::Clean`] after every journal is `fsync`ed; an I/O
+//! failure that poisons a journal writer records [`RunStatus::Poisoned`]
+//! before the process stops.
 //!
 //! Cores open their journals lazily, so a run can end before it has read
 //! every journal the run before it left. The run state therefore also counts
@@ -27,6 +30,15 @@
 //! after a `never` run whose process stopped on this boot therefore first
 //! `fsync`s every journal ([`JournalSync`]): that run acknowledged writes the
 //! page cache still holds but the disk may not.
+//!
+//! The rule is kept per journal class, since the classes run different
+//! policies: the data journals (`core-*`) run the configured one, and the
+//! meta journal always runs `always`. Each class opens by its own record,
+//! through the same decision table, over the node-wide status and boot id:
+//! a host crash under a data policy of `never` gives the data journals a
+//! verified prefix and a new epoch, and leaves the meta journal strict with
+//! its epoch unmoved. No meta journal is written yet: the meta class is
+//! decided and recorded on every start, and it has no journal to open.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -58,6 +70,8 @@ pub const RUN_STATE_FILE: &str = "run-state.bin";
 const WAL_LOCK_FILE: &str = "wal.lock";
 /// The directory of core `N` under the WAL root is `core-N`.
 const CORE_DIR_PREFIX: &str = "core-";
+/// The meta journal's policy, whatever the data journals run.
+const META_FSYNC: WalFsync = WalFsync::Always;
 
 /// The journal directory of core `core` under the WAL `root`.
 pub(crate) fn core_dir(root: &Path, core: u16) -> PathBuf {
@@ -92,18 +106,62 @@ pub enum RunStatus {
     Poisoned,
 }
 
+/// A class of journal under a WAL root. Each opens by its own record in the
+/// run state ([`RunState::journal`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalClass {
+    /// The core journals (`core-*`), which hold the data groups' logs and
+    /// run the configured fsync policy.
+    Data,
+    /// The meta group's journal, which always runs `fsync = always`. No
+    /// meta journal is written yet: the class is decided and recorded, and
+    /// has no journal to open.
+    Meta,
+}
+
+impl std::fmt::Display for JournalClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Data => "data",
+            Self::Meta => "meta",
+        })
+    }
+}
+
+/// What the run state records for one class of journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalRun {
+    /// The fsync policy the class's journals run.
+    pub fsync: WalFsync,
+    /// Runs on this WAL root that read this class's journals as a verified
+    /// prefix, including this one: after a host crash under this class's
+    /// policy of `never`, after a lost run state, or after an I/O failure.
+    /// The run status is node-wide, so an I/O failure of any journal
+    /// advances every class's epoch.
+    pub recovery_epoch: u64,
+}
+
 /// The run-state file's contents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunState {
     /// The host's boot when the run started; `None` where the platform
     /// reports none.
     pub boot_id: Option<BootId>,
-    /// The run's fsync policy.
-    pub fsync: WalFsync,
     pub status: RunStatus,
-    /// Runs that started after a host crash or an I/O failure on this WAL
-    /// root, including this one.
-    pub recovery_epoch: u64,
+    /// The data journals' policy and epoch.
+    pub data: JournalRun,
+    /// The meta journal's policy, always `always`, and epoch.
+    pub meta: JournalRun,
+}
+
+impl RunState {
+    /// What this run state records for the journals of `class`.
+    pub fn journal(&self, class: JournalClass) -> &JournalRun {
+        match class {
+            JournalClass::Data => &self.data,
+            JournalClass::Meta => &self.meta,
+        }
+    }
 }
 
 /// Whether the core journals under a WAL root hold records.
@@ -140,7 +198,8 @@ pub enum PreviousRun {
     ProcessCrash,
     /// The previous run did not shut down cleanly and the boot id changed, or
     /// is unknown: the host crashed and writeback may have left holes in what
-    /// the run wrote without `fsync`.
+    /// the run wrote without `fsync`. `fsync` is the policy the class's
+    /// journals ran.
     HostCrash { fsync: WalFsync },
     /// An I/O error stopped the previous run.
     Poisoned,
@@ -200,10 +259,11 @@ pub struct WalOpening {
 }
 
 impl PreviousRun {
-    /// Reads `previous`, the run state the previous run left, given what
-    /// the core `journals` hold and the current `boot_id`.
+    /// Reads `previous`, the run state the previous run left, for the
+    /// journals of `class`, given what they hold and the current `boot_id`.
     pub fn interpret(
         previous: Option<&RunState>,
+        class: JournalClass,
         journals: JournalHistory,
         boot_id: Option<&BootId>,
     ) -> Self {
@@ -221,7 +281,7 @@ impl PreviousRun {
             RunStatus::Running => match (previous.boot_id.as_ref(), boot_id) {
                 (Some(before), Some(now)) if before == now => Self::ProcessCrash,
                 _ => Self::HostCrash {
-                    fsync: previous.fsync,
+                    fsync: previous.journal(class).fsync,
                 },
             },
         }
@@ -272,19 +332,21 @@ impl PreviousRun {
 }
 
 impl WalOpening {
-    /// The "Startup and replay" decision for a run on `boot_id` with the
-    /// policy `fsync`, after the run that left `previous` and the core
-    /// `journals`.
+    /// The "Startup and replay" decision for the journals of `class` in a
+    /// run on `boot_id` that runs them with the policy `fsync`, after the
+    /// run that left `previous` and what those `journals` hold.
     pub fn decide(
         previous: Option<&RunState>,
+        class: JournalClass,
         journals: JournalHistory,
         boot_id: Option<&BootId>,
         fsync: WalFsync,
     ) -> Result<Self, RaftWalError> {
-        let previous_run = PreviousRun::interpret(previous, journals, boot_id);
+        let previous_run = PreviousRun::interpret(previous, class, journals, boot_id);
         let replay_mode = previous_run.replay_mode();
-        let prior_epoch = previous
-            .map_or(0, |previous| previous.recovery_epoch)
+        let recorded = previous.map(|previous| *previous.journal(class));
+        let prior_epoch = recorded
+            .map_or(0, |recorded| recorded.recovery_epoch)
             .max(journals.verified_epoch());
         let recovery_epoch = match replay_mode {
             JournalReplayMode::Strict => prior_epoch,
@@ -292,11 +354,12 @@ impl WalOpening {
                 prior_epoch
                     .checked_add(1)
                     .ok_or(RaftWalError::RecoveryEpochExhausted {
+                        class,
                         recovery_epoch: prior_epoch,
                     })?
             }
         };
-        let journal_sync = match (previous_run, previous.map(|previous| previous.fsync), fsync) {
+        let journal_sync = match (previous_run, recorded.map(|recorded| recorded.fsync), fsync) {
             (PreviousRun::ProcessCrash, Some(WalFsync::Never), WalFsync::Always) => {
                 JournalSync::BeforeRecording
             }
@@ -312,8 +375,9 @@ impl WalOpening {
     }
 }
 
-/// How a core journal is read: in [`JournalReplayMode::VerifiedPrefix`] when
-/// it has not been read back since the current recovery epoch began.
+/// How a journal is read: in [`JournalReplayMode::VerifiedPrefix`] when it
+/// has not been read back since its class's current recovery epoch began.
+/// `recovery_epoch` is the epoch of the journal's own class.
 pub(crate) fn core_replay_mode(verified_epoch: u64, recovery_epoch: u64) -> JournalReplayMode {
     if verified_epoch < recovery_epoch {
         JournalReplayMode::VerifiedPrefix
@@ -384,8 +448,11 @@ pub enum RaftWalError {
     ReadRunState(#[source] StateFileError),
     #[error("read core metadata while recovering epochs: {0}")]
     ReadCoreMetadata(#[source] StateFileError),
-    #[error("Raft WAL recovery epoch {recovery_epoch} cannot advance")]
-    RecoveryEpochExhausted { recovery_epoch: u64 },
+    #[error("Raft WAL recovery epoch {recovery_epoch} of the {class} journals cannot advance")]
+    RecoveryEpochExhausted {
+        class: JournalClass,
+        recovery_epoch: u64,
+    },
     #[error("list the core journals under '{}': {source}", .root.display())]
     ListCores {
         root: PathBuf,
@@ -482,7 +549,10 @@ impl RunStateFile {
 pub(crate) struct NodeWal {
     root: PathBuf,
     cluster_id: ursula_headers::ClusterId,
+    /// How the data journals open.
     opening: WalOpening,
+    /// How the meta journal opens.
+    meta_opening: WalOpening,
     run_state: Arc<RunStateFile>,
     /// Keeps a second process off the root, so two runs never interleave
     /// their run-state writes. Released by a clean shutdown, or when the
@@ -492,8 +562,9 @@ pub(crate) struct NodeWal {
 
 impl NodeWal {
     /// Starts a run on the WAL under `root`: takes its lock, reads the run
-    /// state the previous run left, decides how to open the journals, and
-    /// durably records this run before any journal write.
+    /// state the previous run left, decides how each class of journal opens,
+    /// and durably records this run before any journal write. `fsync` is the
+    /// data journals' policy.
     pub(crate) fn start(
         root: PathBuf,
         fsync: WalFsync,
@@ -530,8 +601,34 @@ impl NodeWal {
         )?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
-        let opening = WalOpening::decide(previous.as_ref(), journals, boot_id.as_ref(), fsync)?;
-        log_opening(&root, previous.as_ref(), boot_id.as_ref(), fsync, &opening);
+        let opening = WalOpening::decide(
+            previous.as_ref(),
+            JournalClass::Data,
+            journals,
+            boot_id.as_ref(),
+            fsync,
+        )?;
+        // No meta journal is written yet, so the meta class holds no history
+        // and has nothing to mark or sync. Its policy never rises, so it
+        // never syncs first.
+        let meta_opening = WalOpening::decide(
+            previous.as_ref(),
+            JournalClass::Meta,
+            JournalHistory::Empty { verified_epoch: 0 },
+            boot_id.as_ref(),
+            META_FSYNC,
+        )?;
+        log_opening(
+            &root,
+            previous.as_ref(),
+            boot_id.as_ref(),
+            JournalClass::Data,
+            fsync,
+            &opening,
+        );
+        // The meta class's opening is not logged while no meta journal
+        // exists: its recovery warning would describe a log this node does
+        // not have. S1(d), which opens the meta journal, logs it again.
         // Before this run records itself, so a crash in between marks the
         // cores again on the next start.
         if let RecoveryState::Recovering { .. } = opening.recovery {
@@ -553,9 +650,15 @@ impl NodeWal {
         }
         let run_state = RunStateFile::new(path, RunState {
             boot_id,
-            fsync,
             status: RunStatus::Running,
-            recovery_epoch: opening.recovery_epoch,
+            data: JournalRun {
+                fsync,
+                recovery_epoch: opening.recovery_epoch,
+            },
+            meta: JournalRun {
+                fsync: META_FSYNC,
+                recovery_epoch: meta_opening.recovery_epoch,
+            },
         });
         run_state
             .record(RunStatus::Running, "running")
@@ -564,6 +667,7 @@ impl NodeWal {
             root,
             cluster_id,
             opening,
+            meta_opening,
             run_state: Arc::new(run_state),
             lock: Mutex::new(Some(lock)),
         })
@@ -577,12 +681,19 @@ impl NodeWal {
         &self.cluster_id
     }
 
+    /// The data journals' fsync policy.
     pub(crate) fn fsync(&self) -> WalFsync {
-        self.run_state.current().fsync
+        self.run_state.current().data.fsync
     }
 
+    /// How the data journals open.
     pub(crate) fn opening(&self) -> WalOpening {
         self.opening
+    }
+
+    /// How the meta journal opens.
+    pub(crate) fn meta_opening(&self) -> WalOpening {
+        self.meta_opening
     }
 
     pub(crate) fn run_state(&self) -> &Arc<RunStateFile> {
@@ -603,6 +714,32 @@ impl NodeWal {
         );
         Ok(())
     }
+}
+
+/// A run-state file with distinct values in the fields of one type, for the
+/// persisted-envelopes fixture. It decodes to the run state it was encoded
+/// from and re-encodes to the same bytes.
+#[cfg(test)]
+pub(crate) fn sample_file() -> Vec<u8> {
+    let state = RunState {
+        boot_id: Some(BootId::new("0b3f5c1e-9d2a-4e7b-8c61-a1b2c3d4e5f6")),
+        status: RunStatus::Poisoned,
+        data: JournalRun {
+            fsync: WalFsync::Never,
+            recovery_epoch: 4,
+        },
+        meta: JournalRun {
+            fsync: WalFsync::Always,
+            recovery_epoch: 2,
+        },
+    };
+    let bytes = state_file::encode(StateFileKind::RunState, &state);
+    let decoded: RunState =
+        state_file::decode(StateFileKind::RunState, Path::new(RUN_STATE_FILE), &bytes)
+            .expect("the sample decodes");
+    assert_eq!(decoded, state);
+    assert_eq!(state_file::encode(StateFileKind::RunState, &decoded), bytes);
+    bytes
 }
 
 /// The core directories under the WAL `root`, in name order.
@@ -647,15 +784,17 @@ fn log_opening(
     root: &Path,
     previous: Option<&RunState>,
     boot_id: Option<&BootId>,
+    class: JournalClass,
     fsync: WalFsync,
     opening: &WalOpening,
 ) {
     tracing::info!(
         root = %root.display(),
+        ?class,
         ?fsync,
         boot_id = boot_id.map(BootId::as_str),
         previous_boot_id = previous.and_then(|previous| previous.boot_id.as_ref()).map(BootId::as_str),
-        previous_fsync = ?previous.map(|previous| previous.fsync),
+        previous_fsync = ?previous.map(|previous| previous.journal(class).fsync),
         previous_run = ?opening.previous_run,
         replay_mode = ?opening.replay_mode,
         recovery_epoch = opening.recovery_epoch,
@@ -664,6 +803,7 @@ fn log_opening(
     if let RecoveryState::Recovering { reason } = opening.recovery {
         tracing::warn!(
             root = %root.display(),
+            ?class,
             ?reason,
             previous_run = ?opening.previous_run,
             "this node's Raft logs may be missing entries it acknowledged"
@@ -672,6 +812,7 @@ fn log_opening(
     if opening.journal_sync == JournalSync::BeforeRecording {
         tracing::info!(
             root = %root.display(),
+            ?class,
             "the previous run acknowledged writes under fsync = never and its process stopped; \
              syncing every journal before this run records fsync = always"
         );
@@ -683,8 +824,10 @@ mod tests {
     use ursula_config::WalFsync;
 
     use super::BootId;
+    use super::JournalClass;
     use super::JournalHistory;
     use super::JournalReplayMode;
+    use super::JournalRun;
     use super::JournalSync;
     use super::PreviousRun;
     use super::RecoveryReason;
@@ -698,29 +841,29 @@ mod tests {
         BootId::new(id)
     }
 
-    /// Golden bytes: the run-state file is part of the epoch-5 format, so
-    /// its encoding never changes within it.
+    /// A run records the run state as the persisted-envelopes fixture's
+    /// sample holds it ([`super::sample_file`]).
     #[cfg(not(madsim))]
     #[test]
-    fn a_run_state_matches_the_golden_file() {
-        const GOLDEN: &str = "5552535752554e00050000003800000094d92430623366356331652d396432612d346537622d386336312d613162326333643465356636a6616c77617973a8706f69736f6e656404ca36781a";
+    fn a_recorded_run_state_is_the_fixture_sample() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join(super::RUN_STATE_FILE);
         let current = RunState {
             boot_id: Some(boot("0b3f5c1e-9d2a-4e7b-8c61-a1b2c3d4e5f6")),
-            fsync: WalFsync::Always,
             status: RunStatus::Running,
-            recovery_epoch: 4,
+            data: JournalRun {
+                fsync: WalFsync::Never,
+                recovery_epoch: 4,
+            },
+            meta: JournalRun {
+                fsync: WalFsync::Always,
+                recovery_epoch: 2,
+            },
         };
         super::RunStateFile::new(path.clone(), current.clone())
-            .record(RunStatus::Poisoned, "golden")
+            .record(RunStatus::Poisoned, "sample")
             .expect("record");
-        let bytes = std::fs::read(&path).expect("read");
-        let hex = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(hex, GOLDEN);
+        assert_eq!(std::fs::read(&path).expect("read"), super::sample_file());
         let read = super::state_file::read::<RunState>(super::StateFileKind::RunState, &path)
             .expect("read")
             .expect("a run state");
@@ -730,13 +873,31 @@ mod tests {
         });
     }
 
+    /// A previous run whose data journals ran `fsync` in epoch 4, and whose
+    /// meta journal ran `always` in epoch 2.
     fn previous(boot_id: Option<&str>, fsync: WalFsync, status: RunStatus) -> RunState {
         RunState {
             boot_id: boot_id.map(boot),
-            fsync,
             status,
-            recovery_epoch: 4,
+            data: JournalRun {
+                fsync,
+                recovery_epoch: 4,
+            },
+            meta: JournalRun {
+                fsync: WalFsync::Always,
+                recovery_epoch: 2,
+            },
         }
+    }
+
+    /// The data decision, as the core journals take it.
+    fn decide_data(
+        previous: Option<&RunState>,
+        journals: JournalHistory,
+        boot_id: Option<&BootId>,
+        fsync: WalFsync,
+    ) -> Result<WalOpening, super::RaftWalError> {
+        WalOpening::decide(previous, JournalClass::Data, journals, boot_id, fsync)
     }
 
     /// The previous run's state, what the journals hold, the current boot
@@ -903,12 +1064,12 @@ mod tests {
             // The same policy as the previous run: nothing to sync first.
             let fsync = previous
                 .as_ref()
-                .map_or(WalFsync::Never, |previous| previous.fsync);
-            let opening = WalOpening::decide(previous.as_ref(), *journals, boot_id.as_ref(), fsync)
+                .map_or(WalFsync::Never, |previous| previous.data.fsync);
+            let opening = decide_data(previous.as_ref(), *journals, boot_id.as_ref(), fsync)
                 .expect("valid recovery epoch");
             let prior_epoch = previous
                 .as_ref()
-                .map_or(0, |previous| previous.recovery_epoch);
+                .map_or(0, |previous| previous.data.recovery_epoch);
             let recovery_epoch = match replay_mode {
                 JournalReplayMode::Strict => prior_epoch,
                 JournalReplayMode::VerifiedPrefix => {
@@ -927,6 +1088,98 @@ mod tests {
                 "previous {previous:?}, journals {journals:?}, boot {boot_id:?}"
             );
         }
+    }
+
+    /// Each class of journal opens by its own record through the same
+    /// table, over the node-wide status and boot id: a host crash under a
+    /// data policy of `never` opens the data journals as a verified prefix
+    /// in a new epoch and leaves the meta journal strict, `Normal` and in
+    /// its own epoch, while a poisoned or unrecorded run moves both.
+    #[test]
+    fn each_journal_class_opens_by_its_own_record() {
+        use RunStatus::Clean;
+        use RunStatus::Poisoned;
+        use RunStatus::Running;
+        use WalFsync::Always;
+        use WalFsync::Never;
+
+        let meta = |previous: Option<&RunState>, journals, boot_id: Option<&str>| {
+            WalOpening::decide(
+                previous,
+                JournalClass::Meta,
+                journals,
+                boot_id.map(boot).as_ref(),
+                Always,
+            )
+            .expect("valid recovery epoch")
+        };
+        const RECORDS: JournalHistory = JournalHistory::Records { verified_epoch: 0 };
+
+        // A host crash under `never`: the data journals recover, meta does not.
+        let crashed = previous(Some("a"), Never, Running);
+        let data = decide_data(Some(&crashed), RECORDS, Some(&boot("b")), Never)
+            .expect("valid recovery epoch");
+        assert_eq!(data.previous_run, PreviousRun::HostCrash { fsync: Never });
+        assert_eq!((data.replay_mode, data.recovery), (PREFIX, HOST_CRASH));
+        assert_eq!(data.recovery_epoch, 5);
+        let opened = meta(Some(&crashed), RECORDS, Some("b"));
+        assert_eq!(opened, WalOpening {
+            previous_run: PreviousRun::HostCrash { fsync: Always },
+            replay_mode: STRICT,
+            recovery: NORMAL,
+            recovery_epoch: 2,
+            journal_sync: JournalSync::NotNeeded,
+        });
+
+        // A host crash under `always` moves neither.
+        let crashed = previous(Some("a"), Always, Running);
+        let data = decide_data(Some(&crashed), RECORDS, Some(&boot("b")), Always)
+            .expect("valid recovery epoch");
+        assert_eq!((data.replay_mode, data.recovery_epoch), (STRICT, 4));
+        assert_eq!(meta(Some(&crashed), RECORDS, Some("b")).recovery_epoch, 2);
+
+        // An I/O failure is node-wide: both classes start a new epoch.
+        let poisoned = previous(Some("a"), Never, Poisoned);
+        let data = decide_data(Some(&poisoned), RECORDS, Some(&boot("a")), Never)
+            .expect("valid recovery epoch");
+        assert_eq!((data.replay_mode, data.recovery_epoch), (PREFIX, 5));
+        let opened = meta(Some(&poisoned), RECORDS, Some("a"));
+        assert_eq!(
+            (opened.previous_run, opened.replay_mode),
+            (PreviousRun::Poisoned, PREFIX)
+        );
+        assert_eq!((opened.recovery, opened.recovery_epoch), (POISONED, 3));
+
+        // A lost run state: a class with history recovers past its own
+        // surviving epoch, a class without history opens as new.
+        let opened = meta(
+            None,
+            JournalHistory::Records { verified_epoch: 6 },
+            Some("b"),
+        );
+        assert_eq!(
+            (opened.previous_run, opened.recovery),
+            (PreviousRun::Unrecorded, UNKNOWN_HISTORY)
+        );
+        assert_eq!(opened.recovery_epoch, 7);
+        let opened = meta(None, JournalHistory::Empty { verified_epoch: 0 }, Some("b"));
+        assert_eq!(
+            (opened.previous_run, opened.recovery_epoch),
+            (PreviousRun::Absent, 0)
+        );
+
+        // Meta always records `always`, so it never syncs first, while the
+        // data journals do when their policy rises after a process crash.
+        let stopped = previous(Some("a"), Never, Running);
+        let data = decide_data(Some(&stopped), RECORDS, Some(&boot("a")), Always)
+            .expect("valid recovery epoch");
+        assert_eq!(data.journal_sync, JournalSync::BeforeRecording);
+        assert_eq!(
+            meta(Some(&stopped), RECORDS, Some("a")).journal_sync,
+            JournalSync::NotNeeded
+        );
+        let clean = previous(Some("a"), Never, Clean);
+        assert_eq!(meta(Some(&clean), RECORDS, Some("b")).recovery_epoch, 2);
     }
 
     /// A run that records `always` `fsync`s the journals first exactly when
@@ -989,7 +1242,7 @@ mod tests {
         ];
         for (previous, boot_id, fsync, sync) in cases {
             let boot_id = boot_id.map(boot);
-            let opening = WalOpening::decide(
+            let opening = decide_data(
                 previous.as_ref(),
                 JournalHistory::Records { verified_epoch: 0 },
                 boot_id.as_ref(),
@@ -1015,7 +1268,7 @@ mod tests {
                 JournalHistory::Records { verified_epoch: 7 },
                 JournalHistory::Empty { verified_epoch: 7 },
             ] {
-                let opening = WalOpening::decide(None, journals, Some(&boot("b")), fsync)
+                let opening = decide_data(None, journals, Some(&boot("b")), fsync)
                     .expect("epoch can advance");
                 assert_eq!(opening.previous_run, PreviousRun::Unrecorded);
                 assert_eq!(opening.recovery, UNKNOWN_HISTORY);
@@ -1023,7 +1276,7 @@ mod tests {
                 assert_eq!(opening.recovery_epoch, 8);
                 assert_eq!(core_replay_mode(7, opening.recovery_epoch), PREFIX);
             }
-            let fresh = WalOpening::decide(
+            let fresh = decide_data(
                 None,
                 JournalHistory::Empty { verified_epoch: 0 },
                 Some(&boot("b")),
@@ -1040,11 +1293,9 @@ mod tests {
     fn epoch_floor_is_the_maximum_of_recorded_and_surviving_history() {
         for (recorded, surviving) in [(4, 7), (9, 2)] {
             for status in [RunStatus::Clean, RunStatus::Poisoned] {
-                let prior = RunState {
-                    recovery_epoch: recorded,
-                    ..previous(Some("a"), WalFsync::Never, status)
-                };
-                let opening = WalOpening::decide(
+                let mut prior = previous(Some("a"), WalFsync::Never, status);
+                prior.data.recovery_epoch = recorded;
+                let opening = decide_data(
                     Some(&prior),
                     JournalHistory::Records {
                         verified_epoch: surviving,
@@ -1078,25 +1329,43 @@ mod tests {
                 },
             ] {
                 assert!(matches!(
-                    WalOpening::decide(None, journals, Some(&boot("b")), fsync),
+                    decide_data(None, journals, Some(&boot("b")), fsync),
                     Err(super::RaftWalError::RecoveryEpochExhausted {
+                        class: JournalClass::Data,
                         recovery_epoch: u64::MAX
                     })
                 ));
             }
-            let mut prior = RunState {
-                recovery_epoch: u64::MAX,
-                ..previous(Some("a"), fsync, RunStatus::Poisoned)
-            };
+            let mut prior = previous(Some("a"), fsync, RunStatus::Poisoned);
+            prior.data.recovery_epoch = u64::MAX;
             let journals = JournalHistory::Records { verified_epoch: 0 };
             assert!(matches!(
-                WalOpening::decide(Some(&prior), journals, Some(&boot("a")), fsync),
+                decide_data(Some(&prior), journals, Some(&boot("a")), fsync),
                 Err(super::RaftWalError::RecoveryEpochExhausted {
+                    class: JournalClass::Data,
+                    recovery_epoch: u64::MAX
+                })
+            ));
+            // The meta class's own epoch exhausts on its own decision, which
+            // names it.
+            let mut meta_prior = previous(Some("a"), fsync, RunStatus::Poisoned);
+            meta_prior.meta.recovery_epoch = u64::MAX;
+            let meta = WalOpening::decide(
+                Some(&meta_prior),
+                JournalClass::Meta,
+                JournalHistory::Empty { verified_epoch: 0 },
+                Some(&boot("a")),
+                WalFsync::Always,
+            );
+            assert!(matches!(
+                meta,
+                Err(super::RaftWalError::RecoveryEpochExhausted {
+                    class: JournalClass::Meta,
                     recovery_epoch: u64::MAX
                 })
             ));
             prior.status = RunStatus::Clean;
-            let clean = WalOpening::decide(Some(&prior), journals, Some(&boot("a")), fsync)
+            let clean = decide_data(Some(&prior), journals, Some(&boot("a")), fsync)
                 .expect("strict recovery does not advance the epoch");
             assert_eq!(clean.recovery_epoch, u64::MAX);
             assert_eq!(clean.replay_mode, STRICT);
@@ -1117,7 +1386,7 @@ mod tests {
         // A host crash starts epoch 5; a process crash right after it, before
         // a core was read, keeps epoch 5, so that core still reads its prefix.
         let crashed = previous(Some("a"), WalFsync::Never, RunStatus::Running);
-        let after_host_crash = WalOpening::decide(
+        let after_host_crash = decide_data(
             Some(&crashed),
             JournalHistory::Records { verified_epoch: 0 },
             Some(&boot("b")),
@@ -1125,12 +1394,12 @@ mod tests {
         )
         .expect("valid recovery epoch");
         assert_eq!(after_host_crash.recovery_epoch, 5);
-        let restarted = RunState {
+        let mut restarted = RunState {
             boot_id: Some(boot("b")),
-            recovery_epoch: after_host_crash.recovery_epoch,
             ..crashed
         };
-        let after_process_crash = WalOpening::decide(
+        restarted.data.recovery_epoch = after_host_crash.recovery_epoch;
+        let after_process_crash = decide_data(
             Some(&restarted),
             JournalHistory::Records { verified_epoch: 0 },
             Some(&boot("b")),

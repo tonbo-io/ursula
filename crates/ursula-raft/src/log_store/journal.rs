@@ -1221,12 +1221,12 @@ mod tests {
         }
     }
 
-    /// Journals of earlier epochs, 0.6 (version 2) through 0.8 (version 4),
+    /// Journals of earlier epochs, 0.6 (version 2) through 0.9 (version 5),
     /// are refused. The version is checked before the header length and the
     /// checksum.
     #[test]
     fn journals_of_earlier_epochs_are_refused() {
-        for version in [2_u16, 3, 4] {
+        for version in [2_u16, 3, 4, 5] {
             let dir = tempfile::tempdir().expect("temp dir");
             let path = dir.path().join("journal");
             let mut file = File::create(&path).expect("create an old journal");

@@ -2906,7 +2906,7 @@ mod tests {
             store.clone(),
             SnapshotBuildCoordinator::default(),
             snapshots.install.clone(),
-            None,
+            crate::state_machine::RecordSite::NoRecord,
         );
         let decodes_before_install = crate::snapshot_codec::decode_calls_on_this_thread();
         state_machine

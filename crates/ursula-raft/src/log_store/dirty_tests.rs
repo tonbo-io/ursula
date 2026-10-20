@@ -29,6 +29,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 
+use super::JournalRun;
 use super::RaftGroupFileLogStore;
 use super::RecoveryState;
 use super::RunState;
@@ -145,9 +146,15 @@ impl Journal {
                 self.dir.with_extension("run-state"),
                 RunState {
                     boot_id: None,
-                    fsync: self.tuning.fsync,
                     status: RunStatus::Running,
-                    recovery_epoch: 0,
+                    data: JournalRun {
+                        fsync: self.tuning.fsync,
+                        recovery_epoch: 0,
+                    },
+                    meta: JournalRun {
+                        fsync: WalFsync::Always,
+                        recovery_epoch: 0,
+                    },
                 },
             )),
             node_recovery: RecoveryState::Normal,
@@ -792,18 +799,15 @@ async fn snapshot_record_after_a_journal_sync(publication: Publication) {
         .expect("truncate the tail");
 
     let machine = || {
-        let mut machine =
-            crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-                placement(QUIET),
-                None,
-                None,
-                ursula_runtime::default_snapshot_store(),
-                crate::state_machine::SnapshotBuildCoordinator::default(),
-                crate::state_machine::SnapshotInstallCoordinator::default(),
-                Some(record.path().to_path_buf()),
-            );
-        machine.snapshot_record = Some(record.clone());
-        machine
+        crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            placement(QUIET),
+            None,
+            None,
+            ursula_runtime::default_snapshot_store(),
+            crate::state_machine::SnapshotBuildCoordinator::default(),
+            crate::state_machine::SnapshotInstallCoordinator::default(),
+            crate::state_machine::RecordSite::Store(record.clone()),
+        )
     };
     let mut published = machine();
     match publication {
@@ -863,7 +867,8 @@ async fn snapshot_record_after_a_journal_sync(publication: Publication) {
         "{publication:?}: the truncate is as durable as the snapshot record"
     );
     let mut restored = machine();
-    restored.snapshot_record = None;
+    restored.snapshot_record =
+        crate::state_machine::RecordSite::Detached(record.path().to_path_buf());
     restored
         .restore_persisted_snapshot()
         .await

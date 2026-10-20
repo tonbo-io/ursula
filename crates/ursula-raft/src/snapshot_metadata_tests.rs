@@ -49,7 +49,7 @@ fn machine(path: &Path) -> RaftGroupStateMachine {
         default_snapshot_store(),
         SnapshotBuildCoordinator::default(),
         SnapshotInstallCoordinator::default(),
-        Some(path.to_owned()),
+        super::RecordSite::Detached(path.to_owned()),
     )
 }
 
@@ -222,7 +222,7 @@ fn external_machine(
         store,
         SnapshotBuildCoordinator::default(),
         coordinator,
-        Some(path.to_owned()),
+        super::RecordSite::Detached(path.to_owned()),
     )
 }
 

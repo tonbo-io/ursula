@@ -16,7 +16,7 @@
 //!   answers 503 `format_epoch_mismatch` until the process restarts.
 //!
 //! The refusal between epochs is a contract with every earlier release:
-//! nodes of 0.5.x through 0.8 classify a peer's answer only by its shape, so
+//! nodes of 0.5.x through 0.9 classify a peer's answer only by its shape, so
 //! a later epoch keeps these parts unchanged:
 //!
 //! - the `protocol_version` preamble fields (`RaftRpcEnvelopeV1` field 3,
@@ -250,23 +250,23 @@ mod tests {
     /// The cross-epoch refusal contract, pinned with literal text because
     /// released nodes match it: a peer of another epoch is refused with
     /// `FAILED_PRECONDITION` and "raft grpc protocol mismatch", and the
-    /// answer a 0.8.2 node gives a node of this epoch is read as a refusal.
+    /// answer a 0.9 node gives a node of this epoch is read as a refusal.
     #[test]
     fn the_refusal_between_epochs_keeps_its_released_shape() {
         let status = tonic::Status::from(
-            crate::grpc::validate_grpc_metadata(4).expect_err("protocol 4 is refused"),
+            crate::grpc::validate_grpc_metadata(5).expect_err("protocol 5 is refused"),
         );
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
         assert!(
             status.message().starts_with("raft grpc protocol mismatch"),
             "{status:?}"
         );
-        let from_0_8_2 = tonic::Status::failed_precondition(
-            "raft grpc protocol mismatch: local=4, remote=5 (format epochs differ; a node joins \
+        let from_0_9 = tonic::Status::failed_precondition(
+            "raft grpc protocol mismatch: local=5, remote=6 (format epochs differ; a node joins \
              only a cluster of its own format epoch)",
         );
         assert!(matches!(
-            classify_probe_answer(Err(from_0_8_2)),
+            classify_probe_answer(Err(from_0_9)),
             PeerFormatEpoch::Refused(_)
         ));
     }

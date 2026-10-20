@@ -50,10 +50,15 @@ mod wal;
 mod writer;
 use std::io;
 
+#[cfg(all(test, not(madsim)))]
+pub(crate) use core_meta::CoreMetadata;
 pub use core_meta::GroupLogState;
+pub use core_meta::LogGeneration;
 pub use core_meta::MarkRecoveringError;
 pub use core_meta::PlanCut;
 pub use core_meta::RecoveryRecord;
+#[cfg(all(test, not(madsim)))]
+pub(crate) use core_meta::core_metadata_path;
 #[cfg(madsim)]
 pub use disk::JournalDisk;
 #[cfg(madsim)]
@@ -84,7 +89,9 @@ use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::entry::RaftEntry;
 pub use run_state::BootId;
+pub use run_state::JournalClass;
 pub use run_state::JournalHistory;
+pub use run_state::JournalRun;
 pub use run_state::JournalSync;
 pub(crate) use run_state::NodeWal;
 pub use run_state::PreviousRun;
@@ -151,11 +158,25 @@ pub(crate) enum RaftGroupLogRecord {
     Purge(LogIdOf<UrsulaRaftTypeConfig>),
 }
 
+/// One sample of each WAL state file, by name, as the persisted-envelopes
+/// fixture holds it: the whole file, its header and checksum included.
+#[cfg(test)]
+pub(crate) fn state_file_samples() -> [(&'static str, Vec<u8>); 3] {
+    [
+        ("core_metadata_file", core_meta::sample_file()),
+        ("run_state_file", run_state::sample_file()),
+        ("topology_file", topology::sample_file()),
+    ]
+}
+
 /// A [`RaftGroupLogRecord`] tagged with its raft group in the shared per-core
-/// journal.
+/// journal, and with the generation of the group's log it belongs to: replay
+/// keeps only the records of the generation the core's metadata names
+/// ([`LogGeneration`]).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct CoreJournalRecord {
     pub(crate) group_id: u32,
+    pub(crate) generation: LogGeneration,
     pub(crate) record: RaftGroupLogRecord,
 }
 

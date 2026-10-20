@@ -1225,6 +1225,18 @@ impl GroupRejoin {
                 })?;
                 VoteGate::closed(GroupEvidence::Initialized)
             }
+            // Unreachable while nothing retires a log: a retired log holds
+            // no vote and no entries, and never takes a first election.
+            // S2's `NotHeld` (#768) removes this arm.
+            (None, GroupLogState::Retired) => {
+                tracing::warn!(
+                    node_id,
+                    raft_group_id = raft_group_id.0,
+                    "recovery gate: this replica's log of the group is retired; it stays out of \
+                     elections"
+                );
+                VoteGate::closed(GroupEvidence::Initialized)
+            }
             (None, GroupLogState::Empty) => {
                 tracing::debug!(
                     node_id,

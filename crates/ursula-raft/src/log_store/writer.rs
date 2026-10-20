@@ -93,7 +93,10 @@ use super::RaftGroupLogRecord;
 use super::core_meta::CoreMetadata;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::LogGeneration;
 use super::core_meta::RecoveryRecord;
+use super::core_meta::ReplayGenerations;
+use super::core_meta::ReplayRecord;
 use super::core_meta::core_metadata_path;
 use super::disk::Disk;
 use super::disk::DiskFile;
@@ -429,6 +432,9 @@ pub(crate) struct OpenedGroup {
     pub(crate) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
     pub(crate) state: GroupLogState,
     pub(crate) recovery: Option<RecoveryRecord>,
+    /// The generation of the group's log, which every record the store
+    /// writes carries and its snapshot record names.
+    pub(crate) generation: LogGeneration,
 }
 
 /// Closes once a core writer's worker has stopped. The last handle's drop
@@ -581,6 +587,12 @@ impl CoreFileLogWriter {
         let recovery_started_at = Instant::now();
         let mut logs = BTreeMap::<u32, GroupLog>::new();
         let replayed_groups = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        // Each group's log is rebuilt from the records of one generation
+        // only: the metadata's, or without metadata the highest.
+        let generations =
+            std::cell::RefCell::new(ReplayGenerations::of(&metadata, metadata_missing));
+        // Segments holding frames of a generation replay does not keep.
+        let mut dead_generations = BTreeSet::new();
         let mut invalid_tail = false;
         let mut archive_references =
             BTreeMap::<SegmentId, BTreeSet<super::frozen::ArchiveId>>::new();
@@ -592,6 +604,30 @@ impl CoreFileLogWriter {
                 // Include groups whose first journal append preceded its
                 // metadata write in the durable pre-repair gate.
                 replayed_groups.borrow_mut().insert(record.group_id);
+                // The archive a record references stays referenced whatever
+                // generation replay keeps: it goes with its segment.
+                if let RaftGroupLogRecord::FrozenAppend(frozen) = &record.record {
+                    archive_sizes.insert(frozen.archive.id, frozen.archive.bytes);
+                    archive_references
+                        .entry(segment)
+                        .or_default()
+                        .insert(frozen.archive.id);
+                }
+                match generations
+                    .borrow_mut()
+                    .admit(record.group_id, record.generation)
+                {
+                    ReplayRecord::Keep => {}
+                    ReplayRecord::Skip => {
+                        dead_generations.insert(segment);
+                        return Ok(());
+                    }
+                    ReplayRecord::Replace => {
+                        if let Some(older) = logs.remove(&record.group_id) {
+                            dead_generations.extend(older.into_dead_segments());
+                        }
+                    }
+                }
                 let log = logs
                     .entry(record.group_id)
                     .or_insert_with(|| GroupLog::replaying(cache_bytes));
@@ -611,14 +647,12 @@ impl CoreFileLogWriter {
                         ));
                     }
                 };
-                archive_sizes.insert(frozen.archive.id, frozen.archive.bytes);
-                archive_references
-                    .entry(segment)
-                    .or_default()
-                    .insert(frozen.archive.id);
                 log.apply_archived(&selected, at)
             },
             || {
+                for (group, generation) in generations.borrow().adopted() {
+                    metadata.adopt_generation(group, generation);
+                }
                 for group in replayed_groups.borrow().iter() {
                     metadata.initialize(*group, GroupLogState::Recovering);
                 }
@@ -632,7 +666,7 @@ impl CoreFileLogWriter {
             return Err(error.into());
         }
         let recovered = recovered?;
-        let mut died = BTreeSet::new();
+        let mut died = dead_generations;
         for (group_id, log) in &mut logs {
             log.finish_replay()
                 .map_err(|source| CoreJournalError::InconsistentLog {
@@ -690,6 +724,10 @@ impl CoreFileLogWriter {
         // initialized but whose journal holds nothing of it lost its log (a
         // replaced or wiped journal): it recovers.
         let mut metadata_changed = metadata.set_verified_epoch(options.recovery_epoch);
+        // Without metadata, each group is at the generation replay kept.
+        for (group_id, generation) in generations.into_inner().adopted() {
+            metadata_changed |= metadata.adopt_generation(group_id, generation);
+        }
         // Without metadata, surviving records do not prove the lost vote.
         let damaged = metadata_missing || invalid_tail;
         let repaired = match (options.node_recovery, damaged) {
@@ -870,6 +908,7 @@ impl CoreFileLogWriter {
             vote: recorded.vote,
             state: recorded.log,
             recovery: recorded.recovery,
+            generation: recorded.generation,
         })
     }
 
@@ -1798,10 +1837,12 @@ impl CoreJournal {
                         content_hash: [0; 32],
                     };
                     let log_ids = chunk.iter().map(|entry| entry.log_id).collect();
-                    let archive = match super::frozen::publish(&self.context.dir, id, chunk) {
-                        Ok(reference) => reference,
-                        Err(error) => return Reclaim::Poisoned(error),
-                    };
+                    let generation = self.metadata.group(*group_id).generation;
+                    let archive =
+                        match super::frozen::publish(&self.context.dir, id, generation, chunk) {
+                            Ok(reference) => reference,
+                            Err(error) => return Reclaim::Poisoned(error),
+                        };
                     RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
                         archive,
                         log_ids,
@@ -1904,7 +1945,8 @@ impl CoreJournal {
         outcome
     }
 
-    /// Appends a rewritten record of `group_id` to the newest segment.
+    /// Appends a rewritten record of `group_id` to the newest segment, in
+    /// the group's current generation: only its live records are rewritten.
     fn append_rewritten(
         &mut self,
         group_id: u32,
@@ -1917,9 +1959,14 @@ impl CoreJournal {
             }
             _ => None,
         };
+        let generation = self.metadata.group(group_id).generation;
         let loc = self
             .active
-            .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord { group_id, record })?;
+            .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
+                group_id,
+                generation,
+                record,
+            })?;
         if let Some((archive, bytes)) = archive {
             self.archive_sizes.insert(archive, bytes);
             self.archive_references
@@ -2613,6 +2660,7 @@ mod frozen_gc_tests {
     use crate::log_store::RaftGroupFileLogStore;
     use crate::log_store::disk::JournalDisk;
     use crate::log_store::disk::JournalFile;
+    use crate::log_store::run_state::JournalRun;
     use crate::log_store::run_state::PreviousRun;
     use crate::log_store::run_state::RecoveryState;
     use crate::log_store::run_state::RunState;
@@ -2670,9 +2718,15 @@ mod frozen_gc_tests {
                 },
                 run_state: Arc::new(RunStateFile::new(dir.join("run-state"), RunState {
                     boot_id: None,
-                    fsync: WalFsync::Always,
                     status: RunStatus::Running,
-                    recovery_epoch: 0,
+                    data: JournalRun {
+                        fsync: WalFsync::Always,
+                        recovery_epoch: 0,
+                    },
+                    meta: JournalRun {
+                        fsync: WalFsync::Always,
+                        recovery_epoch: 0,
+                    },
                 })),
                 node_recovery: RecoveryState::Normal,
                 lagging: Arc::new(LaggingGroups::default()),

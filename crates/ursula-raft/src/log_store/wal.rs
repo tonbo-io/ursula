@@ -130,6 +130,8 @@ impl RaftWal {
         self.node.cluster_id()
     }
 
+    /// The data journals' fsync policy. The meta journal always runs
+    /// `always`.
     pub fn fsync(&self) -> WalFsync {
         self.node.fsync()
     }
@@ -140,12 +142,20 @@ impl RaftWal {
         self.lagging.clone()
     }
 
-    /// How this run opens the journals the previous run left.
+    /// How this run opens the data journals the previous run left.
     pub fn opening(&self) -> WalOpening {
         self.node.opening()
     }
 
-    /// Whether this node's logs may be missing entries it acknowledged.
+    /// How this run opens the meta journal, by the meta class's own record
+    /// in the run state. No meta journal is written yet, so nothing opens
+    /// by it.
+    pub fn meta_opening(&self) -> WalOpening {
+        self.node.meta_opening()
+    }
+
+    /// Whether this node's data logs may be missing entries they
+    /// acknowledged.
     pub fn recovery_state(&self) -> RecoveryState {
         self.node.opening().recovery
     }

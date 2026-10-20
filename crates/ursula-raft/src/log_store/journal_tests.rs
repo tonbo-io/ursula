@@ -37,6 +37,8 @@ use super::CoreJournalRecord;
 use super::GroupLogState;
 use super::JournalError;
 use super::JournalReplayMode;
+use super::JournalRun;
+use super::LogGeneration;
 use super::RaftGroupFileLogStore;
 use super::RaftGroupLogRecord;
 use super::RecoveryReason;
@@ -150,9 +152,15 @@ impl Core {
                 self.dir.with_extension("run-state"),
                 RunState {
                     boot_id: None,
-                    fsync: self.tuning.fsync,
                     status: RunStatus::Running,
-                    recovery_epoch,
+                    data: JournalRun {
+                        fsync: self.tuning.fsync,
+                        recovery_epoch,
+                    },
+                    meta: JournalRun {
+                        fsync: WalFsync::Always,
+                        recovery_epoch: 0,
+                    },
                 },
             )),
             node_recovery,
@@ -597,6 +605,7 @@ fn archived_payload_damage_is_a_typed_hard_startup_failure() {
                 last_index: 1,
                 content_hash: [0; 32],
             },
+            LogGeneration::FIRST,
             vec![entry.clone()],
         )
         .unwrap();
@@ -605,6 +614,7 @@ fn archived_payload_damage_is_a_typed_hard_startup_failure() {
         journal
             .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                 group_id: 1,
+                generation: LogGeneration::FIRST,
                 record: RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
                     archive: archive.clone(),
                     log_ids: vec![entry.log_id],
@@ -1118,9 +1128,15 @@ async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
     // Unknown boot identity forces a host crash on the first real startup.
     RunStateFile::new(root.join(RUN_STATE_FILE), RunState {
         boot_id: None,
-        fsync: WalFsync::Always,
         status: RunStatus::Running,
-        recovery_epoch: 0,
+        data: JournalRun {
+            fsync: WalFsync::Always,
+            recovery_epoch: 0,
+        },
+        meta: JournalRun {
+            fsync: WalFsync::Always,
+            recovery_epoch: 0,
+        },
     })
     .record(RunStatus::Running, "test host crash")
     .unwrap();
@@ -1215,9 +1231,15 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
         );
         RunStateFile::new(root.join(RUN_STATE_FILE), RunState {
             boot_id: None,
-            fsync: WalFsync::Always,
             status: RunStatus::Running,
-            recovery_epoch: 0,
+            data: JournalRun {
+                fsync: WalFsync::Always,
+                recovery_epoch: 0,
+            },
+            meta: JournalRun {
+                fsync: WalFsync::Always,
+                recovery_epoch: 0,
+            },
         })
         .record(RunStatus::Running, "host crash")
         .unwrap();
@@ -1687,10 +1709,12 @@ fn recovery_restores_a_missing_initialized_flag() {
         for record in [
             CoreJournalRecord {
                 group_id: 7,
+                generation: LogGeneration::FIRST,
                 record: RaftGroupLogRecord::Append(vec![blank_entry(1)]),
             },
             CoreJournalRecord {
                 group_id: 9,
+                generation: LogGeneration::FIRST,
                 record: RaftGroupLogRecord::SaveCommitted(None),
             },
         ] {
@@ -1709,6 +1733,204 @@ fn recovery_restores_a_missing_initialized_flag() {
         let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
         assert_eq!(metadata.group(7).log, expected);
         assert_eq!(metadata.group(9).log, GroupLogState::Empty);
+    }
+}
+
+/// Writes the segment `id` of `core`'s journal holding `records`, each as
+/// `(group, generation, entries)`.
+fn write_generations(core: &Core, id: u64, records: &[(u32, u64, Vec<u64>)]) {
+    let mut journal = JournalWriter::open(&core.segment(id), id).expect("segment");
+    for (group_id, generation, entries) in records {
+        journal
+            .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
+                group_id: *group_id,
+                generation: LogGeneration::new(*generation),
+                record: RaftGroupLogRecord::Append(
+                    entries.iter().map(|index| blank_entry(*index)).collect(),
+                ),
+            })
+            .expect("append");
+    }
+    journal.sync().expect("sync");
+}
+
+/// Replay keeps only the records of the generation the metadata names. A
+/// resurrected segment holding an earlier life of the group, here after the
+/// current one's records, is dead, and another group's first generation is
+/// kept beside it.
+#[tokio::test]
+async fn replay_keeps_only_the_generation_the_metadata_names() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    write_generations(&core, 1, &[(7, 1, vec![1, 2])]);
+    write_generations(&core, 2, &[(7, 0, vec![3, 4, 5]), (3, 0, vec![1])]);
+    let mut metadata = CoreMetadata::default();
+    metadata.initialize(7, GroupLogState::Initialized);
+    metadata.adopt_generation(7, LogGeneration::new(1));
+    metadata.initialize(3, GroupLogState::Initialized);
+    metadata
+        .store(&core_metadata_path(&core.dir))
+        .expect("store metadata");
+
+    let writer = core.writer();
+    let store = core.store(&writer, 7);
+    assert_eq!(log_ids(&store).await, [1, 2]);
+    assert_eq!(store.log_state(), GroupLogState::Initialized);
+    assert_eq!(log_ids(&core.store(&writer, 3)).await, [1]);
+    let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
+    assert_eq!(metadata.group(7).generation, LogGeneration::new(1));
+    assert_eq!(metadata.group(3).generation, LogGeneration::FIRST);
+}
+
+/// Without metadata, replay keeps each group's highest generation among its
+/// frames, before or after the lower ones, and the group opens recovering
+/// at that generation, which the repaired metadata names.
+#[tokio::test]
+async fn replay_without_metadata_keeps_the_highest_generation_recovering() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    write_generations(&core, 1, &[(7, 0, vec![1, 2, 3]), (3, 0, vec![1, 2])]);
+    write_generations(&core, 2, &[(7, 2, vec![4]), (7, 1, vec![5, 6])]);
+    assert!(!core_metadata_path(&core.dir).exists());
+
+    let writer = core.writer();
+    let store = core.store(&writer, 7);
+    assert_eq!(log_ids(&store).await, [4]);
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    let other = core.store(&writer, 3);
+    assert_eq!(log_ids(&other).await, [1, 2]);
+    assert_eq!(other.log_state(), GroupLogState::Recovering);
+    let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
+    assert_eq!(metadata.group(7).generation, LogGeneration::new(2));
+    assert_eq!(metadata.group(7).log, GroupLogState::Recovering);
+    assert_eq!(metadata.group(3).generation, LogGeneration::FIRST);
+}
+
+/// A state machine of `group` on `store`, with the store's snapshot record.
+fn record_machine(
+    store: &RaftGroupFileLogStore,
+    group: u32,
+) -> crate::state_machine::RaftGroupStateMachine {
+    crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+        placement(group),
+        None,
+        None,
+        ursula_runtime::default_snapshot_store(),
+        crate::state_machine::SnapshotBuildCoordinator::default(),
+        crate::state_machine::SnapshotInstallCoordinator::default(),
+        crate::state_machine::RecordSite::Store(store.snapshot_record()),
+    )
+}
+
+/// Groups whose metadata names generation 1 keep everything across
+/// appends, markers, a snapshot build and an install, reclaim (an archive of
+/// an apply-stopped group and rewritten records) and a restart: every
+/// writer stamps the generation the metadata names. One that stamped the
+/// first generation would leave a log empty after replay, or a snapshot
+/// record that restores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_generation_survives_snapshots_reclaim_and_restart() {
+    use openraft::storage::RaftSnapshotBuilder;
+    use openraft::storage::RaftStateMachine;
+
+    const STOPPED: u32 = 1;
+    const HEALTHY: u32 = 2;
+    let generation = LogGeneration::new(1);
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    let mut metadata = CoreMetadata::default();
+    for group in [STOPPED, HEALTHY] {
+        assert!(metadata.adopt_generation(group, generation));
+    }
+    metadata
+        .store(&core_metadata_path(&core.dir))
+        .expect("store metadata");
+
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, STOPPED);
+    let mut healthy = core.store(&writer, HEALTHY);
+    assert_eq!(stopped.snapshot_record().generation(), generation);
+    append(&mut stopped, (1..=8).map(|index| payload_entry(index, 700))).await;
+    stopped.save_committed(Some(log_id(8))).await.unwrap();
+    let mut built = record_machine(&stopped, STOPPED);
+    built
+        .apply(futures_util::stream::iter(
+            (1..=8).map(|index| Ok((blank_entry(index), None))),
+        ))
+        .await
+        .expect("apply the committed entries");
+    built
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .expect("build the snapshot");
+    drop(built);
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    for index in 1..=400_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    healthy.save_committed(Some(log_id(400))).await.unwrap();
+    let snapshot = ursula_runtime::GroupSnapshot {
+        placement: placement(HEALTHY),
+        group_commit_index: 400,
+        stream_snapshot: Default::default(),
+        stream_append_counts: Vec::new(),
+    };
+    let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("snapshot frames")
+        .into_iter()
+        .flatten()
+        .collect();
+    let pointer = ursula_runtime::SnapshotPointer {
+        snapshot_id: "later-generation".to_owned(),
+        location: ursula_runtime::SnapshotLocation::Inline { bytes },
+    };
+    let meta = openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+        last_log_id: Some(log_id(400)),
+        last_membership: Default::default(),
+    };
+    record_machine(&healthy, HEALTHY)
+        .install_snapshot(
+            &meta,
+            crate::types::SnapshotData::new(pointer.encode_binary().expect("encode the pointer")),
+        )
+        .await
+        .expect("install the snapshot");
+    writer.close().await.unwrap();
+    let metrics = core.metrics.snapshot();
+    assert!(metrics.wal_stopped_rewritten_bytes > 0, "{metrics:?}");
+    assert!(metrics.wal_reclaims > 0, "{metrics:?}");
+    drop(stopped);
+    drop(healthy);
+    drop(writer);
+
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, STOPPED);
+    let healthy = core.store(&writer, HEALTHY);
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    assert_eq!(stopped.read_committed().await.unwrap(), Some(log_id(8)));
+    assert_eq!(log_ids(&healthy).await, (397..=400).collect::<Vec<_>>());
+    let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
+    for group in [STOPPED, HEALTHY] {
+        assert_eq!(metadata.group(group).generation, generation);
+    }
+    for (store, group, index) in [(&stopped, STOPPED, 8), (&healthy, HEALTHY, 400)] {
+        let mut restored = record_machine(store, group);
+        restored
+            .restore_persisted_snapshot()
+            .await
+            .expect("restore the snapshot record");
+        assert_eq!(restored.last_applied_log_id, Some(log_id(index)), "{group}");
     }
 }
 
@@ -2205,9 +2427,15 @@ async fn missing_run_state_refuses_unreadable_or_exhausted_core_epochs() {
             drop(super::RaftWal::start(root, fsync, &map).unwrap());
             RunStateFile::new(root.join(super::RUN_STATE_FILE), RunState {
                 boot_id: None,
-                fsync,
                 status: RunStatus::Poisoned,
-                recovery_epoch: u64::MAX.checked_sub(1).unwrap(),
+                data: JournalRun {
+                    fsync,
+                    recovery_epoch: u64::MAX.checked_sub(1).unwrap(),
+                },
+                meta: JournalRun {
+                    fsync: WalFsync::Always,
+                    recovery_epoch: 0,
+                },
             })
             .record(RunStatus::Poisoned, "poisoned")
             .unwrap();
@@ -2233,6 +2461,7 @@ async fn missing_run_state_refuses_unreadable_or_exhausted_core_epochs() {
                 } else {
                     assert!(
                         matches!(error, super::RaftWalError::RecoveryEpochExhausted {
+                            class: super::JournalClass::Data,
                             recovery_epoch: u64::MAX
                         }),
                         "{error}"
@@ -2255,9 +2484,15 @@ async fn an_exhausted_recorded_epoch_refuses_a_new_poisoned_recovery() {
         let path = root.join(super::RUN_STATE_FILE);
         RunStateFile::new(path.clone(), RunState {
             boot_id: None,
-            fsync,
             status: RunStatus::Poisoned,
-            recovery_epoch: u64::MAX,
+            data: JournalRun {
+                fsync,
+                recovery_epoch: u64::MAX,
+            },
+            meta: JournalRun {
+                fsync: WalFsync::Always,
+                recovery_epoch: 0,
+            },
         })
         .record(RunStatus::Poisoned, "exhausted epoch")
         .unwrap();
@@ -2265,11 +2500,66 @@ async fn an_exhausted_recorded_epoch_refuses_a_new_poisoned_recovery() {
         assert!(matches!(
             super::RaftWal::start(root, fsync, &map),
             Err(super::RaftWalError::RecoveryEpochExhausted {
+                class: super::JournalClass::Data,
                 recovery_epoch: u64::MAX
             })
         ));
         assert_eq!(fs::read(&path).unwrap(), before);
     }
+}
+
+/// A start decides and records each journal class by its own record: after
+/// a host crash under a data policy of `never`, the data journals open as a
+/// verified prefix in a new epoch, and the meta class stays strict in its
+/// own epoch, recorded with `always`.
+#[tokio::test]
+async fn a_data_host_crash_under_never_leaves_the_meta_epoch_unmoved() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    drop(super::RaftWal::start(root, WalFsync::Never, &map).unwrap());
+    let path = root.join(super::RUN_STATE_FILE);
+    // No boot id and no clean end: a host crash.
+    RunStateFile::new(path.clone(), RunState {
+        boot_id: None,
+        status: RunStatus::Running,
+        data: JournalRun {
+            fsync: WalFsync::Never,
+            recovery_epoch: 4,
+        },
+        meta: JournalRun {
+            fsync: WalFsync::Always,
+            recovery_epoch: 2,
+        },
+    })
+    .record(RunStatus::Running, "host crash")
+    .unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Never, &map).unwrap();
+    let data = wal.opening();
+    assert_eq!(data.previous_run, PreviousRun::HostCrash {
+        fsync: WalFsync::Never
+    });
+    assert_eq!(data.replay_mode, JournalReplayMode::VerifiedPrefix);
+    assert_eq!(data.recovery_epoch, 5);
+    let meta = wal.meta_opening();
+    assert_eq!(meta.previous_run, PreviousRun::HostCrash {
+        fsync: WalFsync::Always
+    });
+    assert_eq!(meta.replay_mode, JournalReplayMode::Strict);
+    assert_eq!(meta.recovery, super::RecoveryState::Normal);
+    assert_eq!(meta.recovery_epoch, 2);
+    let running = super::state_file::read::<RunState>(super::StateFileKind::RunState, &path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(running.status, RunStatus::Running);
+    assert_eq!(running.data, JournalRun {
+        fsync: WalFsync::Never,
+        recovery_epoch: 5,
+    });
+    assert_eq!(running.meta, JournalRun {
+        fsync: WalFsync::Always,
+        recovery_epoch: 2,
+    });
 }
 
 /// #613: the store reports an append that would overwrite an entry at or
@@ -2648,8 +2938,8 @@ async fn the_screen_refuses_while_the_store_lags_an_admitted_install() {
 #[test]
 fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
     /// The frame and record as CI measured them, in bytes: a 12-byte frame
-    /// header and a 108-byte record.
-    const SMALL_APPEND_WAL_BYTES: u64 = 120;
+    /// header and a 109-byte record, one byte of it the record's generation.
+    const SMALL_APPEND_WAL_BYTES: u64 = 121;
 
     let root = tempfile::tempdir().expect("WAL root");
     let path = root.path().join("journal-00000000000000000001.seg");
@@ -2660,6 +2950,7 @@ fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
     journal
         .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
             group_id: 3,
+            generation: LogGeneration::FIRST,
             record: RaftGroupLogRecord::Append(vec![Entry::new(
                 LogId {
                     leader_id: CommittedLeaderId::new(7, 2),

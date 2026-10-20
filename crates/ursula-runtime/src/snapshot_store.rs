@@ -1820,7 +1820,7 @@ mod tests {
         );
     }
 
-    /// An S3 location of format epoch 5 names its kind, key, sizes and
+    /// An S3 location of format epoch 6 names its kind, key, sizes and
     /// compression, and no `shared_object` flag: no node shares an object.
     #[test]
     fn an_s3_pointer_carries_no_shared_object_field() {
