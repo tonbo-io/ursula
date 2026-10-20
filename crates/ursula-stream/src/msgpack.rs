@@ -9,9 +9,9 @@
 //! written by its name. Field order is therefore part of the format of every
 //! type it encodes: reordering, adding or removing a field, or renaming a
 //! variant, changes the format. Every field is required, so such a type has
-//! no `skip_serializing_if`, `default`, `flatten` or untagged enum. A
-//! document with an element more or less than its type has is refused, not
-//! read in part.
+//! no `skip_serializing_if`, `default`, `flatten` or untagged enum. Ursula
+//! writes only arrays. A shorter or longer array of Ursula's own types is
+//! refused, not read in part.
 //!
 //! Clippy's `disallowed-methods` keeps every `rmp_serde` call inside this
 //! module, and the workspace pins `rmp-serde` to one release: its
