@@ -321,6 +321,38 @@ fn ineligible_target_refuses_a_cordoned_node_that_is_not_a_voter_yet() {
 }
 
 #[test]
+fn ineligible_target_refuses_keeping_a_cordoned_incoming_node_and_the_move_still_cancels() {
+    let mut driver = Driver::live(&[1, 2, 3, 4, 5], 1, 3);
+    driver.request_move(G0, &[1, 2, 4]).unwrap();
+    driver.lifecycle(4, LifecycleChange::Cordon).unwrap();
+    // Node 4 is only a target of the move, not a voter of its source: a
+    // retarget may not keep it once it is cordoned.
+    let error = driver.refused(ControlCommand::RequestMove {
+        group: G0,
+        expected: driver.since(G0),
+        to: voters(&[1, 4, 5]),
+        now_ms: 5,
+    });
+    assert!(matches!(
+        error,
+        ControlError::IneligibleTarget {
+            group,
+            node: n,
+            lifecycle: NodeLifecycle::Cordoned,
+        } if group == G0 && n == node(4)
+    ));
+    // The cancel names only the source's voters, so it is accepted.
+    let accepted = driver.request_move(G0, &[1, 2, 3]).unwrap();
+    assert_eq!(accepted, ControlApplied::MoveAccepted {
+        since: driver.since(G0)
+    });
+    assert_eq!(
+        driver.cluster().role(G0, node(4)),
+        Some(ReplicaRole::Abandoned)
+    );
+}
+
+#[test]
 fn retirement_pending_refuses_placing_a_node_before_its_teardown_report() {
     let mut driver = Driver::live(&[1, 2, 3, 4], 1, 3);
     driver.request_move(G0, &[1, 2, 4]).unwrap();
