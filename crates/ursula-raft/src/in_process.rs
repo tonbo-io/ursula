@@ -100,7 +100,10 @@ impl InProcessRaftRegistry {
         let (_, endpoint) = self
             .endpoint(node_id)
             .ok_or(crate::QuorumProofError::NotRegistered { group })?;
-        endpoint.confirm_recovery_barrier(group).await
+        endpoint
+            .confirm_recovery_barrier(group)
+            .await
+            .map(|answer| (answer.vote, answer.index))
     }
 
     /// The `accept-unsynced-loss` admin route on `node_id`, through the

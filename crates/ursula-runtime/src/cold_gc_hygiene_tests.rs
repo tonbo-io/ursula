@@ -25,7 +25,6 @@ use crate::ColdStoreOperation;
 use crate::CreateStreamRequest;
 use crate::DeleteStreamRequest;
 use crate::FollowerRead;
-use crate::GroupWriteCommand;
 use crate::InMemoryGroupEngine;
 use crate::InMemoryGroupEngineFactory;
 use crate::PlanColdFlushRequest;
@@ -479,7 +478,7 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
         now_ms: 0,
     };
     engine
-        .apply_committed_write(GroupWriteCommand::Stream(create), placement)
+        .apply_committed_write(create, placement)
         .expect("create stream");
     // C7/F14g: the group's first incarnation is `created_at_ms` 1, which is
     // the generation its pages live under.
@@ -511,7 +510,7 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
     // A follower applies the leader's flush of `[0, 4)`.
     engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::FlushCold {
+            StreamCommand::FlushCold {
                 stream_id: stream.clone(),
                 chunk: ColdChunkRef {
                     start_offset: 0,
@@ -521,7 +520,7 @@ async fn applying_flush_cold_drops_cached_pages_of_the_flushed_range() {
                     ..Default::default()
                 },
                 cold_generation: generation,
-            }),
+            },
             placement,
         )
         .expect("apply flush");

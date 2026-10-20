@@ -34,7 +34,6 @@ use ursula_shard::RaftGroupId;
 use ursula_stream::StreamCommand;
 use ursula_stream::sim_controls::Defence;
 
-use crate::command::GroupWriteCommand;
 use crate::engine::GroupEngineError;
 use crate::engine::GroupWriteResponse;
 use crate::request::ExpireStreamsResponse;
@@ -82,12 +81,12 @@ pub fn enabled() -> bool {
 
 /// The entry a sweep proposes at `now_ms`, the [`sweep_now_ms`] of its
 /// pass. Records that the defence fired.
-pub fn command(now_ms: u64) -> GroupWriteCommand {
+pub fn command(now_ms: u64) -> StreamCommand {
     ursula_stream::sim_controls::note_fired(Defence::ExpirySweep);
-    GroupWriteCommand::from(StreamCommand::ExpireStreams {
+    StreamCommand::ExpireStreams {
         now_ms,
         limit: STREAMS_PER_COMMAND,
-    })
+    }
 }
 
 /// What became of one `ExpireStreams` entry: the streams it removed once it

@@ -20,7 +20,6 @@ use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use ursula_config::WalFsync;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -43,6 +42,7 @@ use super::writer::CoreFileLogWriter;
 use super::writer::CoreJournalOptions;
 use super::writer::JournalTuning;
 use super::writer::LaggingGroups;
+use crate::RaftCommand;
 use crate::rt::time::Instant;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -77,7 +77,7 @@ fn log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
 fn entry(index: u64, payload: &[u8]) -> Entry {
     Entry::new(
         log_id(index),
-        EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
             stream_id: BucketStreamId::new("wal-test", "dirty"),
             content_type: Some("application/octet-stream".to_owned()),
             payload: Bytes::copy_from_slice(payload),

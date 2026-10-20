@@ -153,7 +153,7 @@ pub(crate) enum GroupSlot {
     ApplyStopped {
         term: u64,
         index: u64,
-        kind: ursula_proto::admin::ApplyFailureKind,
+        kind: crate::engine::ApplyStopKind,
     },
     /// The group's engine did not open because the snapshot store did not
     /// answer its restore. Until `until`, a request gets the same refusal at

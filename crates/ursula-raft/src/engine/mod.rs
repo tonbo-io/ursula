@@ -94,7 +94,6 @@ use ursula_runtime::GroupStateGaugesFuture;
 use ursula_runtime::GroupTidyStreamFuture;
 use ursula_runtime::GroupTidyStreamsFuture;
 use ursula_runtime::GroupTouchStreamAccessFuture;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::LeadershipReason;
@@ -152,6 +151,7 @@ use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::RecordSite;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
+use crate::types::RaftCommand;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -1121,7 +1121,7 @@ impl RaftGroupEngine {
     /// [`Self::write_upload`], and one proposed here is refused (F14j).
     pub(crate) async fn write(
         &self,
-        command: GroupWriteCommand,
+        command: StreamCommand,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         self.propose(command, ProposalFence::Unfenced).await
     }
@@ -1133,15 +1133,14 @@ impl RaftGroupEngine {
     /// was proposed, so the uploader deletes its object.
     pub(crate) async fn write_upload(
         &self,
-        command: GroupWriteCommand,
+        command: StreamCommand,
         upload: &ProposedUpload,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         let fence = match upload.fence() {
             UploadFence::Leader(leader) => {
                 #[cfg(madsim)]
                 {
-                    let GroupWriteCommand::Stream(stream_command) = &command;
-                    if let Some(object) = ursula_runtime::uploaded_object(stream_command) {
+                    if let Some(object) = ursula_runtime::uploaded_object(&command) {
                         ursula_runtime::cold_uploads::fence_ledger::note_proposed(object, leader);
                     }
                 }
@@ -1160,18 +1159,17 @@ impl RaftGroupEngine {
     /// reached it and lost its answer has an unknown outcome.
     async fn propose(
         &self,
-        command: GroupWriteCommand,
+        command: StreamCommand,
         fence: ProposalFence,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         // Refused before proposal: nothing was written.
         self.apply_health.check(self.placement.raft_group_id)?;
-        crate::forward::validate_proposal(&command)?;
+        let command = RaftCommand::Stream(command);
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
         crate::forward::refuse_unless_leader(&self.raft)?;
         let expected_leader = crate::forward::proposal_leader(&command, fence)?;
-        let GroupWriteCommand::Stream(stream_command) = &command;
-        let expected = ResponseKind::answering(stream_command);
+        let expected = crate::forward::answer_kind(&command);
         let (responder, complete) = ProgressResponder::<UrsulaRaftTypeConfig, _>::complete_only();
         let request = self.raft.write(command).responder(responder);
         let request = match expected_leader {
@@ -1200,7 +1198,7 @@ impl RaftGroupEngine {
 
     pub(crate) async fn forward_write_to_leader_if_follower(
         &self,
-        _command: GroupWriteCommand,
+        _command: StreamCommand,
     ) -> Result<Option<GroupWriteResponse>, GroupEngineError> {
         crate::forward::refuse_unless_leader(&self.raft)?;
         Ok(None)
@@ -1301,13 +1299,11 @@ impl RaftGroupEngine {
             return Ok(None);
         }
         let response = TouchStreamAccessResponse::try_from(
-            self.write(GroupWriteCommand::Stream(
-                StreamCommand::TouchStreamAccess {
-                    stream_id: stream_id.clone(),
-                    now_ms,
-                    renew_ttl,
-                },
-            ))
+            self.write(StreamCommand::TouchStreamAccess {
+                stream_id: stream_id.clone(),
+                now_ms,
+                renew_ttl,
+            })
             .await?,
         )?;
         if response.expired {
@@ -1508,11 +1504,11 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupCreateStreamFuture<'a> {
         if admission.max_hot_bytes_per_group.is_none() {
             return Box::pin(async move {
-                CreateStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+                CreateStreamResponse::try_from(self.write(StreamCommand::from(request)).await?)
             });
         }
         Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
+            let command = StreamCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return CreateStreamResponse::try_from(response);
             }
@@ -1527,7 +1523,7 @@ impl GroupEngine for RaftGroupEngine {
                 }
             })
             .await??;
-            CreateStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            CreateStreamResponse::try_from(self.write(StreamCommand::from(request)).await?)
         })
     }
 
@@ -1541,7 +1537,7 @@ impl GroupEngine for RaftGroupEngine {
             // (F14g), so the engine writes no page entry before proposing.
             let upload = request.upload.clone();
             CreateStreamResponse::try_from(
-                self.write_upload(GroupWriteCommand::from(request), &upload)
+                self.write_upload(StreamCommand::from(request), &upload)
                     .await?,
             )
         })
@@ -1884,7 +1880,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupPublishSnapshotFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
+            let command = StreamCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return PublishSnapshotResponse::try_from(response);
             }
@@ -1892,10 +1888,10 @@ impl GroupEngine for RaftGroupEngine {
                 .await?;
             let response = match request.cold_body.as_ref().map(|body| body.upload.clone()) {
                 Some(upload) => {
-                    self.write_upload(GroupWriteCommand::from(request), &upload)
+                    self.write_upload(StreamCommand::from(request), &upload)
                         .await?
                 }
-                None => self.write(GroupWriteCommand::from(request)).await?,
+                None => self.write(StreamCommand::from(request)).await?,
             };
             PublishSnapshotResponse::try_from(response)
         })
@@ -1907,13 +1903,13 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupAdvanceRetentionFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
+            let command = StreamCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return AdvanceRetentionResponse::try_from(response);
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            AdvanceRetentionResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            AdvanceRetentionResponse::try_from(self.write(StreamCommand::from(request)).await?)
         })
     }
 
@@ -1923,7 +1919,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> ursula_runtime::GroupImportGroupStateFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(ursula_stream::StreamCommand::from(request));
+            let command = ursula_stream::StreamCommand::from(request);
             if let Some(response) = self
                 .forward_write_to_leader_if_follower(command.clone())
                 .await?
@@ -1941,7 +1937,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupTidyStreamFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(StreamCommand::TidyStream { stream_id, now_ms });
+            let command = StreamCommand::TidyStream { stream_id, now_ms };
             if let Some(response) = self
                 .forward_write_to_leader_if_follower(command.clone())
                 .await?
@@ -2004,10 +2000,10 @@ impl GroupEngine for RaftGroupEngine {
                 if let Some(cache) = self.cold_index_cache.as_ref() {
                     cache.invalidate_stream(&candidate.stream_id);
                 }
-                let command = GroupWriteCommand::from(StreamCommand::OffloadColdRefs {
+                let command = StreamCommand::OffloadColdRefs {
                     stream_id: candidate.stream_id,
                     refs: candidate.refs,
-                });
+                };
                 match self
                     .propose(command, ProposalFence::Leadership(leader))
                     .await
@@ -2133,13 +2129,11 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupTouchStreamAccessFuture<'a> {
         Box::pin(async move {
             TouchStreamAccessResponse::try_from(
-                self.write(GroupWriteCommand::Stream(
-                    StreamCommand::TouchStreamAccess {
-                        stream_id,
-                        now_ms,
-                        renew_ttl,
-                    },
-                ))
+                self.write(StreamCommand::TouchStreamAccess {
+                    stream_id,
+                    now_ms,
+                    renew_ttl,
+                })
                 .await?,
             )
         })
@@ -2195,13 +2189,13 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupCloseStreamFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
+            let command = StreamCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return CloseStreamResponse::try_from(response);
             }
             self.ensure_stream_access(request.stream_id.clone(), request.now_ms, false)
                 .await?;
-            CloseStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            CloseStreamResponse::try_from(self.write(StreamCommand::from(request)).await?)
         })
     }
 
@@ -2211,7 +2205,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupDeleteStreamFuture<'a> {
         Box::pin(async move {
-            DeleteStreamResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            DeleteStreamResponse::try_from(self.write(StreamCommand::from(request)).await?)
         })
     }
 
@@ -2236,10 +2230,7 @@ impl GroupEngine for RaftGroupEngine {
                 return forward_purge_bucket_to_leader(&route, self.placement, bucket_id).await;
             }
             ursula_runtime::PurgeBucketResponse::try_from(
-                self.write(GroupWriteCommand::Stream(StreamCommand::PurgeBucket {
-                    bucket_id,
-                }))
-                .await?,
+                self.write(StreamCommand::PurgeBucket { bucket_id }).await?,
             )
         })
     }
@@ -2251,10 +2242,7 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupAckColdGcFuture<'a> {
         Box::pin(async move {
             ursula_runtime::AckColdGcResponse::try_from(
-                self.write(GroupWriteCommand::Stream(StreamCommand::AckColdGc {
-                    up_to_seq,
-                }))
-                .await?,
+                self.write(StreamCommand::AckColdGc { up_to_seq }).await?,
             )
         })
     }
@@ -2267,11 +2255,8 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupDeferColdGcFuture<'a> {
         Box::pin(async move {
             ursula_runtime::DeferColdGcResponse::try_from(
-                self.write(GroupWriteCommand::Stream(StreamCommand::DeferColdGc {
-                    seq,
-                    not_before_ms,
-                }))
-                .await?,
+                self.write(StreamCommand::DeferColdGc { seq, not_before_ms })
+                    .await?,
             )
         })
     }
@@ -2410,7 +2395,10 @@ impl GroupEngine for RaftGroupEngine {
             let count = requests.len();
             let checked = if admission.max_hot_bytes_per_group.is_none() {
                 Ok((
-                    requests.into_iter().map(GroupWriteCommand::from).collect(),
+                    requests
+                        .into_iter()
+                        .map(|request| RaftCommand::Stream(StreamCommand::from(request)))
+                        .collect(),
                     vec![Ok(()); count],
                 ))
             } else {
@@ -2427,7 +2415,8 @@ impl GroupEngine for RaftGroupEngine {
                             ) {
                                 Ok(()) => {
                                     reserved = reserved.saturating_add(request.payload_len());
-                                    commands.push(GroupWriteCommand::from(request));
+                                    commands
+                                        .push(RaftCommand::Stream(StreamCommand::from(request)));
                                     slots.push(Ok(()));
                                 }
                                 Err(error) => slots.push(Err(error)),
@@ -2478,7 +2467,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
+            let command = StreamCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return AppendResponse::try_from(response);
             }
@@ -2489,7 +2478,7 @@ impl GroupEngine for RaftGroupEngine {
             // append committed.
             let upload = request.upload.clone();
             AppendResponse::try_from(
-                self.write_upload(GroupWriteCommand::from(request), &upload)
+                self.write_upload(StreamCommand::from(request), &upload)
                     .await?,
             )
         })
@@ -2502,7 +2491,7 @@ impl GroupEngine for RaftGroupEngine {
         admission: ColdWriteAdmission,
     ) -> GroupAppendFuture<'a> {
         Box::pin(async move {
-            let command = GroupWriteCommand::from(request.clone());
+            let command = StreamCommand::from(request.clone());
             if let Some(response) = self.forward_write_to_leader_if_follower(command).await? {
                 return AppendResponse::try_from(response);
             }
@@ -2519,7 +2508,7 @@ impl GroupEngine for RaftGroupEngine {
                 })
                 .await??;
             }
-            AppendResponse::try_from(self.write(GroupWriteCommand::from(request)).await?)
+            AppendResponse::try_from(self.write(StreamCommand::from(request)).await?)
         })
     }
 
@@ -2572,7 +2561,7 @@ impl GroupEngine for RaftGroupEngine {
             let stream_id = request.stream_id.clone();
             let upload = request.upload.clone();
             let (result, rollback_safe) = match self
-                .write_upload(GroupWriteCommand::from(request), &upload)
+                .write_upload(StreamCommand::from(request), &upload)
                 .await
             {
                 Ok(response) => (FlushColdResponse::try_from(response), false),
@@ -2649,7 +2638,7 @@ impl GroupEngine for RaftGroupEngine {
             let stream_id = request.stream_id.clone();
             let upload = request.upload.clone();
             let (result, rollback_safe) = match self
-                .write_upload(GroupWriteCommand::from(request), &upload)
+                .write_upload(StreamCommand::from(request), &upload)
                 .await
             {
                 Ok(response) => (CompactColdResponse::try_from(response), false),

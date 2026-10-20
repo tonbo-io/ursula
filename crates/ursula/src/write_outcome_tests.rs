@@ -1213,7 +1213,7 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
                 raft_group_id: ursula_shard::RaftGroupId(0),
                 term: 1,
                 index: 2,
-                kind: ursula_proto::admin::ApplyFailureKind::Panic,
+                kind: ursula_runtime::ApplyStopKind::Panic,
             }));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }

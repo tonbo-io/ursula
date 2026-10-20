@@ -1518,11 +1518,11 @@ fn leader_process_crash_with_pending_tail_never_reuses_log_ids() {
                 let before = metrics(&cluster, group, leader).last_log_index.unwrap();
                 let append = madsim::task::spawn(async move {
                     writing
-                        .client_write(ursula_runtime::GroupWriteCommand::from(
-                            AppendRequest::from_bytes(
+                        .client_write(ursula_raft::RaftCommand::Stream(
+                            ursula_stream::StreamCommand::from(AppendRequest::from_bytes(
                                 group_stream(group),
                                 b"lost-on-leader;".to_vec(),
-                            ),
+                            )),
                         ))
                         .await
                 });

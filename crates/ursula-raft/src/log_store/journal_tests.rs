@@ -24,7 +24,6 @@ use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use ursula_config::WalFsync;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -65,6 +64,7 @@ use super::writer::WireCodec;
 use super::writer::group_commit_wait;
 use super::writer::raft_group_log_record_initializes;
 use super::writer::raft_group_log_record_requires_sync;
+use crate::RaftCommand;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::entry_log_bytes;
 
@@ -95,7 +95,7 @@ fn blank_entry(index: u64) -> Entry {
 fn payload_entry(index: u64, payload_size: usize) -> Entry {
     Entry::new(
         log_id(index),
-        EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
             stream_id: BucketStreamId::new("wal-test", "segments"),
             content_type: Some("application/octet-stream".to_owned()),
             payload: Bytes::from(vec![u8::try_from(index % 251).unwrap_or(0); payload_size]),
@@ -2253,7 +2253,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     }
     leader.runtime_config().tick(false);
     let response = leader
-        .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
+        .client_write(RaftCommand::Stream(StreamCommand::CreateStream {
             stream_id: ursula_shard::BucketStreamId::new("before-pause", "events"),
             content_type: "application/octet-stream".to_owned(),
             initial_payload: bytes::Bytes::new(),
@@ -2282,7 +2282,7 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     let writing = leader.clone();
     let append = tokio::spawn(async move {
         writing
-            .client_write(GroupWriteCommand::Stream(StreamCommand::CreateStream {
+            .client_write(RaftCommand::Stream(StreamCommand::CreateStream {
                 stream_id: ursula_shard::BucketStreamId::new("during-pause", "events"),
                 content_type: "application/octet-stream".to_owned(),
                 initial_payload: bytes::Bytes::new(),
@@ -2760,7 +2760,7 @@ async fn the_history_at_the_marker_follows_the_events_apply_would_take() {
     let new_history = |index: u64, history: u64, previous: u64| {
         Entry::new(
             log_id(index),
-            EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::NewHistory {
+            EntryPayload::Normal(RaftCommand::Stream(StreamCommand::NewHistory {
                 history: std::num::NonZeroU64::new(history).expect("non-zero"),
                 now_ms: 0,
                 previous,
@@ -2807,7 +2807,7 @@ async fn the_history_at_the_marker_follows_the_events_apply_would_take() {
     assert_eq!(gate.history_at_marker(None, None, None).await, Some(0));
     append(&mut store, [Entry::new(
         log_id(5),
-        EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::ImportSnapshot {
+        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::ImportSnapshot {
             snapshot: Box::default(),
             history: std::num::NonZeroU64::new(11).expect("non-zero"),
             backup_digest: [1; 32],
@@ -2956,7 +2956,7 @@ fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
                     leader_id: CommittedLeaderId::new(7, 2),
                     index: 1_000_000,
                 },
-                EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+                EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
                     stream_id: BucketStreamId::new("tenant", "orders"),
                     content_type: Some("application/json".to_owned()),
                     payload: Bytes::from_static(payload),

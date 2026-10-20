@@ -13,11 +13,12 @@
 //! Native sources (I/O, OpenRaft, tonic) stay in local boundary types; the
 //! one conversion of each family into this error logs the source.
 //!
-//! No type in the frozen set has a catch-all variant, with one exception:
-//! `ApplyStopped` carries `ursula_proto::admin::ApplyFailureKind`, whose
-//! `#[serde(other)] Unknown` is the admin plane's fallback for another
-//! minor's metrics. Its kinds are frozen within a minor like every other
-//! type here.
+//! No type in the frozen set has a catch-all variant: `#[serde(other)]` is
+//! allowed only on admin JSON enums, never on a type of the replicated,
+//! persisted or RPC MessagePack closure, where an unknown variant decoding as
+//! "other" would hide a format mismatch. So `ApplyStopped` carries the
+//! closed [`ApplyStopKind`], which the group metrics convert to the admin
+//! plane's `ursula_proto::admin::ApplyFailureKind`.
 //!
 //! Module map:
 //!
@@ -147,6 +148,33 @@ pub enum UnproposableCommand {
     CreateBucket,
     /// Only a leader's history driver proposes a history event.
     NewHistory,
+    /// A command of the other Raft plane: a meta command to a data group,
+    /// or a data command to the meta group.
+    OtherPlane,
+}
+
+/// Why a group's committed apply stopped, as
+/// [`GroupInfraError::ApplyStopped`] carries it. Closed, like every type of
+/// the frozen set: a new kind is a format epoch change. The group metrics
+/// show it as `ursula_proto::admin::ApplyFailureKind`, whose `snake_case`
+/// names it shares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyStopKind {
+    /// The apply panicked.
+    Panic,
+    /// The apply met a state no correct log reaches.
+    InvariantViolation,
+}
+
+/// The admin plane's form of the kind, for the group metrics.
+impl From<ApplyStopKind> for ursula_proto::admin::ApplyFailureKind {
+    fn from(kind: ApplyStopKind) -> Self {
+        match kind {
+            ApplyStopKind::Panic => Self::Panic,
+            ApplyStopKind::InvariantViolation => Self::InvariantViolation,
+        }
+    }
 }
 
 /// Serializable startup classification. The WAL facade retains the native
@@ -163,6 +191,9 @@ pub enum WalOpenFailureKind {
     InvalidConfiguration,
     InvalidRecord,
     Poisoned,
+    /// The journal holds no log of the group in its current generation: it
+    /// was retired, and only an admitted creation opens it again.
+    NotHeld,
 }
 
 /// A Raft log id as a replica's log store holds it: the term and node of
@@ -203,6 +234,8 @@ pub enum ResponseKind {
     RaftBlank,
     /// OpenRaft's answer to a membership entry.
     RaftMembership,
+    /// The meta group's answer to a control command.
+    Control,
     /// No answer at all.
     Missing,
 }
@@ -378,19 +411,6 @@ pub enum AnswerProblem {
     ResultCount { results: u64 },
 }
 
-/// What is wrong with a group's static Raft membership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StaticMembershipProblem {
-    /// The per-group voter config does not name the group.
-    MissingGroup,
-    /// The group's static voter set is empty.
-    NoVoters,
-    /// A voter of the group has no static peer address.
-    VoterWithoutPeer { node_id: u64 },
-    /// This node has no static peer address.
-    NodeWithoutPeer { node_id: u64 },
-}
-
 /// Why OpenRaft refused to initialize a group's membership.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MembershipInitRefusal {
@@ -428,7 +448,7 @@ pub enum GroupInfraError {
         raft_group_id: RaftGroupId,
         term: u64,
         index: u64,
-        kind: ursula_proto::admin::ApplyFailureKind,
+        kind: ApplyStopKind,
     },
     #[error("command {command:?} cannot be proposed to a data Raft group")]
     InvalidRaftCommand { command: UnproposableCommand },
@@ -612,12 +632,6 @@ pub enum GroupInfraError {
         election_timeout_min_ms: u64,
         election_timeout_max_ms: u64,
     },
-    /// The group's static Raft membership is unusable.
-    #[error("static membership of raft group {raft_group_id:?}: {problem:?}")]
-    StaticMembership {
-        raft_group_id: RaftGroupId,
-        problem: StaticMembershipProblem,
-    },
     /// The group's recovery gate did not open.
     #[error(
         "open the recovery gate of raft group {raft_group_id:?} on core {core_id:?}: {failure:?}"
@@ -715,7 +729,6 @@ impl GroupInfraError {
             | Self::ForwardFailed { .. }
             | Self::ForwardedAnswerInvalid { .. }
             | Self::InvalidRaftConfig { .. }
-            | Self::StaticMembership { .. }
             | Self::RecoveryGateOpen { .. }
             | Self::MembershipInit { .. }
             | Self::LeaderWaitTimedOut { .. } => ErrorStatus::Persistent,
@@ -760,7 +773,6 @@ impl GroupInfraError {
             | Self::ForwardFailed { .. }
             | Self::ForwardedAnswerInvalid { .. }
             | Self::InvalidRaftConfig { .. }
-            | Self::StaticMembership { .. }
             | Self::RecoveryGateOpen { .. }
             | Self::MembershipInit { .. }
             | Self::LeaderWaitTimedOut { .. } => WriteEffect::Unknown,
@@ -801,7 +813,6 @@ impl GroupInfraError {
             | Self::ForwardFailed { .. }
             | Self::ForwardedAnswerInvalid { .. }
             | Self::InvalidRaftConfig { .. }
-            | Self::StaticMembership { .. }
             | Self::RecoveryGateOpen { .. }
             | Self::MembershipInit { .. }
             | Self::LeaderWaitTimedOut { .. } => false,

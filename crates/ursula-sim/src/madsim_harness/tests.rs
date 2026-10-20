@@ -867,9 +867,8 @@ fn runtime_raft_network_delay_snapshot_purge_probe() {
                     .expect("diagnostic current leader raft handle");
                 let probe_payload = format!("after-delay-{sim_seed}-{delay_ms};").into_bytes();
                 let probe = leader_raft
-                    .client_write(GroupWriteCommand::from(AppendRequest::from_bytes(
-                        stream,
-                        probe_payload,
+                    .client_write(RaftCommand::Stream(ursula_stream::StreamCommand::from(
+                        AppendRequest::from_bytes(stream, probe_payload),
                     )))
                     .await;
                 if let Err(err) = probe {
@@ -2250,7 +2249,9 @@ async fn external_locator_ambiguity(variant: LocatorAmbiguity) {
             // The caller's response is never observed.
             drop(madsim::task::spawn(async move {
                 let _ = raft
-                    .client_write(GroupWriteCommand::from(ambiguous_request))
+                    .client_write(RaftCommand::Stream(ursula_stream::StreamCommand::from(
+                        ambiguous_request,
+                    )))
                     .await;
             }));
             // Let it commit before the next append claims the tail.

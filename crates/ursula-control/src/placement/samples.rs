@@ -263,10 +263,47 @@ impl Driver {
 /// field: a seeded group, a stable group, a moving group with an abandoned
 /// target and a retirement, over nodes of every lifecycle. It holds every
 /// invariant of the kernel.
+///
+/// The groups are one per [`GroupPlacement`] and [`Target`] variant, in
+/// group order, built behind an exhaustive match ([`every`]): a new variant
+/// does not compile until it has a group here.
 pub fn sample_state() -> ControlPlaneState {
+    let placements = every!(GroupPlacement {
+        GroupPlacement::Seeded { .. } => GroupPlacement::Seeded {
+            since: PlacementEpoch::new(meta(3, 21)),
+            voters: voters(&[1, 2]),
+            initializer: node(2),
+        },
+        GroupPlacement::Live {
+            target: Target::Stable { .. },
+            ..
+        } => GroupPlacement::Live {
+            since: PlacementEpoch::new(meta(4, 22)),
+            converged_at: membership(5, 23),
+            target: Target::Stable {
+                voters: voters(&[1, 3]),
+            },
+        },
+        GroupPlacement::Live {
+            target: Target::Moving(_),
+            ..
+        } => GroupPlacement::Live {
+            since: PlacementEpoch::new(meta(6, 24)),
+            converged_at: membership(7, 25),
+            target: Target::Moving(Move {
+                from: voters(&[1, 3]),
+                to: voters(&[1, 2]),
+                abandoned: ids(&[5]),
+                since_ms: 26,
+            }),
+        },
+    });
+    let groups: BTreeMap<RaftGroupId, GroupPlacement> =
+        (0..).map(RaftGroupId).zip(placements).collect();
+    let group_count = u32::try_from(groups.len()).expect("a few sample groups");
     ControlPlaneState::Bootstrapped(Cluster {
         params: ClusterParams {
-            group_count: GroupCount::new(NonZeroU32::new(3).expect("non-zero")),
+            group_count: GroupCount::new(NonZeroU32::new(group_count).expect("non-zero")),
             replication_factor: ReplicationFactor::new(NonZeroU8::new(2).expect("non-zero")),
             meta_voters: voters(&[1, 2]),
             max_concurrent_moves: MoveLimit::new(5),
@@ -294,30 +331,8 @@ pub fn sample_state() -> ControlPlaneState {
                 since_ms: 15,
             }),
         ]),
-        groups: Placements(BTreeMap::from([
-            (RaftGroupId(0), GroupPlacement::Seeded {
-                since: PlacementEpoch::new(meta(3, 21)),
-                voters: voters(&[1, 2]),
-                initializer: node(2),
-            }),
-            (RaftGroupId(1), GroupPlacement::Live {
-                since: PlacementEpoch::new(meta(4, 22)),
-                converged_at: membership(5, 23),
-                target: Target::Stable {
-                    voters: voters(&[1, 3]),
-                },
-            }),
-            (RaftGroupId(2), GroupPlacement::Live {
-                since: PlacementEpoch::new(meta(6, 24)),
-                converged_at: membership(7, 25),
-                target: Target::Moving(Move {
-                    from: voters(&[1, 3]),
-                    to: voters(&[1, 2]),
-                    abandoned: ids(&[5]),
-                    since_ms: 26,
-                }),
-            }),
-        ])),
+        groups: Placements(groups),
+        // Group 1 is the stable group.
         retirements: BTreeMap::from([(
             RaftGroupId(1),
             BTreeMap::from([(node(2), Retirement {
@@ -530,12 +545,12 @@ pub fn sample_errors() -> Vec<ControlError> {
         },
         ControlError::IneligibleTarget { .. } => ControlError::IneligibleTarget {
             group: RaftGroupId(14),
-            node: node(14),
+            node: node(24),
             lifecycle: NodeLifecycle::Decommissioning,
         },
         ControlError::RetirementPending { .. } => ControlError::RetirementPending {
             group: RaftGroupId(15),
-            node: node(15),
+            node: node(25),
         },
         ControlError::MoveLimit { .. } => ControlError::MoveLimit {
             limit: 57,

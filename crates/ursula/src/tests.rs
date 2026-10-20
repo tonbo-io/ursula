@@ -5745,6 +5745,49 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     );
 }
 
+/// The cluster router hands every Raft RPC path to the gRPC service, the
+/// genesis probe's included: each answers with a gRPC content type, where a
+/// path the router does not serve would answer a plain 404.
+#[tokio::test]
+async fn cluster_router_serves_every_raft_rpc_path() {
+    let state = HttpState::new(
+        spawn_runtime(
+            &test_config(1, 1),
+            Persistence::InMemory,
+            Topology::SingleNode {
+                raft_group_count: 1,
+            },
+        )
+        .expect("runtime")
+        .runtime,
+    );
+    let cluster = cluster_router_from_state(state);
+    for path in [
+        RAFT_GRPC_APPEND_PATH,
+        RAFT_GRPC_APPEND_STREAM_PATH,
+        RAFT_GRPC_VOTE_PATH,
+        RAFT_GRPC_FULL_SNAPSHOT_PATH,
+        RAFT_GRPC_GROUP_WRITE_PATH,
+        RAFT_GRPC_GROUP_READ_PATH,
+        RAFT_GRPC_REJOIN_BARRIER_PATH,
+        RAFT_GRPC_TRANSFER_LEADER_PATH,
+        RAFT_GRPC_GENESIS_PROBE_PATH,
+    ] {
+        let response = http_post(
+            &cluster,
+            path,
+            &[("content-type", "application/grpc")],
+            Body::empty(),
+        )
+        .await;
+        assert_ne!(response.status().as_u16(), 404, "{path} is not routed");
+        assert!(
+            header_str(&response, "content-type").starts_with("application/grpc"),
+            "{path} is not served by the gRPC service"
+        );
+    }
+}
+
 #[tokio::test]
 async fn cluster_router_does_not_expose_client_plane_routes() {
     let state = HttpState::new(

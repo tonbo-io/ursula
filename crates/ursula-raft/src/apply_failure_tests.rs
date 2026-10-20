@@ -8,12 +8,12 @@ use std::time::Duration;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogReader;
 use openraft::vote::RaftLeaderId;
-use ursula_runtime::GroupWriteCommand;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
+use crate::RaftCommand;
 use crate::RaftGroupEngine;
 use crate::RaftGroupEngineOptions;
 use crate::RaftGroupHandleRegistry;
@@ -26,8 +26,13 @@ fn placement(group: u32) -> ShardPlacement {
     }
 }
 
-fn create_stream(name: &str) -> GroupWriteCommand {
-    GroupWriteCommand::Stream(ursula_stream::StreamCommand::CreateStream {
+fn create_stream(name: &str) -> RaftCommand {
+    RaftCommand::Stream(create_stream_command(name))
+}
+
+/// The create [`create_stream`] carries, as a data engine proposes it.
+fn create_stream_command(name: &str) -> ursula_stream::StreamCommand {
+    ursula_stream::StreamCommand::CreateStream {
         stream_id: ursula_shard::BucketStreamId::new(name, "events"),
         content_type: "application/octet-stream".to_owned(),
         initial_payload: bytes::Bytes::copy_from_slice(name.as_bytes()),
@@ -36,7 +41,7 @@ fn create_stream(name: &str) -> GroupWriteCommand {
         stream_ttl_seconds: None,
         stream_expires_at_ms: None,
         now_ms: 0,
-    })
+    }
 }
 
 #[tokio::test]
@@ -108,11 +113,9 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .unwrap();
     let poison_index = previous.index().checked_add(1).unwrap();
     let rejected = poisoned
-        .write(GroupWriteCommand::Stream(
-            ursula_stream::StreamCommand::CreateBucket {
-                bucket_id: "not-a-data-command".to_owned(),
-            },
-        ))
+        .write(ursula_stream::StreamCommand::CreateBucket {
+            bucket_id: "not-a-data-command".to_owned(),
+        })
         .await
         .unwrap_err();
     assert!(matches!(
@@ -140,7 +143,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         .unwrap();
     let result = crate::rt::time::timeout(
         Duration::from_secs(5),
-        poisoned.write(create_stream("poison-record")),
+        poisoned.write(create_stream_command("poison-record")),
     )
     .await
     .unwrap();
@@ -153,7 +156,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     ));
     // A later command is refused before proposal and names the failure.
     assert!(matches!(
-        poisoned.write(create_stream("after-stop")).await,
+        poisoned.write(create_stream_command("after-stop")).await,
         Err(ursula_runtime::GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::ApplyStopped { index, .. }
         )) if index == poison_index
@@ -321,6 +324,8 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let write_error = service
         .group_write(tonic::Request::new(
             crate::raft_internal_proto::GroupWriteRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
                 protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
                 command_payloads: vec![crate::codec::encode_wire(&create_stream(
                     "refused-after-replay",
@@ -334,6 +339,8 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let read_error = service
         .group_read(tonic::Request::new(
             crate::raft_internal_proto::GroupReadRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
                 protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
                 ..Default::default()
             },
@@ -389,7 +396,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
                 .await,
             Err(ursula_runtime::RuntimeError::GroupEngine {
                 error: ursula_runtime::GroupEngineError::Infra(
-                    ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
+                    ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyStopKind::Panic, .. }
                 ),
                 ..
             }) if index == poison_index
@@ -399,7 +406,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         runtime.warm_group(RaftGroupId(0)).await,
         Err(ursula_runtime::RuntimeError::GroupEngine {
             error: ursula_runtime::GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
+                ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyStopKind::Panic, .. }
             ),
             ..
         }) if index == poison_index
@@ -540,10 +547,10 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
         ),
         payload: openraft::EntryPayload::Normal(command),
     };
-    let rejected = GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
+    let rejected = ursula_stream::StreamCommand::DeleteStream {
         stream_id: ursula_shard::BucketStreamId::new("absent", "absent"),
         now_ms: 0,
-    });
+    };
     let result = state
         .engine
         .apply_committed_write(rejected.clone(), placement(0));
@@ -552,7 +559,10 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
         Err(ursula_runtime::GroupEngineError::Stream(_))
     ));
     state
-        .apply(futures_util::stream::iter([Ok((entry(1, rejected), None))]))
+        .apply(futures_util::stream::iter([Ok((
+            entry(1, RaftCommand::Stream(rejected)),
+            None,
+        ))]))
         .await
         .unwrap();
     assert_eq!(state.last_applied_log_id.unwrap().index(), 1);
@@ -578,6 +588,88 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
     assert_eq!(
         state.apply_health.failure().unwrap().kind,
         crate::apply_failure::ApplyFailureKind::InvariantViolation
+    );
+}
+
+/// A data group never commits a meta command, which no request of its
+/// plane admits. A state machine that meets one anyway stops its apply as
+/// an invariant violation at that entry, which applies nothing: the last
+/// applied entry stays the one before it.
+#[tokio::test]
+async fn a_meta_command_stops_a_data_groups_apply_before_the_entry() {
+    use openraft::storage::RaftStateMachine;
+    use ursula_runtime::GroupEngine;
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::GroupInfraError;
+    let mut state = crate::RaftGroupStateMachine::new(placement(0));
+    let entry = |index, command| openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
+        log_id: openraft::LogId::new(
+            openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+            index,
+        ),
+        payload: openraft::EntryPayload::Normal(command),
+    };
+    state
+        .apply(futures_util::stream::iter([Ok((
+            entry(1, crate::tests::genesis_command()),
+            None,
+        ))]))
+        .await
+        .expect("the group's genesis");
+    let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
+        ursula_control::ControlCommand::RegisterNode {
+            node: ursula_control::NodeId::new(1),
+            now_ms: 1,
+        },
+    ));
+    let error = state
+        .apply(futures_util::stream::iter([
+            Ok((entry(2, meta), None)),
+            Ok((entry(3, create_stream("after-the-meta-entry")), None)),
+        ]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<crate::apply_failure::ApplyError>(),
+        Some(crate::apply_failure::ApplyError::InvariantViolation(
+            GroupEngineError::Infra(GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::OtherPlane,
+            })
+        ))
+    ));
+    assert_eq!(state.last_applied_log_id.unwrap().index(), 1);
+    let stopped = state.apply_health.stopped().unwrap();
+    assert_eq!(
+        stopped.kind,
+        crate::apply_failure::ApplyStopKind::InvariantViolation
+    );
+    assert_eq!(stopped.index, 2);
+    assert_eq!(stopped.last_applied.unwrap().index(), 1);
+    assert_eq!(
+        state.apply_health.failure().unwrap().kind,
+        crate::apply_failure::ApplyFailureKind::InvariantViolation
+    );
+    assert!(matches!(
+        state.apply_health.check(RaftGroupId(0)),
+        Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped {
+            index: 2,
+            kind: crate::apply_failure::ApplyStopKind::InvariantViolation,
+            ..
+        }))
+    ));
+    assert!(
+        state
+            .engine
+            .snapshot(placement(0))
+            .await
+            .unwrap()
+            .stream_snapshot
+            .streams
+            .is_empty(),
+        "nothing after the meta entry applied"
     );
 }
 

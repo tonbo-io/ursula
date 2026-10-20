@@ -67,7 +67,6 @@ use ursula_runtime::GroupEngineError;
 #[cfg(not(madsim))]
 use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupInfraError;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 #[cfg(not(madsim))]
@@ -97,6 +96,7 @@ use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
+use ursula_stream::StreamCommand;
 
 use super::*;
 use crate::codec::*;
@@ -361,12 +361,14 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     let service = crate::grpc::RaftGrpcService::new(registry);
     // A data group never takes CreateBucket: the leader refuses the batch
     // before it proposes any of it.
-    let unproposable = GroupWriteCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
+    let unproposable = RaftCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
         bucket_id: "forwarded".to_owned(),
     });
     let response = service
         .group_write(tonic::Request::new(
             crate::raft_internal_proto::GroupWriteRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
                 protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
                 command_payloads: vec![encode_wire(&unproposable), encode_wire(&unproposable)],
                 ..Default::default()
@@ -387,6 +389,230 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
             })
         );
     }
+
+    // A data group never takes a meta command: a batch that carries one is
+    // refused as a whole, before anything of it is proposed.
+    let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
+        ursula_control::ControlCommand::RegisterNode {
+            node: ursula_control::NodeId::new(1),
+            now_ms: 1,
+        },
+    ));
+    let response = service
+        .group_write(tonic::Request::new(
+            crate::raft_internal_proto::GroupWriteRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                command_payloads: vec![
+                    encode_wire(&create_stream_command("cross-plane")),
+                    encode_wire(&meta),
+                ],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a refused batch is an answer, not a gRPC error")
+        .into_inner();
+    assert_eq!(response.results.len(), 2);
+    for result in response.results {
+        assert!(!result.ok);
+        let refusal: GroupEngineError =
+            decode_wire(&result.payload, "group engine error").expect("decodes");
+        assert_eq!(
+            refusal,
+            GroupEngineError::Infra(GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::OtherPlane,
+            })
+        );
+    }
+}
+
+/// Every group RPC checks its target before the group: the plane, the
+/// group a meta request names and the node the request is for. A request
+/// for another node is refused with the misdelivery refusal, which names
+/// this node and is no protocol mismatch, and the meta group, which no
+/// node runs yet, is answered as a group this node does not run.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_rpcs_check_their_target_before_the_group() {
+    use crate::raft_internal_proto as pb;
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+
+    let wal_root = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
+            .with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let service = crate::grpc::RaftGrpcService::new(registry);
+    let version = crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
+    let write = |plane: pb::RaftPlaneV1, target_node| pb::GroupWriteRequestV1 {
+        plane: plane.into(),
+        target_node,
+        protocol_version: version,
+        ..Default::default()
+    };
+    let read = |plane: pb::RaftPlaneV1, target_node| pb::GroupReadRequestV1 {
+        plane: plane.into(),
+        target_node,
+        protocol_version: version,
+        ..Default::default()
+    };
+    let barrier = |plane: pb::RaftPlaneV1, target_node| pb::RejoinBarrierRequestV1 {
+        plane: plane.into(),
+        target_node,
+        protocol_version: version,
+        ..Default::default()
+    };
+    fn code<T>(result: Result<tonic::Response<T>, tonic::Status>) -> Option<tonic::Code> {
+        result.err().map(|status| status.code())
+    }
+    for (plane, node, expected) in [
+        (
+            pb::RaftPlaneV1::Unspecified,
+            1,
+            tonic::Code::InvalidArgument,
+        ),
+        (pb::RaftPlaneV1::Meta, 1, tonic::Code::NotFound),
+        (pb::RaftPlaneV1::Data, 2, tonic::Code::FailedPrecondition),
+    ] {
+        assert_eq!(
+            code(
+                service
+                    .group_write(tonic::Request::new(write(plane, node)))
+                    .await
+            ),
+            Some(expected),
+            "GroupWrite of plane {plane:?} for node {node}"
+        );
+        assert_eq!(
+            code(
+                service
+                    .rejoin_barrier(tonic::Request::new(barrier(plane, node)))
+                    .await
+            ),
+            Some(expected),
+            "RejoinBarrier of plane {plane:?} for node {node}"
+        );
+    }
+    // The meta group serves no stream reads.
+    assert_eq!(
+        code(
+            service
+                .group_read(tonic::Request::new(read(pb::RaftPlaneV1::Meta, 1)))
+                .await
+        ),
+        Some(tonic::Code::InvalidArgument)
+    );
+    let misdelivered = service
+        .group_read(tonic::Request::new(read(pb::RaftPlaneV1::Data, 2)))
+        .await
+        .expect_err("node 1 is not node 2");
+    assert_eq!(misdelivered.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(crate::target::refusing_node(&misdelivered), Some(1));
+    assert!(!crate::format_epoch::is_protocol_mismatch(&misdelivered));
+    // A meta request names group 0.
+    let mut meta_group = write(pb::RaftPlaneV1::Meta, 1);
+    meta_group.raft_group_id = 3;
+    assert_eq!(
+        code(service.group_write(tonic::Request::new(meta_group)).await),
+        Some(tonic::Code::InvalidArgument)
+    );
+    // The genesis probe checks its target node, and no node answers it yet.
+    let probe =
+        crate::meta::genesis::genesis_probe_request(2, &crate::meta::genesis::GenesisProbe {
+            claim: ursula_control::samples::sample_genesis_claim(),
+            vote: crate::bootstrap_probe_vote(),
+        });
+    let refused = service
+        .genesis_probe(tonic::Request::new(probe.clone()))
+        .await
+        .expect_err("node 1 is not node 2");
+    assert_eq!(crate::target::refusing_node(&refused), Some(1));
+    let mut probe = probe;
+    probe.target_node = 1;
+    assert_eq!(
+        code(service.genesis_probe(tonic::Request::new(probe)).await),
+        Some(tonic::Code::NotFound)
+    );
+}
+
+/// An inbound append to a data group whose entries carry a meta command is
+/// refused (`INVALID_ARGUMENT`) before OpenRaft sees it: the group keeps
+/// its vote, though the request's is higher. The same request without the
+/// meta entry reaches OpenRaft, which takes its vote.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() {
+    use openraft::rt::WatchReceiver;
+
+    use crate::raft_internal_proto as pb;
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+
+    let wal_root = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
+            .with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let mut metrics = registry.get(RaftGroupId(0)).unwrap().metrics();
+    let term = metrics.borrow_watched().current_term;
+    let higher = term + 10;
+    let service = crate::grpc::RaftGrpcService::new(registry.clone());
+    let append = |entries| {
+        let request = UrsulaAppendEntriesRequest {
+            vote: UrsulaVote::new_committed(higher, 2),
+            prev_log_id: None,
+            entries,
+            leader_commit: None,
+        };
+        let mut envelope = pb::RaftRpcEnvelopeV1 {
+            protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+            payload: encode_wire(&request),
+            ..Default::default()
+        };
+        crate::target::RaftTarget::Data(RaftGroupId(0)).stamp(1, &mut envelope);
+        tonic::Request::new(envelope)
+    };
+    let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
+        ursula_control::ControlCommand::RegisterNode {
+            node: ursula_control::NodeId::new(2),
+            now_ms: 1,
+        },
+    ));
+    let entry = Entry::new(
+        LogId {
+            leader_id: CommittedLeaderId::new(higher, 2),
+            index: 1,
+        },
+        EntryPayload::Normal(meta),
+    );
+    let refused = service
+        .append(append(vec![entry]))
+        .await
+        .expect_err("a data group takes no meta command");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(!crate::format_epoch::is_protocol_mismatch(&refused));
+    assert_eq!(metrics.borrow_watched().current_term, term);
+
+    service
+        .append(append(Vec::new()))
+        .await
+        .expect("an append without the meta entry reaches OpenRaft");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while metrics.borrow_watched().current_term < higher {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("OpenRaft takes the request's vote");
 }
 
 fn placement() -> ShardPlacement {
@@ -431,14 +657,14 @@ fn create_req(stream_id: ursula_shard::BucketStreamId) -> CreateStreamRequest {
     CreateStreamRequest::new(stream_id, "application/octet-stream")
 }
 
-fn create_command(stream_id: ursula_shard::BucketStreamId) -> GroupWriteCommand {
-    GroupWriteCommand::from(create_req(stream_id))
+fn create_command(stream_id: ursula_shard::BucketStreamId) -> RaftCommand {
+    RaftCommand::Stream(StreamCommand::from(create_req(stream_id)))
 }
 
 /// A group's genesis history event, for a test that builds a log or writes
 /// to a raw Raft core: a group applies nothing before it (#581 section 4.3).
-pub(crate) fn genesis_command() -> GroupWriteCommand {
-    GroupWriteCommand::Stream(ursula_stream::StreamCommand::NewHistory {
+pub(crate) fn genesis_command() -> RaftCommand {
+    RaftCommand::Stream(ursula_stream::StreamCommand::NewHistory {
         history: std::num::NonZeroU64::new(1).expect("non-zero"),
         now_ms: 0,
         previous: 0,
@@ -450,8 +676,13 @@ pub(crate) fn genesis_command() -> GroupWriteCommand {
     })
 }
 
-fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> GroupWriteCommand {
-    GroupWriteCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
+fn append_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> RaftCommand {
+    RaftCommand::Stream(append_stream_command(stream_id, payload))
+}
+
+/// The append [`append_command`] carries, as a data engine proposes it.
+fn append_stream_command(stream_id: ursula_shard::BucketStreamId, payload: &[u8]) -> StreamCommand {
+    StreamCommand::from(AppendRequest::from_bytes(stream_id, payload.to_vec()))
 }
 
 #[cfg(not(madsim))]
@@ -671,18 +902,18 @@ fn log_id(index: u64) -> LogId<CommittedLeaderId> {
 
 fn normal_entry(
     index: u64,
-    command: GroupWriteCommand,
+    command: RaftCommand,
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
     Entry::new(log_id(index), EntryPayload::Normal(command))
 }
 
-fn create_stream_command(name: &str) -> GroupWriteCommand {
+fn create_stream_command(name: &str) -> RaftCommand {
     create_command(bsid(name))
 }
 
 #[test]
 fn raft_group_command_round_trips_through_wire_codec() {
-    let command = GroupWriteCommand::Stream(ursula_stream::StreamCommand::Append {
+    let command = RaftCommand::Stream(ursula_stream::StreamCommand::Append {
         stream_id: bsid("shared-wire-log"),
         content_type: Some("application/octet-stream".to_owned()),
         payload: b"abcd".to_vec().into(),
@@ -699,8 +930,7 @@ fn raft_group_command_round_trips_through_wire_codec() {
     });
 
     let encoded = encode_wire(&command);
-    let decoded: GroupWriteCommand =
-        decode_wire(&encoded, "group command").expect("decode wire command");
+    let decoded: RaftCommand = decode_wire(&encoded, "group command").expect("decode wire command");
     assert_eq!(decoded, command);
 
     // Determinism: re-encoding the decoded value is byte-identical.
@@ -1381,7 +1611,7 @@ async fn a_write_right_after_an_election_is_not_refused() {
         "the write lands before the new leader's first quorum acknowledgement"
     );
     let written = engines[new_index]
-        .write(append_command(stream_id, b"after-election"))
+        .write(append_stream_command(stream_id, b"after-election"))
         .await;
     assert!(
         matches!(written, Ok(GroupWriteResponse::Append(_))),
@@ -1419,7 +1649,7 @@ async fn a_leader_past_its_lease_refuses_a_write_before_appending_it() {
         "the cut-off leader still believes it leads"
     );
     let refused = engine
-        .write(append_command(stream_id, b"past-lease"))
+        .write(append_stream_command(stream_id, b"past-lease"))
         .await
         .expect_err("a leader past its lease refuses the write");
     assert!(
@@ -1758,14 +1988,14 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     };
 
     let checked = follower
-        .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"a"))
+        .forward_write_to_leader_if_follower(append_stream_command(stream_id.clone(), b"a"))
         .await
         .expect_err("the engine's check refuses a write on a follower");
     assert!(refused_before_proposal(&checked), "{checked:?}");
     assert!(names_the_leader(&checked), "{checked:?}");
 
     let written = follower
-        .write(append_command(stream_id.clone(), b"a"))
+        .write(append_stream_command(stream_id.clone(), b"a"))
         .await
         .expect_err("the engine's check refuses a write on a follower");
     assert!(refused_before_proposal(&written), "{written:?}");
@@ -2056,7 +2286,7 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         // proposal. Running it after the hand-off would misclassify the
         // write.
         let checked = engines[index(leader_id)]
-            .forward_write_to_leader_if_follower(append_command(stream_id.clone(), b"abc"))
+            .forward_write_to_leader_if_follower(append_stream_command(stream_id.clone(), b"abc"))
             .await
             .expect_err("the deposed node follows the new leader");
         assert!(refused_before_proposal(&checked), "{write:?}: {checked:?}");
@@ -2096,7 +2326,7 @@ async fn writes_are_routed_before_their_body() {
     append.producer = Some(producer.clone());
     let appended = engines[leader_index]
         .raft
-        .client_write(GroupWriteCommand::from(append))
+        .client_write(RaftCommand::Stream(StreamCommand::from(append)))
         .await
         .expect("append through the leader");
     let index = appended.log_id.index();
@@ -3847,7 +4077,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
     };
     apply_entries(&mut sm, vec![normal_entry(
         8,
-        GroupWriteCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
+        RaftCommand::Stream(ursula_stream::StreamCommand::DeleteStream {
             stream_id: deleted,
             now_ms: 0,
         }),
@@ -3857,7 +4087,7 @@ async fn applied_removals_record_what_the_snapshot_held() {
     assert_eq!(owed(&sm), deleted_bytes);
     apply_entries(&mut sm, vec![normal_entry(
         9,
-        GroupWriteCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
+        RaftCommand::Stream(ursula_stream::StreamCommand::PurgeBucket {
             bucket_id: "removal-purged".to_owned(),
         }),
     )])
@@ -3914,7 +4144,10 @@ async fn openraft_snapshot_round_trips_group_state() {
 
     let appended = target
         .engine
-        .apply_committed_write(append_command(bsid("raft-snapshot"), b"-next"), placement())
+        .apply_committed_write(
+            append_stream_command(bsid("raft-snapshot"), b"-next"),
+            placement(),
+        )
         .expect("append after install");
     match appended {
         GroupWriteResponse::Append(response) => {
@@ -4783,7 +5016,7 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     .await
                     .unwrap();
                 let error = leader
-                    .write(append_command(stream.clone(), b"committed-poison"))
+                    .write(append_stream_command(stream.clone(), b"committed-poison"))
                     .await
                     .unwrap_err();
                 assert!(matches!(
@@ -4791,7 +5024,7 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     GroupEngineError::Infra(ursula_runtime::GroupInfraError::OutcomeUnknown)
                 ));
                 let refused = leader
-                    .write(append_command(stream.clone(), b"after-stop"))
+                    .write(append_stream_command(stream.clone(), b"after-stop"))
                     .await
                     .unwrap_err();
                 assert!(
@@ -4824,7 +5057,7 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
                     .await
                     .unwrap();
                 replacement
-                    .write(append_command(stream, b"after-re-election"))
+                    .write(append_stream_command(stream, b"after-re-election"))
                     .await
                     .unwrap();
                 assert_eq!(
@@ -4840,14 +5073,11 @@ fn madsim_apply_failure_survives_real_leader_re_election() {
 
 /// A create of `stream_id` that expires at `expires_at_ms`.
 #[cfg(not(madsim))]
-fn expiring_create(
-    stream_id: ursula_shard::BucketStreamId,
-    expires_at_ms: u64,
-) -> GroupWriteCommand {
+fn expiring_create(stream_id: ursula_shard::BucketStreamId, expires_at_ms: u64) -> RaftCommand {
     let mut request = create_req(stream_id);
     request.stream_expires_at_ms = Some(expires_at_ms);
     request.now_ms = 1;
-    GroupWriteCommand::from(request)
+    RaftCommand::Stream(StreamCommand::from(request))
 }
 
 /// #669: a group's leader sweeps the streams that expired in it in its
@@ -4922,7 +5152,7 @@ async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
         assert!(
             matches!(
                 &entry.payload,
-                EntryPayload::Normal(GroupWriteCommand::Stream(
+                EntryPayload::Normal(RaftCommand::Stream(
                     ursula_stream::StreamCommand::ExpireStreams {
                         now_ms: 19_000,
                         limit,

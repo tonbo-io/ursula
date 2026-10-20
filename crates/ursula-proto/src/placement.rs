@@ -26,7 +26,14 @@
 //!
 //! In both encoded classes a variant is written by its `snake_case` name, so
 //! variant names are format too: renaming one is a format change, or an
-//! admin protocol change. No type here uses `default`,
+//! admin protocol change. The `snake_case` names are deliberate, and so is
+//! the different casing of the Raft-layer envelopes beside them
+//! (`StreamCommand`, `RaftCommand`, `MetaCommand`, `MetaResponse` and
+//! `GenesisAnswer`), which keep serde's default `PascalCase` names as 0.9's
+//! `StreamCommand` does. The types here and those of `ursula_control` are
+//! `snake_case` because one serde form serves both the admin JSON and the
+//! MessagePack closure. Each casing is frozen with format epoch 6, and
+//! neither is converted to the other. No type here uses `default`,
 //! `skip_serializing_if`, `flatten` or an untagged enum. Newtypes are
 //! transparent, and a set that is never empty decodes through a validating
 //! `try_from`.

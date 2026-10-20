@@ -110,10 +110,7 @@ impl RaftInternal for RecoveryTestService {
                         request_id: item.request_id,
                         result: Some(match result {
                             Ok(ack) => WireResult::Ack(ack),
-                            Err(err) => WireResult::Error(pb::RaftAppendStreamError {
-                                code: err.code() as i32,
-                                message: err.message().to_owned(),
-                            }),
+                            Err(err) => WireResult::Error(crate::grpc::stream_item_error(&err)),
                         }),
                     });
                 }
@@ -171,6 +168,13 @@ impl RaftInternal for RecoveryTestService {
         request: Request<pb::RaftTransferLeaderRequestV1>,
     ) -> Result<Response<pb::RaftTransferLeaderAckV1>, Status> {
         self.inner.transfer_leader(request).await
+    }
+
+    async fn genesis_probe(
+        &self,
+        request: Request<pb::GenesisProbeRequestV1>,
+    ) -> Result<Response<pb::GenesisProbeAckV1>, Status> {
+        self.inner.genesis_probe(request).await
     }
 }
 
@@ -384,6 +388,7 @@ async fn fresh_proof(
             PROBE_TIMEOUT.min(remaining),
         )
         .await
+        .map(|answer| (answer.vote, answer.index))
         .map_err(probe_attempt_error)
     })
     .await
@@ -770,6 +775,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     );
     let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
+            plane: pb::RaftPlaneV1::Data.into(),
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
             protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -800,6 +806,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     assert!(
         client
             .transfer_leader(Request::new(pb::RaftTransferLeaderRequestV1 {
+                plane: pb::RaftPlaneV1::Data.into(),
                 raft_group_id: placement().raft_group_id.0,
                 node_id: 1,
                 protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -939,6 +946,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     wal_roots[0] = wal_root;
     let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
+            plane: pb::RaftPlaneV1::Data.into(),
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
             protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -991,6 +999,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                 PROBE_TIMEOUT.min(remaining),
             )
             .await
+            .map(|answer| (answer.vote, answer.index))
             .map_err(|error| {
                 assert!(
                     !gates[0].vote_gate_open(),
@@ -1347,23 +1356,27 @@ async fn lagging_follower_forwards_a_gone_offset_of_a_recreated_stream() {
     let mut last = None;
     for command in [
         append_command(stream_id.clone(), b"old-prefix"),
-        GroupWriteCommand::from(ursula_runtime::PublishSnapshotRequest {
-            stream_id: stream_id.clone(),
-            snapshot_offset: 10,
-            content_type: "application/octet-stream".to_owned(),
-            payload: bytes::Bytes::from_static(b"snapshot"),
-            cold_body: None,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
-        GroupWriteCommand::from(ursula_runtime::AdvanceRetentionRequest {
-            stream_id: stream_id.clone(),
-            retained_offset: 10,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::PublishSnapshotRequest {
+                stream_id: stream_id.clone(),
+                snapshot_offset: 10,
+                content_type: "application/octet-stream".to_owned(),
+                payload: bytes::Bytes::from_static(b"snapshot"),
+                cold_body: None,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::AdvanceRetentionRequest {
+                stream_id: stream_id.clone(),
+                retained_offset: 10,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
     ] {
         last = Some(cluster.engines[1].raft.client_write(command).await.unwrap());
     }
@@ -1389,11 +1402,11 @@ async fn lagging_follower_forwards_a_gone_offset_of_a_recreated_stream() {
         .pause_replication
         .store(true, Ordering::SeqCst);
     for command in [
-        GroupWriteCommand::from(ursula_runtime::DeleteStreamRequest {
+        RaftCommand::Stream(StreamCommand::from(ursula_runtime::DeleteStreamRequest {
             stream_id: stream_id.clone(),
             now_ms: 0,
             if_incarnation: None,
-        }),
+        })),
         create_command(stream_id.clone()),
         append_command(stream_id.clone(), b"new"),
     ] {
@@ -1460,23 +1473,27 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
     let mut last = None;
     for command in [
         append_command(stream_id.clone(), b"old-prefix-tail-bytes"),
-        GroupWriteCommand::from(ursula_runtime::PublishSnapshotRequest {
-            stream_id: stream_id.clone(),
-            snapshot_offset: 10,
-            content_type: "application/octet-stream".to_owned(),
-            payload: bytes::Bytes::from_static(b"snapshot"),
-            cold_body: None,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
-        GroupWriteCommand::from(ursula_runtime::AdvanceRetentionRequest {
-            stream_id: stream_id.clone(),
-            retained_offset: 10,
-            now_ms: 0,
-            expected_incarnation: None,
-            if_incarnation: None,
-        }),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::PublishSnapshotRequest {
+                stream_id: stream_id.clone(),
+                snapshot_offset: 10,
+                content_type: "application/octet-stream".to_owned(),
+                payload: bytes::Bytes::from_static(b"snapshot"),
+                cold_body: None,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
+        RaftCommand::Stream(StreamCommand::from(
+            ursula_runtime::AdvanceRetentionRequest {
+                stream_id: stream_id.clone(),
+                retained_offset: 10,
+                now_ms: 0,
+                expected_incarnation: None,
+                if_incarnation: None,
+            },
+        )),
     ] {
         last = Some(cluster.engines[1].raft.client_write(command).await.unwrap());
     }

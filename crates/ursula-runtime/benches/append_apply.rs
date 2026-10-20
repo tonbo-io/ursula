@@ -9,7 +9,6 @@ use criterion::Throughput;
 use criterion::black_box;
 use criterion::criterion_group;
 use criterion::criterion_main;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::InMemoryGroupEngine;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -82,7 +81,7 @@ fn unrelated_stream_cardinality_benches(c: &mut Criterion) {
                         for _ in 0..CARDINALITY_APPEND_COUNT {
                             let response = engine
                                 .apply_committed_write(
-                                    GroupWriteCommand::Stream(StreamCommand::Append {
+                                    StreamCommand::Append {
                                         stream_id: stream_id(0),
                                         content_type: Some(CONTENT_TYPE.to_owned()),
                                         payload: bytes::Bytes::from_static(b"x"),
@@ -90,7 +89,7 @@ fn unrelated_stream_cardinality_benches(c: &mut Criterion) {
                                         stream_seq: None,
                                         producer: None,
                                         now_ms: 0,
-                                    }),
+                                    },
                                     placement,
                                 )
                                 .expect("append applies");
@@ -113,7 +112,7 @@ fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemor
     for stream_index in 0..stream_count {
         let response = engine
             .apply_committed_write(
-                GroupWriteCommand::Stream(StreamCommand::CreateStream {
+                StreamCommand::CreateStream {
                     stream_id: stream_id(stream_index),
                     content_type: CONTENT_TYPE.to_owned(),
                     initial_payload: bytes::Bytes::new(),
@@ -122,7 +121,7 @@ fn setup_group_engine(stream_count: usize, placement: ShardPlacement) -> InMemor
                     stream_ttl_seconds: None,
                     stream_expires_at_ms: None,
                     now_ms: 0,
-                }),
+                },
                 placement,
             )
             .expect("stream create applies");

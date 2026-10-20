@@ -9,7 +9,6 @@ use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 
 use super::in_memory::InMemoryGroupEngine;
-use crate::command::GroupWriteCommand;
 use crate::request::AppendRequest;
 use crate::request::ColdWriteAdmission;
 use crate::request::CreateStreamRequest;
@@ -32,7 +31,7 @@ fn create(
     request.stream_ttl_seconds = ttl;
     request.now_ms = now_ms;
     engine
-        .apply_committed_write(GroupWriteCommand::from(request), placement())
+        .apply_committed_write(StreamCommand::from(request), placement())
         .expect("create stream");
 }
 
@@ -54,11 +53,11 @@ fn ttl_expiry_drops_append_count_and_recreate_matches_installed_replica() {
     assert_eq!(append(&mut long_lived, &stream_id, 2), 2);
     long_lived
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::TouchStreamAccess {
+            StreamCommand::TouchStreamAccess {
                 stream_id: stream_id.clone(),
                 now_ms: 10_000,
                 renew_ttl: true,
-            }),
+            },
             placement(),
         )
         .expect("expire stream");
@@ -86,9 +85,9 @@ fn purge_bucket_drops_append_counts() {
     }
     engine
         .apply_committed_write(
-            GroupWriteCommand::Stream(StreamCommand::PurgeBucket {
+            StreamCommand::PurgeBucket {
                 bucket_id: "purged".to_owned(),
-            }),
+            },
             placement(),
         )
         .expect("purge bucket");

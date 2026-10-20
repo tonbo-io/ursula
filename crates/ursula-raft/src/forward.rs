@@ -19,7 +19,6 @@ use ursula_runtime::ForwardFailure;
 use ursula_runtime::ForwardedRpc;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::HeadStreamResponse;
@@ -42,11 +41,15 @@ use crate::format_epoch::observe_outbound_status;
 use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
 use crate::grpc::RaftClient;
+use crate::meta::MetaCommand;
+use crate::meta::MetaResponse;
 use crate::peer_channel::peer_endpoint;
 use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::refusing_cluster;
 use crate::raft_internal_proto;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::target::RaftTarget;
+use crate::types::RaftCommand;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -184,8 +187,7 @@ pub(crate) async fn forward_group_read_to_leader(
     now_ms: u64,
     read: raft_internal_proto::group_read_request_v1::Read,
 ) -> Result<raft_internal_proto::GroupReadResponseV1, GroupEngineError> {
-    let request = raft_internal_proto::GroupReadRequestV1 {
-        raft_group_id: placement.raft_group_id.0,
+    let mut request = raft_internal_proto::GroupReadRequestV1 {
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
         bucket_id: stream_id.bucket_id,
@@ -193,7 +195,9 @@ pub(crate) async fn forward_group_read_to_leader(
         now_ms,
         read: Some(read),
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+        ..Default::default()
     };
+    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
     call_leader(
         route,
         placement,
@@ -215,15 +219,16 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     placement: ShardPlacement,
     bucket_id: String,
 ) -> Result<PurgeBucketResponse, GroupEngineError> {
-    let request = raft_internal_proto::GroupWriteRequestV1 {
-        raft_group_id: placement.raft_group_id.0,
+    let mut request = raft_internal_proto::GroupWriteRequestV1 {
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
-        command_payloads: vec![encode_wire(&GroupWriteCommand::Stream(
+        command_payloads: vec![encode_wire(&RaftCommand::Stream(
             ursula_stream::StreamCommand::PurgeBucket { bucket_id },
         ))],
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+        ..Default::default()
     };
+    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
     let response = call_leader(
         route,
         placement,
@@ -272,6 +277,14 @@ pub(crate) enum ForwardError {
         rpc: ForwardedRpc,
         address: String,
         cluster_id: ursula_headers::ClusterId,
+    },
+    /// The leader's address serves another node now, which refused the call
+    /// as meant for another node: nothing ran there.
+    #[error("{rpc} to the group leader at {address} was refused: the address serves node {node}")]
+    OtherNode {
+        rpc: ForwardedRpc,
+        address: String,
+        node: u64,
     },
     #[error("{rpc} cannot be forwarded: invalid gRPC leader endpoint {address}")]
     InvalidEndpoint {
@@ -339,6 +352,12 @@ impl ForwardError {
                     LeadershipReason::LeaderInOtherCluster,
                     Proposal::NotProposed,
                 );
+            }
+            // Nothing ran on the node at the leader's address, which is
+            // another node now: to the client, a leader this node cannot
+            // reach until its view of the group's leader moves on.
+            Self::OtherNode { .. } => {
+                return unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
             }
             // A purge whose request reached the leader's socket may have
             // committed there.
@@ -433,7 +452,13 @@ where
                 Ok(Ok(response)) => return Ok(response.into_inner()),
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
-                    if peer_cluster.observe_refusal(
+                    if let Some(node) = crate::target::refusing_node(&status) {
+                        ForwardError::OtherNode {
+                            rpc,
+                            address: address.to_owned(),
+                            node,
+                        }
+                    } else if peer_cluster.observe_refusal(
                         route.leader_id,
                         address,
                         &status,
@@ -584,29 +609,40 @@ pub(crate) fn has_leader_channel(address: &str) -> bool {
     LEADER_CHANNELS.contains(address)
 }
 
-/// Reject commands that the data-group apply dispatcher cannot execute.
-pub(crate) fn validate_proposal(command: &GroupWriteCommand) -> Result<(), GroupEngineError> {
-    let GroupWriteCommand::Stream(command) = command;
-    let mut command = command;
-    while let ursula_stream::StreamCommand::IfIncarnation { command: inner, .. } = command {
-        command = inner;
-    }
+/// Reject commands that the apply dispatcher of their plane cannot execute,
+/// the one proposal check of both planes. Only a leader's history driver
+/// proposes a history event, straight to its Raft core (#581 section 4.3),
+/// on either plane.
+pub(crate) fn validate_proposal(command: &RaftCommand) -> Result<(), GroupEngineError> {
     let unproposable = match command {
-        ursula_stream::StreamCommand::CreateBucket { .. } => {
-            ursula_runtime::UnproposableCommand::CreateBucket
+        RaftCommand::Stream(command) => {
+            let mut command = command;
+            while let ursula_stream::StreamCommand::IfIncarnation { command: inner, .. } = command {
+                command = inner;
+            }
+            match command {
+                ursula_stream::StreamCommand::CreateBucket { .. } => {
+                    ursula_runtime::UnproposableCommand::CreateBucket
+                }
+                ursula_stream::StreamCommand::NewHistory { .. } => {
+                    ursula_runtime::UnproposableCommand::NewHistory
+                }
+                _ => return Ok(()),
+            }
         }
-        // Only a leader's history driver proposes a history event, straight
-        // to its Raft core (#581 section 4.3).
-        ursula_stream::StreamCommand::NewHistory { .. } => {
+        RaftCommand::Meta(MetaCommand::NewHistory { .. }) => {
             ursula_runtime::UnproposableCommand::NewHistory
         }
-        _ => return Ok(()),
+        RaftCommand::Meta(MetaCommand::Control(_)) => return Ok(()),
     };
-    Err(GroupEngineError::Infra(
-        ursula_runtime::GroupInfraError::InvalidRaftCommand {
-            command: unproposable,
-        },
-    ))
+    Err(invalid_raft_command(unproposable))
+}
+
+/// The refusal of a command that may not be proposed: nothing was written.
+pub(crate) fn invalid_raft_command(
+    command: ursula_runtime::UnproposableCommand,
+) -> GroupEngineError {
+    GroupEngineError::Infra(ursula_runtime::GroupInfraError::InvalidRaftCommand { command })
 }
 
 /// The leadership a proposal must still be appended under (F14j).
@@ -627,7 +663,7 @@ pub(crate) enum ProposalFence {
 /// uploader deletes the object rather than commit it under another
 /// leadership. Both the single write and the batch path ask here.
 pub(crate) fn proposal_leader(
-    command: &GroupWriteCommand,
+    command: &RaftCommand,
     fence: ProposalFence,
 ) -> Result<Option<CommittedLeader>, GroupEngineError> {
     // A negative control turns the fence off: every upload proposes under
@@ -635,8 +671,12 @@ pub(crate) fn proposal_leader(
     if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::UploadFence) {
         return Ok(None);
     }
-    let GroupWriteCommand::Stream(command) = command;
-    match (fence, ursula_runtime::uploaded_object(command)) {
+    // A meta command names no object.
+    let uploaded = match command {
+        RaftCommand::Stream(command) => ursula_runtime::uploaded_object(command),
+        RaftCommand::Meta(_) => None,
+    };
+    match (fence, uploaded) {
         (ProposalFence::Leadership(leader), _) => Ok(Some(leader)),
         (ProposalFence::Unfenced, None) => Ok(None),
         (ProposalFence::Unfenced, Some(object)) => {
@@ -653,26 +693,30 @@ pub(crate) fn proposal_leader(
     }
 }
 
-/// Proposes `commands` as one batch. `history` is the group's history on
+/// Proposes `commands`, which a forwarded `GroupWrite` of a data group
+/// carried, as one batch. A command of the meta plane refuses the batch
+/// before anything of it is proposed. `history` is the group's history on
 /// this replica: a leader whose history is pending admits none of them
 /// (#581 section 4.5).
 pub(crate) async fn write_commands_on_raft(
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     history: &crate::history::GroupHistory,
-    commands: Vec<GroupWriteCommand>,
+    commands: Vec<RaftCommand>,
 ) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
         return Ok(Vec::new());
     }
+    let target = crate::RaftTarget::Data(history.raft_group_id());
     for command in &commands {
-        validate_proposal(command)?;
+        if !target.admits(command) {
+            return Err(invalid_raft_command(
+                ursula_runtime::UnproposableCommand::OtherPlane,
+            ));
+        }
         history.admit_proposal(&raft, command).await?;
     }
     let expected_responses = commands.len();
-    let expected_kinds: Vec<ResponseKind> = commands
-        .iter()
-        .map(|GroupWriteCommand::Stream(command)| ResponseKind::answering(command))
-        .collect();
+    let expected_kinds: Vec<ResponseKind> = commands.iter().map(answer_kind).collect();
     await_first_quorum_ack(&raft).await;
     // A replica that lost the leadership during the admits refuses every
     // command here, before proposing any, as `write` does.
@@ -796,6 +840,17 @@ async fn collect_batch_responses<T, E: std::fmt::Display>(
     responses
 }
 
+/// The kind of response the state machine of `command`'s plane answers it
+/// with when it applies it, as [`write_result_from_raft_response`] names
+/// what it got instead.
+pub(crate) fn answer_kind(command: &RaftCommand) -> ResponseKind {
+    match command {
+        RaftCommand::Stream(command) => ResponseKind::answering(command),
+        RaftCommand::Meta(MetaCommand::NewHistory { .. }) => ResponseKind::NewHistory,
+        RaftCommand::Meta(MetaCommand::Control(_)) => ResponseKind::Control,
+    }
+}
+
 /// Unwraps a raft-applied response into the write outcome it carries. The
 /// command's response is of the kind `expected`
 /// ([`ResponseKind::answering`]); OpenRaft's answer to a blank or membership
@@ -808,6 +863,10 @@ pub(crate) fn write_result_from_raft_response(
         RaftGroupResponse::Write(result) => return Ok(result),
         RaftGroupResponse::Blank => ResponseKind::RaftBlank,
         RaftGroupResponse::Membership => ResponseKind::RaftMembership,
+        RaftGroupResponse::Meta(MetaResponse::History | MetaResponse::HistoryMismatch { .. }) => {
+            ResponseKind::NewHistory
+        }
+        RaftGroupResponse::Meta(MetaResponse::Control(_)) => ResponseKind::Control,
     };
     Err(GroupEngineError::Infra(
         GroupInfraError::UnexpectedResponse { expected, actual },

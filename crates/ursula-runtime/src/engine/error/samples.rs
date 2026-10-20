@@ -5,7 +5,6 @@
 //! with no wildcard ([`every`]), so a new variant does not compile until it
 //! has a sample.
 
-use ursula_proto::admin::ApplyFailureKind;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -17,6 +16,7 @@ use ursula_stream::StreamErrorContext;
 use ursula_stream::StreamSnapshotError;
 
 use super::AnswerProblem;
+use super::ApplyStopKind;
 use super::ColdOperation;
 use super::EngineOperation;
 use super::ForwardFailure;
@@ -33,7 +33,6 @@ use super::Proposal;
 use super::ResponseKind;
 use super::SnapshotObjectCheck;
 use super::SnapshotStoreOperation;
-use super::StaticMembershipProblem;
 use super::StreamRefusal;
 use super::UnproposableCommand;
 use super::WalOpenFailureKind;
@@ -263,7 +262,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             raft_group_id: GROUP,
             term: 4,
             index: 19,
-            kind: ApplyFailureKind::Panic,
+            kind: ApplyStopKind::Panic,
         },
         GroupInfraError::InvalidRaftCommand { .. } => GroupInfraError::InvalidRaftCommand {
             command: UnproposableCommand::CreateBucket,
@@ -372,10 +371,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
             election_timeout_min_ms: 50,
             election_timeout_max_ms: 40,
         },
-        GroupInfraError::StaticMembership { .. } => GroupInfraError::StaticMembership {
-            raft_group_id: GROUP,
-            problem: StaticMembershipProblem::MissingGroup,
-        },
         GroupInfraError::RecoveryGateOpen { .. } => GroupInfraError::RecoveryGateOpen {
             core_id: CoreId(1),
             raft_group_id: GROUP,
@@ -394,10 +389,9 @@ fn infra_errors() -> Vec<GroupInfraError> {
         ),
     });
     errors.extend(
-        every_unit!(ApplyFailureKind {
+        every_unit!(ApplyStopKind {
             Panic,
-            InvariantViolation,
-            Unknown
+            InvariantViolation
         })
         .into_iter()
         .map(|kind| GroupInfraError::ApplyStopped {
@@ -410,7 +404,8 @@ fn infra_errors() -> Vec<GroupInfraError> {
     errors.extend(
         every_unit!(UnproposableCommand {
             CreateBucket,
-            NewHistory
+            NewHistory,
+            OtherPlane
         })
         .into_iter()
         .map(|command| GroupInfraError::InvalidRaftCommand { command }),
@@ -425,6 +420,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
         InvalidConfiguration,
         InvalidRecord,
         Poisoned,
+        NotHeld,
     });
     errors.extend(failures.iter().map(|&failure| GroupInfraError::WalOpen {
         core_id: CoreId(2),
@@ -487,6 +483,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             StreamError,
             RaftBlank,
             RaftMembership,
+            Control,
             Missing,
         })
         .into_iter()
@@ -549,23 +546,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
         rpc,
         failure: ForwardFailure::InvalidEndpoint,
     }));
-    errors.extend(
-        every!(StaticMembershipProblem {
-            StaticMembershipProblem::MissingGroup => StaticMembershipProblem::MissingGroup,
-            StaticMembershipProblem::NoVoters => StaticMembershipProblem::NoVoters,
-            StaticMembershipProblem::VoterWithoutPeer { .. } => {
-                StaticMembershipProblem::VoterWithoutPeer { node_id: 3 }
-            },
-            StaticMembershipProblem::NodeWithoutPeer { .. } => {
-                StaticMembershipProblem::NodeWithoutPeer { node_id: 4 }
-            },
-        })
-        .into_iter()
-        .map(|problem| GroupInfraError::StaticMembership {
-            raft_group_id: GROUP,
-            problem,
-        }),
-    );
     errors.extend(
         every_unit!(MembershipInitRefusal {
             NotAllowed,

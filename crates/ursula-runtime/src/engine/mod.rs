@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub use error::AnswerProblem;
+pub use error::ApplyStopKind;
 pub use error::ColdOperation;
 pub use error::EngineOperation;
 pub use error::ForwardFailure;
@@ -26,7 +27,6 @@ pub use error::Proposal;
 pub use error::ResponseKind;
 pub use error::SnapshotObjectCheck;
 pub use error::SnapshotStoreOperation;
-pub use error::StaticMembershipProblem;
 pub use error::StreamRefusal;
 pub use error::UnproposableCommand;
 pub use error::WalOpenFailureKind;

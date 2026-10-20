@@ -35,10 +35,10 @@ use openraft::async_runtime::OneshotSender;
 use openraft::type_config::TypeConfigExt;
 use ursula_config::WalFsync;
 use ursula_raft::JournalTuning;
+use ursula_raft::RaftCommand;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::snapshot_harness::Gate;
 use ursula_runtime::snapshot_harness::GatePass;
 use ursula_runtime::snapshot_harness::PerMille;
@@ -213,9 +213,8 @@ async fn hold_worker_with_a_queued_apply(
     let payload = format!("g{group}-r{round}-queued;").into_bytes();
     let written = cluster.engines[&(group, leader)]
         .raft_handle()
-        .client_write(GroupWriteCommand::from(AppendRequest::from_bytes(
-            group_stream(group),
-            payload.clone(),
+        .client_write(RaftCommand::Stream(ursula_stream::StreamCommand::from(
+            AppendRequest::from_bytes(group_stream(group), payload.clone()),
         )))
         .await
         .expect("a write while a follower's worker is held commits");
@@ -441,9 +440,8 @@ pub(super) async fn run_engine_restart_inner(
         let in_flight = (node_id != leader && !hold && rng.next_bounded(2) == 0).then(|| {
             let payload = format!("g{group}-r{round}-in-flight;").into_bytes();
             let raft = cluster.engines[&(group, leader)].raft_handle();
-            let command = GroupWriteCommand::from(AppendRequest::from_bytes(
-                group_stream(group),
-                payload.clone(),
+            let command = RaftCommand::Stream(ursula_stream::StreamCommand::from(
+                AppendRequest::from_bytes(group_stream(group), payload.clone()),
             ));
             let write = madsim::task::spawn(async move { raft.client_write(command).await });
             (payload, write)

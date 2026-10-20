@@ -4302,6 +4302,7 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "ursula-config",
+ "ursula-control",
  "ursula-headers",
  "ursula-observability",
  "ursula-proto",

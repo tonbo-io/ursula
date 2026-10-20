@@ -33,10 +33,10 @@ use openraft::vote::leader_id_adv::CommittedLeaderId;
 use serde_json::json;
 use ursula_config::WalFsync;
 use ursula_raft::JournalTuning;
+use ursula_raft::RaftCommand;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
 use ursula_raft::UrsulaRaftTypeConfig;
-use ursula_runtime::GroupWriteCommand;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
@@ -114,7 +114,7 @@ fn log_id(index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
 fn entry(index: u64, group_id: u32, entry_bytes: usize) -> EntryOf<UrsulaRaftTypeConfig> {
     EntryOf::<UrsulaRaftTypeConfig>::new(
         log_id(index),
-        EntryPayload::Normal(GroupWriteCommand::Stream(StreamCommand::Append {
+        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::Append {
             stream_id: BucketStreamId::new("wal-probe", format!("stream-{group_id}")),
             content_type: Some("application/octet-stream".to_owned()),
             // A fresh buffer per entry, as an entry decoded from a request owns one.

@@ -16,9 +16,9 @@
 //! - [`cold_worker`]: background flush, compaction, GC, page-repair,
 //!   orphan-sweep and external-locator offload loops.
 //! - [`request`]: HTTP/gRPC request and response value types for each engine op.
-//! - [`command`]: the replicated [`GroupWriteCommand`] envelope around the
-//!   canonical [`ursula_stream::StreamCommand`], plus `From` conversions from
-//!   request values into that command.
+//! - [`command`]: [`GroupSnapshot`] and the `From` conversions from request
+//!   values into the canonical [`ursula_stream::StreamCommand`], the command
+//!   a data group's Raft entry carries.
 //! - [`error`]: runtime-level error type [`RuntimeError`].
 //! - [`engine`]: the `GroupEngine` trait, factory, metrics, and the boxed-future
 //!   type aliases that form the replaceable per-group engine boundary, its
@@ -154,8 +154,8 @@ pub use cold_worker::spawn_cold_index_repair_worker;
 pub use cold_worker::spawn_cold_orphan_sweep_worker;
 pub use cold_worker::spawn_cold_ref_offload_worker;
 pub use command::GroupSnapshot;
-pub use command::GroupWriteCommand;
 pub use engine::AnswerProblem;
+pub use engine::ApplyStopKind;
 pub use engine::ColdOperation;
 pub use engine::EngineOperation;
 pub use engine::ForwardFailure;
@@ -219,7 +219,6 @@ pub use engine::Proposal;
 pub use engine::ResponseKind;
 pub use engine::SnapshotObjectCheck;
 pub use engine::SnapshotStoreOperation;
-pub use engine::StaticMembershipProblem;
 pub use engine::StreamRefusal;
 pub use engine::UnproposableCommand;
 pub use engine::WalOpenFailureKind;

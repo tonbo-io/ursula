@@ -13,13 +13,43 @@
 //! inherited from the history before. Epoch 5 is the format of Ursula 0.9:
 //! the `ExpireStreams` command, a clock on `DeleteStream`, writes that
 //! remove only the stream they name, and compact MessagePack
-//! ([`crate::msgpack`]) for everything Ursula writes as MessagePack. Epoch 6
-//! is the format of Ursula 0.10: a run state with one record per journal
-//! class, and a log generation on every Raft WAL journal record, core
-//! metadata entry and group snapshot record. The meta group's formats extend
-//! this list as they land (#768). A binary
-//! reads exactly one epoch: it refuses data and peers from any other epoch
-//! loudly, before it writes anything, and it does not convert them.
+//! ([`crate::msgpack`]) for everything Ursula writes as MessagePack.
+//!
+//! Epoch 6 is the format of Ursula 0.10 (#768):
+//!
+//! - a run state with one record per journal class, and a log generation on
+//!   every Raft WAL journal record, core metadata entry and group snapshot
+//!   record;
+//! - a Raft entry payload with the meta group's commands beside the data
+//!   groups' (`RaftCommand`), whose data entries keep their epoch-5 bytes;
+//! - the placement kernel's state, commands and answers, and the meta
+//!   group's state, history event and inline snapshot record. A meta
+//!   snapshot's state is bounded by
+//!   `ursula_raft::meta::snapshot::META_SNAPSHOT_MAX_STATE_BYTES` (16 MiB),
+//!   and the bound is fixed for the epoch, since a node refuses a meta
+//!   record or install above it;
+//! - a plane and a target node on every Raft request, the plane of an
+//!   `AppendStream` in its `ursula-raft-plane` metadata, the refusal of a
+//!   request for another node, and the refusing node of a refused
+//!   `AppendStream` item (`RaftAppendStreamError.refusing_node`);
+//! - barrier answers that echo the plane and the group they answer for and
+//!   carry the leader's memberships;
+//! - the genesis probe RPC;
+//! - the group engine error without its static-membership variant, with a
+//!   not-held WAL open, a control answer kind and a command of the other
+//!   plane, and with the closed `ApplyStopKind` in `ApplyStopped`, which no
+//!   longer decodes the unknown kind epoch 5 accepted;
+//! - two variant casings, each frozen with the epoch. The Raft-layer
+//!   envelopes (`StreamCommand`, `RaftCommand`, `MetaCommand`,
+//!   `MetaResponse` and `GenesisAnswer`) keep serde's default `PascalCase`
+//!   variant names, as 0.9's `StreamCommand` does. The types of
+//!   `ursula_proto::placement` and `ursula_control` write `snake_case`
+//!   names, because one serde form serves both their admin JSON and their
+//!   MessagePack. Neither is converted to the other.
+//!
+//! A binary reads exactly one epoch: it refuses data and peers from any
+//! other epoch loudly, before it writes anything, and it does not convert
+//! them.
 //!
 //! Every version number that an earlier binary checks is set equal to
 //! [`FORMAT_EPOCH`]: the Raft WAL journal header and state files, the Raft

@@ -1863,10 +1863,22 @@ pub(crate) fn snapshot_record_sample() -> Vec<u8> {
             openraft::Membership::new_with_defaults(vec![[1, 2, 3].into_iter().collect()], [4]),
         ),
     };
+    snapshot_record_bytes(LogGeneration::new(3), meta, vec![0x92, 0x05, 0x09])
+}
+
+/// The snapshot record of `generation`, `meta` and `pointer_bytes`, as
+/// `group-N.snapshot.json` holds it, checked to decode to the record it was
+/// encoded from and to re-encode to the same bytes.
+#[cfg(test)]
+pub(crate) fn snapshot_record_bytes(
+    generation: LogGeneration,
+    meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    pointer_bytes: Vec<u8>,
+) -> Vec<u8> {
     let record = PersistedSnapshot {
-        generation: LogGeneration::new(3),
+        generation,
         meta,
-        pointer_bytes: vec![0x92, 0x05, 0x09],
+        pointer_bytes,
     };
     let bytes = encode_binary_envelope(&record).expect("the sample encodes");
     let decoded =
@@ -1896,14 +1908,15 @@ impl RaftGroupStateMachine {
         log_id: LogIdOf<UrsulaRaftTypeConfig>,
         error: crate::apply_failure::ApplyError,
     ) -> io::Error {
-        let failure = crate::apply_failure::ApplyFailure {
+        let stopped = crate::apply_failure::StoppedApply {
             term: log_id.committed_leader_id().term,
             index: log_id.index(),
             kind: error.kind(),
             message: error.to_string(),
+            last_applied: self.last_applied_log_id,
         };
-        tracing::error!(raft_group_id = self.placement.raft_group_id.0, log_index = failure.index, error = %error, "stopping failed group; preserve WAL for corrected-code replay");
-        self.apply_health.stop(failure, self.last_applied_log_id);
+        tracing::error!(raft_group_id = self.placement.raft_group_id.0, log_index = stopped.index, error = %error, "stopping failed group; preserve WAL for corrected-code replay");
+        self.apply_health.stop(stopped);
         self.log_gauge.stop_apply();
         if let Some(signal) = &self.apply_stop_signal {
             signal.store(true, Ordering::Release);
@@ -2349,15 +2362,27 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             let entry_bytes = crate::types::entry_log_bytes(&entry);
             let response = match entry.payload {
                 EntryPayload::Blank => RaftGroupResponse::Blank,
-                EntryPayload::Normal(command) => {
+                // A data group never commits a meta command: the plane of
+                // every request admits only its own (`RaftTarget::admits`).
+                // One that did stops the apply.
+                EntryPayload::Normal(crate::types::RaftCommand::Meta(_)) => {
+                    return Err(self.stop_apply(
+                        entry.log_id,
+                        crate::apply_failure::ApplyError::InvariantViolation(
+                            crate::forward::invalid_raft_command(
+                                ursula_runtime::UnproposableCommand::OtherPlane,
+                            ),
+                        ),
+                    ));
+                }
+                EntryPayload::Normal(crate::types::RaftCommand::Stream(command)) => {
                     let apply_started_at = Instant::now();
                     applied_entries = applied_entries.saturating_add(1);
                     #[cfg(madsim)]
                     {
-                        let ursula_runtime::GroupWriteCommand::Stream(stream_command) = &command;
                         let leader = entry.log_id.committed_leader_id();
                         ursula_runtime::cold_uploads::fence_ledger::note_applied(
-                            stream_command,
+                            &command,
                             ursula_runtime::CommittedLeader::new(leader.term, leader.node_id),
                         );
                     }

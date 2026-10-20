@@ -59,11 +59,12 @@ pub struct ApplyFailure {
 pub enum ApplyFailureKind {
     Panic,
     InvariantViolation,
-    /// A kind this build does not know. The kinds are frozen within a minor,
-    /// since `GroupEngineError::ApplyStopped` carries one over the Raft RPC,
-    /// so only an admin-plane reader of another minor's metrics gets it. The
-    /// group is still stopped. It does not round-trip: it encodes as
-    /// `unknown`, not as the kind it stands for.
+    /// A kind this build does not know, which an admin-plane reader of
+    /// another minor's metrics may meet. The group is still stopped. It does
+    /// not round-trip: it encodes as `unknown`, not as the kind it stands
+    /// for. Admin JSON only: `GroupEngineError::ApplyStopped` carries the
+    /// closed `ursula_runtime::ApplyStopKind` over the Raft RPC, since
+    /// `#[serde(other)]` is never allowed in the MessagePack closure.
     #[serde(other)]
     Unknown,
 }
