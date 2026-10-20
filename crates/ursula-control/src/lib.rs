@@ -100,7 +100,6 @@ pub use ursula_proto::placement::GroupCount;
 pub use ursula_proto::placement::LearnerLag;
 pub use ursula_proto::placement::MembershipAnswer;
 pub use ursula_proto::placement::MembershipLogId;
-pub use ursula_proto::placement::MembershipNodes;
 pub use ursula_proto::placement::MetaLogId;
 pub use ursula_proto::placement::NodeId;
 pub use ursula_proto::placement::NodeLifecycle;

@@ -4,18 +4,20 @@
 //!
 //! The leader sends both memberships whole, never a verdict about the node
 //! that asked, so no field of the request can disagree with the sender's
-//! admitted identity, and every asker classifies them with the one pure
-//! function [`MembershipAnswer::of`]: a replica about its own node, the
-//! removed-node sweep about a removed one.
+//! admitted identity, and every asker classifies them with the kernel's
+//! one classifier, [`ursula_control::membership_answer`]: a replica about
+//! its own node, the removed-node sweep about a removed one.
 
 use std::collections::BTreeSet;
 
 use openraft::type_config::alias::StoredMembershipOf;
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_control::MembershipConfig;
+use ursula_control::membership_answer;
 use ursula_proto::placement::MembershipAnswer;
-use ursula_proto::placement::MembershipNodes;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::VoterSet;
 
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
@@ -47,13 +49,20 @@ impl std::fmt::Display for MembershipKind {
     }
 }
 
-/// A barrier answer whose memberships no live leader holds: a membership
-/// without a voter config, or with an empty one. It is refused as
-/// malformed, never read as an answer that the node is no member.
+/// A barrier answer whose memberships no live leader holds. It is refused
+/// as malformed, never read as an answer that the node is no member.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the leader's {membership} membership has no voters in a config")]
-pub struct EmptyVoterConfig {
-    pub membership: MembershipKind,
+pub enum MalformedMembership {
+    /// A membership without a voter config, or with an empty one.
+    #[error("the leader's {membership} membership has no voters in a config")]
+    EmptyVoterConfig { membership: MembershipKind },
+    /// A membership of more than two voter configs: a config is uniform or
+    /// joint.
+    #[error("the leader's {membership} membership has {configs} voter configs, not one or two")]
+    ConfigCount {
+        membership: MembershipKind,
+        configs: usize,
+    },
 }
 
 impl LeaderMemberships {
@@ -65,42 +74,61 @@ impl LeaderMemberships {
         }
     }
 
-    /// Refuses memberships no live leader holds.
-    pub fn check(&self) -> Result<(), EmptyVoterConfig> {
-        for (membership, kind) in [
-            (&self.committed, MembershipKind::Committed),
-            (&self.effective, MembershipKind::Effective),
-        ] {
-            let configs = membership.get_joint_config();
-            if configs.is_empty() || configs.iter().any(BTreeSet::is_empty) {
-                return Err(EmptyVoterConfig { membership: kind });
-            }
-        }
-        Ok(())
+    /// The committed and the effective membership as the kernel's configs,
+    /// refusing memberships no live leader holds.
+    pub fn configs(&self) -> Result<(MembershipConfig, MembershipConfig), MalformedMembership> {
+        Ok((
+            membership_config(&self.committed, MembershipKind::Committed)?,
+            membership_config(&self.effective, MembershipKind::Effective)?,
+        ))
     }
 
-    /// The leader's answer about `node` ([`MembershipAnswer::of`]).
-    pub fn answer(&self, node: NodeId) -> MembershipAnswer {
-        MembershipAnswer::of(
-            node,
-            &membership_nodes(&self.committed),
-            &membership_nodes(&self.effective),
-        )
+    /// Refuses memberships no live leader holds.
+    pub fn check(&self) -> Result<(), MalformedMembership> {
+        self.configs().map(|_configs| ())
+    }
+
+    /// The leader's answer about `node`, by the kernel's one classifier
+    /// ([`membership_answer`]).
+    pub fn answer(&self, node: NodeId) -> Result<MembershipAnswer, MalformedMembership> {
+        let (committed, effective) = self.configs()?;
+        Ok(membership_answer(node, &committed, &effective))
     }
 }
 
-/// `membership` by node id.
-fn membership_nodes(membership: &Membership) -> MembershipNodes {
-    MembershipNodes {
-        voter_configs: membership
-            .get_joint_config()
-            .iter()
-            .map(|config| config.iter().copied().map(NodeId::new).collect())
-            .collect(),
-        nodes: membership
-            .nodes()
-            .map(|(node, _)| NodeId::new(*node))
-            .collect(),
+/// `membership` as the kernel's config: one voter config is uniform, two are
+/// joint, and every listed node outside them is a learner.
+fn membership_config(
+    membership: &Membership,
+    kind: MembershipKind,
+) -> Result<MembershipConfig, MalformedMembership> {
+    let voter_set = |config: &BTreeSet<u64>| {
+        VoterSet::new(config.iter().copied().map(NodeId::new).collect())
+            .map_err(|_empty| MalformedMembership::EmptyVoterConfig { membership: kind })
+    };
+    let configs = membership.get_joint_config();
+    let voters: BTreeSet<u64> = configs.iter().flatten().copied().collect();
+    let learners: BTreeSet<NodeId> = membership
+        .nodes()
+        .map(|(node, _)| *node)
+        .filter(|node| !voters.contains(node))
+        .map(NodeId::new)
+        .collect();
+    match configs.as_slice() {
+        [] => Err(MalformedMembership::EmptyVoterConfig { membership: kind }),
+        [voters] => Ok(MembershipConfig::Uniform {
+            voters: voter_set(voters)?,
+            learners,
+        }),
+        [old, new] => Ok(MembershipConfig::Joint {
+            old: voter_set(old)?,
+            new: voter_set(new)?,
+            learners,
+        }),
+        _ => Err(MalformedMembership::ConfigCount {
+            membership: kind,
+            configs: configs.len(),
+        }),
     }
 }
 
@@ -121,8 +149,8 @@ mod tests {
     use ursula_proto::placement::MembershipAnswer;
     use ursula_proto::placement::NodeId;
 
-    use super::EmptyVoterConfig;
     use super::LeaderMemberships;
+    use super::MalformedMembership;
     use super::MembershipKind;
     use crate::types::UrsulaRaftTypeConfig;
 
@@ -159,17 +187,26 @@ mod tests {
             effective: membership(11, vec![vec![2, 3, 4]], &[]),
         };
         memberships.check().expect("a live leader's memberships");
-        assert_eq!(memberships.answer(NodeId::new(1)), MembershipAnswer::Voter);
-        assert_eq!(memberships.answer(NodeId::new(4)), MembershipAnswer::Voter);
+        assert_eq!(
+            memberships.answer(NodeId::new(1)),
+            Ok(MembershipAnswer::Voter)
+        );
+        assert_eq!(
+            memberships.answer(NodeId::new(4)),
+            Ok(MembershipAnswer::Voter)
+        );
         assert_eq!(
             memberships.answer(NodeId::new(5)),
-            MembershipAnswer::NotMember
+            Ok(MembershipAnswer::NotMember)
         );
         let settled = LeaderMemberships {
             committed: membership(11, vec![vec![2, 3, 4]], &[1]),
             effective: membership(11, vec![vec![2, 3, 4]], &[1]),
         };
-        assert_eq!(settled.answer(NodeId::new(1)), MembershipAnswer::Learner);
+        assert_eq!(
+            settled.answer(NodeId::new(1)),
+            Ok(MembershipAnswer::Learner)
+        );
     }
 
     /// A membership without voters is malformed, never an answer that a
@@ -195,8 +232,25 @@ mod tests {
                     effective
                 }
                 .check(),
-                Err(EmptyVoterConfig { membership: kind })
+                Err(MalformedMembership::EmptyVoterConfig { membership: kind })
             );
         }
+    }
+
+    /// A config is uniform or joint: a membership of three voter configs is
+    /// malformed too.
+    #[test]
+    fn memberships_of_more_than_two_configs_are_refused() {
+        let memberships = LeaderMemberships {
+            committed: membership(10, vec![vec![1, 2, 3]], &[]),
+            effective: membership(11, vec![vec![1], vec![2], vec![3]], &[]),
+        };
+        assert_eq!(
+            memberships.answer(NodeId::new(1)),
+            Err(MalformedMembership::ConfigCount {
+                membership: MembershipKind::Effective,
+                configs: 3,
+            })
+        );
     }
 }

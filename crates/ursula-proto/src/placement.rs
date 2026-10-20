@@ -21,8 +21,8 @@
 //!   in the meta log or between nodes. [`ReplicaRole`], [`TeardownStage`],
 //!   [`WaitReason`], [`StepKind`], [`StepFailureKind`], [`StepFailure`],
 //!   [`ReconcileState`], [`ReconcileStatus`] and [`WriteEffect`].
-//! - **Never encoded**: [`ViewStage`], [`MembershipAnswer`] and
-//!   [`MembershipNodes`], which stay inside one process and derive no serde.
+//! - **Never encoded**: [`ViewStage`] and [`MembershipAnswer`], which stay
+//!   inside one process and derive no serde.
 //!
 //! In both encoded classes a variant is written by its `snake_case` name, so
 //! variant names are format too: renaming one is a format change, or an
@@ -49,11 +49,6 @@
 //! effect is a yes or no a client must not guess. An `Option` field of an
 //! admin JSON struct is required, also when `null`
 //! ([`crate::admin::required_option`]).
-//!
-//! `#[serde(other)]` is allowed only on these admin JSON enums. It is
-//! forbidden on every format type, and on every other type of the
-//! replicated, persisted or RPC MessagePack closure: an unknown variant
-//! decoding as "other" would hide a format mismatch.
 //!
 //! Group ids are `RaftGroupId` in the kernel's state and plain `u32` in admin
 //! JSON.
@@ -452,9 +447,7 @@ pub enum ViewStage {
 }
 
 /// A live group leader's answer about one node, from its committed and its
-/// effective memberships. A leader sends both memberships whole, and every
-/// asker classifies them with [`MembershipAnswer::of`], so a new
-/// classification needs no change on the wire.
+/// effective memberships.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MembershipAnswer {
     /// A voter of a config of either membership.
@@ -463,46 +456,6 @@ pub enum MembershipAnswer {
     Learner,
     /// A member of neither membership.
     NotMember,
-}
-
-impl MembershipAnswer {
-    /// The answer about `node` from a leader's `committed` and `effective`
-    /// memberships: `Voter` for a voter of a config of either, `Learner` for
-    /// another member of either, `NotMember` for neither. While a joint
-    /// config is committed, its outgoing voters stay voters, even once the
-    /// uniform config that drops them is appended.
-    pub fn of(node: NodeId, committed: &MembershipNodes, effective: &MembershipNodes) -> Self {
-        if committed.has_voter(node) || effective.has_voter(node) {
-            Self::Voter
-        } else if committed.lists(node) || effective.lists(node) {
-            Self::Learner
-        } else {
-            Self::NotMember
-        }
-    }
-}
-
-/// One membership of a group by node id, as a leader holds it: its voter
-/// configs (one, or two while joint) and every node it lists, learners
-/// included.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MembershipNodes {
-    pub voter_configs: Vec<BTreeSet<NodeId>>,
-    pub nodes: BTreeSet<NodeId>,
-}
-
-impl MembershipNodes {
-    /// Whether a config of the membership has `node` as a voter.
-    pub fn has_voter(&self, node: NodeId) -> bool {
-        self.voter_configs
-            .iter()
-            .any(|config| config.contains(&node))
-    }
-
-    /// Whether the membership lists `node`, as a voter or a learner.
-    pub fn lists(&self, node: NodeId) -> bool {
-        self.nodes.contains(&node) || self.has_voter(node)
-    }
 }
 
 /// How far a replica's teardown went.
@@ -668,8 +621,6 @@ mod tests {
     use super::GenesisClaim;
     use super::GroupCount;
     use super::LearnerLag;
-    use super::MembershipAnswer;
-    use super::MembershipNodes;
     use super::MetaLogId;
     use super::NodeId;
     use super::NodeLifecycle;
@@ -711,51 +662,6 @@ mod tests {
             VoterSet::from_first(NodeId::new(5), [NodeId::new(2), NodeId::new(5)]),
             VoterSet::new(ids(&[2, 5])).unwrap()
         );
-    }
-
-    fn membership(configs: &[&[u64]], learners: &[u64]) -> MembershipNodes {
-        let voter_configs: Vec<BTreeSet<NodeId>> =
-            configs.iter().map(|config| ids(config)).collect();
-        let mut nodes = ids(learners);
-        nodes.extend(voter_configs.iter().flatten().copied());
-        MembershipNodes {
-            voter_configs,
-            nodes,
-        }
-    }
-
-    /// Each row: the committed and the effective membership, the node asked
-    /// about, and the answer.
-    #[test]
-    fn a_membership_answer_classifies_both_memberships() {
-        // A committed joint config whose uniform entry is appended: its
-        // outgoing voter 1 stays a voter until the uniform entry commits.
-        let joint = membership(&[&[1, 2, 3], &[2, 3, 4]], &[5]);
-        let uniform = membership(&[&[2, 3, 4]], &[5]);
-        let stable = membership(&[&[1, 2, 3]], &[]);
-        let with_learner = membership(&[&[1, 2, 3]], &[4]);
-        let rows = [
-            (&joint, &uniform, 1, MembershipAnswer::Voter),
-            (&joint, &uniform, 4, MembershipAnswer::Voter),
-            (&joint, &uniform, 5, MembershipAnswer::Learner),
-            (&joint, &uniform, 6, MembershipAnswer::NotMember),
-            (&uniform, &uniform, 1, MembershipAnswer::NotMember),
-            // A learner being added shows in the effective membership only.
-            (&stable, &with_learner, 4, MembershipAnswer::Learner),
-            // A learner being removed shows in the committed one only.
-            (&with_learner, &stable, 4, MembershipAnswer::Learner),
-            // A voter added through the effective membership is a voter.
-            (&stable, &uniform, 4, MembershipAnswer::Voter),
-            (&stable, &stable, 3, MembershipAnswer::Voter),
-            (&stable, &stable, 4, MembershipAnswer::NotMember),
-        ];
-        for (committed, effective, node, answer) in rows {
-            assert_eq!(
-                MembershipAnswer::of(NodeId::new(node), committed, effective),
-                answer,
-                "node {node} in {committed:?} and {effective:?}"
-            );
-        }
     }
 
     #[test]

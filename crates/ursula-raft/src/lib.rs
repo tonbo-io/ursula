@@ -12,7 +12,7 @@
 //! - [`target`]: the typed target of every Raft RPC (plane, group and target
 //!   node), its one encoder and parser, and the misdelivery refusal.
 //! - [`memberships`]: the memberships a recovery barrier answers with, which
-//!   every asker classifies with `MembershipAnswer::of`.
+//!   every asker classifies with `ursula_control::membership_answer`.
 //! - [`codec`]: serde (MessagePack) wire helpers for the canonical command,
 //!   response, and error types that travel through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
@@ -185,8 +185,8 @@ pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
 pub use memberships::BarrierAnswer;
-pub use memberships::EmptyVoterConfig;
 pub use memberships::LeaderMemberships;
+pub use memberships::MalformedMembership;
 pub use memberships::MembershipKind;
 pub use peer_cluster::CLUSTER_ID_METADATA;
 pub use peer_cluster::ClusterCheck;

@@ -268,7 +268,7 @@ pub(crate) enum RecoveryProbeError {
     OtherTarget { plane: i32, raft_group_id: u32 },
     /// The answer's memberships are not a live leader's.
     #[error("recovery answer: {0}")]
-    Memberships(#[from] crate::memberships::EmptyVoterConfig),
+    Memberships(#[from] crate::memberships::MalformedMembership),
 }
 
 /// Confirm a group's current quorum without issuing an application write.
