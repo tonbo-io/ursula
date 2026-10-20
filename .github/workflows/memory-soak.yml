@@ -79,7 +79,7 @@ jobs:
           retention-days: 3
 
   soak:
-    name: Soak (${{ github.event.inputs.owners || '128' }} owners)
+    name: Soak (${{ github.event.inputs.owners || '128' }} owners, ${{ github.event.inputs.seconds || '300' }} s)
     needs: build-ursula
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache

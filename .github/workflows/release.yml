@@ -117,7 +117,7 @@ jobs:
             --jq '.[] | select(.headSha == "'"$SOURCE_REVISION"'") | .databaseId' |
             while read -r run_id; do
               gh api "repos/$REPOSITORY/actions/runs/$run_id/jobs" \
-                --jq '[.jobs[] | select(.conclusion == "success") | .name] | any(.[]; . == "Soak (128 owners)") and any(.[]; . == "sqlite-vfs outage (600 s per mode, model server)")'
+                --jq '[.jobs[] | select(.conclusion == "success") | .name] | any(.[]; . == "Soak (128 owners, 300 s)") and any(.[]; . == "sqlite-vfs outage (600 s per mode, model server)")'
             done | grep -c '^true$' || true)"
           test "$soak_and_outage" -ge 1
 
