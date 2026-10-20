@@ -428,30 +428,40 @@ fn check_transition(
                 "K1: a refusal changed the encoding".to_owned()
             })
         }
-        (Step::History(cause), Outcome::History(_)) => {
+        (Step::History(cause), Outcome::History(answer)) => {
             // K16: the event drops every record, moves every key and ends a
-            // formation on a plan, nothing else.
-            let expected = match before {
-                ControlPlaneState::Forming { .. } if *cause == HistoryCause::Plan => {
-                    ControlPlaneState::FormationCut
-                }
-                ControlPlaneState::Forming { .. } | ControlPlaneState::FormationCut => {
-                    before.clone()
-                }
+            // formation on a plan, nothing else, and answers what it dropped.
+            let (expected, expected_answer) = match before {
+                ControlPlaneState::Forming { .. } => match cause {
+                    HistoryCause::Plan => {
+                        (ControlPlaneState::FormationCut, HistoryBegun::FormationCut)
+                    }
+                    HistoryCause::Genesis => (before.clone(), HistoryBegun::Forming),
+                },
+                ControlPlaneState::FormationCut => (before.clone(), HistoryBegun::FormationCut),
                 ControlPlaneState::Bootstrapped(cluster) => {
                     let mut cluster = cluster.clone();
-                    cluster.retirements.clear();
+                    let dropped = std::mem::take(&mut cluster.retirements)
+                        .into_iter()
+                        .map(|(group, records)| (group, records.into_keys().collect()))
+                        .collect();
                     for placement in cluster.groups.0.values_mut() {
                         match placement {
                             GroupPlacement::Seeded { since: key, .. }
                             | GroupPlacement::Live { since: key, .. } => *key = since,
                         }
                     }
-                    ControlPlaneState::Bootstrapped(cluster)
+                    (
+                        ControlPlaneState::Bootstrapped(cluster),
+                        HistoryBegun::Rebased { dropped },
+                    )
                 }
             };
             ensure(expected == *after, || {
                 "K16: the history event changed more".to_owned()
+            })?;
+            ensure(expected_answer == *answer, || {
+                format!("K16: the history event answered {answer:?}, not {expected_answer:?}")
             })
         }
         (Step::Command(command), Outcome::Command(Ok(applied))) => {
@@ -985,6 +995,55 @@ fn every_sample_state_holds_the_state_invariants() {
     }
 }
 
+/// Registers nodes `1..=node_count` after a genesis event, bootstraps them
+/// when `bootstrap` holds parameters, then runs the generated steps,
+/// checking every property after each one.
+fn drive(
+    run: &mut Run,
+    bootstrap: Option<super::ClusterParams>,
+    steps: &[(u8, u8, u8, u8)],
+) -> Result<(), String> {
+    let ids: Vec<u64> = (1..=run.node_count).collect();
+    let mut prelude = vec![Step::History(HistoryCause::Genesis)];
+    prelude.extend(ids.iter().map(|id| {
+        Step::Command(ControlCommand::RegisterNode {
+            node: node(*id),
+            now_ms: 1,
+        })
+    }));
+    if let Some(params) = bootstrap {
+        prelude.push(Step::Command(ControlCommand::Bootstrap {
+            params,
+            nodes: super::samples::node_set(&ids),
+            now_ms: 2,
+        }));
+    }
+    for step in prelude {
+        run.step(step.clone())
+            .map_err(|violation| format!("{step:?}: {violation}"))?;
+    }
+    for (op, x, y, z) in steps.iter().copied() {
+        let step = run.generate(op, x, y, z);
+        run.step(step.clone())
+            .map_err(|violation| format!("{step:?}: {violation}"))?;
+    }
+    Ok(())
+}
+
+fn steps_strategy(
+    len: std::ops::Range<usize>,
+) -> impl proptest::strategy::Strategy<Value = Vec<(u8, u8, u8, u8)>> {
+    proptest::collection::vec(
+        (
+            0_u8..13,
+            proptest::num::u8::ANY,
+            proptest::num::u8::ANY,
+            proptest::num::u8::ANY,
+        ),
+        len,
+    )
+}
+
 proptest::proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
@@ -1002,41 +1061,24 @@ proptest::proptest! {
         limit in 0_u32..=3,
         reservation in proptest::bool::weighted(0.1),
         bootstrap_first in proptest::bool::weighted(0.9),
-        steps in proptest::collection::vec(
-            (0_u8..13, proptest::num::u8::ANY, proptest::num::u8::ANY, proptest::num::u8::ANY),
-            1..200,
-        ),
+        steps in steps_strategy(1..200),
     ) {
+        // A drawn reservation gets the only topology it accepts, so its
+        // cases run under it rather than refusing their Bootstrap.
+        let (node_count, rf) = if reservation { (3, 3) } else { (node_count, rf) };
         let mut run = Run::new(node_count);
-        let ids: Vec<u64> = (1..=node_count).collect();
-        let mut prelude = vec![Step::History(HistoryCause::Genesis)];
-        prelude.extend(ids.iter().map(|id| Step::Command(ControlCommand::RegisterNode {
-            node: node(*id),
-            now_ms: 1,
-        })));
-        if bootstrap_first {
+        let bootstrap = bootstrap_first.then(|| {
             let rf = rf.min(u8::try_from(node_count).unwrap());
             let maintenance = if reservation {
                 MaintenanceAuthority::Reservation
             } else {
                 MaintenanceAuthority::Placement
             };
-            prelude.push(Step::Command(ControlCommand::Bootstrap {
-                params: params(&ids, group_count, rf, limit, maintenance),
-                nodes: super::samples::node_set(&ids),
-                now_ms: 2,
-            }));
-        }
-        for step in prelude {
-            if let Err(violation) = run.step(step.clone()) {
-                proptest::prop_assert!(false, "{step:?}: {violation}");
-            }
-        }
-        for (op, x, y, z) in steps {
-            let step = run.generate(op, x, y, z);
-            if let Err(violation) = run.step(step.clone()) {
-                proptest::prop_assert!(false, "{step:?}: {violation}");
-            }
+            let ids: Vec<u64> = (1..=node_count).collect();
+            params(&ids, group_count, rf, limit, maintenance)
+        });
+        if let Err(violation) = drive(&mut run, bootstrap, &steps) {
+            proptest::prop_assert!(false, "{violation}");
         }
         // K10: the final state round trips through both encodings.
         let state = &run.driver.state;
@@ -1046,5 +1088,54 @@ proptest::proptest! {
         let json = serde_json::to_string(state).unwrap();
         let decoded: ControlPlaneState = serde_json::from_str(&json).unwrap();
         proptest::prop_assert_eq!(&decoded, state);
+    }
+
+    /// K13 under a valid reservation in every case: nodes and meta voters
+    /// 1, 2 and 3 at replication factor 3. After random steps, which the
+    /// properties check as above, every move of every group and the
+    /// decommission of every registered node are refused with
+    /// `ReservationAuthority`.
+    #[test]
+    fn the_reservation_refuses_every_move_and_decommission(
+        group_count in 1_u32..=4,
+        limit in 0_u32..=3,
+        steps in steps_strategy(0..100),
+    ) {
+        let mut run = Run::new(3);
+        let bootstrap = params(&[1, 2, 3], group_count, 3, limit, MaintenanceAuthority::Reservation);
+        if let Err(violation) = drive(&mut run, Some(bootstrap), &steps) {
+            proptest::prop_assert!(false, "{violation}");
+        }
+        let cluster = run.cluster().unwrap();
+        proptest::prop_assert_eq!(cluster.params().maintenance, MaintenanceAuthority::Reservation);
+        for (group, placement) in cluster.groups().iter() {
+            let targets = [
+                run.swap_one(placement.target_voters(), 0, 0),
+                placement.current_voters().clone(),
+            ];
+            for to in targets {
+                let command = ControlCommand::RequestMove {
+                    group,
+                    expected: placement.since(),
+                    to,
+                    now_ms: 3,
+                };
+                proptest::prop_assert_eq!(
+                    run.driver.state.check(&command),
+                    Err(super::ControlError::ReservationAuthority)
+                );
+            }
+        }
+        for id in cluster.nodes().keys() {
+            let command = ControlCommand::SetNodeLifecycle {
+                node: *id,
+                change: LifecycleChange::Decommission,
+                now_ms: 3,
+            };
+            proptest::prop_assert_eq!(
+                run.driver.state.check(&command),
+                Err(super::ControlError::ReservationAuthority)
+            );
+        }
     }
 }
