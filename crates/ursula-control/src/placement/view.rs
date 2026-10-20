@@ -13,6 +13,10 @@ use std::sync::Arc;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::ViewStage;
 
+#[cfg(test)]
+use super::rules::Rule;
+#[cfg(test)]
+use super::rules::enforced;
 use super::state::Cluster;
 use super::state::ControlPlaneState;
 
@@ -101,6 +105,10 @@ impl ConfirmedView {
 /// Whether a view at `stage` carries `stamp`: it is in the stamp's meta
 /// history and applied at least the stamp's entry, compared term first.
 fn covers(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView> {
+    #[cfg(test)]
+    if !enforced(Rule::ConfirmByLogId) {
+        return covers_by_index(stage, stamp);
+    }
     match stage {
         ViewStage::Empty => Err(UnconfirmedView::Empty),
         ViewStage::Applied { history, .. } if history != stamp.history => {
@@ -110,6 +118,27 @@ fn covers(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView
             })
         }
         ViewStage::Applied { applied, .. } if applied < stamp.applied => {
+            Err(UnconfirmedView::Behind {
+                applied,
+                required: stamp.applied,
+            })
+        }
+        ViewStage::Applied { .. } => Ok(()),
+    }
+}
+
+/// What a confirmation by index alone would accept: any history, and any
+/// applied entry whose index reaches the stamp's. A learner that missed a
+/// meta plan holds a higher index of an older history, so this confirms a
+/// pre-plan view (C6(h)). The switch drops both halves of the rule, the
+/// history check and the term-first comparison, because each alone refuses
+/// that view: a meta plan begins its history in a new term. So C6(h) shows
+/// that confirming needs one of them, not which.
+#[cfg(test)]
+fn covers_by_index(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView> {
+    match stage {
+        ViewStage::Empty => Err(UnconfirmedView::Empty),
+        ViewStage::Applied { applied, .. } if applied.get().index < stamp.applied.get().index => {
             Err(UnconfirmedView::Behind {
                 applied,
                 required: stamp.applied,

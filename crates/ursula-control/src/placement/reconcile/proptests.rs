@@ -472,7 +472,7 @@ fn check_step(
 /// the move has `size` voters in each config, and every voter change keeps
 /// its proposer but the RF 1 step of the only voter.
 fn check_group(group: &Group, size: usize) -> Result<(), String> {
-    for config in &group.committed_configs {
+    for (_, config) in &group.committed_configs {
         ensure(
             config.voter_configs().all(|side| side.len() == size),
             || format!("C7: committed {config:?} is not of size {size}"),

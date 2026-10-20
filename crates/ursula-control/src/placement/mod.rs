@@ -16,6 +16,11 @@
 //! - `decommission`: the meta leader's moves off decommissioning nodes.
 //! - `admin`: the admin JSON types of the placement routes.
 //! - `samples` (tests and `test-support` only): one sample of every root.
+//! - `rules`: the switches of the rules the closed loop's negative traces
+//!   turn off, every rule always on outside tests.
+//! - `closed_loop` (tests only): the kernel and every planner driven
+//!   together over a model of meta, the nodes and their groups, checked
+//!   against C1 to C9, with the scripted negative traces of C6.
 
 mod admin;
 mod apply;
@@ -23,6 +28,7 @@ mod command;
 mod decommission;
 mod hosting;
 mod reconcile;
+mod rules;
 mod seed;
 mod state;
 mod view;
@@ -100,6 +106,8 @@ pub use view::ConfirmedView;
 pub use view::PlacementView;
 pub use view::UnconfirmedView;
 
+#[cfg(test)]
+mod closed_loop;
 #[cfg(test)]
 mod proptests;
 #[cfg(any(test, feature = "test-support"))]

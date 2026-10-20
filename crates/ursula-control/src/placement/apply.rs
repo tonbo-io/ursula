@@ -32,6 +32,8 @@ use super::command::ControlResponse;
 use super::command::HistoryBegun;
 use super::command::HistoryCause;
 use super::command::LifecycleChange;
+use super::rules::Rule;
+use super::rules::enforced;
 use super::seed::initializer;
 use super::seed::seed_voters;
 use super::state::Cluster;
@@ -113,6 +115,12 @@ impl ControlPlaneState {
                         GroupPlacement::Seeded { since: key, .. }
                         | GroupPlacement::Live { since: key, .. } => *key = since,
                     }
+                }
+                #[cfg(test)]
+                if !enforced(Rule::HistoryDrop) {
+                    return HistoryBegun::Rebased {
+                        dropped: BTreeMap::new(),
+                    };
                 }
                 let dropped = std::mem::take(&mut cluster.retirements)
                     .into_iter()
@@ -443,7 +451,7 @@ impl Cluster {
         now_ms: u64,
     ) -> Result<Change, ControlError> {
         let placement = self.existing(group)?;
-        if placement.since() != since {
+        if placement.since() != since && enforced(Rule::PlacementCas) {
             return Err(stale(group, placement));
         }
         let retired = match placement {

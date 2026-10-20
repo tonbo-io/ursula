@@ -35,6 +35,8 @@ use ursula_proto::placement::StepKind;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WaitReason;
 
+use super::rules::Rule;
+use super::rules::enforced;
 use super::state::GroupPlacement;
 use super::state::Target;
 
@@ -309,7 +311,7 @@ pub fn plan_membership_step(view: &MembershipView, target: &MembershipTarget) ->
         EffectiveMembership::Committed { log_id, config } => (*log_id, config),
     };
     let me = view.me;
-    if !config.is_voter(me) {
+    if !config.is_voter(me) && enforced(Rule::NotAMemberWaits) {
         return MembershipStep::Wait(WaitReason::NotAMember);
     }
     let mut live = leader.live.clone();
@@ -421,9 +423,10 @@ fn plan_uniform(
         live,
     } = *current;
     let reached = voters == &target.voters;
-    if reached || matches!(target.stage, TargetStage::Seeded { .. }) {
+    let seeded = matches!(target.stage, TargetStage::Seeded { .. });
+    if reached || (seeded && enforced(Rule::SeededOnlyReports)) {
         let extra: BTreeSet<NodeId> = learners.difference(&target.learners).copied().collect();
-        if !extra.is_empty() {
+        if !extra.is_empty() && enforced(Rule::LearnersBeforeReport) {
             return MembershipStep::RemoveLearners {
                 expected,
                 nodes: extra,
@@ -459,7 +462,7 @@ fn plan_uniform(
             nodes: missing,
         };
     }
-    if leader.view == ViewFreshness::Unconfirmed {
+    if leader.view == ViewFreshness::Unconfirmed && enforced(Rule::ConfirmedVoterChange) {
         return MembershipStep::ConfirmView;
     }
     let add: BTreeSet<NodeId> = target
@@ -568,7 +571,7 @@ fn not_ready(add: &BTreeSet<NodeId>, leader: &LeaderView) -> WaitReason {
 }
 
 #[cfg(test)]
-mod model;
+pub(super) mod model;
 #[cfg(test)]
 mod proptests;
 #[cfg(test)]
