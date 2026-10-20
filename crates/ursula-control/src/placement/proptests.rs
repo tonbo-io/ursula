@@ -99,7 +99,9 @@ impl Run {
             .ids()
             .into_iter()
             .enumerate()
-            .filter(|(bit, _)| mask.checked_shr(u32::try_from(*bit).unwrap()).unwrap_or(0) & 1 == 1)
+            .filter(|(bit, _)| {
+                (mask.checked_shr(u32::try_from(*bit).unwrap()).unwrap_or(0) & 1) == 1
+            })
             .map(|(_, id)| id)
             .collect();
         VoterSet::from_first(chosen.first().copied().unwrap_or(node(1)), chosen)

@@ -466,7 +466,7 @@ mod tests {
         let json = serde_json::to_string(&voters).unwrap();
         assert_eq!(json, "[1,2,3]");
         assert_eq!(serde_json::from_str::<VoterSet>(&json).unwrap(), voters);
-        assert!(matches!(serde_json::from_str::<VoterSet>("[]"), Err(_)));
+        serde_json::from_str::<VoterSet>("[]").expect_err("an empty set does not decode");
         assert_eq!(
             VoterSet::from_first(NodeId::new(5), [NodeId::new(2), NodeId::new(5)]),
             VoterSet::new(ids(&[2, 5])).unwrap()

@@ -453,8 +453,9 @@ fn decommissioning_refuses_cordoning_a_decommissioning_node() {
 fn every_error_variant_has_a_test_above() {
     // The tests above cover each variant once: this list fails to compile
     // when a variant is added, and names the test to write.
-    for error in sample_errors() {
-        let test = match error {
+    let tests: BTreeSet<&str> = sample_errors()
+        .into_iter()
+        .map(|error| match error {
             ControlError::NotBootstrapped => "not_bootstrapped",
             ControlError::AlreadyBootstrapped => "already_bootstrapped",
             ControlError::FormationCut => "formation_cut",
@@ -474,9 +475,9 @@ fn every_error_variant_has_a_test_above() {
             ControlError::MetaVoter { .. } => "meta_voter",
             ControlError::ReservationAuthority => "reservation_authority",
             ControlError::Decommissioning { .. } => "decommissioning",
-        };
-        assert!(!test.is_empty());
-    }
+        })
+        .collect();
+    assert_eq!(tests.len(), 19);
 }
 
 #[test]
@@ -754,8 +755,6 @@ fn every_root_round_trips_through_messagepack_and_json() {
 fn a_set_of_voters_is_never_empty_in_the_encoding() {
     let empty: BTreeSet<u64> = BTreeSet::new();
     let bytes = ursula_stream::msgpack::encode(&empty).unwrap();
-    assert!(matches!(
-        ursula_stream::msgpack::decode::<ursula_proto::placement::VoterSet>(&bytes),
-        Err(_)
-    ));
+    ursula_stream::msgpack::decode::<ursula_proto::placement::VoterSet>(&bytes)
+        .expect_err("an empty set does not decode");
 }
