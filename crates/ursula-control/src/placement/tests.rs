@@ -516,10 +516,11 @@ fn decommissioning_refuses_cordoning_a_decommissioning_node() {
 }
 
 #[test]
-fn every_error_variant_has_a_test_above() {
-    // The tests above cover each variant once: this list fails to compile
-    // when a variant is added, and names the test to write.
-    let tests: BTreeSet<&str> = sample_errors()
+fn every_error_variant_has_a_unit_test_named_after_it() {
+    // One name per variant, in a match that fails to compile when a variant
+    // is added. Each names the test of this file that refuses with it: a
+    // `fn` whose name starts with it.
+    let names: BTreeSet<&str> = sample_errors()
         .into_iter()
         .map(|error| match error {
             ControlError::NotBootstrapped => "not_bootstrapped",
@@ -543,7 +544,13 @@ fn every_error_variant_has_a_test_above() {
             ControlError::Decommissioning { .. } => "decommissioning",
         })
         .collect();
-    assert_eq!(tests.len(), 19);
+    let source = include_str!("tests.rs");
+    for name in names {
+        assert!(
+            source.contains(&format!("fn {name}_")),
+            "no test is named after ControlError's {name} variant"
+        );
+    }
 }
 
 #[test]
