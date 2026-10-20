@@ -140,7 +140,28 @@ impl CoreRaftTransport {
             peer_cluster,
         }
     }
+
+    /// The meta group's transport on a node of `registry`, sending as
+    /// `identity`. Its append sessions carry meta items only, as sessions
+    /// are keyed by peer endpoint and every item of a stream must be of the
+    /// plane the stream names, and its queue is the registry's meta send
+    /// budget, so data replication never waits on meta and meta never on
+    /// data.
+    pub fn for_meta(registry: &RaftGroupHandleRegistry, identity: PeerIdentity) -> Self {
+        Self::with_budget(
+            registry.meta_append_send_budget.clone(),
+            identity,
+            registry.peer_cluster().clone(),
+        )
+    }
 }
+
+/// The meta plane's append budget each way, per node. The meta group's
+/// entries are control commands of a few KiB, and a frame stops collecting
+/// at [`RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES`], so this holds a few
+/// frames in flight. A meta snapshot travels as a full snapshot request,
+/// outside the append budgets.
+pub(crate) const META_APPEND_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// A transport of the test cluster ([`crate::peer_cluster::test_identity`]).
 #[cfg(test)]
 impl Default for CoreRaftTransport {
@@ -956,8 +977,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         let concurrency = Arc::new(Semaphore::new(64));
         // Decoded frames waiting for (or in) processing hold a share of this budget; the next
         // frame is not read off the stream until it fits, so a slow follower pushes back through
-        // HTTP/2 flow control instead of buffering the leader's backlog in memory.
-        let budget = registry.append_receive_budget.clone();
+        // HTTP/2 flow control instead of buffering the leader's backlog in memory. Each plane
+        // has its own budget, so a data backlog never holds up meta replication. A stream that
+        // names no plane has every item refused, and is charged to the data budget.
+        let budget = match plane {
+            Some(raft_internal_proto::RaftPlaneV1::Meta) => {
+                registry.meta_append_receive_budget.clone()
+            }
+            Some(_) | None => registry.append_receive_budget.clone(),
+        };
         let shutdown = registry.subscribe_transport_shutdown();
         let requests = futures_util::stream::unfold(
             (request.into_inner(), shutdown, budget),
@@ -3065,6 +3093,75 @@ mod reconnect_tests {
         let errors = refused_stream_items(&endpoint, Some("meta"), vec![meta()]).await;
         assert_eq!(code(&errors[0]), tonic::Code::NotFound);
         server.abort();
+    }
+
+    /// Each plane's append stream takes its own receive budget: with the
+    /// data plane's taken whole, a meta stream's frame is still read and
+    /// answered, while a data stream's frame waits for budget.
+    #[tokio::test]
+    async fn a_meta_append_stream_takes_the_meta_receive_budget() {
+        let (endpoint, registry, server) = spawn_append_stream_server().await;
+        let data_budget = &registry.append_receive_budget;
+        let held = data_budget
+            .semaphore
+            .clone()
+            .try_acquire_many_owned(u32::try_from(data_budget.bytes).unwrap())
+            .expect("the data receive budget is free");
+        let mut meta = test_envelope(0, Vec::new().into());
+        RaftTarget::Meta.stamp(1, &mut meta);
+
+        let answered = tokio::time::timeout(
+            Duration::from_secs(5),
+            refused_stream_items(&endpoint, Some("meta"), vec![meta]),
+        )
+        .await
+        .expect("a meta frame does not wait for the data budget");
+        // No node runs the meta group yet.
+        assert_eq!(
+            tonic::Code::from_i32(answered[0].code),
+            tonic::Code::NotFound
+        );
+        let data = tokio::time::timeout(
+            Duration::from_millis(300),
+            refused_stream_items(&endpoint, Some("data"), vec![test_envelope(
+                1,
+                Vec::new().into(),
+            )]),
+        )
+        .await;
+        assert!(
+            matches!(data, Err(_elapsed)),
+            "a data frame waits for the data budget: {data:?}"
+        );
+        assert_eq!(
+            registry.meta_append_receive_budget.bytes,
+            META_APPEND_BUDGET_BYTES
+        );
+        drop(held);
+        server.abort();
+    }
+
+    /// The meta transport queues on the meta send budget, which the data
+    /// plane's budget setting leaves alone.
+    #[test]
+    fn the_meta_transport_queues_on_the_meta_send_budget() {
+        let registry = RaftGroupHandleRegistry::default();
+        let meta = CoreRaftTransport::for_meta(&registry, crate::peer_cluster::test_identity(1));
+        assert!(Arc::ptr_eq(
+            &meta.budget.semaphore,
+            &registry.meta_append_send_budget.semaphore
+        ));
+        assert!(!Arc::ptr_eq(
+            &meta.budget.semaphore,
+            &registry.append_send_budget.semaphore
+        ));
+        assert_eq!(meta.budget.bytes, META_APPEND_BUDGET_BYTES);
+        let resized = registry.with_append_transport_budget_bytes(1024);
+        assert_eq!(resized.append_send_budget.bytes, 1024);
+        assert_eq!(
+            resized.meta_append_send_budget.bytes,
+            META_APPEND_BUDGET_BYTES
+        );
     }
 
     /// A stream item for another node is refused as misdelivered, and the
