@@ -325,18 +325,10 @@ pub(crate) async fn probe_rejoin_vote_barrier(
             return Err(status.into());
         }
     };
-    barrier_answer(network.raft_target(), leader_id, &response)
-}
-
-/// The answer a barrier response carries for a request to `leader_id`
-/// about `target`. The answer must echo the target, and its memberships are
-/// required: empty bytes do not decode, and a membership without voters is
-/// refused, never read as an answer that a node is no member.
-fn barrier_answer(
-    target: RaftTarget,
-    leader_id: u64,
-    response: &raft_internal_proto::RejoinBarrierResponseV1,
-) -> Result<BarrierAnswer, RecoveryProbeError> {
+    // The answer must echo the target, and its memberships are required:
+    // empty bytes do not decode, and a membership without voters is refused,
+    // never read as an answer that a node is no member.
+    let target = network.raft_target();
     if response.plane != i32::from(target.plane())
         || response.raft_group_id != target.wire_group_id()
     {

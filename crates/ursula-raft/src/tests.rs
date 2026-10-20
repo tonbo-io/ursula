@@ -4089,7 +4089,10 @@ async fn openraft_snapshot_round_trips_group_state() {
 
     let appended = target
         .engine
-        .apply_committed_write(append_command(bsid("raft-snapshot"), b"-next"), placement())
+        .apply_committed_write(
+            append_stream_command(bsid("raft-snapshot"), b"-next"),
+            placement(),
+        )
         .expect("append after install");
     match appended {
         GroupWriteResponse::Append(response) => {
