@@ -179,7 +179,7 @@ fn normal_entry(
 ) -> <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::Entry {
     Entry::new(
         log_id(index),
-        EntryPayload::Normal(RaftCommand::Stream(StreamCommand::from(command))),
+        EntryPayload::Normal(RaftCommand::Stream(command)),
     )
 }
 

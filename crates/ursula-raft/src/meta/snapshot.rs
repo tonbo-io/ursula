@@ -200,7 +200,7 @@ mod tests {
         let at_bound = pointer(SnapshotLocation::Inline {
             bytes: vec![0; bound],
         });
-        assert!(MetaSnapshotPointer::try_from(at_bound).is_ok());
+        MetaSnapshotPointer::try_from(at_bound).expect("a state at the bound is accepted");
         let above = pointer(SnapshotLocation::Inline {
             bytes: vec![0; bound.saturating_add(1)],
         });

@@ -102,7 +102,7 @@ mod tests {
         let empty = pb::GenesisProbeAckV1 {
             answer: Vec::new().into(),
         };
-        assert!(genesis_answer(&empty).is_err());
+        genesis_answer(&empty).expect_err("an empty answer does not decode");
         let mismatch = GenesisAnswer::Mismatch(samples::sample_genesis_claim());
         let ack = pb::GenesisProbeAckV1 {
             answer: encode_wire(&mismatch),

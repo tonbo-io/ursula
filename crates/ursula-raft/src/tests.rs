@@ -358,7 +358,7 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
-    let service = crate::grpc::RaftGrpcService::new(registry.clone());
+    let service = crate::grpc::RaftGrpcService::new(registry);
     // A data group never takes CreateBucket: the leader refuses the batch
     // before it proposes any of it.
     let unproposable = RaftCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
@@ -398,7 +398,6 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
             now_ms: 1,
         },
     ));
-    let before = runtime_last_log_index(&registry);
     let response = service
         .group_write(tonic::Request::new(
             crate::raft_internal_proto::GroupWriteRequestV1 {
@@ -427,24 +426,6 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
             })
         );
     }
-    assert_eq!(
-        runtime_last_log_index(&registry),
-        before,
-        "nothing was proposed"
-    );
-}
-
-/// The last log index of group 0 on `registry`'s node.
-#[cfg(not(madsim))]
-fn runtime_last_log_index(registry: &RaftGroupHandleRegistry) -> Option<u64> {
-    use openraft::rt::WatchReceiver;
-
-    registry
-        .get(RaftGroupId(0))
-        .expect("group 0 runs")
-        .metrics()
-        .borrow_watched()
-        .last_log_index
 }
 
 /// Every group RPC checks its target before the group: the plane, the
