@@ -501,7 +501,7 @@ pub(crate) async fn confirm_recovery_barrier(
     group: RaftGroupId,
     raft: &OwnerRaftHandle,
     barrier: &dyn ursula_runtime::LinearizableReadBarrier,
-) -> Result<(crate::UrsulaVote, u64), QuorumProofError> {
+) -> Result<crate::BarrierAnswer, QuorumProofError> {
     let before = raft.metrics().borrow_watched().clone();
     if before.current_leader != Some(before.id) || !before.vote.is_committed() {
         return Err(QuorumProofError::NotLeader { group });
@@ -516,7 +516,13 @@ pub(crate) async fn confirm_recovery_barrier(
         return Err(QuorumProofError::LeadershipChanged { group });
     }
     let last_log_index = after.last_log_index.unwrap_or_default();
-    Ok((after.vote, index.max(last_log_index)))
+    Ok(crate::BarrierAnswer {
+        vote: after.vote,
+        index: index.max(last_log_index),
+        // The memberships of the leader view the barrier confirmed, from
+        // the same read of the metrics.
+        memberships: crate::LeaderMemberships::of(&after),
+    })
 }
 
 pub use crate::election::IncomingTransferError;
@@ -614,19 +620,19 @@ impl RaftGroupHandleRegistry {
         &self,
         group: RaftGroupId,
     ) -> Result<ursula_proto::admin::QuorumPrefix, QuorumProofError> {
-        let (vote, index) = self.confirm_recovery_barrier(group).await?;
+        let answer = self.confirm_recovery_barrier(group).await?;
         Ok(ursula_proto::admin::QuorumPrefix {
             raft_group_id: group.0,
-            leader_id: *vote.leader_id().node_id(),
-            leader_term: vote.leader_id().term(),
-            required_applied_index: index,
+            leader_id: *answer.vote.leader_id().node_id(),
+            leader_term: answer.vote.leader_id().term(),
+            required_applied_index: answer.index,
         })
     }
 
     pub(crate) async fn confirm_recovery_barrier(
         &self,
         group: RaftGroupId,
-    ) -> Result<(crate::UrsulaVote, u64), QuorumProofError> {
+    ) -> Result<crate::BarrierAnswer, QuorumProofError> {
         let (raft, barrier, history) = {
             let groups = self.groups.load();
             let entry = groups

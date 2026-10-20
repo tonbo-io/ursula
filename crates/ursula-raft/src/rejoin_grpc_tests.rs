@@ -172,6 +172,13 @@ impl RaftInternal for RecoveryTestService {
     ) -> Result<Response<pb::RaftTransferLeaderAckV1>, Status> {
         self.inner.transfer_leader(request).await
     }
+
+    async fn genesis_probe(
+        &self,
+        request: Request<pb::GenesisProbeRequestV1>,
+    ) -> Result<Response<pb::GenesisProbeAckV1>, Status> {
+        self.inner.genesis_probe(request).await
+    }
 }
 
 /// `raft.peers` of a fixture whose node `i + 1` serves at `endpoints[i]`.
@@ -384,6 +391,7 @@ async fn fresh_proof(
             PROBE_TIMEOUT.min(remaining),
         )
         .await
+        .map(|answer| (answer.vote, answer.index))
         .map_err(probe_attempt_error)
     })
     .await
@@ -770,6 +778,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     );
     let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
+            plane: pb::RaftPlaneV1::Data.into(),
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
             protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -800,6 +809,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     assert!(
         client
             .transfer_leader(Request::new(pb::RaftTransferLeaderRequestV1 {
+                plane: pb::RaftPlaneV1::Data.into(),
                 raft_group_id: placement().raft_group_id.0,
                 node_id: 1,
                 protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -939,6 +949,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     wal_roots[0] = wal_root;
     let rejected = client
         .append(Request::new(pb::RaftRpcEnvelopeV1 {
+            plane: pb::RaftPlaneV1::Data.into(),
             raft_group_id: placement().raft_group_id.0,
             node_id: 1,
             protocol_version: ursula_stream::FORMAT_EPOCH,
@@ -991,6 +1002,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
                 PROBE_TIMEOUT.min(remaining),
             )
             .await
+            .map(|answer| (answer.vote, answer.index))
             .map_err(|error| {
                 assert!(
                     !gates[0].vote_gate_open(),

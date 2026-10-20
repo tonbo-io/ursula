@@ -31,12 +31,13 @@ impl RecoveryTransport for GrpcRecoveryTransport {
             .map(|response| PeerGroupLog::from_vote_response(&response))
     }
     async fn barrier(&self, leader: u64) -> Result<(UrsulaVote, u64), Self::Error> {
-        probe_rejoin_vote_barrier(
+        let answer = probe_rejoin_vote_barrier(
             self.transport.clone(),
             self.placement,
             leader,
             crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
         )
-        .await
+        .await?;
+        Ok((answer.vote, answer.index))
     }
 }
