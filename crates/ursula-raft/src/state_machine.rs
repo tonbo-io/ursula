@@ -1863,10 +1863,22 @@ pub(crate) fn snapshot_record_sample() -> Vec<u8> {
             openraft::Membership::new_with_defaults(vec![[1, 2, 3].into_iter().collect()], [4]),
         ),
     };
+    snapshot_record_bytes(LogGeneration::new(3), meta, vec![0x92, 0x05, 0x09])
+}
+
+/// The snapshot record of `generation`, `meta` and `pointer_bytes`, as
+/// `group-N.snapshot.json` holds it, checked to decode to the record it was
+/// encoded from and to re-encode to the same bytes.
+#[cfg(test)]
+pub(crate) fn snapshot_record_bytes(
+    generation: LogGeneration,
+    meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    pointer_bytes: Vec<u8>,
+) -> Vec<u8> {
     let record = PersistedSnapshot {
-        generation: LogGeneration::new(3),
+        generation,
         meta,
-        pointer_bytes: vec![0x92, 0x05, 0x09],
+        pointer_bytes,
     };
     let bytes = encode_binary_envelope(&record).expect("the sample encodes");
     let decoded =

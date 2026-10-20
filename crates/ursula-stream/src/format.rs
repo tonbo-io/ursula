@@ -16,10 +16,17 @@
 //! ([`crate::msgpack`]) for everything Ursula writes as MessagePack. Epoch 6
 //! is the format of Ursula 0.10: a run state with one record per journal
 //! class, and a log generation on every Raft WAL journal record, core
-//! metadata entry and group snapshot record. The meta group's formats extend
-//! this list as they land (#768). A binary
-//! reads exactly one epoch: it refuses data and peers from any other epoch
-//! loudly, before it writes anything, and it does not convert them.
+//! metadata entry and group snapshot record; a Raft entry payload with the
+//! meta group's commands beside the data groups' (`RaftCommand`, whose data
+//! entries keep their epoch-5 bytes); the placement kernel's state, commands
+//! and answers, and the meta group's state, history event and inline
+//! snapshot record; a plane and a target node on every Raft request, the
+//! refusal of a request for another node, barrier answers that carry the
+//! leader's memberships, and the genesis probe RPC; and the group engine
+//! error without its static-membership variant and with a not-held WAL
+//! open, a control answer kind and a command of the other plane (#768). A
+//! binary reads exactly one epoch: it refuses data and peers from any other
+//! epoch loudly, before it writes anything, and it does not convert them.
 //!
 //! Every version number that an earlier binary checks is set equal to
 //! [`FORMAT_EPOCH`]: the Raft WAL journal header and state files, the Raft

@@ -511,7 +511,218 @@ mod tests {
             "stream_snapshot",
             &ursula_runtime::wire_samples::stream_snapshot(),
         );
+
+        meta_envelopes(samples);
+        placement_vocabulary(samples);
         envelopes
+    }
+
+    /// The meta group's state, one per sample state of the kernel. The
+    /// bootstrapped state under the placement authority carries a history
+    /// event.
+    fn meta_states() -> Vec<(&'static str, crate::meta::MetaState)> {
+        use ursula_control::ControlPlaneState;
+        use ursula_control::MaintenanceAuthority;
+
+        let history = ursula_stream::HistoryEvent {
+            id: std::num::NonZeroU64::new(0x0abc_def0_1234_5678).expect("non-zero"),
+            event_index: 71,
+            previous: 0x0765_4321_0fed_cba9,
+            kept: 70,
+            leader: ursula_stream::HistoryLeader {
+                term: 72,
+                node_id: 3,
+            },
+            imported: None,
+        };
+        ursula_control::samples::sample_states()
+            .into_iter()
+            .map(|control| {
+                let (name, history) = match &control {
+                    ControlPlaneState::Forming { .. } => ("meta_state_forming", None),
+                    ControlPlaneState::FormationCut => ("meta_state_formation_cut", None),
+                    ControlPlaneState::Bootstrapped(cluster) => {
+                        match cluster.params().maintenance {
+                            MaintenanceAuthority::Placement => ("meta_state", Some(history)),
+                            MaintenanceAuthority::Reservation => ("meta_state_reservation", None),
+                        }
+                    }
+                };
+                (name, crate::meta::MetaState { history, control })
+            })
+            .collect()
+    }
+
+    /// The meta group's persisted and sent roots apart from its commands
+    /// and answers: its state, its snapshot record, the memberships a
+    /// barrier answers with, and the genesis probe with every answer.
+    fn meta_envelopes(samples: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        let states = meta_states();
+        for (name, state) in &states {
+            add(samples, name, state);
+        }
+
+        // Meta's snapshot record: the standard record of generation 0 whose
+        // pointer is inline, its bytes the whole state.
+        let (_, state) = states
+            .iter()
+            .find(|(name, _)| *name == "meta_state")
+            .expect("a meta state with a history");
+        let snapshot_log = log_id(73, 3, 74);
+        let pointer = crate::meta::snapshot::MetaSnapshotPointer::new(
+            crate::state_machine::group_snapshot_id(
+                ursula_shard::RaftGroupId(0),
+                Some(snapshot_log),
+            ),
+            state,
+        )
+        .expect("the sample state is within the bound")
+        .into_pointer();
+        let pointer_bytes = wire_bytes("meta_snapshot_pointer", &pointer);
+        assert!(
+            samples
+                .insert(
+                    "meta_snapshot_record".to_owned(),
+                    crate::state_machine::snapshot_record_bytes(
+                        crate::log_store::LogGeneration::FIRST,
+                        SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+                            last_log_id: Some(snapshot_log),
+                            last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                                Some(log_id(73, 3, 2)),
+                                openraft::Membership::new_with_defaults(
+                                    vec![[1, 2, 3].into_iter().collect()],
+                                    [5],
+                                ),
+                            ),
+                        },
+                        pointer_bytes,
+                    ),
+                )
+                .is_none()
+        );
+
+        // A barrier's memberships: a committed joint config with a learner,
+        // and the uniform config appended after it.
+        add(samples, "leader_memberships", &crate::LeaderMemberships {
+            committed: membership(),
+            effective: StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+                Some(log_id(7, 2, 21)),
+                openraft::Membership::new_with_defaults(vec![[2, 3].into_iter().collect()], [4]),
+            ),
+        });
+
+        let claim = ursula_control::samples::sample_genesis_claim();
+        add(
+            samples,
+            "genesis_probe",
+            &crate::meta::genesis::GenesisProbe {
+                claim: claim.clone(),
+                vote: crate::bootstrap_probe_vote(),
+            },
+        );
+        let answers = every!(crate::meta::genesis::GenesisAnswer {
+            crate::meta::genesis::GenesisAnswer::Vote(_) => "genesis_answer_vote":
+                crate::meta::genesis::GenesisAnswer::Vote(crate::types::UrsulaVoteResponse {
+                    vote: openraft::Vote::new(0, 0),
+                    vote_granted: false,
+                    last_log_id: Some(log_id(5, 3, 31)),
+                }),
+            crate::meta::genesis::GenesisAnswer::Mismatch(_) => "genesis_answer_mismatch":
+                crate::meta::genesis::GenesisAnswer::Mismatch(claim),
+        });
+        for (name, answer) in &answers {
+            add(samples, name, answer);
+        }
+    }
+
+    /// The format vocabulary of `ursula_proto::placement` (its module doc
+    /// lists it), each root alone with distinct values, so a change of a
+    /// field's name, place or encoding shows here as well as in the roots
+    /// that carry it.
+    fn placement_vocabulary(samples: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        use ursula_control::samples as kernel;
+        use ursula_proto::placement::GroupCount;
+        use ursula_proto::placement::MembershipLogId;
+        use ursula_proto::placement::MetaLogId;
+        use ursula_proto::placement::NodeId;
+        use ursula_proto::placement::NodeLifecycle;
+        use ursula_proto::placement::NodeRecord;
+        use ursula_proto::placement::PlacementEpoch;
+        use ursula_proto::placement::RaftLogId;
+        use ursula_proto::placement::Registered;
+        use ursula_proto::placement::ReplicationFactor;
+
+        let raft_log_id = |term, leader, index| RaftLogId {
+            term,
+            leader: NodeId::new(leader),
+            index,
+        };
+        add(samples, "placement_node_id", &NodeId::new(81));
+        add(samples, "placement_raft_log_id", &raft_log_id(82, 83, 84));
+        add(
+            samples,
+            "placement_meta_log_id",
+            &MetaLogId::new(raft_log_id(85, 86, 87)),
+        );
+        add(
+            samples,
+            "placement_membership_log_id",
+            &MembershipLogId::new(raft_log_id(88, 89, 90)),
+        );
+        add(
+            samples,
+            "placement_epoch",
+            &PlacementEpoch::new(MetaLogId::new(raft_log_id(91, 92, 93))),
+        );
+        let lifecycles = every!(NodeLifecycle {
+            NodeLifecycle::Active => "placement_node_lifecycle_active": NodeLifecycle::Active,
+            NodeLifecycle::Cordoned => "placement_node_lifecycle_cordoned": NodeLifecycle::Cordoned,
+            NodeLifecycle::Decommissioning => "placement_node_lifecycle_decommissioning":
+                NodeLifecycle::Decommissioning,
+            NodeLifecycle::Removed => "placement_node_lifecycle_removed": NodeLifecycle::Removed,
+        });
+        for (name, lifecycle) in &lifecycles {
+            add(samples, name, lifecycle);
+        }
+        let record = NodeRecord {
+            lifecycle: NodeLifecycle::Decommissioning,
+            since_ms: 94,
+        };
+        add(samples, "placement_node_record", &record);
+        add(
+            samples,
+            "placement_voter_set",
+            &kernel::voters(&[95, 96, 97]),
+        );
+        add(samples, "placement_node_set", &kernel::node_set(&[98, 99]));
+        add(
+            samples,
+            "placement_group_count",
+            &GroupCount::new(std::num::NonZeroU32::new(100).expect("non-zero")),
+        );
+        add(
+            samples,
+            "placement_replication_factor",
+            &ReplicationFactor::new(std::num::NonZeroU8::new(5).expect("non-zero")),
+        );
+        add(
+            samples,
+            "placement_genesis_claim",
+            &kernel::sample_genesis_claim(),
+        );
+        let registered = every!(Registered {
+            Registered::Forming => "placement_registered_forming": Registered::Forming,
+            Registered::Referenced(_) => "placement_registered_referenced":
+                Registered::Referenced(record),
+            Registered::Unreferenced(_) => "placement_registered_unreferenced":
+                Registered::Unreferenced(NodeRecord {
+                    lifecycle: NodeLifecycle::Cordoned,
+                    since_ms: 101,
+                }),
+        });
+        for (name, registered) in &registered {
+            add(samples, name, registered);
+        }
     }
 
     /// Every root that format epoch 6 writes to disk or sends to a peer
@@ -556,15 +767,23 @@ mod tests {
         );
     }
 
-    /// Every replicated command, in the [`RaftCommand`]
-    /// a Raft entry and a forwarded `GroupWrite` carry, every write answer
-    /// and the forwarded read answers, keyed by their `Debug` form.
+    /// Every replicated command of both planes, in the [`RaftCommand`] a
+    /// Raft entry and a forwarded `GroupWrite` carry, every write answer of
+    /// a data group, every answer of the placement kernel a forwarded meta
+    /// write gets, and the forwarded read answers, keyed by their `Debug`
+    /// form. A data entry's key and bytes are those of format epoch 5.
     fn commands_and_responses() -> std::collections::BTreeMap<String, Vec<u8>> {
         use ursula_runtime::wire_samples;
 
         let mut samples = std::collections::BTreeMap::new();
-        for command in wire_samples::group_write_commands() {
-            add_by_debug(&mut samples, &command);
+        for command in wire_samples::stream_commands() {
+            add_by_debug(&mut samples, &RaftCommand::Stream(command));
+        }
+        for command in meta_commands() {
+            add_by_debug(&mut samples, &RaftCommand::Meta(command));
+        }
+        for response in ursula_control::samples::sample_responses() {
+            add_by_debug(&mut samples, &response);
         }
         for response in wire_samples::group_write_responses() {
             add_by_debug(&mut samples, &response);
@@ -576,6 +795,42 @@ mod tests {
             add_by_debug(&mut samples, &read);
         }
         samples
+    }
+
+    /// One meta command of every variant: a history event of each cause and
+    /// every control command of the kernel's samples.
+    fn meta_commands() -> Vec<crate::meta::MetaCommand> {
+        use crate::meta::MetaCommand;
+
+        let events = [
+            (0x0111_2222_3333_4444, 0, 61, 62),
+            (0x0555_6666_7777_8888, 0x0111_2222_3333_4444, 63, 64),
+        ];
+        let mut commands: Vec<MetaCommand> = ursula_control::samples::sample_history_causes()
+            .into_iter()
+            .zip(events)
+            .map(
+                |(cause, (id, previous, kept, term))| MetaCommand::NewHistory {
+                    history: std::num::NonZeroU64::new(id).expect("non-zero"),
+                    previous,
+                    kept,
+                    leader: ursula_stream::HistoryLeader { term, node_id: 4 },
+                    cause,
+                },
+            )
+            .collect();
+        commands.extend(
+            ursula_control::samples::sample_commands()
+                .into_iter()
+                .map(MetaCommand::Control),
+        );
+        // A new variant does not compile until it has a sample.
+        for command in &commands {
+            match command {
+                MetaCommand::NewHistory { .. } | MetaCommand::Control(_) => {}
+            }
+        }
+        commands
     }
 
     /// The commands every replica applies from its log and the answers a
