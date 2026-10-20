@@ -530,12 +530,12 @@ pub fn sample_errors() -> Vec<ControlError> {
         },
         ControlError::IneligibleTarget { .. } => ControlError::IneligibleTarget {
             group: RaftGroupId(14),
-            node: node(14),
+            node: node(24),
             lifecycle: NodeLifecycle::Decommissioning,
         },
         ControlError::RetirementPending { .. } => ControlError::RetirementPending {
             group: RaftGroupId(15),
-            node: node(15),
+            node: node(25),
         },
         ControlError::MoveLimit { .. } => ControlError::MoveLimit {
             limit: 57,
