@@ -1763,11 +1763,11 @@ async fn replay_keeps_only_the_generation_the_metadata_names() {
     let core = Core::small(WalFsync::Always);
     fs::create_dir_all(&core.dir).expect("core dir");
     write_generations(&core, 1, &[(7, 1, vec![1, 2])]);
-    write_generations(&core, 2, &[(7, 0, vec![3, 4, 5]), (9, 0, vec![1])]);
+    write_generations(&core, 2, &[(7, 0, vec![3, 4, 5]), (3, 0, vec![1])]);
     let mut metadata = CoreMetadata::default();
     metadata.initialize(7, GroupLogState::Initialized);
     metadata.adopt_generation(7, LogGeneration::new(1));
-    metadata.initialize(9, GroupLogState::Initialized);
+    metadata.initialize(3, GroupLogState::Initialized);
     metadata
         .store(&core_metadata_path(&core.dir))
         .expect("store metadata");
@@ -1776,10 +1776,10 @@ async fn replay_keeps_only_the_generation_the_metadata_names() {
     let store = core.store(&writer, 7);
     assert_eq!(log_ids(&store).await, [1, 2]);
     assert_eq!(store.log_state(), GroupLogState::Initialized);
-    assert_eq!(log_ids(&core.store(&writer, 9)).await, [1]);
+    assert_eq!(log_ids(&core.store(&writer, 3)).await, [1]);
     let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
     assert_eq!(metadata.group(7).generation, LogGeneration::new(1));
-    assert_eq!(metadata.group(9).generation, LogGeneration::FIRST);
+    assert_eq!(metadata.group(3).generation, LogGeneration::FIRST);
 }
 
 /// Without metadata, replay keeps each group's highest generation among its
@@ -1789,7 +1789,7 @@ async fn replay_keeps_only_the_generation_the_metadata_names() {
 async fn replay_without_metadata_keeps_the_highest_generation_recovering() {
     let core = Core::small(WalFsync::Always);
     fs::create_dir_all(&core.dir).expect("core dir");
-    write_generations(&core, 1, &[(7, 0, vec![1, 2, 3]), (9, 0, vec![1, 2])]);
+    write_generations(&core, 1, &[(7, 0, vec![1, 2, 3]), (3, 0, vec![1, 2])]);
     write_generations(&core, 2, &[(7, 2, vec![4]), (7, 1, vec![5, 6])]);
     assert!(!core_metadata_path(&core.dir).exists());
 
@@ -1797,13 +1797,13 @@ async fn replay_without_metadata_keeps_the_highest_generation_recovering() {
     let store = core.store(&writer, 7);
     assert_eq!(log_ids(&store).await, [4]);
     assert_eq!(store.log_state(), GroupLogState::Recovering);
-    let other = core.store(&writer, 9);
+    let other = core.store(&writer, 3);
     assert_eq!(log_ids(&other).await, [1, 2]);
     assert_eq!(other.log_state(), GroupLogState::Recovering);
     let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
     assert_eq!(metadata.group(7).generation, LogGeneration::new(2));
     assert_eq!(metadata.group(7).log, GroupLogState::Recovering);
-    assert_eq!(metadata.group(9).generation, LogGeneration::FIRST);
+    assert_eq!(metadata.group(3).generation, LogGeneration::FIRST);
 }
 
 /// Under `never` an append is acknowledged without a journal `fsync`;
