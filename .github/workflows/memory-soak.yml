@@ -1,34 +1,32 @@
 name: Memory soak
 
-# Write-overload memory soak: 3 nodes + gateway + S3 (AWS S3 in CI, MinIO for fork PRs), many
-# SQLite-VFS-shaped owners appending flat out (clients/sqlite-ursula/test/soak.e2e.ts). Node RSS
-# must stay bounded — overload has to reach clients as 503/429 pushback, not as server memory
+# Write-overload memory soak: 3 nodes + gateway + S3 (AWS S3 on main, MinIO on other branches),
+# many SQLite-VFS-shaped owners appending flat out (clients/sqlite-ursula/test/soak.e2e.ts). Node
+# RSS must stay bounded — overload has to reach clients as 503/429 pushback, not as server memory
 # growth (the EKS OOM of 2026-10: ~0.7 GB/min per node at 128 owners; here, before the fix,
 # ~4 GB/min to 6 GB in 80 s).
 #
 # The vfs-outage job holds the SQLite VFS's M1 exit criterion: a ten-minute outage in front of the
 # model server, as a blackhole and as refused connections, ends with no reset and a full catch-up
-# (clients/sqlite-ursula/test/outage.e2e.ts, 60 s on every PR in integration.yml). It also runs
-# weekly and on pushes to main that change the extension. The S3 soak runs on PRs and by hand only.
+# (clients/sqlite-ursula/test/outage.e2e.ts). Its 60 s variant still runs on every pull request in
+# integration.yml.
+#
+# Nothing here runs on pull requests. When each job runs:
+# - build-ursula and soak: daily (schedule) and by hand (workflow_dispatch).
+# - vfs-outage: daily, by hand, and on pushes to main that change clients/sqlite-vfs or
+#   clients/sqlite-ursula.
+# Run both on a branch with: gh workflow run memory-soak.yml --ref <branch>
 
 on:
-  pull_request:
-    paths:
-      - "crates/**"
-      - "Cargo.lock"
-      - "clients/sqlite-ursula/**"
-      - "clients/sqlite-vfs/**"
-      - ".github/workflows/memory-soak.yml"
-      - ".github/actions/ci-s3/**"
-      - "scripts/minio_ci.sh"
   push:
     branches:
       - main
     paths:
       - "clients/sqlite-vfs/**"
+      - "clients/sqlite-ursula/**"
   schedule:
-    # Mondays, 04:17 UTC: the outage job only.
-    - cron: "17 4 * * 1"
+    # Daily, 04:47 UTC: both jobs with their defaults.
+    - cron: "47 4 * * *"
   workflow_dispatch:
     inputs:
       seconds:
@@ -46,7 +44,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -54,11 +52,10 @@ env:
 jobs:
   build-ursula:
     name: Build release ursula
-    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
-    # Fork PRs run on GitHub-hosted runners: RunsOn runners run inside our AWS account.
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
     steps:
-      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      # Sends actions/cache to the RunsOn S3 cache.
       - name: Use the RunsOn cache
         uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -84,7 +81,8 @@ jobs:
   soak:
     name: Soak (${{ github.event.inputs.owners || '128' }} owners)
     needs: build-ursula
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
     timeout-minutes: 40
     permissions:
       contents: read
@@ -94,7 +92,7 @@ jobs:
       # env-scraping code, not a boundary.
       NO_OIDC: env -u ACTIONS_ID_TOKEN_REQUEST_URL -u ACTIONS_ID_TOKEN_REQUEST_TOKEN
     steps:
-      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      # Sends actions/cache to the RunsOn S3 cache.
       - name: Use the RunsOn cache
         uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 
@@ -121,7 +119,7 @@ jobs:
           cd clients/sqlite-ursula
           $NO_OIDC npm ci --ignore-scripts
 
-      # AWS S3 through the CI role (one prefix per job) on same-repo PRs and main, MinIO otherwise.
+      # AWS S3 through the CI role (one prefix per job) on main, MinIO on other branches.
       - name: S3 backend
         id: s3
         uses: ./.github/actions/ci-s3
@@ -229,13 +227,14 @@ jobs:
 
   vfs-outage:
     name: sqlite-vfs outage (${{ github.event.inputs.outage_seconds || '600' }} s per mode, model server)
-    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    if: github.event_name == 'schedule' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: runs-on=${{ github.run_id }}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache
     timeout-minutes: 60
     env:
       # Keeps libsqlite3-sys from probing (and linking) a system libsqlite3.
       SQLITE3_LIB_DIR: /nonexistent
     steps:
-      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      # Sends actions/cache to the RunsOn S3 cache.
       - name: Use the RunsOn cache
         uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
 

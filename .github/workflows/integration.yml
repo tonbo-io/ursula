@@ -211,8 +211,9 @@ jobs:
           name: sqlite-ursula-vfs
           path: ${{ runner.temp }}/vfs
 
-      # Includes the M1 exit criteria: the crash matrix, a 60 s outage in two modes (600 s runs in
-      # memory-soak.yml) and Pi's conformance on synced() in three modes.
+      # Includes the M1 exit criteria: the crash matrix, a 60 s outage in two modes (the 600 s
+      # outage runs daily in memory-soak.yml, not on pull requests) and Pi's conformance on
+      # synced() in three modes.
       - name: e2e (the core through its SQL functions, open, synced, resets, worker threads, Pi, crashes, outages)
         timeout-minutes: 20
         run: |
