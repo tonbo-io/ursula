@@ -16,8 +16,11 @@ use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WriteEffect;
+use ursula_shard::RaftGroupId;
 
 use super::command::ControlError;
+use super::decommission::BlockedMove;
+use super::decommission::NodeEligibility;
 use super::state::Cluster;
 use super::state::GroupPlacement;
 use super::state::MoveLimit;
@@ -46,6 +49,29 @@ pub enum ClusterView {
     /// A meta recovery plan ended the formation.
     FormationCut,
     Bootstrapped(Cluster),
+}
+
+/// What only the meta leader knows, filled by the meta leader alone. A
+/// node's placement status names the meta leader, so a client reads this
+/// report from that node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetaLeaderReport {
+    pub leader: NodeId,
+    /// When this node became the meta leader (display only).
+    pub leader_since_ms: u64,
+    /// Every node's eligibility as a move target. A node it leaves out is
+    /// not live.
+    pub eligibility: BTreeMap<NodeId, NodeEligibility>,
+    /// The decommissioning nodes' groups the last decommission pass could
+    /// not move.
+    pub decommission_blocked: Vec<BlockedMove>,
+    /// The groups whose snapshot objects the removed-node sweep has not
+    /// deleted yet, by removed node.
+    pub sweep_pending: BTreeMap<NodeId, BTreeSet<RaftGroupId>>,
+    /// Why the meta leader's last `Bootstrap` was refused, if it was.
+    pub last_bootstrap_refusal: Option<ControlError>,
+    /// The age of the oldest move in progress (display only).
+    pub oldest_move_age_ms: Option<u64>,
 }
 
 /// `POST /__ursula/placement/groups/{group}/move`: move the group to `to`

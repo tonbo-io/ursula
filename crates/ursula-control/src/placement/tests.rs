@@ -12,6 +12,8 @@ use ursula_proto::placement::Registered;
 use ursula_proto::placement::ReplicaRole;
 use ursula_shard::RaftGroupId;
 
+use super::BlockReason;
+use super::BlockedMove;
 use super::BootstrapProblem;
 use super::ClusterView;
 use super::ControlApplied;
@@ -24,9 +26,11 @@ use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
 use super::MaintenanceAuthority;
+use super::MetaLeaderReport;
 use super::MoveLimit;
 use super::MoveLimitRequest;
 use super::MoveRequest;
+use super::NodeEligibility;
 use super::PlacementApiError;
 use super::PlacementApiReason;
 use super::Retirement;
@@ -892,6 +896,46 @@ fn every_root_round_trips_through_messagepack_and_json() {
             message: "refused".to_owned(),
         });
     }
+    round_trip(&MetaLeaderReport {
+        leader: node(2),
+        leader_since_ms: 71,
+        eligibility: BTreeMap::from([
+            (node(1), NodeEligibility::Eligible),
+            (node(3), NodeEligibility::NotLive),
+            (node(4), NodeEligibility::DiskPressure),
+        ]),
+        decommission_blocked: vec![
+            BlockedMove {
+                group: RaftGroupId(3),
+                reason: BlockReason::NoEligibleTarget,
+            },
+            BlockedMove {
+                group: RaftGroupId(4),
+                reason: BlockReason::TargetsUnderDiskPressure,
+            },
+            BlockedMove {
+                group: RaftGroupId(5),
+                reason: BlockReason::GroupNotLive,
+            },
+        ],
+        sweep_pending: BTreeMap::from([(
+            node(6),
+            BTreeSet::from([RaftGroupId(1), RaftGroupId(7)]),
+        )]),
+        last_bootstrap_refusal: Some(ControlError::InvalidBootstrap {
+            problem: BootstrapProblem::ReplicationFactorAboveNodes,
+        }),
+        oldest_move_age_ms: Some(72),
+    });
+    round_trip(&MetaLeaderReport {
+        leader: node(1),
+        leader_since_ms: 0,
+        eligibility: BTreeMap::new(),
+        decommission_blocked: Vec::new(),
+        sweep_pending: BTreeMap::new(),
+        last_bootstrap_refusal: None,
+        oldest_move_age_ms: None,
+    });
     for reason in [
         PlacementApiReason::NoLeader,
         PlacementApiReason::ForwardFailed { leader: node(2) },
