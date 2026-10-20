@@ -406,8 +406,9 @@ impl Cluster {
 
     /// Whether `node` may be in a move target of `group` whose voters are
     /// now `placed_now`: registered, not removed, active unless it is one of
-    /// them, and without a retirement for the group.
-    fn check_target(
+    /// them, and without a retirement for the group. The one target check:
+    /// the decommission planner filters its candidates with it too.
+    pub(crate) fn check_target(
         &self,
         group: RaftGroupId,
         node: NodeId,

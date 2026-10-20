@@ -14,7 +14,9 @@
 //!   through `ursula_stream::msgpack`, which writes a struct as an array of
 //!   its fields, so field order is format: never reorder, add or remove a
 //!   field outside a format epoch. These types get wire fixtures with the
-//!   meta group's roots.
+//!   meta group's roots. No type in the replicated, persisted or RPC
+//!   MessagePack closure uses `#[serde(other)]`: an unknown variant decoding
+//!   as another would hide a format mismatch.
 //! - **Admin JSON**: the admin protocol, compatible within a minor and never
 //!   in the meta log or between nodes. [`ReplicaRole`], [`TeardownStage`],
 //!   [`WaitReason`], [`StepKind`], [`StepFailureKind`], [`StepFailure`],
@@ -29,11 +31,29 @@
 //! transparent, and a set that is never empty decodes through a validating
 //! `try_from`.
 //!
+//! **Admin JSON enums tolerate unknown variants.** The planners and the
+//! reconciler decide only what is proposed, so a patch of the minor may add
+//! a reason or a step, and a same-minor `ursulactl` must still decode the
+//! answer around it. Every admin JSON enum a planner, a driver or the
+//! reconciler produces ([`TeardownStage`], [`WaitReason`], [`StepKind`],
+//! [`StepFailureKind`], [`ReconcileState`], and `ursula-control`'s
+//! `NodeEligibility` and `BlockReason`) ends in a unit `Unknown` variant
+//! marked `#[serde(other)]`, which an unknown name decodes to and nothing
+//! here produces. An enum whose variants carry data is internally tagged
+//! (`reason`, `state`), so its discriminant is a plain string beside the
+//! details and an unknown one decodes to `Unknown`, its details ignored. Such
+//! an enum's details hold no map with number keys, since serde buffers an
+//! internally tagged value and a buffered JSON key stays a string: a list
+//! of structs takes its place. [`ReplicaRole`] and [`WriteEffect`] stay
+//! closed: a role is the kernel's, fixed with the format epoch, and a write
+//! effect is a yes or no a client must not guess. An `Option` field of an
+//! admin JSON struct is required, also when `null`
+//! ([`crate::admin::required_option`]).
+//!
 //! Group ids are `RaftGroupId` in the kernel's state and plain `u32` in admin
 //! JSON.
 
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU8;
@@ -447,11 +467,24 @@ pub enum TeardownStage {
     /// The replica is fenced, stopped, and retired once the group answers
     /// again.
     Fence,
+    /// A stage a newer patch of the minor reports.
+    #[serde(other)]
+    Unknown,
 }
 
-/// Why a group leader's reconciler takes no membership step.
+/// A learner the leader waits for, with its matched log index (`None` when
+/// it matches nothing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct LearnerLag {
+    pub node: NodeId,
+    #[serde(deserialize_with = "crate::admin::required_option")]
+    pub matched: Option<u64>,
+}
+
+/// Why a group leader's reconciler takes no membership step. Encoded with
+/// its name in `reason` beside its details.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "reason", rename_all = "snake_case")]
 pub enum WaitReason {
     NotLeader,
     TransferPending,
@@ -460,10 +493,11 @@ pub enum WaitReason {
     NotAMember,
     NoLiveQuorum,
     TargetSettled,
-    /// Learners whose matched index is behind the committed one.
+    /// Learners whose matched index is behind the committed one, by
+    /// ascending node id.
     CatchingUp {
         committed: u64,
-        behind: BTreeMap<NodeId, Option<u64>>,
+        behind: Vec<LearnerLag>,
     },
     /// Targets the leader's address book does not list.
     PeerNotListed {
@@ -478,6 +512,9 @@ pub enum WaitReason {
         nodes: BTreeSet<NodeId>,
     },
     NoHandoffTarget,
+    /// A reason a newer patch of the minor reports, its details dropped.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A membership step a reconciler takes.
@@ -490,6 +527,9 @@ pub enum StepKind {
     TransferLeadership,
     ConfirmView,
     ReportConverged,
+    /// A step a newer patch of the minor reports.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a reconciler's step failed.
@@ -508,6 +548,9 @@ pub enum StepFailureKind {
     LeadershipProofFailed,
     /// A leadership transfer did not complete.
     TransferAbandoned,
+    /// A failure a newer patch of the minor reports.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The last failed step of a reconciler.
@@ -518,11 +561,15 @@ pub struct StepFailure {
     pub at_ms: u64,
 }
 
-/// What a group leader's reconciler is doing.
+/// What a group leader's reconciler is doing. Encoded with its name in
+/// `state` beside its details: a wait's `reason` and details sit beside it
+/// too.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "state", rename_all = "snake_case")]
 pub enum ReconcileState {
-    Stepping(StepKind),
+    Stepping {
+        step: StepKind,
+    },
     Waiting(WaitReason),
     Reporting,
     /// A report named a placement the meta group had moved past: the
@@ -532,6 +579,9 @@ pub enum ReconcileState {
         current: PlacementEpoch,
     },
     Converged,
+    /// A state a newer patch of the minor reports, its details dropped.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A group leader's reconcile status, published in its group metrics.
@@ -539,12 +589,15 @@ pub enum ReconcileState {
 pub struct ReconcileStatus {
     pub state: ReconcileState,
     pub since_ms: u64,
+    #[serde(deserialize_with = "crate::admin::required_option")]
     pub last_failure: Option<StepFailure>,
     pub attempts: u32,
     /// The placement the leader pursues. `None` for a settled target, which
     /// has no placement key.
+    #[serde(deserialize_with = "crate::admin::required_option")]
     pub target_since: Option<PlacementEpoch>,
     /// The meta entry the leader's view includes. `None` for an empty view.
+    #[serde(deserialize_with = "crate::admin::required_option")]
     pub view_applied: Option<MetaLogId>,
 }
 
@@ -567,13 +620,22 @@ mod tests {
     use super::EmptyNodeSet;
     use super::GenesisClaim;
     use super::GroupCount;
+    use super::LearnerLag;
     use super::MetaLogId;
     use super::NodeId;
     use super::NodeLifecycle;
     use super::NodeSet;
+    use super::PlacementEpoch;
     use super::RaftLogId;
+    use super::ReconcileState;
+    use super::ReconcileStatus;
     use super::ReplicationFactor;
+    use super::StepFailure;
+    use super::StepFailureKind;
+    use super::StepKind;
+    use super::TeardownStage;
     use super::VoterSet;
+    use super::WaitReason;
 
     fn ids(values: &[u64]) -> BTreeSet<NodeId> {
         values.iter().copied().map(NodeId::new).collect()
@@ -644,5 +706,119 @@ mod tests {
             r#"{"meta_voters":[1,2],"peers":[1,2,3,4],"group_count":16,"replication_factor":3}"#
         );
         assert_eq!(serde_json::from_str::<GenesisClaim>(&json).unwrap(), claim);
+    }
+
+    fn json_round_trip<T>(value: &T, expected: &str)
+    where T: serde::Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug {
+        let json = serde_json::to_string(value).unwrap();
+        assert_eq!(json, expected);
+        assert_eq!(&serde_json::from_str::<T>(&json).unwrap(), value);
+    }
+
+    #[test]
+    fn a_reconcile_state_names_its_state_and_reason_beside_their_details() {
+        json_round_trip(
+            &ReconcileState::Stepping {
+                step: StepKind::AddLearners,
+            },
+            r#"{"state":"stepping","step":"add_learners"}"#,
+        );
+        json_round_trip(
+            &ReconcileState::Waiting(WaitReason::NotLeader),
+            r#"{"state":"waiting","reason":"not_leader"}"#,
+        );
+        json_round_trip(
+            &ReconcileState::Waiting(WaitReason::CatchingUp {
+                committed: 10,
+                behind: vec![
+                    LearnerLag {
+                        node: NodeId::new(4),
+                        matched: Some(9),
+                    },
+                    LearnerLag {
+                        node: NodeId::new(5),
+                        matched: None,
+                    },
+                ],
+            }),
+            r#"{"state":"waiting","reason":"catching_up","committed":10,"behind":[{"node":4,"matched":9},{"node":5,"matched":null}]}"#,
+        );
+        json_round_trip(
+            &ReconcileState::Waiting(WaitReason::GateClosed {
+                nodes: ids(&[6, 2]),
+            }),
+            r#"{"state":"waiting","reason":"gate_closed","nodes":[2,6]}"#,
+        );
+        let epoch = |index| {
+            PlacementEpoch::new(MetaLogId::new(RaftLogId {
+                term: 3,
+                leader: NodeId::new(1),
+                index,
+            }))
+        };
+        json_round_trip(
+            &ReconcileState::StaleView {
+                reported: epoch(7),
+                current: epoch(8),
+            },
+            r#"{"state":"stale_view","reported":{"term":3,"leader":1,"index":7},"current":{"term":3,"leader":1,"index":8}}"#,
+        );
+        json_round_trip(&ReconcileState::Converged, r#"{"state":"converged"}"#);
+    }
+
+    #[test]
+    fn admin_json_enums_decode_an_unknown_variant() {
+        assert_eq!(
+            serde_json::from_str::<TeardownStage>(r#""drain""#).unwrap(),
+            TeardownStage::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<StepKind>(r#""rebalance""#).unwrap(),
+            StepKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<StepFailureKind>(r#""throttled""#).unwrap(),
+            StepFailureKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<WaitReason>(
+                r#"{"reason":"snapshot_sending","nodes":[4],"behind":{"4":9}}"#
+            )
+            .unwrap(),
+            WaitReason::Unknown
+        );
+        // A known state around an unknown reason keeps its state.
+        assert_eq!(
+            serde_json::from_str::<ReconcileState>(
+                r#"{"state":"waiting","reason":"snapshot_sending","nodes":[4]}"#
+            )
+            .unwrap(),
+            ReconcileState::Waiting(WaitReason::Unknown)
+        );
+        let status: ReconcileStatus = serde_json::from_str(
+            r#"{"state":{"state":"throttled","limit":3},"since_ms":5,"last_failure":{"step":"rebalance","kind":"throttled","at_ms":4},"attempts":2,"target_since":null,"view_applied":null}"#,
+        )
+        .unwrap();
+        assert_eq!(status, ReconcileStatus {
+            state: ReconcileState::Unknown,
+            since_ms: 5,
+            last_failure: Some(StepFailure {
+                step: StepKind::Unknown,
+                kind: StepFailureKind::Unknown,
+                at_ms: 4,
+            }),
+            attempts: 2,
+            target_since: None,
+            view_applied: None,
+        });
+    }
+
+    #[test]
+    fn an_admin_option_field_is_required_also_when_null() {
+        let missing = r#"{"state":{"state":"converged"},"since_ms":5,"last_failure":null,"attempts":2,"target_since":null}"#;
+        serde_json::from_str::<ReconcileStatus>(missing)
+            .expect_err("a missing `view_applied` does not decode");
+        serde_json::from_str::<LearnerLag>(r#"{"node":4}"#)
+            .expect_err("a missing `matched` does not decode");
     }
 }

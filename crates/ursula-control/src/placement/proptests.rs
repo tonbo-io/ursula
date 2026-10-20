@@ -152,6 +152,8 @@ impl Run {
         VoterSet::from_first(incoming, current.into_iter().filter(|id| *id != out))
     }
 
+    /// The step `(op, x, y, z)` chooses from the current state: mostly
+    /// commands a correct caller would send, some stale or invalid.
     fn generate(&self, op: u8, x: u8, y: u8, z: u8) -> Step {
         match op.checked_rem(13).unwrap() {
             0 => Step::Command(ControlCommand::RegisterNode {
@@ -307,6 +309,51 @@ impl Run {
         check_transition(&before, after, at, &step, &outcome)?;
         invariants(after)
     }
+}
+
+/// A state reachable from a bootstrapped cluster of nodes `1..=node_count`,
+/// every group seeded or, with `live`, reported, by the steps
+/// `(op, x, y, z)` choose, refused ones included: moves, cancels,
+/// retargets, converges, lifecycles, teardown reports and history events.
+/// The planners' property tests plan from such states.
+pub(super) fn reachable(
+    node_count: u64,
+    group_count: u32,
+    rf: u8,
+    live: bool,
+    steps: &[(u8, u8, u8, u8)],
+) -> Driver {
+    let ids: Vec<u64> = (1..=node_count).collect();
+    let rf = rf.min(u8::try_from(node_count).unwrap());
+    let driver = if live {
+        Driver::live(&ids, group_count, rf)
+    } else {
+        Driver::bootstrapped(
+            &ids,
+            params(&ids, group_count, rf, 4, MaintenanceAuthority::Placement),
+        )
+    };
+    let mut run = Run {
+        driver,
+        node_count,
+        bootstraps: 1,
+    };
+    for (op, x, y, z) in steps.iter().copied() {
+        let step = run.generate(op, x, y, z);
+        if matches!(step, Step::History(_)) {
+            run.driver.term = run.driver.term.checked_add(1).unwrap();
+        }
+        let at = run.driver.next_at();
+        match step {
+            Step::Command(command) => {
+                let _response = run.driver.state.apply(at, command);
+            }
+            Step::History(cause) => {
+                let _begun = run.driver.state.begin_history(at, cause);
+            }
+        }
+    }
+    run.driver
 }
 
 /// Properties of one state.

@@ -9,17 +9,26 @@
 //! - `apply`: the dispatcher and the history event, pure and deterministic.
 //! - `seed`: where Bootstrap places each group and who initializes it.
 //! - `view`: placement views and their confirmation.
+//! - `reconcile`: the group leader's membership planner, one voter per step
+//!   toward the placement's target.
+//! - `hosting`: what a node runs, creates and tears down, the teardown
+//!   steps, the seed role, and whom a node asks about a group.
+//! - `decommission`: the meta leader's moves off decommissioning nodes.
 //! - `admin`: the admin JSON types of the placement routes.
 //! - `samples` (tests and `test-support` only): one sample of every root.
 
 mod admin;
 mod apply;
 mod command;
+mod decommission;
+mod hosting;
+mod reconcile;
 mod seed;
 mod state;
 mod view;
 
 pub use admin::ClusterView;
+pub use admin::MetaLeaderReport;
 pub use admin::MoveLimitRequest;
 pub use admin::MoveRequest;
 pub use admin::PlacementApiError;
@@ -32,6 +41,44 @@ pub use command::ControlResponse;
 pub use command::HistoryBegun;
 pub use command::HistoryCause;
 pub use command::LifecycleChange;
+pub use decommission::BlockReason;
+pub use decommission::BlockedMove;
+pub use decommission::DecommissionMove;
+pub use decommission::DecommissionPlan;
+pub use decommission::NodeEligibility;
+pub use decommission::free_slots;
+pub use decommission::plan_decommission;
+pub use hosting::Admission;
+pub use hosting::Counts;
+pub use hosting::HostingInput;
+pub use hosting::HostingPlan;
+pub use hosting::HostingStep;
+pub use hosting::LeaderCandidates;
+pub use hosting::LocalLog;
+pub use hosting::LocalReplica;
+pub use hosting::SeedRoleOf;
+pub use hosting::Standing;
+pub use hosting::Teardown;
+pub use hosting::TeardownEnd;
+pub use hosting::TeardownEvent;
+pub use hosting::TeardownOutcome;
+pub use hosting::TeardownStep;
+pub use hosting::ViewInput;
+pub use hosting::leader_candidates;
+pub use hosting::plan_hosting;
+pub use hosting::seed_role;
+pub use reconcile::EffectiveMembership;
+pub use reconcile::LeaderView;
+pub use reconcile::Leadership;
+pub use reconcile::MembershipConfig;
+pub use reconcile::MembershipStep;
+pub use reconcile::MembershipTarget;
+pub use reconcile::MembershipView;
+pub use reconcile::PeerGate;
+pub use reconcile::TargetStage;
+pub use reconcile::ViewFreshness;
+pub use reconcile::membership_answer;
+pub use reconcile::plan_membership_step;
 pub use seed::default_meta_voters;
 pub use seed::effective_replication_factor;
 pub use seed::initializer;
