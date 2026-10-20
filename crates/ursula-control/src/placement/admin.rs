@@ -4,13 +4,17 @@
 //! `ursulactl` reads the kernel's own types ([`Cluster`], [`GroupPlacement`],
 //! [`ControlError`]) through these, so no rule or shape is mirrored. They are
 //! the admin protocol, compatible within a minor, and not part of the meta
-//! log.
+//! log. They follow the admin JSON rules of `ursula_proto::placement`: the
+//! planner enums they carry (`NodeEligibility`, `BlockReason`) decode an
+//! unknown variant to `Unknown`, and an `Option` field is required, also
+//! when `null`.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::admin::required_option;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
@@ -69,8 +73,10 @@ pub struct MetaLeaderReport {
     /// deleted yet, by removed node.
     pub sweep_pending: BTreeMap<NodeId, BTreeSet<RaftGroupId>>,
     /// Why the meta leader's last `Bootstrap` was refused, if it was.
+    #[serde(deserialize_with = "required_option")]
     pub last_bootstrap_refusal: Option<ControlError>,
     /// The age of the oldest move in progress (display only).
+    #[serde(deserialize_with = "required_option")]
     pub oldest_move_age_ms: Option<u64>,
 }
 
@@ -111,6 +117,7 @@ pub enum PlacementApiReason {
 pub struct PlacementApiError {
     pub reason: PlacementApiReason,
     pub write_effect: WriteEffect,
+    #[serde(deserialize_with = "required_option")]
     pub current: Option<GroupPlacement>,
     /// The rendered source chain.
     pub message: String,

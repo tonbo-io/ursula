@@ -430,8 +430,9 @@ pub struct RecoveryPlanReport {
 }
 
 /// Deserializes an `Option` field that must be present, so that a missing
-/// field is an error rather than `None`.
-fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+/// field is an error rather than `None`. Every admin JSON type's `Option`
+/// fields decode through it.
+pub fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,

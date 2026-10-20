@@ -97,6 +97,7 @@ pub use placement::seed_voters;
 pub use ursula_proto::placement::EmptyNodeSet;
 pub use ursula_proto::placement::GenesisClaim;
 pub use ursula_proto::placement::GroupCount;
+pub use ursula_proto::placement::LearnerLag;
 pub use ursula_proto::placement::MembershipAnswer;
 pub use ursula_proto::placement::MembershipLogId;
 pub use ursula_proto::placement::MetaLogId;

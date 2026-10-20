@@ -33,6 +33,11 @@ pub enum NodeEligibility {
     Eligible,
     /// Sheds leadership for WAL disk pressure.
     DiskPressure,
+    /// A state a newer patch of the minor reports, decoded so that an older
+    /// `ursulactl` still reads the report. No planner produces it, and the
+    /// planner treats it as not eligible.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Why a decommissioning node's group does not move.
@@ -46,6 +51,10 @@ pub enum BlockReason {
     TargetsUnderDiskPressure,
     /// The group is still seeded: it moves once it reported.
     GroupNotLive,
+    /// A reason a newer patch of the minor reports. No planner here
+    /// produces it.
+    #[serde(other)]
+    Unknown,
 }
 
 /// A decommissioning node's group that cannot move now.

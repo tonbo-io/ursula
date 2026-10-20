@@ -109,8 +109,9 @@ fn a_pass_leaves_one_slot_to_operators_at_a_limit_of_two_or_more() {
 fn an_unknown_or_dead_node_is_not_a_target() {
     let mut driver = Driver::live(&[1, 2, 3, 4, 5], 5, 3);
     driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
-    // Nodes 1 and 5 have no entry: neither is live.
-    let nodes = eligible(&[2, 3, 4]);
+    // Node 1 has no entry and node 5 an unknown one: neither is a target.
+    let mut nodes = eligible(&[2, 3, 4]);
+    nodes.insert(node(5), NodeEligibility::Unknown);
     let plan = plan_decommission(driver.cluster(), &nodes);
     // Group 1 needs node 1 or 5, group 3 node 2 or 3.
     assert_eq!(plan.blocked, vec![BlockedMove {

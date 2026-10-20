@@ -2,9 +2,9 @@
 //! step order (5.3), the joint exit, the wait reasons and the membership
 //! answer.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use ursula_proto::placement::LearnerLag;
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::NodeId;
@@ -412,7 +412,10 @@ fn a_voter_change_waits_for_a_confirmed_view_and_a_ready_learner() {
         plan(1, blocked.clone(), &target),
         MembershipStep::Wait(WaitReason::CatchingUp {
             committed: 10,
-            behind: BTreeMap::from([(node(4), Some(9))]),
+            behind: vec![LearnerLag {
+                node: node(4),
+                matched: Some(9),
+            }],
         })
     );
     let mut gated = view.clone();

@@ -13,7 +13,6 @@ use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
-use ursula_proto::placement::TeardownStage;
 use ursula_proto::placement::ViewStage;
 use ursula_shard::RaftGroupId;
 
@@ -61,8 +60,9 @@ fn local_replica(log: u8, voter: bool, teardown: u8) -> LocalReplica {
             Counts::NotVoter
         },
         teardown: match teardown {
-            0 => Some(TeardownStage::Ask),
-            1 => Some(TeardownStage::Fence),
+            0 => Some(Teardown::Asking),
+            1 => Some(Teardown::Running(TeardownStep::Fence)),
+            2 => Some(Teardown::Running(TeardownStep::AskAgain)),
             _ => None,
         },
     }
@@ -88,7 +88,7 @@ fn check_plan(
     let held = |group: RaftGroupId| local(group).is_some_and(|replica| replica.log.is_held());
     let teardown = |group: RaftGroupId| local(group).and_then(|replica| replica.teardown);
     let admissible =
-        |group: RaftGroupId| held(group) && teardown(group) != Some(TeardownStage::Fence);
+        |group: RaftGroupId| held(group) && !matches!(teardown(group), Some(Teardown::Running(_)));
 
     for (group, admission) in &plan.admitted {
         let group = *group;
@@ -164,7 +164,7 @@ fn check_plan(
             )?,
             HostingStep::CancelTeardown { group } => ensure(
                 is_confirmed
-                    && teardown(*group) == Some(TeardownStage::Ask)
+                    && teardown(*group) == Some(Teardown::Asking)
                     && (role(*group).is_some()
                         || local(*group).map(|replica| replica.log) == Some(LocalLog::Unknown)),
                 || format!("cancel of group {}", group.0),
@@ -226,7 +226,7 @@ fn check_plan(
                         .contains(&HostingStep::TearDown { group: *group }),
                 || format!("H2: group {} not torn down", group.0),
             )?;
-            let cancels = replica.teardown == Some(TeardownStage::Ask) && role(*group).is_some();
+            let cancels = replica.teardown == Some(Teardown::Asking) && role(*group).is_some();
             ensure(
                 !cancels
                     || plan
@@ -304,7 +304,7 @@ proptest::proptest! {
                 proptest::bool::weighted(0.1),
                 0_u8..5,
                 proptest::collection::vec(
-                    proptest::option::of((0_u8..4, proptest::bool::ANY, 0_u8..4)),
+                    proptest::option::of((0_u8..4, proptest::bool::ANY, 0_u8..5)),
                     6,
                 ),
             ),

@@ -74,12 +74,15 @@ fn replica(log: LocalLog) -> LocalReplica {
     }
 }
 
-fn tearing_down(log: LocalLog, stage: TeardownStage) -> LocalReplica {
+fn tearing_down(log: LocalLog, teardown: Teardown) -> LocalReplica {
     LocalReplica {
-        teardown: Some(stage),
+        teardown: Some(teardown),
         ..replica(log)
     }
 }
+
+/// A teardown past its first step.
+const FENCING: Teardown = Teardown::Running(TeardownStep::Fence);
 
 fn plan(
     me: u64,
@@ -130,7 +133,7 @@ fn a_confirmed_view_opens_creates_tears_down_and_reports_by_role() {
         }
     );
     // Fenced: no longer admitted, and nothing new starts.
-    local.insert(G1, tearing_down(LocalLog::Holding, TeardownStage::Fence));
+    local.insert(G1, tearing_down(LocalLog::Holding, FENCING));
     let fenced = plan(4, Standing::Member, ViewInput::Confirmed(&view), &local);
     assert!(!fenced.admitted.contains_key(&G1));
     assert!(fenced.steps.is_empty());
@@ -197,8 +200,8 @@ fn a_role_ends_a_teardown_still_asking_and_never_one_past_it() {
     // Node 4 is outgoing in group 1, with a teardown left asking.
     let view = confirmed(&driver);
     let local = BTreeMap::from([
-        (G1, tearing_down(LocalLog::Holding, TeardownStage::Ask)),
-        (G2, tearing_down(LocalLog::Holding, TeardownStage::Fence)),
+        (G1, tearing_down(LocalLog::Holding, Teardown::Asking)),
+        (G2, tearing_down(LocalLog::Holding, FENCING)),
     ]);
     let planned = plan(4, Standing::Member, ViewInput::Confirmed(&view), &local);
     assert_eq!(planned.steps, vec![HostingStep::CancelTeardown {
@@ -230,13 +233,13 @@ fn a_removed_node_keeps_open_only_what_counts_as_a_voter() {
     let driver = Driver::live(&[1, 2, 3, 4], 4, 3);
     let view = confirmed(&driver);
     let local = BTreeMap::from([
-        (G0, tearing_down(LocalLog::Holding, TeardownStage::Fence)),
+        (G0, tearing_down(LocalLog::Holding, FENCING)),
         (G1, replica(LocalLog::Holding)),
         (G2, LocalReplica {
             counts: Counts::NotVoter,
             ..replica(LocalLog::Holding)
         }),
-        (G3, tearing_down(LocalLog::Unknown, TeardownStage::Ask)),
+        (G3, tearing_down(LocalLog::Unknown, Teardown::Asking)),
     ]);
     assert_eq!(
         plan(4, Standing::Removed, ViewInput::Confirmed(&view), &local),

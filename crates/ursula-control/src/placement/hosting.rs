@@ -89,15 +89,15 @@ pub enum Counts {
 pub struct LocalReplica {
     pub log: LocalLog,
     pub counts: Counts,
-    /// The stage of the replica's running teardown, if any.
-    pub teardown: Option<TeardownStage>,
+    /// The replica's running teardown, if any.
+    pub teardown: Option<Teardown>,
 }
 
 impl LocalReplica {
     /// Whether the replica may be open: it is held and no teardown passed
     /// its first step.
     fn admissible(&self) -> bool {
-        self.log.is_held() && self.teardown != Some(TeardownStage::Fence)
+        self.log.is_held() && !matches!(self.teardown, Some(Teardown::Running(_)))
     }
 }
 
@@ -197,7 +197,7 @@ fn plan_removed(local: &BTreeMap<RaftGroupId, LocalReplica>) -> HostingPlan {
             plan.admitted.insert(*group, Admission::Open);
             plan.unplaced.insert(*group);
         }
-        if replica.teardown == Some(TeardownStage::Ask) {
+        if replica.teardown == Some(Teardown::Asking) {
             plan.steps
                 .push(HostingStep::CancelTeardown { group: *group });
         }
@@ -280,7 +280,7 @@ fn plan_group(
                     plan.steps.push(HostingStep::TearDown { group });
                 }
                 // An unknown log is never torn down.
-                (Some(LocalLog::Unknown), Some(TeardownStage::Ask)) => {
+                (Some(LocalLog::Unknown), Some(Teardown::Asking)) => {
                     plan.steps.push(HostingStep::CancelTeardown { group });
                 }
                 (None | Some(LocalLog::Retired), None) => {
@@ -295,7 +295,7 @@ fn plan_group(
             }
         }
         Some(role) => {
-            if teardown == Some(TeardownStage::Ask) {
+            if teardown == Some(Teardown::Asking) {
                 plan.steps.push(HostingStep::CancelTeardown { group });
             }
             let creates = matches!(role, ReplicaRole::Voter | ReplicaRole::Incoming);
@@ -476,7 +476,7 @@ impl Teardown {
         Self::Asking
     }
 
-    /// The stage a hosting plan reads.
+    /// The stage the replica's status reports.
     pub fn stage(self) -> TeardownStage {
         match self {
             Self::Asking => TeardownStage::Ask,

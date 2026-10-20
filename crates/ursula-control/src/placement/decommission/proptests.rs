@@ -251,7 +251,7 @@ proptest::proptest! {
             .enumerate()
             .filter_map(|(slot, value)| {
                 let eligibility = match (*value)? {
-                    0 => return None,
+                    0 => NodeEligibility::Unknown,
                     1 => NodeEligibility::DiskPressure,
                     _ => NodeEligibility::Eligible,
                 };

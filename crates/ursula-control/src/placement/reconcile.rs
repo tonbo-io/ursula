@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use ursula_proto::placement::LearnerLag;
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::NodeId;
@@ -557,7 +558,10 @@ fn not_ready(add: &BTreeSet<NodeId>, leader: &LeaderView) -> WaitReason {
         behind: add
             .iter()
             .filter(|node| !leader.caught_up(**node))
-            .map(|node| (*node, leader.matched.get(node).copied().flatten()))
+            .map(|node| LearnerLag {
+                node: *node,
+                matched: leader.matched.get(node).copied().flatten(),
+            })
             .collect(),
     }
 }
