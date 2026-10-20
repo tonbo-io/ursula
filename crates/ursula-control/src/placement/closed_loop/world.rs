@@ -4,10 +4,10 @@
 //!   dispatcher left after it. A recovery plan keeps a prefix and begins a
 //!   new history with [`ControlPlaneState::begin_history`].
 //! - **A node** has a placement view (a state of the meta log, possibly
-//!   lagging or regressed), its journal's replicas with their open state and
-//!   teardowns, and the snapshot objects it holds. It may crash, restart
-//!   with an older view, be cut off on the data plane, or believe itself
-//!   removed.
+//!   lagging or regressed), its journal's replicas with their log state
+//!   (7.2), open state and teardowns, and the snapshot objects it holds. It
+//!   may crash, restart with an older view, be cut off on the data plane,
+//!   or believe itself removed.
 //! - **A data group** is the abstract group of the reconciler's tests
 //!   ([`Group`]): per-node logs, a CAS on the membership log id, a joint
 //!   then a uniform entry per voter change with kept futures, lost and
@@ -361,10 +361,42 @@ impl Meta {
     }
 }
 
+/// What the node's journal records of a group: 7.2's `GroupLogState`,
+/// from which the shell reads the [`LocalLog`] the hosting planner takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Journal {
+    /// Created and never initialized: the only state the seed probe
+    /// answers as empty.
+    Empty,
+    /// Holds the group's history and its snapshot objects.
+    Initialized,
+    /// A `Retired` log `Create` reopened (7.3): recorded `Recovering` with
+    /// an empty log and no vote, its gate closed. It is held and never
+    /// answers the probe as empty, and holds the group's data and objects
+    /// only once it catches up.
+    Recovering,
+    /// A teardown retired the log.
+    Retired,
+}
+
+impl Journal {
+    fn local(self) -> LocalLog {
+        match self {
+            Self::Empty => LocalLog::Empty,
+            Self::Initialized | Self::Recovering => LocalLog::Holding,
+            Self::Retired => LocalLog::Retired,
+        }
+    }
+
+    pub(super) fn is_held(self) -> bool {
+        self.local().is_held()
+    }
+}
+
 /// A group the node's journal names.
 #[derive(Debug, Clone)]
 pub(super) struct Replica {
-    pub(super) log: LocalLog,
+    pub(super) log: Journal,
     /// The replica runs: it votes, acknowledges and catches up.
     pub(super) open: bool,
     pub(super) teardown: Option<Teardown>,
@@ -375,7 +407,7 @@ pub(super) struct Replica {
 impl Replica {
     fn created() -> Self {
         Self {
-            log: LocalLog::Empty,
+            log: Journal::Empty,
             open: true,
             teardown: None,
             closed_by_removal: false,
@@ -417,6 +449,9 @@ impl NodeState {
 pub(super) struct DataGroup {
     /// `None` until the group initializes.
     pub(super) raft: Option<Group>,
+    /// How often a seed driver initialized the group: C4 fails on a second
+    /// `Initialize`.
+    initializations: u32,
     /// The leader's placement confirmation: the term of its leadership and
     /// the barrier's stamp.
     confirmation: Option<(u64, ConfirmedStamp)>,
@@ -896,7 +931,7 @@ impl World {
             .iter()
             .map(|(group, replica)| {
                 let local = LocalReplica {
-                    log: replica.log,
+                    log: replica.log.local(),
                     counts: self.counts(node, *group),
                     teardown: replica.teardown,
                 };
@@ -1040,22 +1075,22 @@ impl World {
                         replica.closed_by_removal = false;
                     }
                 }
-                Admission::Create => {
-                    let fresh_log = state
-                        .replicas
-                        .get(group)
-                        .is_none_or(|replica| replica.log == LocalLog::Retired);
-                    let replica = state
-                        .replicas
-                        .entry(*group)
-                        .or_insert_with(Replica::created);
-                    if fresh_log {
-                        replica.log = LocalLog::Empty;
+                Admission::Create => match state.replicas.get_mut(group) {
+                    None => {
+                        state.replicas.insert(*group, Replica::created());
                         created.push(*group);
                     }
-                    replica.open = true;
-                    replica.closed_by_removal = false;
-                }
+                    Some(replica) => {
+                        // 7.3's reopen: a retired log comes back
+                        // initialized, never empty.
+                        if replica.log == Journal::Retired {
+                            replica.log = Journal::Recovering;
+                            created.push(*group);
+                        }
+                        replica.open = true;
+                        replica.closed_by_removal = false;
+                    }
+                },
             }
         }
         for step in &plan.steps {
@@ -1165,7 +1200,7 @@ impl World {
         }
         if let Some(state) = self.nodes.get_mut(&me) {
             if let Some(replica) = state.replicas.get_mut(&group) {
-                replica.log = LocalLog::Retired;
+                replica.log = Journal::Retired;
                 replica.open = false;
             }
             state.objects.remove(&group);
@@ -1372,14 +1407,16 @@ impl World {
 
     // Seeding.
 
+    /// The node's seed driver, which runs whether or not the group has
+    /// initialized: only its probe keeps it from initializing again.
     fn seed(&mut self, me: NodeId, group: RaftGroupId) {
-        if !self.alive(me) || self.raft(group).is_some() {
+        if !self.alive(me) {
             return;
         }
         // Only a replica that never held the group initializes it.
         if !self
             .replica(me, group)
-            .is_some_and(|replica| replica.open && replica.log == LocalLog::Empty)
+            .is_some_and(|replica| replica.open && replica.log == Journal::Empty)
         {
             return;
         }
@@ -1412,25 +1449,57 @@ impl World {
             reachable.contains(&voter)
                 && self
                     .replica(voter, group)
-                    .is_some_and(|replica| replica.log == LocalLog::Empty)
+                    .is_some_and(|replica| replica.log == Journal::Empty)
         });
         if !empty {
             return;
         }
-        if !self.in_current_history(&confirmed) {
-            self.found.push(violation(
-                Invariant::C4,
-                format!(
-                    "node {me} initialized group {} from a view not confirmed in the current meta \
-                     history",
-                    group.0
-                ),
+        self.initialize(me, group, &confirmed, Group::new(voters, me, reachable));
+    }
+
+    /// The seed driver's `Initialize`. C4: the confirmed view is in the
+    /// current meta history, meta's latest state shows the group `Seeded`
+    /// with `me` its initializer, and the group never initialized before.
+    fn initialize(
+        &mut self,
+        me: NodeId,
+        group: RaftGroupId,
+        confirmed: &ConfirmedView,
+        raft: Group,
+    ) {
+        let mut found = Vec::new();
+        if !self.in_current_history(confirmed) {
+            found.push(format!(
+                "node {me} initialized group {} from a view not confirmed in the current meta \
+                 history",
+                group.0
             ));
         }
-        let raft = Group::new(voters, me, reachable);
+        let latest = self.placement(group);
+        if !matches!(
+            latest,
+            Some(GroupPlacement::Seeded { initializer, .. }) if initializer == me
+        ) {
+            found.push(format!(
+                "node {me} initialized group {} while meta's latest state places it {latest:?}",
+                group.0
+            ));
+        }
         if let Some(data) = self.groups.get_mut(&group) {
+            data.initializations = data.initializations.saturating_add(1);
+            if data.initializations > 1 {
+                found.push(format!(
+                    "node {me} initialized group {} a second time: {} initializations",
+                    group.0, data.initializations
+                ));
+            }
             data.raft = Some(raft);
         }
+        self.found.extend(
+            found
+                .into_iter()
+                .map(|detail| violation(Invariant::C4, detail)),
+        );
     }
 
     // Drivers and operators.
@@ -1624,9 +1693,9 @@ impl World {
         }
     }
 
-    /// A caught-up empty replica holds the group's data and snapshot
-    /// objects, and a newly removed node is noted with each group's
-    /// history length.
+    /// A caught-up empty or reopened replica holds the group's data and
+    /// snapshot objects, and a newly removed node is noted with each
+    /// group's history length.
     fn observe(&mut self) {
         for node in self.removed_nodes() {
             if self.removed_at.contains_key(&node) {
@@ -1658,9 +1727,9 @@ impl World {
             if let Some(state) = self.nodes.get_mut(&node)
                 && let Some(replica) = state.replicas.get_mut(&group)
                 && replica.open
-                && replica.log == LocalLog::Empty
+                && matches!(replica.log, Journal::Empty | Journal::Recovering)
             {
-                replica.log = LocalLog::Holding;
+                replica.log = Journal::Initialized;
                 state.objects.insert(group);
             }
         }
@@ -1908,7 +1977,10 @@ impl World {
             self.step(Action::Host(*node))?;
         }
         for group in &groups {
-            if self.raft(*group).is_none() {
+            // The seed drivers run while meta places the group `Seeded`,
+            // whether or not it initialized (a meta plan may seed it again).
+            let seeded = matches!(self.placement(*group), Some(GroupPlacement::Seeded { .. }));
+            if seeded {
                 for node in &nodes {
                     self.step(Action::Seed(*node, *group))?;
                 }
@@ -2094,7 +2166,7 @@ impl World {
             .is_some_and(|cluster| cluster.retirement(group, me).is_none());
         let gone = self
             .replica(me, group)
-            .is_none_or(|replica| replica.log == LocalLog::Retired && replica.teardown.is_none());
+            .is_none_or(|replica| replica.log == Journal::Retired && replica.teardown.is_none());
         reported && gone
     }
 

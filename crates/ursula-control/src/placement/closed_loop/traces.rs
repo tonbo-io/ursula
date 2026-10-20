@@ -1,14 +1,17 @@
-//! The scripted traces of C6 (15.1), and one for C2. Each runs once with
-//! every rule on and must pass, then once with its rule turned off and must
-//! fail the check named with it. Every trace but C2's starts from a formed
-//! cluster of nodes 1 to 5, group 0 stable on `{1, 2, 3}` and led by node
-//! 1. C2's runs at replication factor 1.
+//! The scripted traces of C6 (15.1), one for C2 and one for C4. Each C6
+//! trace and C2's run once with every rule on and must pass, then once with
+//! the rule turned off and must fail the check named with it. C4's has no
+//! rule to turn off: it pins the model's reopen (7.3). Every trace but
+//! C2's and C4's starts from a formed cluster of nodes 1 to 5, group 0
+//! stable on `{1, 2, 3}` and led by node 1. C2's and C4's run at
+//! replication factor 1.
 
 use ursula_proto::placement::TeardownStage;
 use ursula_shard::RaftGroupId;
 
 use super::world::Action;
 use super::world::Invariant;
+use super::world::Journal;
 use super::world::ViewAt;
 use super::world::Violation;
 use super::world::World;
@@ -589,6 +592,42 @@ fn c6_i_a_seeded_target_reports_the_voters_it_finds() {
         2,
         a_meta_plan_below_a_first_report,
     );
+}
+
+/// C4 at replication factor 1: group 0 moves from `{1}` onto `{2}` and node
+/// 1 retires its log. A meta plan cuts below the move's first report, so
+/// meta seeds the group on `{1}` again and node 1's `Create` reopens its
+/// retired log. The reopen is initialized (7.2, 7.3): the seed probe finds
+/// no empty replica, nothing initializes a second time, and the group
+/// settles on the voters it has.
+fn a_reopened_seed_voter(world: &mut World) -> Result<(), Violation> {
+    world.quiesce(FORM)?;
+    world.ensure(
+        world.is_stable(GROUP, &[1]) && world.leader(GROUP) == Some(node(1)),
+        "group 0 formed on {1} led by node 1",
+    )?;
+    world.request_move(GROUP, &[2])?;
+    world.drive(GROUP, &[2], DRIVE, |world| world.is_stable(GROUP, &[2]))?;
+    world.finish_teardown(1, GROUP)?;
+    let keep = world.boot_len;
+    world.step(Action::MetaPlan { keep })?;
+    world.step(Action::Host(node(1)))?;
+    world.ensure(
+        world
+            .replica(node(1), GROUP)
+            .is_some_and(|replica| replica.log == Journal::Recovering),
+        "node 1 reopened its retired log",
+    )?;
+    world.step(Action::Seed(node(1), GROUP))?;
+    world.quiesce(DRIVE)
+}
+
+#[test]
+fn c4_a_reopened_seed_voter_never_initializes_again() {
+    let mut world = World::new(5, 1, 1);
+    if let Err(violation) = a_reopened_seed_voter(&mut world) {
+        panic!("{violation}\n{}", world.history());
+    }
 }
 
 /// With every rule on, a restarted node that missed a meta plan views the
