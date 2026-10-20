@@ -42,6 +42,7 @@ use ursula_proto::placement::ReplicationFactor;
 use ursula_proto::placement::TeardownStage;
 use ursula_proto::placement::ViewStage;
 use ursula_proto::placement::VoterSet;
+use ursula_proto::placement::WaitReason;
 use ursula_shard::RaftGroupId;
 
 use crate::placement::Admission;
@@ -204,7 +205,8 @@ pub(super) enum Action {
     /// The leader starts a transfer to the node, which the group's next
     /// settle completes when the node holds the leader's log and wins.
     Transfer(RaftGroupId, NodeId),
-    /// A kept step future runs now, when its planner leads again.
+    /// Every kept step future resolves now: the step of the planner that
+    /// leads runs, possibly in a later leadership, and the others fail.
     DeliverStep(RaftGroupId),
     /// Every report in flight reaches meta now.
     DeliverReports,
@@ -421,9 +423,11 @@ pub(super) struct DataGroup {
     /// Leaders cut off on the data plane, each leading its own copy of the
     /// group, which commits nothing that needs another node.
     deposed: BTreeMap<NodeId, Group>,
-    /// A membership step whose future was kept, with the node that planned
-    /// it.
-    kept: Option<(NodeId, MembershipStep)>,
+    /// The membership steps whose futures were kept, one per planner. A
+    /// kept step may run in a later leadership of its planner, which 5.5's
+    /// `CommittedLeaderId` refuses: the adversary is stronger than the
+    /// design, so the membership CAS alone must keep such a step safe.
+    kept: BTreeMap<NodeId, MembershipStep>,
 }
 
 /// How often a run reached what only a long or faulty run reaches.
@@ -435,6 +439,19 @@ pub(super) struct Tally {
     pub(super) retired: usize,
     pub(super) meta_plans: usize,
     pub(super) data_plans: usize,
+    /// Nodes meta removed (C9).
+    pub(super) removals: usize,
+    /// Snapshot objects the removed-node sweep deleted.
+    pub(super) sweeps: usize,
+    /// Reports meta refused with `StalePlacement` (the placement CAS).
+    pub(super) stale_reports: usize,
+    /// `Converged` answers no leadership proof backed, so never reported.
+    pub(super) unproven_reports: usize,
+    /// Leaders that planned from a committed config without themselves and
+    /// waited (`NotAMember`, step 0 of 5.3).
+    pub(super) not_a_member: usize,
+    /// Elections an outgoing voter won on the uncommitted uniform entry.
+    pub(super) outgoing_wins: usize,
 }
 
 impl Tally {
@@ -444,6 +461,12 @@ impl Tally {
             retired: self.retired.saturating_add(other.retired),
             meta_plans: self.meta_plans.saturating_add(other.meta_plans),
             data_plans: self.data_plans.saturating_add(other.data_plans),
+            removals: self.removals.saturating_add(other.removals),
+            sweeps: self.sweeps.saturating_add(other.sweeps),
+            stale_reports: self.stale_reports.saturating_add(other.stale_reports),
+            unproven_reports: self.unproven_reports.saturating_add(other.unproven_reports),
+            not_a_member: self.not_a_member.saturating_add(other.not_a_member),
+            outgoing_wins: self.outgoing_wins.saturating_add(other.outgoing_wins),
         }
     }
 }
@@ -467,9 +490,6 @@ pub(super) struct World {
     /// When each node was first seen removed: each group's history length
     /// then.
     removed_at: BTreeMap<NodeId, BTreeMap<RaftGroupId, usize>>,
-    /// The lowest history position a data plan may keep without losing a
-    /// certificate: the last data plan's, or the last destruction's.
-    cut_floor: BTreeMap<RaftGroupId, usize>,
     /// Violations an action itself produced: C2, C3's destructions, C4, C8
     /// and C9's voter changes.
     found: Vec<Violation>,
@@ -479,7 +499,7 @@ pub(super) struct World {
     pub(super) boot_len: usize,
     /// The replication factor the cluster bootstrapped with.
     rf: usize,
-    pub(super) tally: Tally,
+    tally: Tally,
 }
 
 impl World {
@@ -531,7 +551,6 @@ impl World {
             uncertified: BTreeSet::new(),
             swept: BTreeSet::new(),
             removed_at: BTreeMap::new(),
-            cut_floor: BTreeMap::new(),
             found: Vec::new(),
             log: Vec::new(),
             boot_len,
@@ -789,14 +808,12 @@ impl World {
     }
 
     /// The lowest position of the group's history a data plan may keep: the
-    /// last certified membership, the last data plan and the last
-    /// destruction.
+    /// last certified membership, the only floor 7.4's tool takes.
     pub(super) fn plan_floor(&self, group: RaftGroupId) -> usize {
         let Some(raft) = self.raft(group) else {
             return 0;
         };
-        let certified = self
-            .certified
+        self.certified
             .iter()
             .filter(|((reported, _), _)| *reported == group)
             .filter_map(|(_, membership)| {
@@ -805,9 +822,21 @@ impl World {
                     .position(|(id, _)| id == membership)
             })
             .max()
-            .unwrap_or(0);
-        let cut = self.cut_floor.get(&group).copied().unwrap_or(0);
-        certified.max(cut)
+            .unwrap_or(0)
+    }
+
+    /// The run's tally, with the outgoing voters' wins of every group.
+    pub(super) fn tally(&self) -> Tally {
+        let outgoing_wins = self
+            .groups
+            .values()
+            .filter_map(|data| data.raft.as_ref())
+            .map(|raft| raft.elections.outgoing)
+            .sum();
+        Tally {
+            outgoing_wins,
+            ..self.tally
+        }
     }
 
     /// Nodes that run and reach the others with an open, held replica of
@@ -901,6 +930,7 @@ impl World {
                     }
                 }
                 Err(ControlError::StalePlacement { .. }) => {
+                    self.tally.stale_reports = self.tally.stale_reports.saturating_add(1);
                     // 5.7: a stale report forces a confirmation before the
                     // next plan.
                     if let Some(data) = self.groups.get_mut(&group) {
@@ -1133,12 +1163,6 @@ impl World {
                 ),
             ));
         }
-        if let Some(position) = self
-            .raft(group)
-            .map(|raft| raft.committed_configs.len().saturating_sub(1))
-        {
-            self.cut_floor.insert(group, position);
-        }
         if let Some(state) = self.nodes.get_mut(&me) {
             if let Some(replica) = state.replicas.get_mut(&group) {
                 replica.log = LocalLog::Retired;
@@ -1167,11 +1191,7 @@ impl World {
         let Some(data) = self.groups.get_mut(&group) else {
             return;
         };
-        if data
-            .kept
-            .as_ref()
-            .is_some_and(|(planner, _)| *planner == me)
-        {
+        if data.kept.contains_key(&me) {
             // A step of this node is pending: it plans nothing.
             return;
         }
@@ -1202,6 +1222,9 @@ impl World {
             && seat.alive.contains(&me)
             && quorum_live(&seat.committed, &seat.alive);
         self.check_voter_change(me, group, &step, &from, &removed);
+        if !deposed && matches!(step, MembershipStep::Wait(WaitReason::NotAMember)) {
+            self.tally.not_a_member = self.tally.not_a_member.saturating_add(1);
+        }
         match step {
             MembershipStep::ConfirmView => {
                 let Some(stamp) = self.confirm(me) else {
@@ -1223,8 +1246,11 @@ impl World {
                     TargetStage::Seeded { since } | TargetStage::Moving { since } => since,
                     TargetStage::Settled => return,
                 };
-                if !proven && enforced(Rule::LeadershipProof) {
-                    return;
+                if !proven {
+                    self.tally.unproven_reports = self.tally.unproven_reports.saturating_add(1);
+                    if enforced(Rule::LeadershipProof) {
+                        return;
+                    }
                 }
                 let report = ControlCommand::ReportConverged {
                     group,
@@ -1252,7 +1278,7 @@ impl World {
                         .get_mut(&me)
                         .and_then(|copy| copy.execute(&step).err())
                 } else if hold {
-                    data.kept = Some((me, step));
+                    data.kept.insert(me, step);
                     None
                 } else {
                     data.raft
@@ -1324,14 +1350,14 @@ impl World {
         let Some(data) = self.groups.get_mut(&group) else {
             return;
         };
-        let Some((planner, step)) = data.kept.take() else {
-            return;
-        };
-        let refused = data
-            .raft
-            .as_mut()
-            .filter(|raft| raft.leader == Some(planner) && raft.alive.contains(&planner))
-            .and_then(|raft| raft.execute(&step).err());
+        // Every kept future resolves: the live leader's step runs, and the
+        // others' fail, since their planners do not lead.
+        let kept = std::mem::take(&mut data.kept);
+        let refused = data.raft.as_mut().and_then(|raft| {
+            let leader = raft.leader.filter(|leader| raft.alive.contains(leader))?;
+            let step = kept.get(&leader)?;
+            raft.execute(step).err()
+        });
         self.refused(group, refused);
     }
 
@@ -1452,6 +1478,7 @@ impl World {
                         state.objects.remove(&group);
                     }
                     self.swept.insert((group, node));
+                    self.tally.sweeps = self.tally.sweeps.saturating_add(1);
                 }
             }
         }
@@ -1470,13 +1497,7 @@ impl World {
         }
         for data in self.groups.values_mut() {
             data.deposed.remove(&node);
-            if data
-                .kept
-                .as_ref()
-                .is_some_and(|(planner, _)| *planner == node)
-            {
-                data.kept = None;
-            }
+            data.kept.remove(&node);
         }
     }
 
@@ -1570,13 +1591,11 @@ impl World {
                 .is_some_and(|position| position > at)
         });
         raft.recover_to(config);
-        let position = raft.committed_configs.len().saturating_sub(1);
         if let Some(data) = self.groups.get_mut(&group) {
             data.confirmation = None;
-            data.kept = None;
+            data.kept.clear();
             data.deposed.clear();
         }
-        self.cut_floor.insert(group, position);
         if at < floor || cuts_a_report {
             self.uncertified.insert(group);
         }
@@ -1613,6 +1632,7 @@ impl World {
             if self.removed_at.contains_key(&node) {
                 continue;
             }
+            self.tally.removals = self.tally.removals.saturating_add(1);
             let starts: BTreeMap<RaftGroupId, usize> = self
                 .groups
                 .iter()

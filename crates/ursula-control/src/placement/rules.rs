@@ -7,9 +7,11 @@
 //! on its own thread with [`disable`], until the guard drops.
 
 /// A rule a negative trace turns off. The planners, the views and the
-/// dispatcher consult the first ten. The last two belong to the reconcile
-/// shell and the removed-node sweep, which later slices build: until then
-/// only the closed loop's model of them consults these.
+/// dispatcher consult the first ten. The last two are model-only: the
+/// reconcile shell's leadership proof and the removed-node sweep live in
+/// `ursula-raft`, which cannot see this crate's `cfg(test)` items, so only
+/// the closed loop's model of them consults these. Outside the model the
+/// proof's control is DST N9, and the sweep's answer has only C6 (15.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Rule {
     /// C6(a): a voter change from a uniform config waits for a confirmed

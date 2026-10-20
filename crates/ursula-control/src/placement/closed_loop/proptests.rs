@@ -15,9 +15,15 @@
 //! reaches states the design leaves to the operator (a removed voter after
 //! a meta plan, a data plan below a meta plan's loss), which the scripted
 //! traces cover instead. A data plan here keeps no less than the last
-//! certified membership, the last data plan and the last destruction, and
-//! waits for the group's reports in flight, as the recovery tool acts only
-//! on a group stalled longer than a report takes (7.4).
+//! certified membership, the only floor of 7.4's tool, and waits for the
+//! group's reports in flight, as the tool acts only on a group stalled
+//! longer than a report takes.
+//!
+//! The tally shows the random runs, not only the traces, reach the
+//! removal and the sweep (C9), the placement CAS, the leadership proof and
+//! step 0's `NotAMember` wait. Outgoing voters' wins are counted, not
+//! asserted: one needs the leader lost between appending the uniform entry
+//! and its commit, which the reconciler's scripted model test pins.
 
 use std::cell::Cell;
 
@@ -291,7 +297,7 @@ fn the_closed_loop_keeps_c1_to_c9() {
             fail_on(&world, result)?;
             let result = world.quiesce(SETTLE_ROUNDS);
             fail_on(&world, result)?;
-            tally.set(tally.get().merge(world.tally));
+            tally.set(tally.get().merge(world.tally()));
             Ok(())
         },
     );
@@ -303,6 +309,11 @@ fn the_closed_loop_keeps_c1_to_c9() {
     assert!(tally.retired > 0, "{tally:?}");
     assert!(tally.meta_plans > 0, "{tally:?}");
     assert!(tally.data_plans > 0, "{tally:?}");
+    assert!(tally.removals > 0, "{tally:?}");
+    assert!(tally.sweeps > 0, "{tally:?}");
+    assert!(tally.stale_reports > 0, "{tally:?}");
+    assert!(tally.unproven_reports > 0, "{tally:?}");
+    assert!(tally.not_a_member > 0, "{tally:?}");
 }
 
 /// Every cluster shape forms without faults: every group initializes on

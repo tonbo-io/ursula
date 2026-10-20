@@ -127,7 +127,10 @@ fn covers(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView
 /// What a confirmation by index alone would accept: any history, and any
 /// applied entry whose index reaches the stamp's. A learner that missed a
 /// meta plan holds a higher index of an older history, so this confirms a
-/// pre-plan view (C6(h)).
+/// pre-plan view (C6(h)). The switch drops both halves of the rule, the
+/// history check and the term-first comparison, because each alone refuses
+/// that view: a meta plan begins its history in a new term. So C6(h) shows
+/// that confirming needs one of them, not which.
 fn covers_by_index(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView> {
     match stage {
         ViewStage::Empty => Err(UnconfirmedView::Empty),
