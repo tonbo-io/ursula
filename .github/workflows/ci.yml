@@ -78,6 +78,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # `cargo publish` builds each crate alone, without the features that
+      # other crates' dev-dependencies turn on in a workspace build.
+      - name: Build each published crate alone
+        run: |
+          for crate in $(python3 -c 'import json, subprocess; m = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"])); print(" ".join(p["name"] for p in m["packages"] if p.get("publish") is None or "crates-io" in p["publish"]))'); do
+            echo "::group::$crate"
+            RUSTFLAGS="-D warnings" cargo check --locked -p "$crate"
+            echo "::endgroup::"
+          done
+
   rust-test:
     name: Rust tests (${{ matrix.arch }})
     runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.hosted || format(matrix.runs-on, github.run_id) }}

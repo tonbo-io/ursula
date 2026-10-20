@@ -1088,6 +1088,7 @@ mod s3 {
     use bytes::Bytes;
     use opendal::ErrorKind;
     use opendal::Operator;
+    #[cfg(any(test, feature = "test-support"))]
     use opendal::Scheme;
     use ursula_shard::RaftGroupId;
 
@@ -1120,6 +1121,7 @@ mod s3 {
         Required,
         /// A HEAD before the write stands in for it, on an in-memory
         /// operator of a test that has no concurrent writer of the name.
+        #[cfg(any(test, feature = "test-support"))]
         EmulatedForTests,
     }
 
@@ -1354,6 +1356,7 @@ mod s3 {
                         key: key.to_owned(),
                     })
                 }
+                #[cfg(any(test, feature = "test-support"))]
                 ConditionalCreate::EmulatedForTests => match self.operator.stat(key).await {
                     Ok(_) => Err(SnapshotStoreError::NameCollision {
                         key: key.to_owned(),
