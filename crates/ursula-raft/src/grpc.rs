@@ -3345,6 +3345,303 @@ mod reconnect_tests {
     }
 }
 
+/// The barrier asker takes only a live leader's answer about the group it
+/// asked: it refuses memberships that do not decode or name no voters, an
+/// answer about another plane or group, and a misdelivery refusal, which is
+/// no answer at all.
+#[cfg(all(test, not(madsim)))]
+mod barrier_asker_tests {
+    use std::collections::BTreeSet;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use futures_util::Stream;
+    use openraft::type_config::alias::StoredMembershipOf;
+    use openraft::vote::RaftLeaderId;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::Request;
+    use tonic::Response;
+    use tonic::Status;
+    use ursula_shard::CoreId;
+    use ursula_shard::RaftGroupId;
+    use ursula_shard::ShardId;
+    use ursula_shard::ShardPlacement;
+
+    use super::CoreRaftTransport;
+    use super::GrpcRpcError;
+    use super::RecoveryProbeError;
+    use super::probe_rejoin_vote_barrier;
+    use crate::codec::encode_wire;
+    use crate::memberships::BarrierAnswer;
+    use crate::memberships::LeaderMemberships;
+    use crate::memberships::MalformedMembership;
+    use crate::memberships::MembershipKind;
+    use crate::raft_internal_proto as pb;
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+    use crate::types::UrsulaRaftTypeConfig;
+    use crate::types::UrsulaVote;
+
+    type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+    type Answer = Result<pb::RejoinBarrierResponseV1, Status>;
+
+    /// The group the asker asks about, and its leader.
+    const GROUP: RaftGroupId = RaftGroupId(3);
+    const LEADER: u64 = 2;
+
+    /// A peer that answers every barrier with its script. Every other RPC
+    /// is unimplemented.
+    #[derive(Clone)]
+    struct ScriptedBarrier {
+        answer: Arc<dyn Fn() -> Answer + Send + Sync>,
+    }
+
+    #[tonic::async_trait]
+    impl RaftInternal for ScriptedBarrier {
+        type AppendStreamStream =
+            Pin<Box<dyn Stream<Item = Result<pb::RaftAppendStreamResponse, Status>> + Send>>;
+
+        async fn append(
+            &self,
+            _request: Request<pb::RaftRpcEnvelopeV1>,
+        ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn append_stream(
+            &self,
+            _request: Request<tonic::Streaming<pb::RaftAppendStreamRequest>>,
+        ) -> Result<Response<Self::AppendStreamStream>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn vote(
+            &self,
+            _request: Request<pb::RaftRpcEnvelopeV1>,
+        ) -> Result<Response<pb::RaftRpcAckV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn full_snapshot(
+            &self,
+            _request: Request<pb::RaftFullSnapshotRequestV1>,
+        ) -> Result<Response<pb::RaftFullSnapshotAckV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn group_write(
+            &self,
+            _request: Request<pb::GroupWriteRequestV1>,
+        ) -> Result<Response<pb::GroupWriteResponseV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn group_read(
+            &self,
+            _request: Request<pb::GroupReadRequestV1>,
+        ) -> Result<Response<pb::GroupReadResponseV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn rejoin_barrier(
+            &self,
+            _request: Request<pb::RejoinBarrierRequestV1>,
+        ) -> Result<Response<pb::RejoinBarrierResponseV1>, Status> {
+            (self.answer)().map(Response::new)
+        }
+
+        async fn transfer_leader(
+            &self,
+            _request: Request<pb::RaftTransferLeaderRequestV1>,
+        ) -> Result<Response<pb::RaftTransferLeaderAckV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+
+        async fn genesis_probe(
+            &self,
+            _request: Request<pb::GenesisProbeRequestV1>,
+        ) -> Result<Response<pb::GenesisProbeAckV1>, Status> {
+            Err(Status::unimplemented("a barrier peer"))
+        }
+    }
+
+    /// A membership of the leader's term 5 with `configs` as its voters.
+    fn membership(configs: Vec<BTreeSet<u64>>) -> StoredMembershipOf<UrsulaRaftTypeConfig> {
+        StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+            Some(openraft::LogId {
+                leader_id: LeaderId::new(5, LEADER),
+                index: 6,
+            }),
+            openraft::Membership::new_with_defaults(configs, std::iter::empty()),
+        )
+    }
+
+    /// The answer of a live leader of [`GROUP`] at index 7.
+    fn live_answer() -> pb::RejoinBarrierResponseV1 {
+        let voters = membership(vec![BTreeSet::from([1, 2, 3])]);
+        let vote: UrsulaVote = openraft::Vote::new_committed(5, LEADER);
+        pb::RejoinBarrierResponseV1 {
+            vote: encode_wire(&vote),
+            index: 7,
+            plane: pb::RaftPlaneV1::Data.into(),
+            raft_group_id: GROUP.0,
+            memberships: encode_wire(&LeaderMemberships {
+                committed: voters.clone(),
+                effective: voters,
+            }),
+        }
+    }
+
+    /// Asks a barrier peer that answers `answer` about [`GROUP`], as node 1.
+    async fn ask(
+        answer: impl Fn() -> Answer + Send + Sync + 'static,
+    ) -> Result<BarrierAnswer, RecoveryProbeError> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the barrier peer");
+        let endpoint = format!(
+            "http://{}",
+            listener.local_addr().expect("barrier peer address")
+        );
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(super::raft_grpc_server(
+                    ScriptedBarrier {
+                        answer: Arc::new(answer),
+                    },
+                    &crate::peer_cluster::test_peer_cluster(LEADER),
+                ))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let transport = Arc::new(CoreRaftTransport::new(
+            crate::peer_cluster::test_identity(1),
+            crate::peer_cluster::test_peer_cluster_with(
+                1,
+                crate::PeerDirectory::new([(
+                    LEADER,
+                    crate::PeerEndpoints::shared(endpoint.as_str()),
+                )]),
+            ),
+        ));
+        let placement = ShardPlacement {
+            core_id: CoreId(0),
+            shard_id: ShardId(0),
+            raft_group_id: GROUP,
+        };
+        let asked =
+            probe_rejoin_vote_barrier(transport, placement, LEADER, Duration::from_secs(5)).await;
+        server.abort();
+        asked
+    }
+
+    /// The control: a live leader's answer about the group asked is taken.
+    #[tokio::test]
+    async fn a_live_leaders_answer_is_taken() {
+        let answer = ask(|| Ok(live_answer()))
+            .await
+            .expect("a live leader's answer");
+        assert_eq!(answer.index, 7);
+        assert_eq!(
+            answer.memberships.committed,
+            membership(vec![BTreeSet::from([1, 2, 3])])
+        );
+    }
+
+    /// Empty memberships bytes do not decode: the field is required.
+    #[tokio::test]
+    async fn an_answer_with_empty_memberships_bytes_is_refused() {
+        let error = ask(|| {
+            Ok(pb::RejoinBarrierResponseV1 {
+                memberships: Default::default(),
+                ..live_answer()
+            })
+        })
+        .await
+        .expect_err("empty memberships are no answer");
+        assert!(matches!(error, RecoveryProbeError::Payload(_)), "{error:?}");
+    }
+
+    /// A membership without voters is malformed, never an answer that the
+    /// asking node is no member.
+    #[tokio::test]
+    async fn an_answer_whose_membership_has_no_voters_is_refused() {
+        let error = ask(|| {
+            Ok(pb::RejoinBarrierResponseV1 {
+                memberships: encode_wire(&LeaderMemberships {
+                    committed: membership(Vec::new()),
+                    effective: membership(vec![BTreeSet::from([1, 2, 3])]),
+                }),
+                ..live_answer()
+            })
+        })
+        .await
+        .expect_err("a membership without voters is no answer");
+        assert!(
+            matches!(
+                error,
+                RecoveryProbeError::Memberships(MalformedMembership::EmptyVoterConfig {
+                    membership: MembershipKind::Committed,
+                })
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// An answer that echoes another plane or another group than the one
+    /// asked about is refused.
+    #[tokio::test]
+    async fn an_answer_about_another_plane_or_group_is_refused() {
+        let meta = i32::from(pb::RaftPlaneV1::Meta);
+        let error = ask(move || {
+            Ok(pb::RejoinBarrierResponseV1 {
+                plane: meta,
+                ..live_answer()
+            })
+        })
+        .await
+        .expect_err("an answer about the meta plane");
+        assert!(
+            matches!(
+                error,
+                RecoveryProbeError::OtherTarget { plane, raft_group_id }
+                    if plane == meta && raft_group_id == GROUP.0
+            ),
+            "{error:?}"
+        );
+        let error = ask(|| {
+            Ok(pb::RejoinBarrierResponseV1 {
+                raft_group_id: 4,
+                ..live_answer()
+            })
+        })
+        .await
+        .expect_err("an answer about group 4");
+        assert!(
+            matches!(
+                error,
+                RecoveryProbeError::OtherTarget {
+                    plane,
+                    raft_group_id: 4,
+                } if plane == i32::from(pb::RaftPlaneV1::Data)
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// A misdelivery refusal names the node the address serves now, and is
+    /// no answer.
+    #[tokio::test]
+    async fn a_misdelivered_barrier_names_the_node_that_refused_it() {
+        let error = ask(|| Err(GrpcRpcError::misdelivered(9, LEADER).into()))
+            .await
+            .expect_err("node 9 answers nothing for node 2");
+        assert!(
+            matches!(error, RecoveryProbeError::OtherNode { node: 9 }),
+            "{error:?}"
+        );
+    }
+}
+
 #[cfg(all(test, not(madsim)))]
 mod transfer_leader_codec_tests {
     use std::sync::Arc;

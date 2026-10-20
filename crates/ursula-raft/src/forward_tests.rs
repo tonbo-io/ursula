@@ -499,6 +499,92 @@ async fn a_follower_forwards_nothing_to_a_leader_raft_peers_does_not_list() {
     shutdown_all(&engines).await;
 }
 
+/// A follower's forwards to a leader whose address serves another node of
+/// the same cluster now are refused as misdelivered before anything runs
+/// there. The client gets the retryable leader-unknown answer with nothing
+/// proposed, the purge included, never a forward the leader refused
+/// (`ForwardFailed` with `FAILED_PRECONDITION`), and nothing is recorded as
+/// a refusal of another cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_forward_to_an_address_that_serves_another_node_is_leader_unknown() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the other node");
+    let url = format!(
+        "http://{}",
+        listener.local_addr().expect("other node address")
+    );
+    // Node 9 of the same cluster, hosting no group: it refuses every
+    // request for another node as misdelivered.
+    let other_node = RaftGroupHandleRegistry::default();
+    other_node.peer_cluster().bind(
+        crate::peer_cluster::test_identity(9),
+        crate::PeerDirectory::default(),
+    );
+    let server = tokio::spawn(
+        tonic::transport::Server::builder()
+            .add_service(crate::grpc::raft_grpc_service(other_node.clone()))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let (mut engines, leader_index, stream_id, _wal_roots) =
+        cluster_advertising("forward-other-node", &url).await;
+    let follower = &mut engines[(leader_index + 1) % 3];
+    wait_for_leader(follower).await;
+
+    let read = follower
+        .read_stream(
+            ReadStreamRequest {
+                leader_only: true,
+                ..read_req(stream_id.clone(), 64)
+            },
+            placement(),
+        )
+        .await
+        .expect_err("another node serves nothing for the leader");
+    assert_leader_unknown("forwarded read", &read, &url);
+    assert!(
+        matches!(
+            read.not_leader(),
+            Some(LeadershipRefusal {
+                proposal: Proposal::NotProposed,
+                ..
+            })
+        ),
+        "{read:?}"
+    );
+    let purge = follower
+        .purge_bucket(stream_id.bucket_id.clone(), placement())
+        .await
+        .expect_err("another node serves nothing for the leader");
+    assert_leader_unknown("forwarded purge", &purge, &url);
+    // Refused before the body: nothing was proposed there.
+    assert!(
+        matches!(
+            purge.not_leader(),
+            Some(LeadershipRefusal {
+                proposal: Proposal::NotProposed,
+                ..
+            })
+        ),
+        "{purge:?}"
+    );
+    for error in [&read, &purge] {
+        assert!(
+            !matches!(
+                error.infra(),
+                Some(ursula_runtime::GroupInfraError::ForwardFailed { .. })
+            ),
+            "a misdelivery is no refused forward: {error:?}"
+        );
+    }
+    let peer_cluster = follower.peer_cluster.as_ref().expect("a gRPC replica");
+    assert!(peer_cluster.mismatches().is_empty());
+    assert_eq!(peer_cluster.refusals(), 0);
+
+    server.abort();
+    shutdown_all(&engines).await;
+}
+
 /// A follower's forwards to a leader of another cluster (a node replaced at
 /// the leader's address with another `server.cluster_id`) are refused
 /// before anything runs there. The client gets the retryable 503 of a
