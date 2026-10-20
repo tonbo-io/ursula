@@ -53,10 +53,10 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | --- | --- |
 | `FORMAT_EPOCH` | Format-epoch marker of the data directory. |
 | `wal.lock` | Advisory lock held by the node for the whole run. |
-| `run-state.bin` | Boot id, `fsync` policy and status of the last run, and the recovery epoch. |
+| `run-state.bin` | Boot id and status of the last run, and the `fsync` policy and recovery epoch of each journal class. |
 | `topology.bin` | Core count, group count and cluster id the root was created with. |
 | `core-N/journal-<seq>.seg` | Journal segments, 20-digit consecutive sequences starting at 1. |
-| `core-N/journal.meta` | Every group's vote and log state, and the core's verified recovery epoch. |
+| `core-N/journal.meta` | Every group's vote, log state and log generation, and the core's verified recovery epoch. |
 | `core-N/journal.lock` | Advisory lock held by the core's writer. |
 | `core-N/frozen-<group>-<seg>-<offset>-<first>-<last>-<hash>.seg` | Entry archives of apply-stopped groups (see Reclaim). |
 
@@ -80,10 +80,12 @@ The frame header CRC covers the segment sequence and the length, so a damaged
 length is caught before replay trusts it. The payload CRC covers the sequence,
 the length and the payload. A frame therefore verifies only in the segment
 that wrote it, and a header naming another sequence than its file is refused.
-A payload is a group id and one of `Append`, `FrozenAppend`, `SaveCommitted`,
-`TruncateAfter` or `Purge`, in compact MessagePack (`ursula_stream::msgpack`):
-a struct is an array of its fields in declaration order and a variant keeps
-its name. Votes are not journal records.
+A payload is the array `[group id, generation, record]`, in compact
+MessagePack (`ursula_stream::msgpack`): a struct is an array of its fields in
+declaration order and a variant keeps its name. The record is one of
+`Append`, `FrozenAppend`, `SaveCommitted`, `TruncateAfter` or `Purge`, and the
+generation is that of the group's log the record belongs to. A frozen archive
+holds one such payload. Votes are not journal records.
 
 `journal.meta`, `run-state.bin` and `topology.bin` are replaced whole
 (temporary file, sync, rename, directory sync), so a crash leaves either
@@ -94,12 +96,32 @@ damaged one fails startup. `journal.meta` records each group's log state:
 - `initialized`: its log holds every entry it acknowledged.
 - `recovering`: its log may be missing acknowledged entries. The recovery gate
   stays closed until the state returns to `initialized`.
+- `retired`: the replica's log of the group was torn down, and the entry
+  names the next generation with no vote and no recovery plan. It counts as
+  initialized. The format holds this state, but nothing writes it yet.
 
 A group leaves `empty` in the batch that persists its first entry or purge and
 never returns to it. That write records `recovering` instead of `initialized`
 when the group's gate is closed and the replica holds nothing of it.
 
-The journal and state-file version is the format epoch, 5. There is no
+Each group's entry also names its log generation, 0 until the replica's first
+retirement of the group and one more after each. A core journal interleaves
+the frames of its groups, so the frames of a retired log cannot be erased in
+place. Every journal record and every snapshot pointer therefore names its
+generation, and only what belongs to the generation `journal.meta` names is
+read back. Older frames are dead bytes that reclaim frees, and a pointer of
+another generation restores nothing. Without `journal.meta`, replay keeps each
+group's highest generation among its frames, the group opens `recovering`,
+and the rewritten `journal.meta` names that generation. Every group stays at
+generation 0 until replica teardown writes `retired`.
+
+`run-state.bin` holds one record per journal class, each with the class's
+`fsync` policy and recovery epoch, beside the node-wide boot id and status.
+The data class covers the core journals and runs the configured policy. The
+meta class always runs `always`. Its record is written on every start but not
+yet used, because no meta journal exists yet.
+
+The journal and state-file version is the format epoch, 6. There is no
 migration: other epochs and files without the Ursula magic are refused, and the
 `FORMAT_EPOCH` marker refuses a directory of another epoch before any journal
 opens. The decoder bounds a frame payload at 512 MiB and a state file at 64 MiB
