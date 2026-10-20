@@ -1436,8 +1436,9 @@ What CI runs (`.github/workflows/integration.yml`):
   `test/failover.e2e.ts`).
 - `sqlite-vfs-perf`: the commit benchmark ([Performance](#performance)). It fails when the VFS's
   commit p50 exceeds B1's by more than 0.5 ms. The `synced()` timings are reported only.
-- `memory-soak.yml` job `vfs-outage`: `test/outage.e2e.ts` through a long outage, weekly, on pushes
-  to main that change the extension, and by hand.
+- `memory-soak.yml` job `vfs-outage`: `test/outage.e2e.ts` through a 600 s outage, daily, on pushes
+  to main that change `clients/sqlite-vfs` or `clients/sqlite-ursula`, and by hand. It does not run
+  on pull requests. The 60 s outage in `sqlite-vfs-e2e` does.
 
 Crash points use `URSULA_VFS_ABORT_AT=<step>[:<n>]`, which SIGKILLs the process at the named step
 ([Crashes](#crashes)).
