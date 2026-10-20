@@ -4151,6 +4151,7 @@ dependencies = [
  "thiserror 1.0.69",
  "toml",
  "ursula-headers",
+ "ursula-proto",
 ]
 
 [[package]]

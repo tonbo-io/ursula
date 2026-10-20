@@ -551,6 +551,9 @@ pub fn sample_errors() -> Vec<ControlError> {
     });
     errors.extend(
         every!(BootstrapProblem {
+            BootstrapProblem::GroupCountAboveMax { .. } => BootstrapProblem::GroupCountAboveMax {
+                count: GroupCount::new(NonZeroU32::new(5_000).expect("non-zero")),
+            },
             BootstrapProblem::MetaVoterNotANode { .. } => BootstrapProblem::MetaVoterNotANode {
                 node: node(20),
             },

@@ -21,6 +21,7 @@ use ursula_proto::placement::NodeSet;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::VoterSet;
+use ursula_proto::placement::group_count_within_bound;
 use ursula_shard::RaftGroupId;
 
 use super::command::BootstrapProblem;
@@ -246,6 +247,11 @@ fn check_bootstrap(
         return Err(ControlError::UnknownNode { node });
     }
     let invalid = |problem| Err(ControlError::InvalidBootstrap { problem });
+    if !group_count_within_bound(u64::from(params.group_count.get())) {
+        return invalid(BootstrapProblem::GroupCountAboveMax {
+            count: params.group_count,
+        });
+    }
     if let Some(node) = params
         .meta_voters
         .iter()

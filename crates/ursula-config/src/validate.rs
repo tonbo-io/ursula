@@ -91,6 +91,13 @@ pub enum ValidationError {
         copy_budget: std::time::Duration,
         install_snapshot_timeout: std::time::Duration,
     },
+    /// The meta group's snapshot holds one placement per group and is
+    /// always inline, so the group count is bounded.
+    #[error(
+        "raft.group_count ({group_count}) must be at most {}",
+        ursula_proto::placement::MAX_GROUP_COUNT
+    )]
+    GroupCountAboveMax { group_count: usize },
     #[error("{0}")]
     Other(String),
 }
@@ -127,6 +134,13 @@ impl UrsulaConfig {
             return Err(ValidationError::Other(
                 "raft.node_id is required (use --node-id CLI flag)".into(),
             ));
+        }
+        if !u64::try_from(self.raft.group_count)
+            .is_ok_and(ursula_proto::placement::group_count_within_bound)
+        {
+            return Err(ValidationError::GroupCountAboveMax {
+                group_count: self.raft.group_count,
+            });
         }
         // A static cluster member keeps its WAL across restarts; only a
         // single node may run on a temporary one.
@@ -461,6 +475,31 @@ mod tests {
                 format!("storage.cold.s3.{setting} must be non-zero")
             );
         }
+    }
+
+    /// The bound `Bootstrap` also checks: the default and the bound pass,
+    /// one group more is refused.
+    #[test]
+    fn the_group_count_is_bounded_as_bootstrap_bounds_it() {
+        let mut config = UrsulaConfig::default();
+        config.raft.node_id = 1;
+        config.validate().expect("the default group count is valid");
+        let max = usize::try_from(ursula_proto::placement::MAX_GROUP_COUNT).unwrap();
+        config.raft.group_count = max;
+        config.validate().expect("the bound is valid");
+        let above = max.checked_add(1).unwrap();
+        config.raft.group_count = above;
+        let err = config
+            .validate()
+            .expect_err("one group above the bound is refused");
+        assert!(
+            matches!(err, ValidationError::GroupCountAboveMax { group_count } if group_count == above),
+            "{err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("raft.group_count ({above}) must be at most {max}")
+        );
     }
 
     #[test]

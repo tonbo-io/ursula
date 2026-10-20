@@ -168,7 +168,9 @@ pub struct RaftConfig {
     /// Unique node ID within the static gRPC Raft cluster.
     /// Must be present in `peers` and must be non-zero.
     pub node_id: u64,
-    /// Number of Raft groups (shards). Defaults to `core_count * 16`.
+    /// Number of Raft groups (shards), at most
+    /// [`ursula_proto::placement::MAX_GROUP_COUNT`]. Defaults to
+    /// `core_count * 16` within that bound.
     pub group_count: usize,
     /// Per-group cap on raft-submitted-but-not-yet-applied payload bytes.
     /// `None` or `0` disables the admission. Catches raft replication lag before
@@ -298,9 +300,14 @@ impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             node_id: 0,
+            // At most the bound `validate` checks, so a large host's
+            // default stays valid.
             group_count: std::thread::available_parallelism()
                 .map(|n| n.get().saturating_mul(16).max(1))
-                .unwrap_or(16),
+                .unwrap_or(16)
+                .min(
+                    usize::try_from(ursula_proto::placement::MAX_GROUP_COUNT).unwrap_or(usize::MAX),
+                ),
             max_uncommitted_size_per_group: None,
             init_membership: false,
             init_membership_per_group: false,

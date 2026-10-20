@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use ursula_proto::placement::MAX_GROUP_COUNT;
 use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
@@ -138,6 +139,32 @@ fn invalid_bootstrap_names_its_problem() {
             problem: BootstrapProblem::MetaVoterNotANode { node: n }
         } if n == node(4)
     ));
+
+    let above = MAX_GROUP_COUNT.checked_add(1).unwrap();
+    let over = params(&[1, 2, 3], above, 3, 4, MaintenanceAuthority::Placement);
+    let error = driver.refused(ControlCommand::Bootstrap {
+        params: over,
+        nodes: node_set(&[1, 2, 3]),
+        now_ms: 3,
+    });
+    assert!(matches!(
+        error,
+        ControlError::InvalidBootstrap {
+            problem: BootstrapProblem::GroupCountAboveMax { count }
+        } if count.get() == above
+    ));
+    let at_bound = ControlCommand::Bootstrap {
+        params: params(
+            &[1, 2, 3],
+            MAX_GROUP_COUNT,
+            3,
+            4,
+            MaintenanceAuthority::Placement,
+        ),
+        nodes: node_set(&[1, 2, 3]),
+        now_ms: 3,
+    };
+    assert_eq!(driver.state.check(&at_bound), Ok(()));
 
     let mut two = forming(&[1, 2]);
     let error = two.refused(ControlCommand::Bootstrap {

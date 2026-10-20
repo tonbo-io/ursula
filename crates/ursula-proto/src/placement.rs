@@ -305,6 +305,27 @@ non_empty_node_set!(
     NodeSet
 );
 
+/// The most data groups a cluster may have.
+///
+/// The meta group's snapshot is always `Inline`, so the whole meta state is
+/// one value: held in memory behind every placement view, rewritten whole
+/// into the meta snapshot record at every meta snapshot and sent whole in
+/// one install. One placement per group dominates it, about 100 bytes at
+/// RF 3 in compact MessagePack (two log ids, the voter sets of a move and
+/// their framing), so 4,096 groups keep it near 400 KiB, and every group
+/// moving with full-width ids and owing retirements stays within a few MiB.
+/// 4,096 is 16 groups per core, the default, on a 256-core host, and eight
+/// times the largest preset. Node records grow with the ids ever
+/// registered, not with the group count.
+pub const MAX_GROUP_COUNT: u32 = 4_096;
+
+/// Whether a cluster may have `count` data groups: at most
+/// [`MAX_GROUP_COUNT`]. `Bootstrap` and the configuration's
+/// `raft.group_count` both check it.
+pub fn group_count_within_bound(count: u64) -> bool {
+    count <= u64::from(MAX_GROUP_COUNT)
+}
+
 /// How many data groups a cluster has, at least one. Group ids are
 /// `0..group_count`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

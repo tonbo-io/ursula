@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::placement::GroupCount;
+use ursula_proto::placement::MAX_GROUP_COUNT;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
@@ -228,6 +230,8 @@ pub enum ControlError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 pub enum BootstrapProblem {
+    #[error("{} groups exceed the bound of {}", .count.get(), MAX_GROUP_COUNT)]
+    GroupCountAboveMax { count: GroupCount },
     #[error("meta voter {node} is not one of the nodes")]
     MetaVoterNotANode { node: NodeId },
     #[error("the replication factor exceeds the node count")]
