@@ -337,6 +337,14 @@ impl ForwardError {
         )
     }
 
+    /// True when the cached channel to the leader's address is of no more
+    /// use: the leader is unreachable over it, or the address serves
+    /// another node now, which `raft.peers` or a moved address can fix
+    /// without a restart. The next call connects afresh.
+    fn drops_channel(&self) -> bool {
+        self.leader_unreachable() || matches!(self, Self::OtherNode { .. })
+    }
+
     /// The engine-level answer, decided here only. A leader this node
     /// cannot reach is, to the client, a leader it does not know:
     /// leader-unknown (HTTP 503 with `Retry-After`), retried once the
@@ -404,7 +412,8 @@ fn is_transport_failure(status: &tonic::Status) -> bool {
 }
 
 /// One forwarded leader RPC under [`FORWARD_RPC_TIMEOUT`]. A call that fails
-/// at the transport drops its cached channel, so the next one reconnects.
+/// at the transport, or that the leader's address refused as meant for
+/// another node, drops its cached channel, so the next one reconnects.
 async fn call_leader<Req, Resp, Fut>(
     route: &LeaderRoute,
     placement: ShardPlacement,
@@ -453,6 +462,7 @@ where
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
                     if let Some(node) = crate::target::refusing_node(&status) {
+                        peer_cluster.observe_misdelivery(route.leader_id, address, node);
                         ForwardError::OtherNode {
                             rpc,
                             address: address.to_owned(),
@@ -487,7 +497,7 @@ where
                 Err(_elapsed) => timed_out(),
             };
             dropped_channel =
-                error.leader_unreachable() && LEADER_CHANNELS.evict(address, leader.generation);
+                error.drops_channel() && LEADER_CHANNELS.evict(address, leader.generation);
             error
         }
     };
@@ -496,7 +506,8 @@ where
             group = placement.raft_group_id.0,
             leader = address,
             error = %ErrorChain(&error),
-            "dropped the forwarding channel to a group leader after a transport failure"
+            "dropped the forwarding channel to a group leader: the leader is unreachable over \
+             it, or its address serves another node now"
         );
     } else {
         tracing::debug!(
