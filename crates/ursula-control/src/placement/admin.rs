@@ -11,6 +11,7 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::VoterSet;
@@ -32,7 +33,7 @@ pub enum ClusterView {
     /// node's.
     MetaGenesis {
         unanswered: BTreeSet<NodeId>,
-        genesis_mismatch: BTreeMap<NodeId, GenesisClaimView>,
+        genesis_mismatch: BTreeMap<NodeId, GenesisClaim>,
     },
     /// Meta formed elsewhere and this node's replica applied nothing yet.
     MetaCatchingUp,
@@ -45,17 +46,6 @@ pub enum ClusterView {
     /// A meta recovery plan ended the formation.
     FormationCut,
     Bootstrapped(Cluster),
-}
-
-/// The values a node proposes meta's genesis with: they must agree on every
-/// node before meta initializes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GenesisClaimView {
-    pub voters: BTreeSet<NodeId>,
-    /// The digest of the node's `raft.peers`, in lowercase hex.
-    pub peers_digest: String,
-    pub group_count: u32,
-    pub replication_factor: u8,
 }
 
 /// `POST /__ursula/placement/groups/{group}/move`: move the group to `to`

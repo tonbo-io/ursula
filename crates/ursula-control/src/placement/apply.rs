@@ -44,6 +44,7 @@ use super::state::Placements;
 use super::state::Registration;
 use super::state::Retirement;
 use super::state::Target;
+use super::state::group_ids;
 
 /// The node ids, meta voters and replication factor a cluster under the
 /// startup reservation must have.
@@ -217,9 +218,7 @@ fn bootstrap(
         since_ms: now_ms,
     };
     let since = PlacementEpoch::new(at);
-    let groups = params
-        .group_count
-        .groups()
+    let groups = group_ids(params.group_count)
         .map(|group| {
             let placement = GroupPlacement::Seeded {
                 since,

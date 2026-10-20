@@ -7,6 +7,8 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::num::NonZeroU32;
 
+use ursula_proto::placement::GenesisClaim;
+use ursula_proto::placement::GroupCount;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
@@ -16,6 +18,7 @@ use ursula_proto::placement::NodeSet;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::RaftLogId;
 use ursula_proto::placement::Registered;
+use ursula_proto::placement::ReplicationFactor;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -27,7 +30,6 @@ use super::ControlCommand;
 use super::ControlError;
 use super::ControlPlaneState;
 use super::ControlResponse;
-use super::GroupCount;
 use super::GroupPlacement;
 use super::HistoryBegun;
 use super::HistoryCause;
@@ -37,7 +39,6 @@ use super::Move;
 use super::MoveLimit;
 use super::Placements;
 use super::Registration;
-use super::ReplicationFactor;
 use super::Retirement;
 use super::Target;
 
@@ -465,6 +466,16 @@ pub(super) fn sample_errors() -> Vec<ControlError> {
         .map(|problem| ControlError::InvalidBootstrap { problem }),
     );
     errors
+}
+
+/// A genesis claim whose sets and counts differ from each other's.
+pub(super) fn sample_genesis_claim() -> GenesisClaim {
+    GenesisClaim {
+        meta_voters: voters(&[31, 32, 33]),
+        peers: node_set(&[31, 32, 33, 34, 35]),
+        group_count: GroupCount::new(NonZeroU32::new(16).unwrap()),
+        replication_factor: ReplicationFactor::new(NonZeroU8::new(4).unwrap()),
+    }
 }
 
 /// One history answer of every variant.

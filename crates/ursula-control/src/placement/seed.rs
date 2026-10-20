@@ -11,10 +11,9 @@ use std::num::NonZeroU8;
 
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeSet;
+use ursula_proto::placement::ReplicationFactor;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
-
-use super::state::ReplicationFactor;
 
 /// How many meta voters a cluster has by default, at most.
 const DEFAULT_META_VOTERS: usize = 3;
@@ -78,13 +77,13 @@ mod tests {
     use proptest::test_runner::RngSeed;
     use ursula_proto::placement::NodeId;
     use ursula_proto::placement::NodeSet;
+    use ursula_proto::placement::ReplicationFactor;
     use ursula_shard::RaftGroupId;
 
     use super::default_meta_voters;
     use super::effective_replication_factor;
     use super::initializer;
     use super::seed_voters;
-    use crate::placement::state::ReplicationFactor;
 
     fn rf(value: u8) -> ReplicationFactor {
         ReplicationFactor::new(NonZeroU8::new(value).unwrap())

@@ -7,17 +7,17 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::num::NonZeroU8;
-use std::num::NonZeroU32;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::placement::GroupCount;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::ReplicaRole;
+use ursula_proto::placement::ReplicationFactor;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -165,40 +165,9 @@ pub struct ClusterParams {
     pub maintenance: MaintenanceAuthority,
 }
 
-/// How many data groups a cluster has, at least one. Group ids are
-/// `0..group_count`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct GroupCount(NonZeroU32);
-
-impl GroupCount {
-    pub const fn new(count: NonZeroU32) -> Self {
-        Self(count)
-    }
-
-    pub const fn get(self) -> u32 {
-        self.0.get()
-    }
-
-    /// Every group id of the cluster, ascending.
-    pub fn groups(self) -> impl Iterator<Item = RaftGroupId> {
-        (0..self.get()).map(RaftGroupId)
-    }
-}
-
-/// How many voters each data group has, at least one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct ReplicationFactor(NonZeroU8);
-
-impl ReplicationFactor {
-    pub const fn new(factor: NonZeroU8) -> Self {
-        Self(factor)
-    }
-
-    pub const fn get(self) -> u8 {
-        self.0.get()
-    }
+/// Every group id of a cluster of `count` groups, ascending.
+pub fn group_ids(count: GroupCount) -> impl Iterator<Item = RaftGroupId> {
+    (0..count.get()).map(RaftGroupId)
 }
 
 /// How many groups may move at once. A limit below the moving count only

@@ -28,6 +28,7 @@ use super::LifecycleChange;
 use super::MaintenanceAuthority;
 use super::MoveLimit;
 use super::Target;
+use super::group_ids;
 use super::initializer;
 use super::samples::Driver;
 use super::samples::membership;
@@ -307,7 +308,7 @@ fn invariants(state: &ControlPlaneState) -> Result<(), String> {
     };
     let rf = usize::from(cluster.params().replication_factor.get());
     let groups: Vec<RaftGroupId> = cluster.groups().iter().map(|(group, _)| group).collect();
-    let expected: Vec<RaftGroupId> = cluster.params().group_count.groups().collect();
+    let expected: Vec<RaftGroupId> = group_ids(cluster.params().group_count).collect();
     ensure(groups == expected, || {
         format!("K9: placements {groups:?}, cluster groups {expected:?}")
     })?;
@@ -688,7 +689,7 @@ fn check_forming(
             ensure(*applied == ControlApplied::Bootstrapped, || {
                 format!("K11: bootstrap answered {applied:?}")
             })?;
-            for group in params.group_count.groups() {
+            for group in group_ids(params.group_count) {
                 let expected = GroupPlacement::Seeded {
                     since,
                     voters: seed_voters(group, params.replication_factor, nodes),

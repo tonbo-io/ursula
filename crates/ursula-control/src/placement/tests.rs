@@ -38,6 +38,7 @@ use super::samples::node_set;
 use super::samples::params;
 use super::samples::sample_commands;
 use super::samples::sample_errors;
+use super::samples::sample_genesis_claim;
 use super::samples::sample_history_answers;
 use super::samples::sample_responses;
 use super::samples::sample_state;
@@ -702,18 +703,14 @@ fn every_root_round_trips_through_messagepack_and_json() {
     for answer in sample_history_answers() {
         round_trip(&answer);
     }
+    round_trip(&sample_genesis_claim());
     let ControlPlaneState::Bootstrapped(cluster) = sample_state() else {
         panic!("the sample state is bootstrapped");
     };
     round_trip(&ClusterView::Bootstrapped(cluster.clone()));
     round_trip(&ClusterView::MetaGenesis {
         unanswered: ids(&[2]),
-        genesis_mismatch: BTreeMap::from([(node(3), super::GenesisClaimView {
-            voters: ids(&[1, 2, 3]),
-            peers_digest: "00ff".to_owned(),
-            group_count: 16,
-            replication_factor: 3,
-        })]),
+        genesis_mismatch: BTreeMap::from([(node(3), sample_genesis_claim())]),
     });
     round_trip(&ClusterView::Registering {
         registered: ids(&[1]),

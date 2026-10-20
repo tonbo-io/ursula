@@ -17,6 +17,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::num::NonZeroU8;
+use std::num::NonZeroU32;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -262,6 +264,54 @@ non_empty_node_set!(
     NodeSet
 );
 
+/// How many data groups a cluster has, at least one. Group ids are
+/// `0..group_count`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct GroupCount(NonZeroU32);
+
+impl GroupCount {
+    pub const fn new(count: NonZeroU32) -> Self {
+        Self(count)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
+/// How many voters each data group has, at least one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReplicationFactor(NonZeroU8);
+
+impl ReplicationFactor {
+    pub const fn new(factor: NonZeroU8) -> Self {
+        Self(factor)
+    }
+
+    pub const fn get(self) -> u8 {
+        self.0.get()
+    }
+}
+
+/// The values a node proposes the meta group's genesis with. Every node must
+/// claim the same before meta initializes.
+///
+/// The claim lists peer ids, not a digest of `raft.peers`: genesis rests on
+/// the id set a node probes, not on how it writes addresses, and a mismatch
+/// names the ids that differ.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct GenesisClaim {
+    /// The configured meta voters.
+    pub meta_voters: VoterSet,
+    /// The ids of `raft.peers`.
+    pub peers: NodeSet,
+    pub group_count: GroupCount,
+    /// The effective replication factor.
+    pub replication_factor: ReplicationFactor,
+}
+
 /// A node's role in one group's placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -439,11 +489,17 @@ pub enum WriteEffect {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::num::NonZeroU8;
+    use std::num::NonZeroU32;
 
     use super::EmptyNodeSet;
+    use super::GenesisClaim;
+    use super::GroupCount;
     use super::MetaLogId;
     use super::NodeId;
+    use super::NodeSet;
     use super::RaftLogId;
+    use super::ReplicationFactor;
     use super::VoterSet;
 
     fn ids(values: &[u64]) -> BTreeSet<NodeId> {
@@ -485,5 +541,21 @@ mod tests {
         assert!(id(2, 1, 1) > id(1, 3, 100));
         assert!(id(2, 2, 1) > id(2, 1, 100));
         assert!(id(2, 2, 5) > id(2, 2, 4));
+    }
+
+    #[test]
+    fn a_genesis_claim_lists_peer_ids() {
+        let claim = GenesisClaim {
+            meta_voters: VoterSet::new(ids(&[2, 1])).unwrap(),
+            peers: NodeSet::new(ids(&[3, 1, 2, 4])).unwrap(),
+            group_count: GroupCount::new(NonZeroU32::new(16).unwrap()),
+            replication_factor: ReplicationFactor::new(NonZeroU8::new(3).unwrap()),
+        };
+        let json = serde_json::to_string(&claim).unwrap();
+        assert_eq!(
+            json,
+            r#"{"meta_voters":[1,2],"peers":[1,2,3,4],"group_count":16,"replication_factor":3}"#
+        );
+        assert_eq!(serde_json::from_str::<GenesisClaim>(&json).unwrap(), claim);
     }
 }
