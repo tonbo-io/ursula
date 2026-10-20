@@ -741,6 +741,65 @@ impl Group {
             .collect();
     }
 
+    /// `node` destroys its replica: it is down, and comes back `Empty`
+    /// without a log.
+    pub(crate) fn wipe(&mut self, node: NodeId) {
+        self.kill(node);
+        self.logs.remove(&node);
+        self.gates.insert(node, Gate::Empty);
+    }
+
+    /// A data recovery plan commits `config` again in a new term: every live
+    /// node holding the group or named by `config` takes the committed log
+    /// with the plan's entry appended, its gate open, and the smallest live
+    /// voter of `config` leads, or no one. The entry's id names that leader,
+    /// else `config`'s smallest voter.
+    pub(crate) fn recover_to(&mut self, config: MembershipConfig) -> MembershipLogId {
+        let voters = config.voters();
+        let leader = voters
+            .iter()
+            .copied()
+            .find(|voter| self.alive.contains(voter));
+        let named = leader
+            .or_else(|| voters.first().copied())
+            .unwrap_or(NodeId::new(0));
+        let mut log = self
+            .reference()
+            .map(|node| self.log(node).to_vec())
+            .unwrap_or_default();
+        log.truncate(usize::try_from(self.commit_index).unwrap());
+        self.lose_leadership();
+        self.term = self.term.checked_add(1).unwrap();
+        let index = u64::try_from(log.len()).unwrap().checked_add(1).unwrap();
+        let id = RaftLogId {
+            term: self.term,
+            leader: named,
+            index,
+        };
+        log.push(Entry {
+            id,
+            config: Some(config.clone()),
+        });
+        let takers: Vec<NodeId> = self
+            .alive
+            .iter()
+            .copied()
+            .filter(|node| !self.log(*node).is_empty() || config.is_member(*node))
+            .collect();
+        for node in takers {
+            self.logs.insert(node, log.clone());
+            self.gates.insert(node, Gate::Open);
+        }
+        let id = MembershipLogId::new(id);
+        self.commit_index = index;
+        self.committed_configs.push((id, config.clone()));
+        self.committed = config;
+        self.committed_id = id;
+        self.leader = leader;
+        self.caught_up = leader.into_iter().collect();
+        id
+    }
+
     /// `node` crashes. A leader stays leader until an election replaces it.
     pub(crate) fn kill(&mut self, node: NodeId) {
         self.alive.remove(&node);

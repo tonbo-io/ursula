@@ -9,12 +9,15 @@
 //!   with an older view, be cut off on the data plane, or believe itself
 //!   removed.
 //! - **A data group** is the abstract group of the reconciler's tests
-//!   ([`Group`]): a CAS on the membership log id, a joint then a uniform
-//!   entry per voter change, lost second steps, commits only with a live
-//!   majority of every config, step-down of a leader outside the committed
-//!   config, elections, catch-up and gates. On top of it the model keeps
-//!   leaders cut off on the data plane that still lead their own copy, step
-//!   futures kept past their leadership, and data recovery plans.
+//!   ([`Group`]): per-node logs, a CAS on the membership log id, a joint
+//!   then a uniform entry per voter change with kept futures, lost and
+//!   delayed second steps, commits only with an acknowledging majority of
+//!   every config, elections by vote with recovery gates, an outgoing leader
+//!   elected again on its uniform entry, a leader outside the committed
+//!   config leading until its step-down, transfers, catch-up and gates. On
+//!   top of it the model keeps leaders cut off on the data plane that still
+//!   lead their own copy, step futures kept past their leadership, and data
+//!   recovery plans.
 //!
 //! Every [`Action`] is one step of one actor or of the adversary, and
 //! [`World::step`] checks C1 to C4 and C7 to C9 after each. C5 is
@@ -84,6 +87,8 @@ use crate::placement::plan_decommission;
 use crate::placement::plan_hosting;
 use crate::placement::plan_membership_step;
 use crate::placement::reconcile::model::Group;
+use crate::placement::reconcile::model::Proposal;
+use crate::placement::reconcile::model::Refused;
 use crate::placement::reconcile::model::quorum_live;
 use crate::placement::rules::Rule;
 use crate::placement::rules::enforced;
@@ -131,6 +136,8 @@ pub(super) enum Invariant {
     C7,
     C8,
     C9,
+    /// OpenRaft refused a step no correct planner takes.
+    Refused,
     Script,
 }
 
@@ -180,14 +187,22 @@ pub(super) enum Action {
     /// The node's seed driver: it initializes the group when a confirmed
     /// view shows it the initializer and every seed voter answers empty.
     Seed(NodeId, RaftGroupId),
-    /// The fair environment of the group: an election when needed, a
-    /// pending entry committed, every live member caught up and gated open.
+    /// The fair environment of the group: the step-down of a leader a past
+    /// action removed, an election when needed, the leader's log replicated
+    /// and committed, a pending transfer resolved, and the barrier's gates
+    /// and catch-up.
     Settle(RaftGroupId),
     /// Only an election when needed.
     Elect(RaftGroupId),
     /// The group's next voter change loses its second step.
     DropSecondStep(RaftGroupId),
-    /// Leadership moves to the node when it is a live, caught-up voter.
+    /// The group's next second step waits for its next settle.
+    DelaySecondStep(RaftGroupId),
+    /// The node campaigns and leads when it would win: an outgoing voter
+    /// holding the uncommitted uniform entry included.
+    Campaign(RaftGroupId, NodeId),
+    /// The leader starts a transfer to the node, which the group's next
+    /// settle completes when the node holds the leader's log and wins.
     Transfer(RaftGroupId, NodeId),
     /// A kept step future runs now, when its planner leads again.
     DeliverStep(RaftGroupId),
@@ -560,10 +575,22 @@ impl World {
                     raft.drop_second_step = true;
                 }
             }
-            Action::Transfer(group, to) => {
+            Action::DelaySecondStep(group) => {
                 if let Some(raft) = self.raft_mut(group) {
-                    raft.execute(&MembershipStep::TransferLeadership { to });
+                    raft.delay_second_step = true;
                 }
+            }
+            Action::Campaign(group, node) => {
+                if let Some(raft) = self.raft_mut(group) {
+                    let _won = raft.campaign(node);
+                }
+            }
+            Action::Transfer(group, to) => {
+                let refused = self.raft_mut(group).and_then(|raft| {
+                    raft.execute(&MembershipStep::TransferLeadership { to })
+                        .err()
+                });
+                self.refused(group, refused);
             }
             Action::DeliverStep(group) => self.deliver_step(group),
             Action::DeliverReports => self.deliver_reports(),
@@ -842,7 +869,7 @@ impl World {
                 let local = LocalReplica {
                     log: replica.log,
                     counts: self.counts(node, *group),
-                    teardown: replica.teardown.map(Teardown::stage),
+                    teardown: replica.teardown,
                 };
                 (*group, local)
             })
@@ -1119,6 +1146,9 @@ impl World {
             }
             state.objects.remove(&group);
         }
+        if let Some(raft) = self.raft_mut(group) {
+            raft.wipe(me);
+        }
     }
 
     // Reconciliation.
@@ -1162,10 +1192,7 @@ impl World {
         }
         let planned = seat.view(me);
         let step = plan_membership_step(&planned, &target);
-        let current = match &seat.committed {
-            MembershipConfig::Uniform { voters, .. } => Some(voters.clone()),
-            MembershipConfig::Joint { .. } => None,
-        };
+        let from = seat.committed.clone();
         let membership = seat.committed_id;
         let term = seat.term;
         // The leadership proof: a live leader of the real group whose
@@ -1174,7 +1201,7 @@ impl World {
             && seat.leader == Some(me)
             && seat.alive.contains(&me)
             && quorum_live(&seat.committed, &seat.alive);
-        self.check_voter_change(me, group, &step, current.as_ref(), &removed);
+        self.check_voter_change(me, group, &step, &from, &removed);
         match step {
             MembershipStep::ConfirmView => {
                 let Some(stamp) = self.confirm(me) else {
@@ -1220,34 +1247,57 @@ impl World {
                 let Some(data) = self.groups.get_mut(&group) else {
                     return;
                 };
-                if deposed {
-                    if let Some(copy) = data.deposed.get_mut(&me) {
-                        copy.execute(&step);
-                    }
+                let refused = if deposed {
+                    data.deposed
+                        .get_mut(&me)
+                        .and_then(|copy| copy.execute(&step).err())
                 } else if hold {
                     data.kept = Some((me, step));
-                } else if let Some(raft) = data.raft.as_mut() {
-                    raft.execute(&step);
-                }
+                    None
+                } else {
+                    data.raft
+                        .as_mut()
+                        .and_then(|raft| raft.execute(&step).err())
+                };
+                self.refused(group, refused);
             }
         }
     }
 
-    /// C2 and C9 on a planned voter change from `current`, the planner's
-    /// committed voters when uniform.
+    /// A step OpenRaft refused, which no correct planner takes.
+    fn refused(&mut self, group: RaftGroupId, refused: Option<Refused>) {
+        if let Some(refused) = refused {
+            self.found.push(violation(
+                Invariant::Refused,
+                format!("group {}: {refused:?}", group.0),
+            ));
+        }
+    }
+
+    /// C2 and C9 on a planned voter change from `from`, the planner's
+    /// committed config: C2 with the reconciler's tests' one predicate,
+    /// [`Proposal::keeps_proposer`].
     fn check_voter_change(
         &mut self,
         me: NodeId,
         group: RaftGroupId,
         step: &MembershipStep,
-        current: Option<&VoterSet>,
+        from: &MembershipConfig,
         removed: &BTreeSet<NodeId>,
     ) {
         let MembershipStep::ChangeVoters { voters, .. } = step else {
             return;
         };
-        let rf1_step = current.is_some_and(|current| current.len() == 1) && voters.len() == 1;
-        if !voters.contains(me) && !rf1_step {
+        let current = match from {
+            MembershipConfig::Uniform { voters, .. } => Some(voters),
+            MembershipConfig::Joint { .. } => None,
+        };
+        let proposal = Proposal {
+            proposer: me,
+            from: from.clone(),
+            voters: voters.clone(),
+        };
+        if !proposal.keeps_proposer() {
             self.found.push(violation(
                 Invariant::C2,
                 format!("node {me} proposed {voters:?} for group {}", group.0),
@@ -1277,12 +1327,12 @@ impl World {
         let Some((planner, step)) = data.kept.take() else {
             return;
         };
-        if let Some(raft) = data.raft.as_mut()
-            && raft.leader == Some(planner)
-            && raft.alive.contains(&planner)
-        {
-            raft.execute(&step);
-        }
+        let refused = data
+            .raft
+            .as_mut()
+            .filter(|raft| raft.leader == Some(planner) && raft.alive.contains(&planner))
+            .and_then(|raft| raft.execute(&step).err());
+        self.refused(group, refused);
     }
 
     fn deliver_reports(&mut self) {
@@ -1366,17 +1416,12 @@ impl World {
         let Some(cluster) = self.meta.state().cluster() else {
             return;
         };
+        // A node that is not live has no entry.
         let eligibility: BTreeMap<NodeId, NodeEligibility> = cluster
             .nodes()
             .keys()
-            .map(|node| {
-                let eligibility = if self.reaches(*node) {
-                    NodeEligibility::Eligible
-                } else {
-                    NodeEligibility::NotLive
-                };
-                (*node, eligibility)
-            })
+            .filter(|node| self.reaches(**node))
+            .map(|node| (*node, NodeEligibility::Eligible))
             .collect();
         let plan = plan_decommission(cluster, &eligibility);
         for planned in plan.moves {
@@ -1524,28 +1569,7 @@ impl World {
                 .position(|(id, _)| id == membership)
                 .is_some_and(|position| position > at)
         });
-        let voters = config.voters();
-        let leader = voters
-            .iter()
-            .copied()
-            .find(|node| raft.alive.contains(node));
-        let named = leader
-            .or_else(|| voters.first().copied())
-            .unwrap_or(NodeId::new(0));
-        raft.term = raft.term.checked_add(1).expect("term");
-        raft.index = raft.index.checked_add(1).expect("index");
-        let id = MembershipLogId::new(RaftLogId {
-            term: raft.term,
-            leader: named,
-            index: raft.index,
-        });
-        raft.pending = None;
-        raft.committed_configs.push((id, config.clone()));
-        raft.committed = config;
-        raft.committed_id = id;
-        raft.leader = leader;
-        raft.confirmed = false;
-        raft.caught_up = leader.into_iter().collect();
+        raft.recover_to(config);
         let position = raft.committed_configs.len().saturating_sub(1);
         if let Some(data) = self.groups.get_mut(&group) {
             data.confirmation = None;
@@ -1806,7 +1830,7 @@ impl World {
             let Some(raft) = self.raft(group) else {
                 return fail(format!("group {} never initialized", group.0));
             };
-            let settled = raft.pending.is_none()
+            let settled = raft.pending().is_none()
                 && matches!(
                     &raft.committed,
                     MembershipConfig::Uniform { voters: committed, learners }
@@ -1815,7 +1839,9 @@ impl World {
             if !settled {
                 return fail(format!(
                     "group {} is stable on {voters:?} with the membership {:?}, pending {:?}",
-                    group.0, raft.committed, raft.pending
+                    group.0,
+                    raft.committed,
+                    raft.pending()
                 ));
             }
         }
@@ -1965,6 +1991,7 @@ impl World {
         for group in groups {
             if let Some(raft) = self.raft_mut(group) {
                 raft.drop_second_step = false;
+                raft.delay_second_step = false;
             }
             self.step(Action::DeliverStep(group))?;
         }

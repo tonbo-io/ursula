@@ -1,13 +1,13 @@
 //! The rules that the closed loop's scripted negative traces (C6 of the
-//! design, issue #768) turn off one at a time, so that each trace shows its
-//! rule is what keeps the loop safe.
+//! design, issue #768, and one for C2) turn off one at a time, so that each
+//! trace shows its rule is what keeps the loop safe.
 //!
 //! Outside tests every rule holds: [`enforced`] is the constant `true` and
 //! nothing can turn a rule off. Under `cfg(test)` a test turns one rule off
 //! on its own thread with [`disable`], until the guard drops.
 
 /// A rule a negative trace turns off. The planners, the views and the
-/// dispatcher consult the first nine. The last two belong to the reconcile
+/// dispatcher consult the first ten. The last two belong to the reconcile
 /// shell and the removed-node sweep, which later slices build: until then
 /// only the closed loop's model of them consults these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +35,9 @@ pub(crate) enum Rule {
     ConfirmByLogId,
     /// C6(i): a seeded target only reports the voters it finds.
     SeededOnlyReports,
+    /// C2: a leader that is no voter of its committed config waits (step 0
+    /// of 5.3) instead of changing the voters from outside it.
+    NotAMemberWaits,
     /// C6(b): a report follows a leadership proof.
     #[cfg(test)]
     LeadershipProof,

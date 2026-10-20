@@ -311,7 +311,7 @@ pub fn plan_membership_step(view: &MembershipView, target: &MembershipTarget) ->
         EffectiveMembership::Committed { log_id, config } => (*log_id, config),
     };
     let me = view.me;
-    if !config.is_voter(me) {
+    if !config.is_voter(me) && enforced(Rule::NotAMemberWaits) {
         return MembershipStep::Wait(WaitReason::NotAMember);
     }
     let mut live = leader.live.clone();

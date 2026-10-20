@@ -1,7 +1,8 @@
-//! The scripted traces of C6 (15.1). Each runs once with every rule on and
-//! must pass, then once with its rule turned off and must fail the check
-//! named with it. Every trace starts from a formed cluster of nodes 1 to 5,
-//! group 0 stable on `{1, 2, 3}` and led by node 1.
+//! The scripted traces of C6 (15.1), and one for C2. Each runs once with
+//! every rule on and must pass, then once with its rule turned off and must
+//! fail the check named with it. Every trace but C2's starts from a formed
+//! cluster of nodes 1 to 5, group 0 stable on `{1, 2, 3}` and led by node
+//! 1. C2's runs at replication factor 1.
 
 use ursula_proto::placement::TeardownStage;
 use ursula_shard::RaftGroupId;
@@ -15,6 +16,7 @@ use super::world::node;
 use super::world::voters;
 use crate::placement::ControlCommand;
 use crate::placement::LifecycleChange;
+use crate::placement::MembershipConfig;
 use crate::placement::MoveLimit;
 use crate::placement::rules::Rule;
 use crate::placement::rules::disable;
@@ -29,16 +31,21 @@ const GROUP: RaftGroupId = RaftGroupId(0);
 
 type Trace = fn(&mut World) -> Result<(), Violation>;
 
-/// Runs `trace` over a fresh cluster of `nodes` nodes and `groups` groups
-/// at replication factor 3: it must pass with every rule on, and fail one
-/// of `caught_by` with `rule` off.
+/// Runs `trace` over a fresh cluster of five nodes and `groups` groups at
+/// replication factor 3: it must pass with every rule on, and fail one of
+/// `caught_by` with `rule` off.
 fn negative(rule: Rule, caught_by: &[Invariant], groups: u32, trace: Trace) {
-    let mut on = World::new(5, groups, 3);
+    negative_at(3, rule, caught_by, groups, trace);
+}
+
+/// [`negative`] at replication factor `rf`.
+fn negative_at(rf: u8, rule: Rule, caught_by: &[Invariant], groups: u32, trace: Trace) {
+    let mut on = World::new(5, groups, rf);
     if let Err(violation) = trace(&mut on) {
         panic!("with every rule on: {violation}\n{}", on.history());
     }
     let off = disable(rule);
-    let mut world = World::new(5, groups, 3);
+    let mut world = World::new(5, groups, rf);
     let result = trace(&mut world);
     drop(off);
     match result {
@@ -67,10 +74,12 @@ fn reconcile(world: &mut World, id: u64, hold: bool) -> Result<(), Violation> {
     })
 }
 
-/// Leadership moves to `id` once the group settled.
+/// Leadership moves to `id` once the group settled: the transfer
+/// completes in the next settle.
 fn transfer(world: &mut World, id: u64) -> Result<(), Violation> {
     world.step(Action::Settle(GROUP))?;
     world.step(Action::Transfer(GROUP, node(id)))?;
+    world.step(Action::Settle(GROUP))?;
     world.ensure(world.leader(GROUP) == Some(node(id)), "leadership moved")
 }
 
@@ -398,6 +407,68 @@ fn a_meta_plan_below_a_first_report(world: &mut World) -> Result<(), Violation> 
     let keep = world.boot_len;
     world.step(Action::MetaPlan { keep })?;
     world.quiesce(DRIVE)
+}
+
+/// C2 and step 0 of 5.3, at replication factor 1: group 0 on `{1}` moves
+/// to `{2}` with node 3 a caught-up learner, and the move's second step
+/// waits for the group's next settle, which commits `{2}` without leader 1.
+/// The move is retargeted to `{3}` before that settle, through which node 1
+/// leads outside its config until the next one steps it down. Only waiting
+/// as no member keeps node 1 from proposing `{3}` from outside its config.
+fn a_leader_removed_by_a_delayed_second_step(world: &mut World) -> Result<(), Violation> {
+    world.quiesce(FORM)?;
+    world.ensure(
+        world.is_stable(GROUP, &[1]) && world.leader(GROUP) == Some(node(1)),
+        "group 0 formed on {1} led by node 1",
+    )?;
+    world.request_move(GROUP, &[3])?;
+    world.drive(GROUP, &[3], DRIVE, |world| {
+        world.learners(GROUP).contains(&node(3)) && world.caught_up(GROUP, 3)
+    })?;
+    world.request_move(GROUP, &[2])?;
+    world.drive(GROUP, &[2], DRIVE, |world| {
+        world.learners(GROUP).contains(&node(2)) && world.caught_up(GROUP, 2)
+    })?;
+    world.step(Action::DelaySecondStep(GROUP))?;
+    // Leader 1 confirms its view if it has not, then changes the voters.
+    for _ in 0..2 {
+        if !joint(world) {
+            reconcile(world, 1, false)?;
+        }
+    }
+    world.ensure(joint(world), "the joint entry of the move to {2} committed")?;
+    world.request_move(GROUP, &[3])?;
+    world.step(Action::Settle(GROUP))?;
+    world.ensure(
+        world.leader(GROUP) == Some(node(1)) && committed_on(world, &[2]),
+        "node 1 leads outside the committed {2}",
+    )?;
+    // Node 1 confirms its view if it has not, then waits.
+    reconcile(world, 1, false)?;
+    reconcile(world, 1, false)?;
+    world.ensure(
+        world.leader(GROUP) == Some(node(1)) && committed_on(world, &[2]),
+        "node 1 waited for its step-down",
+    )?;
+    world.drive(GROUP, &[3], DRIVE, |world| world.is_stable(GROUP, &[3]))
+}
+
+/// Whether group 0's committed config is joint.
+fn joint(world: &World) -> bool {
+    world
+        .raft(GROUP)
+        .is_some_and(|raft| matches!(raft.committed, MembershipConfig::Joint { .. }))
+}
+
+#[test]
+fn c2_a_leader_outside_its_config_waits_as_no_member() {
+    negative_at(
+        1,
+        Rule::NotAMemberWaits,
+        &[Invariant::C2],
+        1,
+        a_leader_removed_by_a_delayed_second_step,
+    );
 }
 
 #[test]

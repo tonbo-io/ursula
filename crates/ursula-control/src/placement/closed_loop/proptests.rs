@@ -7,16 +7,17 @@
 //! The adversary crashes, restarts with regressed views, cuts nodes off on
 //! the data plane (whose leaders keep leading their own copy), lags meta
 //! replicas, keeps step futures past their leadership, holds reports in
-//! flight, drops second steps, moves leadership and takes meta down. Each
-//! run also draws one family of operator recoveries: lifecycle changes
-//! with the decommission driver and the sweep, meta recovery plans, or data
-//! recovery plans. Combining them reaches states the design leaves to the
-//! operator (a removed voter after a meta plan, a data plan below a meta
-//! plan's loss), which the scripted traces cover instead. A data plan here
-//! keeps no less than the last certified membership, the last data plan
-//! and the last destruction, and waits for the group's reports in flight,
-//! as the recovery tool acts only on a group stalled longer than a report
-//! takes (7.4).
+//! flight, drops and delays second steps, lets any node that would win
+//! campaign (an outgoing leader on its uniform entry included), moves
+//! leadership and takes meta down. Each run also draws one family of
+//! operator recoveries: lifecycle changes with the decommission driver and
+//! the sweep, meta recovery plans, or data recovery plans. Combining them
+//! reaches states the design leaves to the operator (a removed voter after
+//! a meta plan, a data plan below a meta plan's loss), which the scripted
+//! traces cover instead. A data plan here keeps no less than the last
+//! certified membership, the last data plan and the last destruction, and
+//! waits for the group's reports in flight, as the recovery tool acts only
+//! on a group stalled longer than a report takes (7.4).
 
 use std::cell::Cell;
 
@@ -204,9 +205,11 @@ fn generate(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u
                 Action::DeliverReports
             }
         }
-        20 => match index(z, 3) {
+        20 => match index(z, 5) {
             0 => Action::Elect(group),
             1 => Action::DropSecondStep(group),
+            2 => Action::DelaySecondStep(group),
+            3 => Action::Campaign(group, node),
             _ => Action::Transfer(group, node),
         },
         21 => match recoveries {
