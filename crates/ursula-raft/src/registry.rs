@@ -52,9 +52,6 @@ pub use crate::election::LeadershipShedFlag;
 pub use crate::election::LeadershipShedReason;
 pub use crate::election::LeadershipShedState;
 use crate::log_store::WalOpening;
-use crate::meta::MetaRaftTypeConfig;
-use crate::meta::MetaSnapshot;
-use crate::meta::MetaSnapshotData;
 use crate::owner::OwnerRaftHandle;
 use crate::read_index::ReadIndexBarrier;
 use crate::rejoin::GroupRejoin;
@@ -126,55 +123,6 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for SingleNodeRaftNetwork {
         RPCError<UrsulaRaftTypeConfig>,
     > {
         unreachable!("single-node raft group must not transfer leadership")
-    }
-}
-
-impl RaftNetworkFactory<MetaRaftTypeConfig> for SingleNodeRaftNetworkFactory {
-    type Network = SingleNodeRaftNetwork;
-
-    async fn new_client(&mut self, _target: u64, _node: &EmptyNode) -> Self::Network {
-        SingleNodeRaftNetwork
-    }
-}
-
-impl RaftNetworkV2<MetaRaftTypeConfig> for SingleNodeRaftNetwork {
-    type SnapshotData = MetaSnapshotData;
-
-    async fn append_entries(
-        &mut self,
-        _rpc: AppendEntriesRequest<MetaRaftTypeConfig>,
-        _option: RPCOption,
-    ) -> Result<AppendEntriesResponse<MetaRaftTypeConfig>, RPCError<MetaRaftTypeConfig>> {
-        unreachable!("single-node meta raft group must not send AppendEntries")
-    }
-
-    async fn vote(
-        &mut self,
-        _rpc: VoteRequest<MetaRaftTypeConfig>,
-        _option: RPCOption,
-    ) -> Result<VoteResponse<MetaRaftTypeConfig>, RPCError<MetaRaftTypeConfig>> {
-        unreachable!("single-node meta raft group must not send Vote")
-    }
-
-    async fn full_snapshot(
-        &mut self,
-        _vote: VoteOf<MetaRaftTypeConfig>,
-        _snapshot: MetaSnapshot,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-        _option: RPCOption,
-    ) -> Result<SnapshotResponse<MetaRaftTypeConfig>, StreamingError<MetaRaftTypeConfig>> {
-        unreachable!("single-node meta raft group must not send snapshots")
-    }
-
-    async fn transfer_leader(
-        &mut self,
-        _req: TransferLeaderRequest<MetaRaftTypeConfig>,
-        _option: RPCOption,
-    ) -> Result<
-        openraft::raft::TransferLeaderResponse<MetaRaftTypeConfig>,
-        RPCError<MetaRaftTypeConfig>,
-    > {
-        unreachable!("single-node meta raft group must not transfer leadership")
     }
 }
 

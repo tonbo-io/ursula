@@ -15,6 +15,9 @@ toml = { workspace = true }
 thiserror = { workspace = true }
 dirs = { workspace = true }
 ursula-headers = { workspace = true, features = ["serde"] }
+# `MAX_GROUP_COUNT`, the bound `raft.group_count` shares with the meta
+# group's `Bootstrap`.
+ursula-proto = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -267,14 +267,3 @@ voter that dies, before or after its group leaders reached it, stays a voter of
 every group, so `verify-survivors` proves its loss and the operator restages
 the host. Nothing drives host recovery automatically, and `startupOwnership`
 stays off by default.
-
-## 7. Library-only components
-
-Two components exist in the tree, and no server or CLI path calls them:
-
-- `crates/ursula-control` is a pure control-plane state machine with node
-  registration, data group placement and one operation kernel for move,
-  rebuild and decommission. It has no I/O, async or clock reads.
-- `crates/ursula-raft/src/meta.rs` defines a meta OpenRaft type config, state
-  machine and snapshots that apply `ursula-control` commands. Its only log
-  store is the test-only `log_store/meta_test_store.rs`.

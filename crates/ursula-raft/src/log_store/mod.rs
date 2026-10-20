@@ -22,8 +22,6 @@
 //! - `state_file`: the atomically replaced, checksummed state-file format.
 //! - `disk`: the I/O seam every journal file operation goes through.
 //! - `sim_disk`: the simulated disk behind the seam under `cfg(madsim)`.
-//! - `meta_test_store`: an in-memory store for the meta Raft's unit tests
-//!   only (`cfg(test)`).
 
 mod core_meta;
 #[cfg(test)]
@@ -37,8 +35,6 @@ mod group_log;
 mod journal;
 #[cfg(all(test, not(madsim)))]
 mod journal_tests;
-#[cfg(test)]
-mod meta_test_store;
 mod reclaim;
 mod run_state;
 mod segment;
@@ -82,8 +78,6 @@ pub use journal::JournalError;
 pub use journal::JournalOp;
 pub use journal::JournalReplayMode;
 pub use journal::RecordTooLarge;
-#[cfg(test)]
-pub(crate) use meta_test_store::MetaTestLogStore;
 use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;

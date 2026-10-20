@@ -52,7 +52,8 @@ First-principles thinking and the elegance of the implementation come before com
 | `ursula-raft`          | OpenRaft-backed group engine: network, log store, snapshot handling, gRPC Raft plumbing.                                                      |
 | `ursula-stream`        | Deterministic stream state machine: bucket/stream commands, responses, snapshots, payload metadata, validation.                               |
 | `ursula-shard`         | Bucket/stream routing, core ownership, Raft group placement, shared shard identifiers (`CoreId`, `ShardId`, `RaftGroupId`, `BucketStreamId`). |
-| `ursula-proto`         | Shared protobuf schemas (model value types and snapshot frames) reused across crates; replicated commands/responses travel as compact serde MessagePack (`ursula_stream::msgpack`). |
+| `ursula-proto`         | Shared protobuf schemas (model value types and snapshot frames) and plain serde types shared across crates: the admin JSON types (`admin`) and the placement vocabulary of the meta group (`placement`). Replicated commands and responses travel as compact serde MessagePack (`ursula_stream::msgpack`). |
+| `ursula-control`       | The meta group's placement kernel: desired group placement, node lifecycles and retirements as a pure state machine, the seed rule, placement views and the admin JSON of the placement routes. |
 | `ursula-headers`       | Typed HTTP headers of the protocol (producer write keys and answers, HEAD metadata, snapshot and parts headers, typed `413`), std-only so the server and `clients/sqlite-vfs` share one implementation. |
 | `ursula-config`        | Configuration types and TOML loading for Ursula server.                                                                                       |
 | `ursula-observability` | Shared tracing/OpenTelemetry initialization for Ursula binaries.                                                                              |

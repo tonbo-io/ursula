@@ -26,7 +26,6 @@
 //!   routing and forward hints share.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
-//! - [`meta`]: meta-group OpenRaft type config and control-plane state machine.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
 //!   factories under `engine::factory`.
 //! - [`openraft_error`]: the one conversion from OpenRaft's errors to the
@@ -85,7 +84,6 @@ mod history;
 mod in_process;
 mod log_store;
 mod maintenance;
-mod meta;
 mod openraft_error;
 mod openraft_work;
 mod peer_channel;
@@ -175,16 +173,6 @@ pub use log_store::generate_cluster_id;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
-pub use meta::MetaNodeRegistration;
-pub use meta::MetaRaft;
-pub use meta::MetaRaftError;
-pub use meta::MetaRaftHandle;
-pub use meta::MetaRaftSnapshotBuilder;
-pub use meta::MetaRaftStateMachine;
-pub use meta::MetaRaftTypeConfig;
-pub use meta::MetaSnapshot;
-pub use meta::MetaSnapshotData;
-pub use meta::UnexpectedRegistrationResponse;
 pub use peer_cluster::CLUSTER_ID_METADATA;
 pub use peer_cluster::ClusterCheck;
 pub use peer_cluster::NODE_ID_METADATA;

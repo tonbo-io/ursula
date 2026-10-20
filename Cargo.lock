@@ -4151,6 +4151,7 @@ dependencies = [
  "thiserror 1.0.69",
  "toml",
  "ursula-headers",
+ "ursula-proto",
 ]
 
 [[package]]
@@ -4163,6 +4164,7 @@ dependencies = [
  "thiserror 1.0.69",
  "ursula-proto",
  "ursula-shard",
+ "ursula-stream",
 ]
 
 [[package]]
@@ -4300,7 +4302,6 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "ursula-config",
- "ursula-control",
  "ursula-headers",
  "ursula-observability",
  "ursula-proto",

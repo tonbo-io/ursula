@@ -33,7 +33,6 @@ tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true, features = ["transport"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }
-ursula-control = { workspace = true }
 ursula-runtime = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-config = { workspace = true }
