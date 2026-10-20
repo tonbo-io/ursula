@@ -20,13 +20,23 @@
 //! group's reports in flight, as the tool acts only on a group stalled
 //! longer than a report takes.
 //!
-//! The tally shows the random runs, not only the traces, reach the
-//! removal and the sweep (C9), the placement CAS and the leadership proof.
-//! Step 0's `NotAMember` wait and outgoing voters' wins are counted, not
-//! asserted. The wait needs a leader to plan between the commit that
-//! removes it and the next settle, which steps it down, and the fixed-seed
-//! runs reach neither: the scripted C2 trace pins the wait, and the
-//! reconciler's scripted model test the outgoing win.
+//! Now and then a step is a fair turn of one group's actors instead of one
+//! action, so that moves make progress between the faults and the
+//! operator commands that interrupt them.
+//!
+//! The tally shows the random runs, not only the traces, reach the paths
+//! only faults reach. The 64 cases of PR CI reach the removal and the
+//! sweep (C9), the placement CAS, the leadership proof, step 0's
+//! `NotAMember` wait, kept steps run in a later leadership, lost and
+//! delayed second steps, cut-off leaders' steps, initializations, the
+//! model's own recovery plans, and elections keeping or truncating an
+//! uncommitted membership entry. `PROPTEST_CASES` overrides the case count
+//! for a longer sweep, and from `SWEEP` cases on the tally also asserts
+//! teardowns held at step 0 and readmitted at step 5, and reopens. An
+//! outgoing voter's win needs a cut that holds the uniform entry back,
+//! heals before any heartbeat, and a campaign in between: the scripted
+//! trace `an_outgoing_voter_wins_on_the_uniform_entry_and_steps_down` pins
+//! it, and the tally only counts it.
 
 use std::cell::Cell;
 
@@ -49,6 +59,9 @@ use crate::placement::ControlCommand;
 use crate::placement::GroupPlacement;
 use crate::placement::LifecycleChange;
 use crate::placement::MoveLimit;
+
+/// The case count from which the tally asserts the rarer paths too.
+const SWEEP: u32 = 1024;
 
 /// Fair rounds that form every group of a fresh cluster.
 const FORM_ROUNDS: usize = 10;
@@ -141,14 +154,34 @@ fn data_plan(world: &World, group: RaftGroupId, z: u8) -> Option<Action> {
     Some(Action::DataPlan { group, at })
 }
 
-/// The step `(op, x, y, z)` chooses in `world`.
-fn generate(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u8)) -> Action {
+/// What one random step does.
+#[derive(Debug, Clone)]
+enum Draw {
+    Act(Action),
+    /// One fair turn of the group's actors (`World::turn`).
+    Turn(RaftGroupId),
+}
+
+/// The step `(op, x, y, z)` chooses in `world`: mostly one action, now and
+/// then a fair turn of one group, so that moves make progress between the
+/// faults and operator commands that interrupt them.
+fn generate(world: &World, recoveries: Recoveries, raw: (u8, u8, u8, u8)) -> Draw {
+    let (op, _, y, _) = raw;
+    let groups: Vec<RaftGroupId> = world.groups.keys().copied().collect();
+    match op.checked_rem(13).unwrap() {
+        0 => Draw::Turn(groups[index(y, groups.len())]),
+        _ => Draw::Act(action(world, recoveries, raw)),
+    }
+}
+
+/// The action `(op, x, y, z)` chooses in `world`.
+fn action(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u8)) -> Action {
     let nodes: Vec<NodeId> = world.nodes.keys().copied().collect();
     let groups: Vec<RaftGroupId> = world.groups.keys().copied().collect();
     let node = nodes[index(x, nodes.len())];
     let group = groups[index(y, groups.len())];
     let host = Action::Host(node);
-    match op.checked_rem(24).unwrap() {
+    match op.checked_rem(25).unwrap() {
         0..=3 => host,
         4..=6 => match world.leader(group) {
             Some(leader) => Action::Reconcile {
@@ -165,11 +198,24 @@ fn generate(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u
         },
         8 => Action::Seed(node, group),
         9 | 10 => Action::Settle(group),
-        11 => match world.teardown_of(node) {
-            Some(torn) => Action::Teardown(node, torn),
-            None => host,
+        11 => {
+            let running = world.running_teardowns();
+            if running.is_empty() {
+                host
+            } else {
+                let (torn, group) = running[index(x, running.len())];
+                Action::Teardown(torn, group)
+            }
+        }
+        12 => operator_move(world, group, z).map_or(host, Action::Command),
+        13 => match world.leader(group) {
+            Some(leader) => Action::Reconcile {
+                node: leader,
+                group,
+                hold: false,
+            },
+            None => Action::Settle(group),
         },
-        12 | 13 => operator_move(world, group, z).map_or(host, Action::Command),
         14 => match recoveries {
             Recoveries::Lifecycles => {
                 let change = match index(z, 3) {
@@ -208,17 +254,16 @@ fn generate(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u
         }
         18 => Action::View(node, view_at(world, z)),
         19 => {
-            if one_in(z, 2) {
-                Action::DeliverStep(group)
-            } else {
+            if one_in(z, 4) {
                 Action::DeliverReports
+            } else {
+                Action::DeliverStep(group)
             }
         }
-        20 => match index(z, 5) {
+        20 => match index(z, 4) {
             0 => Action::Elect(group),
             1 => Action::DropSecondStep(group),
             2 => Action::DelaySecondStep(group),
-            3 => Action::Campaign(group, node),
             _ => Action::Transfer(group, node),
         },
         21 => match recoveries {
@@ -242,16 +287,34 @@ fn generate(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u
                 host
             }
         }
+        23 => Action::Campaign(group, campaigner(world, group, x).unwrap_or(node)),
         _ => Action::Command(ControlCommand::SetMoveLimit {
             limit: MoveLimit::new(u32::try_from(index(z, 4)).unwrap()),
         }),
     }
 }
 
-/// The fixed-seed config: 64 long runs.
+/// A node that would win a campaign of the group, if any.
+fn campaigner(world: &World, group: RaftGroupId, x: u8) -> Option<NodeId> {
+    let raft = world.raft(group)?;
+    let winners: Vec<NodeId> = raft
+        .alive
+        .iter()
+        .copied()
+        .filter(|node| raft.can_win(*node))
+        .collect();
+    (!winners.is_empty()).then(|| winners[index(x, winners.len())])
+}
+
+/// The fixed-seed config: 64 long runs, unless `PROPTEST_CASES` says
+/// otherwise.
 fn config() -> ProptestConfig {
+    let cases = std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|cases| cases.parse().ok())
+        .unwrap_or(64);
     ProptestConfig {
-        cases: 64,
+        cases,
         rng_seed: RngSeed::Fixed(768),
         // The seed is fixed, so a failure reproduces without a regression file.
         failure_persistence: None,
@@ -292,8 +355,10 @@ fn the_closed_loop_keeps_c1_to_c9() {
                 fail_on(&world, result)?;
             }
             for raw in steps {
-                let action = generate(&world, recoveries, raw);
-                let result = world.step(action);
+                let result = match generate(&world, recoveries, raw) {
+                    Draw::Act(action) => world.step(action),
+                    Draw::Turn(group) => world.turn(group),
+                };
                 fail_on(&world, result)?;
             }
             let result = world.stop_faults();
@@ -308,14 +373,40 @@ fn the_closed_loop_keeps_c1_to_c9() {
         panic!("{failure}");
     }
     let tally = tally.get();
-    assert!(tally.moves > 0, "{tally:?}");
-    assert!(tally.retired > 0, "{tally:?}");
-    assert!(tally.meta_plans > 0, "{tally:?}");
-    assert!(tally.data_plans > 0, "{tally:?}");
-    assert!(tally.removals > 0, "{tally:?}");
-    assert!(tally.sweeps > 0, "{tally:?}");
-    assert!(tally.stale_reports > 0, "{tally:?}");
-    assert!(tally.unproven_reports > 0, "{tally:?}");
+    let reached = [
+        ("moves", tally.moves),
+        ("retired", tally.retired),
+        ("meta_plans", tally.meta_plans),
+        ("data_plans", tally.data_plans),
+        ("removals", tally.removals),
+        ("sweeps", tally.sweeps),
+        ("stale_reports", tally.stale_reports),
+        ("unproven_reports", tally.unproven_reports),
+        ("not_a_member", tally.not_a_member),
+        ("kept_later", tally.kept_later),
+        ("dropped_second_steps", tally.dropped_second_steps),
+        ("delayed_second_steps", tally.delayed_second_steps),
+        ("cut_off_steps", tally.cut_off_steps),
+        ("initializations", tally.initializations),
+        ("recovery_elections", tally.recovery_elections),
+        ("pending_kept", tally.pending_kept),
+        ("pending_truncated", tally.pending_truncated),
+    ];
+    let at_scale = [
+        ("held_at_ask", tally.held_at_ask),
+        ("readmitted_at_ask_again", tally.readmitted_at_ask_again),
+        ("reopens", tally.reopens),
+    ];
+    let swept = config().cases >= SWEEP;
+    for (path, count) in reached
+        .into_iter()
+        .chain(at_scale.into_iter().filter(|_| swept))
+    {
+        assert!(
+            count > 0,
+            "the random runs never reached {path}: {tally:#?}"
+        );
+    }
 }
 
 /// Every cluster shape forms without faults: every group initializes on

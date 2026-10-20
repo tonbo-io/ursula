@@ -467,7 +467,14 @@ pub(super) struct DataGroup {
     /// kept step may run in a later leadership of its planner, which 5.5's
     /// `CommittedLeaderId` refuses: the adversary is stronger than the
     /// design, so the membership CAS alone must keep such a step safe.
-    kept: BTreeMap<NodeId, MembershipStep>,
+    kept: BTreeMap<NodeId, Kept>,
+}
+
+/// A kept step future and the term of the leadership that planned it.
+#[derive(Debug, Clone)]
+struct Kept {
+    term: u64,
+    step: MembershipStep,
 }
 
 /// How often a run reached what only a long or faulty run reaches.
@@ -492,6 +499,29 @@ pub(super) struct Tally {
     pub(super) not_a_member: usize,
     /// Elections an outgoing voter won on the uncommitted uniform entry.
     pub(super) outgoing_wins: usize,
+    /// Kept step futures that ran in a later leadership of their planner.
+    pub(super) kept_later: usize,
+    /// Second steps lost to a leadership change.
+    pub(super) dropped_second_steps: usize,
+    /// Second steps that waited for the next fair round.
+    pub(super) delayed_second_steps: usize,
+    /// Membership steps a leader cut off on the data plane executed.
+    pub(super) cut_off_steps: usize,
+    /// Teardowns step 0 held, the group not answering `NotMember`.
+    pub(super) held_at_ask: usize,
+    /// Teardowns step 5 readmitted, the group not answering `NotMember`.
+    pub(super) readmitted_at_ask_again: usize,
+    /// Retired logs a `Create` reopened as `Recovering` (7.3).
+    pub(super) reopens: usize,
+    /// Groups a seed driver initialized.
+    pub(super) initializations: usize,
+    /// Leaderless groups the model's operator plan elected a leader of.
+    pub(super) recovery_elections: usize,
+    /// Winners holding an uncommitted membership entry their no-op commits.
+    pub(super) pending_kept: usize,
+    /// Elections truncating an uncommitted membership entry the winner
+    /// lacks.
+    pub(super) pending_truncated: usize,
 }
 
 impl Tally {
@@ -507,6 +537,27 @@ impl Tally {
             unproven_reports: self.unproven_reports.saturating_add(other.unproven_reports),
             not_a_member: self.not_a_member.saturating_add(other.not_a_member),
             outgoing_wins: self.outgoing_wins.saturating_add(other.outgoing_wins),
+            kept_later: self.kept_later.saturating_add(other.kept_later),
+            dropped_second_steps: self
+                .dropped_second_steps
+                .saturating_add(other.dropped_second_steps),
+            delayed_second_steps: self
+                .delayed_second_steps
+                .saturating_add(other.delayed_second_steps),
+            cut_off_steps: self.cut_off_steps.saturating_add(other.cut_off_steps),
+            held_at_ask: self.held_at_ask.saturating_add(other.held_at_ask),
+            readmitted_at_ask_again: self
+                .readmitted_at_ask_again
+                .saturating_add(other.readmitted_at_ask_again),
+            reopens: self.reopens.saturating_add(other.reopens),
+            initializations: self.initializations.saturating_add(other.initializations),
+            recovery_elections: self
+                .recovery_elections
+                .saturating_add(other.recovery_elections),
+            pending_kept: self.pending_kept.saturating_add(other.pending_kept),
+            pending_truncated: self
+                .pending_truncated
+                .saturating_add(other.pending_truncated),
         }
     }
 }
@@ -769,18 +820,8 @@ impl World {
             })
     }
 
-    /// The first group whose teardown runs on the node.
-    pub(super) fn teardown_of(&self, node: NodeId) -> Option<RaftGroupId> {
-        self.nodes.get(&node).and_then(|state| {
-            state
-                .replicas
-                .iter()
-                .find(|(_, replica)| replica.teardown.is_some())
-                .map(|(group, _)| *group)
-        })
-    }
-
-    fn running_teardowns(&self) -> Vec<(NodeId, RaftGroupId)> {
+    /// Every teardown running on a live node.
+    pub(super) fn running_teardowns(&self) -> Vec<(NodeId, RaftGroupId)> {
         self.nodes
             .iter()
             .filter(|(_, state)| state.alive)
@@ -870,28 +911,28 @@ impl World {
             .unwrap_or(0)
     }
 
-    /// The run's tally, with the outgoing voters' wins of every group.
+    /// The run's tally, with what every group's model counted.
     pub(super) fn tally(&self) -> Tally {
-        let outgoing_wins = self
-            .groups
-            .values()
-            .filter_map(|data| data.raft.as_ref())
-            .map(|raft| raft.elections.outgoing)
-            .sum();
+        let rafts = || self.groups.values().filter_map(|data| data.raft.as_ref());
+        let sum = |count: fn(&Group) -> usize| -> usize { rafts().map(count).sum() };
         Tally {
-            outgoing_wins,
+            outgoing_wins: sum(|raft| raft.elections.outgoing),
+            recovery_elections: sum(|raft| raft.elections.plans),
+            pending_kept: sum(|raft| raft.elections.pending_kept),
+            pending_truncated: sum(|raft| raft.elections.pending_truncated),
+            dropped_second_steps: sum(|raft| raft.second_steps.dropped),
+            delayed_second_steps: sum(|raft| raft.second_steps.delayed),
             ..self.tally
         }
     }
 
-    /// Nodes that run and reach the others with an open, held replica of
-    /// the group: the group's live members.
-    fn reachable_replicas(&self, group: RaftGroupId) -> BTreeSet<NodeId> {
+    /// Nodes that run with an open, held replica of the group: the group's
+    /// live members, cut off on the data plane or not.
+    fn members(&self, group: RaftGroupId) -> BTreeSet<NodeId> {
         self.nodes
             .iter()
             .filter(|(_, state)| {
                 state.alive
-                    && !state.partitioned
                     && state
                         .replicas
                         .get(&group)
@@ -1076,6 +1117,7 @@ impl World {
     fn carry_out(&mut self, me: NodeId, standing: Standing, plan: &HostingPlan, fresh: bool) {
         let mut created = Vec::new();
         let mut reports = Vec::new();
+        let mut reopens = 0_usize;
         let Some(state) = self.nodes.get_mut(&me) else {
             return;
         };
@@ -1106,6 +1148,7 @@ impl World {
                         if replica.log == Journal::Retired {
                             replica.log = Journal::Recovering;
                             created.push(*group);
+                            reopens = reopens.saturating_add(1);
                         }
                         replica.open = true;
                         replica.closed_by_removal = false;
@@ -1142,6 +1185,7 @@ impl World {
                 }
             }
         }
+        self.tally.reopens = self.tally.reopens.saturating_add(reopens);
         if !fresh {
             for group in created {
                 self.found.push(violation(
@@ -1188,10 +1232,22 @@ impl World {
             }
         }
         let next = match teardown.advance(event) {
-            TeardownOutcome::Continue(next) => Some(next),
+            TeardownOutcome::Continue(next) => {
+                if teardown == Teardown::Asking && next == Teardown::Asking {
+                    self.tally.held_at_ask = self.tally.held_at_ask.saturating_add(1);
+                }
+                Some(next)
+            }
             TeardownOutcome::Ended(end) => {
-                if end == TeardownEnd::Retired {
-                    self.tally.retired = self.tally.retired.saturating_add(1);
+                match end {
+                    TeardownEnd::Retired => {
+                        self.tally.retired = self.tally.retired.saturating_add(1);
+                    }
+                    TeardownEnd::Readmitted => {
+                        self.tally.readmitted_at_ask_again =
+                            self.tally.readmitted_at_ask_again.saturating_add(1);
+                    }
+                    TeardownEnd::Cancelled => {}
                 }
                 None
             }
@@ -1337,15 +1393,19 @@ impl World {
             | MembershipStep::ChangeVoters { .. }
             | MembershipStep::RemoveLearners { .. }
             | MembershipStep::TransferLeadership { .. }) => {
+                let cut_off = self.partitioned(me);
                 let Some(data) = self.groups.get_mut(&group) else {
                     return;
                 };
+                if cut_off && !hold {
+                    self.tally.cut_off_steps = self.tally.cut_off_steps.saturating_add(1);
+                }
                 let refused = if deposed {
                     data.deposed
                         .get_mut(&me)
                         .and_then(|copy| copy.execute(&step).err())
                 } else if hold {
-                    data.kept.insert(me, step);
+                    data.kept.insert(me, Kept { term, step });
                     None
                 } else {
                     data.raft
@@ -1420,11 +1480,16 @@ impl World {
         // Every kept future resolves: the live leader's step runs, and the
         // others' fail, since their planners do not lead.
         let kept = std::mem::take(&mut data.kept);
+        let mut later = false;
         let refused = data.raft.as_mut().and_then(|raft| {
             let leader = raft.leader.filter(|leader| raft.alive.contains(leader))?;
-            let step = kept.get(&leader)?;
-            raft.execute(step).err()
+            let kept = kept.get(&leader)?;
+            later = kept.term != raft.term;
+            raft.execute(&kept.step).err()
         });
+        if later {
+            self.tally.kept_later = self.tally.kept_later.saturating_add(1);
+        }
         self.refused(group, refused);
     }
 
@@ -1518,6 +1583,7 @@ impl World {
                 group.0
             ));
         }
+        self.tally.initializations = self.tally.initializations.saturating_add(1);
         if let Some(data) = self.groups.get_mut(&group) {
             data.initializations = data.initializations.saturating_add(1);
             if data.initializations > 1 {
@@ -2054,6 +2120,40 @@ impl World {
         }
         self.step(Action::Decommission)?;
         self.step(Action::Sweep)?;
+        self.step(Action::DeliverReports)
+    }
+
+    /// One fair turn of the group's actors: every node hosts, the seed
+    /// drivers act while meta places the group `Seeded`, the group settles,
+    /// kept steps run, its leader acts, its teardowns step, and the reports
+    /// in flight land.
+    pub(super) fn turn(&mut self, group: RaftGroupId) -> Result<(), Violation> {
+        let nodes: Vec<NodeId> = self.nodes.keys().copied().collect();
+        for node in &nodes {
+            self.step(Action::Host(*node))?;
+        }
+        if matches!(self.placement(group), Some(GroupPlacement::Seeded { .. })) {
+            for node in &nodes {
+                self.step(Action::Seed(*node, group))?;
+            }
+        }
+        self.step(Action::Settle(group))?;
+        self.step(Action::DeliverStep(group))?;
+        if let Some(leader) = self.leader(group) {
+            self.step(Action::Reconcile {
+                node: leader,
+                group,
+                hold: false,
+            })?;
+        }
+        let teardowns: Vec<(NodeId, RaftGroupId)> = self
+            .running_teardowns()
+            .into_iter()
+            .filter(|(_, torn)| *torn == group)
+            .collect();
+        for (node, torn) in teardowns {
+            self.step(Action::Teardown(node, torn))?;
+        }
         self.step(Action::DeliverReports)
     }
 
