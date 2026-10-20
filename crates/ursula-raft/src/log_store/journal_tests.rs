@@ -1806,6 +1806,134 @@ async fn replay_without_metadata_keeps_the_highest_generation_recovering() {
     assert_eq!(metadata.group(3).generation, LogGeneration::FIRST);
 }
 
+/// A state machine of `group` on `store`, with the store's snapshot record.
+fn record_machine(
+    store: &RaftGroupFileLogStore,
+    group: u32,
+) -> crate::state_machine::RaftGroupStateMachine {
+    crate::state_machine::RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+        placement(group),
+        None,
+        None,
+        ursula_runtime::default_snapshot_store(),
+        crate::state_machine::SnapshotBuildCoordinator::default(),
+        crate::state_machine::SnapshotInstallCoordinator::default(),
+        crate::state_machine::RecordSite::Store(store.snapshot_record()),
+    )
+}
+
+/// Groups whose metadata names generation 1 keep everything across
+/// appends, markers, a snapshot build and an install, reclaim (an archive of
+/// an apply-stopped group and rewritten records) and a restart: every
+/// writer stamps the generation the metadata names. One that stamped the
+/// first generation would leave a log empty after replay, or a snapshot
+/// record that restores nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_generation_survives_snapshots_reclaim_and_restart() {
+    use openraft::storage::RaftSnapshotBuilder;
+    use openraft::storage::RaftStateMachine;
+
+    const STOPPED: u32 = 1;
+    const HEALTHY: u32 = 2;
+    let generation = LogGeneration::new(1);
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    let mut metadata = CoreMetadata::default();
+    for group in [STOPPED, HEALTHY] {
+        assert!(metadata.adopt_generation(group, generation));
+    }
+    metadata
+        .store(&core_metadata_path(&core.dir))
+        .expect("store metadata");
+
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, STOPPED);
+    let mut healthy = core.store(&writer, HEALTHY);
+    assert_eq!(stopped.snapshot_record().generation(), generation);
+    append(&mut stopped, (1..=8).map(|index| payload_entry(index, 700))).await;
+    stopped.save_committed(Some(log_id(8))).await.unwrap();
+    let mut built = record_machine(&stopped, STOPPED);
+    built
+        .apply(futures_util::stream::iter(
+            (1..=8).map(|index| Ok((blank_entry(index), None))),
+        ))
+        .await
+        .expect("apply the committed entries");
+    built
+        .get_snapshot_builder()
+        .await
+        .build_snapshot()
+        .await
+        .expect("build the snapshot");
+    drop(built);
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    for index in 1..=400_u64 {
+        append(&mut healthy, [payload_entry(index, 512)]).await;
+        if index % 8 == 0 {
+            healthy
+                .purge(log_id(index.saturating_sub(4)))
+                .await
+                .unwrap();
+        }
+    }
+    healthy.save_committed(Some(log_id(400))).await.unwrap();
+    let snapshot = ursula_runtime::GroupSnapshot {
+        placement: placement(HEALTHY),
+        group_commit_index: 400,
+        stream_snapshot: Default::default(),
+        stream_append_counts: Vec::new(),
+    };
+    let bytes = crate::snapshot_codec::group_snapshot_frames(Arc::new(snapshot))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("snapshot frames")
+        .into_iter()
+        .flatten()
+        .collect();
+    let pointer = ursula_runtime::SnapshotPointer {
+        snapshot_id: "later-generation".to_owned(),
+        location: ursula_runtime::SnapshotLocation::Inline { bytes },
+    };
+    let meta = openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+        last_log_id: Some(log_id(400)),
+        last_membership: Default::default(),
+    };
+    record_machine(&healthy, HEALTHY)
+        .install_snapshot(
+            &meta,
+            crate::types::SnapshotData::new(pointer.encode_binary().expect("encode the pointer")),
+        )
+        .await
+        .expect("install the snapshot");
+    writer.close().await.unwrap();
+    let metrics = core.metrics.snapshot();
+    assert!(metrics.wal_stopped_rewritten_bytes > 0, "{metrics:?}");
+    assert!(metrics.wal_reclaims > 0, "{metrics:?}");
+    drop(stopped);
+    drop(healthy);
+    drop(writer);
+
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, STOPPED);
+    let healthy = core.store(&writer, HEALTHY);
+    assert_eq!(log_ids(&stopped).await, (1..=8).collect::<Vec<_>>());
+    assert_eq!(stopped.read_committed().await.unwrap(), Some(log_id(8)));
+    assert_eq!(log_ids(&healthy).await, (397..=400).collect::<Vec<_>>());
+    let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
+    for group in [STOPPED, HEALTHY] {
+        assert_eq!(metadata.group(group).generation, generation);
+    }
+    for (store, group, index) in [(&stopped, STOPPED, 8), (&healthy, HEALTHY, 400)] {
+        let mut restored = record_machine(store, group);
+        restored
+            .restore_persisted_snapshot()
+            .await
+            .expect("restore the snapshot record");
+        assert_eq!(restored.last_applied_log_id, Some(log_id(index)), "{group}");
+    }
+}
+
 /// Under `never` an append is acknowledged without a journal `fsync`;
 /// closing the writer `fsync`s the journal and refuses later writes.
 #[tokio::test]
@@ -2333,6 +2461,7 @@ async fn missing_run_state_refuses_unreadable_or_exhausted_core_epochs() {
                 } else {
                     assert!(
                         matches!(error, super::RaftWalError::RecoveryEpochExhausted {
+                            class: super::JournalClass::Data,
                             recovery_epoch: u64::MAX
                         }),
                         "{error}"
@@ -2371,6 +2500,7 @@ async fn an_exhausted_recorded_epoch_refuses_a_new_poisoned_recovery() {
         assert!(matches!(
             super::RaftWal::start(root, fsync, &map),
             Err(super::RaftWalError::RecoveryEpochExhausted {
+                class: super::JournalClass::Data,
                 recovery_epoch: u64::MAX
             })
         ));

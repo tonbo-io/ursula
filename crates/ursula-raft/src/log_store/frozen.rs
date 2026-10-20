@@ -190,6 +190,10 @@ pub(crate) fn read(
     let RaftGroupLogRecord::Append(entries) = record.record else {
         return Err(defect(ArchiveDefect::Content));
     };
+    // The archive's generation is not compared: the content hash checked
+    // above covers the encoded record, generation included, and a reference
+    // is read only from a record of the group's current generation, so an
+    // archive of another generation never matches it.
     if record.group_id != group
         || entries.first().map(|entry| entry.log_id.index) != Some(reference.id.first_index)
         || entries.last().map(|entry| entry.log_id.index) != Some(reference.id.last_index)

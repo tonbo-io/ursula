@@ -119,13 +119,25 @@ pub enum JournalClass {
     Meta,
 }
 
+impl std::fmt::Display for JournalClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Data => "data",
+            Self::Meta => "meta",
+        })
+    }
+}
+
 /// What the run state records for one class of journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JournalRun {
     /// The fsync policy the class's journals run.
     pub fsync: WalFsync,
-    /// Runs that started after a host crash or an I/O failure of this
-    /// class's journals on this WAL root, including this one.
+    /// Runs on this WAL root that read this class's journals as a verified
+    /// prefix, including this one: after a host crash under this class's
+    /// policy of `never`, after a lost run state, or after an I/O failure.
+    /// The run status is node-wide, so an I/O failure of any journal
+    /// advances every class's epoch.
     pub recovery_epoch: u64,
 }
 
@@ -342,6 +354,7 @@ impl WalOpening {
                 prior_epoch
                     .checked_add(1)
                     .ok_or(RaftWalError::RecoveryEpochExhausted {
+                        class,
                         recovery_epoch: prior_epoch,
                     })?
             }
@@ -435,8 +448,11 @@ pub enum RaftWalError {
     ReadRunState(#[source] StateFileError),
     #[error("read core metadata while recovering epochs: {0}")]
     ReadCoreMetadata(#[source] StateFileError),
-    #[error("Raft WAL recovery epoch {recovery_epoch} cannot advance")]
-    RecoveryEpochExhausted { recovery_epoch: u64 },
+    #[error("Raft WAL recovery epoch {recovery_epoch} of the {class} journals cannot advance")]
+    RecoveryEpochExhausted {
+        class: JournalClass,
+        recovery_epoch: u64,
+    },
     #[error("list the core journals under '{}': {source}", .root.display())]
     ListCores {
         root: PathBuf,
@@ -1315,6 +1331,7 @@ mod tests {
                 assert!(matches!(
                     decide_data(None, journals, Some(&boot("b")), fsync),
                     Err(super::RaftWalError::RecoveryEpochExhausted {
+                        class: JournalClass::Data,
                         recovery_epoch: u64::MAX
                     })
                 ));
@@ -1325,6 +1342,25 @@ mod tests {
             assert!(matches!(
                 decide_data(Some(&prior), journals, Some(&boot("a")), fsync),
                 Err(super::RaftWalError::RecoveryEpochExhausted {
+                    class: JournalClass::Data,
+                    recovery_epoch: u64::MAX
+                })
+            ));
+            // The meta class's own epoch exhausts on its own decision, which
+            // names it.
+            let mut meta_prior = previous(Some("a"), fsync, RunStatus::Poisoned);
+            meta_prior.meta.recovery_epoch = u64::MAX;
+            let meta = WalOpening::decide(
+                Some(&meta_prior),
+                JournalClass::Meta,
+                JournalHistory::Empty { verified_epoch: 0 },
+                Some(&boot("a")),
+                WalFsync::Always,
+            );
+            assert!(matches!(
+                meta,
+                Err(super::RaftWalError::RecoveryEpochExhausted {
+                    class: JournalClass::Meta,
                     recovery_epoch: u64::MAX
                 })
             ));

@@ -1227,6 +1227,7 @@ impl GroupRejoin {
             }
             // Unreachable while nothing retires a log: a retired log holds
             // no vote and no entries, and never takes a first election.
+            // S2's `NotHeld` (#768) removes this arm.
             (None, GroupLogState::Retired) => {
                 tracing::warn!(
                     node_id,

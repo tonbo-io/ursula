@@ -476,7 +476,9 @@ impl RaftGroupFileLogStore {
     pub(crate) async fn record_recovered(&self) -> Result<(), CoreJournalError> {
         let _order = self.write_order.lock().await;
         match self.store_log() {
-            // A gate does not reopen a retired log.
+            // A gate does not reopen a retired log. The `Retired` arm is
+            // unreachable until replica teardown records it, and S2's
+            // `NotHeld` (#768) removes it.
             StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) | StoreLog::Retired => {
                 Ok(())
             }
@@ -526,6 +528,8 @@ impl RaftGroupFileLogStore {
             StoreLog::Empty(EmptyHistory::Unknown) => {
                 self.set_store_log(StoreLog::Empty(EmptyHistory::New));
             }
+            // `Retired` is unreachable until replica teardown records it,
+            // and S2's `NotHeld` (#768) removes this arm.
             StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) | StoreLog::Retired => {}
         }
         Ok(())
