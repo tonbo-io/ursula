@@ -4,16 +4,23 @@
 //! any leadership, uniform or joint configs, live, caught-up, gated and
 //! listed sets, confirmed or not, against any target. R6 and R10 run it
 //! over the abstract group of [`super::model`], whose adversary moves
-//! leadership onto any voter, drops second steps, revokes the
-//! confirmation, holds catch-up and gates back, unlists targets and kills
-//! nodes, before the environment turns fair.
+//! leadership onto any live voter, drops second steps, revokes the
+//! confirmation, holds catch-up and gates back, unlists targets, crashes
+//! members, strands the leader without a quorum and restarts nodes. R6
+//! restarts every node before the environment turns fair. R10 cancels
+//! from every state the faulty run passes through. Both count the paths
+//! that only a fault reaches, and fail when a path is never reached.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use proptest::prelude::ProptestConfig;
 use proptest::prelude::Strategy;
 use proptest::test_runner::RngSeed;
+use proptest::test_runner::TestCaseError;
+use proptest::test_runner::TestCaseResult;
+use proptest::test_runner::TestRunner;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
@@ -34,9 +41,11 @@ use super::TargetStage;
 use super::ViewFreshness;
 use super::model::Ended;
 use super::model::Group;
+use super::model::Planned;
+use super::model::act;
+use super::model::environment;
 use super::model::node;
 use super::model::quorum_live;
-use super::model::round;
 use super::model::run;
 use super::plan_membership_step;
 
@@ -470,7 +479,8 @@ fn check_group(group: &Group, size: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// One adversary action before the environment turns fair.
+/// One adversary action, taken between the environment's half of a round
+/// and the leader's.
 #[derive(Debug, Clone, Copy)]
 enum Fault {
     /// An election wins for any live voter of the effective membership.
@@ -481,15 +491,26 @@ enum Fault {
     HoldBack,
     /// A target's address drops out of the leader's book.
     Unlist(u8),
+    /// A live member of the effective membership crashes, the leader
+    /// included.
+    Kill(u8),
+    /// Every other member crashes or is cut off, and the leader keeps
+    /// leading without a quorum.
+    Strand,
+    /// A crashed node restarts.
+    Revive(u8),
 }
 
 fn fault() -> impl Strategy<Value = Fault> {
-    (0_u8..5, proptest::num::u8::ANY).prop_map(|(kind, x)| match kind {
+    (0_u8..8, proptest::num::u8::ANY).prop_map(|(kind, x)| match kind {
         0 => Fault::MoveLeader(x),
         1 => Fault::DropSecondStep,
         2 => Fault::RevokeConfirmation,
         3 => Fault::HoldBack,
-        _ => Fault::Unlist(x),
+        4 => Fault::Unlist(x),
+        5 => Fault::Kill(x),
+        6 => Fault::Strand,
+        _ => Fault::Revive(x),
     })
 }
 
@@ -498,19 +519,188 @@ fn pick(set: &BTreeSet<NodeId>, x: u8) -> Option<NodeId> {
     set.iter().nth(slot).copied()
 }
 
-/// Rounds beyond the voters still to replace that a fair run may take: a
-/// joint exit with its handoff, two more handoffs with their confirmations,
-/// the learners in two steps, a learner removal and the report.
-const FAIR_ROUNDS: usize = 12;
+/// One round toward `target` with `fault` between its halves, the nodes
+/// of `universe` able to crash and restart.
+fn fault_round(
+    group: &mut Group,
+    fault: Fault,
+    target: &MembershipTarget,
+    universe: &BTreeSet<NodeId>,
+) -> Option<Planned> {
+    environment(group, !matches!(fault, Fault::HoldBack));
+    match fault {
+        Fault::MoveLeader(x) => {
+            let candidates: BTreeSet<NodeId> = group
+                .effective()
+                .voters()
+                .intersection(&group.alive)
+                .copied()
+                .collect();
+            if let Some(next) = pick(&candidates, x) {
+                group.elect_as(next);
+            }
+        }
+        Fault::DropSecondStep => group.drop_second_step = true,
+        Fault::RevokeConfirmation => group.confirmed = false,
+        Fault::HoldBack => {}
+        Fault::Unlist(x) => {
+            if let Some(unlisted) = pick(&target.voters.to_set(), x) {
+                group.unlisted.insert(unlisted);
+            }
+        }
+        Fault::Kill(x) => {
+            let live: BTreeSet<NodeId> = group
+                .effective()
+                .members()
+                .intersection(&group.alive)
+                .copied()
+                .collect();
+            if let Some(dead) = pick(&live, x) {
+                group.kill(dead);
+            }
+        }
+        Fault::Strand => {
+            if let Some(leader) = group.leader {
+                for member in group.effective().members() {
+                    if member != leader {
+                        group.kill(member);
+                    }
+                }
+            }
+        }
+        Fault::Revive(x) => {
+            let dead: BTreeSet<NodeId> = universe.difference(&group.alive).copied().collect();
+            if let Some(back) = pick(&dead, x) {
+                group.revive(back);
+            }
+        }
+    }
+    act(group, target)
+}
 
-proptest::proptest! {
-    #![proptest_config(ProptestConfig {
+/// How often a property's runs reached the paths that only a fault
+/// reaches.
+#[derive(Debug, Default)]
+struct Coverage {
+    /// A leader waited on an uncommitted membership.
+    uncommitted: Cell<usize>,
+    /// A leader of a joint config with no live majority on either side
+    /// waited.
+    no_live_quorum: Cell<usize>,
+    /// A voter change from a uniform config dropped a crashed voter while
+    /// a smaller live one was also to go.
+    dead_first: Cell<usize>,
+    /// A new leader committed a pending entry on its election.
+    election_commits: Cell<usize>,
+    /// A cancel started from a committed joint config.
+    cancel_from_joint: Cell<usize>,
+    /// A cancel started from a pending entry.
+    cancel_from_pending: Cell<usize>,
+}
+
+fn bump(counter: &Cell<usize>, by: usize) {
+    counter.set(counter.get().saturating_add(by));
+}
+
+impl Coverage {
+    /// Tallies one planner call toward `target`.
+    fn observe(&self, planned: &Planned, target: &MembershipTarget) {
+        match &planned.step {
+            MembershipStep::Wait(WaitReason::MembershipUncommitted) => bump(&self.uncommitted, 1),
+            MembershipStep::Wait(WaitReason::NoLiveQuorum) => bump(&self.no_live_quorum, 1),
+            MembershipStep::ChangeVoters { voters, .. }
+                if drops_dead_first(planned, voters, target) =>
+            {
+                bump(&self.dead_first, 1);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether `voters`, planned from a uniform config, drops a crashed voter
+/// while a smaller live voter other than the leader is also to go.
+fn drops_dead_first(planned: &Planned, voters: &VoterSet, target: &MembershipTarget) -> bool {
+    let Leadership::Leading(leader) = &planned.view.leadership else {
+        return false;
+    };
+    let EffectiveMembership::Committed {
+        config: MembershipConfig::Uniform {
+            voters: current, ..
+        },
+        ..
+    } = &leader.membership
+    else {
+        return false;
+    };
+    let me = planned.view.me;
+    current.iter().any(|dropped| {
+        !voters.contains(dropped)
+            && !leader.live.contains(&dropped)
+            && current.iter().any(|other| {
+                other != me
+                    && other.get() < dropped.get()
+                    && !target.voters.contains(other)
+                    && leader.live.contains(&other)
+            })
+    })
+}
+
+/// The fixed-seed config of every property here.
+fn config() -> ProptestConfig {
+    ProptestConfig {
         cases: 256,
         rng_seed: RngSeed::Fixed(768),
         // The seed is fixed, so a failure reproduces without a regression file.
         failure_persistence: None,
         ..ProptestConfig::default()
-    })]
+    }
+}
+
+/// Rounds beyond the voters still to replace that a fair run may take: a
+/// joint exit with its handoff, two more handoffs with their confirmations,
+/// the learners in two steps, a learner removal and the report.
+const FAIR_ROUNDS: usize = 12;
+
+/// The voters a fair run from `group` still has to replace toward `to`.
+fn round_limit(group: &Group, to: &VoterSet) -> usize {
+    let remaining = group
+        .effective()
+        .voters()
+        .into_iter()
+        .filter(|voter| !to.contains(*voter))
+        .count();
+    remaining.checked_add(FAIR_ROUNDS).unwrap()
+}
+
+/// Two voter sets of one size in `1..=size_max`, over the ids
+/// `1..=id_max`.
+fn moving_pair(
+    size_max: usize,
+    id_max: u64,
+) -> impl Strategy<Value = (BTreeSet<u64>, BTreeSet<u64>)> {
+    (1_usize..=size_max).prop_flat_map(move |size| {
+        (
+            proptest::collection::btree_set(1_u64..=id_max, size),
+            proptest::collection::btree_set(1_u64..=id_max, size),
+        )
+    })
+}
+
+fn voter_set_of(ids: BTreeSet<u64>) -> VoterSet {
+    VoterSet::new(ids.into_iter().map(node).collect()).unwrap()
+}
+
+fn moving_target(voters: &VoterSet) -> MembershipTarget {
+    MembershipTarget {
+        voters: voters.clone(),
+        learners: BTreeSet::new(),
+        stage: TargetStage::Moving { since: since() },
+    }
+}
+
+proptest::proptest! {
+    #![proptest_config(config())]
 
     /// R1 to R5, R7 to R9, R11 and R12 on one call.
     #[test]
@@ -523,117 +713,146 @@ proptest::proptest! {
             }
         }
     }
+}
 
-    /// R6: from every moving start of 1 to 5 voters, after any faults, a
-    /// fair run converges within the voters still to replace plus
-    /// `FAIR_ROUNDS`, keeping C7 and R1 throughout.
-    #[test]
-    fn every_moving_start_converges_within_the_bound(
-        (from, to) in (1_usize..=5).prop_flat_map(|size| (
-            proptest::collection::btree_set(1_u64..=10, size),
-            proptest::collection::btree_set(1_u64..=10, size),
-        )),
-        leader in proptest::num::u8::ANY,
-        faults in proptest::collection::vec(fault(), 0..10),
-    ) {
-        proptest::prop_assume!(from != to);
-        let from = VoterSet::new(from.into_iter().map(node).collect()).unwrap();
-        let to = VoterSet::new(to.into_iter().map(node).collect()).unwrap();
-        let size = to.len();
-        let alive: BTreeSet<NodeId> = (1..=10).map(node).collect();
-        let first = pick(&from.to_set(), leader).unwrap();
-        let mut group = Group::new(&from, first, alive);
-        let target = MembershipTarget {
-            voters: to.clone(),
-            learners: BTreeSet::new(),
-            stage: TargetStage::Moving { since: since() },
-        };
-        for fault in faults {
-            let fair = match fault {
-                Fault::MoveLeader(x) => {
-                    let candidates: BTreeSet<NodeId> = group.effective().voters();
-                    if let Some(next) = pick(&candidates, x) {
-                        group.elect_as(next);
-                    }
-                    true
+/// R6: from every moving start of 1 to 5 voters, after any faults, every
+/// crashed node restarted, a fair run converges within the voters still to
+/// replace plus `FAIR_ROUNDS`, keeping C7 and R1 throughout.
+#[test]
+fn every_moving_start_converges_within_the_bound() {
+    let coverage = Coverage::default();
+    let strategy = (
+        moving_pair(5, 10),
+        proptest::num::u8::ANY,
+        proptest::collection::vec(fault(), 0..16),
+    );
+    let result = TestRunner::new(config()).run(
+        &strategy,
+        |((from, to), leader, faults)| -> TestCaseResult {
+            proptest::prop_assume!(from != to);
+            let from = voter_set_of(from);
+            let to = voter_set_of(to);
+            let size = to.len();
+            let universe: BTreeSet<NodeId> = (1..=10).map(node).collect();
+            let first = pick(&from.to_set(), leader).unwrap();
+            let mut group = Group::new(&from, first, universe.clone());
+            let target = moving_target(&to);
+            for fault in faults {
+                if let Some(planned) = fault_round(&mut group, fault, &target, &universe) {
+                    coverage.observe(&planned, &target);
                 }
-                Fault::DropSecondStep => {
-                    group.drop_second_step = true;
-                    true
-                }
-                Fault::RevokeConfirmation => {
-                    group.confirmed = false;
-                    true
-                }
-                Fault::HoldBack => false,
-                Fault::Unlist(x) => {
-                    if let Some(unlisted) = pick(&to.to_set(), x) {
-                        group.unlisted.insert(unlisted);
-                    }
-                    false
-                }
-            };
-            round(&mut group, &target, fair);
-            if let Err(violation) = check_group(&group, size) {
-                proptest::prop_assert!(false, "{violation}");
+                check_group(&group, size).map_err(TestCaseError::fail)?;
             }
-        }
-        group.drop_second_step = false;
-        let remaining = group.effective().voters().into_iter().filter(|voter| !to.contains(*voter)).count();
-        let limit = remaining.checked_add(FAIR_ROUNDS).unwrap();
-        let ended = run(&mut group, &target, limit, |group, _step| check_group(group, size));
-        match ended {
-            Ok(Ended::Converged) => {}
-            Ok(Ended::Stuck) => proptest::prop_assert!(false, "R6: stuck after {limit} fair rounds: {group:?}"),
-            Err(violation) => proptest::prop_assert!(false, "{violation}"),
-        }
+            let dead: BTreeSet<NodeId> = universe.difference(&group.alive).copied().collect();
+            for node in dead {
+                group.revive(node);
+            }
+            group.drop_second_step = false;
+            let limit = round_limit(&group, &to);
+            let ended = run(&mut group, &target, limit, |group, planned| {
+                if let Some(planned) = planned {
+                    coverage.observe(planned, &target);
+                }
+                check_group(group, size)
+            });
+            bump(&coverage.election_commits, group.election_commits);
+            match ended {
+                Ok(Ended::Converged) => Ok(()),
+                Ok(Ended::Stuck) => Err(TestCaseError::fail(format!(
+                    "R6: stuck after {limit} fair rounds: {group:?}"
+                ))),
+                Err(violation) => Err(TestCaseError::fail(violation)),
+            }
+        },
+    );
+    if let Err(failure) = result {
+        panic!("{failure}");
     }
+    assert!(coverage.uncommitted.get() > 0, "{coverage:?}");
+    assert!(coverage.no_live_quorum.get() > 0, "{coverage:?}");
+    assert!(coverage.dead_first.get() > 0, "{coverage:?}");
+    assert!(coverage.election_commits.get() > 0, "{coverage:?}");
+}
 
-    /// R10: with every target dead and a live majority of every config of
-    /// the effective membership, the uncommitted entry included, a cancel
-    /// reaches the move's source.
-    #[test]
-    fn a_cancel_with_every_target_dead_returns_to_the_source(
-        (from, to) in (1_usize..=3).prop_flat_map(|size| (
-            proptest::collection::btree_set(1_u64..=8, size),
-            proptest::collection::btree_set(1_u64..=8, size),
-        )),
-        leader in proptest::num::u8::ANY,
-        progress in 0_usize..12,
-    ) {
-        proptest::prop_assume!(from != to);
-        let from = VoterSet::new(from.into_iter().map(node).collect()).unwrap();
-        let to = VoterSet::new(to.into_iter().map(node).collect()).unwrap();
-        let alive: BTreeSet<NodeId> = (1..=8).map(node).collect();
-        let first = pick(&from.to_set(), leader).unwrap();
-        let mut group = Group::new(&from, first, alive);
-        let toward = MembershipTarget {
-            voters: to.clone(),
-            learners: BTreeSet::new(),
-            stage: TargetStage::Moving { since: since() },
-        };
-        for _ in 0..progress {
-            round(&mut group, &toward, true);
-        }
-        let reached = matches!(&group.committed, MembershipConfig::Uniform { voters, .. } if *voters == to);
-        proptest::prop_assume!(!reached);
-        for dead in to.iter().filter(|node| !from.contains(*node)) {
-            group.alive.remove(&dead);
-        }
-        proptest::prop_assume!(quorum_live(group.effective(), &group.alive));
-        let cancel = MembershipTarget {
-            voters: from.clone(),
-            learners: BTreeSet::new(),
-            stage: TargetStage::Moving { since: since() },
-        };
-        let size = from.len();
-        let remaining = group.effective().voters().into_iter().filter(|voter| !from.contains(*voter)).count();
-        let limit = remaining.checked_add(FAIR_ROUNDS).unwrap();
-        let ended = run(&mut group, &cancel, limit, |group, _step| check_group(group, size));
-        match ended {
-            Ok(Ended::Converged) => {}
-            Ok(Ended::Stuck) => proptest::prop_assert!(false, "R10: stuck after {limit} rounds: {group:?}"),
-            Err(violation) => proptest::prop_assert!(false, "{violation}"),
-        }
+/// R10: a move runs under faults, and from every state it passes through,
+/// every target crashed and every other node restarted, a cancel with a
+/// live majority of every config of the effective membership, a pending
+/// entry's included, reaches the move's source. Cancels start from
+/// uniform and committed joint configs and from pending entries.
+#[test]
+fn a_cancel_with_every_target_dead_returns_to_the_source() {
+    let coverage = Coverage::default();
+    let strategy = (
+        moving_pair(3, 8),
+        proptest::num::u8::ANY,
+        proptest::collection::vec(fault(), 0..16),
+    );
+    let result = TestRunner::new(config()).run(
+        &strategy,
+        |((from, to), leader, faults)| -> TestCaseResult {
+            proptest::prop_assume!(from != to);
+            let from = voter_set_of(from);
+            let to = voter_set_of(to);
+            let size = from.len();
+            let universe: BTreeSet<NodeId> = (1..=8).map(node).collect();
+            let targets: BTreeSet<NodeId> = to.iter().filter(|node| !from.contains(*node)).collect();
+            let first = pick(&from.to_set(), leader).unwrap();
+            let mut group = Group::new(&from, first, universe.clone());
+            let toward = moving_target(&to);
+            let cancel = moving_target(&from);
+            let mut starts = vec![group.clone()];
+            for fault in faults {
+                if let Some(planned) = fault_round(&mut group, fault, &toward, &universe) {
+                    coverage.observe(&planned, &toward);
+                }
+                check_group(&group, size).map_err(TestCaseError::fail)?;
+                starts.push(group.clone());
+            }
+            for mut start in starts {
+                let reached = matches!(&start.committed, MembershipConfig::Uniform { voters, .. } if *voters == to);
+                if reached {
+                    continue;
+                }
+                for node in &universe {
+                    if targets.contains(node) {
+                        start.kill(*node);
+                    } else if !start.alive.contains(node) {
+                        start.revive(*node);
+                    }
+                }
+                if !quorum_live(start.effective(), &start.alive) {
+                    continue;
+                }
+                start.drop_second_step = false;
+                if matches!(start.committed, MembershipConfig::Joint { .. }) {
+                    bump(&coverage.cancel_from_joint, 1);
+                }
+                if start.pending.is_some() {
+                    bump(&coverage.cancel_from_pending, 1);
+                }
+                let limit = round_limit(&start, &from);
+                let ended = run(&mut start, &cancel, limit, |group, planned| {
+                    if let Some(planned) = planned {
+                        coverage.observe(planned, &cancel);
+                    }
+                    check_group(group, size)
+                });
+                match ended {
+                    Ok(Ended::Converged) => {}
+                    Ok(Ended::Stuck) => {
+                        return Err(TestCaseError::fail(format!(
+                            "R10: stuck after {limit} rounds: {start:?}"
+                        )));
+                    }
+                    Err(violation) => return Err(TestCaseError::fail(violation)),
+                }
+            }
+            Ok(())
+        },
+    );
+    if let Err(failure) = result {
+        panic!("{failure}");
     }
+    assert!(coverage.cancel_from_joint.get() > 0, "{coverage:?}");
+    assert!(coverage.cancel_from_pending.get() > 0, "{coverage:?}");
 }

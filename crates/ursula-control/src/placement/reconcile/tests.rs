@@ -114,8 +114,8 @@ fn walk(from: &[u64], leader: u64, to: &[u64]) -> (Vec<StepKind>, Vec<VoterSet>)
     let mut group = Group::new(&voters(from), node(leader), alive);
     let target = moving(to);
     let mut kinds = Vec::new();
-    let ended = run(&mut group, &target, 20, |_group, step| {
-        if let Some(kind) = step.and_then(MembershipStep::kind) {
+    let ended = run(&mut group, &target, 20, |_group, planned| {
+        if let Some(kind) = planned.and_then(|planned| planned.step.kind()) {
             kinds.push(kind);
         }
         Ok(())

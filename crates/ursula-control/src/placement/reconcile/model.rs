@@ -5,14 +5,17 @@
 //! - A voter change from a uniform config appends a joint entry and, from
 //!   the same call, the uniform one (unless the test drops the second
 //!   step). `retain = false` drops old voters from the membership.
-//! - An entry takes effect when appended and commits when its leader is
-//!   live and every config of it has a live majority.
+//! - An entry takes effect when appended. It commits when appended, or
+//!   later in a fair round or on an election, once its leader is live and
+//!   every config of it has a live majority. Until then it stays pending.
 //! - A leader that is no voter of the committed uniform config steps down,
 //!   and an election picks the smallest live voter of the effective
 //!   membership when every config of it has a live majority, committing a
-//!   pending entry it can.
+//!   pending entry it can. A live leader keeps leading after its quorum
+//!   dies, as OpenRaft's does.
 //! - Every append leaves the other members behind until the environment
-//!   catches them up. A new learner starts unmatched.
+//!   catches them up. A new learner starts unmatched, and so does a node
+//!   that restarts, with its gate closed.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -90,6 +93,15 @@ pub(super) struct Group {
     pub(super) committed_configs: Vec<MembershipConfig>,
     /// Every voter change the planner proposed, with its proposer.
     pub(super) proposals: Vec<(NodeId, VoterSet)>,
+    /// How many pending entries a new leader committed on its election.
+    pub(super) election_commits: usize,
+}
+
+/// One planner call of a round: the view it planned from and its step.
+#[derive(Debug, Clone)]
+pub(super) struct Planned {
+    pub(super) view: MembershipView,
+    pub(super) step: MembershipStep,
 }
 
 impl Group {
@@ -120,6 +132,7 @@ impl Group {
             confirmed: false,
             drop_second_step: false,
             proposals: Vec::new(),
+            election_commits: 0,
         }
     }
 
@@ -199,14 +212,35 @@ impl Group {
         if let Some((config, id)) = self.pending.clone()
             && quorum_live(&config, &self.alive)
         {
+            self.election_commits = self.election_commits.checked_add(1).unwrap();
             self.commit(config, id);
         }
     }
 
-    /// The fair environment: an election when needed, and every live
-    /// member caught up, gated open and listed.
+    /// `node` crashes. A leader stays leader until an election replaces it.
+    pub(super) fn kill(&mut self, node: NodeId) {
+        self.alive.remove(&node);
+    }
+
+    /// `node` restarts unmatched, with its gate closed.
+    pub(super) fn revive(&mut self, node: NodeId) {
+        self.alive.insert(node);
+        self.caught_up.remove(&node);
+        self.gates_open.remove(&node);
+    }
+
+    /// The fair environment: an election when needed, a pending entry
+    /// committed once its leader has a live majority of every config of it,
+    /// and every live member caught up, gated open and listed.
     pub(super) fn settle(&mut self) {
         self.elect();
+        if self.leader_live()
+            && let Some((config, id)) = self.pending.clone()
+            && quorum_live(&config, &self.alive)
+        {
+            self.commit(config, id);
+            self.elect();
+        }
         let members = self.effective().members();
         self.caught_up = members
             .iter()
@@ -395,22 +429,30 @@ pub(super) enum Ended {
     Stuck,
 }
 
-/// One round: the environment acts, then the leader plans and executes.
-/// Returns the step planned, `None` without a live leader.
-pub(super) fn round(
-    group: &mut Group,
-    target: &MembershipTarget,
-    fair: bool,
-) -> Option<MembershipStep> {
+/// The environment's half of a round: [`Group::settle`] when `fair`, else
+/// only an election.
+pub(super) fn environment(group: &mut Group, fair: bool) {
     if fair {
         group.settle();
     } else {
         group.elect();
     }
+}
+
+/// The leader's half of a round: it plans and executes. `None` without a
+/// leader. A leader that crashed plans from a `NotLeading` view.
+pub(super) fn act(group: &mut Group, target: &MembershipTarget) -> Option<Planned> {
     let leader = group.leader?;
-    let step = plan_membership_step(&group.view(leader), target);
+    let view = group.view(leader);
+    let step = plan_membership_step(&view, target);
     group.execute(&step);
-    Some(step)
+    Some(Planned { view, step })
+}
+
+/// One round: the environment acts, then the leader plans and executes.
+pub(super) fn round(group: &mut Group, target: &MembershipTarget, fair: bool) -> Option<Planned> {
+    environment(group, fair);
+    act(group, target)
 }
 
 /// Runs fair rounds until the leader reports the target's voters, at most
@@ -419,12 +461,15 @@ pub(super) fn run(
     group: &mut Group,
     target: &MembershipTarget,
     limit: usize,
-    mut check: impl FnMut(&Group, Option<&MembershipStep>) -> Result<(), String>,
+    mut check: impl FnMut(&Group, Option<&Planned>) -> Result<(), String>,
 ) -> Result<Ended, String> {
     for _ in 0..limit {
-        let step = round(group, target, true);
-        check(group, step.as_ref())?;
-        if let Some(MembershipStep::Converged { voters }) = &step
+        let planned = round(group, target, true);
+        check(group, planned.as_ref())?;
+        if let Some(Planned {
+            step: MembershipStep::Converged { voters },
+            ..
+        }) = &planned
             && voters == &target.voters
             && group.committed.learners().is_subset(&target.learners)
         {
