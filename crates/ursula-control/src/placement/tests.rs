@@ -647,6 +647,73 @@ fn a_registration_answers_whether_the_node_has_a_role() {
 }
 
 #[test]
+fn uncordon_returns_a_cordoned_or_decommissioning_node_to_active() {
+    let mut driver = Driver::live(&[1, 2, 3, 4, 5], 1, 3);
+    driver.lifecycle(5, LifecycleChange::Cordon).unwrap();
+    assert_eq!(
+        driver.lifecycle(5, LifecycleChange::Uncordon),
+        Ok(ControlApplied::LifecycleChanged {
+            lifecycle: NodeLifecycle::Active
+        })
+    );
+    assert_eq!(
+        driver.cluster().node(node(5)).unwrap().lifecycle,
+        NodeLifecycle::Active
+    );
+    // Node 4 is incoming, so it stays decommissioning until uncordoned.
+    driver.request_move(G0, &[1, 2, 4]).unwrap();
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    assert_eq!(
+        driver.lifecycle(4, LifecycleChange::Uncordon),
+        Ok(ControlApplied::LifecycleChanged {
+            lifecycle: NodeLifecycle::Active
+        })
+    );
+    assert_eq!(
+        driver.cluster().node(node(4)).unwrap().lifecycle,
+        NodeLifecycle::Active
+    );
+    // The aborted decommission removes nothing when the node's role ends.
+    driver.request_move(G0, &[1, 2, 3]).unwrap();
+    let converged = driver.report(G0, &[1, 2, 3]).unwrap();
+    assert!(matches!(
+        &converged,
+        ControlApplied::Converged { retired, removed, .. } if *retired == ids(&[4]) && removed.is_empty()
+    ));
+    assert_eq!(
+        driver.cluster().node(node(4)).unwrap().lifecycle,
+        NodeLifecycle::Active
+    );
+}
+
+#[test]
+fn a_known_node_registering_again_keeps_its_cordon_or_decommission() {
+    let mut driver = Driver::live(&[1, 2, 3, 4, 5], 1, 3);
+    driver.request_move(G0, &[1, 2, 4]).unwrap();
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    driver.lifecycle(5, LifecycleChange::Cordon).unwrap();
+    let before = driver.state.clone();
+    // Nodes register at every start, which must not undo either change.
+    assert!(matches!(
+        driver.apply(ControlCommand::RegisterNode {
+            node: node(4),
+            now_ms: 50,
+        }),
+        Ok(ControlApplied::NodeRegistered(Registered::Referenced(record)))
+            if record.lifecycle == NodeLifecycle::Decommissioning
+    ));
+    assert!(matches!(
+        driver.apply(ControlCommand::RegisterNode {
+            node: node(5),
+            now_ms: 50,
+        }),
+        Ok(ControlApplied::NodeRegistered(Registered::Unreferenced(record)))
+            if record.lifecycle == NodeLifecycle::Cordoned
+    ));
+    assert_eq!(driver.state, before);
+}
+
+#[test]
 fn a_history_event_drops_every_retirement_and_moves_every_key() {
     let mut driver = Driver::live(&[1, 2, 3, 4], 2, 3);
     driver.request_move(G0, &[1, 2, 4]).unwrap();

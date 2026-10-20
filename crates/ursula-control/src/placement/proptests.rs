@@ -3,7 +3,10 @@
 //! checked after every step against K1 to K16 of the design (issue #768):
 //! refusals change nothing, placement keys move exactly on accepted moves,
 //! converges and history events and never backwards, retirements never sit
-//! beside a role, removal is terminal, and the rest.
+//! beside a role, removal is terminal, and the rest. An accepted command
+//! must also leave exactly the state the effect column of the command table
+//! (2.3) describes, built here from that table rather than from the
+//! dispatcher, and answer what that state says.
 
 use std::collections::BTreeSet;
 
@@ -12,7 +15,9 @@ use proptest::test_runner::RngSeed;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
+use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
+use ursula_proto::placement::Registered;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -26,7 +31,9 @@ use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
 use super::MaintenanceAuthority;
+use super::Move;
 use super::MoveLimit;
+use super::Retirement;
 use super::Target;
 use super::group_ids;
 use super::initializer;
@@ -447,7 +454,7 @@ fn check_transition(
             })
         }
         (Step::Command(command), Outcome::Command(Ok(applied))) => {
-            check_accepted(before, after, since, command, applied)
+            check_accepted(before, after, at, command, applied)
         }
         (Step::Command(_), Outcome::History(_)) | (Step::History(_), Outcome::Command(_)) => {
             Err("a step answered as another kind".to_owned())
@@ -459,15 +466,24 @@ fn check_transition(
 fn check_accepted(
     before: &ControlPlaneState,
     after: &ControlPlaneState,
-    since: PlacementEpoch,
+    at: MetaLogId,
     command: &ControlCommand,
     applied: &ControlApplied,
 ) -> Result<(), String> {
+    let since = PlacementEpoch::new(at);
     let (ControlPlaneState::Bootstrapped(old), ControlPlaneState::Bootstrapped(new)) =
         (before, after)
     else {
         return check_forming(before, after, since, command, applied);
     };
+    // The effect column of 2.3: every placement, node, retirement and
+    // parameter, so a command that changes too little fails as one that
+    // changes too much. K8 and K14 are part of it.
+    let expected = expected_cluster(old, at, command)?;
+    ensure(expected == *new, || {
+        format!("2.3: {command:?} left {new:?}, the table says {expected:?}")
+    })?;
+    check_answer(old, new, at, command, applied)?;
     // K13: the reservation refuses moves and decommissions.
     if old.params().maintenance == MaintenanceAuthority::Reservation {
         ensure(
@@ -514,7 +530,7 @@ fn check_accepted(
         if !named && placement != previous {
             return Err(format!("{group:?} changed on {command:?}"));
         }
-        check_group_transition(old, group, previous, placement, command, applied)?;
+        check_group_transition(old, group, previous, placement, command)?;
         // K4: every move can be cancelled.
         if let Some(moving) = placement.moving()
             && moving.from != moving.to
@@ -567,43 +583,16 @@ fn check_accepted(
             )?;
         }
     }
-    // K14: a teardown report removes only its matching record.
-    if let ControlCommand::ReportTornDown {
-        group,
-        node,
-        created_at,
-    } = command
-    {
-        let mut expected = old.clone();
-        if *applied == ControlApplied::TornDown {
-            ensure(
-                old.retirement(*group, *node)
-                    .map(|record| record.created_at)
-                    == Some(*created_at),
-                || "K14: a report removed another record".to_owned(),
-            )?;
-            if let Some(records) = expected.retirements.get_mut(group) {
-                records.remove(node);
-                if records.is_empty() {
-                    expected.retirements.remove(group);
-                }
-            }
-        }
-        ensure(expected == *new, || {
-            "K14: a teardown report changed more".to_owned()
-        })?;
-    }
     Ok(())
 }
 
-/// K3 and K8 for one group.
+/// K3 for one group.
 fn check_group_transition(
     old: &Cluster,
     group: RaftGroupId,
     previous: &GroupPlacement,
     placement: &GroupPlacement,
     command: &ControlCommand,
-    applied: &ControlApplied,
 ) -> Result<(), String> {
     let stable = matches!(placement, GroupPlacement::Live {
         target: Target::Stable { .. },
@@ -623,22 +612,6 @@ fn check_group_transition(
             );
             ensure(reported, || {
                 format!("K3: {group:?} stopped moving on {command:?}")
-            })?;
-            // K8: the converge retires exactly what left, minus what it removed.
-            let ControlApplied::Converged {
-                retired, removed, ..
-            } = applied
-            else {
-                return Err(format!("K8: {group:?} converged answering {applied:?}"));
-            };
-            let left: BTreeSet<NodeId> = moving
-                .from
-                .iter()
-                .chain(moving.abandoned.iter().copied())
-                .filter(|id| !moving.to.contains(*id) && !removed.contains(id))
-                .collect();
-            ensure(*retired == left, || {
-                format!("K8: {group:?} retired {retired:?}, expected {left:?}")
             })
         }
         GroupPlacement::Seeded { since: key, .. }
@@ -669,6 +642,261 @@ fn check_group_transition(
         }
         GroupPlacement::Seeded { .. } | GroupPlacement::Live { .. } => Ok(()),
     }
+}
+
+/// The cluster an accepted `command` applied at `at` leaves, by the effect
+/// column of the command table (2.3).
+fn expected_cluster(
+    old: &Cluster,
+    at: MetaLogId,
+    command: &ControlCommand,
+) -> Result<Cluster, String> {
+    let since = PlacementEpoch::new(at);
+    let mut expected = old.clone();
+    match command {
+        ControlCommand::RegisterNode { node, now_ms } => {
+            // A new id joins `Active`. A known id changes nothing, whatever
+            // its lifecycle.
+            expected.nodes.entry(*node).or_insert(NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: *now_ms,
+            });
+        }
+        ControlCommand::Bootstrap { .. } => {
+            return Err(format!("K11: a bootstrapped cluster accepted {command:?}"));
+        }
+        ControlCommand::RequestMove {
+            group, to, now_ms, ..
+        } => {
+            let Some(GroupPlacement::Live {
+                converged_at,
+                target,
+                ..
+            }) = old.group(*group)
+            else {
+                return Err(format!("{group:?} accepted a move while not live"));
+            };
+            let moving = match target {
+                Target::Stable { voters } => Move {
+                    from: voters.clone(),
+                    to: to.clone(),
+                    abandoned: BTreeSet::new(),
+                    since_ms: *now_ms,
+                },
+                // `abandoned := (abandoned ∪ old to) \ (from ∪ to)`.
+                Target::Moving(moving) => Move {
+                    from: moving.from.clone(),
+                    to: to.clone(),
+                    abandoned: moving
+                        .abandoned
+                        .iter()
+                        .copied()
+                        .chain(moving.to.iter())
+                        .filter(|id| !moving.from.contains(*id) && !to.contains(*id))
+                        .collect(),
+                    since_ms: moving.since_ms,
+                },
+            };
+            expected.groups.0.insert(*group, GroupPlacement::Live {
+                since,
+                converged_at: *converged_at,
+                target: Target::Moving(moving),
+            });
+        }
+        ControlCommand::ReportConverged {
+            group,
+            voters,
+            membership,
+            ..
+        } => {
+            // A seed node outside `voters` gets no record. K8: a move
+            // retires `(from ∪ abandoned) \ to`.
+            let retired: BTreeSet<NodeId> = match old.group(*group) {
+                Some(GroupPlacement::Seeded { .. }) => BTreeSet::new(),
+                Some(GroupPlacement::Live {
+                    target: Target::Moving(moving),
+                    ..
+                }) => moving
+                    .from
+                    .iter()
+                    .chain(moving.abandoned.iter().copied())
+                    .filter(|id| !moving.to.contains(*id))
+                    .collect(),
+                other => return Err(format!("{group:?} accepted a report from {other:?}")),
+            };
+            expected.groups.0.insert(*group, GroupPlacement::Live {
+                since,
+                converged_at: *membership,
+                target: Target::Stable {
+                    voters: voters.clone(),
+                },
+            });
+            for id in retired {
+                expected
+                    .retirements
+                    .entry(*group)
+                    .or_default()
+                    .insert(id, Retirement { created_at: at });
+            }
+            let roleless: Vec<NodeId> = expected
+                .nodes
+                .iter()
+                .filter(|(id, record)| {
+                    record.lifecycle == NodeLifecycle::Decommissioning
+                        && !expected.has_any_role(**id)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in roleless {
+                remove(&mut expected, id);
+            }
+        }
+        ControlCommand::SetNodeLifecycle {
+            node,
+            change,
+            now_ms,
+        } => {
+            let Some(record) = old.node(*node) else {
+                return Err(format!("accepted {command:?} for an unregistered node"));
+            };
+            let lifecycle = match (change, record.lifecycle) {
+                (LifecycleChange::Cordon, NodeLifecycle::Active) => NodeLifecycle::Cordoned,
+                (
+                    LifecycleChange::Uncordon,
+                    NodeLifecycle::Cordoned | NodeLifecycle::Decommissioning,
+                ) => NodeLifecycle::Active,
+                (
+                    LifecycleChange::Decommission,
+                    NodeLifecycle::Active | NodeLifecycle::Cordoned,
+                ) => NodeLifecycle::Decommissioning,
+                // Repeats are no-ops.
+                (LifecycleChange::Cordon, NodeLifecycle::Cordoned)
+                | (LifecycleChange::Uncordon, NodeLifecycle::Active)
+                | (LifecycleChange::Decommission, NodeLifecycle::Decommissioning) => {
+                    record.lifecycle
+                }
+                (_, lifecycle) => {
+                    return Err(format!("accepted {command:?} for a {lifecycle:?} node"));
+                }
+            };
+            if lifecycle != record.lifecycle {
+                expected.nodes.insert(*node, NodeRecord {
+                    lifecycle,
+                    since_ms: *now_ms,
+                });
+                // A node without a role is removed at once.
+                if lifecycle == NodeLifecycle::Decommissioning && !expected.has_any_role(*node) {
+                    remove(&mut expected, *node);
+                }
+            }
+        }
+        ControlCommand::SetMoveLimit { limit } => expected.params.max_concurrent_moves = *limit,
+        ControlCommand::ReportTornDown {
+            group,
+            node,
+            created_at,
+        } => {
+            // K14: only the matching record goes.
+            if old
+                .retirement(*group, *node)
+                .is_some_and(|record| record.created_at == *created_at)
+                && let Some(records) = expected.retirements.get_mut(group)
+            {
+                records.remove(node);
+                if records.is_empty() {
+                    expected.retirements.remove(group);
+                }
+            }
+        }
+    }
+    Ok(expected)
+}
+
+/// Marks `node` removed and drops its retirements.
+fn remove(cluster: &mut Cluster, node: NodeId) {
+    if let Some(record) = cluster.nodes.get_mut(&node) {
+        record.lifecycle = NodeLifecycle::Removed;
+    }
+    for records in cluster.retirements.values_mut() {
+        records.remove(&node);
+    }
+    cluster.retirements.retain(|_, records| !records.is_empty());
+}
+
+/// The answer of an accepted command, read from the state it left.
+fn check_answer(
+    old: &Cluster,
+    new: &Cluster,
+    at: MetaLogId,
+    command: &ControlCommand,
+    applied: &ControlApplied,
+) -> Result<(), String> {
+    let since = PlacementEpoch::new(at);
+    let record_of = |node: NodeId| {
+        new.node(node)
+            .copied()
+            .ok_or_else(|| format!("{command:?} left node {node} unregistered"))
+    };
+    let answer = match command {
+        ControlCommand::RegisterNode { node, .. } => {
+            let record = record_of(*node)?;
+            ControlApplied::NodeRegistered(if new.has_any_role(*node) {
+                Registered::Referenced(record)
+            } else {
+                Registered::Unreferenced(record)
+            })
+        }
+        ControlCommand::Bootstrap { .. } => {
+            return Err(format!("K11: a bootstrapped cluster accepted {command:?}"));
+        }
+        ControlCommand::RequestMove { .. } => ControlApplied::MoveAccepted { since },
+        ControlCommand::ReportConverged { group, .. } => ControlApplied::Converged {
+            since,
+            retired: new
+                .retirements()
+                .get(group)
+                .map(|records| {
+                    records
+                        .iter()
+                        .filter(|(_, record)| record.created_at == at)
+                        .map(|(id, _)| *id)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            removed: new
+                .nodes()
+                .iter()
+                .filter(|(id, record)| {
+                    record.lifecycle == NodeLifecycle::Removed
+                        && old
+                            .node(**id)
+                            .is_some_and(|before| before.lifecycle != NodeLifecycle::Removed)
+                })
+                .map(|(id, _)| *id)
+                .collect(),
+        },
+        ControlCommand::SetNodeLifecycle { node, .. } => ControlApplied::LifecycleChanged {
+            lifecycle: record_of(*node)?.lifecycle,
+        },
+        ControlCommand::SetMoveLimit { limit } => ControlApplied::MoveLimitSet { limit: *limit },
+        ControlCommand::ReportTornDown {
+            group,
+            node,
+            created_at,
+        } => {
+            if old
+                .retirement(*group, *node)
+                .is_some_and(|record| record.created_at == *created_at)
+            {
+                ControlApplied::TornDown
+            } else {
+                ControlApplied::NothingToTearDown
+            }
+        }
+    };
+    ensure(answer == *applied, || {
+        format!("{command:?} answered {applied:?}, its state says {answer:?}")
+    })
 }
 
 /// Properties of an accepted command before Bootstrap.
