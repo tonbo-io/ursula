@@ -10,6 +10,9 @@ message BucketStreamIdV1 {
   reserved "affinity_key";
 }
 
+// Also a serde type (see build.rs): Ursula's compact MessagePack writes it
+// as an array of its fields in declaration order, whatever their tags. Do not
+// reorder, insert or remove fields within a minor.
 message ProducerRequestV1 {
   string producer_id = 1;
   uint64 producer_epoch = 2;
@@ -33,12 +36,18 @@ enum ContentFaultV1 {
   CONTENT_FAULT_MALFORMED_JSON = 3;
 }
 
+// Also a serde type (see build.rs): Ursula's compact MessagePack writes it
+// as an array of its fields in declaration order, whatever their tags. Do not
+// reorder, insert or remove fields within a minor.
 message ExternalPayloadRefV1 {
   string s3_path = 1;
   uint64 payload_len = 2;
   uint64 object_size = 3;
 }
 
+// Also a serde type (see build.rs): Ursula's compact MessagePack writes it
+// as an array of its fields in declaration order, whatever their tags. Do not
+// reorder, insert or remove fields within a minor.
 message ColdChunkRefV1 {
   uint64 start_offset = 1;
   uint64 end_offset = 2;

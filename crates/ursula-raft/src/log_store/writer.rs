@@ -2503,19 +2503,21 @@ impl CoreFileLogWrite {
     }
 }
 
-/// Frames Raft log records as length-delimited MessagePack for the shared
-/// journal (see [`crate::codec::encode_wire`]).
+/// Frames Raft log records as length-delimited compact MessagePack
+/// ([`ursula_stream::msgpack`]) for the shared journal, as
+/// [`crate::codec::encode_wire`] encodes them for the wire.
 pub(crate) struct WireCodec<T>(PhantomData<T>);
 
 impl<T: Serialize + DeserializeOwned> journal::FrameCodec for WireCodec<T> {
     type Record = T;
 
     fn encode_into(record: &T, out: &mut Vec<u8>) {
-        rmp_serde::encode::write_named(out, record).expect("wire value serializes to MessagePack");
+        ursula_stream::msgpack::encode_into(record, out)
+            .expect("wire value serializes to MessagePack");
     }
 
     fn decode(payload: &[u8]) -> Result<T, io::Error> {
-        rmp_serde::from_slice(payload).map_err(invalid_data)
+        ursula_stream::msgpack::decode(payload).map_err(invalid_data)
     }
 }
 

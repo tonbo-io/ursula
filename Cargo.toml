@@ -76,7 +76,10 @@ protoc-bin-vendored = "3"
 rand = { version = "0.10", default-features = false }
 reqsign = { version = "0.16", default-features = false, features = ["services-aws", "reqwest_request"] }
 reqwest = { version = "0.12", default-features = false }
-rmp-serde = "1.3"
+# Pinned: compact MessagePack is a format (`ursula_stream::msgpack`), and
+# this release's documentation claims integer variant indices that it does
+# not write. A release that wrote them would change every format silently.
+rmp-serde = "=1.3.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_bytes = "0.11"
 serde_json = { version = "1.0", features = ["raw_value"] }

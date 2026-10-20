@@ -2444,7 +2444,8 @@ pub(crate) async fn backup_info(State(state): State<HttpState>) -> Response {
         .into_response()
 }
 
-/// Exports one group's complete stream state as a MessagePack document.
+/// Exports one group's complete stream state as a compact MessagePack
+/// document of this binary's backup format.
 ///
 /// The export is the same deterministic `StreamSnapshot` the raft snapshot
 /// path persists, so it is internally consistent per group while writes
@@ -2472,7 +2473,7 @@ pub(crate) async fn export_backup_group(
             return read_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await;
         }
     };
-    let body = match rmp_serde::to_vec_named(&snapshot.stream_snapshot) {
+    let body = match ursula_stream::msgpack::encode(&snapshot.stream_snapshot) {
         Ok(body) => body,
         Err(err) => {
             return (
@@ -2502,13 +2503,6 @@ pub(crate) async fn export_backup_group(
     response
 }
 
-/// The only field an import reads before it trusts the payload (E10).
-#[derive(serde::Deserialize)]
-struct BackupFormatProbe {
-    #[serde(default, rename = "format_epoch")]
-    format_version: Option<u32>,
-}
-
 /// Reads one backup group object addressed to group `raft_group_id`: the
 /// group must exist here and the body must be a stream snapshot of this
 /// server's backup format (E10). A refusal is the `400` to answer.
@@ -2528,14 +2522,10 @@ fn decode_backup_group(
     let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
         return Err(bad_request("invalid raft group id".to_owned()));
     };
-    // E10: read only the backup format first, so a group of another format
+    // E10: the backup format is read first, so a group of another format
     // answers 400 instead of being decoded under this format's rules.
-    let probe = rmp_serde::from_slice::<BackupFormatProbe>(body)
-        .map_err(|err| bad_request(format!("decode backup snapshot: {err}")))?;
-    ursula_runtime::StreamSnapshot::check_format(probe.format_version)
-        .map_err(|err| bad_request(err.to_string()))?;
-    let snapshot = rmp_serde::from_slice(body)
-        .map_err(|err| bad_request(format!("decode backup snapshot: {err}")))?;
+    let snapshot =
+        ursula_stream::decode_backup_snapshot(body).map_err(|err| bad_request(err.to_string()))?;
     Ok((raft_group_id, snapshot))
 }
 

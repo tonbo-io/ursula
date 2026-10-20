@@ -1344,7 +1344,9 @@ fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
             let placement = group_placement(0);
             let metrics = standalone_wal_metrics(placement);
             let mut store = wal.open(placement, metrics.clone()).await;
-            for chunk in 0..60_u64 {
+            // Blank entries are a few bytes each, so it takes this many to
+            // fill several 4 KiB segments.
+            for chunk in 0..120_u64 {
                 store
                     .blocking_append((1..=10).map(|offset| blank_entry(chunk * 10 + offset)))
                     .await
@@ -1354,15 +1356,15 @@ fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
             let before = journal_segments(&core).expect("segments");
             assert!(
                 before.len() >= 4,
-                "seed {seed}: 600 entries span several segments: {}",
+                "seed {seed}: 1200 entries span several segments: {}",
                 before.len()
             );
-            let purged = sim_log_id(590);
+            let purged = sim_log_id(1190);
             store.purge(purged).await.expect("purge");
             // The reclaim pass after the purge's batch has run once the next
             // write returns.
             store
-                .save_committed(Some(sim_log_id(600)))
+                .save_committed(Some(sim_log_id(1200)))
                 .await
                 .expect("commit");
             let after = journal_segments(&core).expect("segments");
@@ -1393,7 +1395,7 @@ fn a_purge_is_durable_before_the_segments_it_frees_are_deleted() {
                 "seed {seed}: the purge that freed the deleted segments survives ({report:?})"
             );
             let log = DurableGroupLog::read(&store).await;
-            let expected = (591..)
+            let expected = (1191..)
                 .take(log.log_ids.len())
                 .map(sim_log_id)
                 .collect::<Vec<_>>();

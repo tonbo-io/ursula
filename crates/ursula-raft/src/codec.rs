@@ -1,15 +1,17 @@
 //! Serde wire codec for replicated commands, responses, forwarded reads, and
 //! the openraft envelope types.
 //!
-//! The canonical types ([`GroupWriteCommand`], [`ursula_runtime::GroupWriteResponse`],
-//! [`ursula_runtime::GroupEngineError`], the forwarded read responses) and openraft's own
-//! serde-capable RPC/log types travel as self-describing MessagePack produced
-//! directly by their serde derives — there are no hand-written per-field proto
-//! mirrors. MessagePack with named struct fields is self-describing, so a
-//! decoder names the field or variant it cannot read. Within a minor the wire
-//! form of `GroupEngineError` and of every type it carries is frozen, with
-//! every field required: the `group-engine-errors-epoch<N>.json` fixture
-//! shows any change.
+//! The canonical types ([`ursula_runtime::GroupWriteCommand`],
+//! [`ursula_runtime::GroupWriteResponse`], [`ursula_runtime::GroupEngineError`],
+//! the forwarded read responses) and openraft's own serde-capable RPC and log
+//! types travel as compact MessagePack ([`ursula_stream::msgpack`]) produced
+//! directly by their serde derives. There are no hand-written per-field proto
+//! mirrors. A struct is an array of its fields in declaration order and a
+//! variant keeps its name, so field order is part of the wire form and every
+//! field is required. Within a minor the wire form of `GroupEngineError` and
+//! of every type it carries is frozen: the `group-engine-errors-epoch<N>.json`
+//! fixture shows any change, and the persisted-envelopes and
+//! commands-and-responses fixtures show a change to every other root.
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -30,7 +32,7 @@ use crate::grpc::GrpcRpcError;
 pub(crate) struct WireDecodeError {
     pub(crate) what: &'static str,
     #[source]
-    pub(crate) source: rmp_serde::decode::Error,
+    pub(crate) source: ursula_stream::msgpack::DecodeError,
 }
 
 /// Encodes a canonical value into its MessagePack wire form.
@@ -38,7 +40,7 @@ pub(crate) struct WireDecodeError {
 /// Infallible in practice: every wire type is a plain serde derive over owned
 /// data, so serialization cannot fail.
 pub(crate) fn encode_wire<T: Serialize>(value: &T) -> Bytes {
-    rmp_serde::to_vec_named(value)
+    ursula_stream::msgpack::encode(value)
         .expect("wire value serializes to MessagePack")
         .into()
 }
@@ -47,7 +49,7 @@ pub(crate) fn decode_wire<T: DeserializeOwned>(
     bytes: &[u8],
     what: &'static str,
 ) -> Result<T, WireDecodeError> {
-    rmp_serde::from_slice(bytes).map_err(|source| WireDecodeError { what, source })
+    ursula_stream::msgpack::decode(bytes).map_err(|source| WireDecodeError { what, source })
 }
 
 /// The placement a Raft gRPC request names, refused as `INVALID_ARGUMENT`
@@ -131,7 +133,7 @@ mod tests {
 
     /// What the persisted-envelopes fixture says produced it.
     const ENVELOPES_PRODUCER: &str =
-        "rmp_serde::to_vec_named, format epoch 5, openraft 0.10.0-alpha.37";
+        "ursula_stream::msgpack, format epoch 5, openraft 0.10.0-alpha.37";
 
     fn log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
         openraft::LogId {

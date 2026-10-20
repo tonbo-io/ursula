@@ -40,7 +40,6 @@ opentelemetry = { workspace = true }
 rand = { workspace = true, features = ["thread_rng"] }
 reqwest = { workspace = true, features = ["rustls-tls"] }
 serde = { workspace = true }
-rmp-serde = { workspace = true }
 blake3 = { workspace = true }
 http-body-util = "0.1"
 serde_json = { workspace = true }

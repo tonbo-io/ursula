@@ -4,8 +4,9 @@ package ursula.raft.v1;
 
 // Raft RPC envelopes keep a plain proto preamble (protocol version, group id,
 // target node) so routing and validation never decode the payload. The payload
-// itself is opaque MessagePack produced by the serde derives of openraft's own
-// request/response types (see `codec::encode_wire`).
+// itself is opaque compact MessagePack (`ursula_stream::msgpack`: a struct is
+// an array of its fields in declaration order) produced by the serde derives
+// of openraft's own request/response types (see `codec::encode_wire`).
 
 message RaftRpcEnvelopeV1 {
   uint32 raft_group_id = 1;

@@ -527,7 +527,7 @@ fn an_import_weighs_at_least_what_its_bodies_encode_to() {
         panic!("one stream");
     };
     let visible = entry.visible_snapshot.as_ref().expect("a published body");
-    let encoded = |body: &Vec<u8>| rmp_serde::to_vec_named(body).expect("encode").len();
+    let encoded = |body: &Vec<u8>| crate::msgpack::encode(body).expect("encode").len();
     let bodies = encoded(&entry.payload) + encoded(&visible.payload);
     assert!(bodies > 4 * 64 * 1024, "each high byte encodes to two");
     let import = StreamCommand::ImportSnapshot {
@@ -2369,8 +2369,8 @@ fn snapshot_restore_round_trips_payload_metadata_and_stream_seq() {
         }
     );
 
-    let encoded = serde_json::to_vec(&machine.snapshot()).expect("serialize snapshot");
-    let decoded = serde_json::from_slice::<StreamSnapshot>(&encoded).expect("deserialize snapshot");
+    let encoded = crate::msgpack::encode(&machine.snapshot()).expect("serialize snapshot");
+    let decoded = crate::msgpack::decode::<StreamSnapshot>(&encoded).expect("deserialize snapshot");
     let mut restored = StreamStateMachine::restore(decoded).expect("restore snapshot");
 
     assert_eq!(

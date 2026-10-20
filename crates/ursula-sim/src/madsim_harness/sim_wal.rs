@@ -179,6 +179,12 @@ impl SimNodeWal {
         SimDisk::power_loss(&self.root).expect("cut the power of a stopped simulated node")
     }
 
+    /// Writes the node's unsynced pages back to its disk while it runs, as
+    /// the host's page cache does ([`SimDisk::write_back`]).
+    pub(super) fn write_back(&self) {
+        SimDisk::write_back(&self.root).expect("write back a simulated node's page cache");
+    }
+
     /// Cuts the node's power after its engines have stopped, and loses
     /// everything written since the last `fsync`.
     pub(super) async fn power_loss_losing_unsynced(&self) -> SimPowerLoss {

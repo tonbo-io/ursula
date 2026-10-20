@@ -132,10 +132,11 @@ pub struct SnapshotPointer {
     pub location: SnapshotLocation,
 }
 
-/// Encodes `value` as the F12a binary snapshot envelope (MessagePack map
-/// with named fields), the only envelope Ursula writes.
+/// Encodes `value` as the F12a binary snapshot envelope (compact
+/// MessagePack, [`ursula_stream::msgpack`]), the only envelope Ursula writes.
 pub fn encode_binary_envelope<T: Serialize>(value: &T) -> Result<Vec<u8>, SnapshotStoreError> {
-    rmp_serde::to_vec_named(value).map_err(|err| SnapshotStoreError::Serialize(err.to_string()))
+    ursula_stream::msgpack::encode(value)
+        .map_err(|err| SnapshotStoreError::Serialize(err.to_string()))
 }
 
 /// Decodes the F12a binary snapshot envelope. A leading `{` marks the JSON
@@ -151,7 +152,8 @@ pub fn decode_snapshot_envelope<T: serde::de::DeserializeOwned>(
             ),
         ));
     }
-    rmp_serde::from_slice(bytes).map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))
+    ursula_stream::msgpack::decode(bytes)
+        .map_err(|err| SnapshotStoreError::Deserialize(err.to_string()))
 }
 
 impl SnapshotPointer {

@@ -1,7 +1,7 @@
 //! Verifiable cluster backup, verification, and restore.
 //!
 //! A backup is a directory (local filesystem or `s3://bucket/prefix`) holding
-//! one MessagePack `group-NNNN.snapshot` object per raft group plus a JSON
+//! one compact MessagePack `group-NNNN.snapshot` object per raft group plus a JSON
 //! `manifest.json`. The manifest carries the backup format version
 //! ([`BACKUP_FORMAT_VERSION`], which moves only when what a backup holds
 //! changes), per-object byte sizes and BLAKE3 checksums, and the group commit
@@ -33,7 +33,7 @@ use serde::Serialize;
 use ursula_proto::admin::BackupColdCheck;
 use ursula_proto::admin::BackupInfo;
 use ursula_stream::BACKUP_FORMAT_VERSION;
-use ursula_stream::StreamSnapshot;
+use ursula_stream::BackupSnapshotError;
 use ursula_stream::StreamSnapshotError;
 use ursula_stream::StreamStateMachine;
 
@@ -117,7 +117,7 @@ pub enum BackupError {
     DecodeSnapshot {
         raft_group_id: u32,
         #[source]
-        source: rmp_serde::decode::Error,
+        source: ursula_stream::msgpack::DecodeError,
     },
     #[error("group {raft_group_id} snapshot failed state-machine validation")]
     InvalidSnapshot {
@@ -507,11 +507,16 @@ async fn status_error(url: url::Url, response: reqwest::Response) -> BackupError
 
 /// Decodes and deeply validates one exported snapshot, returning its shape.
 fn validate_snapshot(raft_group_id: u32, bytes: &[u8]) -> Result<(u64, u64), BackupError> {
-    let snapshot: StreamSnapshot =
-        rmp_serde::from_slice(bytes).map_err(|source| BackupError::DecodeSnapshot {
+    let snapshot = ursula_stream::decode_backup_snapshot(bytes).map_err(|error| match error {
+        BackupSnapshotError::Undecodable(source) => BackupError::DecodeSnapshot {
             raft_group_id,
             source,
-        })?;
+        },
+        BackupSnapshotError::Format(source) => BackupError::InvalidSnapshot {
+            raft_group_id,
+            source,
+        },
+    })?;
     let buckets = u64::try_from(snapshot.buckets.len()).unwrap_or(u64::MAX);
     let streams = u64::try_from(snapshot.streams.len()).unwrap_or(u64::MAX);
     StreamStateMachine::restore(snapshot).map_err(|source| BackupError::InvalidSnapshot {
@@ -720,6 +725,8 @@ pub async fn restore(
 
 #[cfg(test)]
 mod tests {
+    use ursula_stream::StreamSnapshot;
+
     use super::*;
 
     fn snapshot_bytes(buckets: Vec<String>) -> Vec<u8> {
@@ -727,7 +734,7 @@ mod tests {
             buckets,
             ..StreamSnapshot::default()
         };
-        rmp_serde::to_vec_named(&snapshot).expect("encode snapshot")
+        ursula_stream::msgpack::encode(&snapshot).expect("encode snapshot")
     }
 
     async fn store_in(dir: &std::path::Path) -> BackupStore {
@@ -826,7 +833,7 @@ mod tests {
         }
 
         // A group snapshot of another backup format.
-        let body = rmp_serde::to_vec_named(&StreamSnapshot {
+        let body = ursula_stream::msgpack::encode(&StreamSnapshot {
             format_version: BACKUP_FORMAT_VERSION + 1,
             buckets: vec!["tenant-a".to_owned()],
             ..StreamSnapshot::default()

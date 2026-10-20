@@ -242,8 +242,7 @@ async fn import_once(
     raft_group_id: ursula_shard::RaftGroupId,
     backup: &Bytes,
 ) -> ImportAnswer {
-    let snapshot: ursula_runtime::StreamSnapshot =
-        rmp_serde::from_slice(backup).expect("decode the backup");
+    let snapshot = ursula_stream::decode_backup_snapshot(backup).expect("decode the backup");
     let request = ursula_runtime::ImportGroupStateRequest {
         snapshot: Box::new(snapshot),
         history: ursula_runtime::draw_history_id(),

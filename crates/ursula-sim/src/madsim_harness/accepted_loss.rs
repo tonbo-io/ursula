@@ -644,6 +644,11 @@ pub(super) async fn run_recovery_plan_inner(
     let a = plan.cut_off;
     lead_every_group(&cluster, a, &context).await;
     trace.push(SimEvent::LeaderElected { leader_id: a });
+    // The page cache writes everything so far back on every node, so the
+    // power loss below takes only what is written after the cut-off.
+    for wal in cluster.wals.values() {
+        wal.write_back();
+    }
 
     // A is cut off and appends a write of its term that never commits.
     for node in NODES.into_iter().filter(|node| *node != a) {
@@ -1041,7 +1046,7 @@ mod tests {
         let _guard = sim_test_guard();
         assert_fails(
             SimScenario::RecoveryPlanSurvivorCampaigns,
-            394,
+            396,
             Controls::LEADER_LAST,
             UNPLANNED_LEADER_INVARIANT,
         );

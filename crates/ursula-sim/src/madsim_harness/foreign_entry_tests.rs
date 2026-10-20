@@ -157,6 +157,12 @@ fn run(seed: u64, controls: Controls) -> Outcome {
         cluster.verify_reads().await;
         lead_every_group(&cluster, 1, &context).await;
         madsim::time::sleep(Duration::from_millis(200)).await;
+        // The page cache writes everything so far back on every node, so
+        // the power loss below takes only what is written after the
+        // cut-offs.
+        for wal in cluster.wals.values() {
+            wal.write_back();
+        }
 
         // P is cut off and does not campaign.
         for group in JOURNAL_GROUPS {

@@ -50,14 +50,15 @@ Stream-generation fix: databendlabs/openraft commit
 through progress notifications and rejects responses from replaced streams.
 Alpha28 includes this fix as well as the stale-inflight-ACK fix above.
 
-The Ursula codec test `epoch5_persisted_envelopes_are_stable` pins the named
-MessagePack bytes of format epoch 5 in
+The Ursula codec test `epoch5_persisted_envelopes_are_stable` pins the compact
+MessagePack bytes (`ursula_stream::msgpack`) of format epoch 5 in
 `crates/ursula-raft/src/fixtures/persisted-envelopes-epoch5.json`. It checks
 Vote, LogId, joint StoredMembership (including a learner), a membership Entry
-and SnapshotMeta, then requires byte-identical re-encoding. Membership names
-each member with OpenRaft's `EmptyNode`, which named MessagePack writes as an
-empty map. The three membership-bearing values were edited from the alpha37
-bytes by replacing each node's address map with that empty map. Alpha37 writes SnapshotMeta's `snapshot_id` empty and ignores it on
-read, so the fixture's SnapshotMeta carries an empty id. It does not assert
-that later OpenRaft releases or mixed-version cluster operation are
-compatible.
+and SnapshotMeta, then requires byte-identical re-encoding. Compact MessagePack
+writes a struct as an array of its fields in declaration order, so the fixture
+also pins OpenRaft's field order. Membership names each member with OpenRaft's
+`EmptyNode`, which compact MessagePack writes as an empty array. The fixture
+is generated from the test's own output on CI. Alpha37 writes SnapshotMeta's
+`snapshot_id` empty and ignores it on read, so the fixture's SnapshotMeta
+carries an empty id. It does not assert that later OpenRaft releases or
+mixed-version cluster operation are compatible.

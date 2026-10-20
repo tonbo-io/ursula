@@ -9073,8 +9073,7 @@ mod snapshot_driver {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
-        let backup: ursula_runtime::StreamSnapshot =
-            rmp_serde::from_slice(&body).expect("decode the backup");
+        let backup = ursula_stream::decode_backup_snapshot(&body).expect("decode the backup");
         assert!(
             backup
                 .streams
@@ -11828,14 +11827,22 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
 }
 
 /// E10: an import is refused with 400 before decoding when its group has no
-/// backup format (Ursula 0.5.x) or another one.
+/// backup format (Ursula 0.5.x) or another one: a compact document of
+/// another format, or the named map of backup format 4 that Ursula 0.8
+/// wrote.
 #[tokio::test]
 async fn backup_import_refuses_groups_of_another_backup_format() {
     let app = test_router();
     let without_format =
-        rmp_serde::to_vec_named(&json!({"buckets": ["tenant-a"], "streams": []})).unwrap();
+        ursula_stream::msgpack::encode(&json!({"buckets": ["tenant-a"], "streams": []})).unwrap();
+    let named_0_8 = ursula_stream::msgpack::encode(&json!({
+        "format_epoch": 4,
+        "buckets": ["tenant-a"],
+        "streams": [],
+    }))
+    .unwrap();
     let other_format = |format_version| {
-        rmp_serde::to_vec_named(&ursula_runtime::StreamSnapshot {
+        ursula_stream::msgpack::encode(&ursula_runtime::StreamSnapshot {
             format_version,
             ..ursula_runtime::StreamSnapshot::default()
         })
@@ -11845,6 +11852,7 @@ async fn backup_import_refuses_groups_of_another_backup_format() {
     let newer = ursula_runtime::BACKUP_FORMAT_VERSION + 1;
     for (body, expected) in [
         (without_format, "has no format_epoch field".to_owned()),
+        (named_0_8, "is backup format 4".to_owned()),
         (other_format(older), format!("is backup format {older}")),
         (other_format(newer), format!("is backup format {newer}")),
     ] {
@@ -12222,8 +12230,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
     // fails closed.
     let mut conflicted = false;
     for (group, body) in exports.iter().enumerate() {
-        let snapshot: ursula_runtime::StreamSnapshot =
-            rmp_serde::from_slice(body).expect("decode export");
+        let snapshot = ursula_stream::decode_backup_snapshot(body).expect("decode export");
         if snapshot.buckets.is_empty() {
             continue;
         }
@@ -12245,7 +12252,7 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
 
         let mut other = snapshot.clone();
         other.buckets.push("tenant-z".to_owned());
-        let other = rmp_serde::to_vec_named(&other).expect("encode another backup");
+        let other = ursula_stream::msgpack::encode(&other).expect("encode another backup");
         let digest = blake3::hash(&other).to_hex().to_string();
         let response = http_post(
             &restored,

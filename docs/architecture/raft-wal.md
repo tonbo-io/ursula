@@ -73,7 +73,7 @@ Every segment starts with a 32-byte header, and every record is a frame:
 ```text
 header  magic "URSJWAL\0" | u16 version | u16 header length (32) | u32 zero
         | u64 sequence | u32 zero | u32 CRC32 of the 28 bytes before it
-frame   u32 payload length | u32 header CRC | u32 payload CRC | MessagePack payload
+frame   u32 payload length | u32 header CRC | u32 payload CRC | compact MessagePack payload
 ```
 
 The frame header CRC covers the segment sequence and the length, so a damaged
@@ -81,7 +81,9 @@ length is caught before replay trusts it. The payload CRC covers the sequence,
 the length and the payload. A frame therefore verifies only in the segment
 that wrote it, and a header naming another sequence than its file is refused.
 A payload is a group id and one of `Append`, `FrozenAppend`, `SaveCommitted`,
-`TruncateAfter` or `Purge`. Votes are not journal records.
+`TruncateAfter` or `Purge`, in compact MessagePack (`ursula_stream::msgpack`):
+a struct is an array of its fields in declaration order and a variant keeps
+its name. Votes are not journal records.
 
 `journal.meta`, `run-state.bin` and `topology.bin` are replaced whole
 (temporary file, sync, rename, directory sync), so a crash leaves either

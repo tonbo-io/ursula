@@ -580,7 +580,7 @@ async fn log_holds_marker(cluster: &JournalCluster, node_id: u64) -> Option<Stri
         .await
         .unwrap_or_else(|error| panic!("node {node_id}: read the log: {error}"));
     entries.iter().find_map(|entry| {
-        let encoded = rmp_serde::to_vec(entry).expect("encode a log entry");
+        let encoded = ursula_stream::msgpack::encode(entry).expect("encode a log entry");
         holds_marker(&encoded).then(|| format!("log entry {} holds the marker", entry.log_id))
     })
 }

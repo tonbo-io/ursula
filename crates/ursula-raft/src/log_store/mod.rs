@@ -135,11 +135,13 @@ use crate::types::UrsulaRaftTypeConfig;
 
 /// One durable operation appended to a group's raft log journal.
 ///
-/// Journaled as self-describing MessagePack of openraft's own serde-capable
-/// types (via [`crate::codec::encode_wire`]) instead of hand-written proto
-/// mirrors; the on-disk format is therefore coupled to the Rust type layout,
-/// which is acceptable while every deployment upgrades atomically. Votes are
-/// not journaled: each core's metadata file holds them.
+/// Journaled as compact MessagePack of openraft's own serde-capable types
+/// ([`ursula_stream::msgpack`], as [`crate::codec::encode_wire`] uses it)
+/// instead of hand-written proto mirrors. A struct is an array of its fields
+/// in declaration order, so the on-disk format is the Rust type layout,
+/// OpenRaft's included: a reordered, added or removed field is a format
+/// change, which the persisted-envelopes fixture shows. Votes are not
+/// journaled: each core's metadata file holds them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum RaftGroupLogRecord {
     SaveCommitted(Option<LogIdOf<UrsulaRaftTypeConfig>>),

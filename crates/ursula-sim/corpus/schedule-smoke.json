@@ -3845,7 +3845,7 @@
       "seed": 546,
       "leader_id": 3,
       "target_node_id": null,
-      "appended_log_index": 35,
+      "appended_log_index": 36,
       "trace": {
         "events": [
           {
@@ -3881,16 +3881,16 @@
             "node_id": 3
           },
           {
-            "event": "fault_applied",
-            "phase": "power_lost"
-          },
-          {
             "event": "node_restarted",
             "node_id": 3
           },
           {
             "event": "node_stopped",
             "node_id": 2
+          },
+          {
+            "event": "fault_applied",
+            "phase": "power_lost"
           },
           {
             "event": "node_restarted",
@@ -3903,7 +3903,7 @@
             "restore_reads": 6,
             "deletes": 38,
             "late_puts_landed": 2,
-            "store_log_digest": "54bc8176d35f6b4acccc978c62d7ea52182438454462e58dea9dfe46c418c3cb"
+            "store_log_digest": "9646317617e474daab42460e2ef20b71558248ff1abee3dd6f386877c89a8a8b"
           }
         ]
       }

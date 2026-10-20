@@ -10,6 +10,8 @@
 //!   protocol share, the backup format, and their policy.
 //! - [`response`]: result variants and error codes returned per command.
 //! - [`model`]: persistent data types (metadata, segments, producer state, plans).
+//! - [`msgpack`]: Ursula's one MessagePack codec, compact: a struct is an
+//!   array of its fields in declaration order and a variant keeps its name.
 //! - [`json_records`]: canonical JSON message text: LF-terminated messages,
 //!   whose count feeds the `committed_records` usage counter.
 //! - [`sim_controls`]: defences a simulation's negative control turns off
@@ -29,6 +31,7 @@ mod format;
 mod history;
 mod json_records;
 mod model;
+pub mod msgpack;
 mod response;
 pub mod sim_controls;
 mod snapshot;
@@ -95,9 +98,11 @@ pub use response::ProducerRefusal;
 pub use response::StreamErrorCode;
 pub use response::StreamErrorContext;
 pub use response::StreamResponse;
+pub use snapshot::BackupSnapshotError;
 pub use snapshot::StreamSnapshot;
 pub use snapshot::StreamSnapshotEntry;
 pub use snapshot::StreamSnapshotError;
+pub use snapshot::decode_backup_snapshot;
 pub use state_machine::COMMITTED_WRITE_UNIT_BYTES;
 pub use state_machine::ColdFlushHotAge;
 pub use state_machine::ColdFlushPass;

@@ -18,7 +18,6 @@ opendal = { workspace = true, features = ["services-memory", "services-s3"] }
 rand = { workspace = true, features = ["thread_rng"] }
 reqsign = { workspace = true }
 reqwest = { workspace = true }
-rmp-serde = { workspace = true }
 serde = { workspace = true }
 serde_bytes = { workspace = true }
 serde_json = { workspace = true }

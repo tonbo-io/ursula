@@ -2,6 +2,18 @@ disallowed-types = [
     { path = "once_cell::sync::Lazy", reason = "Please use `std::sync::LazyLock` instead." },
 ]
 
+disallowed-methods = [
+    { path = "rmp_serde::encode::to_vec", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::encode::to_vec_named", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::encode::write", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::encode::write_named", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::encode::Serializer::new", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::decode::from_slice", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::decode::from_read", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::decode::from_read_ref", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+    { path = "rmp_serde::decode::Deserializer::new", reason = "Use `ursula_stream::msgpack`, Ursula's one MessagePack codec." },
+]
+
 disallowed-macros = [
     { path = "lazy_static::lazy_static", reason = "Please use `std::sync::LazyLock` instead." },
 ]

@@ -15,12 +15,11 @@ use crate::model::StreamVisibleSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamSnapshot {
-    /// Backup format of this snapshot ([`crate::BACKUP_FORMAT_VERSION`]),
-    /// under the wire key `format_epoch` that every backup format has used.
-    /// Deliberately not `serde(default)`: a MessagePack snapshot from Ursula
-    /// 0.5.x (epoch 1) has no such field and fails to decode instead of being
-    /// misread.
-    #[serde(rename = "format_epoch")]
+    /// Backup format of this snapshot ([`crate::BACKUP_FORMAT_VERSION`]).
+    /// It is the first field in every backup format from 5 on, so
+    /// [`decode_backup_snapshot`] reads it before anything else of the
+    /// document. Backup formats up to 4 wrote a map with this field under
+    /// the key `format_epoch`, and Ursula 0.5.x none.
     pub format_version: u32,
     pub buckets: Vec<String>,
     /// Permanent bucket-erasure fences.
@@ -55,14 +54,79 @@ impl Default for StreamSnapshot {
 
 impl StreamSnapshot {
     /// Refuses a snapshot document of another backup format before anything
-    /// else of it is trusted. `found` is its `format_epoch` field, `None` when
-    /// it has none (Ursula 0.5.x). Restore, the import route and `ursulactl`
-    /// share this one check.
+    /// else of it is trusted. `found` is its backup format, `None` when it has
+    /// none (Ursula 0.5.x).
     pub fn check_format(found: Option<u32>) -> Result<(), StreamSnapshotError> {
         match found {
             Some(crate::BACKUP_FORMAT_VERSION) => Ok(()),
             found => Err(StreamSnapshotError::BackupFormat { found }),
         }
+    }
+}
+
+/// Why a backup group object does not restore.
+#[derive(Debug, thiserror::Error)]
+pub enum BackupSnapshotError {
+    /// The document does not decode as a stream snapshot.
+    #[error("backup snapshot does not decode: {0}")]
+    Undecodable(#[source] crate::msgpack::DecodeError),
+    /// The document is of another backup format.
+    #[error(transparent)]
+    Format(#[from] StreamSnapshotError),
+}
+
+/// Decodes a backup group object (E10). It reads the document's backup
+/// format first and refuses one of another format before it decodes the
+/// rest under this format's rules: under compact MessagePack a document of
+/// another format whose field count happens to match would otherwise be
+/// misread. The import route, its cold check, `ursulactl` and the
+/// simulation share this one check.
+pub fn decode_backup_snapshot(bytes: &[u8]) -> Result<StreamSnapshot, BackupSnapshotError> {
+    let BackupFormatProbe(found) =
+        crate::msgpack::decode(bytes).map_err(BackupSnapshotError::Undecodable)?;
+    StreamSnapshot::check_format(found)?;
+    crate::msgpack::decode(bytes).map_err(BackupSnapshotError::Undecodable)
+}
+
+/// The backup format of a group object of any backup format: the first
+/// element of the array of backup format 5 and later, the `format_epoch`
+/// entry of the map of backup formats up to 4, `None` for a map without
+/// one (Ursula 0.5.x). It skips the rest of the document unread.
+struct BackupFormatProbe(Option<u32>);
+
+impl<'de> Deserialize<'de> for BackupFormatProbe {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BackupFormatProbeVisitor)
+    }
+}
+
+struct BackupFormatProbeVisitor;
+
+impl<'de> serde::de::Visitor<'de> for BackupFormatProbeVisitor {
+    type Value = BackupFormatProbe;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a stream snapshot")
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let found = seq
+            .next_element::<u32>()?
+            .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+        while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+        Ok(BackupFormatProbe(Some(found)))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut found = None;
+        while let Some(key) = map.next_key::<String>()? {
+            if key == "format_epoch" && found.is_none() {
+                found = Some(map.next_value::<u32>()?);
+            } else {
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+        }
+        Ok(BackupFormatProbe(found))
     }
 }
 
@@ -136,4 +200,67 @@ fn snapshot_backup_format_message(found: &Option<u32>) -> String {
         None => "has no format_epoch field".to_owned(),
     };
     crate::backup_format_refusal("snapshot", &found)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackupSnapshotError;
+    use super::StreamSnapshot;
+    use super::StreamSnapshotError;
+    use super::decode_backup_snapshot;
+    use crate::msgpack;
+
+    fn of_format(format_version: u32) -> Vec<u8> {
+        msgpack::encode(&StreamSnapshot {
+            format_version,
+            buckets: vec!["tenant-a".to_owned()],
+            ..StreamSnapshot::default()
+        })
+        .unwrap()
+    }
+
+    /// E10: a group object of this backup format decodes, and one of any
+    /// other is refused by its format before the rest is read: a compact
+    /// document of another format, the named map of backup format 4 (Ursula
+    /// 0.8) and a map with no format at all (Ursula 0.5.x).
+    #[test]
+    fn a_backup_of_another_format_is_refused_by_its_format() {
+        let snapshot = decode_backup_snapshot(&of_format(crate::BACKUP_FORMAT_VERSION)).unwrap();
+        assert_eq!(snapshot.buckets, vec!["tenant-a".to_owned()]);
+
+        let older = crate::BACKUP_FORMAT_VERSION.checked_sub(1).unwrap();
+        let newer = crate::BACKUP_FORMAT_VERSION.checked_add(1).unwrap();
+        let named_0_8 = msgpack::encode(&serde_json::json!({
+            "format_epoch": 4,
+            "buckets": ["tenant-a"],
+            "streams": [],
+        }))
+        .unwrap();
+        let without_format =
+            msgpack::encode(&serde_json::json!({"buckets": ["tenant-a"], "streams": []})).unwrap();
+        for (body, found) in [
+            (of_format(older), Some(older)),
+            (of_format(newer), Some(newer)),
+            (named_0_8, Some(4)),
+            (without_format, None),
+        ] {
+            let error = decode_backup_snapshot(&body).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    BackupSnapshotError::Format(StreamSnapshotError::BackupFormat { found: got })
+                        if *got == found
+                ),
+                "{error}"
+            );
+        }
+
+        // A document that is no snapshot at all does not decode.
+        for body in [vec![0x90], vec![0xc0], vec![0x91, 0xa1, b'x']] {
+            assert!(matches!(
+                decode_backup_snapshot(&body),
+                Err(BackupSnapshotError::Undecodable(_))
+            ));
+        }
+    }
 }

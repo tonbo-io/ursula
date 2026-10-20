@@ -224,17 +224,11 @@ pub struct ColdGcEntry {
     /// chunk names scoped to it. Always set for `Stream` targets and always
     /// `None` for `Paths` targets; the worker refuses a `Stream` entry
     /// without a generation as corrupt and deletes nothing.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_generation: Option<u64>,
     /// How many times the leader's GC worker deferred this entry after a
     /// failure (`DeferColdGc`, F14b). The worker backs off
     /// exponentially in it.
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub defer_attempts: u32,
-}
-
-fn is_zero_u32(value: &u32) -> bool {
-    *value == 0
 }
 
 /// A pending GC entry as planned for the leader's GC worker, with the cold
@@ -335,7 +329,6 @@ pub struct StreamVisibleSnapshot {
     /// BLAKE3 digest over the content type and body.
     pub digest: String,
     /// Cold-tier object holding the whole body (bounded-state F16). `payload_len` is the body length.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<ExternalPayloadRef>,
 }
 

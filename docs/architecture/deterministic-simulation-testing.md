@@ -186,6 +186,7 @@ Disk faults live in `SimDisk` (`crates/ursula-raft/src/log_store/sim_disk.rs`) a
 
 - `SimDisk::inject_fault(path, SimDiskFault)` fails the next matching operation: `Write`, `PartialWrite` (half the bytes, then an error), `Sync`, `Remove` or `Rename`. A failed `fsync` marks pages clean without persisting them, as Linux does.
 - `SimDisk::power_loss(prefix)` keeps or drops each unsynced 4 KiB page with madsim's RNG, which can leave zero-filled holes, and reverts directory entries not made durable by a directory `fsync`. `power_loss_losing_unsynced` drops every unsynced page.
+- `SimDisk::write_back(prefix)` makes every page under the prefix durable, as a host's page cache writes pages back on its own. A scenario whose power loss must keep what it wrote before its fault calls it before the fault instead of relying on a segment rotation to `fsync` those pages.
 - `SimDisk::process_crash(prefix)` keeps the page cache. `RaftGroupFileLogStore::pause_simulated_writer` and `abort_simulated_writer` hold or discard queued journal writes.
 
 ### Snapshot store faults
