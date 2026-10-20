@@ -18,7 +18,9 @@
 //! alike on every RPC. The code alone already means a protocol
 //! mismatch (by message text) or another cluster (by `ursula-cluster-id`
 //! metadata), so a sender reads this refusal only through
-//! [`refusing_node`], and never records it as a format-epoch mismatch.
+//! [`refusing_node`], and never records it as a format-epoch mismatch. The
+//! mismatch text decides first: a status that carries it is a version
+//! refusal, never a misdelivery, whatever metadata it carries.
 
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
@@ -177,10 +179,14 @@ pub(crate) fn check_target_node(target_node: u64, local: u64) -> Result<(), Grpc
 
 /// The node that refused an outbound request as meant for another node,
 /// read from the refusal's [`NODE_ID_METADATA`]: the address dialed now
-/// serves that node. `None` for every other status. The only reader of the
-/// misdelivery refusal.
+/// serves that node. `None` for every other status, a protocol-version
+/// refusal ([`crate::format_epoch::is_protocol_mismatch`]) among them even
+/// when it carries that metadata. The only reader of the misdelivery
+/// refusal.
 pub(crate) fn refusing_node(status: &tonic::Status) -> Option<u64> {
-    if status.code() != tonic::Code::FailedPrecondition {
+    if status.code() != tonic::Code::FailedPrecondition
+        || crate::format_epoch::is_protocol_mismatch(status)
+    {
         return None;
     }
     status

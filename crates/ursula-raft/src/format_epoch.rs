@@ -31,16 +31,19 @@
 //!   by a peer of the same epoch;
 //! - the refusal: `FAILED_PRECONDITION` with a message that contains
 //!   [`PROTOCOL_MISMATCH_TEXT`], for unary RPCs and as the code and message
-//!   of an AppendStream item;
+//!   of an AppendStream item. The text decides: a `FAILED_PRECONDITION`
+//!   whose message contains it is a version refusal whatever metadata it
+//!   carries, and every reader checks the text before any metadata, so no
+//!   later refusal that also names a node or a cluster hides a mismatch;
 //! - the `ursula-cluster-id` and `ursula-node-id` request metadata.
 //!
 //! A refusal of a request meant for another node is `FAILED_PRECONDITION`
 //! too, told apart by the refusing node's id in its `ursula-node-id` status
-//! metadata ([`crate::target::refusing_node`]), which an AppendStream item
-//! carries in `RaftAppendStreamError.refusing_node` and the sender turns
-//! back into that metadata. It is never a format-epoch
-//! answer: the probe reads it as unreachable, and no reader records it as a
-//! mismatch.
+//! metadata ([`crate::target::refusing_node`]) and a message without the
+//! mismatch text. An AppendStream item carries the id in
+//! `RaftAppendStreamError.refusing_node`, and the sender turns it back into
+//! that metadata. It is never a format-epoch answer: the probe reads it as
+//! unreachable, and no reader records it as a mismatch.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -97,12 +100,14 @@ pub(crate) fn record_format_epoch_mismatch(direction: &'static str, message: &st
     FormatEpochMismatch::global().record();
 }
 
-/// Whether a peer's answer is a protocol-version refusal. A refusal of a
-/// request meant for another node ([`crate::target::refusing_node`]) never
-/// is: its address serves another node, of whatever epoch.
+/// Whether a peer's answer is a protocol-version refusal:
+/// `FAILED_PRECONDITION` with [`PROTOCOL_MISMATCH_TEXT`] in its message,
+/// whatever metadata it carries. The text is the frozen part of the
+/// contract, so it is read before any metadata. A refusal of a request meant
+/// for another node ([`crate::target::refusing_node`]) never is one: its
+/// message does not contain the text.
 pub(crate) fn is_protocol_mismatch(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
-        && crate::target::refusing_node(status).is_none()
         && status.message().contains(PROTOCOL_MISMATCH_TEXT)
 }
 
@@ -183,11 +188,11 @@ pub(crate) async fn probe_peer_with_protocol(
     classify_probe_answer(result.map(|_| ()))
 }
 
-/// NOT_FOUND is a peer on this protocol; FAILED_PRECONDITION naming a
-/// cluster id is a peer of another cluster; FAILED_PRECONDITION naming a
-/// node is an address that serves another node, unreachable for the peer
-/// probed; FAILED_PRECONDITION with the mismatch text is E8; anything else
-/// is treated as unreachable.
+/// NOT_FOUND is a peer on this protocol; FAILED_PRECONDITION with the
+/// mismatch text is E8, whatever metadata it carries; otherwise
+/// FAILED_PRECONDITION naming a cluster id is a peer of another cluster,
+/// and naming a node an address that serves another node, unreachable for
+/// the peer probed; anything else is treated as unreachable.
 pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFormatEpoch {
     let status = match result {
         Err(status) => status,
@@ -199,14 +204,14 @@ pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFo
     if status.code() == tonic::Code::NotFound {
         return PeerFormatEpoch::Compatible;
     }
+    if is_protocol_mismatch(&status) {
+        return PeerFormatEpoch::Refused(status.message().to_owned());
+    }
     if let Some(cluster_id) = refusing_cluster(&status) {
         return PeerFormatEpoch::OtherCluster(cluster_id);
     }
     if let Some(node) = crate::target::refusing_node(&status) {
         return PeerFormatEpoch::Unreachable(format!("the address serves node {node}"));
-    }
-    if is_protocol_mismatch(&status) {
-        return PeerFormatEpoch::Refused(status.message().to_owned());
     }
     PeerFormatEpoch::Unreachable(status.to_string())
 }
@@ -293,6 +298,39 @@ mod tests {
             classify_probe_answer(Err(from_0_9)),
             PeerFormatEpoch::Refused(_)
         ));
+    }
+
+    /// The text decides, before any metadata: a version refusal that also
+    /// names a node or a cluster in its status metadata, as a later epoch's
+    /// refusal might, is still E8 to the probe, and no reader takes it as a
+    /// misdelivery or a refusal of another cluster.
+    #[test]
+    fn a_version_refusal_that_names_a_node_or_a_cluster_is_still_refused() {
+        let message = "raft grpc protocol mismatch: local=7, remote=6 (format epochs differ)";
+        let mut naming_a_node = tonic::Status::failed_precondition(message);
+        naming_a_node.metadata_mut().insert(
+            crate::peer_cluster::NODE_ID_METADATA,
+            tonic::metadata::AsciiMetadataValue::from(3_u64),
+        );
+        let mut naming_a_cluster = tonic::Status::failed_precondition(message);
+        naming_a_cluster.metadata_mut().insert(
+            crate::peer_cluster::CLUSTER_ID_METADATA,
+            tonic::metadata::AsciiMetadataValue::from_static("other-cluster"),
+        );
+        for status in [naming_a_node, naming_a_cluster] {
+            assert!(is_protocol_mismatch(&status), "{status:?}");
+            assert_eq!(crate::target::refusing_node(&status), None);
+            assert_eq!(refusing_cluster(&status), None);
+            assert_eq!(
+                crate::grpc::stream_item_error(&status).refusing_node,
+                0,
+                "{status:?}"
+            );
+            match classify_probe_answer(Err(status)) {
+                PeerFormatEpoch::Refused(refused) => assert_eq!(refused, message),
+                other => panic!("expected a refusal, got {other:?}"),
+            }
+        }
     }
 
     /// An address that serves another node than the one configured answers

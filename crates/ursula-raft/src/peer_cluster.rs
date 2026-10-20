@@ -179,9 +179,13 @@ impl From<PeerClusterError> for tonic::Status {
 
 /// The cluster id of the peer that refused an outbound RPC because it is in
 /// another cluster, read from the refusal's metadata. `None` for every other
-/// status.
+/// status, a protocol-version refusal
+/// ([`crate::format_epoch::is_protocol_mismatch`]) among them even when it
+/// carries that metadata.
 pub(crate) fn refusing_cluster(status: &tonic::Status) -> Option<ClusterId> {
-    if status.code() != tonic::Code::FailedPrecondition {
+    if status.code() != tonic::Code::FailedPrecondition
+        || crate::format_epoch::is_protocol_mismatch(status)
+    {
         return None;
     }
     let value = status.metadata().get(CLUSTER_ID_METADATA)?.to_str().ok()?;
