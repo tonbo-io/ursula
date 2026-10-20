@@ -10,6 +10,7 @@
 //! - `seed`: where Bootstrap places each group and who initializes it.
 //! - `view`: placement views and their confirmation.
 //! - `admin`: the admin JSON types of the placement routes.
+//! - `samples` (tests and `test-support` only): one sample of every root.
 
 mod admin;
 mod apply;
@@ -54,7 +55,7 @@ pub use view::UnconfirmedView;
 
 #[cfg(test)]
 mod proptests;
-#[cfg(test)]
-mod samples;
+#[cfg(any(test, feature = "test-support"))]
+pub mod samples;
 #[cfg(test)]
 mod tests;

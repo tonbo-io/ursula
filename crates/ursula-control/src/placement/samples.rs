@@ -1,6 +1,10 @@
-//! Test helpers: ids, a driver that applies commands at increasing meta log
-//! ids, and one sample of every variant of each replicated root, with
-//! distinct field values.
+//! One sample of every variant of each kernel root, nested variants
+//! included, with distinct field values, for the tests here and the
+//! MessagePack fixtures of other crates (the `test-support` feature). Each
+//! list is built behind an exhaustive match with no wildcard ([`every`]), so
+//! a new variant does not compile until it has a sample. The constructors
+//! build ids and sets, and `Driver` (tests only) applies commands at
+//! increasing meta log ids.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -61,23 +65,26 @@ macro_rules! every {
     }};
 }
 
-pub(super) fn node(id: u64) -> NodeId {
+pub fn node(id: u64) -> NodeId {
     NodeId::new(id)
 }
 
-pub(super) fn voters(ids: &[u64]) -> VoterSet {
-    VoterSet::new(ids.iter().copied().map(NodeId::new).collect()).unwrap()
+/// The voter set of `ids`, which must not be empty.
+pub fn voters(ids: &[u64]) -> VoterSet {
+    VoterSet::new(ids.iter().copied().map(NodeId::new).collect()).expect("a sample names voters")
 }
 
-pub(super) fn node_set(ids: &[u64]) -> NodeSet {
-    NodeSet::new(ids.iter().copied().map(NodeId::new).collect()).unwrap()
+/// The node set of `ids`, which must not be empty.
+pub fn node_set(ids: &[u64]) -> NodeSet {
+    NodeSet::new(ids.iter().copied().map(NodeId::new).collect()).expect("a sample names nodes")
 }
 
-pub(super) fn ids(values: &[u64]) -> BTreeSet<NodeId> {
+pub fn ids(values: &[u64]) -> BTreeSet<NodeId> {
     values.iter().copied().map(NodeId::new).collect()
 }
 
-pub(super) fn meta(term: u64, index: u64) -> MetaLogId {
+/// A meta entry of node 1's leadership in `term`.
+pub fn meta(term: u64, index: u64) -> MetaLogId {
     MetaLogId::new(RaftLogId {
         term,
         leader: NodeId::new(1),
@@ -85,7 +92,8 @@ pub(super) fn meta(term: u64, index: u64) -> MetaLogId {
     })
 }
 
-pub(super) fn membership(term: u64, index: u64) -> MembershipLogId {
+/// A data group's membership entry of node 2's leadership in `term`.
+pub fn membership(term: u64, index: u64) -> MembershipLogId {
     MembershipLogId::new(RaftLogId {
         term,
         leader: NodeId::new(2),
@@ -93,7 +101,9 @@ pub(super) fn membership(term: u64, index: u64) -> MembershipLogId {
     })
 }
 
-pub(super) fn params(
+/// Bootstrap parameters over `nodes`, with their default meta voters.
+/// `groups` and `rf` must not be zero.
+pub fn params(
     nodes: &[u64],
     groups: u32,
     rf: u8,
@@ -102,8 +112,10 @@ pub(super) fn params(
 ) -> ClusterParams {
     let nodes = node_set(nodes);
     ClusterParams {
-        group_count: GroupCount::new(NonZeroU32::new(groups).unwrap()),
-        replication_factor: ReplicationFactor::new(NonZeroU8::new(rf).unwrap()),
+        group_count: GroupCount::new(NonZeroU32::new(groups).expect("a sample has groups")),
+        replication_factor: ReplicationFactor::new(
+            NonZeroU8::new(rf).expect("a sample has voters"),
+        ),
         meta_voters: super::default_meta_voters(&nodes),
         max_concurrent_moves: MoveLimit::new(limit),
         maintenance,
@@ -111,15 +123,17 @@ pub(super) fn params(
 }
 
 /// Applies commands at increasing meta log ids.
+#[cfg(test)]
 #[derive(Debug, Clone)]
-pub(super) struct Driver {
-    pub(super) state: ControlPlaneState,
-    pub(super) term: u64,
-    pub(super) index: u64,
+pub(crate) struct Driver {
+    pub(crate) state: ControlPlaneState,
+    pub(crate) term: u64,
+    pub(crate) index: u64,
 }
 
+#[cfg(test)]
 impl Driver {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             state: ControlPlaneState::default(),
             term: 1,
@@ -129,7 +143,7 @@ impl Driver {
 
     /// A cluster of `nodes`, every group seeded and reported, with move
     /// limit 4.
-    pub(super) fn live(nodes: &[u64], groups: u32, rf: u8) -> Self {
+    pub(crate) fn live(nodes: &[u64], groups: u32, rf: u8) -> Self {
         let mut driver = Self::bootstrapped(
             nodes,
             params(nodes, groups, rf, 4, MaintenanceAuthority::Placement),
@@ -151,7 +165,7 @@ impl Driver {
     }
 
     /// Registers `nodes` and bootstraps them with `params`.
-    pub(super) fn bootstrapped(nodes: &[u64], params: ClusterParams) -> Self {
+    pub(crate) fn bootstrapped(nodes: &[u64], params: ClusterParams) -> Self {
         let mut driver = Self::new();
         for id in nodes {
             driver
@@ -171,19 +185,19 @@ impl Driver {
         driver
     }
 
-    pub(super) fn next_at(&mut self) -> MetaLogId {
+    pub(crate) fn next_at(&mut self) -> MetaLogId {
         self.index = self.index.checked_add(1).unwrap();
         meta(self.term, self.index)
     }
 
-    pub(super) fn apply(&mut self, command: ControlCommand) -> ControlResponse {
+    pub(crate) fn apply(&mut self, command: ControlCommand) -> ControlResponse {
         let at = self.next_at();
         self.state.apply(at, command)
     }
 
     /// Applies `command` and asserts that the state machine refused it
     /// without changing the state, and that `check` answers the same.
-    pub(super) fn refused(&mut self, command: ControlCommand) -> ControlError {
+    pub(crate) fn refused(&mut self, command: ControlCommand) -> ControlError {
         let before = self.state.clone();
         let checked = self.state.check(&command);
         let response = self.apply(command);
@@ -196,25 +210,25 @@ impl Driver {
     }
 
     /// A history event in a new term.
-    pub(super) fn history(&mut self, cause: HistoryCause) -> HistoryBegun {
+    pub(crate) fn history(&mut self, cause: HistoryCause) -> HistoryBegun {
         self.term = self.term.checked_add(1).unwrap();
         let at = self.next_at();
         self.state.begin_history(at, cause)
     }
 
-    pub(super) fn cluster(&self) -> &Cluster {
+    pub(crate) fn cluster(&self) -> &Cluster {
         self.state.cluster().unwrap()
     }
 
-    pub(super) fn placement(&self, group: RaftGroupId) -> &GroupPlacement {
+    pub(crate) fn placement(&self, group: RaftGroupId) -> &GroupPlacement {
         self.cluster().group(group).unwrap()
     }
 
-    pub(super) fn since(&self, group: RaftGroupId) -> PlacementEpoch {
+    pub(crate) fn since(&self, group: RaftGroupId) -> PlacementEpoch {
         self.placement(group).since()
     }
 
-    pub(super) fn request_move(&mut self, group: RaftGroupId, to: &[u64]) -> ControlResponse {
+    pub(crate) fn request_move(&mut self, group: RaftGroupId, to: &[u64]) -> ControlResponse {
         let expected = self.since(group);
         self.apply(ControlCommand::RequestMove {
             group,
@@ -224,7 +238,7 @@ impl Driver {
         })
     }
 
-    pub(super) fn report(&mut self, group: RaftGroupId, reported: &[u64]) -> ControlResponse {
+    pub(crate) fn report(&mut self, group: RaftGroupId, reported: &[u64]) -> ControlResponse {
         let since = self.since(group);
         let membership = membership(2, self.index);
         self.apply(ControlCommand::ReportConverged {
@@ -236,7 +250,7 @@ impl Driver {
         })
     }
 
-    pub(super) fn lifecycle(&mut self, id: u64, change: LifecycleChange) -> ControlResponse {
+    pub(crate) fn lifecycle(&mut self, id: u64, change: LifecycleChange) -> ControlResponse {
         self.apply(ControlCommand::SetNodeLifecycle {
             node: node(id),
             change,
@@ -245,13 +259,15 @@ impl Driver {
     }
 }
 
-/// A bootstrapped state that sets every field: a seeded group, a stable
-/// group, a moving group and a retirement.
-pub(super) fn sample_state() -> ControlPlaneState {
+/// A bootstrapped state under the placement authority that sets every
+/// field: a seeded group, a stable group, a moving group with an abandoned
+/// target and a retirement, over nodes of every lifecycle. It holds every
+/// invariant of the kernel.
+pub fn sample_state() -> ControlPlaneState {
     ControlPlaneState::Bootstrapped(Cluster {
         params: ClusterParams {
-            group_count: GroupCount::new(NonZeroU32::new(3).unwrap()),
-            replication_factor: ReplicationFactor::new(NonZeroU8::new(2).unwrap()),
+            group_count: GroupCount::new(NonZeroU32::new(3).expect("non-zero")),
+            replication_factor: ReplicationFactor::new(NonZeroU8::new(2).expect("non-zero")),
             meta_voters: voters(&[1, 2]),
             max_concurrent_moves: MoveLimit::new(5),
             maintenance: MaintenanceAuthority::Placement,
@@ -272,6 +288,10 @@ pub(super) fn sample_state() -> ControlPlaneState {
             (node(4), NodeRecord {
                 lifecycle: NodeLifecycle::Removed,
                 since_ms: 14,
+            }),
+            (node(5), NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: 15,
             }),
         ]),
         groups: Placements(BTreeMap::from([
@@ -307,19 +327,69 @@ pub(super) fn sample_state() -> ControlPlaneState {
     })
 }
 
-/// One state of every variant.
-pub(super) fn sample_states() -> Vec<ControlPlaneState> {
-    vec![
-        ControlPlaneState::Forming {
-            registered: BTreeMap::from([(node(7), Registration { since_ms: 31 })]),
+/// A bootstrapped state under the startup reservation: nodes and meta
+/// voters 1, 2 and 3 at replication factor 3, one stable group.
+pub fn sample_reservation_state() -> ControlPlaneState {
+    ControlPlaneState::Bootstrapped(Cluster {
+        params: ClusterParams {
+            group_count: GroupCount::new(NonZeroU32::new(1).expect("non-zero")),
+            replication_factor: ReplicationFactor::new(NonZeroU8::new(3).expect("non-zero")),
+            meta_voters: voters(&[1, 2, 3]),
+            max_concurrent_moves: MoveLimit::new(6),
+            maintenance: MaintenanceAuthority::Reservation,
         },
-        ControlPlaneState::FormationCut,
-        sample_state(),
-    ]
+        nodes: BTreeMap::from([
+            (node(1), NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: 16,
+            }),
+            (node(2), NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: 17,
+            }),
+            (node(3), NodeRecord {
+                lifecycle: NodeLifecycle::Cordoned,
+                since_ms: 18,
+            }),
+        ]),
+        groups: Placements(BTreeMap::from([(RaftGroupId(0), GroupPlacement::Live {
+            since: PlacementEpoch::new(meta(9, 28)),
+            converged_at: membership(10, 29),
+            target: Target::Stable {
+                voters: voters(&[1, 2, 3]),
+            },
+        })])),
+        retirements: BTreeMap::new(),
+    })
 }
 
-/// One command of every variant.
-pub(super) fn sample_commands() -> Vec<ControlCommand> {
+/// One state of every variant, and a bootstrapped one under each
+/// maintenance authority.
+pub fn sample_states() -> Vec<ControlPlaneState> {
+    every!(ControlPlaneState {
+        ControlPlaneState::Forming { .. } => ControlPlaneState::Forming {
+            registered: BTreeMap::from([(node(7), Registration { since_ms: 31 })]),
+        },
+        ControlPlaneState::FormationCut => ControlPlaneState::FormationCut,
+        ControlPlaneState::Bootstrapped(Cluster {
+            params: ClusterParams {
+                maintenance: MaintenanceAuthority::Placement,
+                ..
+            },
+            ..
+        }) => sample_state(),
+        ControlPlaneState::Bootstrapped(Cluster {
+            params: ClusterParams {
+                maintenance: MaintenanceAuthority::Reservation,
+                ..
+            },
+            ..
+        }) => sample_reservation_state(),
+    })
+}
+
+/// One command of every variant, and one lifecycle command per change.
+pub fn sample_commands() -> Vec<ControlCommand> {
     every!(ControlCommand {
         ControlCommand::RegisterNode { .. } => ControlCommand::RegisterNode {
             node: node(9),
@@ -343,7 +413,26 @@ pub(super) fn sample_commands() -> Vec<ControlCommand> {
             membership: membership(11, 46),
             now_ms: 50,
         },
-        ControlCommand::SetNodeLifecycle { .. } => ControlCommand::SetNodeLifecycle {
+        ControlCommand::SetNodeLifecycle {
+            change: LifecycleChange::Cordon,
+            ..
+        } => ControlCommand::SetNodeLifecycle {
+            node: node(13),
+            change: LifecycleChange::Cordon,
+            now_ms: 51,
+        },
+        ControlCommand::SetNodeLifecycle {
+            change: LifecycleChange::Uncordon,
+            ..
+        } => ControlCommand::SetNodeLifecycle {
+            node: node(14),
+            change: LifecycleChange::Uncordon,
+            now_ms: 52,
+        },
+        ControlCommand::SetNodeLifecycle {
+            change: LifecycleChange::Decommission,
+            ..
+        } => ControlCommand::SetNodeLifecycle {
             node: node(8),
             change: LifecycleChange::Decommission,
             now_ms: 47,
@@ -359,47 +448,52 @@ pub(super) fn sample_commands() -> Vec<ControlCommand> {
     })
 }
 
-/// One answer of every variant, accepted and refused.
-pub(super) fn sample_responses() -> Vec<ControlResponse> {
-    let record = NodeRecord {
-        lifecycle: NodeLifecycle::Cordoned,
-        since_ms: 51,
-    };
-    let applied = vec![
-        ControlApplied::NodeRegistered(Registered::Forming),
-        ControlApplied::NodeRegistered(Registered::Referenced(record)),
-        ControlApplied::NodeRegistered(Registered::Unreferenced(NodeRecord {
-            lifecycle: NodeLifecycle::Active,
-            since_ms: 52,
-        })),
-        ControlApplied::Bootstrapped,
-        ControlApplied::MoveAccepted {
+/// One answer of every variant, accepted and refused, and one registration
+/// answer per variant of [`Registered`].
+pub fn sample_responses() -> Vec<ControlResponse> {
+    let applied = every!(ControlApplied {
+        ControlApplied::NodeRegistered(Registered::Forming) => {
+            ControlApplied::NodeRegistered(Registered::Forming)
+        },
+        ControlApplied::NodeRegistered(Registered::Referenced(_)) => {
+            ControlApplied::NodeRegistered(Registered::Referenced(NodeRecord {
+                lifecycle: NodeLifecycle::Cordoned,
+                since_ms: 51,
+            }))
+        },
+        ControlApplied::NodeRegistered(Registered::Unreferenced(_)) => {
+            ControlApplied::NodeRegistered(Registered::Unreferenced(NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: 52,
+            }))
+        },
+        ControlApplied::Bootstrapped => ControlApplied::Bootstrapped,
+        ControlApplied::MoveAccepted { .. } => ControlApplied::MoveAccepted {
             since: PlacementEpoch::new(meta(13, 53)),
         },
-        ControlApplied::Converged {
+        ControlApplied::Converged { .. } => ControlApplied::Converged {
             since: PlacementEpoch::new(meta(14, 54)),
             retired: ids(&[3]),
             removed: ids(&[4]),
         },
-        ControlApplied::LifecycleChanged {
+        ControlApplied::LifecycleChanged { .. } => ControlApplied::LifecycleChanged {
             lifecycle: NodeLifecycle::Removed,
         },
-        ControlApplied::MoveLimitSet {
+        ControlApplied::MoveLimitSet { .. } => ControlApplied::MoveLimitSet {
             limit: MoveLimit::new(55),
         },
-        ControlApplied::TornDown,
-        ControlApplied::NothingToTearDown,
-    ];
-    let errors = sample_errors();
+        ControlApplied::TornDown => ControlApplied::TornDown,
+        ControlApplied::NothingToTearDown => ControlApplied::NothingToTearDown,
+    });
     applied
         .into_iter()
         .map(Ok)
-        .chain(errors.into_iter().map(Err))
+        .chain(sample_errors().into_iter().map(Err))
         .collect()
 }
 
-/// One error of every variant.
-pub(super) fn sample_errors() -> Vec<ControlError> {
+/// One error of every variant, and one invalid bootstrap per problem.
+pub fn sample_errors() -> Vec<ControlError> {
     let mut errors = every!(ControlError {
         ControlError::NotBootstrapped => ControlError::NotBootstrapped,
         ControlError::AlreadyBootstrapped => ControlError::AlreadyBootstrapped,
@@ -472,22 +566,30 @@ pub(super) fn sample_errors() -> Vec<ControlError> {
 }
 
 /// A genesis claim whose sets and counts differ from each other's.
-pub(super) fn sample_genesis_claim() -> GenesisClaim {
+pub fn sample_genesis_claim() -> GenesisClaim {
     GenesisClaim {
         meta_voters: voters(&[31, 32, 33]),
         peers: node_set(&[31, 32, 33, 34, 35]),
-        group_count: GroupCount::new(NonZeroU32::new(16).unwrap()),
-        replication_factor: ReplicationFactor::new(NonZeroU8::new(4).unwrap()),
+        group_count: GroupCount::new(NonZeroU32::new(16).expect("non-zero")),
+        replication_factor: ReplicationFactor::new(NonZeroU8::new(4).expect("non-zero")),
     }
 }
 
+/// One cause of every variant.
+pub fn sample_history_causes() -> Vec<HistoryCause> {
+    every!(HistoryCause {
+        HistoryCause::Genesis => HistoryCause::Genesis,
+        HistoryCause::Plan => HistoryCause::Plan,
+    })
+}
+
 /// One history answer of every variant.
-pub(super) fn sample_history_answers() -> Vec<HistoryBegun> {
-    vec![
-        HistoryBegun::Forming,
-        HistoryBegun::FormationCut,
-        HistoryBegun::Rebased {
+pub fn sample_history_answers() -> Vec<HistoryBegun> {
+    every!(HistoryBegun {
+        HistoryBegun::Forming => HistoryBegun::Forming,
+        HistoryBegun::FormationCut => HistoryBegun::FormationCut,
+        HistoryBegun::Rebased { .. } => HistoryBegun::Rebased {
             dropped: BTreeMap::from([(RaftGroupId(17), ids(&[20, 21]))]),
         },
-    ]
+    })
 }

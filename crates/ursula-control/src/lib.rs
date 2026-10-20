@@ -12,6 +12,9 @@
 //!   dispatcher, the seed rule, placement views and the admin JSON types.
 //!   Everything is re-exported here, together with the shared vocabulary of
 //!   [`ursula_proto::placement`].
+//! - `samples` (tests and the `test-support` feature only): one sample of
+//!   every variant of each kernel root, nested variants included, with
+//!   distinct field values, for the MessagePack fixtures of other crates.
 
 mod placement;
 
@@ -47,6 +50,8 @@ pub use placement::default_meta_voters;
 pub use placement::effective_replication_factor;
 pub use placement::group_ids;
 pub use placement::initializer;
+#[cfg(any(test, feature = "test-support"))]
+pub use placement::samples;
 pub use placement::seed_voters;
 pub use ursula_proto::placement::EmptyNodeSet;
 pub use ursula_proto::placement::GenesisClaim;

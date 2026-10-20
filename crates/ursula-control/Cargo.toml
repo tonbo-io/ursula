@@ -23,5 +23,11 @@ serde_json = { workspace = true }
 # the kernel is encoded with.
 ursula-stream = { path = "../ursula-stream" }
 
+[features]
+# `samples`: one sample of every variant of each kernel root, for the
+# MessagePack fixtures of other crates. Off by default: only dev-dependencies
+# turn it on.
+test-support = []
+
 [lints]
 workspace = true

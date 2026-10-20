@@ -41,6 +41,7 @@ use super::samples::sample_commands;
 use super::samples::sample_errors;
 use super::samples::sample_genesis_claim;
 use super::samples::sample_history_answers;
+use super::samples::sample_history_causes;
 use super::samples::sample_responses;
 use super::samples::sample_state;
 use super::samples::sample_states;
@@ -787,6 +788,9 @@ fn every_root_round_trips_through_messagepack_and_json() {
     }
     for answer in sample_history_answers() {
         round_trip(&answer);
+    }
+    for cause in sample_history_causes() {
+        round_trip(&cause);
     }
     round_trip(&sample_genesis_claim());
     let ControlPlaneState::Bootstrapped(cluster) = sample_state() else {

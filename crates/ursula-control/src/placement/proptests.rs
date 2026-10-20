@@ -976,6 +976,15 @@ fn check_forming(
     }
 }
 
+#[test]
+fn every_sample_state_holds_the_state_invariants() {
+    for state in super::samples::sample_states() {
+        if let Err(violation) = invariants(&state) {
+            panic!("{state:?}: {violation}");
+        }
+    }
+}
+
 proptest::proptest! {
     #![proptest_config(ProptestConfig {
         cases: 256,
