@@ -18,6 +18,7 @@ use ursula_shard::RaftGroupId;
 use super::world::Action;
 use super::world::Invariant;
 use super::world::Journal;
+use super::world::Outage;
 use super::world::ViewAt;
 use super::world::Violation;
 use super::world::World;
@@ -174,7 +175,8 @@ fn confirmation_before_a_voter_addition(world: &mut World) -> Result<(), Violati
     world.finish_teardown(4, GROUP)
 }
 
-/// C6(a), a step outliving its leadership (P0-18): leader 1 plans the
+/// C6(a), a step outliving its leadership, which only removing the
+/// learners before reporting `Converged` keeps safe: leader 1 plans the
 /// promotion of node 4 and its future is kept, node 2 leads a cancel to
 /// its convergence, and leader 1 leads again before the kept step runs.
 /// The converge removed the learner first, so the kept step's CAS fails.
@@ -252,7 +254,9 @@ fn the_placement_cas_across_a_meta_plan(world: &mut World) -> Result<(), Violati
 /// Leader 1 reaches `{1, 2, 4}` and its report goes in flight, then a data
 /// plan whose floor predates the report cuts the group back to
 /// `{1, 2, 3}`, and the report lands: it retires node 3, which the group
-/// lists as a voter again (P0-1).
+/// lists as a voter again. A data plan below a report voids the claims the
+/// report certified, so only the group's answers keep node 3's teardown
+/// from destroying a voter's log.
 fn a_report_a_data_plan_makes_wrong(world: &mut World) -> Result<(), Violation> {
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| committed_on(world, &[1, 2, 4]))?;
@@ -633,11 +637,13 @@ fn a_restart_with_a_regressed_view_creates_nothing_unconfirmed() {
 /// Group 0 on `{1}` moves to `{2}`. The move's joint entry commits and its
 /// second step waits for the next settle, which appends the uniform `{2}`
 /// while node 2 is cut off on the data plane: it stays uncommitted. Node 2
-/// reconnects with its open gate, and node 1, no voter of the uniform entry
-/// but one of the committed joint config, wins with node 2's vote: its
-/// no-op commits `{2}`. Node 1 leads outside its config and waits as no
-/// member, the next settle steps it down, node 2 reports, and node 1's
-/// teardown retires its replica.
+/// was cut off past an election timeout and campaigned (pre-vote is off),
+/// so its higher vote deposes node 1 before node 1's next append reaches
+/// it. Node 1, no voter of the uniform entry but one of the committed joint
+/// config, wins the election that follows with node 2's vote, its log
+/// being newer: its no-op commits `{2}`. Node 1 leads outside its config
+/// and waits as no member, the next settle steps it down, node 2 reports,
+/// and node 1's teardown retires its replica.
 fn an_outgoing_voter_wins_on_the_uniform_entry(world: &mut World) -> Result<(), Violation> {
     world.request_move(GROUP, &[2])?;
     world.drive(GROUP, &[2], DRIVE, |world| {
@@ -660,13 +666,22 @@ fn an_outgoing_voter_wins_on_the_uniform_entry(world: &mut World) -> Result<(), 
                 .is_some_and(|raft| raft.pending().is_some()),
         "the uniform {2} is appended and uncommitted",
     )?;
-    world.step(Action::Heal(node(2)))?;
-    world.step(Action::Campaign(GROUP, node(1)))?;
     world.ensure(
-        world.tally().outgoing_wins > 0
+        world.tally().outgoing_wins == 0 && world.tally().not_a_member == 0,
+        "no outgoing voter won and no leader waited as no member yet",
+    )?;
+    world.step(Action::Heal(node(2), Outage::Long))?;
+    world.ensure(
+        world.tally().deposed_by_returns > 0
+            && world.tally().outgoing_wins > 0
             && world.leader(GROUP) == Some(node(1))
             && committed_on(world, &[2]),
-        "node 1 won on the uniform entry and its no-op committed {2}",
+        "node 2's return deposed node 1, which won on the uniform entry and \
+         whose no-op committed {2}",
+    )?;
+    world.ensure(
+        world.tally().not_a_member == 0,
+        "node 1 did not wait as no member before it planned",
     )?;
     reconcile(world, 1, false)?;
     world.ensure(

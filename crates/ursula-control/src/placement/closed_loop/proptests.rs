@@ -5,38 +5,47 @@
 //! are made, and C5 must hold within a bound of fair rounds.
 //!
 //! The adversary crashes, restarts with regressed views, cuts nodes off on
-//! the data plane (they keep their gates, and a cut-off leader keeps
-//! leading its own copy once the others elected another), lags meta
-//! replicas, keeps step futures past their leadership, holds reports in
-//! flight, drops and delays second steps, lets a node that would win
-//! campaign (an outgoing voter on the uniform entry included), moves
-//! leadership and takes meta down. Each run also draws one family of
-//! operator recoveries: lifecycle changes with the decommission driver and
-//! the sweep, meta recovery plans, or data recovery plans. Combining them
-//! reaches states the design leaves to the operator (a removed voter after
-//! a meta plan, a data plan below a meta plan's loss), which the scripted
-//! traces cover instead. A data plan here keeps no less than the last
-//! certified membership, the only floor of 7.4's tool, and waits for the
-//! group's reports in flight, as the tool acts only on a group stalled
-//! longer than a report takes.
+//! the data plane (they keep their gates, and a cut-off leader keeps leading
+//! its own copy once the others elected another) and heals a cut shorter or
+//! longer than an election timeout. Ursula runs OpenRaft with pre-vote off,
+//! so a voter back from a longer cut campaigned during it, and its higher
+//! vote deposes the leaders replicating to it before their next append
+//! reaches it. In the election that follows, a voter of the committed joint
+//! config holding the uncommitted uniform entry may win, an outgoing one
+//! included. The adversary also lags meta replicas, keeps step futures past
+//! their leadership, holds reports in flight, drops and delays second steps,
+//! lets a node that would win campaign, moves leadership and takes meta
+//! down. In half the runs every second step waits for its group's next fair
+//! round, and the adversary cuts off an incoming voter while one waits and
+//! heals the voters a leader holds an uncommitted entry back from: the
+//! uniform entry is held back, and a long cut's heal hands the election to
+//! the outgoing voter. Each run also draws one family of operator
+//! recoveries: lifecycle changes with the decommission driver and the sweep,
+//! meta recovery plans, or data recovery plans. Combining them reaches
+//! states the design leaves to the operator (a removed voter after a meta
+//! plan, a data plan below a meta plan's loss), which the scripted traces
+//! cover instead. A data plan here keeps no less than the last certified
+//! membership, the only floor of 7.4's tool, and waits for the group's
+//! reports in flight, as the tool acts only on a group stalled longer than a
+//! report takes.
 //!
 //! Now and then a step is a fair turn of one group's actors instead of one
 //! action, so that moves make progress between the faults and the
 //! operator commands that interrupt them.
 //!
 //! The tally shows the random runs, not only the traces, reach the paths
-//! only faults reach. The 64 cases of PR CI reach the removal and the
-//! sweep (C9), the placement CAS, the leadership proof, step 0's
+//! only faults reach. The [`CASES`] cases of PR CI reach the removal and
+//! the sweep (C9), the placement CAS, the leadership proof, step 0's
 //! `NotAMember` wait, kept steps run in a later leadership, lost and
 //! delayed second steps, cut-off leaders' steps, initializations, the
-//! model's own recovery plans, and elections keeping or truncating an
-//! uncommitted membership entry. `PROPTEST_CASES` overrides the case count
-//! for a longer sweep, and from `SWEEP` cases on the tally also asserts
-//! teardowns held at step 0 and readmitted at step 5, and reopens. An
-//! outgoing voter's win needs a cut that holds the uniform entry back,
-//! heals before any heartbeat, and a campaign in between: the scripted
-//! trace `an_outgoing_voter_wins_on_the_uniform_entry_and_steps_down` pins
-//! it, and the tally only counts it.
+//! model's own recovery plans, elections keeping or truncating an
+//! uncommitted membership entry, leaders deposed by a voter back from a
+//! long cut, and an outgoing voter's win on the uncommitted uniform entry.
+//! `PROPTEST_CASES` overrides the case count for a longer sweep, and from
+//! [`SWEEP`] cases on the tally also asserts teardowns held at step 0 and
+//! readmitted at step 5, and reopens. The scripted trace
+//! `an_outgoing_voter_wins_on_the_uniform_entry_and_steps_down` pins the
+//! outgoing voter's win step by step.
 
 use std::cell::Cell;
 
@@ -51,6 +60,7 @@ use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
 use super::world::Action;
+use super::world::Outage;
 use super::world::Tally;
 use super::world::ViewAt;
 use super::world::Violation;
@@ -59,6 +69,10 @@ use crate::placement::ControlCommand;
 use crate::placement::GroupPlacement;
 use crate::placement::LifecycleChange;
 use crate::placement::MoveLimit;
+
+/// The case count of PR CI (about 1.5 s), from which the tally asserts
+/// what random runs reach.
+const CASES: u32 = 256;
 
 /// The case count from which the tally asserts the rarer paths too.
 const SWEEP: u32 = 1024;
@@ -246,10 +260,18 @@ fn action(world: &World, recoveries: Recoveries, (op, x, y, z): (u8, u8, u8, u8)
             }
         }
         17 => {
+            // The adversary heals a node a leader holds an entry back from,
+            // or cuts off an incoming voter while a second step waits.
+            let node = world.held_back().filter(|_| one_in(y, 2)).unwrap_or(node);
             if world.partitioned(node) {
-                Action::Heal(node)
+                let outage = if one_in(z, 2) {
+                    Outage::Long
+                } else {
+                    Outage::Short
+                };
+                Action::Heal(node, outage)
             } else {
-                Action::Partition(node)
+                Action::Partition(world.incoming_awaiting_round().unwrap_or(node))
             }
         }
         18 => Action::View(node, view_at(world, z)),
@@ -306,13 +328,13 @@ fn campaigner(world: &World, group: RaftGroupId, x: u8) -> Option<NodeId> {
     (!winners.is_empty()).then(|| winners[index(x, winners.len())])
 }
 
-/// The fixed-seed config: 64 long runs, unless `PROPTEST_CASES` says
-/// otherwise.
+/// The fixed-seed config: [`CASES`] long runs, unless `PROPTEST_CASES`
+/// says otherwise.
 fn config() -> ProptestConfig {
     let cases = std::env::var("PROPTEST_CASES")
         .ok()
         .and_then(|cases| cases.parse().ok())
-        .unwrap_or(64);
+        .unwrap_or(CASES);
     ProptestConfig {
         cases,
         rng_seed: RngSeed::Fixed(768),
@@ -340,10 +362,11 @@ fn the_closed_loop_keeps_c1_to_c9() {
         0_u8..3,
         proptest::bool::ANY,
         proptest::collection::vec(any::<(u8, u8, u8, u8)>(), 0..=200),
+        proptest::bool::ANY,
     );
     let result = TestRunner::new(config()).run(
         &strategy,
-        |(nodes, groups, rf, family, formed, steps)| -> TestCaseResult {
+        |(nodes, groups, rf, family, formed, steps, waits)| -> TestCaseResult {
             let recoveries = match family {
                 0 => Recoveries::Lifecycles,
                 1 => Recoveries::MetaPlans,
@@ -353,6 +376,9 @@ fn the_closed_loop_keeps_c1_to_c9() {
             if formed {
                 let result = world.quiesce(FORM_ROUNDS);
                 fail_on(&world, result)?;
+            }
+            if waits {
+                world.delay_every_second_step();
             }
             for raw in steps {
                 let result = match generate(&world, recoveries, raw) {
@@ -391,16 +417,19 @@ fn the_closed_loop_keeps_c1_to_c9() {
         ("recovery_elections", tally.recovery_elections),
         ("pending_kept", tally.pending_kept),
         ("pending_truncated", tally.pending_truncated),
+        ("deposed_by_returns", tally.deposed_by_returns),
+        ("outgoing_wins", tally.outgoing_wins),
     ];
     let at_scale = [
-        ("held_at_ask", tally.held_at_ask),
+        ("held_asks", tally.held_asks),
         ("readmitted_at_ask_again", tally.readmitted_at_ask_again),
         ("reopens", tally.reopens),
     ];
-    let swept = config().cases >= SWEEP;
+    let cases = config().cases;
     for (path, count) in reached
         .into_iter()
-        .chain(at_scale.into_iter().filter(|_| swept))
+        .filter(|_| cases >= CASES)
+        .chain(at_scale.into_iter().filter(|_| cases >= SWEEP))
     {
         assert!(
             count > 0,

@@ -219,6 +219,9 @@ pub(crate) struct Elections {
     pub(crate) outgoing: usize,
     /// A recovery plan elected a leader.
     pub(crate) plans: usize,
+    /// Leaders a voter returning from a long cut deposed with its higher
+    /// vote.
+    pub(crate) deposed: usize,
 }
 
 /// What heals a cut.
@@ -909,6 +912,75 @@ impl Group {
     /// `node` reaches the others again, with the gate it had.
     pub(crate) fn reconnect(&mut self, node: NodeId) {
         self.cut.remove(&node);
+    }
+
+    /// `node` reaches the others again after a cut longer than an election
+    /// timeout. Ursula runs OpenRaft with pre-vote off, so a node that may
+    /// campaign (a voter of its effective or committed membership, its gate
+    /// open) campaigned during the cut and comes back with a higher vote.
+    /// A live leader replicating to it refuses that vote on its newer log,
+    /// its next append to `node` is rejected by the higher vote, and it
+    /// steps down (`Notification::HigherVote`) before anything it appended
+    /// reaches `node`. An election follows, which a voter of the committed
+    /// joint config holding the uncommitted uniform entry may win.
+    pub(crate) fn reconnect_after_timeout(&mut self, node: NodeId) {
+        self.reconnect(node);
+        let campaigned = self.alive.contains(&node)
+            && self.gate(node) == Gate::Open
+            && (self
+                .membership_of(node)
+                .is_some_and(|(config, _)| config.is_voter(node))
+                || self.committed.is_voter(node));
+        let Some(leader) = self.leader else {
+            return;
+        };
+        let replicates_to = self.alive.contains(&leader)
+            && self.reachable(leader, node)
+            && self
+                .membership_of(leader)
+                .is_some_and(|(config, _)| config.is_member(node));
+        if !campaigned || leader == node || !replicates_to {
+            return;
+        }
+        self.elections.deposed = self.elections.deposed.checked_add(1).unwrap();
+        self.lose_leadership();
+        self.elect();
+    }
+
+    /// The voters of the live leader's uncommitted membership entry that a
+    /// cut keeps from it: a long cut of one of them, healed, deposes the
+    /// leader before the entry reaches it.
+    pub(crate) fn held_back(&self) -> BTreeSet<NodeId> {
+        let Some(leader) = self.leader.filter(|leader| self.alive.contains(leader)) else {
+            return BTreeSet::new();
+        };
+        let Some((config, id)) = self.membership_of(leader) else {
+            return BTreeSet::new();
+        };
+        if id.index <= self.commit_index {
+            return BTreeSet::new();
+        }
+        config
+            .voters()
+            .into_iter()
+            .filter(|voter| self.cut.contains_key(voter) && !self.holds(*voter, id))
+            .collect()
+    }
+
+    /// The incoming voters of a voter change whose second step waits for
+    /// the next fair round, which no cut holds off yet: cutting off a
+    /// majority of them holds the uniform entry back once it is appended.
+    pub(crate) fn incoming_awaiting_round(&self) -> BTreeSet<NodeId> {
+        let Some(future) = self.future.as_ref().filter(|future| future.delayed) else {
+            return BTreeSet::new();
+        };
+        let Some((MembershipConfig::Joint { old, new, .. }, _)) = self.membership_of(future.leader)
+        else {
+            return BTreeSet::new();
+        };
+        new.iter()
+            .filter(|node| !old.contains(*node) && !self.cut.contains_key(node))
+            .collect()
     }
 
     /// The fair environment: a leader a past round removed steps down, an

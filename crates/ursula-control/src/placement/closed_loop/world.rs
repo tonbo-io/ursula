@@ -17,7 +17,10 @@
 //!   elected again on its uniform entry, a leader outside the committed
 //!   config leading until its step-down, transfers, catch-up and gates, and
 //!   data recovery plans. A node cut off on the data plane stays a member
-//!   that nobody reaches. On top of the group the model keeps the copy each
+//!   that nobody reaches. Back from a cut longer than an election timeout,
+//!   a voter that campaigned during it deposes the leaders that replicate
+//!   to it before their next append lands, as pre-vote is off, and an
+//!   election follows. On top of the group the model keeps the copy each
 //!   cut-off leader still leads once the others elected another, and step
 //!   futures kept past their leadership.
 //!
@@ -225,7 +228,8 @@ pub(super) enum Action {
     /// The node is cut off from every other node on the data plane. Meta
     /// still reaches it.
     Partition(NodeId),
-    Heal(NodeId),
+    /// The node reaches the others again after a cut of the given length.
+    Heal(NodeId, Outage),
     /// The node's meta replica shows the given state, and lags there until
     /// a later action shows it the latest.
     View(NodeId, ViewAt),
@@ -242,6 +246,17 @@ pub(super) enum Action {
     },
     /// Meta answers, or not.
     MetaAvailable(bool),
+}
+
+/// How long a data-plane cut lasted, against OpenRaft's election timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Outage {
+    /// Shorter: the node never campaigned, and reconnects with its gate.
+    Short,
+    /// Longer: a node that may campaign did, with pre-vote off, and its
+    /// higher vote deposes the leaders that replicate to it before any
+    /// heartbeat lands (`Group::reconnect_after_timeout`).
+    Long,
 }
 
 /// One meta entry and the state after it.
@@ -499,6 +514,8 @@ pub(super) struct Tally {
     pub(super) not_a_member: usize,
     /// Elections an outgoing voter won on the uncommitted uniform entry.
     pub(super) outgoing_wins: usize,
+    /// Leaders a voter back from a long cut deposed with its higher vote.
+    pub(super) deposed_by_returns: usize,
     /// Kept step futures that ran in a later leadership of their planner.
     pub(super) kept_later: usize,
     /// Second steps lost to a leadership change.
@@ -507,8 +524,9 @@ pub(super) struct Tally {
     pub(super) delayed_second_steps: usize,
     /// Membership steps a leader cut off on the data plane executed.
     pub(super) cut_off_steps: usize,
-    /// Teardowns step 0 held, the group not answering `NotMember`.
-    pub(super) held_at_ask: usize,
+    /// Teardown steps that asked at step 0 and were held, the group not
+    /// answering `NotMember`: a teardown held for several steps counts each.
+    pub(super) held_asks: usize,
     /// Teardowns step 5 readmitted, the group not answering `NotMember`.
     pub(super) readmitted_at_ask_again: usize,
     /// Retired logs a `Create` reopened as `Recovering` (7.3).
@@ -537,6 +555,9 @@ impl Tally {
             unproven_reports: self.unproven_reports.saturating_add(other.unproven_reports),
             not_a_member: self.not_a_member.saturating_add(other.not_a_member),
             outgoing_wins: self.outgoing_wins.saturating_add(other.outgoing_wins),
+            deposed_by_returns: self
+                .deposed_by_returns
+                .saturating_add(other.deposed_by_returns),
             kept_later: self.kept_later.saturating_add(other.kept_later),
             dropped_second_steps: self
                 .dropped_second_steps
@@ -545,7 +566,7 @@ impl Tally {
                 .delayed_second_steps
                 .saturating_add(other.delayed_second_steps),
             cut_off_steps: self.cut_off_steps.saturating_add(other.cut_off_steps),
-            held_at_ask: self.held_at_ask.saturating_add(other.held_at_ask),
+            held_asks: self.held_asks.saturating_add(other.held_asks),
             readmitted_at_ask_again: self
                 .readmitted_at_ask_again
                 .saturating_add(other.readmitted_at_ask_again),
@@ -573,8 +594,9 @@ pub(super) struct World {
     /// converge entry: the retirements' claims (6.2) start there.
     certified: BTreeMap<(RaftGroupId, MetaLogId), MembershipLogId>,
     /// Groups a data plan cut below what a report or a teardown relied on:
-    /// C1's destruction clause and C3's claims skip them from then on
-    /// (P0-1, I8's exception).
+    /// C1's destruction clause and C3's claims skip them from then on: a
+    /// data plan below a report voids what the report certified (I8's
+    /// exception). The destruction check itself is never skipped.
     uncertified: BTreeSet<RaftGroupId>,
     /// Snapshot objects the removed-node sweep deleted.
     swept: BTreeSet<(RaftGroupId, NodeId)>,
@@ -590,6 +612,9 @@ pub(super) struct World {
     pub(super) boot_len: usize,
     /// The replication factor the cluster bootstrapped with.
     rf: usize,
+    /// Every second step waits for its group's next fair round, until the
+    /// faults stop: the window in which a cut holds a uniform entry back.
+    second_steps_wait: bool,
     tally: Tally,
 }
 
@@ -646,6 +671,7 @@ impl World {
             log: Vec::new(),
             boot_len,
             rf: usize::from(replication_factor.get()),
+            second_steps_wait: false,
             tally: Tally::default(),
         }
     }
@@ -654,6 +680,13 @@ impl World {
     pub(super) fn step(&mut self, action: Action) -> Result<(), Violation> {
         self.log.push(action.clone());
         self.sync();
+        if self.second_steps_wait {
+            for data in self.groups.values_mut() {
+                if let Some(raft) = data.raft.as_mut() {
+                    raft.delay_second_step = true;
+                }
+            }
+        }
         self.act(action);
         self.sync();
         self.observe();
@@ -712,7 +745,7 @@ impl World {
             Action::Crash(node) => self.crash(node),
             Action::Restart(node, at) => self.restart(node, at),
             Action::Partition(node) => self.partition(node),
-            Action::Heal(node) => self.heal(node),
+            Action::Heal(node, outage) => self.heal(node, outage),
             Action::View(node, at) => {
                 let view = self.meta_view(at);
                 if let Some(state) = self.nodes.get_mut(&node) {
@@ -745,6 +778,30 @@ impl World {
 
     pub(super) fn leader(&self, group: RaftGroupId) -> Option<NodeId> {
         self.raft(group).and_then(|raft| raft.leader)
+    }
+
+    /// Every second step waits for its group's next fair round until the
+    /// faults stop.
+    pub(super) fn delay_every_second_step(&mut self) {
+        self.second_steps_wait = true;
+    }
+
+    /// An incoming voter of a voter change whose second step waits for the
+    /// next fair round, not cut off yet, if any.
+    pub(super) fn incoming_awaiting_round(&self) -> Option<NodeId> {
+        self.groups
+            .values()
+            .filter_map(|data| data.raft.as_ref())
+            .find_map(|raft| raft.incoming_awaiting_round().into_iter().next())
+    }
+
+    /// A node cut off on the data plane that a group's live leader holds an
+    /// uncommitted membership entry back from, if any.
+    pub(super) fn held_back(&self) -> Option<NodeId> {
+        self.groups
+            .values()
+            .filter_map(|data| data.raft.as_ref())
+            .find_map(|raft| raft.held_back().into_iter().next())
     }
 
     /// A leader of the group cut off on the data plane, if any.
@@ -917,6 +974,7 @@ impl World {
         let sum = |count: fn(&Group) -> usize| -> usize { rafts().map(count).sum() };
         Tally {
             outgoing_wins: sum(|raft| raft.elections.outgoing),
+            deposed_by_returns: sum(|raft| raft.elections.deposed),
             recovery_elections: sum(|raft| raft.elections.plans),
             pending_kept: sum(|raft| raft.elections.pending_kept),
             pending_truncated: sum(|raft| raft.elections.pending_truncated),
@@ -1234,7 +1292,7 @@ impl World {
         let next = match teardown.advance(event) {
             TeardownOutcome::Continue(next) => {
                 if teardown == Teardown::Asking && next == Teardown::Asking {
-                    self.tally.held_at_ask = self.tally.held_at_ask.saturating_add(1);
+                    self.tally.held_asks = self.tally.held_asks.saturating_add(1);
                 }
                 Some(next)
             }
@@ -1698,13 +1756,20 @@ impl World {
     }
 
     /// The node reaches the others again with the gates it had, and its
-    /// copies of the groups it led are gone.
-    fn heal(&mut self, node: NodeId) {
+    /// copies of the groups it led are gone. After a long outage it
+    /// reconnects in every group now, deposing the leaders its higher vote
+    /// reaches before the next heartbeat.
+    fn heal(&mut self, node: NodeId, outage: Outage) {
         if let Some(state) = self.nodes.get_mut(&node) {
             state.partitioned = false;
         }
         for data in self.groups.values_mut() {
             data.deposed.remove(&node);
+            if outage == Outage::Long
+                && let Some(raft) = data.raft.as_mut()
+            {
+                raft.reconnect_after_timeout(node);
+            }
         }
     }
 
@@ -2210,6 +2275,7 @@ impl World {
     /// (12.2's discard step), lagging views catch up, kept steps run or are
     /// dropped and every report in flight lands.
     pub(super) fn stop_faults(&mut self) -> Result<(), Violation> {
+        self.second_steps_wait = false;
         self.step(Action::MetaAvailable(true))?;
         self.step(Action::Command(ControlCommand::SetMoveLimit {
             limit: MoveLimit::new(DEFAULT_MOVE_LIMIT),
@@ -2222,7 +2288,7 @@ impl World {
                 .get(&node)
                 .is_some_and(|state| state.removed && !removed.contains(&node));
             if self.partitioned(node) {
-                self.step(Action::Heal(node))?;
+                self.step(Action::Heal(node, Outage::Short))?;
             }
             if self.alive(node) && misled {
                 self.step(Action::Crash(node))?;
