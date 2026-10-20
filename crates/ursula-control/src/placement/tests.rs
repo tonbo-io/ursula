@@ -368,6 +368,10 @@ fn ineligible_target_refuses_keeping_a_cordoned_incoming_node_and_the_move_still
             lifecycle: NodeLifecycle::Cordoned,
         } if group == G0 && n == node(4)
     ));
+    assert_eq!(
+        error.to_string(),
+        "node 4 is cordoned and cannot join group 0"
+    );
     // The cancel names only the source's voters, so it is accepted.
     let accepted = driver.request_move(G0, &[1, 2, 3]).unwrap();
     assert_eq!(accepted, ControlApplied::MoveAccepted {

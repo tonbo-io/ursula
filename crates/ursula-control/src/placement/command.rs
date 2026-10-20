@@ -203,7 +203,7 @@ pub enum ControlError {
         current: u8,
         requested: u8,
     },
-    #[error("node {node} is {lifecycle:?} and cannot join group {}", .group.0)]
+    #[error("node {node} is {lifecycle} and cannot join group {}", .group.0)]
     IneligibleTarget {
         group: RaftGroupId,
         node: NodeId,

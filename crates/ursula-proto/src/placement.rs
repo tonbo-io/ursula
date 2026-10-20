@@ -198,6 +198,18 @@ pub enum NodeLifecycle {
     Removed,
 }
 
+impl fmt::Display for NodeLifecycle {
+    /// The lifecycle's name as its encodings write it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Active => "active",
+            Self::Cordoned => "cordoned",
+            Self::Decommissioning => "decommissioning",
+            Self::Removed => "removed",
+        })
+    }
+}
+
 /// A registered node's lifecycle and when it entered it (display only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeRecord {
@@ -557,6 +569,7 @@ mod tests {
     use super::GroupCount;
     use super::MetaLogId;
     use super::NodeId;
+    use super::NodeLifecycle;
     use super::NodeSet;
     use super::RaftLogId;
     use super::ReplicationFactor;
@@ -587,6 +600,19 @@ mod tests {
             VoterSet::from_first(NodeId::new(5), [NodeId::new(2), NodeId::new(5)]),
             VoterSet::new(ids(&[2, 5])).unwrap()
         );
+    }
+
+    #[test]
+    fn a_lifecycle_displays_as_its_encodings_name() {
+        for lifecycle in [
+            NodeLifecycle::Active,
+            NodeLifecycle::Cordoned,
+            NodeLifecycle::Decommissioning,
+            NodeLifecycle::Removed,
+        ] {
+            let json = serde_json::to_string(&lifecycle).unwrap();
+            assert_eq!(json, format!("\"{lifecycle}\""));
+        }
     }
 
     #[test]
