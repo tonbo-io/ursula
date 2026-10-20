@@ -7,7 +7,7 @@ authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 readme.workspace = true
-description = "Control-plane state for Ursula dynamic node registration, group placement, and maintenance operations."
+description = "The placement kernel of Ursula's meta group: desired group placement, node lifecycles and retirements, as a pure state machine."
 
 [dependencies]
 serde = { workspace = true }
@@ -18,6 +18,10 @@ ursula-proto = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+# Path-only: a versionless dev-dependency is dropped from the published
+# manifest. `ursula_stream::msgpack` is the codec every replicated root of
+# the kernel is encoded with.
+ursula-stream = { path = "../ursula-stream" }
 
 [lints]
 workspace = true
