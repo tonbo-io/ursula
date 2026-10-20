@@ -5,7 +5,6 @@
 //! with no wildcard ([`every`]), so a new variant does not compile until it
 //! has a sample.
 
-use ursula_proto::admin::ApplyFailureKind;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -17,6 +16,7 @@ use ursula_stream::StreamErrorContext;
 use ursula_stream::StreamSnapshotError;
 
 use super::AnswerProblem;
+use super::ApplyStopKind;
 use super::ColdOperation;
 use super::EngineOperation;
 use super::ForwardFailure;
@@ -262,7 +262,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             raft_group_id: GROUP,
             term: 4,
             index: 19,
-            kind: ApplyFailureKind::Panic,
+            kind: ApplyStopKind::Panic,
         },
         GroupInfraError::InvalidRaftCommand { .. } => GroupInfraError::InvalidRaftCommand {
             command: UnproposableCommand::CreateBucket,
@@ -389,10 +389,9 @@ fn infra_errors() -> Vec<GroupInfraError> {
         ),
     });
     errors.extend(
-        every_unit!(ApplyFailureKind {
+        every_unit!(ApplyStopKind {
             Panic,
-            InvariantViolation,
-            Unknown
+            InvariantViolation
         })
         .into_iter()
         .map(|kind| GroupInfraError::ApplyStopped {

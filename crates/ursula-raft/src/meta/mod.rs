@@ -9,6 +9,12 @@
 //! enum. The persisted-envelopes and commands-and-responses fixtures pin
 //! each root.
 //!
+//! `#[serde(other)]` is allowed only on admin JSON enums (the admin
+//! vocabulary of `ursula_proto::placement`), and forbidden on every type
+//! here and on every other type of the replicated, persisted or RPC
+//! MessagePack closure: an unknown variant decoding as "other" would hide a
+//! format mismatch.
+//!
 //! Nothing runs the meta group yet: this module is its format, and the
 //! state machine, the journal and the transport that use it land with the
 //! meta runtime.

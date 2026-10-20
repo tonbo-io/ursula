@@ -396,7 +396,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
                 .await,
             Err(ursula_runtime::RuntimeError::GroupEngine {
                 error: ursula_runtime::GroupEngineError::Infra(
-                    ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
+                    ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyStopKind::Panic, .. }
                 ),
                 ..
             }) if index == poison_index
@@ -406,7 +406,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         runtime.warm_group(RaftGroupId(0)).await,
         Err(ursula_runtime::RuntimeError::GroupEngine {
             error: ursula_runtime::GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyFailureKind::Panic, .. }
+                ursula_runtime::GroupInfraError::ApplyStopped { index, kind: crate::apply_failure::ApplyStopKind::Panic, .. }
             ),
             ..
         }) if index == poison_index

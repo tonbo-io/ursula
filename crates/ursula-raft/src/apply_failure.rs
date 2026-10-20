@@ -4,6 +4,7 @@ use std::sync::Mutex;
 
 pub use ursula_proto::admin::ApplyFailure;
 pub use ursula_proto::admin::ApplyFailureKind;
+pub use ursula_runtime::ApplyStopKind;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_shard::RaftGroupId;
@@ -16,24 +17,50 @@ pub(crate) enum ApplyError {
     InvariantViolation(#[source] GroupEngineError),
 }
 impl ApplyError {
-    pub(crate) fn kind(&self) -> ApplyFailureKind {
+    pub(crate) fn kind(&self) -> ApplyStopKind {
         match self {
-            Self::Panic { .. } => ApplyFailureKind::Panic,
-            Self::InvariantViolation(_) => ApplyFailureKind::InvariantViolation,
+            Self::Panic { .. } => ApplyStopKind::Panic,
+            Self::InvariantViolation(_) => ApplyStopKind::InvariantViolation,
         }
     }
 }
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ApplyHealth(Arc<Mutex<Option<StoppedApply>>>);
 
+/// A group whose committed apply stopped: the entry it stopped at and why.
 #[derive(Debug, Clone)]
 pub(crate) struct StoppedApply {
-    pub(crate) failure: ApplyFailure,
+    pub(crate) term: u64,
+    pub(crate) index: u64,
+    pub(crate) kind: ApplyStopKind,
+    pub(crate) message: String,
     pub(crate) last_applied: Option<openraft::alias::LogIdOf<crate::types::UrsulaRaftTypeConfig>>,
+}
+impl StoppedApply {
+    /// The stop as the group metrics show it, with the admin plane's form of
+    /// its kind: the one conversion of [`ApplyStopKind`].
+    pub(crate) fn failure(&self) -> ApplyFailure {
+        ApplyFailure {
+            term: self.term,
+            index: self.index,
+            kind: self.kind.into(),
+            message: self.message.clone(),
+        }
+    }
+
+    /// The refusal of every request to the stopped group.
+    pub(crate) fn error(&self, raft_group_id: RaftGroupId) -> GroupEngineError {
+        GroupEngineError::Infra(GroupInfraError::ApplyStopped {
+            raft_group_id,
+            term: self.term,
+            index: self.index,
+            kind: self.kind,
+        })
+    }
 }
 impl ApplyHealth {
     pub(crate) fn failure(&self) -> Option<ApplyFailure> {
-        self.stopped().map(|stopped| stopped.failure)
+        self.stopped().map(|stopped| stopped.failure())
     }
     pub(crate) fn stopped(&self) -> Option<StoppedApply> {
         self.0
@@ -41,29 +68,17 @@ impl ApplyHealth {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
-    pub(crate) fn stop(
-        &self,
-        failure: ApplyFailure,
-        last_applied: Option<openraft::alias::LogIdOf<crate::types::UrsulaRaftTypeConfig>>,
-    ) {
+    /// Records the first stop; a later one leaves it.
+    pub(crate) fn stop(&self, stopped: StoppedApply) {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get_or_insert(StoppedApply {
-                failure,
-                last_applied,
-            });
+            .get_or_insert(stopped);
     }
     pub(crate) fn check(&self, raft_group_id: RaftGroupId) -> Result<(), GroupEngineError> {
-        if let Some(failure) = self.failure() {
-            Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped {
-                raft_group_id,
-                term: failure.term,
-                index: failure.index,
-                kind: failure.kind,
-            }))
-        } else {
-            Ok(())
+        match self.stopped() {
+            Some(stopped) => Err(stopped.error(raft_group_id)),
+            None => Ok(()),
         }
     }
 }

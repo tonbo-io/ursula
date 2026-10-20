@@ -1726,7 +1726,7 @@ mod tests {
                 raft_group_id: ursula_shard::RaftGroupId(2),
                 term: 3,
                 index: 7,
-                kind: ursula_proto::admin::ApplyFailureKind::Panic,
+                kind: ursula_runtime::ApplyStopKind::Panic,
             },
             ursula_runtime::GroupInfraError::OutcomeUnknown,
         ] {

@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 pub use error::AnswerProblem;
+pub use error::ApplyStopKind;
 pub use error::ColdOperation;
 pub use error::EngineOperation;
 pub use error::ForwardFailure;

@@ -155,6 +155,7 @@ pub use cold_worker::spawn_cold_orphan_sweep_worker;
 pub use cold_worker::spawn_cold_ref_offload_worker;
 pub use command::GroupSnapshot;
 pub use engine::AnswerProblem;
+pub use engine::ApplyStopKind;
 pub use engine::ColdOperation;
 pub use engine::EngineOperation;
 pub use engine::ForwardFailure;

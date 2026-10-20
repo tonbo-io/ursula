@@ -1235,7 +1235,7 @@ impl RaftGroupHandleRegistry {
                     snapshots.push(RaftGroupMetricsSnapshot {
                         raft_group_id,
                         node_id: *node_id,
-                        current_term: stopped.failure.term,
+                        current_term: stopped.term,
                         current_leader: None,
                         last_log: None,
                         committed: None,
@@ -1254,7 +1254,7 @@ impl RaftGroupHandleRegistry {
                             membership_log_index: None,
                             stopped_for_operator: false,
                         },
-                        apply_failure: Some(stopped.failure.clone()),
+                        apply_failure: Some(stopped.failure()),
                         log,
                         history: None,
                         recovery: None,
@@ -1366,14 +1366,7 @@ impl RaftGroupHandleRegistry {
                 active.apply_health.check(group)?;
                 Ok(active.clone())
             }
-            GroupEntry::ApplyStopped { stopped, .. } => Err(GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::ApplyStopped {
-                    raft_group_id: group,
-                    term: stopped.failure.term,
-                    index: stopped.failure.index,
-                    kind: stopped.failure.kind,
-                },
-            )),
+            GroupEntry::ApplyStopped { stopped, .. } => Err(stopped.error(group)),
         }
     }
 

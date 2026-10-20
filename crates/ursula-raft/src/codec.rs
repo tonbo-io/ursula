@@ -884,6 +884,30 @@ mod tests {
         );
     }
 
+    /// The apply-stop kind is closed on the wire: an `ApplyStopped` with a
+    /// kind this build does not know does not decode, so a peer of another
+    /// format shows as a mismatch instead of a stop of no known kind.
+    #[test]
+    fn an_apply_stop_of_an_unknown_kind_does_not_decode() {
+        let known = ursula_runtime::GroupEngineError::Infra(
+            ursula_runtime::GroupInfraError::ApplyStopped {
+                raft_group_id: ursula_shard::RaftGroupId(7),
+                term: 5,
+                index: 20,
+                kind: ursula_runtime::ApplyStopKind::Panic,
+            },
+        );
+        let bytes = encode_wire(&known).to_vec();
+        let panic = b"\xa5panic";
+        assert!(bytes.ends_with(panic));
+        let mut unknown = bytes[..bytes.len() - panic.len()].to_vec();
+        unknown.extend_from_slice(b"\xa7unknown");
+        assert!(matches!(
+            decode_wire::<ursula_runtime::GroupEngineError>(&unknown, "apply stop"),
+            Err(super::WireDecodeError { .. })
+        ));
+    }
+
     /// The form of a fixture: a JSON object with one entry per line.
     fn one_entry_per_line<T: serde::Serialize>(
         entries: &std::collections::BTreeMap<String, T>,

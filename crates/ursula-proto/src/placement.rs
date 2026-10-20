@@ -50,6 +50,11 @@
 //! admin JSON struct is required, also when `null`
 //! ([`crate::admin::required_option`]).
 //!
+//! `#[serde(other)]` is allowed only on these admin JSON enums. It is
+//! forbidden on every format type, and on every other type of the
+//! replicated, persisted or RPC MessagePack closure: an unknown variant
+//! decoding as "other" would hide a format mismatch.
+//!
 //! Group ids are `RaftGroupId` in the kernel's state and plain `u32` in admin
 //! JSON.
 
