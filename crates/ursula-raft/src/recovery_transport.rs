@@ -3,7 +3,6 @@ use std::time::Duration;
 
 use openraft::RaftNetworkV2;
 use openraft::network::RPCOption;
-use ursula_shard::ShardPlacement;
 
 use crate::UrsulaVote;
 use crate::grpc::GrpcRaftNetwork;
@@ -11,20 +10,21 @@ use crate::grpc::probe_rejoin_vote_barrier;
 use crate::rejoin::PeerGroupLog;
 use crate::rejoin::RecoveryTransport;
 use crate::rejoin::bootstrap_probe_vote;
+use crate::target::RaftTarget;
 
-/// Recovery probes over gRPC. A peer is dialed at the cluster URL
-/// `raft.peers` lists for it in `transport`'s peer cluster. A peer it does
-/// not list is not probed.
+/// Recovery probes over gRPC, about group `target`. A peer is dialed at the
+/// cluster URL `raft.peers` lists for it in `transport`'s peer cluster. A
+/// peer it does not list is not probed.
 #[derive(Clone)]
 pub(crate) struct GrpcRecoveryTransport {
     pub transport: std::sync::Arc<crate::grpc::CoreRaftTransport>,
-    pub placement: ShardPlacement,
+    pub target: RaftTarget,
     pub timeout: Duration,
 }
 impl RecoveryTransport for GrpcRecoveryTransport {
     type Error = crate::grpc::RecoveryProbeError;
     async fn probe(&self, peer: u64) -> Option<PeerGroupLog> {
-        GrpcRaftNetwork::new(self.transport.clone(), self.placement.raft_group_id, peer)
+        GrpcRaftNetwork::new(self.transport.clone(), self.target, peer)
             .vote(bootstrap_probe_vote(), RPCOption::new(self.timeout))
             .await
             .ok()
@@ -33,7 +33,7 @@ impl RecoveryTransport for GrpcRecoveryTransport {
     async fn barrier(&self, leader: u64) -> Result<(UrsulaVote, u64), Self::Error> {
         let answer = probe_rejoin_vote_barrier(
             self.transport.clone(),
-            self.placement,
+            self.target,
             leader,
             crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
         )

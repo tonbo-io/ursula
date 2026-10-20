@@ -197,10 +197,11 @@ pub(crate) async fn forward_group_read_to_leader(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
         ..Default::default()
     };
-    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
+    let target = RaftTarget::Data(placement.raft_group_id);
+    target.stamp(route.leader_id, &mut request);
     call_leader(
         route,
-        placement,
+        target,
         ForwardedRpc::GroupRead,
         request,
         |mut client, request| async move { client.group_read(request).await },
@@ -228,10 +229,11 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
         ..Default::default()
     };
-    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
+    let target = RaftTarget::Data(placement.raft_group_id);
+    target.stamp(route.leader_id, &mut request);
     let response = call_leader(
         route,
-        placement,
+        target,
         ForwardedRpc::GroupWrite,
         request,
         |mut client, request| async move { client.group_write(request).await },
@@ -416,7 +418,7 @@ fn is_transport_failure(status: &tonic::Status) -> bool {
 /// another node, drops its cached channel, so the next one reconnects.
 async fn call_leader<Req, Resp, Fut>(
     route: &LeaderRoute,
-    placement: ShardPlacement,
+    target: RaftTarget,
     rpc: ForwardedRpc,
     request: Req,
     send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
@@ -503,7 +505,8 @@ where
     };
     if dropped_channel {
         tracing::warn!(
-            group = placement.raft_group_id.0,
+            plane = ?target.plane(),
+            group = target.wire_group_id(),
             leader = address,
             error = %ErrorChain(&error),
             "dropped the forwarding channel to a group leader: the leader is unreachable over \
@@ -511,7 +514,8 @@ where
         );
     } else {
         tracing::debug!(
-            group = placement.raft_group_id.0,
+            plane = ?target.plane(),
+            group = target.wire_group_id(),
             leader = address,
             error = %ErrorChain(&error),
             "forwarded leader RPC failed"

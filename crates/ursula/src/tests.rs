@@ -2184,7 +2184,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
 
     let mut network = ursula_raft::GrpcRaftNetwork::new(
         peer_transport(&registry, 1, &format!("http://{addr}")),
-        RaftGroupId(0),
+        ursula_raft::RaftTarget::Data(RaftGroupId(0)),
         1,
     );
     let vote_request =
@@ -2196,7 +2196,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
 
     let mut missing_group = ursula_raft::GrpcRaftNetwork::new(
         peer_transport(&registry, 1, &format!("http://{addr}")),
-        RaftGroupId(1),
+        ursula_raft::RaftTarget::Data(RaftGroupId(1)),
         1,
     );
     let err = missing_group
@@ -4248,7 +4248,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
     let vote = ursula_raft::UrsulaVote::new(1, 1);
     let mut snapshot_network = ursula_raft::GrpcRaftNetwork::new(
         peer_transport(&nodes[0].registry, 2, &peers[1].1),
-        RaftGroupId(0),
+        ursula_raft::RaftTarget::Data(RaftGroupId(0)),
         2,
     );
     let _: SnapshotResponse<UrsulaRaftTypeConfig> = snapshot_network

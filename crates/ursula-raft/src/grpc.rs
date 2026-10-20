@@ -281,7 +281,13 @@ pub(crate) async fn confirm_quorum_prefix(
     leader_id: u64,
     timeout: Duration,
 ) -> Result<QuorumPrefix, RecoveryProbeError> {
-    let answer = probe_rejoin_vote_barrier(transport, placement, leader_id, timeout).await?;
+    let answer = probe_rejoin_vote_barrier(
+        transport,
+        RaftTarget::Data(placement.raft_group_id),
+        leader_id,
+        timeout,
+    )
+    .await?;
     Ok(QuorumPrefix {
         raft_group_id: placement.raft_group_id.0,
         leader_id,
@@ -296,11 +302,11 @@ pub(crate) async fn confirm_quorum_prefix(
 /// The leader is dialed at the cluster URL `raft.peers` lists for it.
 pub(crate) async fn probe_rejoin_vote_barrier(
     transport: Arc<CoreRaftTransport>,
-    placement: ursula_shard::ShardPlacement,
+    target: RaftTarget,
     leader_id: u64,
     timeout: Duration,
 ) -> Result<BarrierAnswer, RecoveryProbeError> {
-    let network = GrpcRaftNetwork::new(transport, placement.raft_group_id, leader_id);
+    let network = GrpcRaftNetwork::new(transport, target, leader_id);
     let channel = network.channel.as_ref().map_err(Clone::clone)?;
     let mut client = channel.client.clone();
     let mut request = tonic::Request::new(network.stamped(
@@ -1416,18 +1422,20 @@ pub(crate) fn validate_grpc_metadata(protocol_version: u32) -> Result<(), GrpcRp
     Ok(())
 }
 
+/// The Raft networks of one group: each client it makes names `target` on
+/// every request.
 #[derive(Debug, Clone)]
 pub struct GrpcRaftNetworkFactory {
     transport: Arc<CoreRaftTransport>,
-    raft_group_id: RaftGroupId,
+    target: RaftTarget,
     reconnect_threshold: u32,
 }
 
 impl GrpcRaftNetworkFactory {
-    pub fn new(transport: Arc<CoreRaftTransport>, raft_group_id: RaftGroupId) -> Self {
+    pub fn new(transport: Arc<CoreRaftTransport>, target: RaftTarget) -> Self {
         Self {
             transport,
-            raft_group_id,
+            target,
             reconnect_threshold: 8,
         }
     }
@@ -1446,7 +1454,7 @@ impl RaftNetworkFactory<UrsulaRaftTypeConfig> for GrpcRaftNetworkFactory {
     async fn new_client(&mut self, target: u64, _node: &EmptyNode) -> Self::Network {
         GrpcRaftNetwork::resolve(
             self.transport.clone(),
-            self.raft_group_id,
+            self.target,
             target,
             self.reconnect_threshold,
         )
@@ -1493,7 +1501,9 @@ struct PeerChannel {
 #[derive(Clone)]
 pub struct GrpcRaftNetwork {
     transport: Arc<CoreRaftTransport>,
-    raft_group_id: RaftGroupId,
+    /// The group every request names.
+    raft_target: RaftTarget,
+    /// The node every request is for.
     target: u64,
     channel: Result<PeerChannel, RaftChannelError>,
     /// Streak of consecutive RPC failures on this channel. Reset to 0 on the
@@ -1513,7 +1523,7 @@ impl Debug for GrpcRaftNetwork {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut debug = f.debug_struct("GrpcRaftNetwork");
         debug
-            .field("raft_group_id", &self.raft_group_id)
+            .field("raft_target", &self.raft_target)
             .field("target", &self.target);
         match &self.channel {
             Ok(channel) => debug
@@ -1530,16 +1540,17 @@ impl Debug for GrpcRaftNetwork {
 }
 
 impl GrpcRaftNetwork {
-    /// A client to `target` at the cluster URL `raft.peers` lists for it in
-    /// `transport`'s peer cluster. A node it does not list gets a client
-    /// that answers every RPC unreachable without dialing.
-    pub fn new(transport: Arc<CoreRaftTransport>, raft_group_id: RaftGroupId, target: u64) -> Self {
-        Self::resolve(transport, raft_group_id, target, 8)
+    /// A client of group `raft_target` to node `target`, at the cluster URL
+    /// `raft.peers` lists for it in `transport`'s peer cluster. A node it
+    /// does not list gets a client that answers every RPC unreachable
+    /// without dialing.
+    pub fn new(transport: Arc<CoreRaftTransport>, raft_target: RaftTarget, target: u64) -> Self {
+        Self::resolve(transport, raft_target, target, 8)
     }
 
     fn resolve(
         transport: Arc<CoreRaftTransport>,
-        raft_group_id: RaftGroupId,
+        raft_target: RaftTarget,
         target: u64,
         reconnect_threshold: u32,
     ) -> Self {
@@ -1549,7 +1560,7 @@ impl GrpcRaftNetwork {
         };
         Self {
             transport,
-            raft_group_id,
+            raft_target,
             target,
             channel,
             consecutive_failures: 0,
@@ -1562,7 +1573,7 @@ impl GrpcRaftNetwork {
     #[cfg(test)]
     fn with_transport(
         transport: Arc<CoreRaftTransport>,
-        raft_group_id: RaftGroupId,
+        raft_target: RaftTarget,
         target: u64,
         address: impl Into<String>,
         reconnect_threshold: u32,
@@ -1570,7 +1581,7 @@ impl GrpcRaftNetwork {
         let channel = open_peer_channel(&transport, address.into());
         Self {
             transport,
-            raft_group_id,
+            raft_target,
             target,
             channel,
             consecutive_failures: 0,
@@ -1691,7 +1702,7 @@ impl GrpcRaftNetwork {
 
     /// The Raft target this client's requests name.
     fn raft_target(&self) -> RaftTarget {
-        RaftTarget::Data(self.raft_group_id)
+        self.raft_target
     }
 
     /// `request` with this client's target and target node stamped on it.
@@ -2530,7 +2541,18 @@ mod reconnect_tests {
         target: u64,
         address: impl Into<String>,
     ) -> GrpcRaftNetwork {
-        GrpcRaftNetwork::with_transport(transport, group, target, address, 8)
+        GrpcRaftNetwork::with_transport(transport, RaftTarget::Data(group), target, address, 8)
+    }
+
+    /// A client of data group `group` to node 2 at `address`, rebuilding
+    /// its channel after `threshold` failures.
+    fn test_network_with_threshold(
+        transport: Arc<CoreRaftTransport>,
+        group: RaftGroupId,
+        address: &str,
+        threshold: u32,
+    ) -> GrpcRaftNetwork {
+        GrpcRaftNetwork::with_transport(transport, RaftTarget::Data(group), 2, address, threshold)
     }
 
     use std::collections::BTreeSet;
@@ -3234,7 +3256,7 @@ mod reconnect_tests {
                 crate::PeerDirectory::new([(1, crate::PeerEndpoints::shared(endpoint.as_str()))]),
             ),
         ));
-        let mut factory = GrpcRaftNetworkFactory::new(transport, RaftGroupId(1));
+        let mut factory = GrpcRaftNetworkFactory::new(transport, RaftTarget::Data(RaftGroupId(1)));
         let mut network = factory.new_client(1, &EmptyNode {}).await;
         assert_eq!(network.endpoint(), endpoint);
         // The server hosts no group 1: the vote reached it and was answered.
@@ -3257,8 +3279,9 @@ mod reconnect_tests {
             crate::peer_cluster::test_identity(2),
             crate::peer_cluster::test_peer_cluster(2),
         ));
-        let mut factory = GrpcRaftNetworkFactory::new(transport.clone(), RaftGroupId(1))
-            .with_reconnect_threshold(1);
+        let mut factory =
+            GrpcRaftNetworkFactory::new(transport.clone(), RaftTarget::Data(RaftGroupId(1)))
+                .with_reconnect_threshold(1);
         let mut network = factory.new_client(7, &EmptyNode {}).await;
         assert!(matches!(
             network.channel,
@@ -3314,52 +3337,68 @@ mod reconnect_tests {
     }
 
     /// A peer whose address serves node 9 refuses node 1's votes and
-    /// appends as misdelivered. Each refusal is unreachable to OpenRaft and
-    /// counted, and is no cluster refusal. Once `raft.peers` points node 1
-    /// at its new address, the next call reaches it there, without a
-    /// restart.
+    /// appends as misdelivered, on the data plane and the meta plane alike.
+    /// Each refusal is unreachable to OpenRaft and counted, and is no
+    /// cluster refusal. Once `raft.peers` points node 1 at its new address,
+    /// the next call reaches it there, without a restart.
     #[tokio::test]
     async fn a_peer_re_pointed_in_raft_peers_gets_the_next_call_at_its_new_address() {
         let (other_node, _other_registry, other_server) = spawn_raft_server_as(9).await;
         let (node_1, _registry, server) = spawn_raft_server_as(1).await;
-        let (peer_cluster, transport) = sender_listing_node_1_at(&other_node);
-        let mut factory = GrpcRaftNetworkFactory::new(transport, RaftGroupId(1));
-        let mut network = factory.new_client(1, &EmptyNode {}).await;
-        let option = RPCOption::new(Duration::from_secs(2));
-        let vote = || UrsulaVoteRequest::new(UrsulaVote::new(1, 2), None);
+        for raft_target in [RaftTarget::Data(RaftGroupId(1)), RaftTarget::Meta] {
+            // A transport per plane, as each plane's sessions are its own.
+            let (peer_cluster, transport) = sender_listing_node_1_at(&other_node);
+            let mut factory = GrpcRaftNetworkFactory::new(transport, raft_target);
+            let mut network = factory.new_client(1, &EmptyNode {}).await;
+            let option = RPCOption::new(Duration::from_secs(2));
+            let vote = || UrsulaVoteRequest::new(UrsulaVote::new(1, 2), None);
 
-        let refused = network
-            .vote(vote(), option.clone())
-            .await
-            .expect_err("node 9 is not node 1");
-        assert!(matches!(refused, RPCError::Unreachable(_)), "{refused:?}");
-        let refused = network
-            .append_entries(empty_append(), option.clone())
-            .await
-            .expect_err("node 9 is not node 1");
-        assert!(matches!(refused, RPCError::Unreachable(_)), "{refused:?}");
-        assert_eq!(peer_cluster.misdeliveries(1), 2);
-        assert_eq!(peer_cluster.refusals(), 0);
-        assert!(peer_cluster.mismatches().is_empty());
-        assert_eq!(network.endpoint(), other_node);
+            let refused = network
+                .vote(vote(), option.clone())
+                .await
+                .expect_err("node 9 is not node 1");
+            assert!(
+                matches!(refused, RPCError::Unreachable(_)),
+                "{raft_target:?}: {refused:?}"
+            );
+            let refused = network
+                .append_entries(empty_append(), option.clone())
+                .await
+                .expect_err("node 9 is not node 1");
+            assert!(
+                matches!(refused, RPCError::Unreachable(_)),
+                "{raft_target:?}: {refused:?}"
+            );
+            assert_eq!(peer_cluster.misdeliveries(1), 2, "{raft_target:?}");
+            assert_eq!(peer_cluster.refusals(), 0);
+            assert!(peer_cluster.mismatches().is_empty());
+            assert_eq!(network.endpoint(), other_node);
 
-        peer_cluster.bind(
-            crate::peer_cluster::test_identity(2),
-            crate::PeerDirectory::new([(1, crate::PeerEndpoints::shared(node_1.as_str()))]),
-        );
-        // Node 1 hosts no group 1: the vote and the append reached it.
-        let answered = network
-            .vote(vote(), option.clone())
-            .await
-            .expect_err("node 1 hosts no group 1");
-        assert!(matches!(answered, RPCError::Network(_)), "{answered:?}");
-        assert_eq!(network.endpoint(), node_1);
-        let answered = network
-            .append_entries(empty_append(), option)
-            .await
-            .expect_err("node 1 hosts no group 1");
-        assert!(matches!(answered, RPCError::Network(_)), "{answered:?}");
-        assert_eq!(peer_cluster.misdeliveries(1), 2);
+            peer_cluster.bind(
+                crate::peer_cluster::test_identity(2),
+                crate::PeerDirectory::new([(1, crate::PeerEndpoints::shared(node_1.as_str()))]),
+            );
+            // Node 1 runs neither group 1 nor a meta replica: the vote and
+            // the append reached it.
+            let answered = network
+                .vote(vote(), option.clone())
+                .await
+                .expect_err("node 1 runs no replica of the target");
+            assert!(
+                matches!(answered, RPCError::Network(_)),
+                "{raft_target:?}: {answered:?}"
+            );
+            assert_eq!(network.endpoint(), node_1);
+            let answered = network
+                .append_entries(empty_append(), option)
+                .await
+                .expect_err("node 1 runs no replica of the target");
+            assert!(
+                matches!(answered, RPCError::Network(_)),
+                "{raft_target:?}: {answered:?}"
+            );
+            assert_eq!(peer_cluster.misdeliveries(1), 2, "{raft_target:?}");
+        }
         server.abort();
         other_server.abort();
     }
@@ -3373,8 +3412,10 @@ mod reconnect_tests {
     async fn a_misdelivery_at_the_same_address_dials_a_new_connection() {
         let (other_node, _other_registry, other_server) = spawn_raft_server_as(9).await;
         let (peer_cluster, transport) = sender_listing_node_1_at(&other_node);
-        let mut first = GrpcRaftNetwork::new(transport.clone(), RaftGroupId(1), 1);
-        let mut second = GrpcRaftNetwork::new(transport.clone(), RaftGroupId(2), 1);
+        let mut first =
+            GrpcRaftNetwork::new(transport.clone(), RaftTarget::Data(RaftGroupId(1)), 1);
+        let mut second =
+            GrpcRaftNetwork::new(transport.clone(), RaftTarget::Data(RaftGroupId(2)), 1);
         let option = RPCOption::new(Duration::from_secs(2));
         let generation = first.generation();
         assert_eq!(second.generation(), generation);
@@ -3549,10 +3590,8 @@ mod reconnect_tests {
         let transport = Arc::new(CoreRaftTransport::default());
         let endpoint = "http://127.0.0.1:32198";
         remove_shared_channel(&transport, endpoint);
-        let mut first =
-            GrpcRaftNetwork::with_transport(transport.clone(), RaftGroupId(1), 2, endpoint, 1);
-        let mut stale =
-            GrpcRaftNetwork::with_transport(transport.clone(), RaftGroupId(2), 2, endpoint, 1);
+        let mut first = test_network_with_threshold(transport.clone(), RaftGroupId(1), endpoint, 1);
+        let mut stale = test_network_with_threshold(transport.clone(), RaftGroupId(2), endpoint, 1);
         let original_generation = first.generation();
 
         first.note_failure("Append");
@@ -3619,10 +3658,7 @@ mod barrier_asker_tests {
     use tonic::Request;
     use tonic::Response;
     use tonic::Status;
-    use ursula_shard::CoreId;
     use ursula_shard::RaftGroupId;
-    use ursula_shard::ShardId;
-    use ursula_shard::ShardPlacement;
 
     use super::CoreRaftTransport;
     use super::GrpcRpcError;
@@ -3635,6 +3671,7 @@ mod barrier_asker_tests {
     use crate::memberships::MembershipKind;
     use crate::raft_internal_proto as pb;
     use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+    use crate::target::RaftTarget;
     use crate::types::UrsulaRaftTypeConfig;
     use crate::types::UrsulaVote;
 
@@ -3785,13 +3822,13 @@ mod barrier_asker_tests {
                 )]),
             ),
         ));
-        let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
-            raft_group_id: GROUP,
-        };
-        let asked =
-            probe_rejoin_vote_barrier(transport, placement, LEADER, Duration::from_secs(5)).await;
+        let asked = probe_rejoin_vote_barrier(
+            transport,
+            RaftTarget::Data(GROUP),
+            LEADER,
+            Duration::from_secs(5),
+        )
+        .await;
         server.abort();
         asked
     }
@@ -3915,7 +3952,7 @@ mod transfer_leader_codec_tests {
     async fn transfer_leader_ack_preserves_typed_rejections_and_refuses_an_empty_response() {
         let network = GrpcRaftNetwork::with_transport(
             Arc::new(CoreRaftTransport::default()),
-            RaftGroupId(1),
+            crate::target::RaftTarget::Data(RaftGroupId(1)),
             2,
             "http://127.0.0.1:1",
             8,
