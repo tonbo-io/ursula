@@ -3130,7 +3130,7 @@ mod reconnect_tests {
         )
         .await;
         assert!(
-            matches!(data, Err(_elapsed)),
+            data.is_err(),
             "a data frame waits for the data budget: {data:?}"
         );
         assert_eq!(
