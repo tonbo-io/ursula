@@ -1825,7 +1825,7 @@ impl RecordSite {
     }
 
     /// The log store's record site, when the group has one.
-    fn store(&self) -> Option<&crate::SnapshotRecord> {
+    pub(crate) fn store(&self) -> Option<&crate::SnapshotRecord> {
         match self {
             Self::NoRecord => None,
             Self::Store(record) => Some(record),

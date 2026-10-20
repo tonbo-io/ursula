@@ -5041,7 +5041,7 @@ async fn the_engine_factory_wires_the_snapshot_record_to_the_log_store() {
             Box::pin(async move {
                 state_machine
                     .snapshot_record
-                    .as_ref()
+                    .store()
                     .map(|record| record.path().to_path_buf())
             })
         })
