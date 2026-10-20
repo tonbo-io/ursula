@@ -555,6 +555,8 @@ fn a_placement_gives_its_groups_target() {
 mod model_semantics {
     use std::collections::BTreeSet;
 
+    use ursula_proto::placement::WaitReason;
+
     use super::moving;
     use super::uniform;
     use crate::placement::reconcile::Leadership;
@@ -567,6 +569,7 @@ mod model_semantics {
     use crate::placement::reconcile::model::node;
     use crate::placement::reconcile::model::round;
     use crate::placement::reconcile::model::voters;
+    use crate::placement::reconcile::plan_membership_step;
 
     fn group(voter_ids: &[u64], leader: u64, nodes: u64) -> Group {
         Group::new(
@@ -704,12 +707,19 @@ mod model_semantics {
             Some(uniform(&[2], &[]))
         );
         // 1 is no voter of its uniform entry but one of the committed joint
-        // config: it wins again with 2's vote, and the commit steps it down.
+        // config: it wins again with 2's vote, and its no-op commits it.
         group.heal();
         assert!(group.campaign(node(1)));
         assert_eq!(group.elections.outgoing, 1);
         assert_eq!(group.committed, uniform(&[2], &[]));
-        assert_eq!(group.leader, None);
+        // OpenRaft keeps it leading until its step-down, and it waits.
+        assert_eq!(group.leader, Some(node(1)));
+        assert_eq!(
+            plan_membership_step(&group.view(node(1)), &target),
+            MembershipStep::Wait(WaitReason::NotAMember)
+        );
+        // The next fair round's step-down hands off to 2, the voter with
+        // the greatest match.
         group.settle();
         assert_eq!(group.leader, Some(node(2)));
     }

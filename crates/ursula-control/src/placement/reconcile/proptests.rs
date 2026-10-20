@@ -31,6 +31,7 @@ use ursula_proto::placement::RaftLogId;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WaitReason;
 
+use super::Current;
 use super::EffectiveMembership;
 use super::LeaderView;
 use super::Leadership;
@@ -47,10 +48,13 @@ use super::model::Planned;
 use super::model::Planner;
 use super::model::act;
 use super::model::environment;
+use super::model::ids;
 use super::model::node;
 use super::model::quorum_live;
+use super::model::round;
 use super::model::run;
 use super::plan_membership_step;
+use super::plan_uniform;
 
 /// Node ids `1..=6` chosen by the low bits of `mask`.
 fn set_of(mask: u8) -> BTreeSet<NodeId> {
@@ -466,7 +470,7 @@ fn check_step(
 
 /// C7 and R1 over a run of the abstract group: every committed config of
 /// the move has `size` voters in each config, and every voter change keeps
-/// its proposer but the RF 1 step.
+/// its proposer but the RF 1 step of the only voter.
 fn check_group(group: &Group, size: usize) -> Result<(), String> {
     for config in &group.committed_configs {
         ensure(
@@ -474,11 +478,13 @@ fn check_group(group: &Group, size: usize) -> Result<(), String> {
             || format!("C7: committed {config:?} is not of size {size}"),
         )?;
     }
-    for (proposer, voters) in &group.proposals {
-        ensure(
-            voters.contains(*proposer) || (size == 1 && voters.len() == 1),
-            || format!("R1: {proposer} proposed {voters:?}"),
-        )?;
+    for proposal in &group.proposals {
+        ensure(proposal.keeps_proposer(), || {
+            format!(
+                "R1: {} proposed {:?} from {:?}",
+                proposal.proposer, proposal.voters, proposal.from
+            )
+        })?;
     }
     Ok(())
 }
@@ -594,6 +600,8 @@ struct Coverage {
     dead_first: Cell<usize>,
     /// A leader waited on its pending transfer.
     transfer_pending: Cell<usize>,
+    /// A leader outside its committed membership waited for its step-down.
+    not_a_member: Cell<usize>,
     /// Elections over an uncommitted membership entry whose winner held it,
     /// and whose winner lacked one another node held.
     pending_kept: Cell<usize>,
@@ -621,6 +629,7 @@ impl Coverage {
             }
             MembershipStep::Wait(WaitReason::NoLiveQuorum) => bump(&self.no_live_quorum, 1),
             MembershipStep::Wait(WaitReason::TransferPending) => bump(&self.transfer_pending, 1),
+            MembershipStep::Wait(WaitReason::NotAMember) => bump(&self.not_a_member, 1),
             MembershipStep::ChangeVoters { voters, .. }
                 if drops_dead_first(planned, voters, target) =>
             {
@@ -813,6 +822,7 @@ fn every_moving_start_converges_within_the_bound() {
     assert!(coverage.no_live_quorum.get() > 0, "{coverage:?}");
     assert!(coverage.dead_first.get() > 0, "{coverage:?}");
     assert!(coverage.transfer_pending.get() > 0, "{coverage:?}");
+    assert!(coverage.not_a_member.get() > 0, "{coverage:?}");
     // Elections over a pending entry happen, whichever way they go.
     assert!(
         coverage
@@ -993,6 +1003,78 @@ fn stays_joint(view: &MembershipView, target: &MembershipTarget) -> MembershipSt
     plan_membership_step(view, target)
 }
 
+/// Broken: plans on from a committed config without itself instead of
+/// waiting for its step-down (`NotAMember`).
+fn ignores_removal(view: &MembershipView, target: &MembershipTarget) -> MembershipStep {
+    let step = plan_membership_step(view, target);
+    if step != MembershipStep::Wait(WaitReason::NotAMember) {
+        return step;
+    }
+    let Leadership::Leading(leader) = &view.leadership else {
+        return step;
+    };
+    let EffectiveMembership::Committed {
+        log_id,
+        config: MembershipConfig::Uniform { voters, learners },
+    } = &leader.membership
+    else {
+        return step;
+    };
+    let mut live = leader.live.clone();
+    live.insert(view.me);
+    let current = Current {
+        me: view.me,
+        expected: *log_id,
+        voters,
+        learners,
+        live: &live,
+    };
+    plan_uniform(&current, leader, target)
+}
+
+/// C2's trace on one group: an RF 1 move from `{1}` toward `{2}`, with `3`
+/// a caught-up learner, whose second step waits for the next round, which
+/// commits it. So the removed leader 1 leads through that round, toward
+/// the retarget `{3}`, until its step-down hands off to 2. A fair run
+/// toward `{3}` then converges, keeping R1 throughout.
+fn removed_leader_case(planner: Planner, coverage: &Coverage) -> Result<(), String> {
+    let universe: BTreeSet<NodeId> = (1..=3).map(node).collect();
+    let mut group = Group::new(&voter_set_of(BTreeSet::from([1])), node(1), universe);
+    group.planner = planner;
+    let expected = group.committed_id;
+    group
+        .execute(&MembershipStep::AddLearners {
+            expected,
+            nodes: ids(&[3]),
+        })
+        .map_err(|refused| format!("{refused:?}"))?;
+    let toward = moving_target(&voter_set_of(BTreeSet::from([2])));
+    // The learner 2, the confirmation, then the joint entry.
+    for _ in 0..2 {
+        round(&mut group, &toward, true)?;
+    }
+    group.delay_second_step = true;
+    let planned = round(&mut group, &toward, true)?;
+    ensure(
+        matches!(
+            planned.map(|planned| planned.step),
+            Some(MembershipStep::ChangeVoters { .. })
+        ),
+        || format!("no voter change toward {toward:?}: {group:?}"),
+    )?;
+    let retarget = moving_target(&voter_set_of(BTreeSet::from([3])));
+    let limit = round_limit(&group, &retarget.voters);
+    let ended = run(&mut group, &retarget, limit, |group, planned| {
+        if let Some(planned) = planned {
+            coverage.observe(planned, &retarget);
+        }
+        check_group(group, 1)
+    })?;
+    ensure(ended == Ended::Converged, || {
+        format!("stuck toward {retarget:?}: {group:?}")
+    })
+}
+
 /// R6 and R10 fail when the planner breaks a rule: each broken planner
 /// runs where the real one passes, and the run names the rule.
 #[test]
@@ -1021,4 +1103,10 @@ fn a_broken_planner_fails_the_runs() {
     let violation = cancel_case(stays_joint, &from, &shared, 0, &faults, &coverage)
         .expect_err("R10 catches a planner that keeps a joint config");
     assert!(violation.contains("R10: stuck"), "{violation}");
+    // A removed leader leads until its step-down and waits.
+    removed_leader_case(plan_membership_step, &coverage).unwrap();
+    assert!(coverage.not_a_member.get() > 0, "{coverage:?}");
+    let violation = removed_leader_case(ignores_removal, &coverage)
+        .expect_err("R1 catches a removed leader that plans on");
+    assert!(violation.contains("R1"), "{violation}");
 }

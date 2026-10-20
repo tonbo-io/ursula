@@ -15,15 +15,32 @@
 //!   every config of its effective membership: live, reachable voters with
 //!   an open gate (or a plan naming it) whose log is not newer than its own.
 //!   So an outgoing voter holding the uncommitted uniform entry can win, and
-//!   that entry's commit steps it down.
+//!   its no-op commits that entry.
+//! - A leader outside its committed effective membership keeps leading
+//!   (`calc_server_state`, `raft_state/mod.rs:416-421`), so it plans from a
+//!   committed config without itself. Only OpenRaft's step-down watcher
+//!   hands off (`removed_leader_step_down`, default `After(150)`, which
+//!   Ursula keeps): in the environment's next fair round it transfers to the
+//!   voter with the greatest match, and reverts to a learner when the
+//!   transfer takes no effect (`core/step_down_watcher.rs:171-199`).
 //! - A voter change from a uniform config appends the joint entry, and its
 //!   kept future appends the uniform one once the joint entry committed in
 //!   the same leadership, unless the test drops that second step or delays
-//!   it to the environment's next round. From a joint config onto one of
-//!   its sides it appends one uniform entry, and onto a third set OpenRaft
-//!   bridges `[A, B]` to `[B, C]` first. `retain = false` drops old voters.
-//!   A new voter that is no member fails with `LearnerNotFound`, and the run
-//!   with it, since no correct planner asks for one.
+//!   it to the environment's next round. Design 5.5 passes the planning
+//!   leadership's `CommittedLeaderId` with `LastMembershipLogId(expected)`,
+//!   and OpenRaft carries it into the second step
+//!   (`raft/api/management.rs:155-170`), so no other leadership runs it, the
+//!   proposer's later ones included. OpenRaft drains the future only when its entry applies or is
+//!   truncated on the proposer (`core/raft_core.rs:1113,2475,2497`), not on
+//!   a step-down, but a deposed proposer plans from `NotLeading`, and a
+//!   re-elected one commits the joint entry with its no-op, which ends the
+//!   future with `PreconditionFailed`. So the model drops the future with
+//!   the leadership.
+//! - From a joint config onto one of its sides a voter change appends one
+//!   uniform entry, and onto a third set OpenRaft bridges `[A, B]` to
+//!   `[B, C]` first. `retain = false` drops old voters. A new voter that is
+//!   no member fails with `LearnerNotFound`, and the run with it, since no
+//!   correct planner asks for one.
 //! - A step whose entry has not committed keeps its future pending
 //!   (`StepPending`). A transfer waits for the environment (`Transferring`)
 //!   and completes once its target holds the leader's log with an open gate
@@ -159,6 +176,28 @@ pub(super) enum Refused {
     LearnerNotFound { node: NodeId },
 }
 
+/// A voter change OpenRaft accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Proposal {
+    pub(super) proposer: NodeId,
+    /// The effective membership it changed.
+    pub(super) from: MembershipConfig,
+    pub(super) voters: VoterSet,
+}
+
+impl Proposal {
+    /// Whether the proposer keeps itself as a voter, or is the RF 1 step:
+    /// the only voter of a uniform config replaced by one other.
+    pub(super) fn keeps_proposer(&self) -> bool {
+        let rf1_step = matches!(
+            &self.from,
+            MembershipConfig::Uniform { voters, .. }
+                if voters.len() == 1 && voters.contains(self.proposer)
+        ) && self.voters.len() == 1;
+        self.voters.contains(self.proposer) || rf1_step
+    }
+}
+
 /// The elections and plans a run reached.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Elections {
@@ -201,8 +240,8 @@ pub(super) struct Group {
     pub(super) delay_second_step: bool,
     /// Every config that committed, the first one included.
     pub(super) committed_configs: Vec<MembershipConfig>,
-    /// Every voter change OpenRaft accepted, with its proposer.
-    pub(super) proposals: Vec<(NodeId, VoterSet)>,
+    /// Every voter change OpenRaft accepted.
+    pub(super) proposals: Vec<Proposal>,
     pub(super) elections: Elections,
     pub(super) planner: Planner,
 }
@@ -430,18 +469,40 @@ impl Group {
             self.committed = config;
             self.committed_id = MembershipLogId::new(id);
         }
-        if matches!(self.committed, MembershipConfig::Uniform { .. })
-            && !self.committed.is_voter(leader)
-        {
-            // OpenRaft's step-down of a leader outside the committed config.
+    }
+
+    /// OpenRaft's step-down watcher: a live leader outside its committed
+    /// effective membership transfers leadership to the voter with the
+    /// greatest match (`voter_ids().max_by_key(matching)`, the last one on
+    /// a tie), then reverts to a learner if the transfer took no effect.
+    fn step_down_removed_leader(&mut self) {
+        let Some(leader) = self.leader.filter(|leader| self.alive.contains(leader)) else {
+            return;
+        };
+        let Some((config, id)) = self.membership_of(leader) else {
+            return;
+        };
+        if id.index > self.commit_index || config.is_member(leader) {
+            return;
+        }
+        let to = config
+            .voters()
+            .into_iter()
+            .max_by_key(|voter| self.caught_up.contains(voter));
+        if let Some(to) = to {
+            self.transferring = Some(to);
+            self.resolve_transfer();
+        }
+        if self.leader == Some(leader) {
             self.lose_leadership();
         }
     }
 
     /// Advances the kept future once its entry committed: it is done, or it
-    /// appends its second step under `LastMembershipLogId` and
-    /// `CommittedLeaderId`. A delayed second step runs only `in_round`, the
-    /// environment's half.
+    /// appends its second step under the joint entry's
+    /// `LastMembershipLogId` and the planning leadership's
+    /// `CommittedLeaderId`, so only in that leadership. A delayed second
+    /// step runs only `in_round`, the environment's half.
     fn advance_future(&mut self, in_round: bool) {
         let Some(future) = self.future.clone() else {
             return;
@@ -709,12 +770,15 @@ impl Group {
         self.cut = None;
     }
 
-    /// The fair environment: an election the partition allowed runs, the
-    /// network heals, the leader replicates and commits, a pending transfer
-    /// resolves, an election runs when needed (a recovery plan when no
-    /// candidate wins), and the leader's barrier opens gates and catches its
-    /// metrics up. Every target is listed.
+    /// The fair environment: a leader a past round removed steps down, an
+    /// election the partition allowed runs, the network heals, the leader
+    /// replicates and commits, a pending transfer resolves, an election runs
+    /// when needed (a recovery plan when no candidate wins), and the
+    /// leader's barrier opens gates and catches its metrics up. Every target
+    /// is listed. A leader removed in this round leads through it and steps
+    /// down in the next fair one.
     pub(super) fn settle(&mut self) {
+        self.step_down_removed_leader();
         self.elect();
         self.heal();
         self.heartbeat();
@@ -863,7 +927,11 @@ impl Group {
                     if let Some(node) = voters.iter().find(|node| !members.contains(node)) {
                         return Err(Refused::LearnerNotFound { node });
                     }
-                    self.proposals.push((leader, voters.clone()));
+                    self.proposals.push(Proposal {
+                        proposer: leader,
+                        from: config.clone(),
+                        voters: voters.clone(),
+                    });
                     self.change_voters(&config, voters);
                 }
             }
