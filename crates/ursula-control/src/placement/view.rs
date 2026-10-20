@@ -79,23 +79,8 @@ impl ConfirmedView {
     /// Confirms `view` by `stamp`, when the view is in the stamp's meta
     /// history and applied at least the stamp's entry, compared term first.
     pub fn new(view: Arc<PlacementView>, stamp: ConfirmedStamp) -> Result<Self, UnconfirmedView> {
-        let stage = view.stage;
-        match stage {
-            ViewStage::Empty => Err(UnconfirmedView::Empty),
-            ViewStage::Applied { history, .. } if history != stamp.history => {
-                Err(UnconfirmedView::OtherHistory {
-                    view: history,
-                    stamp: stamp.history,
-                })
-            }
-            ViewStage::Applied { applied, .. } if applied < stamp.applied => {
-                Err(UnconfirmedView::Behind {
-                    applied,
-                    required: stamp.applied,
-                })
-            }
-            ViewStage::Applied { .. } => Ok(Self { view, stamp }),
-        }
+        covers(view.stage, stamp)?;
+        Ok(Self { view, stamp })
     }
 
     pub fn view(&self) -> &PlacementView {
@@ -106,15 +91,31 @@ impl ConfirmedView {
         self.stamp
     }
 
-    /// Whether a later `view` still carries this confirmation: the same meta
-    /// history, and an applied entry not below the stamp's.
+    /// Whether a later `view` still carries this confirmation, by the rule
+    /// [`Self::new`] confirms with.
     pub fn still_covers(&self, view: &PlacementView) -> bool {
-        match view.stage {
-            ViewStage::Empty => false,
-            ViewStage::Applied { applied, history } => {
-                history == self.stamp.history && applied >= self.stamp.applied
-            }
+        covers(view.stage, self.stamp).is_ok()
+    }
+}
+
+/// Whether a view at `stage` carries `stamp`: it is in the stamp's meta
+/// history and applied at least the stamp's entry, compared term first.
+fn covers(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView> {
+    match stage {
+        ViewStage::Empty => Err(UnconfirmedView::Empty),
+        ViewStage::Applied { history, .. } if history != stamp.history => {
+            Err(UnconfirmedView::OtherHistory {
+                view: history,
+                stamp: stamp.history,
+            })
         }
+        ViewStage::Applied { applied, .. } if applied < stamp.applied => {
+            Err(UnconfirmedView::Behind {
+                applied,
+                required: stamp.applied,
+            })
+        }
+        ViewStage::Applied { .. } => Ok(()),
     }
 }
 
