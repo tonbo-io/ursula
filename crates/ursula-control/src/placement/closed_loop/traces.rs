@@ -1,10 +1,16 @@
-//! The scripted traces of C6 (15.1), one for C2 and one for C4. Each C6
-//! trace and C2's run once with every rule on and must pass, then once with
-//! the rule turned off and must fail the check named with it. C4's has no
-//! rule to turn off: it pins the model's reopen (7.3). Every trace but
-//! C2's and C4's starts from a formed cluster of nodes 1 to 5, group 0
-//! stable on `{1, 2, 3}` and led by node 1. C2's and C4's run at
-//! replication factor 1.
+//! The scripted traces of C6 (15.1), one for C2, two for C4 and one of an
+//! outgoing voter's win. Each negative trace is a formation and a
+//! scenario. It runs once with every rule on and must pass. It then forms
+//! again with every rule on, turns its rule off for the scenario alone, and
+//! must fail the check named with it within the scenario. Every C6 trace
+//! but (i) forms a cluster of nodes 1 to 5 with group 0 stable on
+//! `{1, 2, 3}` and led by node 1. C2's, C4's and the outgoing voter's run
+//! at replication factor 1.
+//!
+//! Two rules switch off model code only: `LeadershipProof` (b) the
+//! reconcile shell's proof and `SweepAnswer` (g) the removed-node sweep,
+//! which live outside this crate. Their traces show that the model's
+//! checks catch a shell without them, not that the shells have them.
 
 use ursula_proto::placement::TeardownStage;
 use ursula_shard::RaftGroupId;
@@ -32,32 +38,57 @@ const DRIVE: usize = 20;
 
 const GROUP: RaftGroupId = RaftGroupId(0);
 
-type Trace = fn(&mut World) -> Result<(), Violation>;
+type Script = fn(&mut World) -> Result<(), Violation>;
 
-/// Runs `trace` over a fresh cluster of five nodes and `groups` groups at
-/// replication factor 3: it must pass with every rule on, and fail one of
-/// `caught_by` with `rule` off.
-fn negative(rule: Rule, caught_by: &[Invariant], groups: u32, trace: Trace) {
-    negative_at(3, rule, caught_by, groups, trace);
+/// A negative trace: a cluster of five nodes, how it forms and the
+/// scenario its rule guards.
+struct Trace {
+    rf: u8,
+    groups: u32,
+    form: Script,
+    scenario: Script,
 }
 
-/// [`negative`] at replication factor `rf`.
-fn negative_at(rf: u8, rule: Rule, caught_by: &[Invariant], groups: u32, trace: Trace) {
-    let mut on = World::new(5, groups, rf);
-    if let Err(violation) = trace(&mut on) {
-        panic!("with every rule on: {violation}\n{}", on.history());
+impl Trace {
+    /// Group 0 of one group formed on `{1, 2, 3}`, then `scenario`.
+    fn formed(scenario: Script) -> Self {
+        Self {
+            rf: 3,
+            groups: 1,
+            form,
+            scenario,
+        }
     }
-    let off = disable(rule);
-    let mut world = World::new(5, groups, rf);
-    let result = trace(&mut world);
-    drop(off);
-    match result {
-        Ok(()) => panic!("with {rule:?} off the trace passes\n{}", world.history()),
-        Err(violation) => assert!(
-            caught_by.contains(&violation.invariant),
-            "with {rule:?} off: {violation}\n{}",
-            world.history()
-        ),
+
+    /// The trace forms and runs its scenario with every rule on and
+    /// passes. It forms again with every rule on, and with `rule` off for
+    /// the scenario alone fails one of `caught_by` there.
+    fn negative(&self, rule: Rule, caught_by: &[Invariant]) {
+        let mut on = World::new(5, self.groups, self.rf);
+        let passed = (self.form)(&mut on).and_then(|()| (self.scenario)(&mut on));
+        if let Err(violation) = passed {
+            panic!("with every rule on: {violation}\n{}", on.history());
+        }
+        let mut world = World::new(5, self.groups, self.rf);
+        if let Err(violation) = (self.form)(&mut world) {
+            panic!(
+                "forming with every rule on: {violation}\n{}",
+                world.history()
+            );
+        }
+        let formed = world.steps();
+        let off = disable(rule);
+        let result = (self.scenario)(&mut world);
+        drop(off);
+        match result {
+            Ok(()) => panic!("with {rule:?} off the trace passes\n{}", world.history()),
+            Err(violation) => assert!(
+                caught_by.contains(&violation.invariant) && world.steps() > formed,
+                "with {rule:?} off, {} steps after the formation's {formed}: {violation}\n{}",
+                world.steps().saturating_sub(formed),
+                world.history()
+            ),
+        }
     }
 }
 
@@ -66,6 +97,15 @@ fn form(world: &mut World) -> Result<(), Violation> {
     world.ensure(
         world.is_stable(GROUP, &[1, 2, 3]) && world.leader(GROUP) == Some(node(1)),
         "group 0 formed on {1, 2, 3} led by node 1",
+    )
+}
+
+/// Replication factor 1: group 0 formed on `{1}` led by node 1.
+fn form_single(world: &mut World) -> Result<(), Violation> {
+    world.quiesce(FORM)?;
+    world.ensure(
+        world.is_stable(GROUP, &[1]) && world.leader(GROUP) == Some(node(1)),
+        "group 0 formed on {1} led by node 1",
     )
 }
 
@@ -105,7 +145,6 @@ fn learner_four(world: &mut World) -> Result<(), Violation> {
 /// waiting, but promoting it needs a confirmed view, which shows the move
 /// settled.
 fn confirmation_before_a_voter_addition(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     learner_four(world)?;
     world.freeze(2)?;
     world.request_move(GROUP, &[1, 2, 5])?;
@@ -140,7 +179,6 @@ fn confirmation_before_a_voter_addition(world: &mut World) -> Result<(), Violati
 /// its convergence, and leader 1 leads again before the kept step runs.
 /// The converge removed the learner first, so the kept step's CAS fails.
 fn a_step_outliving_its_leadership(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     learner_four(world)?;
     reconcile(world, 1, false)?;
     reconcile(world, 1, true)?;
@@ -157,9 +195,9 @@ fn a_step_outliving_its_leadership(world: &mut World) -> Result<(), Violation> {
 /// keeps leading its own copy. Node 2 leads the retarget to `{1, 2, 5}`,
 /// and the move is retargeted back to `{1, 2, 4}`. Node 1's view is
 /// current and its copy is at the target: only the proof stops its report,
-/// which would retire node 5, a voter.
+/// which would retire node 5, a voter. The proof switched off is the
+/// model's.
 fn the_leadership_proof(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| committed_on(world, &[1, 2, 4]))?;
     world.step(Action::Partition(node(1)))?;
@@ -178,7 +216,6 @@ fn the_leadership_proof(world: &mut World) -> Result<(), Violation> {
 /// move is retargeted back to `{1, 2, 4}`. The report's voters equal the
 /// target again: only the placement CAS refuses it.
 fn the_placement_cas(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| committed_on(world, &[1, 2, 4]))?;
     reconcile(world, 1, true)?;
@@ -196,7 +233,6 @@ fn the_placement_cas(world: &mut World) -> Result<(), Violation> {
 /// again. The history event moved the placement key, so the CAS refuses
 /// the report, which would retire node 3, a voter.
 fn the_placement_cas_across_a_meta_plan(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     let keep = world.meta.len();
     world.drive(GROUP, &[4], DRIVE, |world| committed_on(world, &[1, 2, 4]))?;
@@ -218,7 +254,6 @@ fn the_placement_cas_across_a_meta_plan(world: &mut World) -> Result<(), Violati
 /// `{1, 2, 3}`, and the report lands: it retires node 3, which the group
 /// lists as a voter again (P0-1).
 fn a_report_a_data_plan_makes_wrong(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| committed_on(world, &[1, 2, 4]))?;
     reconcile(world, 1, true)?;
@@ -253,7 +288,6 @@ fn the_answers_against_a_wrong_report(world: &mut World) -> Result<(), Violation
 /// promotes it from that old answer. Only step 5's second ask keeps the
 /// voter's log.
 fn the_answers_against_a_re_placement(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| {
         world.is_stable(GROUP, &[1, 2, 4])
@@ -293,7 +327,6 @@ fn the_answers_against_a_re_placement(world: &mut World) -> Result<(), Violation
 /// C6(e): node 4's view lags at the move to `{1, 2, 4}`, which a retarget
 /// to `{1, 2, 5}` abandoned. Only a confirmed view creates a replica.
 fn creation_only_when_confirmed(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.freeze(4)?;
     world.request_move(GROUP, &[1, 2, 5])?;
@@ -309,7 +342,6 @@ fn creation_only_when_confirmed(world: &mut World) -> Result<(), Violation> {
 /// plan keeps the log up to the converge: the history event must drop the
 /// retirement, whose claim the group's later membership broke.
 fn the_history_drop(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| {
         world.is_stable(GROUP, &[1, 2, 4])
@@ -326,9 +358,9 @@ fn the_history_drop(world: &mut World) -> Result<(), Violation> {
 /// predates it cuts the group back to `{1, 2, 4}`, and the report lands:
 /// node 4 is removed while the group lists it as a voter. The removed node
 /// keeps the replica open while it counts, and the sweep keeps its objects
-/// while the group answers it is a voter.
+/// while the group answers it is a voter. The sweep switched off is the
+/// model's.
 fn the_close_rule_and_the_sweep(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     world.request_move(GROUP, &[1, 2, 4])?;
     world.drive(GROUP, &[4], DRIVE, |world| {
         world.is_stable(GROUP, &[1, 2, 4])
@@ -362,7 +394,6 @@ fn the_close_rule_and_the_sweep(world: &mut World) -> Result<(), Violation> {
 /// index of the older history, where it is a move's target. Confirming by
 /// index would take that view as current and create the replica.
 fn confirmation_by_log_id(world: &mut World) -> Result<(), Violation> {
-    form(world)?;
     let keep = world.meta.len();
     world.request_move(GROUP, &[1, 2, 4])?;
     for limit in [3, 4, 3, 4] {
@@ -379,6 +410,15 @@ fn confirmation_by_log_id(world: &mut World) -> Result<(), Violation> {
     )
 }
 
+/// Two groups formed, group 1 on `{2, 3, 4}`.
+fn form_two(world: &mut World) -> Result<(), Violation> {
+    world.quiesce(FORM)?;
+    world.ensure(
+        world.is_stable(RaftGroupId(1), &[2, 3, 4]),
+        "group 1 formed on {2, 3, 4}",
+    )
+}
+
 /// C6(i): group 1, seeded on `{2, 3, 4}`, moves onto `{2, 3, 5}`, node 4
 /// tears its replica down and is decommissioned, so removed at once. A
 /// meta plan cuts below both groups' first reports: group 1 is seeded on
@@ -387,11 +427,6 @@ fn confirmation_by_log_id(world: &mut World) -> Result<(), Violation> {
 /// finds and every group settles.
 fn a_meta_plan_below_a_first_report(world: &mut World) -> Result<(), Violation> {
     let moved = RaftGroupId(1);
-    world.quiesce(FORM)?;
-    world.ensure(
-        world.is_stable(moved, &[2, 3, 4]),
-        "group 1 formed on {2, 3, 4}",
-    )?;
     world.request_move(moved, &[2, 3, 5])?;
     world.drive(moved, &[5], DRIVE, |world| {
         world.is_stable(moved, &[2, 3, 5])
@@ -419,11 +454,6 @@ fn a_meta_plan_below_a_first_report(world: &mut World) -> Result<(), Violation> 
 /// leads outside its config until the next one steps it down. Only waiting
 /// as no member keeps node 1 from proposing `{3}` from outside its config.
 fn a_leader_removed_by_a_delayed_second_step(world: &mut World) -> Result<(), Violation> {
-    world.quiesce(FORM)?;
-    world.ensure(
-        world.is_stable(GROUP, &[1]) && world.leader(GROUP) == Some(node(1)),
-        "group 0 formed on {1} led by node 1",
-    )?;
     world.request_move(GROUP, &[3])?;
     world.drive(GROUP, &[3], DRIVE, |world| {
         world.learners(GROUP).contains(&node(3)) && world.caught_up(GROUP, 3)
@@ -465,133 +495,89 @@ fn joint(world: &World) -> bool {
 
 #[test]
 fn c2_a_leader_outside_its_config_waits_as_no_member() {
-    negative_at(
-        1,
-        Rule::NotAMemberWaits,
-        &[Invariant::C2],
-        1,
-        a_leader_removed_by_a_delayed_second_step,
-    );
+    Trace {
+        rf: 1,
+        groups: 1,
+        form: form_single,
+        scenario: a_leader_removed_by_a_delayed_second_step,
+    }
+    .negative(Rule::NotAMemberWaits, &[Invariant::C2]);
 }
 
 #[test]
 fn c6_a_a_voter_addition_needs_a_confirmed_view() {
-    negative(
-        Rule::ConfirmedVoterChange,
-        &[Invariant::C3],
-        1,
-        confirmation_before_a_voter_addition,
-    );
+    Trace::formed(confirmation_before_a_voter_addition)
+        .negative(Rule::ConfirmedVoterChange, &[Invariant::C3]);
 }
 
 #[test]
 fn c6_a_a_kept_step_fails_its_cas_after_the_converge() {
-    negative(
-        Rule::LearnersBeforeReport,
-        &[Invariant::C3],
-        1,
-        a_step_outliving_its_leadership,
-    );
+    Trace::formed(a_step_outliving_its_leadership)
+        .negative(Rule::LearnersBeforeReport, &[Invariant::C3]);
 }
 
 #[test]
 fn c6_b_a_cut_off_leader_reports_nothing_without_the_proof() {
-    negative(
-        Rule::LeadershipProof,
-        &[Invariant::C3],
-        1,
-        the_leadership_proof,
-    );
+    Trace::formed(the_leadership_proof).negative(Rule::LeadershipProof, &[Invariant::C3]);
 }
 
 #[test]
 fn c6_c_the_placement_cas_refuses_a_delayed_report() {
-    negative(Rule::PlacementCas, &[Invariant::C3], 1, the_placement_cas);
+    Trace::formed(the_placement_cas).negative(Rule::PlacementCas, &[Invariant::C3]);
 }
 
 #[test]
 fn c6_c_the_placement_cas_refuses_a_report_across_a_meta_plan() {
-    negative(
-        Rule::PlacementCas,
-        &[Invariant::C3],
-        1,
-        the_placement_cas_across_a_meta_plan,
-    );
+    Trace::formed(the_placement_cas_across_a_meta_plan)
+        .negative(Rule::PlacementCas, &[Invariant::C3]);
 }
 
 #[test]
 fn c6_d_the_group_refuses_the_teardown_a_wrong_report_asks_for() {
-    negative(
-        Rule::RetireAnswer,
-        &[Invariant::C1, Invariant::C3],
-        1,
-        the_answers_against_a_wrong_report,
-    );
+    Trace::formed(the_answers_against_a_wrong_report)
+        .negative(Rule::RetireAnswer, &[Invariant::C1, Invariant::C3]);
 }
 
 #[test]
 fn c6_d_step_five_keeps_a_voter_placed_again_before_it() {
-    negative(
-        Rule::RetireAnswer,
-        &[Invariant::C1, Invariant::C3],
-        1,
-        the_answers_against_a_re_placement,
-    );
+    Trace::formed(the_answers_against_a_re_placement)
+        .negative(Rule::RetireAnswer, &[Invariant::C1, Invariant::C3]);
 }
 
 #[test]
 fn c6_e_only_a_confirmed_view_creates() {
-    negative(
-        Rule::ConfirmedCreation,
-        &[Invariant::C8],
-        1,
-        creation_only_when_confirmed,
-    );
+    Trace::formed(creation_only_when_confirmed).negative(Rule::ConfirmedCreation, &[Invariant::C8]);
 }
 
 #[test]
 fn c6_f_a_history_event_drops_every_retirement() {
-    negative(Rule::HistoryDrop, &[Invariant::C3], 1, the_history_drop);
+    Trace::formed(the_history_drop).negative(Rule::HistoryDrop, &[Invariant::C3]);
 }
 
 #[test]
 fn c6_g_a_removed_node_keeps_a_counting_replica_open() {
-    negative(
-        Rule::RemovedNodeCloses,
-        &[Invariant::C1],
-        1,
-        the_close_rule_and_the_sweep,
-    );
+    Trace::formed(the_close_rule_and_the_sweep).negative(Rule::RemovedNodeCloses, &[Invariant::C1]);
 }
 
 #[test]
 fn c6_g_the_sweep_keeps_the_objects_of_a_voter() {
-    negative(
-        Rule::SweepAnswer,
-        &[Invariant::C1],
-        1,
-        the_close_rule_and_the_sweep,
-    );
+    Trace::formed(the_close_rule_and_the_sweep).negative(Rule::SweepAnswer, &[Invariant::C1]);
 }
 
 #[test]
 fn c6_h_a_view_confirms_by_log_id_not_by_index() {
-    negative(
-        Rule::ConfirmByLogId,
-        &[Invariant::C8],
-        1,
-        confirmation_by_log_id,
-    );
+    Trace::formed(confirmation_by_log_id).negative(Rule::ConfirmByLogId, &[Invariant::C8]);
 }
 
 #[test]
 fn c6_i_a_seeded_target_reports_the_voters_it_finds() {
-    negative(
-        Rule::SeededOnlyReports,
-        &[Invariant::C5],
-        2,
-        a_meta_plan_below_a_first_report,
-    );
+    Trace {
+        rf: 3,
+        groups: 2,
+        form: form_two,
+        scenario: a_meta_plan_below_a_first_report,
+    }
+    .negative(Rule::SeededOnlyReports, &[Invariant::C5]);
 }
 
 /// C4 at replication factor 1: group 0 moves from `{1}` onto `{2}` and node
@@ -601,11 +587,7 @@ fn c6_i_a_seeded_target_reports_the_voters_it_finds() {
 /// no empty replica, nothing initializes a second time, and the group
 /// settles on the voters it has.
 fn a_reopened_seed_voter(world: &mut World) -> Result<(), Violation> {
-    world.quiesce(FORM)?;
-    world.ensure(
-        world.is_stable(GROUP, &[1]) && world.leader(GROUP) == Some(node(1)),
-        "group 0 formed on {1} led by node 1",
-    )?;
+    form_single(world)?;
     world.request_move(GROUP, &[2])?;
     world.drive(GROUP, &[2], DRIVE, |world| world.is_stable(GROUP, &[2]))?;
     world.finish_teardown(1, GROUP)?;

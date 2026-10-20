@@ -677,6 +677,11 @@ impl World {
 
     // Accessors.
 
+    /// How many actions the world took.
+    pub(super) fn steps(&self) -> usize {
+        self.log.len()
+    }
+
     pub(super) fn raft(&self, group: RaftGroupId) -> Option<&Group> {
         self.groups.get(&group).and_then(|data| data.raft.as_ref())
     }
