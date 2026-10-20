@@ -3110,7 +3110,6 @@ mod group_rpc_status_tests {
                 | GroupInfraError::ForwardFailed { .. }
                 | GroupInfraError::ForwardedAnswerInvalid { .. }
                 | GroupInfraError::InvalidRaftConfig { .. }
-                | GroupInfraError::StaticMembership { .. }
                 | GroupInfraError::RecoveryGateOpen { .. }
                 | GroupInfraError::MembershipInit { .. }
                 | GroupInfraError::LeaderWaitTimedOut { .. } => Code::Internal,

@@ -77,7 +77,6 @@ fn expected(error: &GroupEngineError) -> (ErrorStatus, WriteEffect, bool) {
             | GroupInfraError::ForwardFailed { .. }
             | GroupInfraError::ForwardedAnswerInvalid { .. }
             | GroupInfraError::InvalidRaftConfig { .. }
-            | GroupInfraError::StaticMembership { .. }
             | GroupInfraError::RecoveryGateOpen { .. }
             | GroupInfraError::MembershipInit { .. }
             | GroupInfraError::LeaderWaitTimedOut { .. } => (Persistent, Unknown, false),

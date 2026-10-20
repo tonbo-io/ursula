@@ -722,7 +722,6 @@ fn every_group_engine_error_answers_its_table_row() {
                 | GroupInfraError::ForwardFailed { .. }
                 | GroupInfraError::ForwardedAnswerInvalid { .. }
                 | GroupInfraError::InvalidRaftConfig { .. }
-                | GroupInfraError::StaticMembership { .. }
                 | GroupInfraError::RecoveryGateOpen { .. }
                 | GroupInfraError::MembershipInit { .. }
                 | GroupInfraError::LeaderWaitTimedOut { .. } => internal,

@@ -14,7 +14,7 @@ use ursula_runtime::GroupEngineFactory;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::SharedSnapshotStore;
-use ursula_runtime::StaticMembershipProblem;
+use ursula_runtime::WalOpenFailureKind;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
@@ -353,35 +353,21 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
-    /// The node ids that make up `raft_group_id`'s voters: its configured
-    /// voters, or every peer when no per-group voters are configured.
-    fn group_voters(&self, raft_group_id: RaftGroupId) -> Result<BTreeSet<u64>, GroupEngineError> {
-        let refused = |problem| {
-            GroupEngineError::Infra(GroupInfraError::StaticMembership {
-                raft_group_id,
-                problem,
-            })
-        };
-        let voters = if self.per_group_voters.is_empty() {
+    /// The node ids that make up the voters of `placement`'s group: its
+    /// configured voters, or every peer when no per-group voters are
+    /// configured. Configuration load refuses a voter config this refuses,
+    /// so the refusal is an invalid configuration of the group's open.
+    fn group_voters(&self, placement: ShardPlacement) -> Result<BTreeSet<u64>, GroupEngineError> {
+        if self.per_group_voters.is_empty() {
             return Ok(self.peers.node_ids().collect());
-        } else {
-            self.per_group_voters
-                .get(&raft_group_id)
-                .ok_or_else(|| refused(StaticMembershipProblem::MissingGroup))?
-        };
-        if voters.is_empty() {
-            return Err(refused(StaticMembershipProblem::NoVoters));
         }
-
-        if let Some(node_id) = voters
-            .iter()
-            .find(|node_id| !self.peers.contains(**node_id))
-        {
-            return Err(refused(StaticMembershipProblem::VoterWithoutPeer {
-                node_id: *node_id,
-            }));
-        }
-        Ok(voters.clone())
+        self.per_group_voters
+            .get(&placement.raft_group_id)
+            .filter(|voters| {
+                !voters.is_empty() && voters.iter().all(|node_id| self.peers.contains(*node_id))
+            })
+            .cloned()
+            .ok_or_else(|| invalid_configuration(placement))
     }
 
     fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Option<Vec<u64>> {
@@ -422,6 +408,17 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 }
 
+/// The refusal of a group whose static voter config this node cannot run:
+/// configuration load refuses such a config, so it reaches a group's open
+/// only as an invalid configuration.
+fn invalid_configuration(placement: ShardPlacement) -> GroupEngineError {
+    GroupEngineError::Infra(GroupInfraError::WalOpen {
+        core_id: placement.core_id,
+        raft_group_id: placement.raft_group_id,
+        failure: WalOpenFailureKind::InvalidConfiguration,
+    })
+}
+
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
         if self.per_group_voters.is_empty() {
@@ -445,14 +442,9 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
             if !self.peers.contains(self.node_id) {
-                return Err(GroupEngineError::Infra(GroupInfraError::StaticMembership {
-                    raft_group_id: placement.raft_group_id,
-                    problem: StaticMembershipProblem::NodeWithoutPeer {
-                        node_id: self.node_id,
-                    },
-                }));
+                return Err(invalid_configuration(placement));
             }
-            let voters = self.group_voters(placement.raft_group_id)?;
+            let voters = self.group_voters(placement)?;
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
             let store = self
@@ -629,22 +621,28 @@ mod tests {
         let wal_root = tempfile::tempdir().expect("WAL root");
         let factory = factory_for_node(1, &wal_root);
 
+        let placement = |group| ShardPlacement {
+            core_id: CoreId(1),
+            shard_id: ShardId(group),
+            raft_group_id: RaftGroupId(group),
+        };
         assert_eq!(
-            factory.group_voters(RaftGroupId(0)).unwrap(),
+            factory.group_voters(placement(0)).unwrap(),
             BTreeSet::from([1, 2, 3])
         );
         assert_eq!(
-            factory.group_voters(RaftGroupId(1)).unwrap(),
+            factory.group_voters(placement(1)).unwrap(),
             BTreeSet::from([2, 3, 4])
         );
         let err = factory
-            .group_voters(RaftGroupId(2))
+            .group_voters(placement(2))
             .expect_err("partial per-group voter config must not fall back to all peers");
         assert_eq!(
             err,
-            GroupEngineError::Infra(GroupInfraError::StaticMembership {
+            GroupEngineError::Infra(GroupInfraError::WalOpen {
+                core_id: CoreId(1),
                 raft_group_id: RaftGroupId(2),
-                problem: StaticMembershipProblem::MissingGroup,
+                failure: WalOpenFailureKind::InvalidConfiguration,
             })
         );
     }

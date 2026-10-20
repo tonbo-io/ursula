@@ -167,7 +167,6 @@ fn infra_error_answer(err: &GroupInfraError) -> (StatusCode, ErrorCode) {
         | GroupInfraError::ForwardFailed { .. }
         | GroupInfraError::ForwardedAnswerInvalid { .. }
         | GroupInfraError::InvalidRaftConfig { .. }
-        | GroupInfraError::StaticMembership { .. }
         | GroupInfraError::RecoveryGateOpen { .. }
         | GroupInfraError::MembershipInit { .. }
         | GroupInfraError::LeaderWaitTimedOut { .. }

@@ -219,7 +219,6 @@ pub use engine::Proposal;
 pub use engine::ResponseKind;
 pub use engine::SnapshotObjectCheck;
 pub use engine::SnapshotStoreOperation;
-pub use engine::StaticMembershipProblem;
 pub use engine::StreamRefusal;
 pub use engine::UnproposableCommand;
 pub use engine::WalOpenFailureKind;

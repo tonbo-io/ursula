@@ -33,7 +33,6 @@ use super::Proposal;
 use super::ResponseKind;
 use super::SnapshotObjectCheck;
 use super::SnapshotStoreOperation;
-use super::StaticMembershipProblem;
 use super::StreamRefusal;
 use super::UnproposableCommand;
 use super::WalOpenFailureKind;
@@ -372,10 +371,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
             election_timeout_min_ms: 50,
             election_timeout_max_ms: 40,
         },
-        GroupInfraError::StaticMembership { .. } => GroupInfraError::StaticMembership {
-            raft_group_id: GROUP,
-            problem: StaticMembershipProblem::MissingGroup,
-        },
         GroupInfraError::RecoveryGateOpen { .. } => GroupInfraError::RecoveryGateOpen {
             core_id: CoreId(1),
             raft_group_id: GROUP,
@@ -410,7 +405,8 @@ fn infra_errors() -> Vec<GroupInfraError> {
     errors.extend(
         every_unit!(UnproposableCommand {
             CreateBucket,
-            NewHistory
+            NewHistory,
+            OtherPlane
         })
         .into_iter()
         .map(|command| GroupInfraError::InvalidRaftCommand { command }),
@@ -425,6 +421,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
         InvalidConfiguration,
         InvalidRecord,
         Poisoned,
+        NotHeld,
     });
     errors.extend(failures.iter().map(|&failure| GroupInfraError::WalOpen {
         core_id: CoreId(2),
@@ -487,6 +484,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             StreamError,
             RaftBlank,
             RaftMembership,
+            Control,
             Missing,
         })
         .into_iter()
@@ -549,23 +547,6 @@ fn infra_errors() -> Vec<GroupInfraError> {
         rpc,
         failure: ForwardFailure::InvalidEndpoint,
     }));
-    errors.extend(
-        every!(StaticMembershipProblem {
-            StaticMembershipProblem::MissingGroup => StaticMembershipProblem::MissingGroup,
-            StaticMembershipProblem::NoVoters => StaticMembershipProblem::NoVoters,
-            StaticMembershipProblem::VoterWithoutPeer { .. } => {
-                StaticMembershipProblem::VoterWithoutPeer { node_id: 3 }
-            },
-            StaticMembershipProblem::NodeWithoutPeer { .. } => {
-                StaticMembershipProblem::NodeWithoutPeer { node_id: 4 }
-            },
-        })
-        .into_iter()
-        .map(|problem| GroupInfraError::StaticMembership {
-            raft_group_id: GROUP,
-            problem,
-        }),
-    );
     errors.extend(
         every_unit!(MembershipInitRefusal {
             NotAllowed,

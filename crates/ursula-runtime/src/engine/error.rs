@@ -147,6 +147,9 @@ pub enum UnproposableCommand {
     CreateBucket,
     /// Only a leader's history driver proposes a history event.
     NewHistory,
+    /// A command of the other Raft plane: a meta command to a data group,
+    /// or a data command to the meta group.
+    OtherPlane,
 }
 
 /// Serializable startup classification. The WAL facade retains the native
@@ -163,6 +166,9 @@ pub enum WalOpenFailureKind {
     InvalidConfiguration,
     InvalidRecord,
     Poisoned,
+    /// The journal holds no log of the group in its current generation: it
+    /// was retired, and only an admitted creation opens it again.
+    NotHeld,
 }
 
 /// A Raft log id as a replica's log store holds it: the term and node of
@@ -203,6 +209,8 @@ pub enum ResponseKind {
     RaftBlank,
     /// OpenRaft's answer to a membership entry.
     RaftMembership,
+    /// The meta group's answer to a control command.
+    Control,
     /// No answer at all.
     Missing,
 }
@@ -376,19 +384,6 @@ pub enum AnswerProblem {
     Undecodable,
     /// A forwarded write answered this many results for its one command.
     ResultCount { results: u64 },
-}
-
-/// What is wrong with a group's static Raft membership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum StaticMembershipProblem {
-    /// The per-group voter config does not name the group.
-    MissingGroup,
-    /// The group's static voter set is empty.
-    NoVoters,
-    /// A voter of the group has no static peer address.
-    VoterWithoutPeer { node_id: u64 },
-    /// This node has no static peer address.
-    NodeWithoutPeer { node_id: u64 },
 }
 
 /// Why OpenRaft refused to initialize a group's membership.
@@ -612,12 +607,6 @@ pub enum GroupInfraError {
         election_timeout_min_ms: u64,
         election_timeout_max_ms: u64,
     },
-    /// The group's static Raft membership is unusable.
-    #[error("static membership of raft group {raft_group_id:?}: {problem:?}")]
-    StaticMembership {
-        raft_group_id: RaftGroupId,
-        problem: StaticMembershipProblem,
-    },
     /// The group's recovery gate did not open.
     #[error(
         "open the recovery gate of raft group {raft_group_id:?} on core {core_id:?}: {failure:?}"
@@ -715,7 +704,6 @@ impl GroupInfraError {
             | Self::ForwardFailed { .. }
             | Self::ForwardedAnswerInvalid { .. }
             | Self::InvalidRaftConfig { .. }
-            | Self::StaticMembership { .. }
             | Self::RecoveryGateOpen { .. }
             | Self::MembershipInit { .. }
             | Self::LeaderWaitTimedOut { .. } => ErrorStatus::Persistent,
@@ -760,7 +748,6 @@ impl GroupInfraError {
             | Self::ForwardFailed { .. }
             | Self::ForwardedAnswerInvalid { .. }
             | Self::InvalidRaftConfig { .. }
-            | Self::StaticMembership { .. }
             | Self::RecoveryGateOpen { .. }
             | Self::MembershipInit { .. }
             | Self::LeaderWaitTimedOut { .. } => WriteEffect::Unknown,
@@ -801,7 +788,6 @@ impl GroupInfraError {
             | Self::ForwardFailed { .. }
             | Self::ForwardedAnswerInvalid { .. }
             | Self::InvalidRaftConfig { .. }
-            | Self::StaticMembership { .. }
             | Self::RecoveryGateOpen { .. }
             | Self::MembershipInit { .. }
             | Self::LeaderWaitTimedOut { .. } => false,
