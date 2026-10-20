@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use ursula_proto::placement::NodeLifecycle;
+use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::ReplicaRole;
@@ -226,6 +227,7 @@ fn stale_placement_refuses_a_move_or_report_naming_an_older_placement() {
         since: old,
         voters: voters(&[1, 2, 4]),
         membership: membership(3, 3),
+        now_ms: 6,
     });
     assert!(matches!(error, ControlError::StalePlacement { .. }));
 }
@@ -253,6 +255,7 @@ fn not_moving_refuses_a_report_for_a_stable_group() {
         since: driver.since(G0),
         voters: voters(&[1, 2, 3]),
         membership: membership(3, 3),
+        now_ms: 6,
     });
     assert!(matches!(error, ControlError::NotMoving { group } if group == G0));
 }
@@ -376,6 +379,7 @@ fn not_target_refuses_a_report_of_other_voters() {
         since: driver.since(G0),
         voters: voters(&[1, 2, 3]),
         membership: membership(3, 3),
+        now_ms: 6,
     });
     assert!(
         matches!(error, ControlError::NotTarget { reported, .. } if reported == voters(&[1, 2, 3]))
@@ -390,6 +394,7 @@ fn not_target_refuses_a_report_of_other_voters() {
         since: seeded.since(G0),
         voters: voters(&[1, 2]),
         membership: membership(3, 3),
+        now_ms: 6,
     });
     assert!(matches!(error, ControlError::NotTarget { .. }));
 }
@@ -608,9 +613,21 @@ fn a_decommissioning_node_is_removed_by_the_converge_that_takes_its_last_role() 
         &converged,
         ControlApplied::Converged { retired, removed, .. } if retired.is_empty() && *removed == ids(&[4])
     ));
+    // A record's time is when the node entered its lifecycle: node 4 by
+    // the converge (`now_ms` 35), node 5 by its decommission (40).
     assert_eq!(
-        driver.cluster().node(node(4)).unwrap().lifecycle,
-        NodeLifecycle::Removed
+        driver.cluster().node(node(4)),
+        Some(&NodeRecord {
+            lifecycle: NodeLifecycle::Removed,
+            since_ms: 35,
+        })
+    );
+    assert_eq!(
+        driver.cluster().node(node(5)),
+        Some(&NodeRecord {
+            lifecycle: NodeLifecycle::Removed,
+            since_ms: 40,
+        })
     );
     assert!(driver.cluster().retirements().is_empty());
     // Uncordon brings a decommissioning node back only while it has a role.
@@ -742,6 +759,7 @@ fn a_history_event_drops_every_retirement_and_moves_every_key() {
         since: before.group(G1).unwrap().since(),
         voters: voters(&[1, 3, 4]),
         membership: membership(4, 4),
+        now_ms: 6,
     });
     assert!(matches!(error, ControlError::StalePlacement { .. }));
 }

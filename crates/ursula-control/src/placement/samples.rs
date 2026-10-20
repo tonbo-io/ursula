@@ -143,6 +143,7 @@ impl Driver {
                     since: placement.since(),
                     voters: placement.target_voters().clone(),
                     membership: membership(1, u64::from(group.0)),
+                    now_ms: 25,
                 })
                 .unwrap();
         }
@@ -231,6 +232,7 @@ impl Driver {
             since,
             voters: voters(reported),
             membership,
+            now_ms: 35,
         })
     }
 
@@ -339,6 +341,7 @@ pub(super) fn sample_commands() -> Vec<ControlCommand> {
             since: PlacementEpoch::new(meta(10, 45)),
             voters: voters(&[3, 5]),
             membership: membership(11, 46),
+            now_ms: 50,
         },
         ControlCommand::SetNodeLifecycle { .. } => ControlCommand::SetNodeLifecycle {
             node: node(8),

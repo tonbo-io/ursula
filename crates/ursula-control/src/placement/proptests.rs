@@ -213,6 +213,7 @@ impl Run {
                     since: self.expected(group, y),
                     voters,
                     membership: membership(u64::from(z), u64::from(x)),
+                    now_ms: u64::from(y),
                 })
             }
             9 => {
@@ -583,7 +584,31 @@ fn check_accepted(
             )?;
         }
     }
+    // K6: a record's `since_ms` is the time of the entry that put the node
+    // in its lifecycle, a removal by a converge included.
+    for (id, record) in new.nodes() {
+        let entered = old
+            .node(*id)
+            .is_none_or(|previous| previous.lifecycle != record.lifecycle);
+        if entered {
+            ensure(Some(record.since_ms) == now_ms_of(command), || {
+                format!("K6: node {id} entered {record:?} on {command:?}")
+            })?;
+        }
+    }
     Ok(())
+}
+
+/// The time a command carries, if any.
+fn now_ms_of(command: &ControlCommand) -> Option<u64> {
+    match command {
+        ControlCommand::RegisterNode { now_ms, .. }
+        | ControlCommand::Bootstrap { now_ms, .. }
+        | ControlCommand::RequestMove { now_ms, .. }
+        | ControlCommand::ReportConverged { now_ms, .. }
+        | ControlCommand::SetNodeLifecycle { now_ms, .. } => Some(*now_ms),
+        ControlCommand::SetMoveLimit { .. } | ControlCommand::ReportTornDown { .. } => None,
+    }
 }
 
 /// K3 for one group.
@@ -707,6 +732,7 @@ fn expected_cluster(
             group,
             voters,
             membership,
+            now_ms,
             ..
         } => {
             // A seed node outside `voters` gets no record. K8: a move
@@ -748,7 +774,7 @@ fn expected_cluster(
                 .map(|(id, _)| *id)
                 .collect();
             for id in roleless {
-                remove(&mut expected, id);
+                remove(&mut expected, id, *now_ms);
             }
         }
         ControlCommand::SetNodeLifecycle {
@@ -786,7 +812,7 @@ fn expected_cluster(
                 });
                 // A node without a role is removed at once.
                 if lifecycle == NodeLifecycle::Decommissioning && !expected.has_any_role(*node) {
-                    remove(&mut expected, *node);
+                    remove(&mut expected, *node, *now_ms);
                 }
             }
         }
@@ -812,11 +838,12 @@ fn expected_cluster(
     Ok(expected)
 }
 
-/// Marks `node` removed and drops its retirements.
-fn remove(cluster: &mut Cluster, node: NodeId) {
-    if let Some(record) = cluster.nodes.get_mut(&node) {
-        record.lifecycle = NodeLifecycle::Removed;
-    }
+/// Marks `node` removed as of `now_ms` and drops its retirements.
+fn remove(cluster: &mut Cluster, node: NodeId, now_ms: u64) {
+    cluster.nodes.insert(node, NodeRecord {
+        lifecycle: NodeLifecycle::Removed,
+        since_ms: now_ms,
+    });
     for records in cluster.retirements.values_mut() {
         records.remove(&node);
     }

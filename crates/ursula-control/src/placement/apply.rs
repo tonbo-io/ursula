@@ -162,6 +162,7 @@ enum Change {
         converged_at: MembershipLogId,
         voters: VoterSet,
         retired: BTreeSet<NodeId>,
+        now_ms: u64,
     },
     Lifecycle {
         node: NodeId,
@@ -288,7 +289,8 @@ impl Cluster {
                 since,
                 voters,
                 membership,
-            } => self.plan_converge(group, since, voters, membership),
+                now_ms,
+            } => self.plan_converge(group, since, voters, membership, now_ms),
             ControlCommand::SetNodeLifecycle {
                 node,
                 change,
@@ -431,6 +433,7 @@ impl Cluster {
         since: PlacementEpoch,
         voters: VoterSet,
         membership: MembershipLogId,
+        now_ms: u64,
     ) -> Result<Change, ControlError> {
         let placement = self.existing(group)?;
         if placement.since() != since {
@@ -479,6 +482,7 @@ impl Cluster {
             converged_at: membership,
             voters,
             retired,
+            now_ms,
         })
     }
 
@@ -575,6 +579,7 @@ impl Cluster {
                 converged_at,
                 voters,
                 retired,
+                now_ms,
             } => {
                 let placement = GroupPlacement::Live {
                     since,
@@ -588,7 +593,7 @@ impl Cluster {
                         records.insert(*node, Retirement { created_at: at });
                     }
                 }
-                let removed = self.remove_roleless_decommissioning();
+                let removed = self.remove_roleless_decommissioning(now_ms);
                 let retired = retired.difference(&removed).copied().collect();
                 ControlApplied::Converged {
                     since,
@@ -598,7 +603,7 @@ impl Cluster {
             }
             Change::Lifecycle { node, record } => {
                 self.nodes.insert(node, record);
-                let removed = self.remove_roleless_decommissioning();
+                let removed = self.remove_roleless_decommissioning(record.since_ms);
                 let lifecycle = if removed.contains(&node) {
                     NodeLifecycle::Removed
                 } else {
@@ -623,9 +628,10 @@ impl Cluster {
     }
 
     /// Removes every decommissioning node left without a role, with its
-    /// retirements. Removal destroys nothing: the node's replicas close as
-    /// their groups answer.
-    fn remove_roleless_decommissioning(&mut self) -> BTreeSet<NodeId> {
+    /// retirements, as of `now_ms`, the removing entry's time, so a record's
+    /// `since_ms` is always when it entered its lifecycle. Removal destroys
+    /// nothing: the node's replicas close as their groups answer.
+    fn remove_roleless_decommissioning(&mut self, now_ms: u64) -> BTreeSet<NodeId> {
         let removed: BTreeSet<NodeId> = self
             .nodes
             .iter()
@@ -635,9 +641,10 @@ impl Cluster {
             .map(|(node, _)| *node)
             .collect();
         for node in &removed {
-            if let Some(record) = self.nodes.get_mut(node) {
-                record.lifecycle = NodeLifecycle::Removed;
-            }
+            self.nodes.insert(*node, NodeRecord {
+                lifecycle: NodeLifecycle::Removed,
+                since_ms: now_ms,
+            });
         }
         if !removed.is_empty() {
             for records in self.retirements.values_mut() {

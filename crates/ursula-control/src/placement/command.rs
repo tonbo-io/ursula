@@ -46,12 +46,13 @@ pub enum ControlCommand {
     },
     /// A proven leader of `group` reports that its committed uniform
     /// membership at `membership` has `voters`, while the placement it
-    /// pursued was at `since`.
+    /// pursued was at `since`. `now_ms` dates the removals it causes.
     ReportConverged {
         group: RaftGroupId,
         since: PlacementEpoch,
         voters: VoterSet,
         membership: MembershipLogId,
+        now_ms: u64,
     },
     SetNodeLifecycle {
         node: NodeId,
