@@ -149,6 +149,7 @@ use crate::openraft_error;
 use crate::read_index::ReadIndexBarrier;
 use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::state_machine::RecordSite;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
 use crate::types::SnapshotData;
@@ -801,12 +802,9 @@ impl RaftGroupEngine {
             snapshot_store.clone(),
             snapshot_build,
             snapshot_install.clone(),
-            snapshot_record
-                .as_ref()
-                .map(|record| record.path().to_path_buf()),
+            snapshot_record.map_or(RecordSite::NoRecord, RecordSite::Store),
         );
         state_machine.apply_stop_signal = apply_stop_signal;
-        state_machine.snapshot_record = snapshot_record;
         state_machine.apply_health = apply_health.clone();
         #[cfg(any(test, madsim, feature = "fault-injection"))]
         {

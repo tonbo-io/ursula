@@ -52,6 +52,7 @@ use super::CurrentSnapshot;
 use super::DEFAULT_LATE_WRITE_PASS;
 use super::RaftGroupSnapshotBuilder;
 use super::RaftGroupStateMachine;
+use super::RecordSite;
 use super::SnapshotBuildCoordinator;
 use super::SnapshotInstallCoordinator;
 use super::SnapshotRestoreError;
@@ -152,8 +153,7 @@ async fn builder(
         log_gauge: Arc::default(),
         log_mark: Default::default(),
         holds: holds.clone(),
-        snapshot_metadata_path: None,
-        snapshot_record: None,
+        snapshot_record: RecordSite::NoRecord,
         work: crate::openraft_work::WorkToken::detached(),
     }
 }
@@ -188,7 +188,9 @@ fn machine(
         store.clone(),
         SnapshotBuildCoordinator::default(),
         install.clone(),
-        path.map(Path::to_path_buf),
+        path.map_or(RecordSite::NoRecord, |path| {
+            RecordSite::Detached(path.to_path_buf())
+        }),
     )
 }
 
@@ -559,7 +561,7 @@ async fn an_install_copy_survives_the_leaders_passes_and_a_restart() {
     );
     let foreign_path = root.path().join("foreign.snapshot.json");
     persist_snapshot_metadata(
-        Some(&foreign_path),
+        &foreign_path,
         crate::log_store::LogGeneration::FIRST,
         &meta(1),
         &SnapshotPointer {
@@ -879,7 +881,7 @@ async fn a_foreign_restore_is_refused_and_a_name_collision_falls_back_inline() {
     let foreign = ten.write_staged(staged).await.unwrap().into_location();
     let path = root.path().join("group-7.snapshot.json");
     persist_snapshot_metadata(
-        Some(&path),
+        &path,
         crate::log_store::LogGeneration::FIRST,
         &meta(1),
         &SnapshotPointer {

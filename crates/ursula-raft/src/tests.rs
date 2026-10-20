@@ -5595,7 +5595,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
             ursula_runtime::default_snapshot_store(),
             crate::state_machine::SnapshotBuildCoordinator::default(),
             crate::state_machine::SnapshotInstallCoordinator::default(),
-            Some(metadata_path.clone()),
+            crate::state_machine::RecordSite::Detached(metadata_path.clone()),
         );
         let snapshot = ursula_runtime::GroupSnapshot {
             placement: placement(),

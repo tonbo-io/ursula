@@ -1772,11 +1772,9 @@ pub struct RaftGroupStateMachine {
     /// What this engine incarnation holds of its own snapshot objects: its
     /// own, empty until its restore ended (#687).
     pub(crate) holds: Arc<SnapshotHolds>,
-    snapshot_metadata_path: Option<PathBuf>,
-    /// The record site and core journal of the group's log store: a
-    /// snapshot record is published only after the journal synced, and a
-    /// restored one is checked against the log ([`crate::SnapshotRecord`]).
-    pub(crate) snapshot_record: Option<crate::SnapshotRecord>,
+    /// Where the group's snapshot record lives, and in which generation of
+    /// the group's log ([`RecordSite`]).
+    pub(crate) snapshot_record: RecordSite,
     /// Log applied since the last snapshot (F12e), read by the driver.
     log_gauge: Arc<GroupLogGauge>,
     /// The engine's token: OpenRaft's state-machine worker owns this state
@@ -1796,10 +1794,52 @@ struct PersistedSnapshot {
     pointer_bytes: Vec<u8>,
 }
 
-/// The generation of the group's log a snapshot record is written in and
-/// restored from: the log store's, or the first for a group without one.
-fn record_generation(record: Option<&crate::SnapshotRecord>) -> LogGeneration {
-    record.map_or(LogGeneration::FIRST, crate::SnapshotRecord::generation)
+/// Where a group's state machine keeps its snapshot record, and in which
+/// generation of the group's log it writes and restores it.
+#[derive(Debug, Clone)]
+pub(crate) enum RecordSite {
+    /// No record: a build or an install persists none, and a restore
+    /// restores nothing.
+    NoRecord,
+    /// The record site of the group's log store ([`crate::SnapshotRecord`]):
+    /// the record's path and generation, the journal synced before every
+    /// record, and the log a restored record is checked against.
+    Store(crate::SnapshotRecord),
+    /// A test setup without a log store: a record file at a path, written
+    /// and restored in the first generation, with no journal to sync and no
+    /// log to check it against.
+    #[cfg(test)]
+    Detached(PathBuf),
+}
+
+impl RecordSite {
+    /// The record's file, and the generation it is written in and restored
+    /// from.
+    fn file(&self) -> Option<(&Path, LogGeneration)> {
+        match self {
+            Self::NoRecord => None,
+            Self::Store(record) => Some((record.path(), record.generation())),
+            #[cfg(test)]
+            Self::Detached(path) => Some((path.as_path(), LogGeneration::FIRST)),
+        }
+    }
+
+    /// The log store's record site, when the group has one.
+    fn store(&self) -> Option<&crate::SnapshotRecord> {
+        match self {
+            Self::NoRecord => None,
+            Self::Store(record) => Some(record),
+            #[cfg(test)]
+            Self::Detached(_) => None,
+        }
+    }
+
+    /// The record's file and generation, owned, for a publication that
+    /// runs off the state machine.
+    fn owned_file(&self) -> Option<(PathBuf, LogGeneration)> {
+        self.file()
+            .map(|(path, generation)| (path.to_path_buf(), generation))
+    }
 }
 
 /// A snapshot record of three distinct fields, for the persisted-envelopes
@@ -1904,7 +1944,7 @@ impl RaftGroupStateMachine {
             snapshot_store,
             SnapshotBuildCoordinator::default(),
             SnapshotInstallCoordinator::default(),
-            None,
+            RecordSite::NoRecord,
         )
     }
 
@@ -1915,7 +1955,7 @@ impl RaftGroupStateMachine {
         snapshot_store: SharedSnapshotStore,
         snapshot_build: SnapshotBuildCoordinator,
         snapshot_install: SnapshotInstallCoordinator,
-        snapshot_metadata_path: Option<PathBuf>,
+        snapshot_record: RecordSite,
     ) -> Self {
         let log_gauge = snapshot_build.log_gauge(placement.raft_group_id.0);
         // Every incarnation starts with holds of its own, authoritative once
@@ -1943,8 +1983,7 @@ impl RaftGroupStateMachine {
             snapshot_build,
             snapshot_install,
             holds,
-            snapshot_metadata_path,
-            snapshot_record: None,
+            snapshot_record,
             log_gauge,
             work: WorkToken::detached(),
         }
@@ -1993,7 +2032,7 @@ impl RaftGroupStateMachine {
 
     async fn restore_snapshot_record(&mut self) -> Result<(), SnapshotRestoreError> {
         let raft_group_id = self.placement.raft_group_id;
-        let Some(path) = &self.snapshot_metadata_path else {
+        let Some((path, generation)) = self.snapshot_record.file() else {
             return Ok(());
         };
         if !Disk::exists(path) {
@@ -2019,7 +2058,6 @@ impl RaftGroupStateMachine {
         // group on this replica, whose objects may be gone: it restores
         // nothing, before it is checked against the log or names anything
         // to download.
-        let generation = record_generation(self.snapshot_record.as_ref());
         if persisted.generation != generation {
             tracing::info!(
                 raft_group_id = raft_group_id.0,
@@ -2035,7 +2073,7 @@ impl RaftGroupStateMachine {
             SnapshotPointer::decode(&persisted.pointer_bytes).map_err(pointer_unreadable)?;
         // Before anything is downloaded: a log the record contradicts
         // keeps the group closed (R1).
-        if let Some(record) = &self.snapshot_record
+        if let Some(record) = self.snapshot_record.store()
             && let Some(snapshot) = persisted.meta.last_log_id
         {
             record.check_restored(snapshot).map_err(|source| {
@@ -2249,7 +2287,6 @@ impl RaftGroupStateMachine {
             snapshot_store: self.snapshot_store.clone(),
             metrics: self.metrics.clone(),
             build,
-            snapshot_metadata_path: self.snapshot_metadata_path.clone(),
             snapshot_record: self.snapshot_record.clone(),
             log_gauge: Arc::clone(&self.log_gauge),
             log_mark: self.log_gauge.mark(),
@@ -2544,26 +2581,18 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let log_mark = self.log_gauge.mark();
         let membership = self.last_membership.clone();
         let current_snapshot = self.current_snapshot.clone();
-        let metadata_path = self.snapshot_metadata_path.clone();
-        let generation = record_generation(self.snapshot_record.as_ref());
+        let record_file = self.snapshot_record.owned_file();
         let holds = Arc::clone(&self.holds);
         let meta = meta.clone();
         // The truncate of a conflicting tail this install replaced must be
         // durable before the record is (R1).
-        if let Some(record) = &self.snapshot_record {
+        if let Some(record) = self.snapshot_record.store() {
             record.sync().await.map_err(io::Error::from)?;
         }
         snapshot_metadata_work(self.metadata_serial.clone(), move || {
             // The copy stays leased until it is current.
             let _lease = lease;
-            persist_snapshot_candidate(
-                metadata_path.as_deref(),
-                generation,
-                &meta,
-                &pointer_bytes,
-                &owned,
-                &holds,
-            )?;
+            persist_snapshot_candidate(record_file, &meta, &pointer_bytes, &owned, &holds)?;
             let snapshot_index = meta.last_log_id.map_or(0, |log_id| log_id.index());
             publish_current(
                 &current_snapshot,
@@ -2601,8 +2630,7 @@ pub struct RaftGroupSnapshotBuilder {
     metrics: Option<GroupEngineMetrics>,
     /// The build's permit, counted in flight until the builder is dropped.
     build: SnapshotBuildLease,
-    snapshot_metadata_path: Option<PathBuf>,
-    snapshot_record: Option<crate::SnapshotRecord>,
+    snapshot_record: RecordSite,
     log_gauge: Arc<GroupLogGauge>,
     /// The applied log this snapshot covers (F12e).
     log_mark: GroupLogMark,
@@ -2722,15 +2750,14 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         let snapshot_bytes = usize::try_from(pointer.location().size_hint()).unwrap_or(usize::MAX);
         let pointer_len = pointer_bytes.len();
         let current_snapshot = self.current_snapshot.clone();
-        let metadata_path = self.snapshot_metadata_path.clone();
-        let generation = record_generation(self.snapshot_record.as_ref());
+        let record_file = self.snapshot_record.owned_file();
         let meta = self.meta.clone();
         let holds = Arc::clone(&self.holds);
         let log_gauge = self.log_gauge.clone();
         let log_mark = self.log_mark;
         let snapshot_index = meta.last_log_id.map_or(0, |log_id| log_id.index());
         // As for an install: the journal before the record (R1).
-        if let Some(record) = &self.snapshot_record {
+        if let Some(record) = self.snapshot_record.store() {
             record.sync().await.map_err(io::Error::from)?;
         }
         let chosen = snapshot_metadata_work(self.metadata_serial.clone(), move || {
@@ -2747,14 +2774,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             if let Some(newer) = newer {
                 return Ok(newer);
             }
-            persist_snapshot_candidate(
-                metadata_path.as_deref(),
-                generation,
-                &meta,
-                &pointer_bytes,
-                &pointer,
-                &holds,
-            )?;
+            persist_snapshot_candidate(record_file, &meta, &pointer_bytes, &pointer, &holds)?;
             let current = CurrentSnapshot::new(meta, pointer_bytes, pointer.location());
             publish_current(&current_snapshot, &holds, current.clone(), &pointer);
             log_gauge.record_snapshot(log_mark, pointer.location().size_hint(), snapshot_index);
@@ -2914,14 +2934,16 @@ pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
 }
 
 fn persist_snapshot_candidate(
-    path: Option<&Path>,
-    generation: LogGeneration,
+    record_file: Option<(PathBuf, LogGeneration)>,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
     pointer_bytes: &[u8],
     pointer: &OwnedPointer,
     holds: &SnapshotHolds,
 ) -> Result<(), io::Error> {
-    persist_snapshot_metadata(path, generation, meta, pointer_bytes).inspect_err(|_error| {
+    let Some((path, generation)) = record_file else {
+        return Ok(());
+    };
+    persist_snapshot_metadata(&path, generation, meta, pointer_bytes).inspect_err(|_error| {
         // Rename may already have happened. Keep the candidate even if this
         // particular failure occurred earlier; the terminal latch bounds it.
         holds.retain_failed_candidate(pointer.location());
@@ -2929,14 +2951,11 @@ fn persist_snapshot_candidate(
 }
 
 fn persist_snapshot_metadata(
-    path: Option<&Path>,
+    path: &Path,
     generation: LogGeneration,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
     pointer_bytes: &[u8],
 ) -> Result<(), io::Error> {
-    let Some(path) = path else {
-        return Ok(());
-    };
     if let Some(parent) = path.parent() {
         create_dir_all_durable(parent)?;
     }
@@ -2979,8 +2998,7 @@ mod tests {
         // prevents opening the directory for fsync after the rename succeeds.
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
         let can_open = std::fs::File::open(root.path());
-        let result =
-            persist_snapshot_metadata(Some(&path), LogGeneration::FIRST, &meta, b"pointer");
+        let result = persist_snapshot_metadata(&path, LogGeneration::FIRST, &meta, b"pointer");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = can_open.expect_err(
             "directory-permission fault must be exercised: run this test as an unprivileged user on a filesystem that enforces directory read permissions",
@@ -3122,74 +3140,9 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("group-7.snapshot.json");
-        persist_snapshot_metadata(Some(&path), LogGeneration::new(3), &meta, &[
-            0x92, 0x05, 0x09,
-        ])
-        .unwrap();
+        persist_snapshot_metadata(&path, LogGeneration::new(3), &meta, &[0x92, 0x05, 0x09])
+            .unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), snapshot_record_sample());
-    }
-
-    /// A state machine of group 7 that restores from the record at `path`,
-    /// without a log store: its log is of the first generation.
-    #[cfg(not(madsim))]
-    fn restoring_from(path: &Path) -> RaftGroupStateMachine {
-        RaftGroupStateMachine::new_with_stores_and_snapshot_install(
-            ShardPlacement {
-                core_id: ursula_shard::CoreId(0),
-                shard_id: ursula_shard::ShardId(0),
-                raft_group_id: RaftGroupId(7),
-            },
-            None,
-            None,
-            default_snapshot_store(),
-            SnapshotBuildCoordinator::default(),
-            SnapshotInstallCoordinator::default(),
-            Some(path.to_owned()),
-        )
-    }
-
-    /// A snapshot record of another generation of the group's log, which an
-    /// earlier life of the group on this replica left, restores nothing. It
-    /// is dropped before its pointer is read: before it is checked against
-    /// the log and before anything is downloaded.
-    #[cfg(not(madsim))]
-    #[tokio::test]
-    async fn a_snapshot_record_of_another_generation_restores_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("group-7.snapshot.json");
-        // A pointer nothing decodes: only a restore that reads it fails.
-        let unreadable = b"not a snapshot pointer";
-        persist_snapshot_metadata(
-            Some(&path),
-            LogGeneration::new(1),
-            &test_snapshot_meta(42),
-            unreadable,
-        )
-        .unwrap();
-        let mut restored = restoring_from(&path);
-        restored
-            .restore_persisted_snapshot()
-            .await
-            .expect("a record of another generation restores nothing");
-        assert_eq!(restored.last_applied_log_id, None);
-        assert!(restored.current_snapshot.lock().unwrap().is_none());
-
-        // The same record in the log's own generation is read, and refused.
-        persist_snapshot_metadata(
-            Some(&path),
-            LogGeneration::FIRST,
-            &test_snapshot_meta(42),
-            unreadable,
-        )
-        .unwrap();
-        let error = restoring_from(&path)
-            .restore_persisted_snapshot()
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(error, SnapshotRestoreError::Pointer { .. }),
-            "{error}"
-        );
     }
 
     /// A store whose core metadata names generation 1 of its group's log
@@ -3233,22 +3186,20 @@ mod tests {
         assert_eq!(record.generation(), LogGeneration::new(1));
         let path = record.path().to_path_buf();
         let restoring = |record: crate::SnapshotRecord| {
-            let mut state_machine = RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            RaftGroupStateMachine::new_with_stores_and_snapshot_install(
                 placement,
                 None,
                 None,
                 default_snapshot_store(),
                 SnapshotBuildCoordinator::default(),
                 SnapshotInstallCoordinator::default(),
-                Some(record.path().to_path_buf()),
-            );
-            state_machine.snapshot_record = Some(record);
-            state_machine
+                RecordSite::Store(record),
+            )
         };
         // A pointer nothing decodes: only a restore that reads it fails.
         let unreadable = b"not a snapshot pointer";
         persist_snapshot_metadata(
-            Some(&path),
+            &path,
             LogGeneration::FIRST,
             &test_snapshot_meta(42),
             unreadable,
@@ -3263,7 +3214,7 @@ mod tests {
         assert!(restored.current_snapshot.lock().unwrap().is_none());
 
         persist_snapshot_metadata(
-            Some(&path),
+            &path,
             LogGeneration::new(1),
             &test_snapshot_meta(42),
             unreadable,
@@ -3353,9 +3304,8 @@ mod tests {
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             holds: Arc::default(),
-            snapshot_metadata_path: Some(metadata_path.clone()),
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_record: None,
+            snapshot_record: RecordSite::Detached(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
         // #561: the build records what it covers while it holds its permit.
@@ -3371,7 +3321,7 @@ mod tests {
             default_snapshot_store(),
             SnapshotBuildCoordinator::default(),
             SnapshotInstallCoordinator::default(),
-            Some(metadata_path),
+            RecordSite::Detached(metadata_path),
         );
         restored
             .restore_persisted_snapshot()
@@ -3426,9 +3376,8 @@ mod tests {
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             holds: Arc::default(),
-            snapshot_metadata_path: Some(metadata_path.clone()),
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_record: None,
+            snapshot_record: RecordSite::Detached(metadata_path.clone()),
         };
         builder.build_snapshot().await.expect("persist snapshot");
 
@@ -3448,7 +3397,7 @@ mod tests {
             default_snapshot_store(),
             SnapshotBuildCoordinator::default(),
             SnapshotInstallCoordinator::default(),
-            Some(metadata_path),
+            RecordSite::Detached(metadata_path),
         );
         restored
             .restore_persisted_snapshot()
@@ -3486,7 +3435,7 @@ mod tests {
             store.clone(),
             SnapshotBuildCoordinator::default(),
             coordinator.clone(),
-            Some(metadata.clone()),
+            RecordSite::Detached(metadata.clone()),
         );
         state.restore_persisted_snapshot().await.unwrap();
         state
@@ -3532,7 +3481,7 @@ mod tests {
             store,
             SnapshotBuildCoordinator::default(),
             SnapshotInstallCoordinator::default(),
-            Some(metadata),
+            RecordSite::Detached(metadata),
         );
         restored.restore_persisted_snapshot().await.unwrap();
         assert_eq!(restored.last_applied_log_id, Some(test_log_id(2)));
@@ -3565,9 +3514,8 @@ mod tests {
             log_gauge: Arc::default(),
             log_mark: GroupLogMark::default(),
             holds: holds.clone(),
-            snapshot_metadata_path: None,
             work: crate::openraft_work::WorkToken::detached(),
-            snapshot_record: None,
+            snapshot_record: RecordSite::NoRecord,
         }
     }
 
@@ -4000,7 +3948,7 @@ mod tests {
             default_snapshot_store(),
             build,
             install,
-            None,
+            RecordSite::NoRecord,
         )
     }
 
