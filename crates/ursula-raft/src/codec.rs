@@ -776,11 +776,8 @@ mod tests {
         use ursula_runtime::wire_samples;
 
         let mut samples = std::collections::BTreeMap::new();
-        for command in wire_samples::stream_commands() {
-            add_by_debug(&mut samples, &RaftCommand::Stream(command));
-        }
-        for command in meta_commands() {
-            add_by_debug(&mut samples, &RaftCommand::Meta(command));
+        for command in raft_commands() {
+            add_by_debug(&mut samples, &command);
         }
         for response in ursula_control::samples::sample_responses() {
             add_by_debug(&mut samples, &response);
@@ -795,6 +792,35 @@ mod tests {
             add_by_debug(&mut samples, &read);
         }
         samples
+    }
+
+    /// Every command of both planes in the [`RaftCommand`] a Raft entry
+    /// carries: each data command of `ursula_runtime::wire_samples` and each
+    /// meta command of [`meta_commands`]. One witness per variant stands for
+    /// its family, so a new variant does not compile until it has samples.
+    fn raft_commands() -> Vec<RaftCommand> {
+        use ursula_runtime::wire_samples;
+
+        let witnesses = every!(RaftCommand {
+            RaftCommand::Stream(_) => "stream": RaftCommand::Stream(
+                ursula_stream::StreamCommand::AckColdGc { up_to_seq: 21 }
+            ),
+            RaftCommand::Meta(_) => "meta": RaftCommand::Meta(meta_commands().swap_remove(0)),
+        });
+        witnesses
+            .iter()
+            .flat_map(|(_, witness)| -> Vec<RaftCommand> {
+                match witness {
+                    RaftCommand::Stream(_) => wire_samples::stream_commands()
+                        .into_iter()
+                        .map(RaftCommand::Stream)
+                        .collect(),
+                    RaftCommand::Meta(_) => {
+                        meta_commands().into_iter().map(RaftCommand::Meta).collect()
+                    }
+                }
+            })
+            .collect()
     }
 
     /// One meta command of every variant: a history event of each cause and
