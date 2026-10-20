@@ -541,6 +541,80 @@ async fn group_rpcs_check_their_target_before_the_group() {
     );
 }
 
+/// An inbound append to a data group whose entries carry a meta command is
+/// refused (`INVALID_ARGUMENT`) before OpenRaft sees it: the group keeps
+/// its vote, though the request's is higher. The same request without the
+/// meta entry reaches OpenRaft, which takes its vote.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() {
+    use openraft::rt::WatchReceiver;
+
+    use crate::raft_internal_proto as pb;
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+
+    let wal_root = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
+            .with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let mut metrics = registry.get(RaftGroupId(0)).unwrap().metrics();
+    let term = metrics.borrow_watched().current_term;
+    let higher = term + 10;
+    let service = crate::grpc::RaftGrpcService::new(registry.clone());
+    let append = |entries| {
+        let request = UrsulaAppendEntriesRequest {
+            vote: UrsulaVote::new_committed(higher, 2),
+            prev_log_id: None,
+            entries,
+            leader_commit: None,
+        };
+        let mut envelope = pb::RaftRpcEnvelopeV1 {
+            protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+            payload: encode_wire(&request),
+            ..Default::default()
+        };
+        crate::target::RaftTarget::Data(RaftGroupId(0)).stamp(1, &mut envelope);
+        tonic::Request::new(envelope)
+    };
+    let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
+        ursula_control::ControlCommand::RegisterNode {
+            node: ursula_control::NodeId::new(2),
+            now_ms: 1,
+        },
+    ));
+    let entry = Entry::new(
+        LogId {
+            leader_id: CommittedLeaderId::new(higher, 2),
+            index: 1,
+        },
+        EntryPayload::Normal(meta),
+    );
+    let refused = service
+        .append(append(vec![entry]))
+        .await
+        .expect_err("a data group takes no meta command");
+    assert_eq!(refused.code(), tonic::Code::InvalidArgument);
+    assert!(!crate::format_epoch::is_protocol_mismatch(&refused));
+    assert_eq!(metrics.borrow_watched().current_term, term);
+
+    service
+        .append(append(Vec::new()))
+        .await
+        .expect("an append without the meta entry reaches OpenRaft");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while metrics.borrow_watched().current_term < higher {
+            metrics.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("OpenRaft takes the request's vote");
+}
+
 fn placement() -> ShardPlacement {
     ShardPlacement {
         core_id: CoreId(0),

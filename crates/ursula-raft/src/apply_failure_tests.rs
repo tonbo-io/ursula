@@ -591,6 +591,88 @@ async fn invariant_failure_is_fatal_but_business_rejection_is_applied() {
     );
 }
 
+/// A data group never commits a meta command, which no request of its
+/// plane admits. A state machine that meets one anyway stops its apply as
+/// an invariant violation at that entry, which applies nothing: the last
+/// applied entry stays the one before it.
+#[tokio::test]
+async fn a_meta_command_stops_a_data_groups_apply_before_the_entry() {
+    use openraft::storage::RaftStateMachine;
+    use ursula_runtime::GroupEngine;
+    use ursula_runtime::GroupEngineError;
+    use ursula_runtime::GroupInfraError;
+    let mut state = crate::RaftGroupStateMachine::new(placement(0));
+    let entry = |index, command| openraft::alias::EntryOf::<crate::UrsulaRaftTypeConfig> {
+        log_id: openraft::LogId::new(
+            openraft::vote::leader_id_adv::CommittedLeaderId::new(1, 1),
+            index,
+        ),
+        payload: openraft::EntryPayload::Normal(command),
+    };
+    state
+        .apply(futures_util::stream::iter([Ok((
+            entry(1, crate::tests::genesis_command()),
+            None,
+        ))]))
+        .await
+        .expect("the group's genesis");
+    let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
+        ursula_control::ControlCommand::RegisterNode {
+            node: ursula_control::NodeId::new(1),
+            now_ms: 1,
+        },
+    ));
+    let error = state
+        .apply(futures_util::stream::iter([
+            Ok((entry(2, meta), None)),
+            Ok((entry(3, create_stream("after-the-meta-entry")), None)),
+        ]))
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<crate::apply_failure::ApplyError>(),
+        Some(crate::apply_failure::ApplyError::InvariantViolation(
+            GroupEngineError::Infra(GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::OtherPlane,
+            })
+        ))
+    ));
+    assert_eq!(state.last_applied_log_id.unwrap().index(), 1);
+    let stopped = state.apply_health.stopped().unwrap();
+    assert_eq!(
+        stopped.kind,
+        crate::apply_failure::ApplyStopKind::InvariantViolation
+    );
+    assert_eq!(stopped.index, 2);
+    assert_eq!(stopped.last_applied.unwrap().index(), 1);
+    assert_eq!(
+        state.apply_health.failure().unwrap().kind,
+        crate::apply_failure::ApplyFailureKind::InvariantViolation
+    );
+    assert!(matches!(
+        state.apply_health.check(RaftGroupId(0)),
+        Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped {
+            index: 2,
+            kind: crate::apply_failure::ApplyStopKind::InvariantViolation,
+            ..
+        }))
+    ));
+    assert!(
+        state
+            .engine
+            .snapshot(placement(0))
+            .await
+            .unwrap()
+            .stream_snapshot
+            .streams
+            .is_empty(),
+        "nothing after the meta entry applied"
+    );
+}
+
 #[tokio::test]
 async fn three_replica_poison_drill_replays_every_payload_without_skipping() {
     crate::rt::time::timeout(
