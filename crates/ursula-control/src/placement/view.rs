@@ -13,7 +13,9 @@ use std::sync::Arc;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::ViewStage;
 
+#[cfg(test)]
 use super::rules::Rule;
+#[cfg(test)]
 use super::rules::enforced;
 use super::state::Cluster;
 use super::state::ControlPlaneState;
@@ -103,6 +105,7 @@ impl ConfirmedView {
 /// Whether a view at `stage` carries `stamp`: it is in the stamp's meta
 /// history and applied at least the stamp's entry, compared term first.
 fn covers(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView> {
+    #[cfg(test)]
     if !enforced(Rule::ConfirmByLogId) {
         return covers_by_index(stage, stamp);
     }
@@ -131,6 +134,7 @@ fn covers(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView
 /// history check and the term-first comparison, because each alone refuses
 /// that view: a meta plan begins its history in a new term. So C6(h) shows
 /// that confirming needs one of them, not which.
+#[cfg(test)]
 fn covers_by_index(stage: ViewStage, stamp: ConfirmedStamp) -> Result<(), UnconfirmedView> {
     match stage {
         ViewStage::Empty => Err(UnconfirmedView::Empty),

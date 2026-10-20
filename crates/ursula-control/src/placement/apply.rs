@@ -116,14 +116,16 @@ impl ControlPlaneState {
                         | GroupPlacement::Live { since: key, .. } => *key = since,
                     }
                 }
-                let dropped = if enforced(Rule::HistoryDrop) {
-                    std::mem::take(&mut cluster.retirements)
-                        .into_iter()
-                        .map(|(group, records)| (group, records.into_keys().collect()))
-                        .collect()
-                } else {
-                    BTreeMap::new()
-                };
+                #[cfg(test)]
+                if !enforced(Rule::HistoryDrop) {
+                    return HistoryBegun::Rebased {
+                        dropped: BTreeMap::new(),
+                    };
+                }
+                let dropped = std::mem::take(&mut cluster.retirements)
+                    .into_iter()
+                    .map(|(group, records)| (group, records.into_keys().collect()))
+                    .collect();
                 HistoryBegun::Rebased { dropped }
             }
         }

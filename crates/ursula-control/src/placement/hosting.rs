@@ -183,6 +183,7 @@ pub fn plan_hosting(input: &HostingInput<'_>) -> HostingPlan {
         ViewInput::Unconfirmed(view) => {
             let mut plan = plan_held(view, input.me, input.local);
             let confirmed = plan_member(input.me, view, input.local);
+            #[cfg(test)]
             if !enforced(Rule::ConfirmedCreation) {
                 for (group, admission) in &confirmed.admitted {
                     if *admission == Admission::Create {
@@ -500,7 +501,9 @@ impl Teardown {
     /// for changes nothing: an answer while fencing, a completion while
     /// asking, a cancel past step 0.
     pub fn advance(self, event: TeardownEvent) -> TeardownOutcome {
-        let not_member = event == TeardownEvent::Answered(Some(MembershipAnswer::NotMember))
+        let not_member = event == TeardownEvent::Answered(Some(MembershipAnswer::NotMember));
+        #[cfg(test)]
+        let not_member = not_member
             || (!enforced(Rule::RetireAnswer) && matches!(event, TeardownEvent::Answered(_)));
         match (self, event) {
             (Self::Asking, TeardownEvent::Cancel) => TeardownOutcome::Ended(TeardownEnd::Cancelled),
