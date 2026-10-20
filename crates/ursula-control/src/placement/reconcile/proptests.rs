@@ -4,12 +4,14 @@
 //! any leadership, uniform or joint configs, live, caught-up, gated and
 //! listed sets, confirmed or not, against any target. R6 and R10 run it
 //! over the abstract group of [`super::model`], whose adversary moves
-//! leadership onto any live voter, drops second steps, revokes the
-//! confirmation, holds catch-up and gates back, unlists targets, crashes
-//! members, strands the leader without a quorum and restarts nodes. R6
-//! restarts every node before the environment turns fair. R10 cancels
-//! from every state the faulty run passes through. Both count the paths
-//! that only a fault reaches, and fail when a path is never reached.
+//! leadership onto any node that would win an election, drops or delays
+//! second steps, revokes the confirmation, holds catch-up, gates and
+//! transfers back, unlists targets, crashes members, cuts the leader off
+//! and restarts nodes. R6 restarts every node before the environment turns
+//! fair. R10 cancels from every state the faulty run passes through. Both
+//! count the paths that only a fault reaches, and fail when a path is never
+//! reached. Broken planners swapped into the same runs show that R6 and
+//! R10 catch a planner that breaks a rule.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -42,6 +44,7 @@ use super::ViewFreshness;
 use super::model::Ended;
 use super::model::Group;
 use super::model::Planned;
+use super::model::Planner;
 use super::model::act;
 use super::model::environment;
 use super::model::node;
@@ -484,33 +487,37 @@ fn check_group(group: &Group, size: usize) -> Result<(), String> {
 /// and the leader's.
 #[derive(Debug, Clone, Copy)]
 enum Fault {
-    /// An election wins for any live voter of the effective membership.
+    /// An election, won by any node that would win one.
     MoveLeader(u8),
     DropSecondStep,
+    /// The next second step waits for the environment's next round.
+    DelaySecondStep,
     RevokeConfirmation,
-    /// Catch-up, gates and listings stay as they are this round.
+    /// Catch-up, gates, listings and a pending transfer stay as they are
+    /// this round.
     HoldBack,
     /// A target's address drops out of the leader's book.
     Unlist(u8),
     /// A live member of the effective membership crashes, the leader
     /// included.
     Kill(u8),
-    /// Every other member crashes or is cut off, and the leader keeps
-    /// leading without a quorum.
+    /// The leader is cut off from every other node and keeps leading
+    /// without a quorum until the others elect one.
     Strand,
     /// A crashed node restarts.
     Revive(u8),
 }
 
 fn fault() -> impl Strategy<Value = Fault> {
-    (0_u8..8, proptest::num::u8::ANY).prop_map(|(kind, x)| match kind {
+    (0_u8..9, proptest::num::u8::ANY).prop_map(|(kind, x)| match kind {
         0 => Fault::MoveLeader(x),
         1 => Fault::DropSecondStep,
-        2 => Fault::RevokeConfirmation,
-        3 => Fault::HoldBack,
-        4 => Fault::Unlist(x),
-        5 => Fault::Kill(x),
-        6 => Fault::Strand,
+        2 => Fault::DelaySecondStep,
+        3 => Fault::RevokeConfirmation,
+        4 => Fault::HoldBack,
+        5 => Fault::Unlist(x),
+        6 => Fault::Kill(x),
+        7 => Fault::Strand,
         _ => Fault::Revive(x),
     })
 }
@@ -527,21 +534,22 @@ fn fault_round(
     fault: Fault,
     target: &MembershipTarget,
     universe: &BTreeSet<NodeId>,
-) -> Option<Planned> {
+) -> Result<Option<Planned>, String> {
     environment(group, !matches!(fault, Fault::HoldBack));
     match fault {
         Fault::MoveLeader(x) => {
-            let candidates: BTreeSet<NodeId> = group
-                .effective()
-                .voters()
-                .intersection(&group.alive)
+            let winners: BTreeSet<NodeId> = group
+                .alive
+                .iter()
                 .copied()
+                .filter(|node| group.can_win(*node))
                 .collect();
-            if let Some(next) = pick(&candidates, x) {
-                group.elect_as(next);
+            if let Some(next) = pick(&winners, x) {
+                group.campaign(next);
             }
         }
         Fault::DropSecondStep => group.drop_second_step = true,
+        Fault::DelaySecondStep => group.delay_second_step = true,
         Fault::RevokeConfirmation => group.confirmed = false,
         Fault::HoldBack => {}
         Fault::Unlist(x) => {
@@ -560,15 +568,7 @@ fn fault_round(
                 group.kill(dead);
             }
         }
-        Fault::Strand => {
-            if let Some(leader) = group.leader {
-                for member in group.effective().members() {
-                    if member != leader {
-                        group.kill(member);
-                    }
-                }
-            }
-        }
+        Fault::Strand => group.strand(),
         Fault::Revive(x) => {
             let dead: BTreeSet<NodeId> = universe.difference(&group.alive).copied().collect();
             if let Some(back) = pick(&dead, x) {
@@ -583,7 +583,8 @@ fn fault_round(
 /// reaches.
 #[derive(Debug, Default)]
 struct Coverage {
-    /// A leader waited on an uncommitted membership.
+    /// A leader waited on an uncommitted membership: its own step's kept
+    /// future, or an entry it was elected with.
     uncommitted: Cell<usize>,
     /// A leader of a joint config with no live majority on either side
     /// waited.
@@ -591,8 +592,16 @@ struct Coverage {
     /// A voter change from a uniform config dropped a crashed voter while
     /// a smaller live one was also to go.
     dead_first: Cell<usize>,
-    /// A new leader committed a pending entry on its election.
-    election_commits: Cell<usize>,
+    /// A leader waited on its pending transfer.
+    transfer_pending: Cell<usize>,
+    /// Elections over an uncommitted membership entry whose winner held it,
+    /// and whose winner lacked one another node held.
+    pending_kept: Cell<usize>,
+    pending_truncated: Cell<usize>,
+    /// Elections an outgoing voter won.
+    outgoing_wins: Cell<usize>,
+    /// Recovery plans that elected a leader.
+    plans: Cell<usize>,
     /// A cancel started from a committed joint config.
     cancel_from_joint: Cell<usize>,
     /// A cancel started from a pending entry.
@@ -607,8 +616,11 @@ impl Coverage {
     /// Tallies one planner call toward `target`.
     fn observe(&self, planned: &Planned, target: &MembershipTarget) {
         match &planned.step {
-            MembershipStep::Wait(WaitReason::MembershipUncommitted) => bump(&self.uncommitted, 1),
+            MembershipStep::Wait(WaitReason::MembershipUncommitted | WaitReason::StepPending) => {
+                bump(&self.uncommitted, 1);
+            }
             MembershipStep::Wait(WaitReason::NoLiveQuorum) => bump(&self.no_live_quorum, 1),
+            MembershipStep::Wait(WaitReason::TransferPending) => bump(&self.transfer_pending, 1),
             MembershipStep::ChangeVoters { voters, .. }
                 if drops_dead_first(planned, voters, target) =>
             {
@@ -616,6 +628,14 @@ impl Coverage {
             }
             _ => {}
         }
+    }
+
+    /// Tallies the elections and plans of a finished run.
+    fn tally(&self, group: &Group) {
+        bump(&self.pending_kept, group.elections.pending_kept);
+        bump(&self.pending_truncated, group.elections.pending_truncated);
+        bump(&self.outgoing_wins, group.elections.outgoing);
+        bump(&self.plans, group.elections.plans);
     }
 }
 
@@ -716,6 +736,50 @@ proptest::proptest! {
     }
 }
 
+/// One R6 case: a move from `from` to `to` led by the node `leader` picks,
+/// planned by `planner`, runs `faults`, then every crashed node restarts
+/// and a fair run converges within the voters still to replace plus
+/// `FAIR_ROUNDS`, keeping C7 and R1 throughout.
+fn moving_case(
+    planner: Planner,
+    from: &VoterSet,
+    to: &VoterSet,
+    leader: u8,
+    faults: &[Fault],
+    coverage: &Coverage,
+) -> Result<(), String> {
+    let size = to.len();
+    let universe: BTreeSet<NodeId> = (1..=10).map(node).collect();
+    let first = pick(&from.to_set(), leader).ok_or("an empty source")?;
+    let mut group = Group::new(from, first, universe.clone());
+    group.planner = planner;
+    let target = moving_target(to);
+    for fault in faults {
+        if let Some(planned) = fault_round(&mut group, *fault, &target, &universe)? {
+            coverage.observe(&planned, &target);
+        }
+        check_group(&group, size)?;
+    }
+    let dead: BTreeSet<NodeId> = universe.difference(&group.alive).copied().collect();
+    for node in dead {
+        group.revive(node);
+    }
+    group.drop_second_step = false;
+    group.delay_second_step = false;
+    let limit = round_limit(&group, to);
+    let ended = run(&mut group, &target, limit, |group, planned| {
+        if let Some(planned) = planned {
+            coverage.observe(planned, &target);
+        }
+        check_group(group, size)
+    });
+    coverage.tally(&group);
+    match ended? {
+        Ended::Converged => Ok(()),
+        Ended::Stuck => Err(format!("R6: stuck after {limit} fair rounds: {group:?}")),
+    }
+}
+
 /// R6: from every moving start of 1 to 5 voters, after any faults, every
 /// crashed node restarted, a fair run converges within the voters still to
 /// replace plus `FAIR_ROUNDS`, keeping C7 and R1 throughout.
@@ -731,39 +795,15 @@ fn every_moving_start_converges_within_the_bound() {
         &strategy,
         |((from, to), leader, faults)| -> TestCaseResult {
             proptest::prop_assume!(from != to);
-            let from = voter_set_of(from);
-            let to = voter_set_of(to);
-            let size = to.len();
-            let universe: BTreeSet<NodeId> = (1..=10).map(node).collect();
-            let first = pick(&from.to_set(), leader).unwrap();
-            let mut group = Group::new(&from, first, universe.clone());
-            let target = moving_target(&to);
-            for fault in faults {
-                if let Some(planned) = fault_round(&mut group, fault, &target, &universe) {
-                    coverage.observe(&planned, &target);
-                }
-                check_group(&group, size).map_err(TestCaseError::fail)?;
-            }
-            let dead: BTreeSet<NodeId> = universe.difference(&group.alive).copied().collect();
-            for node in dead {
-                group.revive(node);
-            }
-            group.drop_second_step = false;
-            let limit = round_limit(&group, &to);
-            let ended = run(&mut group, &target, limit, |group, planned| {
-                if let Some(planned) = planned {
-                    coverage.observe(planned, &target);
-                }
-                check_group(group, size)
-            });
-            bump(&coverage.election_commits, group.election_commits);
-            match ended {
-                Ok(Ended::Converged) => Ok(()),
-                Ok(Ended::Stuck) => Err(TestCaseError::fail(format!(
-                    "R6: stuck after {limit} fair rounds: {group:?}"
-                ))),
-                Err(violation) => Err(TestCaseError::fail(violation)),
-            }
+            moving_case(
+                plan_membership_step,
+                &voter_set_of(from),
+                &voter_set_of(to),
+                leader,
+                &faults,
+                &coverage,
+            )
+            .map_err(TestCaseError::fail)
         },
     );
     if let Err(failure) = result {
@@ -772,7 +812,84 @@ fn every_moving_start_converges_within_the_bound() {
     assert!(coverage.uncommitted.get() > 0, "{coverage:?}");
     assert!(coverage.no_live_quorum.get() > 0, "{coverage:?}");
     assert!(coverage.dead_first.get() > 0, "{coverage:?}");
-    assert!(coverage.election_commits.get() > 0, "{coverage:?}");
+    assert!(coverage.transfer_pending.get() > 0, "{coverage:?}");
+    // Elections over a pending entry happen, whichever way they go.
+    assert!(
+        coverage
+            .pending_kept
+            .get()
+            .saturating_add(coverage.pending_truncated.get())
+            > 0,
+        "{coverage:?}"
+    );
+}
+
+/// One R10 case: a move from `from` to `to` planned by `planner` runs
+/// `faults`, and from every state it passes through, every target crashed
+/// and every other node restarted, a cancel with a live majority of every
+/// config of the effective membership, a pending entry's included, reaches
+/// the move's source.
+fn cancel_case(
+    planner: Planner,
+    from: &VoterSet,
+    to: &VoterSet,
+    leader: u8,
+    faults: &[Fault],
+    coverage: &Coverage,
+) -> Result<(), String> {
+    let size = from.len();
+    let universe: BTreeSet<NodeId> = (1..=8).map(node).collect();
+    let targets: BTreeSet<NodeId> = to.iter().filter(|node| !from.contains(*node)).collect();
+    let first = pick(&from.to_set(), leader).ok_or("an empty source")?;
+    let mut group = Group::new(from, first, universe.clone());
+    group.planner = planner;
+    let toward = moving_target(to);
+    let cancel = moving_target(from);
+    let mut starts = vec![group.clone()];
+    for fault in faults {
+        if let Some(planned) = fault_round(&mut group, *fault, &toward, &universe)? {
+            coverage.observe(&planned, &toward);
+        }
+        check_group(&group, size)?;
+        starts.push(group.clone());
+    }
+    for mut start in starts {
+        let reached =
+            matches!(&start.committed, MembershipConfig::Uniform { voters, .. } if voters == to);
+        if reached {
+            continue;
+        }
+        for node in &universe {
+            if targets.contains(node) {
+                start.kill(*node);
+            } else if !start.alive.contains(node) {
+                start.revive(*node);
+            }
+        }
+        if !quorum_live(start.effective(), &start.alive) {
+            continue;
+        }
+        start.drop_second_step = false;
+        start.delay_second_step = false;
+        if matches!(start.committed, MembershipConfig::Joint { .. }) {
+            bump(&coverage.cancel_from_joint, 1);
+        }
+        if start.pending().is_some() {
+            bump(&coverage.cancel_from_pending, 1);
+        }
+        let limit = round_limit(&start, from);
+        let ended = run(&mut start, &cancel, limit, |group, planned| {
+            if let Some(planned) = planned {
+                coverage.observe(planned, &cancel);
+            }
+            check_group(group, size)
+        });
+        coverage.tally(&start);
+        if ended? == Ended::Stuck {
+            return Err(format!("R10: stuck after {limit} rounds: {start:?}"));
+        }
+    }
+    Ok(())
 }
 
 /// R10: a move runs under faults, and from every state it passes through,
@@ -792,63 +909,15 @@ fn a_cancel_with_every_target_dead_returns_to_the_source() {
         &strategy,
         |((from, to), leader, faults)| -> TestCaseResult {
             proptest::prop_assume!(from != to);
-            let from = voter_set_of(from);
-            let to = voter_set_of(to);
-            let size = from.len();
-            let universe: BTreeSet<NodeId> = (1..=8).map(node).collect();
-            let targets: BTreeSet<NodeId> = to.iter().filter(|node| !from.contains(*node)).collect();
-            let first = pick(&from.to_set(), leader).unwrap();
-            let mut group = Group::new(&from, first, universe.clone());
-            let toward = moving_target(&to);
-            let cancel = moving_target(&from);
-            let mut starts = vec![group.clone()];
-            for fault in faults {
-                if let Some(planned) = fault_round(&mut group, fault, &toward, &universe) {
-                    coverage.observe(&planned, &toward);
-                }
-                check_group(&group, size).map_err(TestCaseError::fail)?;
-                starts.push(group.clone());
-            }
-            for mut start in starts {
-                let reached = matches!(&start.committed, MembershipConfig::Uniform { voters, .. } if *voters == to);
-                if reached {
-                    continue;
-                }
-                for node in &universe {
-                    if targets.contains(node) {
-                        start.kill(*node);
-                    } else if !start.alive.contains(node) {
-                        start.revive(*node);
-                    }
-                }
-                if !quorum_live(start.effective(), &start.alive) {
-                    continue;
-                }
-                start.drop_second_step = false;
-                if matches!(start.committed, MembershipConfig::Joint { .. }) {
-                    bump(&coverage.cancel_from_joint, 1);
-                }
-                if start.pending.is_some() {
-                    bump(&coverage.cancel_from_pending, 1);
-                }
-                let limit = round_limit(&start, &from);
-                let ended = run(&mut start, &cancel, limit, |group, planned| {
-                    if let Some(planned) = planned {
-                        coverage.observe(planned, &cancel);
-                    }
-                    check_group(group, size)
-                });
-                match ended {
-                    Ok(Ended::Converged) => {}
-                    Ok(Ended::Stuck) => {
-                        return Err(TestCaseError::fail(format!(
-                            "R10: stuck after {limit} rounds: {start:?}"
-                        )));
-                    }
-                    Err(violation) => return Err(TestCaseError::fail(violation)),
-                }
-            }
-            Ok(())
+            cancel_case(
+                plan_membership_step,
+                &voter_set_of(from),
+                &voter_set_of(to),
+                leader,
+                &faults,
+                &coverage,
+            )
+            .map_err(TestCaseError::fail)
         },
     );
     if let Err(failure) = result {
@@ -856,4 +925,100 @@ fn a_cancel_with_every_target_dead_returns_to_the_source() {
     }
     assert!(coverage.cancel_from_joint.get() > 0, "{coverage:?}");
     assert!(coverage.cancel_from_pending.get() > 0, "{coverage:?}");
+}
+
+/// The view's committed uniform voters, when it leads from one.
+fn uniform_voters(view: &MembershipView) -> Option<(MembershipLogId, VoterSet)> {
+    let Leadership::Leading(leader) = &view.leadership else {
+        return None;
+    };
+    match &leader.membership {
+        EffectiveMembership::Committed {
+            log_id,
+            config: MembershipConfig::Uniform { voters, .. },
+        } => Some((*log_id, voters.clone())),
+        EffectiveMembership::Committed { .. } | EffectiveMembership::Uncommitted { .. } => None,
+    }
+}
+
+/// Broken: promotes the whole target at once instead of adding learners.
+fn skips_learners(view: &MembershipView, target: &MembershipTarget) -> MembershipStep {
+    match plan_membership_step(view, target) {
+        MembershipStep::AddLearners { expected, .. } => MembershipStep::ChangeVoters {
+            expected,
+            voters: target.voters.clone(),
+        },
+        step => step,
+    }
+}
+
+/// Broken: adds the promoted voter without dropping one.
+fn grows_first(view: &MembershipView, target: &MembershipTarget) -> MembershipStep {
+    let step = plan_membership_step(view, target);
+    if let MembershipStep::ChangeVoters { expected, voters } = &step
+        && let Some((_, current)) = uniform_voters(view)
+    {
+        return MembershipStep::ChangeVoters {
+            expected: *expected,
+            voters: VoterSet::from_first(view.me, current.iter().chain(voters.iter())),
+        };
+    }
+    step
+}
+
+/// Broken: replaces the leader instead of handing off first.
+fn drops_itself(view: &MembershipView, target: &MembershipTarget) -> MembershipStep {
+    let step = plan_membership_step(view, target);
+    if let MembershipStep::TransferLeadership { .. } = step
+        && let Some((expected, _)) = uniform_voters(view)
+    {
+        return MembershipStep::ChangeVoters {
+            expected,
+            voters: target.voters.clone(),
+        };
+    }
+    step
+}
+
+/// Broken: never leaves a joint config.
+fn stays_joint(view: &MembershipView, target: &MembershipTarget) -> MembershipStep {
+    if let Leadership::Leading(leader) = &view.leadership
+        && let EffectiveMembership::Committed {
+            config: MembershipConfig::Joint { .. },
+            ..
+        } = &leader.membership
+    {
+        return MembershipStep::Wait(WaitReason::NoLiveQuorum);
+    }
+    plan_membership_step(view, target)
+}
+
+/// R6 and R10 fail when the planner breaks a rule: each broken planner
+/// runs where the real one passes, and the run names the rule.
+#[test]
+fn a_broken_planner_fails_the_runs() {
+    let coverage = Coverage::default();
+    let from = voter_set_of(BTreeSet::from([1, 2, 3]));
+    let away = voter_set_of(BTreeSet::from([4, 5, 6]));
+    let one_new = voter_set_of(BTreeSet::from([2, 3, 4]));
+    let shared = voter_set_of(BTreeSet::from([1, 2, 4]));
+    // Leader 1 (slot 0) is outgoing toward `one_new`.
+    moving_case(plan_membership_step, &from, &away, 0, &[], &coverage).unwrap();
+    moving_case(plan_membership_step, &from, &one_new, 0, &[], &coverage).unwrap();
+    let cases: [(Planner, &VoterSet, &str); 3] = [
+        (skips_learners, &away, "LearnerNotFound"),
+        (grows_first, &one_new, "C7"),
+        (drops_itself, &one_new, "R1"),
+    ];
+    for (planner, to, rule) in cases {
+        let violation = moving_case(planner, &from, to, 0, &[], &coverage)
+            .expect_err("R6 catches a broken planner");
+        assert!(violation.contains(rule), "{rule}: {violation}");
+    }
+    // A joint config left by a dropped second step: the cancel must exit it.
+    let faults = [Fault::DropSecondStep; 4];
+    cancel_case(plan_membership_step, &from, &shared, 0, &faults, &coverage).unwrap();
+    let violation = cancel_case(stays_joint, &from, &shared, 0, &faults, &coverage)
+        .expect_err("R10 catches a planner that keeps a joint config");
+    assert!(violation.contains("R10: stuck"), "{violation}");
 }

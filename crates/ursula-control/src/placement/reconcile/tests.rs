@@ -195,7 +195,7 @@ fn a_lost_second_step_is_flattened_onto_the_target_without_a_confirmation() {
     // The learner, a confirmation, the handoff to 2 and its confirmation,
     // then the change whose second step a leadership change loses.
     for _ in 0..5 {
-        round(&mut group, &target, true);
+        round(&mut group, &target, true).unwrap();
     }
     assert!(matches!(group.committed, MembershipConfig::Joint { .. }));
     assert_eq!(group.leader, None);
@@ -204,14 +204,20 @@ fn a_lost_second_step_is_flattened_onto_the_target_without_a_confirmation() {
     assert_eq!(group.leader, Some(node(1)));
     let step = plan_membership_step(&group.view(node(1)), &target);
     assert_eq!(step, MembershipStep::TransferLeadership { to: node(2) });
-    group.execute(&step);
+    group.execute(&step).unwrap();
+    // The transfer is pending until the environment's round.
+    assert_eq!(group.view(node(1)).leadership, Leadership::Transferring {
+        to: node(2)
+    });
+    group.settle();
+    assert_eq!(group.leader, Some(node(2)));
     // An unconfirmed leader flattens the joint config onto the target.
     let step = plan_membership_step(&group.view(node(2)), &target);
     assert_eq!(step, MembershipStep::ChangeVoters {
         expected: group.committed_id,
         voters: voters(&[2, 3, 4]),
     });
-    group.execute(&step);
+    group.execute(&step).unwrap();
     assert_eq!(group.committed, uniform(&[2, 3, 4], &[]));
 }
 
@@ -542,4 +548,208 @@ fn a_placement_gives_its_groups_target() {
         since: driver.since(group)
     });
     assert_eq!(moving.voters, voters(&[2, 3, 4]));
+}
+
+/// The model of OpenRaft the R6 and R10 runs use: the cases its adversary
+/// reaches only rarely, scripted.
+mod model_semantics {
+    use std::collections::BTreeSet;
+
+    use super::moving;
+    use super::uniform;
+    use crate::placement::reconcile::Leadership;
+    use crate::placement::reconcile::MembershipConfig;
+    use crate::placement::reconcile::MembershipStep;
+    use crate::placement::reconcile::model::Gate;
+    use crate::placement::reconcile::model::Group;
+    use crate::placement::reconcile::model::Refused;
+    use crate::placement::reconcile::model::act;
+    use crate::placement::reconcile::model::node;
+    use crate::placement::reconcile::model::round;
+    use crate::placement::reconcile::model::voters;
+
+    fn group(voter_ids: &[u64], leader: u64, nodes: u64) -> Group {
+        Group::new(
+            &voters(voter_ids),
+            node(leader),
+            (1..=nodes).map(node).collect(),
+        )
+    }
+
+    /// Adds the target's learners and confirms the view: two fair rounds.
+    fn prepare(group: &mut Group, to: &[u64]) {
+        let target = moving(to);
+        for _ in 0..2 {
+            round(group, &target, true).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_pending_entry_the_new_leader_lacks_is_truncated() {
+        let mut group = group(&[1, 2, 3], 1, 4);
+        let target = moving(&[1, 2, 4]);
+        group.strand();
+        // The stranded leader adds the learner: only it holds the entry.
+        let planned = act(&mut group, &target).unwrap().unwrap();
+        assert!(matches!(planned.step, MembershipStep::AddLearners { .. }));
+        assert!(group.pending().is_some());
+        assert_eq!(group.view(node(1)).leadership, Leadership::StepPending);
+        // The others elect 2, whose no-op commits without the entry.
+        group.elect();
+        assert_eq!(group.leader, Some(node(2)));
+        assert_eq!(group.elections.pending_truncated, 1);
+        assert_eq!(group.elections.pending_kept, 0);
+        group.settle();
+        assert_eq!(group.committed, uniform(&[1, 2, 3], &[]));
+        assert_eq!(group.log(node(1)), group.log(node(2)));
+        assert!(group.pending().is_none());
+    }
+
+    #[test]
+    fn a_pending_entry_the_winner_holds_commits_on_its_no_op() {
+        let mut group = group(&[1, 2, 3], 1, 4);
+        let target = moving(&[1, 2, 4]);
+        group.strand();
+        act(&mut group, &target).unwrap();
+        assert!(group.pending().is_some());
+        // The partition heals before the others elect, and 1 wins a new
+        // term: its no-op commits the entry its old term appended.
+        group.heal();
+        assert!(group.campaign(node(1)));
+        assert_eq!(group.elections.pending_kept, 1);
+        assert_eq!(group.elections.pending_truncated, 0);
+        assert_eq!(group.committed, uniform(&[1, 2, 3], &[4]));
+        assert!(group.pending().is_none());
+    }
+
+    #[test]
+    fn a_group_whose_voters_restarted_takes_a_recovery_plan() {
+        let mut group = group(&[1, 2, 3], 1, 4);
+        for voter in [1, 2, 3] {
+            group.kill(node(voter));
+        }
+        group.revive(node(2));
+        group.revive(node(3));
+        // 2 and 3 restarted with their gates closed and 1 is down: nobody
+        // can win.
+        group.elect();
+        assert_eq!(group.leader, None);
+        assert!(!group.can_win(node(2)) && !group.can_win(node(3)));
+        // The operator's plan names 2, the smallest of the newest logs, and
+        // its barrier opens 3's gate.
+        group.settle();
+        assert_eq!(group.elections.plans, 1);
+        assert_eq!(group.leader, Some(node(2)));
+        assert_eq!(group.gate(node(3)), Gate::Open);
+    }
+
+    #[test]
+    fn a_voter_with_a_closed_gate_or_an_older_log_does_not_win() {
+        let mut group = group(&[1, 2, 3], 1, 4);
+        let target = moving(&[1, 2, 4]);
+        // 3 is cut off and misses the learner entry, which commits on 1, 2.
+        group.cut = Some(node(3));
+        act(&mut group, &target).unwrap();
+        assert_eq!(group.committed, uniform(&[1, 2, 3], &[4]));
+        group.heal();
+        group.kill(node(1));
+        // 3's log is older than 2's: 2 refuses it, and 2 wins.
+        assert!(!group.can_win(node(3)));
+        assert!(group.can_win(node(2)));
+        // A restart closes 2's gate: it neither campaigns nor votes.
+        group.kill(node(2));
+        group.revive(node(2));
+        assert_eq!(group.gate(node(2)), Gate::Recovering);
+        assert!(!group.can_win(node(2)) && !group.can_win(node(3)));
+    }
+
+    #[test]
+    fn a_joint_entry_left_pending_keeps_its_second_step() {
+        let mut group = group(&[1, 2, 3], 1, 4);
+        let target = moving(&[1, 2, 4]);
+        prepare(&mut group, &[1, 2, 4]);
+        group.settle();
+        // 2 and 4 crash after the round: the new side has no quorum.
+        group.kill(node(2));
+        group.kill(node(4));
+        let planned = act(&mut group, &target).unwrap().unwrap();
+        assert!(matches!(planned.step, MembershipStep::ChangeVoters { .. }));
+        assert!(matches!(group.effective(), MembershipConfig::Joint { .. }));
+        assert_eq!(group.view(node(1)).leadership, Leadership::StepPending);
+        // 4 restarts and acknowledges: the joint entry commits, and the kept
+        // future appends the uniform one, which commits too.
+        group.revive(node(4));
+        group.settle();
+        assert_eq!(group.committed, uniform(&[1, 2, 4], &[]));
+        assert!(matches!(
+            group.view(node(1)).leadership,
+            Leadership::Leading(_)
+        ));
+    }
+
+    #[test]
+    fn an_outgoing_voter_wins_on_the_uncommitted_uniform_entry() {
+        let mut group = group(&[1], 1, 2);
+        let target = moving(&[2]);
+        prepare(&mut group, &[2]);
+        group.settle();
+        // The second step waits for the next round, and 2 is cut off first.
+        group.delay_second_step = true;
+        act(&mut group, &target).unwrap();
+        assert!(matches!(group.committed, MembershipConfig::Joint { .. }));
+        group.cut = Some(node(2));
+        group.hold_back();
+        assert_eq!(
+            group.pending().map(|(config, _)| config.clone()),
+            Some(uniform(&[2], &[]))
+        );
+        // 1 is no voter of its uniform entry but one of the committed joint
+        // config: it wins again with 2's vote, and the commit steps it down.
+        group.heal();
+        assert!(group.campaign(node(1)));
+        assert_eq!(group.elections.outgoing, 1);
+        assert_eq!(group.committed, uniform(&[2], &[]));
+        assert_eq!(group.leader, None);
+        group.settle();
+        assert_eq!(group.leader, Some(node(2)));
+    }
+
+    #[test]
+    fn openraft_bridges_a_third_voter_set_and_refuses_a_non_learner() {
+        let mut group = group(&[1, 2, 3], 1, 6);
+        prepare(&mut group, &[1, 2, 4]);
+        group.settle();
+        group.drop_second_step = true;
+        act(&mut group, &moving(&[1, 2, 4])).unwrap();
+        group.settle();
+        assert_eq!(group.leader, Some(node(1)));
+        let expected = group.committed_id;
+        // A node that is no member cannot become a voter.
+        let refused = group
+            .execute(&MembershipStep::ChangeVoters {
+                expected,
+                voters: voters(&[1, 2, 5]),
+            })
+            .expect_err("5 is no learner");
+        assert!(
+            matches!(refused, Refused::LearnerNotFound { node: missing } if missing == node(5))
+        );
+        // `[{1, 2, 3}, {1, 2, 4}]` toward `{1, 3, 4}`, neither side:
+        // OpenRaft goes through `[{1, 2, 4}, {1, 3, 4}]`.
+        group
+            .execute(&MembershipStep::ChangeVoters {
+                expected,
+                voters: voters(&[1, 3, 4]),
+            })
+            .unwrap();
+        assert_eq!(
+            group.committed_configs.iter().rev().nth(1),
+            Some(&MembershipConfig::Joint {
+                old: voters(&[1, 2, 4]),
+                new: voters(&[1, 3, 4]),
+                learners: BTreeSet::new(),
+            })
+        );
+        assert_eq!(group.committed, uniform(&[1, 3, 4], &[]));
+    }
 }

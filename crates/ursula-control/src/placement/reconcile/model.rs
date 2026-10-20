@@ -1,21 +1,43 @@
-//! An abstract Raft group for the reconciler's tests: one membership log
-//! with OpenRaft's change semantics as section 5.10 of the design lists
-//! them, a leader, live nodes, catch-up and gates.
+//! An abstract Raft group for the reconciler's tests, following OpenRaft
+//! 0.10.0-alpha.37 as section 5.10 of the design lists it.
 //!
-//! - A voter change from a uniform config appends a joint entry and, from
-//!   the same call, the uniform one (unless the test drops the second
-//!   step). `retain = false` drops old voters from the membership.
-//! - An entry takes effect when appended. It commits when appended, or
-//!   later in a fair round or on an election, once its leader is live and
-//!   every config of it has a live majority. Until then it stays pending.
-//! - A leader that is no voter of the committed uniform config steps down,
-//!   and an election picks the smallest live voter of the effective
-//!   membership when every config of it has a live majority, committing a
-//!   pending entry it can. A live leader keeps leading after its quorum
-//!   dies, as OpenRaft's does.
-//! - Every append leaves the other members behind until the environment
-//!   catches them up. A new learner starts unmatched, and so does a node
-//!   that restarts, with its gate closed.
+//! - Every node keeps its own log, whose entries are membership configs or
+//!   leaders' no-ops. A leader's append reaches at once every live member of
+//!   its effective membership it can reach, and its matched metrics lag
+//!   until the environment's round catches them up.
+//! - The leader's log commits once its last entry, of its own term, is held
+//!   by a majority of every config of its effective membership that
+//!   acknowledges: live, reachable voters whose gate is not `Empty`. A new
+//!   leader commits what it holds through its no-op, so a pending entry the
+//!   new leader does not hold is truncated, and the membership reverts.
+//! - A node campaigns only with an open gate and as a voter of its effective
+//!   or the committed membership. It wins with the votes of a majority of
+//!   every config of its effective membership: live, reachable voters with
+//!   an open gate (or a plan naming it) whose log is not newer than its own.
+//!   So an outgoing voter holding the uncommitted uniform entry can win, and
+//!   that entry's commit steps it down.
+//! - A voter change from a uniform config appends the joint entry, and its
+//!   kept future appends the uniform one once the joint entry committed in
+//!   the same leadership, unless the test drops that second step or delays
+//!   it to the environment's next round. From a joint config onto one of
+//!   its sides it appends one uniform entry, and onto a third set OpenRaft
+//!   bridges `[A, B]` to `[B, C]` first. `retain = false` drops old voters.
+//!   A new voter that is no member fails with `LearnerNotFound`, and the run
+//!   with it, since no correct planner asks for one.
+//! - A step whose entry has not committed keeps its future pending
+//!   (`StepPending`). A transfer waits for the environment (`Transferring`)
+//!   and completes once its target holds the leader's log with an open gate
+//!   and wins, else it is abandoned.
+//! - A crash keeps the log. A restarted node comes back `Recovering` (it
+//!   acknowledges, but neither votes nor campaigns), a new member `Empty`
+//!   (it acknowledges nothing), and a barrier of a leader with a quorum
+//!   opens either. A restarted leader comes back a follower. A group no
+//!   candidate can lead takes the operator's recovery plan in a fair round:
+//!   the freshest voter's gate opens and every other member votes only for
+//!   it.
+//! - A leader cut off from every other node keeps leading until the others
+//!   elect one, and a live leader keeps leading after its quorum died, as
+//!   OpenRaft's do.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -48,12 +70,17 @@ pub(super) fn ids(values: &[u64]) -> BTreeSet<NodeId> {
     values.iter().copied().map(NodeId::new).collect()
 }
 
+/// Whether more than half of `side` is `counted`.
+fn majority(side: &VoterSet, counted: impl Fn(NodeId) -> bool) -> bool {
+    let count = side.iter().filter(|node| counted(*node)).count();
+    count.checked_mul(2).unwrap() > side.len()
+}
+
 /// Whether every config of `config` has a live majority among `alive`.
 pub(super) fn quorum_live(config: &MembershipConfig, alive: &BTreeSet<NodeId>) -> bool {
-    config.voter_configs().all(|side| {
-        let live = side.iter().filter(|node| alive.contains(node)).count();
-        live.checked_mul(2).unwrap() > side.len()
-    })
+    config
+        .voter_configs()
+        .all(|side| majority(side, |node| alive.contains(&node)))
 }
 
 /// `config` with `learners` as its learners.
@@ -71,30 +98,113 @@ fn with_learners(config: &MembershipConfig, learners: BTreeSet<NodeId>) -> Membe
     }
 }
 
+/// The planner a group's leaders plan with: the real one, or a broken one a
+/// test swaps in to show that the run catches it.
+pub(super) type Planner = fn(&MembershipView, &MembershipTarget) -> MembershipStep;
+
+/// One log entry: a membership config, or a leader's no-op.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Entry {
+    pub(super) id: RaftLogId,
+    pub(super) config: Option<MembershipConfig>,
+}
+
+/// A node's recovery gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Gate {
+    Open,
+    /// Restarted after a crash: acknowledges appends, and neither votes nor
+    /// campaigns.
+    Recovering,
+    /// Never held the group: acknowledges nothing, votes for no one and
+    /// does not campaign.
+    Empty,
+    /// Took an operator's recovery plan: votes only for its `leader`.
+    Planned {
+        leader: NodeId,
+    },
+}
+
+impl Gate {
+    fn acknowledges(self) -> bool {
+        !matches!(self, Self::Empty)
+    }
+
+    fn votes_for(self, candidate: NodeId) -> bool {
+        match self {
+            Self::Open => true,
+            Self::Planned { leader } => leader == candidate,
+            Self::Recovering | Self::Empty => false,
+        }
+    }
+}
+
+/// The future of a membership step, kept until OpenRaft answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepFuture {
+    leader: NodeId,
+    term: u64,
+    /// The entry it waits on.
+    awaiting: RaftLogId,
+    /// The uniform entry it appends once the joint one committed.
+    second: Option<MembershipConfig>,
+    /// The second step waits for the environment's next round.
+    delayed: bool,
+}
+
+/// A step OpenRaft refuses that no correct planner takes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Refused {
+    /// A new voter that is no member of the effective membership.
+    LearnerNotFound { node: NodeId },
+}
+
+/// The elections and plans a run reached.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Elections {
+    /// The winner held an uncommitted membership entry, which its no-op
+    /// commits once a quorum holds it.
+    pub(super) pending_kept: usize,
+    /// Another node held an uncommitted membership entry the winner lacks,
+    /// which its leadership truncates.
+    pub(super) pending_truncated: usize,
+    /// The winner is no voter of its effective membership.
+    pub(super) outgoing: usize,
+    /// A recovery plan elected a leader.
+    pub(super) plans: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct Group {
     pub(super) alive: BTreeSet<NodeId>,
+    /// A node cut off from every other node.
+    pub(super) cut: Option<NodeId>,
+    pub(super) logs: BTreeMap<NodeId, Vec<Entry>>,
+    pub(super) gates: BTreeMap<NodeId, Gate>,
     pub(super) committed: MembershipConfig,
     pub(super) committed_id: MembershipLogId,
-    /// An appended entry that has not committed.
-    pub(super) pending: Option<(MembershipConfig, MembershipLogId)>,
-    pub(super) index: u64,
+    /// The index of the last committed entry.
+    pub(super) commit_index: u64,
     pub(super) term: u64,
     pub(super) leader: Option<NodeId>,
-    /// Members matched up to the last index.
+    /// Members the leader's metrics show matched up to its last entry.
     pub(super) caught_up: BTreeSet<NodeId>,
-    pub(super) gates_open: BTreeSet<NodeId>,
     pub(super) unlisted: BTreeSet<NodeId>,
     /// Whether the leader's placement view is confirmed in its leadership.
     pub(super) confirmed: bool,
-    /// The next voter change loses its second step to a leadership change.
+    future: Option<StepFuture>,
+    /// The target of a transfer the leader started.
+    pub(super) transferring: Option<NodeId>,
+    /// The next second step is lost to a leadership change.
     pub(super) drop_second_step: bool,
+    /// The next second step waits for the environment's next round.
+    pub(super) delay_second_step: bool,
     /// Every config that committed, the first one included.
     pub(super) committed_configs: Vec<MembershipConfig>,
-    /// Every voter change the planner proposed, with its proposer.
+    /// Every voter change OpenRaft accepted, with its proposer.
     pub(super) proposals: Vec<(NodeId, VoterSet)>,
-    /// How many pending entries a new leader committed on its election.
-    pub(super) election_commits: usize,
+    pub(super) elections: Elections,
+    pub(super) planner: Planner,
 }
 
 /// One planner call of a round: the view it planned from and its step.
@@ -106,115 +216,467 @@ pub(super) struct Planned {
 
 impl Group {
     /// A group whose committed uniform config is `voters`, led by `leader`,
-    /// with every node of `alive` live, caught up and gated open.
+    /// with every node of `alive` live. The voters hold the config with
+    /// open gates and are caught up. Every other node is `Empty`.
     pub(super) fn new(voters: &VoterSet, leader: NodeId, alive: BTreeSet<NodeId>) -> Self {
         let committed = MembershipConfig::Uniform {
             voters: voters.clone(),
             learners: BTreeSet::new(),
         };
-        let committed_id = MembershipLogId::new(RaftLogId {
+        let id = RaftLogId {
             term: 1,
             leader,
             index: 1,
-        });
+        };
+        let entry = Entry {
+            id,
+            config: Some(committed.clone()),
+        };
+        let logs = voters
+            .iter()
+            .map(|voter| (voter, vec![entry.clone()]))
+            .collect();
+        let gates = alive
+            .iter()
+            .copied()
+            .chain(voters.iter())
+            .map(|node| {
+                let gate = if voters.contains(node) {
+                    Gate::Open
+                } else {
+                    Gate::Empty
+                };
+                (node, gate)
+            })
+            .collect();
         Self {
-            caught_up: alive.clone(),
-            gates_open: alive.clone(),
+            caught_up: voters.to_set(),
             alive,
+            cut: None,
+            logs,
+            gates,
             committed_configs: vec![committed.clone()],
             committed,
-            committed_id,
-            pending: None,
-            index: 1,
+            committed_id: MembershipLogId::new(id),
+            commit_index: 1,
             term: 1,
             leader: Some(leader),
             unlisted: BTreeSet::new(),
             confirmed: false,
+            future: None,
+            transferring: None,
             drop_second_step: false,
+            delay_second_step: false,
             proposals: Vec::new(),
-            election_commits: 0,
+            elections: Elections::default(),
+            planner: plan_membership_step,
         }
+    }
+
+    pub(super) fn log(&self, node: NodeId) -> &[Entry] {
+        self.logs.get(&node).map(Vec::as_slice).unwrap_or_default()
+    }
+
+    fn last_id(&self, node: NodeId) -> Option<RaftLogId> {
+        self.log(node).last().map(|entry| entry.id)
+    }
+
+    pub(super) fn gate(&self, node: NodeId) -> Gate {
+        self.gates.get(&node).copied().unwrap_or(Gate::Empty)
+    }
+
+    fn holds(&self, node: NodeId, id: RaftLogId) -> bool {
+        self.log(node).iter().any(|entry| entry.id == id)
+    }
+
+    /// The last membership entry of `node`'s log: its effective membership.
+    fn membership_of(&self, node: NodeId) -> Option<(&MembershipConfig, RaftLogId)> {
+        self.log(node)
+            .iter()
+            .rev()
+            .find_map(|entry| entry.config.as_ref().map(|config| (config, entry.id)))
+    }
+
+    /// The node whose log the group's effective membership is read from: a
+    /// live leader, else the live node with the newest log, else any.
+    fn reference(&self) -> Option<NodeId> {
+        if let Some(leader) = self.leader
+            && self.alive.contains(&leader)
+        {
+            return Some(leader);
+        }
+        let newest = |nodes: &mut dyn Iterator<Item = NodeId>| -> Option<NodeId> {
+            let mut best: Option<(RaftLogId, NodeId)> = None;
+            for node in nodes {
+                let Some(last) = self.last_id(node) else {
+                    continue;
+                };
+                if best.is_none_or(|(best_last, _)| last > best_last) {
+                    best = Some((last, node));
+                }
+            }
+            best.map(|(_, node)| node)
+        };
+        newest(&mut self.alive.iter().copied()).or_else(|| newest(&mut self.logs.keys().copied()))
     }
 
     pub(super) fn effective(&self) -> &MembershipConfig {
-        self.pending
-            .as_ref()
+        self.reference()
+            .and_then(|node| self.membership_of(node))
             .map_or(&self.committed, |(config, _)| config)
     }
 
-    fn leader_live(&self) -> bool {
-        self.leader
-            .is_some_and(|leader| self.alive.contains(&leader))
+    /// The effective membership when it has not committed.
+    pub(super) fn pending(&self) -> Option<(&MembershipConfig, MembershipLogId)> {
+        let (config, id) = self.reference().and_then(|node| self.membership_of(node))?;
+        (id.index > self.commit_index).then_some((config, MembershipLogId::new(id)))
     }
 
-    fn append(&mut self, config: MembershipConfig) {
+    fn reachable(&self, from: NodeId, to: NodeId) -> bool {
+        from == to || (self.cut != Some(from) && self.cut != Some(to))
+    }
+
+    /// Whether `to` is live and `from` reaches it.
+    fn up(&self, from: NodeId, to: NodeId) -> bool {
+        self.alive.contains(&to) && self.reachable(from, to)
+    }
+
+    fn lose_leadership(&mut self) {
+        self.leader = None;
+        self.future = None;
+        self.transferring = None;
+        self.confirmed = false;
+        self.caught_up.clear();
+    }
+
+    /// The live leader's log reaches the members of its effective
+    /// membership it can reach, truncating what they hold beyond it.
+    fn replicate(&mut self) {
         let Some(leader) = self.leader else {
             return;
         };
-        self.index = self.index.checked_add(1).unwrap();
-        let id = MembershipLogId::new(RaftLogId {
-            term: self.term,
-            leader,
-            index: self.index,
-        });
-        self.caught_up = BTreeSet::from([leader]);
-        if self.leader_live() && quorum_live(&config, &self.alive) {
-            self.commit(config, id);
-        } else {
-            self.pending = Some((config, id));
-        }
-    }
-
-    fn commit(&mut self, config: MembershipConfig, id: MembershipLogId) {
-        self.committed_configs.push(config.clone());
-        self.committed = config;
-        self.committed_id = id;
-        self.pending = None;
-        if let Some(leader) = self.leader
-            && matches!(self.committed, MembershipConfig::Uniform { .. })
-            && !self.committed.is_voter(leader)
-        {
-            // OpenRaft's step-down of a leader outside the committed config.
-            self.leader = None;
-        }
-    }
-
-    /// Elects a leader when the current one is gone, and commits a pending
-    /// entry the new leader can.
-    pub(super) fn elect(&mut self) {
-        if self.leader_live()
-            && self
-                .leader
-                .is_some_and(|leader| self.effective().is_voter(leader))
-        {
+        if !self.alive.contains(&leader) {
             return;
         }
-        self.leader = None;
-        if !quorum_live(self.effective(), &self.alive) {
-            return;
-        }
-        let Some(leader) = self
-            .effective()
-            .voters()
-            .into_iter()
-            .find(|node| self.alive.contains(node))
+        let Some(members) = self
+            .membership_of(leader)
+            .map(|(config, _)| config.members())
         else {
             return;
         };
-        self.elect_as(leader);
+        let log = self.log(leader).to_vec();
+        for member in members {
+            if member != leader && self.up(leader, member) {
+                self.logs.insert(member, log.clone());
+            }
+        }
     }
 
-    /// `leader` wins an election.
-    pub(super) fn elect_as(&mut self, leader: NodeId) {
-        self.leader = Some(leader);
-        self.term = self.term.checked_add(1).unwrap();
-        self.confirmed = false;
-        if let Some((config, id)) = self.pending.clone()
-            && quorum_live(&config, &self.alive)
-        {
-            self.election_commits = self.election_commits.checked_add(1).unwrap();
-            self.commit(config, id);
+    /// The leader appends `config`, or a no-op for `None`, and its members
+    /// receive it. Its metrics then show only itself matched.
+    fn append(&mut self, config: Option<MembershipConfig>) -> Option<RaftLogId> {
+        let leader = self.leader?;
+        let log = self.logs.entry(leader).or_default();
+        let index = u64::try_from(log.len()).ok()?.checked_add(1)?;
+        let id = RaftLogId {
+            term: self.term,
+            leader,
+            index,
+        };
+        log.push(Entry { id, config });
+        self.caught_up = BTreeSet::from([leader]);
+        self.replicate();
+        Some(id)
+    }
+
+    /// Whether `node` acknowledges `leader`'s last entry.
+    fn acknowledges(&self, leader: NodeId, node: NodeId) -> bool {
+        node == leader
+            || (self.up(leader, node)
+                && self.gate(node).acknowledges()
+                && self.log(node) == self.log(leader))
+    }
+
+    /// Whether a majority of every config of `leader`'s effective membership
+    /// acknowledges its last entry.
+    fn quorum_acknowledges(&self, leader: NodeId) -> bool {
+        if !self.alive.contains(&leader) {
+            return false;
         }
+        let Some((config, _)) = self.membership_of(leader) else {
+            return false;
+        };
+        config
+            .voter_configs()
+            .all(|side| majority(side, |node| self.acknowledges(leader, node)))
+    }
+
+    /// Commits the leader's log once a quorum acknowledges its last entry,
+    /// which is of its own term: every leadership starts with a no-op.
+    fn try_commit(&mut self) {
+        let Some(leader) = self.leader else {
+            return;
+        };
+        if !self.quorum_acknowledges(leader) {
+            return;
+        }
+        let index = u64::try_from(self.log(leader).len()).unwrap();
+        self.commit_index = self.commit_index.max(index);
+        if let Some((config, id)) = self.membership_of(leader)
+            && MembershipLogId::new(id) != self.committed_id
+        {
+            let config = config.clone();
+            self.committed_configs.push(config.clone());
+            self.committed = config;
+            self.committed_id = MembershipLogId::new(id);
+        }
+        if matches!(self.committed, MembershipConfig::Uniform { .. })
+            && !self.committed.is_voter(leader)
+        {
+            // OpenRaft's step-down of a leader outside the committed config.
+            self.lose_leadership();
+        }
+    }
+
+    /// Advances the kept future once its entry committed: it is done, or it
+    /// appends its second step under `LastMembershipLogId` and
+    /// `CommittedLeaderId`. A delayed second step runs only `in_round`, the
+    /// environment's half.
+    fn advance_future(&mut self, in_round: bool) {
+        let Some(future) = self.future.clone() else {
+            return;
+        };
+        if self.leader != Some(future.leader) || self.term != future.term {
+            self.future = None;
+            return;
+        }
+        if future.awaiting.index > self.commit_index {
+            return;
+        }
+        let Some(second) = future.second.clone() else {
+            self.future = None;
+            return;
+        };
+        if self.drop_second_step {
+            self.drop_second_step = false;
+            self.lose_leadership();
+            return;
+        }
+        if self.delay_second_step && !in_round {
+            self.delay_second_step = false;
+            self.future = Some(StepFuture {
+                delayed: true,
+                ..future
+            });
+            return;
+        }
+        if future.delayed && !in_round {
+            return;
+        }
+        if self.membership_of(future.leader).map(|(_, id)| id) != Some(future.awaiting) {
+            self.future = None;
+            return;
+        }
+        self.future = self.append(Some(second)).map(|awaiting| StepFuture {
+            leader: future.leader,
+            term: future.term,
+            awaiting,
+            second: None,
+            delayed: false,
+        });
+    }
+
+    /// Commits what a quorum holds and advances the kept future until
+    /// neither changes.
+    fn sync(&mut self, in_round: bool) {
+        for _ in 0..4 {
+            let before = (self.commit_index, self.future.clone(), self.leader);
+            self.try_commit();
+            self.advance_future(in_round);
+            if (self.commit_index, self.future.clone(), self.leader) == before {
+                break;
+            }
+        }
+    }
+
+    /// The live leader's heartbeat: it replicates its log and commits.
+    fn heartbeat(&mut self) {
+        self.replicate();
+        self.sync(true);
+    }
+
+    /// Whether `candidate` may campaign and would collect its votes.
+    pub(super) fn can_win(&self, candidate: NodeId) -> bool {
+        if !self.alive.contains(&candidate) || self.gate(candidate) != Gate::Open {
+            return false;
+        }
+        let Some((config, _)) = self.membership_of(candidate) else {
+            return false;
+        };
+        if !config.is_voter(candidate) && !self.committed.is_voter(candidate) {
+            return false;
+        }
+        let last = self.last_id(candidate);
+        config.voter_configs().all(|side| {
+            majority(side, |voter| {
+                self.up(candidate, voter)
+                    && self.gate(voter).votes_for(candidate)
+                    && self.last_id(voter) <= last
+            })
+        })
+    }
+
+    /// `candidate` wins: it leads in a new term and appends its no-op.
+    fn win(&mut self, candidate: NodeId) {
+        let uncommitted: BTreeSet<RaftLogId> = self
+            .logs
+            .values()
+            .flatten()
+            .filter(|entry| entry.config.is_some() && entry.id.index > self.commit_index)
+            .map(|entry| entry.id)
+            .collect();
+        if uncommitted.iter().any(|id| self.holds(candidate, *id)) {
+            self.elections.pending_kept = self.elections.pending_kept.checked_add(1).unwrap();
+        }
+        if uncommitted.iter().any(|id| !self.holds(candidate, *id)) {
+            self.elections.pending_truncated =
+                self.elections.pending_truncated.checked_add(1).unwrap();
+        }
+        if !self
+            .membership_of(candidate)
+            .is_some_and(|(config, _)| config.is_voter(candidate))
+        {
+            self.elections.outgoing = self.elections.outgoing.checked_add(1).unwrap();
+        }
+        self.lose_leadership();
+        self.leader = Some(candidate);
+        self.term = self.term.checked_add(1).unwrap();
+        self.append(None);
+        self.sync(true);
+    }
+
+    /// `candidate` campaigns, and leads when it wins.
+    pub(super) fn campaign(&mut self, candidate: NodeId) -> bool {
+        let won = self.can_win(candidate);
+        if won {
+            self.win(candidate);
+        }
+        won
+    }
+
+    /// An election when the leader is gone or cut off: the smallest node
+    /// that wins leads. A cut-off leader no one replaces keeps leading.
+    pub(super) fn elect(&mut self) {
+        let current = self.leader.filter(|leader| self.alive.contains(leader));
+        if current.is_some_and(|leader| self.cut != Some(leader)) {
+            return;
+        }
+        let winner = self
+            .alive
+            .iter()
+            .copied()
+            .find(|node| Some(*node) != current && self.can_win(*node));
+        match winner {
+            Some(winner) => self.win(winner),
+            None if current.is_none() => self.lose_leadership(),
+            None => {}
+        }
+    }
+
+    /// The operator's recovery plan for a group without a leader: the live
+    /// node with the newest log that may campaign leads, the smallest on a
+    /// tie, its gate opens and every other live node holding the group votes
+    /// only for it.
+    fn accept_recovery_plan(&mut self) {
+        let mut best: Option<(RaftLogId, NodeId)> = None;
+        for node in self.alive.iter().copied() {
+            let Some((config, last)) = self
+                .membership_of(node)
+                .map(|(config, _)| config)
+                .zip(self.last_id(node))
+            else {
+                continue;
+            };
+            let may_campaign = config.is_voter(node) || self.committed.is_voter(node);
+            if may_campaign && best.is_none_or(|(best_last, _)| last > best_last) {
+                best = Some((last, node));
+            }
+        }
+        let Some((_, leader)) = best else {
+            return;
+        };
+        let members: Vec<NodeId> = self
+            .alive
+            .iter()
+            .copied()
+            .filter(|node| !self.log(*node).is_empty())
+            .collect();
+        for node in members {
+            let gate = if node == leader {
+                Gate::Open
+            } else {
+                Gate::Planned { leader }
+            };
+            self.gates.insert(node, gate);
+        }
+        if self.campaign(leader) {
+            self.elections.plans = self.elections.plans.checked_add(1).unwrap();
+        }
+    }
+
+    /// A pending transfer completes once its target holds the leader's log
+    /// with an open gate and wins, and is abandoned otherwise.
+    fn resolve_transfer(&mut self) {
+        let Some(to) = self.transferring.take() else {
+            return;
+        };
+        let Some(leader) = self.leader else {
+            return;
+        };
+        let ready = self.alive.contains(&leader)
+            && self.up(leader, to)
+            && self.gate(to) == Gate::Open
+            && self.log(to) == self.log(leader)
+            && self
+                .membership_of(leader)
+                .is_some_and(|(config, _)| config.is_voter(to));
+        if ready {
+            self.campaign(to);
+        }
+    }
+
+    /// The barrier of a leader with a quorum opens the gate of every member
+    /// holding its log, and its metrics catch up with every member that
+    /// acknowledges.
+    fn barrier(&mut self) {
+        let Some(leader) = self.leader else {
+            return;
+        };
+        if !self.alive.contains(&leader) {
+            return;
+        }
+        let Some(members) = self
+            .membership_of(leader)
+            .map(|(config, _)| config.members())
+        else {
+            return;
+        };
+        let holding: BTreeSet<NodeId> = members
+            .into_iter()
+            .filter(|member| {
+                *member == leader
+                    || (self.up(leader, *member) && self.log(*member) == self.log(leader))
+            })
+            .collect();
+        if self.quorum_acknowledges(leader) {
+            for member in &holding {
+                self.gates.insert(*member, Gate::Open);
+            }
+        }
+        self.caught_up = holding
+            .into_iter()
+            .filter(|member| self.acknowledges(leader, *member))
+            .collect();
     }
 
     /// `node` crashes. A leader stays leader until an election replaces it.
@@ -222,81 +684,121 @@ impl Group {
         self.alive.remove(&node);
     }
 
-    /// `node` restarts unmatched, with its gate closed.
+    /// `node` restarts with its log, `Recovering`, or `Empty` without one,
+    /// and a leader as a follower.
     pub(super) fn revive(&mut self, node: NodeId) {
         self.alive.insert(node);
         self.caught_up.remove(&node);
-        self.gates_open.remove(&node);
+        let gate = if self.log(node).is_empty() {
+            Gate::Empty
+        } else {
+            Gate::Recovering
+        };
+        self.gates.insert(node, gate);
+        if self.leader == Some(node) {
+            self.lose_leadership();
+        }
     }
 
-    /// The fair environment: an election when needed, a pending entry
-    /// committed once its leader has a live majority of every config of it,
-    /// and every live member caught up, gated open and listed.
+    /// The leader is cut off from every other node.
+    pub(super) fn strand(&mut self) {
+        self.cut = self.leader;
+    }
+
+    pub(super) fn heal(&mut self) {
+        self.cut = None;
+    }
+
+    /// The fair environment: an election the partition allowed runs, the
+    /// network heals, the leader replicates and commits, a pending transfer
+    /// resolves, an election runs when needed (a recovery plan when no
+    /// candidate wins), and the leader's barrier opens gates and catches its
+    /// metrics up. Every target is listed.
     pub(super) fn settle(&mut self) {
         self.elect();
-        if self.leader_live()
-            && let Some((config, id)) = self.pending.clone()
-            && quorum_live(&config, &self.alive)
-        {
-            self.commit(config, id);
+        self.heal();
+        self.heartbeat();
+        self.resolve_transfer();
+        for _ in 0..2 {
             self.elect();
+            if self.leader.is_none() {
+                self.accept_recovery_plan();
+            }
+            self.heartbeat();
         }
-        let members = self.effective().members();
-        self.caught_up = members
-            .iter()
-            .copied()
-            .filter(|node| self.alive.contains(node))
-            .collect();
-        self.gates_open.extend(self.caught_up.iter().copied());
+        self.barrier();
         self.unlisted.clear();
+    }
+
+    /// The environment that holds catch-up, gates and listings back: a
+    /// delayed second step runs and an election runs when needed, and a
+    /// pending transfer stays pending.
+    pub(super) fn hold_back(&mut self) {
+        self.sync(true);
+        self.elect();
     }
 
     /// What `me` plans from.
     pub(super) fn view(&self, me: NodeId) -> MembershipView {
+        let not_leading = MembershipView {
+            me,
+            leadership: Leadership::NotLeading,
+        };
         if self.leader != Some(me) || !self.alive.contains(&me) {
+            return not_leading;
+        }
+        if let Some(to) = self.transferring {
             return MembershipView {
                 me,
-                leadership: Leadership::NotLeading,
+                leadership: Leadership::Transferring { to },
             };
         }
-        let membership = match &self.pending {
-            Some((_, log_id)) => EffectiveMembership::Uncommitted { log_id: *log_id },
-            None => EffectiveMembership::Committed {
-                log_id: self.committed_id,
-                config: self.committed.clone(),
-            },
+        if self.future.is_some() {
+            return MembershipView {
+                me,
+                leadership: Leadership::StepPending,
+            };
+        }
+        let Some((config, id)) = self.membership_of(me) else {
+            return not_leading;
         };
-        let effective = self.effective();
-        let members = effective.members();
+        let log_id = MembershipLogId::new(id);
+        let membership = if id.index > self.commit_index {
+            EffectiveMembership::Uncommitted { log_id }
+        } else {
+            EffectiveMembership::Committed {
+                log_id,
+                config: config.clone(),
+            }
+        };
+        let last_index = u64::try_from(self.log(me).len()).unwrap();
+        let members = config.members();
         let matched: BTreeMap<NodeId, Option<u64>> = members
             .iter()
             .filter(|node| **node != me)
-            .map(|node| {
-                let matched = self.caught_up.contains(node).then_some(self.index);
-                (*node, matched)
-            })
+            .map(|node| (*node, self.caught_up.contains(node).then_some(last_index)))
             .collect();
         let live = members
             .iter()
             .copied()
-            .filter(|node| self.alive.contains(node))
+            .filter(|node| self.up(me, *node))
             .collect();
-        let handoff_ready = effective
+        let handoff_ready = config
             .voters()
             .into_iter()
             .filter(|node| {
                 *node != me
-                    && self.alive.contains(node)
+                    && self.up(me, *node)
                     && self.caught_up.contains(node)
-                    && self.gates_open.contains(node)
+                    && self.gate(*node) == Gate::Open
             })
             .collect();
-        let gates = effective
+        let gates = config
             .learners()
             .iter()
             .filter(|node| self.caught_up.contains(node))
             .map(|node| {
-                let gate = if self.gates_open.contains(node) {
+                let gate = if self.gate(*node) == Gate::Open {
                     PeerGate::Open
                 } else {
                     PeerGate::Closed
@@ -313,7 +815,7 @@ impl Group {
             me,
             leadership: Leadership::Leading(Box::new(LeaderView {
                 membership,
-                committed_index: self.index,
+                committed_index: self.commit_index,
                 matched,
                 live,
                 handoff_ready,
@@ -324,99 +826,110 @@ impl Group {
         }
     }
 
-    /// Executes `step` as the leader would, each membership change under
-    /// its CAS.
-    pub(super) fn execute(&mut self, step: &MembershipStep) {
-        let Some(leader) = self.leader else {
-            return;
+    /// Executes `step` as the live leader would, each membership change
+    /// under its CAS: `expected` must be the effective membership's log id,
+    /// committed, with no step or transfer pending, else OpenRaft answers
+    /// `PreconditionFailed` or `InProgress` and nothing changes.
+    pub(super) fn execute(&mut self, step: &MembershipStep) -> Result<(), Refused> {
+        let Some(leader) = self.leader.filter(|leader| self.alive.contains(leader)) else {
+            return Ok(());
         };
-        let cas = |expected: &MembershipLogId, group: &Self| {
-            group.pending.is_none() && *expected == group.committed_id
+        let Some((config, id)) = self
+            .membership_of(leader)
+            .map(|(config, id)| (config.clone(), id))
+        else {
+            return Ok(());
         };
+        let open =
+            id.index <= self.commit_index && self.future.is_none() && self.transferring.is_none();
+        let cas = |expected: &MembershipLogId| open && *expected == MembershipLogId::new(id);
         match step {
             MembershipStep::AddLearners { expected, nodes } => {
-                if cas(expected, self) {
-                    let mut learners = self.committed.learners().clone();
+                if cas(expected) {
+                    let mut learners = config.learners().clone();
                     learners.extend(nodes.iter().copied());
-                    let next = with_learners(&self.committed, learners);
-                    self.append(next);
+                    self.propose(with_learners(&config, learners), None);
                 }
             }
             MembershipStep::RemoveLearners { expected, nodes } => {
-                if cas(expected, self) {
-                    let learners = self
-                        .committed
-                        .learners()
-                        .difference(nodes)
-                        .copied()
-                        .collect();
-                    let next = with_learners(&self.committed, learners);
-                    self.append(next);
+                if cas(expected) {
+                    let learners = config.learners().difference(nodes).copied().collect();
+                    self.propose(with_learners(&config, learners), None);
                 }
             }
             MembershipStep::ChangeVoters { expected, voters } => {
-                if cas(expected, self) {
+                if cas(expected) {
+                    let members = config.members();
+                    if let Some(node) = voters.iter().find(|node| !members.contains(node)) {
+                        return Err(Refused::LearnerNotFound { node });
+                    }
                     self.proposals.push((leader, voters.clone()));
-                    self.change_voters(voters);
+                    self.change_voters(&config, voters);
                 }
             }
             MembershipStep::TransferLeadership { to } => {
-                if self.alive.contains(to)
-                    && self.effective().is_voter(*to)
-                    && self.caught_up.contains(to)
-                {
-                    self.leader = Some(*to);
-                    self.term = self.term.checked_add(1).unwrap();
-                    self.confirmed = false;
+                if self.transferring.is_none() {
+                    self.transferring = Some(*to);
                 }
             }
             MembershipStep::ConfirmView => self.confirmed = true,
             MembershipStep::Converged { .. } | MembershipStep::Wait(_) => {}
         }
+        Ok(())
     }
 
-    /// `change_membership(ReplaceAllVoters, retain = false)`.
-    fn change_voters(&mut self, target: &VoterSet) {
-        let learners_without = |learners: &BTreeSet<NodeId>| -> BTreeSet<NodeId> {
-            learners
-                .iter()
-                .copied()
-                .filter(|node| !target.contains(*node))
-                .collect()
+    /// The leader appends `config` and keeps the step's future, with the
+    /// uniform `second` step of a joint entry.
+    fn propose(&mut self, config: MembershipConfig, second: Option<MembershipConfig>) {
+        let Some(leader) = self.leader else {
+            return;
         };
-        match self.committed.clone() {
-            MembershipConfig::Uniform { voters, learners } => {
-                if &voters == target {
+        let term = self.term;
+        self.future = self.append(Some(config)).map(|awaiting| StepFuture {
+            leader,
+            term,
+            awaiting,
+            second,
+            delayed: false,
+        });
+        self.sync(false);
+    }
+
+    /// `change_membership(ReplaceAllVoters(target), retain = false)` from
+    /// `config`, the effective membership.
+    fn change_voters(&mut self, config: &MembershipConfig, target: &VoterSet) {
+        let learners: BTreeSet<NodeId> = config
+            .learners()
+            .iter()
+            .copied()
+            .filter(|node| !target.contains(*node))
+            .collect();
+        let uniform = MembershipConfig::Uniform {
+            voters: target.clone(),
+            learners: learners.clone(),
+        };
+        let old = match config {
+            MembershipConfig::Uniform { voters, .. } => {
+                if voters == target {
                     return;
                 }
-                let learners = learners_without(&learners);
-                self.append(MembershipConfig::Joint {
-                    old: voters,
-                    new: target.clone(),
-                    learners: learners.clone(),
-                });
-                if self.pending.is_some() {
-                    return;
-                }
-                if self.drop_second_step {
-                    self.drop_second_step = false;
-                    self.leader = None;
-                    return;
-                }
-                self.append(MembershipConfig::Uniform {
-                    voters: target.clone(),
-                    learners,
-                });
+                voters.clone()
             }
-            MembershipConfig::Joint { old, new, learners } => {
-                if &old == target || &new == target {
-                    self.append(MembershipConfig::Uniform {
-                        voters: target.clone(),
-                        learners: learners_without(&learners),
-                    });
+            MembershipConfig::Joint { old, new, .. } => {
+                if old == target || new == target {
+                    self.propose(uniform, None);
+                    return;
                 }
+                // `bridge_to`: `[A, B]` toward `C` goes through `[B, C]`.
+                new.clone()
             }
-        }
+        };
+        let joint = MembershipConfig::Joint {
+            old,
+            new: target.clone(),
+            learners,
+        };
+        self.propose(joint, Some(uniform));
     }
 }
 
@@ -430,27 +943,36 @@ pub(super) enum Ended {
 }
 
 /// The environment's half of a round: [`Group::settle`] when `fair`, else
-/// only an election.
+/// [`Group::hold_back`].
 pub(super) fn environment(group: &mut Group, fair: bool) {
     if fair {
         group.settle();
     } else {
-        group.elect();
+        group.hold_back();
     }
 }
 
-/// The leader's half of a round: it plans and executes. `None` without a
-/// leader. A leader that crashed plans from a `NotLeading` view.
-pub(super) fn act(group: &mut Group, target: &MembershipTarget) -> Option<Planned> {
-    let leader = group.leader?;
+/// The leader's half of a round: it plans with the group's planner and
+/// executes. `None` without a leader. A leader that crashed plans from a
+/// `NotLeading` view. A step OpenRaft refuses fails the run.
+pub(super) fn act(group: &mut Group, target: &MembershipTarget) -> Result<Option<Planned>, String> {
+    let Some(leader) = group.leader else {
+        return Ok(None);
+    };
     let view = group.view(leader);
-    let step = plan_membership_step(&view, target);
-    group.execute(&step);
-    Some(Planned { view, step })
+    let step = (group.planner)(&view, target);
+    group
+        .execute(&step)
+        .map_err(|refused| format!("OpenRaft refused {step:?}: {refused:?}"))?;
+    Ok(Some(Planned { view, step }))
 }
 
 /// One round: the environment acts, then the leader plans and executes.
-pub(super) fn round(group: &mut Group, target: &MembershipTarget, fair: bool) -> Option<Planned> {
+pub(super) fn round(
+    group: &mut Group,
+    target: &MembershipTarget,
+    fair: bool,
+) -> Result<Option<Planned>, String> {
     environment(group, fair);
     act(group, target)
 }
@@ -464,7 +986,7 @@ pub(super) fn run(
     mut check: impl FnMut(&Group, Option<&Planned>) -> Result<(), String>,
 ) -> Result<Ended, String> {
     for _ in 0..limit {
-        let planned = round(group, target, true);
+        let planned = round(group, target, true)?;
         check(group, planned.as_ref())?;
         if let Some(Planned {
             step: MembershipStep::Converged { voters },
