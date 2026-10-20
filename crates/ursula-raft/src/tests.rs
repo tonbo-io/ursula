@@ -358,7 +358,7 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
-    let service = crate::grpc::RaftGrpcService::new(registry);
+    let service = crate::grpc::RaftGrpcService::new(registry.clone());
     // A data group never takes CreateBucket: the leader refuses the batch
     // before it proposes any of it.
     let unproposable = RaftCommand::Stream(ursula_stream::StreamCommand::CreateBucket {
@@ -367,6 +367,8 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     let response = service
         .group_write(tonic::Request::new(
             crate::raft_internal_proto::GroupWriteRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
                 protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
                 command_payloads: vec![encode_wire(&unproposable), encode_wire(&unproposable)],
                 ..Default::default()
@@ -387,6 +389,175 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
             })
         );
     }
+
+    // A data group never takes a meta command: a batch that carries one is
+    // refused as a whole, before anything of it is proposed.
+    let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
+        ursula_control::ControlCommand::RegisterNode {
+            node: ursula_control::NodeId::new(1),
+            now_ms: 1,
+        },
+    ));
+    let before = runtime_last_log_index(&registry);
+    let response = service
+        .group_write(tonic::Request::new(
+            crate::raft_internal_proto::GroupWriteRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
+                protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
+                command_payloads: vec![
+                    encode_wire(&create_stream_command("cross-plane")),
+                    encode_wire(&meta),
+                ],
+                ..Default::default()
+            },
+        ))
+        .await
+        .expect("a refused batch is an answer, not a gRPC error")
+        .into_inner();
+    assert_eq!(response.results.len(), 2);
+    for result in response.results {
+        assert!(!result.ok);
+        let refusal: GroupEngineError =
+            decode_wire(&result.payload, "group engine error").expect("decodes");
+        assert_eq!(
+            refusal,
+            GroupEngineError::Infra(GroupInfraError::InvalidRaftCommand {
+                command: ursula_runtime::UnproposableCommand::OtherPlane,
+            })
+        );
+    }
+    assert_eq!(
+        runtime_last_log_index(&registry),
+        before,
+        "nothing was proposed"
+    );
+}
+
+/// The last log index of group 0 on `registry`'s node.
+#[cfg(not(madsim))]
+fn runtime_last_log_index(registry: &RaftGroupHandleRegistry) -> Option<u64> {
+    use openraft::rt::WatchReceiver;
+
+    registry
+        .get(RaftGroupId(0))
+        .expect("group 0 runs")
+        .metrics()
+        .borrow_watched()
+        .last_log_index
+}
+
+/// Every group RPC checks its target before the group: the plane, the
+/// group a meta request names and the node the request is for. A request
+/// for another node is refused with the misdelivery refusal, which names
+/// this node and is no protocol mismatch, and the meta group, which no
+/// node runs yet, is answered as a group this node does not run.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn group_rpcs_check_their_target_before_the_group() {
+    use crate::raft_internal_proto as pb;
+    use crate::raft_internal_proto::raft_internal_server::RaftInternal;
+
+    let wal_root = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let runtime = ShardRuntime::spawn_with_engine_factory(
+        RuntimeConfig::new(1, 1),
+        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
+            .with_registry(registry.clone()),
+    )
+    .unwrap();
+    runtime.warm_group(RaftGroupId(0)).await.unwrap();
+    let service = crate::grpc::RaftGrpcService::new(registry);
+    let version = crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
+    let write = |plane: pb::RaftPlaneV1, target_node| pb::GroupWriteRequestV1 {
+        plane: plane.into(),
+        target_node,
+        protocol_version: version,
+        ..Default::default()
+    };
+    let read = |plane: pb::RaftPlaneV1, target_node| pb::GroupReadRequestV1 {
+        plane: plane.into(),
+        target_node,
+        protocol_version: version,
+        ..Default::default()
+    };
+    let barrier = |plane: pb::RaftPlaneV1, target_node| pb::RejoinBarrierRequestV1 {
+        plane: plane.into(),
+        target_node,
+        protocol_version: version,
+        ..Default::default()
+    };
+    fn code<T>(result: Result<tonic::Response<T>, tonic::Status>) -> Option<tonic::Code> {
+        result.err().map(|status| status.code())
+    }
+    for (plane, node, expected) in [
+        (
+            pb::RaftPlaneV1::Unspecified,
+            1,
+            tonic::Code::InvalidArgument,
+        ),
+        (pb::RaftPlaneV1::Meta, 1, tonic::Code::NotFound),
+        (pb::RaftPlaneV1::Data, 2, tonic::Code::FailedPrecondition),
+    ] {
+        assert_eq!(
+            code(
+                service
+                    .group_write(tonic::Request::new(write(plane, node)))
+                    .await
+            ),
+            Some(expected),
+            "GroupWrite of plane {plane:?} for node {node}"
+        );
+        assert_eq!(
+            code(
+                service
+                    .rejoin_barrier(tonic::Request::new(barrier(plane, node)))
+                    .await
+            ),
+            Some(expected),
+            "RejoinBarrier of plane {plane:?} for node {node}"
+        );
+    }
+    // The meta group serves no stream reads.
+    assert_eq!(
+        code(
+            service
+                .group_read(tonic::Request::new(read(pb::RaftPlaneV1::Meta, 1)))
+                .await
+        ),
+        Some(tonic::Code::InvalidArgument)
+    );
+    let misdelivered = service
+        .group_read(tonic::Request::new(read(pb::RaftPlaneV1::Data, 2)))
+        .await
+        .expect_err("node 1 is not node 2");
+    assert_eq!(misdelivered.code(), tonic::Code::FailedPrecondition);
+    assert_eq!(crate::target::refusing_node(&misdelivered), Some(1));
+    assert!(!crate::format_epoch::is_protocol_mismatch(&misdelivered));
+    // A meta request names group 0.
+    let mut meta_group = write(pb::RaftPlaneV1::Meta, 1);
+    meta_group.raft_group_id = 3;
+    assert_eq!(
+        code(service.group_write(tonic::Request::new(meta_group)).await),
+        Some(tonic::Code::InvalidArgument)
+    );
+    // The genesis probe checks its target node, and no node answers it yet.
+    let probe =
+        crate::meta::genesis::genesis_probe_request(2, &crate::meta::genesis::GenesisProbe {
+            claim: ursula_control::samples::sample_genesis_claim(),
+            vote: crate::bootstrap_probe_vote(),
+        });
+    let refused = service
+        .genesis_probe(tonic::Request::new(probe.clone()))
+        .await
+        .expect_err("node 1 is not node 2");
+    assert_eq!(crate::target::refusing_node(&refused), Some(1));
+    let mut probe = probe;
+    probe.target_node = 1;
+    assert_eq!(
+        code(service.genesis_probe(tonic::Request::new(probe)).await),
+        Some(tonic::Code::NotFound)
+    );
 }
 
 fn placement() -> ShardPlacement {

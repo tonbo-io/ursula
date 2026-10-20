@@ -2,19 +2,35 @@ syntax = "proto3";
 
 package ursula.raft.v1;
 
-// Raft RPC envelopes keep a plain proto preamble (protocol version, group id,
-// target node) so routing and validation never decode the payload. The payload
-// itself is opaque compact MessagePack (`ursula_stream::msgpack`: a struct is
-// an array of its fields in declaration order) produced by the serde derives
-// of openraft's own request/response types (see `codec::encode_wire`).
+// Raft RPC envelopes keep a plain proto preamble (protocol version, plane,
+// group id, target node) so routing and validation never decode the payload.
+// The payload itself is opaque compact MessagePack (`ursula_stream::msgpack`:
+// a struct is an array of its fields in declaration order) produced by the
+// serde derives of openraft's own request/response types (see
+// `codec::encode_wire`).
+//
+// A receiver checks the protocol version first, then the target (plane,
+// group and target node, `target::RaftTarget`), then looks the group up.
+
+// The Raft plane a request names: a data group, or the meta group, whose
+// group id is 0. A receiver refuses UNSPECIFIED, so a request that names no
+// plane never reaches data group 0.
+enum RaftPlaneV1 {
+  RAFT_PLANE_V1_UNSPECIFIED = 0;
+  RAFT_PLANE_V1_DATA = 1;
+  RAFT_PLANE_V1_META = 2;
+}
 
 message RaftRpcEnvelopeV1 {
   uint32 raft_group_id = 1;
+  // The node the request is for. A receiver of another id refuses it with
+  // FAILED_PRECONDITION and its own id in `ursula-node-id` status metadata.
   uint64 node_id = 2;
   uint32 protocol_version = 3;
   // MessagePack-encoded openraft `AppendEntriesRequest` (Append RPC) or
   // `VoteRequest` (Vote RPC).
   bytes payload = 4;
+  RaftPlaneV1 plane = 5;
 }
 
 message RaftRpcAckV1 {
@@ -24,7 +40,9 @@ message RaftRpcAckV1 {
 }
 
 // A process-wide peer stream multiplexes independent OpenRaft Append RPCs from
-// every group. request_id is transport-local correlation only; it never enters
+// every group of one plane, which the stream's `ursula-raft-plane` request
+// metadata names (`data` or `meta`); a receiver refuses an item of another
+// plane. request_id is transport-local correlation only; it never enters
 // the replicated state machine or changes per-group ordering.
 message RaftAppendStreamRequest {
   // Fields 1 and 2 held the removed single-item request.
@@ -68,6 +86,7 @@ message RaftFullSnapshotRequestV1 {
   // MessagePack-encoded openraft `SnapshotMeta`.
   bytes snapshot_meta = 5;
   bytes snapshot_payload = 6;
+  RaftPlaneV1 plane = 7;
 }
 
 message RaftFullSnapshotAckV1 {
@@ -81,6 +100,7 @@ message RaftTransferLeaderRequestV1 {
   uint32 protocol_version = 3;
   // MessagePack-encoded openraft `TransferLeaderRequest`.
   bytes request = 4;
+  RaftPlaneV1 plane = 5;
 }
 
 message RaftTransferLeaderAckV1 {
@@ -97,6 +117,9 @@ message GroupWriteRequestV1 {
   // Raft gRPC protocol version (the format epoch), checked before anything
   // else. Senders before format epoch 2 omit it, so it decodes as 0.
   uint32 protocol_version = 5;
+  RaftPlaneV1 plane = 6;
+  // The node the request is for, refused by a receiver of another id.
+  uint64 target_node = 7;
 }
 
 message GroupWriteResultV1 {
@@ -128,6 +151,10 @@ message GroupReadRequestV1 {
   // Raft gRPC protocol version (the format epoch), checked before anything
   // else. Senders before format epoch 2 omit it, so it decodes as 0.
   uint32 protocol_version = 11;
+  // Always DATA: the meta group serves no stream reads.
+  RaftPlaneV1 plane = 12;
+  // The node the request is for, refused by a receiver of another id.
+  uint64 target_node = 13;
 }
 
 message HeadStreamReadV1 {
@@ -174,11 +201,38 @@ message GroupReadResponseV1 {
 message RejoinBarrierRequestV1 {
   uint32 raft_group_id = 1;
   uint32 protocol_version = 2;
+  RaftPlaneV1 plane = 3;
+  // The node the request is for, refused by a receiver of another id.
+  uint64 target_node = 4;
 }
 
 message RejoinBarrierResponseV1 {
   bytes vote = 1;
   uint64 index = 2;
+  // The group the answer is about, echoed from the request.
+  RaftPlaneV1 plane = 3;
+  uint32 raft_group_id = 4;
+  // MessagePack-encoded `LeaderMemberships`: the committed and effective
+  // memberships of the leader view the barrier confirmed. Required: an
+  // empty value is a malformed response.
+  bytes memberships = 5;
+}
+
+// The meta group's genesis probe. Field 1 is part of the frozen preamble of
+// the format-epoch contract: a receiver checks it before anything else.
+message GenesisProbeRequestV1 {
+  uint32 protocol_version = 1;
+  // The node the request is for, refused by a receiver of another id.
+  uint64 target_node = 2;
+  // MessagePack-encoded `GenesisProbe`: the sender's genesis claim and its
+  // probe vote.
+  bytes probe = 3;
+}
+
+message GenesisProbeAckV1 {
+  // MessagePack-encoded `GenesisAnswer`. Required: an empty value is a
+  // malformed response.
+  bytes answer = 1;
 }
 
 service RaftInternal {
@@ -190,4 +244,5 @@ service RaftInternal {
   rpc GroupRead(GroupReadRequestV1) returns (GroupReadResponseV1);
   rpc RejoinBarrier(RejoinBarrierRequestV1) returns (RejoinBarrierResponseV1);
   rpc TransferLeader(RaftTransferLeaderRequestV1) returns (RaftTransferLeaderAckV1);
+  rpc GenesisProbe(GenesisProbeRequestV1) returns (GenesisProbeAckV1);
 }

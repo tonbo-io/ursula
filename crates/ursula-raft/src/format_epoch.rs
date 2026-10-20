@@ -8,9 +8,12 @@
 //! to a node of another:
 //!
 //! - **Startup peer probe** ([`probe_peer_format_epoch`]): before a node
-//!   writes anything, it sends each configured peer one `Vote` for a group no
-//!   node registers (`u32::MAX`). `NOT_FOUND` means the peer speaks this
-//!   protocol; `FAILED_PRECONDITION` means it does not.
+//!   writes anything, it sends each configured peer one `Vote` for a data
+//!   group no node registers (`u32::MAX`), stamped for the peer's configured
+//!   id. `NOT_FOUND` means the peer speaks this protocol;
+//!   `FAILED_PRECONDITION` with the mismatch text means it does not, and
+//!   with an `ursula-node-id` status metadata that the address serves
+//!   another node.
 //! - **Readiness** ([`FormatEpochMismatch`]): any later mismatch, inbound or
 //!   outbound, is logged at error level and recorded; `/__ursula/ready` then
 //!   answers 503 `format_epoch_mismatch` until the process restarts.
@@ -21,14 +24,21 @@
 //!
 //! - the `protocol_version` preamble fields (`RaftRpcEnvelopeV1` field 3,
 //!   `GroupWriteRequestV1` field 5, `GroupReadRequestV1` field 11,
-//!   `RejoinBarrierRequestV1` field 2, and field 3 of the snapshot and
-//!   leader-transfer requests);
+//!   `RejoinBarrierRequestV1` field 2, field 3 of the snapshot and
+//!   leader-transfer requests, and from format epoch 6
+//!   `GenesisProbeRequestV1` field 1);
 //! - the startup probe: a `Vote` for group `u32::MAX`, answered `NOT_FOUND`
 //!   by a peer of the same epoch;
 //! - the refusal: `FAILED_PRECONDITION` with a message that contains
 //!   [`PROTOCOL_MISMATCH_TEXT`], for unary RPCs and as the code and message
 //!   of an AppendStream item;
 //! - the `ursula-cluster-id` and `ursula-node-id` request metadata.
+//!
+//! A refusal of a request meant for another node is `FAILED_PRECONDITION`
+//! too, told apart by the refusing node's id in its `ursula-node-id` status
+//! metadata ([`crate::target::refusing_node`]). It is never a format-epoch
+//! answer: the probe reads it as unreachable, and no reader records it as a
+//! mismatch.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -85,9 +95,12 @@ pub(crate) fn record_format_epoch_mismatch(direction: &'static str, message: &st
     FormatEpochMismatch::global().record();
 }
 
-/// Whether a peer's answer is a protocol-version refusal.
+/// Whether a peer's answer is a protocol-version refusal. A refusal of a
+/// request meant for another node ([`crate::target::refusing_node`]) never
+/// is: its address serves another node, of whatever epoch.
 pub(crate) fn is_protocol_mismatch(status: &tonic::Status) -> bool {
     status.code() == tonic::Code::FailedPrecondition
+        && crate::target::refusing_node(status).is_none()
         && status.message().contains(PROTOCOL_MISMATCH_TEXT)
 }
 
@@ -116,17 +129,19 @@ pub enum PeerFormatEpoch {
     Unreachable(String),
 }
 
-/// Probe one peer's Raft protocol version with a `Vote` for
-/// `FORMAT_EPOCH_PROBE_GROUP`, sent as `identity`. Both 0.5.x and this binary
-/// check the version before the group and the payload, so the probe has no
-/// side effect.
+/// Probe the Raft protocol version of peer `peer_id` at `url` with a
+/// `Vote` for `FORMAT_EPOCH_PROBE_GROUP`, sent as `identity`. Both 0.5.x and
+/// this binary check the version before the group and the payload, so the
+/// probe has no side effect.
 pub async fn probe_peer_format_epoch(
     url: &str,
+    peer_id: u64,
     identity: &PeerIdentity,
     timeout: Duration,
 ) -> PeerFormatEpoch {
     probe_peer_with_protocol(
         url,
+        peer_id,
         identity,
         crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
         timeout,
@@ -136,6 +151,7 @@ pub async fn probe_peer_format_epoch(
 
 pub(crate) async fn probe_peer_with_protocol(
     url: &str,
+    peer_id: u64,
     identity: &PeerIdentity,
     protocol_version: u32,
     timeout: Duration,
@@ -148,12 +164,13 @@ pub(crate) async fn probe_peer_with_protocol(
         Ok(channel) => channel,
         Err(err) => return PeerFormatEpoch::Unreachable(format!("connect: {err}")),
     };
-    let mut request = tonic::Request::new(raft_internal_proto::RaftRpcEnvelopeV1 {
-        raft_group_id: FORMAT_EPOCH_PROBE_GROUP,
-        node_id: 0,
+    let mut envelope = raft_internal_proto::RaftRpcEnvelopeV1 {
         protocol_version,
-        payload: Vec::new().into(),
-    });
+        ..Default::default()
+    };
+    crate::target::RaftTarget::Data(ursula_shard::RaftGroupId(FORMAT_EPOCH_PROBE_GROUP))
+        .stamp(peer_id, &mut envelope);
+    let mut request = tonic::Request::new(envelope);
     request.set_timeout(timeout);
     let result = raft_internal_proto::raft_internal_client::RaftInternalClient::with_interceptor(
         channel,
@@ -165,8 +182,10 @@ pub(crate) async fn probe_peer_with_protocol(
 }
 
 /// NOT_FOUND is a peer on this protocol; FAILED_PRECONDITION naming a
-/// cluster id is a peer of another cluster; FAILED_PRECONDITION with the
-/// mismatch text is E8; anything else is treated as unreachable.
+/// cluster id is a peer of another cluster; FAILED_PRECONDITION naming a
+/// node is an address that serves another node, unreachable for the peer
+/// probed; FAILED_PRECONDITION with the mismatch text is E8; anything else
+/// is treated as unreachable.
 pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFormatEpoch {
     let status = match result {
         Err(status) => status,
@@ -180,6 +199,9 @@ pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFo
     }
     if let Some(cluster_id) = refusing_cluster(&status) {
         return PeerFormatEpoch::OtherCluster(cluster_id);
+    }
+    if let Some(node) = crate::target::refusing_node(&status) {
+        return PeerFormatEpoch::Unreachable(format!("the address serves node {node}"));
     }
     if is_protocol_mismatch(&status) {
         return PeerFormatEpoch::Refused(status.message().to_owned());
@@ -227,12 +249,12 @@ mod tests {
         let timeout = Duration::from_secs(2);
         let identity = test_identity(2);
         assert_eq!(
-            probe_peer_format_epoch(&url, &identity, timeout).await,
+            probe_peer_format_epoch(&url, 1, &identity, timeout).await,
             PeerFormatEpoch::Compatible
         );
         // A peer on another epoch answers the probe the way this server
         // answers a sender on another epoch.
-        match probe_peer_with_protocol(&url, &identity, RAFT_GRPC_PROTOCOL_VERSION - 1, timeout)
+        match probe_peer_with_protocol(&url, 1, &identity, RAFT_GRPC_PROTOCOL_VERSION - 1, timeout)
             .await
         {
             PeerFormatEpoch::Refused(message) => {
@@ -242,7 +264,7 @@ mod tests {
         }
         assert!(FormatEpochMismatch::global().recorded());
         assert!(matches!(
-            probe_peer_format_epoch("http://127.0.0.1:1", &identity, timeout).await,
+            probe_peer_format_epoch("http://127.0.0.1:1", 1, &identity, timeout).await,
             PeerFormatEpoch::Unreachable(_)
         ));
     }
@@ -271,12 +293,48 @@ mod tests {
         ));
     }
 
+    /// An address that serves another node than the one configured answers
+    /// the probe with the misdelivery refusal: the probed peer is
+    /// unreachable there, and the answer is no format-epoch answer.
+    #[tokio::test]
+    async fn probe_of_an_address_that_serves_another_node_is_unreachable() {
+        let url = spawn_server().await;
+        match probe_peer_format_epoch(&url, 3, &test_identity(2), Duration::from_secs(2)).await {
+            PeerFormatEpoch::Unreachable(reason) => {
+                assert!(reason.contains("serves node 1"), "{reason}");
+            }
+            other => panic!("expected an unreachable peer, got {other:?}"),
+        }
+    }
+
+    /// The order of the checks: the protocol version before the target
+    /// node, so a peer of another epoch learns of the mismatch even when it
+    /// dialed an address that serves another node.
+    #[tokio::test]
+    async fn the_protocol_version_is_checked_before_the_target_node() {
+        let url = spawn_server().await;
+        match probe_peer_with_protocol(
+            &url,
+            3,
+            &test_identity(2),
+            RAFT_GRPC_PROTOCOL_VERSION - 1,
+            Duration::from_secs(2),
+        )
+        .await
+        {
+            PeerFormatEpoch::Refused(message) => {
+                assert!(message.contains(PROTOCOL_MISMATCH_TEXT), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn probe_reports_a_peer_of_another_cluster_by_its_id() {
         let other = ursula_headers::ClusterId::new("other-cluster").unwrap();
         let url = spawn_server_in(PeerIdentity::new(1, other.clone())).await;
         assert_eq!(
-            probe_peer_format_epoch(&url, &test_identity(2), Duration::from_secs(2)).await,
+            probe_peer_format_epoch(&url, 1, &test_identity(2), Duration::from_secs(2)).await,
             PeerFormatEpoch::OtherCluster(other)
         );
     }
@@ -292,11 +350,8 @@ mod tests {
         let mut client = RaftInternalClient::with_interceptor(channel, test_identity(2));
         let write = client
             .group_write(raft_internal_proto::GroupWriteRequestV1 {
-                raft_group_id: 0,
-                core_id: 0,
-                shard_id: 0,
-                command_payloads: Vec::new(),
                 protocol_version: 0,
+                ..Default::default()
             })
             .await
             .expect_err("a sender without protocol_version is refused");
@@ -304,14 +359,10 @@ mod tests {
         assert!(write.message().contains(PROTOCOL_MISMATCH_TEXT));
         let read = client
             .group_read(raft_internal_proto::GroupReadRequestV1 {
-                raft_group_id: 0,
-                core_id: 0,
-                shard_id: 0,
                 bucket_id: "fmt-epoch".to_owned(),
                 stream_id: "probe".to_owned(),
-                now_ms: 0,
-                read: None,
                 protocol_version: 0,
+                ..Default::default()
             })
             .await
             .expect_err("a sender without protocol_version is refused");

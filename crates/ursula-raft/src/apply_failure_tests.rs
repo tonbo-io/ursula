@@ -324,6 +324,8 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let write_error = service
         .group_write(tonic::Request::new(
             crate::raft_internal_proto::GroupWriteRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
                 protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
                 command_payloads: vec![crate::codec::encode_wire(&create_stream(
                     "refused-after-replay",
@@ -337,6 +339,8 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     let read_error = service
         .group_read(tonic::Request::new(
             crate::raft_internal_proto::GroupReadRequestV1 {
+                plane: crate::raft_internal_proto::RaftPlaneV1::Data.into(),
+                target_node: 1,
                 protocol_version: crate::grpc::RAFT_GRPC_PROTOCOL_VERSION,
                 ..Default::default()
             },

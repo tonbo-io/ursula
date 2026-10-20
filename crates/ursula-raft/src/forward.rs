@@ -48,6 +48,7 @@ use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::refusing_cluster;
 use crate::raft_internal_proto;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::target::RaftTarget;
 use crate::types::RaftCommand;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -186,8 +187,7 @@ pub(crate) async fn forward_group_read_to_leader(
     now_ms: u64,
     read: raft_internal_proto::group_read_request_v1::Read,
 ) -> Result<raft_internal_proto::GroupReadResponseV1, GroupEngineError> {
-    let request = raft_internal_proto::GroupReadRequestV1 {
-        raft_group_id: placement.raft_group_id.0,
+    let mut request = raft_internal_proto::GroupReadRequestV1 {
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
         bucket_id: stream_id.bucket_id,
@@ -195,7 +195,9 @@ pub(crate) async fn forward_group_read_to_leader(
         now_ms,
         read: Some(read),
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+        ..Default::default()
     };
+    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
     call_leader(
         route,
         placement,
@@ -217,15 +219,16 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     placement: ShardPlacement,
     bucket_id: String,
 ) -> Result<PurgeBucketResponse, GroupEngineError> {
-    let request = raft_internal_proto::GroupWriteRequestV1 {
-        raft_group_id: placement.raft_group_id.0,
+    let mut request = raft_internal_proto::GroupWriteRequestV1 {
         core_id: u32::from(placement.core_id.0),
         shard_id: placement.shard_id.0,
         command_payloads: vec![encode_wire(&RaftCommand::Stream(
             ursula_stream::StreamCommand::PurgeBucket { bucket_id },
         ))],
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+        ..Default::default()
     };
+    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
     let response = call_leader(
         route,
         placement,
@@ -274,6 +277,14 @@ pub(crate) enum ForwardError {
         rpc: ForwardedRpc,
         address: String,
         cluster_id: ursula_headers::ClusterId,
+    },
+    /// The leader's address serves another node now, which refused the call
+    /// as meant for another node: nothing ran there.
+    #[error("{rpc} to the group leader at {address} was refused: the address serves node {node}")]
+    OtherNode {
+        rpc: ForwardedRpc,
+        address: String,
+        node: u64,
     },
     #[error("{rpc} cannot be forwarded: invalid gRPC leader endpoint {address}")]
     InvalidEndpoint {
@@ -341,6 +352,12 @@ impl ForwardError {
                     LeadershipReason::LeaderInOtherCluster,
                     Proposal::NotProposed,
                 );
+            }
+            // Nothing ran on the node at the leader's address, which is
+            // another node now: to the client, a leader this node cannot
+            // reach until its view of the group's leader moves on.
+            Self::OtherNode { .. } => {
+                return unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
             }
             // A purge whose request reached the leader's socket may have
             // committed there.
@@ -435,7 +452,13 @@ where
                 Ok(Ok(response)) => return Ok(response.into_inner()),
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
-                    if peer_cluster.observe_refusal(
+                    if let Some(node) = crate::target::refusing_node(&status) {
+                        ForwardError::OtherNode {
+                            rpc,
+                            address: address.to_owned(),
+                            node,
+                        }
+                    } else if peer_cluster.observe_refusal(
                         route.leader_id,
                         address,
                         &status,

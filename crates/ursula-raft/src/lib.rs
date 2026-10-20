@@ -7,8 +7,12 @@
 //!   [`RaftCommand`] of every entry on either plane, and the
 //!   [`RaftGroupResponse`] applied-entry response around the canonical
 //!   `ursula_runtime` write types.
-//! - [`meta`]: the meta group's replicated types: its commands, its state
-//!   and its snapshot pointer.
+//! - [`meta`]: the meta group's replicated types: its commands, its state,
+//!   its snapshot pointer and its genesis probe.
+//! - [`target`]: the typed target of every Raft RPC (plane, group and target
+//!   node), its one encoder and parser, and the misdelivery refusal.
+//! - [`memberships`]: the memberships a recovery barrier answers with, which
+//!   every asker classifies with `MembershipAnswer::of`.
 //! - [`codec`]: serde (MessagePack) wire helpers for the canonical command,
 //!   response, and error types that travel through the Raft state machine.
 //! - [`grpc`]: gRPC service ([`RaftGrpcService`]) and network factory
@@ -87,6 +91,7 @@ mod history;
 mod in_process;
 mod log_store;
 mod maintenance;
+mod memberships;
 pub mod meta;
 mod openraft_error;
 mod openraft_work;
@@ -106,6 +111,7 @@ pub mod snapshot_cadence;
 mod snapshot_codec;
 mod snapshot_holds;
 mod state_machine;
+mod target;
 mod telemetry;
 mod types;
 pub mod wal;
@@ -126,6 +132,7 @@ pub use grpc::QuorumPrefix;
 pub use grpc::RAFT_GRPC_APPEND_PATH;
 pub use grpc::RAFT_GRPC_APPEND_STREAM_PATH;
 pub use grpc::RAFT_GRPC_FULL_SNAPSHOT_PATH;
+pub use grpc::RAFT_GRPC_GENESIS_PROBE_PATH;
 pub use grpc::RAFT_GRPC_GROUP_READ_PATH;
 pub use grpc::RAFT_GRPC_GROUP_WRITE_PATH;
 pub use grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
@@ -177,6 +184,10 @@ pub use log_store::generate_cluster_id;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
+pub use memberships::BarrierAnswer;
+pub use memberships::EmptyVoterConfig;
+pub use memberships::LeaderMemberships;
+pub use memberships::MembershipKind;
 pub use peer_cluster::CLUSTER_ID_METADATA;
 pub use peer_cluster::ClusterCheck;
 pub use peer_cluster::NODE_ID_METADATA;
@@ -238,6 +249,8 @@ pub use state_machine::SnapshotPermitError;
 pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::persisted_snapshot_pointer;
+pub use target::RAFT_PLANE_METADATA;
+pub use target::RaftTarget;
 pub use types::RaftCommand;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;

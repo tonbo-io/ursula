@@ -114,7 +114,13 @@ async fn probe_peers(
             (
                 peer_id,
                 peer_url,
-                ursula_raft::probe_peer_format_epoch(peer_url, identity, PEER_PROBE_TIMEOUT).await,
+                ursula_raft::probe_peer_format_epoch(
+                    peer_url,
+                    peer_id,
+                    identity,
+                    PEER_PROBE_TIMEOUT,
+                )
+                .await,
             )
         }))
         .await;

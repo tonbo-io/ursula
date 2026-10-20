@@ -280,6 +280,13 @@ impl RaftInternal for WedgedPeer {
     ) -> Result<Response<pb::RaftTransferLeaderAckV1>, Status> {
         std::future::pending().await
     }
+
+    async fn genesis_probe(
+        &self,
+        _request: Request<pb::GenesisProbeRequestV1>,
+    ) -> Result<Response<pb::GenesisProbeAckV1>, Status> {
+        std::future::pending().await
+    }
 }
 
 /// HTTP/2 keepalive cannot end a call to a leader that answers PINGs; the
