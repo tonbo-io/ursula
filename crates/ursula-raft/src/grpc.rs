@@ -3383,7 +3383,14 @@ mod barrier_asker_tests {
     use crate::types::UrsulaVote;
 
     type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
-    type Answer = Result<pb::RejoinBarrierResponseV1, Status>;
+
+    /// What a scripted barrier peer answers.
+    #[derive(Clone)]
+    enum Script {
+        Answer(pb::RejoinBarrierResponseV1),
+        /// The misdelivery refusal of the node the address serves now.
+        Misdelivered(u64),
+    }
 
     /// The group the asker asks about, and its leader.
     const GROUP: RaftGroupId = RaftGroupId(3);
@@ -3393,7 +3400,7 @@ mod barrier_asker_tests {
     /// is unimplemented.
     #[derive(Clone)]
     struct ScriptedBarrier {
-        answer: Arc<dyn Fn() -> Answer + Send + Sync>,
+        script: Script,
     }
 
     #[tonic::async_trait]
@@ -3447,7 +3454,10 @@ mod barrier_asker_tests {
             &self,
             _request: Request<pb::RejoinBarrierRequestV1>,
         ) -> Result<Response<pb::RejoinBarrierResponseV1>, Status> {
-            (self.answer)().map(Response::new)
+            match &self.script {
+                Script::Answer(answer) => Ok(Response::new(answer.clone())),
+                Script::Misdelivered(node) => Err(GrpcRpcError::misdelivered(*node, LEADER).into()),
+            }
         }
 
         async fn transfer_leader(
@@ -3492,10 +3502,8 @@ mod barrier_asker_tests {
         }
     }
 
-    /// Asks a barrier peer that answers `answer` about [`GROUP`], as node 1.
-    async fn ask(
-        answer: impl Fn() -> Answer + Send + Sync + 'static,
-    ) -> Result<BarrierAnswer, RecoveryProbeError> {
+    /// Asks a barrier peer that answers `script` about [`GROUP`], as node 1.
+    async fn ask(script: Script) -> Result<BarrierAnswer, RecoveryProbeError> {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind the barrier peer");
@@ -3506,9 +3514,7 @@ mod barrier_asker_tests {
         let server = tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(super::raft_grpc_server(
-                    ScriptedBarrier {
-                        answer: Arc::new(answer),
-                    },
+                    ScriptedBarrier { script },
                     &crate::peer_cluster::test_peer_cluster(LEADER),
                 ))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
@@ -3537,7 +3543,7 @@ mod barrier_asker_tests {
     /// The control: a live leader's answer about the group asked is taken.
     #[tokio::test]
     async fn a_live_leaders_answer_is_taken() {
-        let answer = ask(|| Ok(live_answer()))
+        let answer = ask(Script::Answer(live_answer()))
             .await
             .expect("a live leader's answer");
         assert_eq!(answer.index, 7);
@@ -3550,12 +3556,10 @@ mod barrier_asker_tests {
     /// Empty memberships bytes do not decode: the field is required.
     #[tokio::test]
     async fn an_answer_with_empty_memberships_bytes_is_refused() {
-        let error = ask(|| {
-            Ok(pb::RejoinBarrierResponseV1 {
-                memberships: Default::default(),
-                ..live_answer()
-            })
-        })
+        let error = ask(Script::Answer(pb::RejoinBarrierResponseV1 {
+            memberships: Default::default(),
+            ..live_answer()
+        }))
         .await
         .expect_err("empty memberships are no answer");
         assert!(matches!(error, RecoveryProbeError::Payload(_)), "{error:?}");
@@ -3565,15 +3569,13 @@ mod barrier_asker_tests {
     /// asking node is no member.
     #[tokio::test]
     async fn an_answer_whose_membership_has_no_voters_is_refused() {
-        let error = ask(|| {
-            Ok(pb::RejoinBarrierResponseV1 {
-                memberships: encode_wire(&LeaderMemberships {
-                    committed: membership(Vec::new()),
-                    effective: membership(vec![BTreeSet::from([1, 2, 3])]),
-                }),
-                ..live_answer()
-            })
-        })
+        let error = ask(Script::Answer(pb::RejoinBarrierResponseV1 {
+            memberships: encode_wire(&LeaderMemberships {
+                committed: membership(Vec::new()),
+                effective: membership(vec![BTreeSet::from([1, 2, 3])]),
+            }),
+            ..live_answer()
+        }))
         .await
         .expect_err("a membership without voters is no answer");
         assert!(
@@ -3592,12 +3594,10 @@ mod barrier_asker_tests {
     #[tokio::test]
     async fn an_answer_about_another_plane_or_group_is_refused() {
         let meta = i32::from(pb::RaftPlaneV1::Meta);
-        let error = ask(move || {
-            Ok(pb::RejoinBarrierResponseV1 {
-                plane: meta,
-                ..live_answer()
-            })
-        })
+        let error = ask(Script::Answer(pb::RejoinBarrierResponseV1 {
+            plane: meta,
+            ..live_answer()
+        }))
         .await
         .expect_err("an answer about the meta plane");
         assert!(
@@ -3608,12 +3608,10 @@ mod barrier_asker_tests {
             ),
             "{error:?}"
         );
-        let error = ask(|| {
-            Ok(pb::RejoinBarrierResponseV1 {
-                raft_group_id: 4,
-                ..live_answer()
-            })
-        })
+        let error = ask(Script::Answer(pb::RejoinBarrierResponseV1 {
+            raft_group_id: 4,
+            ..live_answer()
+        }))
         .await
         .expect_err("an answer about group 4");
         assert!(
@@ -3632,7 +3630,7 @@ mod barrier_asker_tests {
     /// no answer.
     #[tokio::test]
     async fn a_misdelivered_barrier_names_the_node_that_refused_it() {
-        let error = ask(|| Err(GrpcRpcError::misdelivered(9, LEADER).into()))
+        let error = ask(Script::Misdelivered(9))
             .await
             .expect_err("node 9 answers nothing for node 2");
         assert!(
