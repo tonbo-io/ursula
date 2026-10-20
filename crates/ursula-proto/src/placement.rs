@@ -14,6 +14,7 @@
 //! Group ids are `RaftGroupId` in the kernel's state and plain `u32` in admin
 //! JSON.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fmt;
@@ -64,11 +65,29 @@ impl fmt::Display for NodeId {
 /// every earlier leader's (plan members keep their votes), so its term
 /// exceeds every earlier term and its entries compare above every entry
 /// written before the cut. Comparing by index alone would not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// The order is written by hand, not derived: field order is the encoding,
+/// and the order must not change with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RaftLogId {
     pub term: u64,
     pub leader: NodeId,
     pub index: u64,
+}
+
+impl Ord for RaftLogId {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.term
+            .cmp(&other.term)
+            .then_with(|| self.leader.cmp(&other.leader))
+            .then_with(|| self.index.cmp(&other.index))
+    }
+}
+
+impl PartialOrd for RaftLogId {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl fmt::Display for RaftLogId {
@@ -541,6 +560,7 @@ mod tests {
         assert!(id(2, 1, 1) > id(1, 3, 100));
         assert!(id(2, 2, 1) > id(2, 1, 100));
         assert!(id(2, 2, 5) > id(2, 2, 4));
+        assert_eq!(id(2, 2, 5).cmp(&id(2, 2, 5)), std::cmp::Ordering::Equal);
     }
 
     #[test]
