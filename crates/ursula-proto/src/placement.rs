@@ -2,11 +2,29 @@
 //! the journal metadata, the maintenance report, group metrics and
 //! `ursulactl`.
 //!
-//! The serde form of these types is persisted in the meta log and its
-//! snapshots and sent between nodes, and every encode and decode goes through
-//! `ursula_stream::msgpack`, which writes a struct as an array of its fields.
-//! Field order is therefore format: never reorder, add or remove a field of a
-//! type here outside a format epoch. No type here uses `default`,
+//! Each type here is in one of three classes, and its class says what may
+//! change it:
+//!
+//! - **Format**: persisted in the meta log and its snapshots, replicated, or
+//!   sent between nodes. [`NodeId`], [`RaftLogId`], [`MetaLogId`],
+//!   [`MembershipLogId`], [`PlacementEpoch`], [`NodeLifecycle`],
+//!   [`NodeRecord`], [`VoterSet`], [`NodeSet`], [`GroupCount`],
+//!   [`ReplicationFactor`], [`GenesisClaim`] (the genesis probe) and
+//!   [`Registered`] (in the kernel's answers). Every encode and decode goes
+//!   through `ursula_stream::msgpack`, which writes a struct as an array of
+//!   its fields, so field order is format: never reorder, add or remove a
+//!   field outside a format epoch. These types get wire fixtures with the
+//!   meta group's roots.
+//! - **Admin JSON**: the admin protocol, compatible within a minor and never
+//!   in the meta log or between nodes. [`ReplicaRole`], [`TeardownStage`],
+//!   [`WaitReason`], [`StepKind`], [`StepFailureKind`], [`StepFailure`],
+//!   [`ReconcileState`], [`ReconcileStatus`] and [`WriteEffect`].
+//! - **Never encoded**: [`ViewStage`] and [`MembershipAnswer`], which stay
+//!   inside one process and derive no serde.
+//!
+//! In both encoded classes a variant is written by its `snake_case` name, so
+//! variant names are format too: renaming one is a format change, or an
+//! admin protocol change. No type here uses `default`,
 //! `skip_serializing_if`, `flatten` or an untagged enum. Newtypes are
 //! transparent, and a set that is never empty decodes through a validating
 //! `try_from`.
@@ -61,9 +79,13 @@ impl fmt::Display for NodeId {
 /// The id of an entry of a Raft log: its leader's `(term, leader)`, then its
 /// index, compared in that order.
 ///
-/// After a recovery plan cut a log, the next leader's electing majority meets
-/// every earlier leader's (plan members keep their votes), so its term
-/// exceeds every earlier term and its entries compare above every entry
+/// Under OpenRaft's `leader_id_adv` two leaders can share a term, so the
+/// term alone does not order leaderships: the `(term, leader)` pair does,
+/// as a node votes only for a pair not below the one it last voted for.
+/// After a
+/// recovery plan cut a log, the next leader's electing majority meets every
+/// earlier leader's (plan members keep their votes), so its `(term, leader)`
+/// exceeds every earlier one and its entries compare above every entry
 /// written before the cut. Comparing by index alone would not.
 ///
 /// The order is written by hand, not derived: field order is the encoding,
@@ -359,8 +381,7 @@ pub enum Registered {
 }
 
 /// How far a node's placement view reaches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ViewStage {
     /// The local meta replica applied no history event yet.
     Empty,
@@ -374,8 +395,7 @@ pub enum ViewStage {
 
 /// A live group leader's answer about one node, from its committed and its
 /// effective memberships.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MembershipAnswer {
     /// A voter of a config of either membership.
     Voter,
