@@ -556,8 +556,8 @@ pub const RAFT_GRPC_REJOIN_BARRIER_PATH: &str = "/ursula.raft.v1.RaftInternal/Re
 pub const RAFT_GRPC_TRANSFER_LEADER_PATH: &str = "/ursula.raft.v1.RaftInternal/TransferLeader";
 pub const RAFT_GRPC_MAX_MESSAGE_BYTES: usize = 256 * 1024 * 1024;
 /// The Raft gRPC protocol version is the format epoch: Ursula 0.7 speaks
-/// protocol 3 and 0.8 protocol 4, each refuses this one with its own check,
-/// and this binary refuses theirs.
+/// protocol 3, 0.8 protocol 4 and 0.9 protocol 5, each refuses this one with
+/// its own check, and this binary refuses theirs.
 pub(crate) const RAFT_GRPC_PROTOCOL_VERSION: u32 = ursula_stream::FORMAT_EPOCH;
 const RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RAFT_GRPC_APPEND_STREAM_MAX_BATCH_ITEMS: usize = 32;
