@@ -84,7 +84,7 @@ jobs:
         run: |
           for crate in $(python3 -c 'import json, subprocess; m = json.loads(subprocess.check_output(["cargo", "metadata", "--locked", "--no-deps", "--format-version", "1"])); print(" ".join(p["name"] for p in m["packages"] if p.get("publish") is None or "crates-io" in p["publish"]))'); do
             echo "::group::$crate"
-            RUSTFLAGS="-D warnings" cargo check --locked -p "$crate" --lib --bins
+            RUSTFLAGS="-D warnings" cargo check --locked -p "$crate"
             echo "::endgroup::"
           done
 
