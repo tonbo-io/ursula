@@ -1950,7 +1950,10 @@ fn open_peer_channel(
 /// its underlying channel works; replace it only after its sender closes.
 /// A transport's sessions serve the plane of the groups it carries: the
 /// stream names it in its `ursula-raft-plane` metadata, and the receiver
-/// refuses an item of another plane.
+/// refuses an item of another plane. Sessions are keyed by endpoint alone,
+/// so one plane per stream holds only because the meta group gets a
+/// transport of its own: a transport that carried both planes would send
+/// meta items on the data stream, which the receiver refuses.
 fn shared_append_session(
     transport: &CoreRaftTransport,
     endpoint: &str,

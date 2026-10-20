@@ -37,6 +37,16 @@
 //!   later refusal that also names a node or a cluster hides a mismatch;
 //! - the `ursula-cluster-id` and `ursula-node-id` request metadata.
 //!
+//! Releases v0.1.0 through v0.2.0 are outside this contract. Later
+//! releases reuse some of their field numbers with other types: fields 4
+//! and 5 of `RaftRpcEnvelopeV1`, fields 4 and 5 of the snapshot and
+//! leader-transfer requests, and field 7 of the snapshot request. Format
+//! epoch 6 puts the plane in field 5 of the envelope and of the
+//! leader-transfer request and in field 7 of the snapshot request. A peer
+//! that old can fail to decode a request before it checks the version, and
+//! answers a protobuf decode error instead of the refusal, which the
+//! startup probe reads as unreachable.
+//!
 //! A refusal of a request meant for another node is `FAILED_PRECONDITION`
 //! too, told apart by the refusing node's id in its `ursula-node-id` status
 //! metadata ([`crate::target::refusing_node`]) and a message without the
