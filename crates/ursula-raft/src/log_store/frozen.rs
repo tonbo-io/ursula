@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use super::CoreJournalRecord;
+use super::LogGeneration;
 use super::RaftGroupLogRecord;
 use super::disk::Disk;
 use super::disk::JournalDisk;
@@ -100,9 +101,12 @@ fn bytes(path: &Path) -> Result<Vec<u8>, JournalError> {
     Ok(bytes)
 }
 
+/// Publishes `entries` of the group's log of `generation` as the archive
+/// `id`, and returns the reference a journal record keeps.
 pub(crate) fn publish(
     dir: &Path,
     mut id: ArchiveId,
+    generation: LogGeneration,
     entries: Vec<Entry>,
 ) -> Result<ArchiveRef, JournalError> {
     let temporary = path(dir, id).with_extension("tmp");
@@ -114,6 +118,7 @@ pub(crate) fn publish(
     let mut writer = JournalWriter::open(&temporary, id.segment)?;
     writer.append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
         group_id: id.group_id,
+        generation,
         record: RaftGroupLogRecord::Append(entries),
     })?;
     writer.sync_data()?;

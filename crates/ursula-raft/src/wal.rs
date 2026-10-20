@@ -18,6 +18,7 @@ pub mod diagnostics {
     pub use crate::log_store::FrameDefect;
     pub use crate::log_store::GroupLogState;
     pub use crate::log_store::HeaderDefect;
+    pub use crate::log_store::JournalClass;
     #[cfg(madsim)]
     pub use crate::log_store::JournalDisk;
     pub use crate::log_store::JournalError;
@@ -26,9 +27,11 @@ pub mod diagnostics {
     pub use crate::log_store::JournalHistory;
     pub use crate::log_store::JournalOp;
     pub use crate::log_store::JournalReplayMode;
+    pub use crate::log_store::JournalRun;
     pub use crate::log_store::JournalSync;
     #[cfg(madsim)]
     pub use crate::log_store::LockAttempt;
+    pub use crate::log_store::LogGeneration;
     pub use crate::log_store::MarkRecoveringError;
     pub use crate::log_store::PreviousRun;
     pub use crate::log_store::RUN_STATE_FILE;

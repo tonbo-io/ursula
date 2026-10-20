@@ -29,6 +29,7 @@ use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 use ursula_stream::StreamCommand;
 
+use super::JournalRun;
 use super::RaftGroupFileLogStore;
 use super::RecoveryState;
 use super::RunState;
@@ -145,9 +146,15 @@ impl Journal {
                 self.dir.with_extension("run-state"),
                 RunState {
                     boot_id: None,
-                    fsync: self.tuning.fsync,
                     status: RunStatus::Running,
-                    recovery_epoch: 0,
+                    data: JournalRun {
+                        fsync: self.tuning.fsync,
+                        recovery_epoch: 0,
+                    },
+                    meta: JournalRun {
+                        fsync: WalFsync::Always,
+                        recovery_epoch: 0,
+                    },
                 },
             )),
             node_recovery: RecoveryState::Normal,

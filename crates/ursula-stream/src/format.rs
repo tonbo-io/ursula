@@ -13,7 +13,10 @@
 //! inherited from the history before. Epoch 5 is the format of Ursula 0.9:
 //! the `ExpireStreams` command, a clock on `DeleteStream`, writes that
 //! remove only the stream they name, and compact MessagePack
-//! ([`crate::msgpack`]) for everything Ursula writes as MessagePack. A binary
+//! ([`crate::msgpack`]) for everything Ursula writes as MessagePack. Epoch 6
+//! is the format of Ursula 0.10: a run state with one record per journal
+//! class, and a log generation on every Raft WAL journal record, core
+//! metadata entry and group snapshot record. A binary
 //! reads exactly one epoch: it refuses data and peers from any other epoch
 //! loudly, before it writes anything, and it does not convert them.
 //!
@@ -30,7 +33,7 @@
 //! pages and the cold key layout), in encoding and in meaning. It is the
 //! format epoch that last changed one of them, so it never exceeds
 //! [`FORMAT_EPOCH`]. Backup format 4 is written by 0.8, backup format 5 by
-//! 0.9. From backup format 5 on, a group object's first field is its
+//! 0.9 and 0.10. From backup format 5 on, a group object's first field is its
 //! backup format.
 //!
 //! Policy:
@@ -47,17 +50,18 @@
 //! - There is no migration between epochs. Data of an older epoch moves by
 //!   `ursulactl` backup and restore when its backup format is this binary's,
 //!   and otherwise by export and re-import through the applications that own
-//!   it. Neither the server nor `ursulactl` converts it. 0.9 refuses every
-//!   epoch-4 data directory, object-storage prefix, peer and group snapshot,
-//!   and every backup of backup format 4.
+//!   it. Neither the server nor `ursulactl` converts it. 0.10 refuses every
+//!   epoch-5 data directory, object-storage prefix, peer and group snapshot.
+//!   It restores backups of backup format 5, which epoch 6 did not change.
 //! - Epoch 2 was frozen when 0.6.0 was tagged, epoch 3 when 0.7.0 was tagged,
-//!   epoch 4 when 0.8.0 was tagged. Epoch 5 is frozen when 0.9.0 is tagged.
+//!   epoch 4 when 0.8.0 was tagged, epoch 5 when 0.9.0 was tagged. Epoch 6 is
+//!   frozen when 0.10.0 is tagged.
 //!   Main builds before that tag are not supported on each other's data;
 //!   every deployment of such a build starts from fresh prefixes and empty
 //!   data directories.
 
 /// The format epoch this binary reads and writes.
-pub const FORMAT_EPOCH: u32 = 5;
+pub const FORMAT_EPOCH: u32 = 6;
 
 /// The backup format this binary reads and writes: the format epoch that last
 /// changed what a backup holds.

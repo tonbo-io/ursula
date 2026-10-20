@@ -49,6 +49,27 @@ struct StoredTopology {
     cluster_id: ClusterId,
 }
 
+/// A topology file of 4 cores, 8 groups and the cluster id `prod-a`, for
+/// the persisted-envelopes fixture. It decodes to the file it was encoded
+/// from and re-encodes to the same bytes.
+#[cfg(test)]
+pub(crate) fn sample_file() -> Vec<u8> {
+    let file = TopologyFile {
+        routing: WalTopology {
+            core_count: 4,
+            group_count: 8,
+        },
+        cluster_id: "prod-a".to_owned(),
+    };
+    let bytes = state_file::encode(StateFileKind::Topology, &file);
+    let decoded: TopologyFile =
+        state_file::decode(StateFileKind::Topology, Path::new(TOPOLOGY_FILE), &bytes)
+            .expect("the sample decodes");
+    assert_eq!(decoded, file);
+    assert_eq!(state_file::encode(StateFileKind::Topology, &decoded), bytes);
+    bytes
+}
+
 /// A cluster id for a node that configures none: `u` followed by 32 hex
 /// digits of 128 random bits.
 pub fn generate_cluster_id() -> ClusterId {
@@ -302,11 +323,10 @@ mod tests {
     use crate::log_store::RUN_STATE_FILE;
     use crate::types::UrsulaRaftTypeConfig;
 
-    /// Golden bytes: the topology file is part of the epoch-5 format, so its
-    /// encoding never changes within it.
+    /// A WAL root records its topology as the persisted-envelopes fixture's
+    /// sample holds it ([`sample_file`]).
     #[test]
-    fn a_topology_matches_the_golden_file() {
-        const GOLDEN: &str = "55525357544f504f050000000b00000092920408a670726f642d61b4c19578";
+    fn a_recorded_topology_is_the_fixture_sample() {
         let dir = tempfile::tempdir().unwrap();
         let map = StaticShardMap::new(4, 8).unwrap();
         let cluster_id = ClusterId::new("prod-a").unwrap();
@@ -315,11 +335,7 @@ mod tests {
             cluster_id
         );
         let bytes = std::fs::read(dir.path().join(TOPOLOGY_FILE)).unwrap();
-        let hex = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(hex, GOLDEN);
+        assert_eq!(bytes, sample_file());
         assert_eq!(stored_cluster_id(dir.path()).unwrap(), Some(cluster_id));
     }
 

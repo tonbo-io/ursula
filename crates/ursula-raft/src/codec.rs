@@ -133,7 +133,7 @@ mod tests {
 
     /// What the persisted-envelopes fixture says produced it.
     const ENVELOPES_PRODUCER: &str =
-        "ursula_stream::msgpack, format epoch 5, openraft 0.10.0-alpha.37";
+        "ursula_stream::msgpack, format epoch 6, openraft 0.10.0-alpha.37";
 
     fn log_id(term: u64, node_id: u64, index: u64) -> LogIdOf<UrsulaRaftTypeConfig> {
         openraft::LogId {
@@ -234,11 +234,13 @@ mod tests {
         add(samples, &format!("{value:?}"), value);
     }
 
-    /// Every root that format epoch 5 writes to disk or sends to a peer
+    /// Every root that format epoch 6 writes to disk or sends to a peer
     /// apart from the replicated commands and their answers: the OpenRaft
     /// envelopes (votes, log ids, memberships, entries, snapshot metadata
-    /// and every RPC message), each record of the WAL journal, the snapshot
-    /// pointers and a full backup snapshot.
+    /// and every RPC message), each record of the WAL journal, the WAL's
+    /// state files (core metadata, run state and topology, each as a whole
+    /// file), the snapshot record, the snapshot pointers and a full backup
+    /// snapshot.
     fn persisted_envelopes() -> std::collections::BTreeMap<String, Vec<u8>> {
         use ursula_stream::StreamCommand;
 
@@ -410,9 +412,24 @@ mod tests {
         for (name, record) in records {
             add(samples, name, &CoreJournalRecord {
                 group_id: 7,
+                generation: crate::log_store::LogGeneration::new(3),
                 record,
             });
         }
+
+        // The WAL's state files, whole: header, payload and checksum.
+        for (name, bytes) in crate::log_store::state_file_samples() {
+            assert!(samples.insert(name.to_owned(), bytes).is_none(), "{name}");
+        }
+        // The snapshot record (`group-N.snapshot.json`).
+        assert!(
+            samples
+                .insert(
+                    "snapshot_record".to_owned(),
+                    crate::state_machine::snapshot_record_sample(),
+                )
+                .is_none()
+        );
 
         // The Raft RPC messages.
         add(
@@ -498,7 +515,7 @@ mod tests {
         envelopes
     }
 
-    /// Every root that format epoch 5 writes to disk or sends to a peer
+    /// Every root that format epoch 6 writes to disk or sends to a peer
     /// apart from the commands and their answers ([`persisted_envelopes`])
     /// encodes to the fixture's bytes, and decoding and re-encoding them
     /// reproduces each value and each byte. Each sample sets every field,
@@ -506,7 +523,7 @@ mod tests {
     /// name or place changes the fixture. A change to the fixture is a
     /// change to the format.
     #[test]
-    fn epoch5_persisted_envelopes_are_stable() {
+    fn epoch6_persisted_envelopes_are_stable() {
         let mut actual: std::collections::BTreeMap<String, serde_json::Value> =
             persisted_envelopes()
                 .into_iter()
@@ -514,7 +531,7 @@ mod tests {
                 .collect();
         actual.insert("producer".to_owned(), ENVELOPES_PRODUCER.into());
         let fixture: std::collections::BTreeMap<String, serde_json::Value> =
-            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch5.json"))
+            serde_json::from_str(include_str!("fixtures/persisted-envelopes-epoch6.json"))
                 .expect("the fixture parses");
         assert!(
             fixture == actual,
@@ -569,10 +586,10 @@ mod tests {
     /// distinct values, so a change of a field's name or place changes the
     /// fixture. A change to the fixture is a change to the format.
     #[test]
-    fn commands_and_responses_epoch5_wire_form_is_stable() {
+    fn commands_and_responses_epoch6_wire_form_is_stable() {
         let actual = commands_and_responses();
         let fixture: std::collections::BTreeMap<String, Vec<u8>> =
-            serde_json::from_str(include_str!("fixtures/commands-and-responses-epoch5.json"))
+            serde_json::from_str(include_str!("fixtures/commands-and-responses-epoch6.json"))
                 .expect("the fixture parses");
         assert!(
             fixture == actual,
@@ -590,7 +607,7 @@ mod tests {
     /// decoding and re-encoding them reproduces each byte for byte. A change
     /// to the fixture is a change to the protocol.
     #[test]
-    fn group_engine_errors_epoch5_wire_form_is_stable() {
+    fn group_engine_errors_epoch6_wire_form_is_stable() {
         let actual: std::collections::BTreeMap<String, Vec<u8>> =
             ursula_runtime::group_engine_error_samples()
                 .iter()
@@ -603,7 +620,7 @@ mod tests {
             assert_eq!(&format!("{decoded:?}"), name);
         }
         let fixture: std::collections::BTreeMap<String, Vec<u8>> =
-            serde_json::from_str(include_str!("fixtures/group-engine-errors-epoch5.json"))
+            serde_json::from_str(include_str!("fixtures/group-engine-errors-epoch6.json"))
                 .expect("the fixture parses");
         assert!(
             fixture == actual,
@@ -723,7 +740,7 @@ mod tests {
                 index in any::<prop::sample::Index>(),
                 mask in any::<u64>(),
                 (term, node_id, log_index) in (any::<u64>(), any::<u64>(), any::<u64>()),
-                group_id in any::<u32>(),
+                (group_id, generation) in (any::<u32>(), any::<u64>()),
             ) {
                 let commands = wire_samples::stream_commands();
                 let command = wire_samples::vary_command(index.get(&commands).clone(), mask);
@@ -734,6 +751,7 @@ mod tests {
                 wire_bytes("entry", &entry);
                 wire_bytes("journal record", &CoreJournalRecord {
                     group_id,
+                    generation: crate::log_store::LogGeneration::new(generation),
                     record: RaftGroupLogRecord::Append(vec![entry]),
                 });
             }

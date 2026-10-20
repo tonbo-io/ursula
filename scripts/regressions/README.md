@@ -50,9 +50,9 @@ Stream-generation fix: databendlabs/openraft commit
 through progress notifications and rejects responses from replaced streams.
 Alpha28 includes this fix as well as the stale-inflight-ACK fix above.
 
-The Ursula codec test `epoch5_persisted_envelopes_are_stable` pins the compact
-MessagePack bytes (`ursula_stream::msgpack`) of format epoch 5 in
-`crates/ursula-raft/src/fixtures/persisted-envelopes-epoch5.json`. It checks
+The Ursula codec test `epoch6_persisted_envelopes_are_stable` pins the compact
+MessagePack bytes (`ursula_stream::msgpack`) of format epoch 6 in
+`crates/ursula-raft/src/fixtures/persisted-envelopes-epoch6.json`. It checks
 Vote, LogId, joint StoredMembership (including a learner), a membership Entry
 and SnapshotMeta, then requires byte-identical re-encoding. Compact MessagePack
 writes a struct as an array of its fields in declaration order, so the fixture

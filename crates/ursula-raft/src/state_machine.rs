@@ -68,6 +68,7 @@ use ursula_shard::ShardPlacement;
 
 use crate::engine::group_engine_io_error;
 use crate::engine::invalid_data;
+use crate::log_store::LogGeneration;
 use crate::log_store::SnapshotOrderError;
 use crate::log_store::disk::Disk;
 use crate::log_store::disk::JournalDisk;
@@ -1784,12 +1785,60 @@ pub struct RaftGroupStateMachine {
 }
 
 /// Node-local record of the current snapshot (`group-N.snapshot.json`),
-/// in the MessagePack envelope (bounded-state F12a).
+/// in the MessagePack envelope (bounded-state F12a). It names the
+/// generation of the group's log it was written in: only a record of the
+/// generation the core's metadata names restores.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedSnapshot {
+    generation: LogGeneration,
     meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
     #[serde(with = "serde_bytes")]
     pointer_bytes: Vec<u8>,
+}
+
+/// The generation of the group's log a snapshot record is written in and
+/// restored from: the log store's, or the first for a group without one.
+fn record_generation(record: Option<&crate::SnapshotRecord>) -> LogGeneration {
+    record.map_or(LogGeneration::FIRST, crate::SnapshotRecord::generation)
+}
+
+/// A snapshot record of four distinct fields, for the persisted-envelopes
+/// fixture. It decodes to the record it was encoded from and re-encodes to
+/// the same bytes.
+#[cfg(test)]
+pub(crate) fn snapshot_record_sample() -> Vec<u8> {
+    use openraft::vote::RaftLeaderId;
+
+    type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+    let meta = SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+        last_log_id: Some(openraft::LogId {
+            leader_id: LeaderId::new(7, 2),
+            index: 19,
+        }),
+        last_membership: StoredMembershipOf::<UrsulaRaftTypeConfig>::new(
+            Some(openraft::LogId {
+                leader_id: LeaderId::new(6, 1),
+                index: 12,
+            }),
+            openraft::Membership::new_with_defaults(vec![[1, 2, 3].into_iter().collect()], [4]),
+        ),
+    };
+    let record = PersistedSnapshot {
+        generation: LogGeneration::new(3),
+        meta,
+        pointer_bytes: vec![0x92, 0x05, 0x09],
+    };
+    let bytes = encode_binary_envelope(&record).expect("the sample encodes");
+    let decoded =
+        decode_snapshot_envelope::<PersistedSnapshot>(&bytes).expect("the sample decodes");
+    assert_eq!(decoded.generation, record.generation);
+    assert_eq!(decoded.meta, record.meta);
+    assert_eq!(decoded.pointer_bytes, record.pointer_bytes);
+    assert_eq!(
+        encode_binary_envelope(&decoded).expect("the sample encodes"),
+        bytes
+    );
+    bytes
 }
 
 /// The pointer of a group's snapshot record (`group-N.snapshot.json`),
@@ -1966,6 +2015,22 @@ impl RaftGroupStateMachine {
         };
         let persisted =
             decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(pointer_unreadable)?;
+        // A record of another generation belongs to an earlier life of the
+        // group on this replica, whose objects may be gone: it restores
+        // nothing, before it is checked against the log or names anything
+        // to download.
+        let generation = record_generation(self.snapshot_record.as_ref());
+        if persisted.generation != generation {
+            tracing::info!(
+                raft_group_id = raft_group_id.0,
+                record_generation = persisted.generation.get(),
+                log_generation = generation.get(),
+                path = %path.display(),
+                "the group's snapshot record is of another generation of its log; it restores \
+                 nothing"
+            );
+            return Ok(());
+        }
         let pointer =
             SnapshotPointer::decode(&persisted.pointer_bytes).map_err(pointer_unreadable)?;
         // Before anything is downloaded: a log the record contradicts
@@ -2480,6 +2545,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
         let membership = self.last_membership.clone();
         let current_snapshot = self.current_snapshot.clone();
         let metadata_path = self.snapshot_metadata_path.clone();
+        let generation = record_generation(self.snapshot_record.as_ref());
         let holds = Arc::clone(&self.holds);
         let meta = meta.clone();
         // The truncate of a conflicting tail this install replaced must be
@@ -2492,6 +2558,7 @@ impl RaftStateMachine<UrsulaRaftTypeConfig> for RaftGroupStateMachine {
             let _lease = lease;
             persist_snapshot_candidate(
                 metadata_path.as_deref(),
+                generation,
                 &meta,
                 &pointer_bytes,
                 &owned,
@@ -2656,6 +2723,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
         let pointer_len = pointer_bytes.len();
         let current_snapshot = self.current_snapshot.clone();
         let metadata_path = self.snapshot_metadata_path.clone();
+        let generation = record_generation(self.snapshot_record.as_ref());
         let meta = self.meta.clone();
         let holds = Arc::clone(&self.holds);
         let log_gauge = self.log_gauge.clone();
@@ -2681,6 +2749,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
             }
             persist_snapshot_candidate(
                 metadata_path.as_deref(),
+                generation,
                 &meta,
                 &pointer_bytes,
                 &pointer,
@@ -2846,12 +2915,13 @@ pub(crate) async fn snapshot_metadata_work<T: Send + 'static>(
 
 fn persist_snapshot_candidate(
     path: Option<&Path>,
+    generation: LogGeneration,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
     pointer_bytes: &[u8],
     pointer: &OwnedPointer,
     holds: &SnapshotHolds,
 ) -> Result<(), io::Error> {
-    persist_snapshot_metadata(path, meta, pointer_bytes).inspect_err(|_error| {
+    persist_snapshot_metadata(path, generation, meta, pointer_bytes).inspect_err(|_error| {
         // Rename may already have happened. Keep the candidate even if this
         // particular failure occurred earlier; the terminal latch bounds it.
         holds.retain_failed_candidate(pointer.location());
@@ -2860,6 +2930,7 @@ fn persist_snapshot_candidate(
 
 fn persist_snapshot_metadata(
     path: Option<&Path>,
+    generation: LogGeneration,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,
     pointer_bytes: &[u8],
 ) -> Result<(), io::Error> {
@@ -2870,6 +2941,7 @@ fn persist_snapshot_metadata(
         create_dir_all_durable(parent)?;
     }
     let encoded = encode_binary_envelope(&PersistedSnapshot {
+        generation,
         meta: meta.clone(),
         pointer_bytes: pointer_bytes.to_vec(),
     })
@@ -2907,7 +2979,8 @@ mod tests {
         // prevents opening the directory for fsync after the rename succeeds.
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
         let can_open = std::fs::File::open(root.path());
-        let result = persist_snapshot_metadata(Some(&path), &meta, b"pointer");
+        let result =
+            persist_snapshot_metadata(Some(&path), LogGeneration::FIRST, &meta, b"pointer");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let error = can_open.expect_err(
             "directory-permission fault must be exercised: run this test as an unprivileged user on a filesystem that enforces directory read permissions",
@@ -3026,15 +3099,14 @@ mod tests {
 
     use super::*;
 
-    /// Golden bytes: the snapshot record (`group-N.snapshot.json`) is part
-    /// of the epoch-5 format, so its encoding never changes within it.
+    /// A group persists its snapshot record as the persisted-envelopes
+    /// fixture's sample holds it ([`snapshot_record_sample`]).
     #[cfg(not(madsim))]
     #[test]
-    fn a_snapshot_record_matches_the_golden_file() {
+    fn a_persisted_snapshot_record_is_the_fixture_sample() {
         use openraft::vote::RaftLeaderId;
 
         type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
-        const GOLDEN: &str = "9293929207021392929206010c929193010203840190029003900490a0c403920509";
         let meta = SnapshotMetaOf::<UrsulaRaftTypeConfig> {
             last_log_id: Some(openraft::LogId {
                 leader_id: LeaderId::new(7, 2),
@@ -3048,19 +3120,76 @@ mod tests {
                 openraft::Membership::new_with_defaults(vec![[1, 2, 3].into_iter().collect()], [4]),
             ),
         };
-        let pointer_bytes = [0x92, 0x05, 0x09];
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("group-7.snapshot.json");
-        persist_snapshot_metadata(Some(&path), &meta, &pointer_bytes).unwrap();
-        let bytes = std::fs::read(&path).unwrap();
-        let hex = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(hex, GOLDEN);
-        let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&bytes).unwrap();
-        assert_eq!(persisted.meta, meta);
-        assert_eq!(persisted.pointer_bytes, pointer_bytes);
+        persist_snapshot_metadata(Some(&path), LogGeneration::new(3), &meta, &[
+            0x92, 0x05, 0x09,
+        ])
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), snapshot_record_sample());
+    }
+
+    /// A state machine of group 7 that restores from the record at `path`,
+    /// without a log store: its log is of the first generation.
+    #[cfg(not(madsim))]
+    fn restoring_from(path: &Path) -> RaftGroupStateMachine {
+        RaftGroupStateMachine::new_with_stores_and_snapshot_install(
+            ShardPlacement {
+                core_id: ursula_shard::CoreId(0),
+                shard_id: ursula_shard::ShardId(0),
+                raft_group_id: RaftGroupId(7),
+            },
+            None,
+            None,
+            default_snapshot_store(),
+            SnapshotBuildCoordinator::default(),
+            SnapshotInstallCoordinator::default(),
+            Some(path.to_owned()),
+        )
+    }
+
+    /// A snapshot record of another generation of the group's log, which an
+    /// earlier life of the group on this replica left, restores nothing. It
+    /// is dropped before its pointer is read: before it is checked against
+    /// the log and before anything is downloaded.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_snapshot_record_of_another_generation_restores_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("group-7.snapshot.json");
+        // A pointer nothing decodes: only a restore that reads it fails.
+        let unreadable = b"not a snapshot pointer";
+        persist_snapshot_metadata(
+            Some(&path),
+            LogGeneration::new(1),
+            &test_snapshot_meta(42),
+            unreadable,
+        )
+        .unwrap();
+        let mut restored = restoring_from(&path);
+        restored
+            .restore_persisted_snapshot()
+            .await
+            .expect("a record of another generation restores nothing");
+        assert_eq!(restored.last_applied_log_id, None);
+        assert!(restored.current_snapshot.lock().unwrap().is_none());
+
+        // The same record in the log's own generation is read, and refused.
+        persist_snapshot_metadata(
+            Some(&path),
+            LogGeneration::FIRST,
+            &test_snapshot_meta(42),
+            unreadable,
+        )
+        .unwrap();
+        let error = restoring_from(&path)
+            .restore_persisted_snapshot()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, SnapshotRestoreError::Pointer { .. }),
+            "{error}"
+        );
     }
 
     #[cfg(not(madsim))]

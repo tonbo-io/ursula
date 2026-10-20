@@ -12,6 +12,10 @@
 //! or purge is acknowledged and never returns to it. A replica whose log is
 //! empty but whose state is not knows it once held the group's log.
 //!
+//! Each group's entry also names the group's [`LogGeneration`] on this
+//! replica: the journal and the snapshot record keep only what belongs to
+//! it.
+//!
 //! It also holds a group's recovery plan ([`RecoveryRecord`]) while the
 //! replica waits for the history event that satisfies it (#581 section
 //! 4.5).
@@ -35,6 +39,34 @@ use super::state_file::StateFileError;
 use super::state_file::StateFileKind;
 use crate::types::UrsulaRaftTypeConfig;
 
+/// The generation of one raft group's log on this replica: 0 until the
+/// replica's first retirement of the group, one more after each.
+///
+/// A core journal interleaves the frames of its groups, so the frames of a
+/// retired log cannot be erased in place, and a deleted segment may come
+/// back. Every journal record, the group's metadata entry and its snapshot
+/// record therefore name the generation they belong to, and only what
+/// belongs to the generation the metadata names is read back: older frames
+/// are dead bytes the age rule frees, and an older snapshot record restores
+/// nothing. Until replica teardown lands, every group stays at
+/// [`LogGeneration::FIRST`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LogGeneration(u64);
+
+impl LogGeneration {
+    /// A group's generation before its first retirement on this replica.
+    pub const FIRST: Self = Self(0);
+
+    pub const fn new(generation: u64) -> Self {
+        Self(generation)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 /// The state of one raft group's log on this replica.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +81,13 @@ pub enum GroupLogState {
     /// history before this log is unknown. The replica stays out of
     /// elections until its recovery gate opens.
     Recovering,
+    /// The replica's log of the group was torn down: the metadata names the
+    /// generation after the retired one and holds no vote and no recovery
+    /// plan for it. It counts as initialized, so the replica never joins a
+    /// new group's first election or answers as empty. Only a retirement
+    /// records it, and only the replica's reopen leaves it. Nothing records
+    /// it before replica teardown lands.
+    Retired,
 }
 
 impl GroupLogState {
@@ -95,6 +134,8 @@ pub(crate) struct GroupMetadata {
     pub(crate) log: GroupLogState,
     /// The recovery plan the replica holds, until it is satisfied.
     pub(crate) recovery: Option<RecoveryRecord>,
+    /// The generation of the group's log: replay keeps only its records.
+    pub(crate) generation: LogGeneration,
 }
 
 /// The metadata of one core journal and of every raft group on the core.
@@ -172,27 +213,50 @@ impl CoreMetadata {
         changed
     }
 
-    /// Records the first entry or purge of an empty `group_id` as `first`;
-    /// whether anything changed. A group that is not empty keeps its state.
+    /// Records the first entry or purge of an empty `group_id` as `first`,
+    /// initialized or recovering; whether anything changed. A group that is
+    /// not empty keeps its state.
     pub(crate) fn initialize(&mut self, group_id: u32, first: GroupLogState) -> bool {
         let group = self.groups.entry(group_id).or_default();
-        if group.log.is_initialized() || !first.is_initialized() {
+        let first_entry = matches!(
+            first,
+            GroupLogState::Initialized | GroupLogState::Recovering
+        );
+        if group.log != GroupLogState::Empty || !first_entry {
             return false;
         }
         group.log = first;
         true
     }
 
-    /// Moves an initialized `group_id` to `state`, into or out of recovery;
-    /// whether anything changed. An empty group stays empty.
+    /// Moves `group_id` into or out of recovery, between
+    /// [`GroupLogState::Initialized`] and [`GroupLogState::Recovering`];
+    /// whether anything changed. An empty group stays empty and a retired
+    /// one stays retired.
     pub(crate) fn set_log_state(&mut self, group_id: u32, state: GroupLogState) -> bool {
         let Some(group) = self.groups.get_mut(&group_id) else {
             return false;
         };
-        if !group.log.is_initialized() || !state.is_initialized() || group.log == state {
+        let moves = matches!(
+            (group.log, state),
+            (GroupLogState::Initialized, GroupLogState::Recovering)
+                | (GroupLogState::Recovering, GroupLogState::Initialized)
+        );
+        if !moves {
             return false;
         }
         group.log = state;
+        true
+    }
+
+    /// Names `generation` as `group_id`'s generation, for a replay that
+    /// found no metadata file and kept the group's highest generation among
+    /// its frames; whether anything changed.
+    pub(crate) fn adopt_generation(&mut self, group_id: u32, generation: LogGeneration) -> bool {
+        if self.group(group_id).generation == generation {
+            return false;
+        }
+        self.groups.entry(group_id).or_default().generation = generation;
         true
     }
 
@@ -206,6 +270,86 @@ impl CoreMetadata {
             }
         }
         changed
+    }
+}
+
+/// Which generation of each group's log a replay of a core journal keeps:
+/// the one the core's metadata names, or, without a metadata file, the
+/// highest among the group's records, since nothing then says which life
+/// of the group is current.
+#[derive(Debug)]
+pub(crate) enum ReplayGenerations {
+    /// The metadata file names each group's generation; a group it does not
+    /// list is at [`LogGeneration::FIRST`].
+    Named(BTreeMap<u32, LogGeneration>),
+    /// No metadata file: the highest generation found so far per group.
+    Highest(BTreeMap<u32, LogGeneration>),
+}
+
+/// What replay does with one record, by its generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayRecord {
+    /// The record belongs to the generation replay keeps.
+    Keep,
+    /// The record belongs to another generation: a dead frame.
+    Skip,
+    /// The record is the first of a higher generation than the log replay
+    /// built so far, which it replaces: that log's frames are dead.
+    Replace,
+}
+
+impl ReplayGenerations {
+    /// The rule for a replay of a journal whose metadata is `metadata`,
+    /// which was `missing` from disk.
+    pub(crate) fn of(metadata: &CoreMetadata, missing: bool) -> Self {
+        if missing {
+            Self::Highest(BTreeMap::new())
+        } else {
+            Self::Named(
+                metadata
+                    .groups()
+                    .map(|(group_id, group)| (group_id, group.generation))
+                    .collect(),
+            )
+        }
+    }
+
+    /// What replay does with a record of `group_id` of `generation`.
+    pub(crate) fn admit(&mut self, group_id: u32, generation: LogGeneration) -> ReplayRecord {
+        match self {
+            Self::Named(named) => {
+                if named.get(&group_id).copied().unwrap_or_default() == generation {
+                    ReplayRecord::Keep
+                } else {
+                    ReplayRecord::Skip
+                }
+            }
+            Self::Highest(highest) => match highest.get(&group_id).copied() {
+                None => {
+                    highest.insert(group_id, generation);
+                    ReplayRecord::Keep
+                }
+                Some(kept) if kept.get() == generation.get() => ReplayRecord::Keep,
+                Some(kept) if kept.get() > generation.get() => ReplayRecord::Skip,
+                Some(_) => {
+                    highest.insert(group_id, generation);
+                    ReplayRecord::Replace
+                }
+            },
+        }
+    }
+
+    /// The generation replay kept of each group it found, when no metadata
+    /// named them: the metadata adopts them ([`CoreMetadata::adopt_generation`]).
+    pub(crate) fn adopted(&self) -> impl Iterator<Item = (u32, LogGeneration)> + '_ {
+        let highest = match self {
+            Self::Named(_) => None,
+            Self::Highest(highest) => Some(highest),
+        };
+        highest
+            .into_iter()
+            .flatten()
+            .map(|(group_id, generation)| (*group_id, *generation))
     }
 }
 
@@ -229,12 +373,97 @@ pub enum MarkRecoveringError {
     Write(JournalError),
 }
 
+/// A core metadata file of four groups, with every [`GroupLogState`] and
+/// every [`PlanCut`], and distinct values in the fields of one type, for the
+/// persisted-envelopes fixture. It decodes to the metadata it was encoded
+/// from and re-encodes to the same bytes.
+#[cfg(test)]
+pub(crate) fn sample_file() -> Vec<u8> {
+    use openraft::vote::RaftLeaderId;
+
+    type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
+
+    let plan = |leader, point, leader_term, cut| RecoveryRecord {
+        leader,
+        point,
+        leader_term,
+        cut,
+    };
+    let groups = [
+        (3, GroupMetadata {
+            vote: Some(openraft::Vote::new_committed(7, 2)),
+            log: GroupLogState::Initialized,
+            recovery: Some(plan(2, 19, 6, PlanCut::Pending {
+                keep: openraft::LogId::new(LeaderId::new(5, 1), 17),
+            })),
+            generation: LogGeneration(1),
+        }),
+        (4, GroupMetadata {
+            vote: Some(openraft::Vote::new(8, 3)),
+            log: GroupLogState::Recovering,
+            recovery: Some(plan(3, 23, 9, PlanCut::NoCut)),
+            generation: LogGeneration(4),
+        }),
+        (5, GroupMetadata {
+            vote: Some(openraft::Vote::new(10, 4)),
+            log: GroupLogState::Recovering,
+            recovery: Some(plan(4, 29, 11, PlanCut::Done)),
+            generation: LogGeneration(3),
+        }),
+        (6, GroupMetadata {
+            vote: None,
+            log: GroupLogState::Retired,
+            recovery: None,
+            generation: LogGeneration(2),
+        }),
+        (8, GroupMetadata {
+            vote: Some(openraft::Vote::new(12, 6)),
+            log: GroupLogState::Empty,
+            recovery: None,
+            generation: LogGeneration::FIRST,
+        }),
+    ];
+    // Every log state and every cut, behind matches with no wildcard.
+    for (_, group) in &groups {
+        match group.log {
+            GroupLogState::Empty
+            | GroupLogState::Initialized
+            | GroupLogState::Recovering
+            | GroupLogState::Retired => {}
+        }
+        if let Some(record) = group.recovery {
+            match record.cut {
+                PlanCut::NoCut | PlanCut::Pending { .. } | PlanCut::Done => {}
+            }
+        }
+    }
+    let metadata = CoreMetadata {
+        verified_epoch: 5,
+        groups: groups.into_iter().collect(),
+    };
+    let bytes = state_file::encode(StateFileKind::CoreMetadata, &metadata);
+    let decoded: CoreMetadata = state_file::decode(
+        StateFileKind::CoreMetadata,
+        Path::new(CORE_METADATA_FILE),
+        &bytes,
+    )
+    .expect("the sample decodes");
+    assert_eq!(decoded, metadata);
+    assert_eq!(
+        state_file::encode(StateFileKind::CoreMetadata, &decoded),
+        bytes
+    );
+    bytes
+}
+
 #[cfg(all(test, not(madsim)))]
 mod tests {
     use super::CoreMetadata;
     use super::GroupLogState;
     use super::GroupMetadata;
-    use super::RecoveryRecord;
+    use super::LogGeneration;
+    use super::ReplayGenerations;
+    use super::ReplayRecord;
     use super::core_metadata_path;
     use super::mark_core_recovering;
 
@@ -269,6 +498,7 @@ mod tests {
             vote: Some(vote),
             log: GroupLogState::Empty,
             recovery: None,
+            generation: LogGeneration::FIRST,
         });
         assert_eq!(loaded.group(7).log, GroupLogState::Initialized);
         assert_eq!(loaded.group(8).log, GroupLogState::Recovering);
@@ -298,6 +528,104 @@ mod tests {
         assert_eq!(metadata.group(2).log, GroupLogState::Recovering);
     }
 
+    /// A retired log leaves `Retired` only by the reopen: neither recovery
+    /// nor a first entry moves it, and nothing but a retirement enters it.
+    #[test]
+    fn a_retired_log_stays_retired() {
+        let mut metadata = CoreMetadata::default();
+        metadata.groups.insert(1, GroupMetadata {
+            vote: None,
+            log: GroupLogState::Retired,
+            recovery: None,
+            generation: LogGeneration::new(1),
+        });
+        assert!(metadata.group(1).log.is_initialized());
+        assert!(!metadata.initialize(1, GroupLogState::Recovering));
+        assert!(!metadata.set_log_state(1, GroupLogState::Recovering));
+        assert!(!metadata.set_log_state(1, GroupLogState::Initialized));
+        assert!(!metadata.mark_recovering());
+        assert_eq!(metadata.group(1).log, GroupLogState::Retired);
+
+        assert!(metadata.initialize(2, GroupLogState::Initialized));
+        assert!(!metadata.set_log_state(2, GroupLogState::Retired));
+        assert!(!metadata.initialize(3, GroupLogState::Retired));
+        assert_eq!(metadata.group(2).log, GroupLogState::Initialized);
+        assert_eq!(metadata.group(3).log, GroupLogState::Empty);
+    }
+
+    /// A replay without metadata names the generation it kept; adopting a
+    /// group's own generation changes nothing and adds no entry.
+    #[test]
+    fn a_replay_without_metadata_adopts_the_generation_it_kept() {
+        let mut metadata = CoreMetadata::default();
+        assert!(!metadata.adopt_generation(4, LogGeneration::FIRST));
+        assert_eq!(metadata, CoreMetadata::default());
+        assert!(metadata.adopt_generation(4, LogGeneration::new(3)));
+        assert!(!metadata.adopt_generation(4, LogGeneration::new(3)));
+        assert_eq!(metadata.group(4).generation, LogGeneration::new(3));
+        assert_eq!(metadata.group(4).log, GroupLogState::Empty);
+    }
+
+    /// With metadata, replay keeps the generation it names, and a group it
+    /// does not list is at the first: records of any other generation, a
+    /// resurrected segment of an older one included, are dead frames.
+    #[test]
+    fn replay_keeps_the_generation_the_metadata_names() {
+        let mut metadata = CoreMetadata::default();
+        metadata.groups.insert(1, GroupMetadata {
+            vote: None,
+            log: GroupLogState::Recovering,
+            recovery: None,
+            generation: LogGeneration::new(2),
+        });
+        let mut generations = ReplayGenerations::of(&metadata, false);
+        let admitted = [
+            (1, 0),
+            (1, 1),
+            (1, 2),
+            (1, 3),
+            (1, 2),
+            (1, 1),
+            (5, 0),
+            (5, 1),
+        ]
+        .map(|(group, generation)| generations.admit(group, LogGeneration::new(generation)));
+        assert_eq!(admitted, [
+            ReplayRecord::Skip,
+            ReplayRecord::Skip,
+            ReplayRecord::Keep,
+            ReplayRecord::Skip,
+            ReplayRecord::Keep,
+            ReplayRecord::Skip,
+            ReplayRecord::Keep,
+            ReplayRecord::Skip,
+        ]);
+        assert_eq!(generations.adopted().count(), 0);
+    }
+
+    /// Without metadata, replay keeps each group's highest generation, in
+    /// whatever order its records come: a higher one replaces the log built
+    /// so far, and a lower one after it is dead.
+    #[test]
+    fn replay_without_metadata_keeps_each_groups_highest_generation() {
+        let mut generations = ReplayGenerations::of(&CoreMetadata::default(), true);
+        let admitted = [(1, 0), (1, 0), (2, 3), (1, 2), (1, 0), (1, 2), (2, 1)]
+            .map(|(group, generation)| generations.admit(group, LogGeneration::new(generation)));
+        assert_eq!(admitted, [
+            ReplayRecord::Keep,
+            ReplayRecord::Keep,
+            ReplayRecord::Keep,
+            ReplayRecord::Replace,
+            ReplayRecord::Skip,
+            ReplayRecord::Keep,
+            ReplayRecord::Skip,
+        ]);
+        assert_eq!(generations.adopted().collect::<Vec<_>>(), [
+            (1, LogGeneration::new(2)),
+            (2, LogGeneration::new(3)),
+        ]);
+    }
+
     #[test]
     fn a_recovering_node_marks_every_initialized_group_of_a_core() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -323,8 +651,9 @@ mod tests {
         use super::CoreMetadata;
         use super::GroupLogState;
         use super::GroupMetadata;
-        use super::RecoveryRecord;
+        use super::LogGeneration;
         use crate::log_store::PlanCut;
+        use crate::log_store::RecoveryRecord;
         use crate::log_store::state_file;
         use crate::log_store::state_file::StateFileKind;
 
@@ -345,12 +674,14 @@ mod tests {
                 GroupLogState::Empty,
                 GroupLogState::Initialized,
                 GroupLogState::Recovering,
+                GroupLogState::Retired,
             ];
             for state in states {
                 match state {
                     GroupLogState::Empty
                     | GroupLogState::Initialized
-                    | GroupLogState::Recovering => {}
+                    | GroupLogState::Recovering
+                    | GroupLogState::Retired => {}
                 }
             }
             let log = proptest::sample::select(states.to_vec());
@@ -377,10 +708,13 @@ mod tests {
                         cut,
                     },
                 ));
-            (vote, log, recovery).prop_map(|(vote, log, recovery)| GroupMetadata {
-                vote,
-                log,
-                recovery,
+            (vote, log, recovery, any::<u64>()).prop_map(|(vote, log, recovery, generation)| {
+                GroupMetadata {
+                    vote,
+                    log,
+                    recovery,
+                    generation: LogGeneration::new(generation),
+                }
             })
         }
 
@@ -407,36 +741,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    /// Golden bytes: a recovery record in a core metadata file (#581 section
-    /// 4.5) is part of the epoch-5 format, so its encoding never changes.
-    #[test]
-    fn a_recovery_record_matches_the_golden_metadata_file() {
-        const GOLDEN: &str = "555253574d4554410500000023000000920081039392920702c3a5656d7074799402130681a770656e64696e6791929205011101be21e4";
-        let dir = tempfile::tempdir().expect("temp dir");
-        let path = core_metadata_path(dir.path());
-        let mut metadata = CoreMetadata::default();
-        metadata.set_vote(3, openraft::Vote::new_committed(7, 2));
-        let record = RecoveryRecord {
-            leader: 2,
-            point: 19,
-            leader_term: 6,
-            cut: super::PlanCut::Pending {
-                keep: openraft::LogId::new(openraft::vote::RaftLeaderId::new(5, 1), 17),
-            },
-        };
-        metadata.set_recovery(3, Some(record));
-        metadata.store(&path).expect("store");
-        let bytes = std::fs::read(&path).expect("read");
-        let hex = bytes
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>();
-        assert_eq!(hex, GOLDEN);
-        assert_eq!(
-            CoreMetadata::load(&path).expect("load").group(3).recovery,
-            Some(record)
-        );
     }
 }

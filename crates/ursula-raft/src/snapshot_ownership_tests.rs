@@ -560,6 +560,7 @@ async fn an_install_copy_survives_the_leaders_passes_and_a_restart() {
     let foreign_path = root.path().join("foreign.snapshot.json");
     persist_snapshot_metadata(
         Some(&foreign_path),
+        crate::log_store::LogGeneration::FIRST,
         &meta(1),
         &SnapshotPointer {
             snapshot_id: group_snapshot_id(GROUP, Some(log_id(1))),
@@ -879,6 +880,7 @@ async fn a_foreign_restore_is_refused_and_a_name_collision_falls_back_inline() {
     let path = root.path().join("group-7.snapshot.json");
     persist_snapshot_metadata(
         Some(&path),
+        crate::log_store::LogGeneration::FIRST,
         &meta(1),
         &SnapshotPointer {
             snapshot_id: group_snapshot_id(GROUP, Some(log_id(1))),

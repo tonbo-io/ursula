@@ -391,8 +391,8 @@ mod tests {
         let err = classify_data_dir(&old).unwrap_err();
         assert!(err.to_string().contains("without a format marker"), "{err}");
 
-        // E2: another epoch, such as epoch 4 (Ursula 0.8).
-        for epoch in [4, FORMAT_EPOCH + 1] {
+        // E2: another epoch, such as epoch 5 (Ursula 0.9).
+        for epoch in [5, FORMAT_EPOCH + 1] {
             let other = root.path().join(format!("other-{epoch}"));
             fs::create_dir_all(&other).unwrap();
             write_marker_file(&other, epoch);
@@ -441,7 +441,7 @@ mod tests {
                 OBJECT_MARKER,
                 serde_json::to_vec(&FormatEpochMarker {
                     format_epoch: FORMAT_EPOCH - 1,
-                    written_by: "ursula 0.8.2".to_owned(),
+                    written_by: "ursula 0.9.0".to_owned(),
                 })
                 .unwrap(),
             )

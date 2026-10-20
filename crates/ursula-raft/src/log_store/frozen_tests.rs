@@ -20,6 +20,7 @@ use ursula_shard::BucketStreamId;
 use ursula_stream::StreamCommand;
 
 use super::CoreJournalRecord;
+use super::LogGeneration;
 use super::RaftGroupLogRecord;
 use super::disk::JournalDisk;
 use super::disk::JournalFile;
@@ -111,7 +112,9 @@ fn published_archive_survives_power_loss_and_identical_retry() {
         simulated(seed, || {
             let dir = SimDisk::provision_dir("archive-published").unwrap();
             let expected = entries(11);
-            let reference = frozen::publish(&dir, archive_id(), expected.clone()).unwrap();
+            let reference =
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, expected.clone())
+                    .unwrap();
             assert!(reference.bytes > 32_768);
             let before = SimDisk::read(&frozen::path(&dir, reference.id)).unwrap();
             SimDisk::power_loss(&dir).unwrap();
@@ -120,7 +123,8 @@ fn published_archive_survives_power_loss_and_identical_retry() {
                 encode_wire(&expected)
             );
             assert_eq!(
-                frozen::publish(&dir, archive_id(), expected.clone()).unwrap(),
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, expected.clone())
+                    .unwrap(),
                 reference
             );
             SimDisk::power_loss_losing_unsynced(&dir).unwrap();
@@ -145,7 +149,8 @@ fn publication_faults_never_return_a_reference_and_retry_survives_power_loss() {
             let dir = SimDisk::provision_dir("archive-publication-fault").unwrap();
             // Determine the content-addressed destination through publication,
             // then remove this unreferenced probe before arming a first-write fault.
-            let probe = frozen::publish(&dir, archive_id(), entries(22)).unwrap();
+            let probe =
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(22)).unwrap();
             let destination = frozen::path(&dir, probe.id);
             SimDisk::remove_file(&destination).unwrap();
             SimDisk::sync_dir(&dir).unwrap();
@@ -158,7 +163,7 @@ fn publication_faults_never_return_a_reference_and_retry_survives_power_loss() {
             };
             SimDisk::inject_fault(&target, fault).unwrap();
             assert_injected(
-                frozen::publish(&dir, archive_id(), entries(22)).unwrap_err(),
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(22)).unwrap_err(),
                 operation,
                 &target,
                 fault,
@@ -170,7 +175,8 @@ fn publication_faults_never_return_a_reference_and_retry_survives_power_loss() {
                 SimDisk::process_crash(&dir).unwrap();
                 assert_eq!(SimDisk::exists(&destination), boundary == 3);
             }
-            let reference = frozen::publish(&dir, archive_id(), entries(22)).unwrap();
+            let reference =
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(22)).unwrap();
             SimDisk::power_loss_losing_unsynced(&dir).unwrap();
             assert_eq!(
                 encode_wire(&frozen::read(&dir, 7, &reference).unwrap()),
@@ -184,10 +190,11 @@ fn publication_faults_never_return_a_reference_and_retry_survives_power_loss() {
 fn reused_source_position_publishes_distinct_content_without_overwriting_old_payload() {
     simulated(11, || {
         let dir = SimDisk::provision_dir("archive-source-position-reuse").unwrap();
-        let first = frozen::publish(&dir, archive_id(), entries(33)).unwrap();
+        let first = frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(33)).unwrap();
         let first_path = frozen::path(&dir, first.id);
         let before = SimDisk::read(&first_path).unwrap();
-        let second = frozen::publish(&dir, archive_id(), entries(44)).unwrap();
+        let second =
+            frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(44)).unwrap();
         assert_ne!(first.id, second.id);
         assert_eq!(SimDisk::read(&first_path).unwrap(), before);
         SimDisk::power_loss_losing_unsynced(&dir).unwrap();
@@ -207,7 +214,8 @@ fn missing_truncated_corrupt_and_wrong_group_archives_fail_closed_without_repair
     simulated(17, || {
         for defect in 0..4 {
             let dir = SimDisk::provision_dir("archive-corruption").unwrap();
-            let reference = frozen::publish(&dir, archive_id(), entries(55)).unwrap();
+            let reference =
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(55)).unwrap();
             let path = frozen::path(&dir, reference.id);
             match defect {
                 0 => {
@@ -258,7 +266,8 @@ fn missing_truncated_corrupt_and_wrong_group_archives_fail_closed_without_repair
 fn checksum_matching_incomplete_archive_is_still_rejected() {
     simulated(23, || {
         let dir = SimDisk::provision_dir("archive-incomplete-frame").unwrap();
-        let mut reference = frozen::publish(&dir, archive_id(), entries(66)).unwrap();
+        let mut reference =
+            frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(66)).unwrap();
         let path = frozen::path(&dir, reference.id);
         SimDisk::truncate(&path, reference.bytes.saturating_sub(1)).unwrap();
         let before = SimDisk::read(&path).unwrap();
@@ -284,6 +293,7 @@ fn old_decoder_refuses_frozen_reference_without_trimming_either_replay_mode() {
     #[derive(Serialize, Deserialize)]
     struct LegacyCoreJournalRecord {
         group_id: u32,
+        generation: u64,
         record: LegacyRaftGroupLogRecord,
     }
     #[derive(Serialize, Deserialize)]
@@ -296,18 +306,21 @@ fn old_decoder_refuses_frozen_reference_without_trimming_either_replay_mode() {
     simulated(29, || {
         let dir = SimDisk::provision_dir("archive-old-decoder").unwrap();
         let values = entries(77);
-        let archive = frozen::publish(&dir, archive_id(), values.clone()).unwrap();
+        let archive =
+            frozen::publish(&dir, archive_id(), LogGeneration::FIRST, values.clone()).unwrap();
         let path = dir.join("journal-00000000000000000001.seg");
         let mut writer = JournalWriter::open(&path, 1).unwrap();
         writer
             .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                 group_id: 7,
+                generation: LogGeneration::FIRST,
                 record: RaftGroupLogRecord::Append(values.clone()),
             })
             .unwrap();
         writer
             .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                 group_id: 7,
+                generation: LogGeneration::FIRST,
                 record: RaftGroupLogRecord::FrozenAppend(Box::new(FrozenAppend {
                     archive,
                     log_ids: values.iter().map(|entry| entry.log_id).collect(),
@@ -323,7 +336,7 @@ fn old_decoder_refuses_frozen_reference_without_trimming_either_replay_mode() {
                 &path,
                 mode,
                 |_loc, record| {
-                    assert_eq!(record.group_id, 7);
+                    assert_eq!((record.group_id, record.generation), (7, 0));
                     match record.record {
                         LegacyRaftGroupLogRecord::Append(entries) => assert_eq!(entries.len(), 3),
                         LegacyRaftGroupLogRecord::SaveCommitted(id)
@@ -354,7 +367,8 @@ fn selected_reference_keeps_exact_live_ids_and_rejects_invalid_selection() {
     simulated(31, || {
         let dir = SimDisk::provision_dir("archive-selected-ids").unwrap();
         let values = entries(88);
-        let archive = frozen::publish(&dir, archive_id(), values.clone()).unwrap();
+        let archive =
+            frozen::publish(&dir, archive_id(), LogGeneration::FIRST, values.clone()).unwrap();
         let ids = values.iter().map(|entry| entry.log_id).collect::<Vec<_>>();
         let reference = FrozenAppend {
             archive: archive.clone(),
@@ -410,19 +424,22 @@ fn archive_and_journal_reference_have_separate_durability_boundaries() {
             source
                 .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                     group_id: 7,
+                    generation: LogGeneration::FIRST,
                     record: RaftGroupLogRecord::Append(values.clone()),
                 })
                 .unwrap();
             source.sync().unwrap();
             drop(source);
             let original_bytes = SimDisk::read(&original).unwrap();
-            let archive = frozen::publish(&dir, archive_id(), values.clone()).unwrap();
+            let archive =
+                frozen::publish(&dir, archive_id(), LogGeneration::FIRST, values.clone()).unwrap();
             let destination = dir.join("journal-00000000000000000002.seg");
             let mut target = JournalWriter::open(&destination, 2).unwrap();
             target.sync().unwrap();
             target
                 .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
                     group_id: 7,
+                    generation: LogGeneration::FIRST,
                     record: RaftGroupLogRecord::FrozenAppend(Box::new(FrozenAppend {
                         archive: archive.clone(),
                         log_ids: values.iter().map(|entry| entry.log_id).collect(),
@@ -486,10 +503,12 @@ fn garbage_collection_preserves_duplicate_references_and_syncs_their_deletion_fi
     simulated(41, || {
         let dir = SimDisk::provision_dir("archive-reference-gc").unwrap();
         let values = entries(111);
-        let archive = frozen::publish(&dir, archive_id(), values.clone()).unwrap();
+        let archive =
+            frozen::publish(&dir, archive_id(), LogGeneration::FIRST, values.clone()).unwrap();
         let archive_path = frozen::path(&dir, archive.id);
         let record = CoreJournalRecord {
             group_id: 7,
+            generation: LogGeneration::FIRST,
             record: RaftGroupLogRecord::FrozenAppend(Box::new(FrozenAppend {
                 archive: archive.clone(),
                 log_ids: values.iter().map(|entry| entry.log_id).collect(),

@@ -40,6 +40,7 @@ use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::LogGeneration;
 use super::core_meta::PlanCut;
 use super::core_meta::RecoveryRecord;
 use super::disk::Disk;
@@ -91,6 +92,8 @@ pub struct RaftGroupFileLogStore {
     core_writer: Arc<CoreFileLogWriter>,
     /// The recovery plan the replica holds, as the metadata file records it.
     recovery: Mutex<Option<RecoveryRecord>>,
+    /// The generation of the group's log, fixed while a store holds it.
+    generation: LogGeneration,
 }
 
 /// At most one submitted batch per group. Keeping its entries readable lets
@@ -120,6 +123,10 @@ enum StoreLog {
     Empty(EmptyHistory),
     Initialized,
     Recovering,
+    /// A retired log ([`GroupLogState::Retired`]). Only its reopen leaves
+    /// it, which no store performs: nothing retires a log before replica
+    /// teardown lands, and then a retired log opens only through the reopen.
+    Retired,
 }
 
 impl StoreLog {
@@ -128,6 +135,7 @@ impl StoreLog {
             GroupLogState::Empty => Self::Empty(EmptyHistory::New),
             GroupLogState::Initialized => Self::Initialized,
             GroupLogState::Recovering => Self::Recovering,
+            GroupLogState::Retired => Self::Retired,
         }
     }
 
@@ -136,6 +144,7 @@ impl StoreLog {
             Self::Empty(_) => GroupLogState::Empty,
             Self::Initialized => GroupLogState::Initialized,
             Self::Recovering => GroupLogState::Recovering,
+            Self::Retired => GroupLogState::Retired,
         }
     }
 
@@ -143,7 +152,9 @@ impl StoreLog {
     fn first_entry(self) -> GroupLogState {
         match self {
             Self::Empty(EmptyHistory::New) | Self::Initialized => GroupLogState::Initialized,
-            Self::Empty(EmptyHistory::Unknown) | Self::Recovering => GroupLogState::Recovering,
+            Self::Empty(EmptyHistory::Unknown) | Self::Recovering | Self::Retired => {
+                GroupLogState::Recovering
+            }
         }
     }
 }
@@ -206,6 +217,9 @@ pub struct SnapshotRecord {
     /// down must not hold the journal, and its lock, open (#709).
     writer: std::sync::Weak<CoreFileLogWriter>,
     log: Arc<Mutex<GroupLog>>,
+    /// The generation of the group's log: a record of another generation
+    /// restores nothing.
+    generation: LogGeneration,
 }
 
 impl std::fmt::Debug for SnapshotRecord {
@@ -220,6 +234,12 @@ impl SnapshotRecord {
     /// The file that holds the group's current snapshot record.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// The generation of the group's log, which a record this replica
+    /// writes names and a record it restores must name.
+    pub(crate) fn generation(&self) -> LogGeneration {
+        self.generation
     }
 
     /// Returns once every record the journal took before this call is
@@ -288,6 +308,7 @@ impl Drop for RaftGroupFileLogStore {
                 vote: *lock(&self.vote),
                 log: self.store_log().durable(),
                 recovery: *lock(&self.recovery),
+                generation: self.generation,
             });
     }
 }
@@ -328,6 +349,7 @@ impl RaftGroupFileLogStore {
             pending: Arc::new(Mutex::new(PendingAppend::Idle)),
             core_writer,
             recovery: Mutex::new(opened.recovery),
+            generation: opened.generation,
         }))
     }
 
@@ -454,7 +476,10 @@ impl RaftGroupFileLogStore {
     pub(crate) async fn record_recovered(&self) -> Result<(), CoreJournalError> {
         let _order = self.write_order.lock().await;
         match self.store_log() {
-            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) => Ok(()),
+            // A gate does not reopen a retired log.
+            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) | StoreLog::Retired => {
+                Ok(())
+            }
             StoreLog::Empty(EmptyHistory::Unknown) => {
                 self.set_store_log(StoreLog::Empty(EmptyHistory::New));
                 Ok(())
@@ -501,7 +526,7 @@ impl RaftGroupFileLogStore {
             StoreLog::Empty(EmptyHistory::Unknown) => {
                 self.set_store_log(StoreLog::Empty(EmptyHistory::New));
             }
-            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) => {}
+            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) | StoreLog::Retired => {}
         }
         Ok(())
     }
@@ -578,6 +603,7 @@ impl RaftGroupFileLogStore {
             journal: self.core_writer.dir().to_path_buf(),
             writer: Arc::downgrade(&self.core_writer),
             log: self.log.clone(),
+            generation: self.generation,
         }
     }
 
@@ -712,6 +738,7 @@ impl RaftGroupFileLogStore {
             .write(CoreWriteOp::Record {
                 record: CoreJournalRecord {
                     group_id: self.placement.raft_group_id.0,
+                    generation: self.generation,
                     record,
                 },
                 first,
@@ -1073,6 +1100,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
             CoreWriteOp::Record {
                 record: CoreJournalRecord {
                     group_id: self.placement.raft_group_id.0,
+                    generation: self.generation,
                     record,
                 },
                 first,
