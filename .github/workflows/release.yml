@@ -102,6 +102,25 @@ jobs:
             --jq '[.[] | select(.headSha == "'"$SOURCE_REVISION"'" and .conclusion == "success")] | length')"
           test "$successful_dst" -ge 1
 
+          # The memory soak and the SQLite VFS's 600 s outage (its M1 exit
+          # criterion) run daily on the default branch and on dispatch, not
+          # on pull requests. Dispatch Memory soak on the release HEAD and
+          # wait for both jobs to pass at their defaults. A push run that
+          # only ran the outage does not count.
+          soak_and_outage="$(gh run list \
+            --repo "$REPOSITORY" \
+            --workflow "Memory soak" \
+            --commit "$SOURCE_REVISION" \
+            --status success \
+            --limit 20 \
+            --json databaseId,headSha \
+            --jq '.[] | select(.headSha == "'"$SOURCE_REVISION"'") | .databaseId' |
+            while read -r run_id; do
+              gh api "repos/$REPOSITORY/actions/runs/$run_id/jobs" \
+                --jq '[.jobs[] | select(.conclusion == "success") | .name] | any(.[]; . == "Soak (128 owners)") and any(.[]; . == "sqlite-vfs outage (600 s per mode, model server)")'
+            done | grep -c '^true$' || true)"
+          test "$soak_and_outage" -ge 1
+
           tag="v${RELEASE_VERSION}"
           if tag_ref="$(gh api "repos/$REPOSITORY/git/ref/tags/$tag" 2>/dev/null)"; then
             tag_sha="$(jq -r .object.sha <<<"$tag_ref")"
