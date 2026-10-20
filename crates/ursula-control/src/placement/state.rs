@@ -129,8 +129,9 @@ impl Cluster {
     }
 }
 
-/// Every group's placement, keyed by group id.
+/// Every group's placement, keyed by group id, encoded as the plain map.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Placements(pub(crate) BTreeMap<RaftGroupId, GroupPlacement>);
 
 impl Placements {

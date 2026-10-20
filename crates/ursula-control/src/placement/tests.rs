@@ -908,6 +908,23 @@ fn every_root_round_trips_through_messagepack_and_json() {
 }
 
 #[test]
+fn placements_encode_as_the_plain_map() {
+    let ControlPlaneState::Bootstrapped(cluster) = sample_state() else {
+        panic!("the sample state is bootstrapped");
+    };
+    let placements = cluster.groups();
+    let map = &placements.0;
+    assert_eq!(
+        ursula_stream::msgpack::encode(placements).unwrap(),
+        ursula_stream::msgpack::encode(map).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_string(placements).unwrap(),
+        serde_json::to_string(map).unwrap()
+    );
+}
+
+#[test]
 fn a_set_of_voters_is_never_empty_in_the_encoding() {
     let empty: BTreeSet<u64> = BTreeSet::new();
     let bytes = ursula_stream::msgpack::encode(&empty).unwrap();
