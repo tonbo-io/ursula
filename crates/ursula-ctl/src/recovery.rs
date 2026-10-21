@@ -1,5 +1,11 @@
 //! Recovery plans for a stalled group after an accepted loss (#581 section
-//! 4.5), over `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`.
+//! 4.5), over `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss`,
+//! where the target is the meta group or a data group ([`RecoverTarget`]).
+//!
+//! Every plan carries the floor of its plane ([`PlanFloor`]). The meta
+//! group's is `meta`. A data group's is read from a confirmed meta view
+//! ([`group_floor`]), so meta is recovered first: without a confirmed view
+//! the tool refuses to plan a data group and names `--target meta`.
 //!
 //! The tool reads every reachable replica of the group, computes the plan
 //! ([`plan_group`]), and sends it to the plan's leader first with the
@@ -18,7 +24,11 @@ use std::time::Duration;
 
 use reqwest::Method;
 use tokio::time::Instant;
+use ursula_control::ClusterView;
+use ursula_control::GroupPlacement;
+use ursula_control::PlacementStatus;
 use ursula_proto::admin::EntryId;
+use ursula_proto::admin::PlanFloor;
 use ursula_proto::admin::PlanStep;
 use ursula_proto::admin::RaftGroupMetrics;
 use ursula_proto::admin::RaftGroupRecovery;
@@ -31,6 +41,119 @@ use ursula_proto::admin::ReplicaLogView;
 
 use crate::metrics::MetricsClient;
 use crate::provider::NodeInfo;
+
+/// The group `recover-group` plans: the meta group, or a data group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoverTarget {
+    Meta,
+    Group(u32),
+}
+
+/// A `--target` that is neither `meta` nor a raft group id.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid recovery target `{raw}`: `meta` or a raft group id")]
+pub struct InvalidRecoverTarget {
+    pub raw: String,
+}
+
+impl std::str::FromStr for RecoverTarget {
+    type Err = InvalidRecoverTarget;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        if raw == "meta" {
+            return Ok(Self::Meta);
+        }
+        raw.parse::<u32>()
+            .map(Self::Group)
+            .map_err(|_invalid| InvalidRecoverTarget {
+                raw: raw.to_owned(),
+            })
+    }
+}
+
+impl std::fmt::Display for RecoverTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Meta => f.write_str("meta"),
+            Self::Group(group) => write!(f, "group {group}"),
+        }
+    }
+}
+
+impl RecoverTarget {
+    /// The `{target}` of the admin routes.
+    fn path_segment(self) -> String {
+        match self {
+            Self::Meta => "meta".to_owned(),
+            Self::Group(group) => group.to_string(),
+        }
+    }
+
+    /// This target's replica in one node's metrics: `meta`, or the group
+    /// in `groups`, where the meta group never is.
+    fn replica(self, view: &crate::metrics::NodeMetricsView) -> Option<&RaftGroupMetrics> {
+        match self {
+            Self::Meta => view.meta.as_ref(),
+            Self::Group(group) => view.group(u64::from(group)),
+        }
+    }
+}
+
+/// Why the tool does not plan a data group: its floor comes from a
+/// confirmed meta view ([`group_floor`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FloorError {
+    #[error(
+        "no node answered a confirmed placement view, so group {group} has no plan floor: \
+         recover the meta group first with `recover-group --target meta`"
+    )]
+    NoConfirmedView { group: u32 },
+    #[error(
+        "the confirmed placement view shows no bootstrapped cluster, so group {group} has no \
+         plan floor: recover the meta group first with `recover-group --target meta`"
+    )]
+    NotBootstrapped { group: u32 },
+    #[error("group {group} is not in the confirmed placement view")]
+    UnknownGroup { group: u32 },
+    #[error(
+        "group {group} is live: its plan must keep the membership its last converge certified, \
+         and this release sends no certified floor"
+    )]
+    Live { group: u32 },
+}
+
+/// The floor of a plan of data group `group`, from the confirmed meta view
+/// `confirmed` (`None` when no node answered one): `seeded` while the view
+/// shows the group seeded. A live group, a view that is not bootstrapped
+/// and no view at all are refused.
+pub fn group_floor(group: u32, confirmed: Option<&ClusterView>) -> Result<PlanFloor, FloorError> {
+    let cluster = match confirmed {
+        None => return Err(FloorError::NoConfirmedView { group }),
+        Some(ClusterView::Bootstrapped(cluster)) => cluster,
+        Some(
+            ClusterView::MetaGenesis { .. }
+            | ClusterView::MetaCatchingUp
+            | ClusterView::Registering { .. }
+            | ClusterView::FormationCut,
+        ) => return Err(FloorError::NotBootstrapped { group }),
+    };
+    match cluster.group(ursula_shard::RaftGroupId(group)) {
+        None => Err(FloorError::UnknownGroup { group }),
+        Some(GroupPlacement::Seeded { .. }) => Ok(PlanFloor::Seeded),
+        Some(GroupPlacement::Live { .. }) => Err(FloorError::Live { group }),
+    }
+}
+
+/// The plan floor of `target` ([`group_floor`] for a data group).
+pub fn plan_floor(
+    target: RecoverTarget,
+    confirmed: Option<&ClusterView>,
+) -> Result<PlanFloor, FloorError> {
+    match target {
+        RecoverTarget::Meta => Ok(PlanFloor::Meta),
+        RecoverTarget::Group(group) => group_floor(group, confirmed),
+    }
+}
 
 /// One replica of the group as the tool read it from its metrics.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -687,13 +810,14 @@ pub struct PlanSent {
     pub refused: Vec<SendError>,
 }
 
-/// Sends `plan` to its leader first, with the highest vote term the tool
-/// read, then to every other member with the leader's plan term
+/// Sends `plan` with `floor` to its leader first, with the highest vote
+/// term the tool read, then to every other member with the leader's plan term
 /// ([`send_follows`]). A refusal of the leader fails the round, and nothing
 /// changed.
 pub async fn send_plan<T: PlanTransport>(
     transport: &mut T,
     plan: GroupPlan,
+    floor: PlanFloor,
     members: &[PlanMember],
 ) -> Result<PlanSent, SendError> {
     let leader = members
@@ -711,10 +835,11 @@ pub async fn send_plan<T: PlanTransport>(
             step: PlanStep::Lead {
                 highest_term: plan.highest_term,
             },
+            floor,
             expected: leader.log,
         })
         .await?;
-    Ok(send_follows(transport, plan, report.leader_term, members).await)
+    Ok(send_follows(transport, plan, floor, report.leader_term, members).await)
 }
 
 /// Sends `plan` to every member but its leader with the plan term
@@ -726,6 +851,7 @@ pub async fn send_plan<T: PlanTransport>(
 pub async fn send_follows<T: PlanTransport>(
     transport: &mut T,
     plan: GroupPlan,
+    floor: PlanFloor,
     leader_term: u64,
     members: &[PlanMember],
 ) -> PlanSent {
@@ -741,6 +867,7 @@ pub async fn send_follows<T: PlanTransport>(
             point: plan.point,
             cut: plan.cut,
             step: PlanStep::Follow { leader_term },
+            floor,
             expected: member.log,
         };
         match transport.send(member.node_id, &request).await {
@@ -810,6 +937,8 @@ pub enum RecoverOutcome {
 pub enum RecoverError {
     #[error(transparent)]
     Plan(#[from] PlanError),
+    #[error(transparent)]
+    Floor(#[from] FloorError),
     /// A replica refused for a reason no plan fixes.
     #[error("no recovery plan can fix this: {source}")]
     Unfixable {
@@ -1096,18 +1225,18 @@ pub fn plan_sent(
     }
 }
 
-/// Reads every reachable replica of `raft_group_id`.
+/// Reads every reachable replica of `target`.
 async fn observe(
     client: &MetricsClient,
     nodes: &[NodeInfo],
-    raft_group_id: u64,
+    target: RecoverTarget,
 ) -> Vec<PlanMember> {
     let mut members = Vec::new();
     for node in nodes {
         match client.fetch_node(node).await {
             Ok(view) => {
-                if let Some(group) = view.group(raft_group_id) {
-                    members.push(PlanMember::from_metrics(group));
+                if let Some(replica) = target.replica(&view) {
+                    members.push(PlanMember::from_metrics(replica));
                 }
             }
             Err(error) => {
@@ -1118,11 +1247,46 @@ async fn observe(
     members
 }
 
+/// The confirmed meta view of the first manifest node that answers one
+/// (`GET /__ursula/placement?confirmed=true` on its admin plane), `None`
+/// when none does.
+async fn confirmed_view(client: &MetricsClient, nodes: &[NodeInfo]) -> Option<ClusterView> {
+    for node in nodes {
+        let url = match node.admin_url.join("/__ursula/placement?confirmed=true") {
+            Ok(url) => url,
+            Err(error) => {
+                tracing::warn!(node_id = node.id, %error, "recovery: no placement url");
+                continue;
+            }
+        };
+        let response = match client.http_client().get(url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                tracing::warn!(node_id = node.id, %error, "recovery: node did not answer a confirmed view");
+                continue;
+            }
+        };
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(node_id = node.id, %status, body, "recovery: node refused a confirmed view");
+            continue;
+        }
+        match response.json::<PlacementStatus>().await {
+            Ok(placement) => return Some(placement.view),
+            Err(error) => {
+                tracing::warn!(node_id = node.id, %error, "recovery: undecodable placement status");
+            }
+        }
+    }
+    None
+}
+
 /// [`PlanTransport`] over the nodes' admin planes.
 struct HttpTransport<'a> {
     client: &'a MetricsClient,
     nodes: &'a [NodeInfo],
-    raft_group_id: u64,
+    target: RecoverTarget,
     timeout: Duration,
 }
 
@@ -1141,7 +1305,7 @@ impl HttpTransport<'_> {
             .admin_url
             .join(&format!(
                 "/__ursula/raft/{}/recovery/accept-unsynced-loss",
-                self.raft_group_id
+                self.target.path_segment()
             ))
             .map_err(|source| SendError::Url { node_id, source })?;
         let response = self
@@ -1188,26 +1352,33 @@ impl PlanTransport for HttpTransport<'_> {
     }
 }
 
-/// Plans `raft_group_id` and waits until the plan is satisfied, as
-/// [`next_step`] decides on every observation, up to
-/// [`RecoverOptions::max_plans`] plans.
+/// Plans `target` and waits until the plan is satisfied, as [`next_step`]
+/// decides on every observation, up to [`RecoverOptions::max_plans`]
+/// plans. A data group's floor is read once, first ([`plan_floor`]), so a
+/// data group without a confirmed meta view is refused before anything is
+/// read or sent.
 pub async fn recover_group(
     client: &MetricsClient,
     nodes: &[NodeInfo],
-    raft_group_id: u64,
+    target: RecoverTarget,
     options: &RecoverOptions,
 ) -> Result<RecoverOutcome, RecoverError> {
+    let confirmed = match target {
+        RecoverTarget::Meta => None,
+        RecoverTarget::Group(_) => confirmed_view(client, nodes).await,
+    };
+    let floor = plan_floor(target, confirmed.as_ref())?;
     let mut transport = HttpTransport {
         client,
         nodes,
-        raft_group_id,
+        target,
         timeout: options.accept_timeout,
     };
     let mut state = LoopState::default();
     let settle = |now: Instant| now.checked_add(options.settle_timeout).unwrap_or(now);
     let mut deadline = settle(Instant::now());
     loop {
-        let members = observe(client, nodes, raft_group_id).await;
+        let members = observe(client, nodes, target).await;
         match next_step(&mut state, &members, options.max_plans)? {
             Step::Done(outcome) => return Ok(outcome),
             Step::Wait => {}
@@ -1217,7 +1388,7 @@ pub async fn recover_group(
             Step::Plan(plan) => {
                 state.plans_sent = state.plans_sent.saturating_add(1);
                 tracing::info!(
-                    raft_group_id,
+                    %target,
                     leader = plan.leader,
                     point = plan.point,
                     cut = plan.cut,
@@ -1226,21 +1397,21 @@ pub async fn recover_group(
                     "recovery: sending the plan, the leader first"
                 );
                 deadline = settle(Instant::now());
-                let sent = send_plan(&mut transport, plan, &members).await;
+                let sent = send_plan(&mut transport, plan, floor, &members).await;
                 if let Ok(sent) = &sent {
                     for error in &sent.refused {
-                        tracing::warn!(raft_group_id, %error, "recovery: a member refused the plan");
+                        tracing::warn!(%target, %error, "recovery: a member refused the plan");
                     }
                 }
                 plan_sent(&mut state, plan, sent, &electorate(&plan, &members))?;
             }
             Step::Resume { plan, leader_term } => {
                 tracing::info!(
-                    raft_group_id,
+                    %target,
                     leader_term,
                     "recovery: the plan's leader recorded the plan; sending it to the members"
                 );
-                let sent = send_follows(&mut transport, plan, leader_term, &members).await;
+                let sent = send_follows(&mut transport, plan, floor, leader_term, &members).await;
                 plan_sent(&mut state, plan, Ok(sent), &electorate(&plan, &members))?;
             }
         }
@@ -1255,6 +1426,7 @@ pub async fn recover_group(
 
 #[cfg(test)]
 mod tests {
+    use ursula_proto::admin::PlanFloor;
     use ursula_proto::admin::RecoveryGateStatus;
     use ursula_proto::admin::ReplicaLogView;
 
@@ -1509,7 +1681,7 @@ mod tests {
             ]
             .into(),
         );
-        let sent = super::send_plan(&mut table, plan, &members)
+        let sent = super::send_plan(&mut table, plan, PlanFloor::Seeded, &members)
             .await
             .expect("the leader took it");
         assert_eq!(sent.leader_term, 9);
@@ -1522,15 +1694,87 @@ mod tests {
         table
             .0
             .insert(3, Some(RecoveryPlanRefusal::FollowsLeader { leader: 2 }));
-        let sent = super::send_plan(&mut table, plan, &members)
+        let sent = super::send_plan(&mut table, plan, PlanFloor::Seeded, &members)
             .await
             .expect("the leader took it");
         assert_eq!(sent.refused.len(), 1);
         table.0.insert(1, Some(RecoveryPlanRefusal::LeadsLive));
-        let refused = super::send_plan(&mut table, plan, &members)
+        let refused = super::send_plan(&mut table, plan, PlanFloor::Seeded, &members)
             .await
             .expect_err("the leader refused");
         assert_eq!(refused.refusal(), Some(RecoveryPlanRefusal::LeadsLive));
+    }
+
+    /// The plan floor of each target and confirmed view: meta always plans
+    /// with `meta`, and a data group only with `seeded` from a confirmed,
+    /// bootstrapped view that shows it seeded.
+    #[test]
+    fn the_plan_floor_comes_from_the_target_and_a_confirmed_view() {
+        use std::collections::BTreeMap;
+        use std::collections::BTreeSet;
+
+        use ursula_control::ClusterView;
+        use ursula_control::ControlPlaneState;
+        use ursula_control::samples::sample_state;
+
+        use super::FloorError;
+        use super::RecoverTarget;
+        use super::group_floor;
+        use super::plan_floor;
+        // Group 0 of the sample is seeded, groups 1 and 2 are live.
+        let ControlPlaneState::Bootstrapped(cluster) = sample_state() else {
+            panic!("the sample state is bootstrapped");
+        };
+        let bootstrapped = ClusterView::Bootstrapped(cluster);
+        assert_eq!(group_floor(0, Some(&bootstrapped)), Ok(PlanFloor::Seeded));
+        for live in [1, 2] {
+            assert_eq!(
+                group_floor(live, Some(&bootstrapped)),
+                Err(FloorError::Live { group: live })
+            );
+        }
+        assert_eq!(
+            group_floor(3, Some(&bootstrapped)),
+            Err(FloorError::UnknownGroup { group: 3 })
+        );
+        assert_eq!(
+            group_floor(0, None),
+            Err(FloorError::NoConfirmedView { group: 0 })
+        );
+        for unbootstrapped in [
+            ClusterView::MetaGenesis {
+                unanswered: BTreeSet::new(),
+                genesis_mismatch: BTreeMap::new(),
+            },
+            ClusterView::MetaCatchingUp,
+            ClusterView::Registering {
+                registered: BTreeSet::new(),
+                waiting_for: BTreeSet::new(),
+            },
+            ClusterView::FormationCut,
+        ] {
+            assert_eq!(
+                group_floor(0, Some(&unbootstrapped)),
+                Err(FloorError::NotBootstrapped { group: 0 })
+            );
+        }
+        // Refusals of a data group name the meta group's recovery first.
+        for refused in [
+            FloorError::NoConfirmedView { group: 0 },
+            FloorError::NotBootstrapped { group: 0 },
+        ] {
+            assert!(refused.to_string().contains("--target meta"), "{refused}");
+        }
+        // Meta needs no view, and ignores one.
+        assert_eq!(plan_floor(RecoverTarget::Meta, None), Ok(PlanFloor::Meta));
+        assert_eq!(
+            plan_floor(RecoverTarget::Meta, Some(&bootstrapped)),
+            Ok(PlanFloor::Meta)
+        );
+        assert_eq!(
+            plan_floor(RecoverTarget::Group(0), Some(&bootstrapped)),
+            Ok(PlanFloor::Seeded)
+        );
     }
 
     /// A stalled three-voter group: node 1 survived open with the longest

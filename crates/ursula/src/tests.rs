@@ -6582,6 +6582,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         let plan = |expected: ursula_proto::admin::ReplicaLogView| {
             ursula_proto::admin::RecoveryPlanRequest {
                 point_entry: None,
+                floor: ursula_proto::admin::PlanFloor::Seeded,
                 leader: 1,
                 point: expected.last_log_index.unwrap_or(0),
                 cut: false,

@@ -1949,6 +1949,7 @@ fn a_stale_leader_or_candidate_that_takes_a_plan_restarts_first() {
                         group,
                     },
                     plan,
+                    ursula_proto::admin::PlanFloor::Seeded,
                     &members,
                 )
                 .await

@@ -848,6 +848,135 @@ mod tests {
         );
     }
 
+    /// The admin recovery route takes `meta` as its target and hands the
+    /// plan to the meta replica, and each plane refuses a plan floor of the
+    /// other one before the plan runs.
+    #[tokio::test]
+    async fn the_admin_recovery_route_plans_meta_and_refuses_a_floor_of_the_other_plane() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        use ursula_proto::admin::PlanFloor;
+        use ursula_proto::admin::PlanStep;
+        use ursula_proto::admin::RecoveryPlanRefusal;
+        use ursula_proto::admin::RecoveryPlanRefused;
+        use ursula_proto::admin::RecoveryPlanRequest;
+        use ursula_proto::admin::ReplicaLogView;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.raft.node_id = 7;
+        config.raft.wal.path = Some(dir.path().to_owned());
+        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
+        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
+        let state = super::init_state(&config, crate::Persistence::Raft {
+            log_dir: wal_dir.log_dir(),
+        })
+        .await
+        .unwrap();
+        let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let registry = state.raft_registry().cloned().expect("a Raft node");
+        let mut placement = registry.placement_watch();
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while placement.current().cluster().is_none() {
+                assert!(placement.changed().await, "the meta runtime runs");
+            }
+        })
+        .await
+        .expect("meta bootstraps the cluster");
+        let admin = crate::admin_router(state.clone());
+        let incarnation = state.process_incarnation.as_str().to_owned();
+        let post = |uri: String, plan: RecoveryPlanRequest| {
+            let admin = admin.clone();
+            let incarnation = incarnation.clone();
+            async move {
+                let response = admin
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header(ursula_proto::admin::PROCESS_INCARNATION_HEADER, incarnation)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&plan).unwrap()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (status, body)
+            }
+        };
+        let refused = |(status, body): (StatusCode, axum::body::Bytes)| {
+            assert_eq!(status, StatusCode::CONFLICT, "{body:?}");
+            serde_json::from_slice::<RecoveryPlanRefused>(&body).expect("a typed refusal")
+        };
+        // A `follow` to the plan's own leader is refused inside the plan's
+        // job, after the replica was found and before anything changed.
+        let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
+        let view = |replica: &serde_json::Value| ReplicaLogView {
+            last_log_index: replica["last_log_index"].as_u64(),
+            last_log_term: replica["last_log_term"].as_u64(),
+            current_term: replica["current_term"].as_u64().expect("current term"),
+        };
+        let mismatched = |expected: ReplicaLogView, floor| RecoveryPlanRequest {
+            leader: 7,
+            point: expected.last_log_index.unwrap_or(0),
+            cut: false,
+            step: PlanStep::Follow {
+                leader_term: expected.current_term,
+            },
+            floor,
+            point_entry: None,
+            expected,
+        };
+        let meta_url = "/__ursula/raft/meta/recovery/accept-unsynced-loss".to_owned();
+        let meta = view(&metrics["meta"]);
+        // No data group runs yet: the plan reached the meta replica.
+        assert!(registry.get(super::RaftGroupId(0)).is_none());
+        let answer = refused(post(meta_url.clone(), mismatched(meta, PlanFloor::Meta)).await);
+        assert_eq!(answer.refusal, RecoveryPlanRefusal::StepMismatch);
+        assert_eq!((answer.raft_group_id, answer.node_id), (0, 7));
+        let answer = refused(post(meta_url, mismatched(meta, PlanFloor::Seeded)).await);
+        assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
+
+        let created = create_a_stream(&state).await;
+        assert_eq!(created, StatusCode::CREATED);
+        let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
+        let data = view(&metrics["raft_groups"][0]);
+        let data_url = "/__ursula/raft/0/recovery/accept-unsynced-loss".to_owned();
+        let answer = refused(post(data_url.clone(), mismatched(data, PlanFloor::Meta)).await);
+        assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
+        let answer = refused(post(data_url, mismatched(data, PlanFloor::Seeded)).await);
+        assert_eq!(answer.refusal, RecoveryPlanRefusal::StepMismatch);
+        assert_eq!(
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
+            super::WalShutdown::Clean
+        );
+    }
+
+    /// Creates a stream through the client router, which opens group 0.
+    async fn create_a_stream(state: &crate::HttpState) -> axum::http::StatusCode {
+        use tower::ServiceExt;
+        crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default())
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/plans/events")
+                    .header("content-type", "text/plain")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
     /// A meta journal that does not read leaves the node without a meta
     /// replica, and the node still starts, is ready and serves writes.
     #[tokio::test]

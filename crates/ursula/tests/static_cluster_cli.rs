@@ -947,6 +947,7 @@ async fn cli_three_voters_run_a_cutting_plan_through_their_in_process_restarts()
                    step: ursula_proto::admin::PlanStep| {
         ursula_proto::admin::RecoveryPlanRequest {
             point_entry: None,
+            floor: ursula_proto::admin::PlanFloor::Seeded,
             leader: leader.node_id,
             point,
             cut: true,
@@ -1134,6 +1135,7 @@ async fn single_voter_recovery_plan(cut: bool) {
     if cut {
         let cutting = ursula_proto::admin::RecoveryPlanRequest {
             point_entry: None,
+            floor: ursula_proto::admin::PlanFloor::Seeded,
             leader: 1,
             point: group["committed_index"]
                 .as_u64()
@@ -1160,6 +1162,7 @@ async fn single_voter_recovery_plan(cut: bool) {
     }
     let plan = ursula_proto::admin::RecoveryPlanRequest {
         point_entry: None,
+        floor: ursula_proto::admin::PlanFloor::Seeded,
         leader: 1,
         point: expected.last_log_index.unwrap_or(0),
         cut: false,

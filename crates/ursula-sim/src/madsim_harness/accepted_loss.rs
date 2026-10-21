@@ -405,9 +405,14 @@ async fn recover_group_slowly(
             leader: plan.leader,
             leader_first: true,
         };
-        let sent = send_plan(&mut transport, plan, &members)
-            .await
-            .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
+        let sent = send_plan(
+            &mut transport,
+            plan,
+            ursula_proto::admin::PlanFloor::Seeded,
+            &members,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
         for error in &sent.refused {
             tracing::info!(%error, "{context}: group {group}: a member refused the plan");
         }
@@ -421,6 +426,7 @@ async fn recover_group_slowly(
         point: plan.point,
         cut: plan.cut,
         step,
+        floor: ursula_proto::admin::PlanFloor::Seeded,
         expected: member.log,
     };
     let after = "recovery_plan_sending";

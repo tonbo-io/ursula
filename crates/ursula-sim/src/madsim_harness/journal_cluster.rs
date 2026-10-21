@@ -1268,9 +1268,14 @@ pub(super) async fn recover_group(
     let plan = plan_group(&members)
         .unwrap_or_else(|error| panic!("{context}: group {group}: no plan: {error}"));
     cluster.plan_leaders.insert(plan.leader);
-    let sent = send_plan(&mut SimPlanTransport { cluster, group }, plan, &members)
-        .await
-        .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
+    let sent = send_plan(
+        &mut SimPlanTransport { cluster, group },
+        plan,
+        ursula_proto::admin::PlanFloor::Seeded,
+        &members,
+    )
+    .await
+    .unwrap_or_else(|error| panic!("{context}: group {group}: {plan:?}: {error}"));
     assert!(
         sent.refused.is_empty(),
         "{context}: group {group}: {plan:?}: members refused: {:?}",
