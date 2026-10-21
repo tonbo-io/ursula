@@ -1746,25 +1746,29 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
         .unwrap();
     let (observations, mut observed) = tokio::sync::mpsc::unbounded_channel();
     let peer = second_gate.clone();
-    let bootstrap = tokio::spawn(crate::run_group_bootstrap(
-        1,
-        first.raft_handle(),
-        first_gate,
-        BTreeSet::from([1, 2]),
-        BTreeSet::from([1, 2]),
-        move |_id| {
-            let peer = peer.clone();
-            let observations = observations.clone();
-            async move {
-                let response = peer.screen_vote(&crate::bootstrap_probe_vote()).unwrap();
-                let state = crate::PeerGroupLog::from_vote_response(&response);
-                observations.send(state.clone()).unwrap();
-                Some(state)
-            }
-        },
-        Duration::from_millis(1),
-        Duration::from_secs(5),
-    ));
+    let raft = first.raft_handle();
+    let bootstrap = tokio::spawn(async move {
+        crate::run_group_bootstrap(
+            1,
+            raft,
+            first_gate,
+            &crate::FixedNodes::from_voters(BTreeSet::from([1, 2])),
+            &crate::FixedRole(Some(ursula_control::SeedRoleOf::Initializer)),
+            move |_id| {
+                let peer = peer.clone();
+                let observations = observations.clone();
+                async move {
+                    let response = peer.screen_vote(&crate::bootstrap_probe_vote()).unwrap();
+                    let state = crate::PeerGroupLog::from_vote_response(&response);
+                    observations.send(state.clone()).unwrap();
+                    Some(state)
+                }
+            },
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        )
+        .await
+    });
     // Seeing a second probe proves the first Unprepared answer was processed.
     for _ in 0..2 {
         assert_eq!(
@@ -1821,8 +1825,11 @@ async fn the_bootstrap_driver_probes_its_probed_peers_and_initializes_its_member
             1,
             engine.raft_handle(),
             gate,
-            BTreeSet::from([1, 2, 3]),
-            BTreeSet::from([1, 2]),
+            &crate::FixedNodes {
+                candidates: BTreeSet::from([1, 2, 3]),
+                voters: BTreeSet::from([1, 2]),
+            },
+            &crate::FixedRole(Some(ursula_control::SeedRoleOf::Initializer)),
             move |peer| {
                 probe_asked.lock().unwrap().insert(peer);
                 async { Some(crate::PeerGroupLog::Empty) }

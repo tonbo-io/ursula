@@ -17,9 +17,9 @@ use openraft::raft::SnapshotResponse;
 use openraft::rt::WatchReceiver;
 use serde_json::json;
 use tower::ServiceExt;
+use ursula_raft::PlacedRaftGroupEngineFactory;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
-use ursula_raft::StaticGrpcRaftGroupEngineFactory;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
@@ -653,12 +653,10 @@ async fn spawn_static_grpc_test_node(
             .unwrap_or(ursula_config::PlacementConfig::default().replication_factor),
     );
     let voter_table = seeds.voter_table();
-    let mut factory = StaticGrpcRaftGroupEngineFactory::new(
-        node_id,
-        factory_peers,
-        seeds,
-        registry.clone(),
+    let mut factory = PlacedRaftGroupEngineFactory::new(
         log_stores.clone(),
+        registry.clone(),
+        Arc::new(seeds.for_node(node_id)),
     );
     factory = factory.with_cold_store(storage.cold_store.clone());
     if let Some(engine_config) = storage.engine_config {
@@ -6635,7 +6633,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             registry.get(RaftGroupId(0)).expect("registered owner"),
             gate.clone(),
             registry.election_policy(),
-            BTreeSet::new(),
+            Arc::new(ursula_raft::FixedNodes::from_voters(BTreeSet::new())),
             |_leader| async { Err::<ursula_raft::BarrierAnswer, _>("no leader".to_owned()) },
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(10),

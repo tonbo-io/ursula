@@ -1,6 +1,5 @@
 //! Recovery driver wiring, transport seam and task ownership.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -9,6 +8,7 @@ use std::time::Duration;
 use openraft::rt::WatchReceiver;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_control::SeedRoleOf;
 
 use super::GroupRejoin;
 use super::PeerGroupLog;
@@ -16,7 +16,10 @@ use super::run_group_bootstrap;
 use super::run_rejoin_heal;
 use super::run_rejoin_vote_barrier;
 use crate::BarrierAnswer;
+use crate::GroupNodes;
+use crate::PlacementInputs;
 use crate::RaftTarget;
+use crate::SeedRole;
 use crate::meta::MetaForwardError;
 use crate::meta::confirm::BarrierFailure;
 use crate::meta::genesis::GenesisProbe;
@@ -176,9 +179,11 @@ pub trait RecoveryTransport: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<ControlResponse, MetaForwardError>> + Send;
 }
 
+/// The timings of a replica's recovery drivers. What they ask and whom
+/// they initialize comes from the group's placement inputs
+/// ([`crate::PlacementInputs`]).
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
-    pub initialize: bool,
     pub interval: Duration,
     pub barrier_timeout: Duration,
     pub stall_after: Duration,
@@ -195,16 +200,19 @@ pub(crate) type GateProbe = Arc<
 impl RecoveryGate {
     /// Publishes a data replica's recovery gate, then spawns its heal driver
     /// and its gate drivers (`spawn_gate_drivers`) with the
-    /// transport's bootstrap probe vote.
+    /// transport's bootstrap probe vote, over the seed role and the node
+    /// sets `inputs` gives the replica's group.
     pub fn attach<T: RecoveryTransport>(
         &self,
         engine: &crate::RaftGroupEngine,
         rejoin: Arc<GroupRejoin>,
         registry: &RaftGroupHandleRegistry,
-        nodes: BTreeSet<u64>,
+        inputs: &dyn PlacementInputs,
         transport: T,
         config: RecoveryConfig,
     ) -> Result<(), ursula_runtime::GroupEngineError> {
+        let group = engine.placement.raft_group_id;
+        let nodes = inputs.nodes(group);
         engine.publish_recovery(rejoin.clone(), registry)?;
         self.push(crate::rt::spawn(run_rejoin_heal(
             engine.raft_handle(),
@@ -223,8 +231,8 @@ impl RecoveryGate {
             engine.read_barrier.owner().clone(),
             rejoin,
             registry.election_policy(),
-            nodes.clone(),
             nodes,
+            inputs.seed_role(group),
             probe,
             transport,
             config,
@@ -233,11 +241,13 @@ impl RecoveryGate {
     }
 
     /// Spawns the drivers that open one replica's recovery gate, for a
-    /// replica of any state machine: the barrier driver, which asks
-    /// `candidates` for a leader's barrier, the genesis vote floor task,
-    /// which records the floor once every other candidate answers `probe`
-    /// empty, and, for an initializer, the bootstrap driver, which
-    /// initializes `members` once every other candidate does.
+    /// replica of any state machine: the barrier driver, which asks the
+    /// candidates of `nodes` for a leader's barrier, the genesis vote floor
+    /// task, which records the floor once every other candidate answers
+    /// `probe` empty and `seed` confirms a role, and, while `seed` shows the
+    /// replica as its group's initializer, the bootstrap driver, which
+    /// initializes the voters of `nodes` once every other candidate does.
+    /// Each reads `nodes` at each use.
     ///
     /// Each driver starts once the node owes no predecessor wait, so a
     /// barrier round, a vote floor and an initialization all come after the
@@ -248,8 +258,8 @@ impl RecoveryGate {
         owner: crate::owner::OwnerRaftHandle<SM>,
         rejoin: Arc<GroupRejoin>,
         election: crate::ElectionPolicy,
-        candidates: BTreeSet<u64>,
-        members: BTreeSet<u64>,
+        nodes: Arc<dyn GroupNodes>,
+        seed: Arc<dyn SeedRole>,
         probe: GateProbe,
         transport: T,
         config: RecoveryConfig,
@@ -264,7 +274,7 @@ impl RecoveryGate {
             owner,
             rejoin.clone(),
             election,
-            candidates.clone(),
+            nodes.clone(),
             move |leader| {
                 let transport = transport.clone();
                 async move { transport.barrier(leader, target).await }
@@ -280,14 +290,15 @@ impl RecoveryGate {
         }));
         if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
             let rejoin = rejoin.clone();
-            let candidates = candidates.clone();
+            let nodes = nodes.clone();
+            let seed = seed.clone();
             let probe = probe.clone();
             let fence = fence.clone();
             self.push(crate::rt::spawn(async move {
                 fence.waited().await;
                 while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
                     let mut all_empty = true;
-                    for peer in &candidates {
+                    for peer in &nodes.candidates() {
                         if *peer != rejoin.node_id
                             && !matches!(
                                 probe(*peer).await,
@@ -299,6 +310,17 @@ impl RecoveryGate {
                         }
                     }
                     if all_empty {
+                        // The floor is written only while a confirmed
+                        // placement gives the replica a role in its group.
+                        match seed.confirmed_role().await {
+                            Ok(Some(_role)) => {}
+                            Ok(None) => return,
+                            Err(error) => {
+                                tracing::debug!(%error, "genesis vote floor: no confirmed seed role yet, retrying");
+                                crate::rt::time::sleep(config.bootstrap_interval).await;
+                                continue;
+                            }
+                        }
                         if let Err(error) = rejoin.establish_vote_floor(UrsulaVote::new(0, 0)).await
                         {
                             // Journal I/O failures poison/stop the writer. Never retry
@@ -311,15 +333,15 @@ impl RecoveryGate {
                 }
             }));
         }
-        if config.initialize && !rejoin.holds_group_history() {
+        if seed.local_role() == Some(SeedRoleOf::Initializer) && !rejoin.holds_group_history() {
             self.push(crate::rt::spawn(async move {
                 fence.waited().await;
                 run_group_bootstrap(
                     rejoin.node_id,
                     raft,
                     rejoin,
-                    candidates,
-                    members,
+                    &*nodes,
+                    &*seed,
                     &*probe,
                     config.bootstrap_interval,
                     config.bootstrap_warn_after,

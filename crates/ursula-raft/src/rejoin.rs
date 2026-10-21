@@ -49,11 +49,14 @@
 //!   (`leader_tick`), which observes each reversion in the replication
 //!   metrics, counts it per follower and logs it. The heal driver
 //!   (`run_rejoin_heal`) brings the membership back to the configured
-//!   voters when an operator or a recovery plan left one out.
+//!   voters, which it reads from the group's placement inputs on each tick
+//!   ([`crate::GroupNodes`]), when an operator or a recovery plan left one
+//!   out.
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   configured voter answers a probe `Vote` with an empty log and no
-//!   leader and has persisted its genesis floor. The reserved T0-N0 probe
+//!   leader and has persisted its genesis floor, and its seed role
+//!   ([`crate::SeedRole`]) confirms it as the initializer right before. The reserved T0-N0 probe
 //!   is read-only; its grant bit reports this readiness. A replica that ever
 //!   held the group never runs
 //!   `Initialize`.

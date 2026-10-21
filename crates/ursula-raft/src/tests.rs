@@ -1307,42 +1307,6 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
 }
 
 #[cfg(not(madsim))]
-#[test]
-fn dynamic_group_hosting_allows_non_voter_warmup() {
-    let wal_root = tempfile::tempdir().expect("WAL root");
-    let registry = RaftGroupHandleRegistry::default();
-    // Over four nodes at the default replication factor, group 2 is seeded
-    // on nodes 3, 4 and 1: node 2 hosts none of it.
-    let peers = crate::PeerDirectory::new((1..=4).map(|node_id| {
-        (
-            node_id,
-            crate::PeerEndpoints::shared(format!("node{node_id}")),
-        )
-    }));
-    let seeds = crate::ConfigSeeds::new(
-        &peers,
-        3,
-        ursula_config::PlacementConfig::default().replication_factor,
-    );
-    let factory = StaticGrpcRaftGroupEngineFactory::new(
-        2,
-        peers,
-        seeds,
-        registry.clone(),
-        start_wal(wal_root.path(), 1, 3),
-    );
-    let placement = ShardPlacement {
-        shard_id: ShardId(0),
-        core_id: CoreId(0),
-        raft_group_id: RaftGroupId(2),
-    };
-
-    assert!(!factory.hosts_group(placement));
-    registry.allow_dynamic_group_hosting(RaftGroupId(2));
-    assert!(factory.hosts_group(placement));
-}
-
-#[cfg(not(madsim))]
 #[tokio::test]
 async fn single_node_openraft_group_applies_client_writes() {
     let config = raft_config("ursula-single-node-test", 30, 60);
@@ -1442,7 +1406,7 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
         leader.read_barrier.owner().clone(),
         gate,
         RaftGroupHandleRegistry::default().election_policy(),
-        BTreeSet::from([4]),
+        Arc::new(crate::FixedNodes::from_voters(BTreeSet::from([4]))),
         move |candidate| {
             let recorded = recorded.clone();
             let rounds = rounds.clone();

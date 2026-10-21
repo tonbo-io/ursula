@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
@@ -209,7 +208,6 @@ pub struct RaftGroupHandleRegistry {
     pub(crate) meta_append_send_budget: crate::grpc::AppendTransportBudget,
     pub(crate) meta_append_receive_budget: crate::grpc::AppendTransportBudget,
     groups: Arc<arc_swap::ArcSwap<BTreeMap<u32, Arc<GroupEntry>>>>,
-    dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     election: ElectionPolicy,
     transport_shutdown: watch::Sender<bool>,
     snapshot_store: Arc<Mutex<SharedSnapshotStore>>,
@@ -244,7 +242,6 @@ impl Default for RaftGroupHandleRegistry {
                 crate::grpc::META_APPEND_BUDGET_BYTES,
             ),
             groups: Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
-            dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             election: ElectionPolicy::default(),
             transport_shutdown,
             snapshot_store: Arc::new(Mutex::new(default_snapshot_store())),
@@ -918,20 +915,6 @@ impl RaftGroupHandleRegistry {
 
     pub fn contains_group(&self, raft_group_id: RaftGroupId) -> bool {
         self.groups.load().contains_key(&raft_group_id.0)
-    }
-
-    pub fn allow_dynamic_group_hosting(&self, raft_group_id: RaftGroupId) -> bool {
-        self.dynamic_hosted_groups
-            .lock()
-            .expect("raft dynamic hosted groups mutex")
-            .insert(raft_group_id)
-    }
-
-    pub fn dynamic_group_hosting_allowed(&self, raft_group_id: RaftGroupId) -> bool {
-        self.dynamic_hosted_groups
-            .lock()
-            .expect("raft dynamic hosted groups mutex")
-            .contains(&raft_group_id)
     }
 
     pub fn len(&self) -> usize {
@@ -1855,6 +1838,8 @@ pub(crate) fn log_progress_snapshot(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(not(madsim))]
+    use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     #[cfg(not(madsim))]

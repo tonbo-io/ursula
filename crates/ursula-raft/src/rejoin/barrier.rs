@@ -1,6 +1,5 @@
 //! Follower-side fresh quorum barrier driver.
 
-use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::sync::Arc;
@@ -13,14 +12,15 @@ use openraft::storage::RaftStateMachine;
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
+use crate::GroupNodes;
 use crate::owner::OwnerRaftHandle;
 use crate::target::WireTarget;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
 /// Opens a gated replica's recovery gate from fresh outbound leader proofs.
-/// It asks the group's configured voters (`nodes`) and the members of its
-/// effective membership, by node id. The supplied probe must confirm a new
+/// It asks the candidates of `nodes`, read at each round, and the members
+/// of its effective membership, by node id. The supplied probe must confirm a new
 /// post-call ReadIndex with a quorum and return that leader's committed vote
 /// and required local applied index ([`crate::BarrierAnswer`]). The driver
 /// does not read the answer's memberships. A replica that for `stall_after` gets no barrier and applies
@@ -33,7 +33,7 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
     raft: OwnerRaftHandle<SM>,
     rejoin: Arc<GroupRejoin>,
     election: crate::ElectionPolicy,
-    nodes: BTreeSet<u64>,
+    nodes: Arc<dyn GroupNodes>,
     probe: P,
     probe_timeout: Duration,
     interval: Duration,
@@ -81,7 +81,7 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
             })
         {
             last_probe = Some((metrics.vote, crate::rt::time::Instant::now()));
-            let mut candidates = nodes.clone();
+            let mut candidates = nodes.candidates();
             candidates.extend(
                 metrics
                     .membership_config

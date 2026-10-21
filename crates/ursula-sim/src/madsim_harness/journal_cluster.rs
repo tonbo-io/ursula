@@ -592,7 +592,7 @@ impl JournalCluster {
         group: u32,
         node_id: u64,
     ) -> Result<(), ReplicaStartRefused> {
-        let voters = recovery_wiring::configured_voters(1..=self.voters);
+        let inputs = recovery_wiring::fixed_placement(node_id, 1..=self.voters);
         let placement = group_placement(group);
         let store = self.wals[&node_id]
             .open(placement, self.metrics[&node_id].group_engine_metrics())
@@ -671,7 +671,7 @@ impl JournalCluster {
             &rejoin,
             &registry,
             &self.policy,
-            &voters,
+            &inputs,
             &self.recovery_registries[&node_id],
         );
         registry.register(node_id, &engine);
