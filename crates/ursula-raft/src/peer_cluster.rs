@@ -49,11 +49,25 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
 use ursula_headers::ClusterId;
+use ursula_proto::placement::ProcessIncarnation;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_runtime::NodeFence;
 
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
+use crate::incarnation::Discarded;
+use crate::incarnation::Effect;
+use crate::incarnation::IncarnationBook;
+use crate::incarnation::IncarnationCounts;
+use crate::incarnation::Judgement;
+use crate::incarnation::Received;
+use crate::incarnation::Rpc;
+use crate::incarnation::Stamp;
 use crate::peer_directory::PeerDirectory;
 use crate::rt::time::Instant;
+use crate::target::FenceRefusal;
+use crate::target::INCARNATION_METADATA;
+use crate::target::TARGET_INCARNATION_METADATA;
 
 /// The format epoch that introduced cluster ids on Raft RPCs: a sender that
 /// names none is a node of an earlier epoch.
@@ -84,12 +98,15 @@ struct IdentityValues {
     cluster_value: AsciiMetadataValue,
     node_value: AsciiMetadataValue,
     fence: NodeFence,
+    incarnation: Option<ProcessIncarnation>,
+    incarnation_value: Option<AsciiMetadataValue>,
 }
 
-/// Who this node is to its peers: the cluster id its WAL root holds and its
-/// Raft node id. As a client interceptor it stamps both on every request,
-/// and sends none while its node fence does not admit it. Cloning it is
-/// cheap: every Raft client holds one.
+/// Who this node is to its peers: the cluster id its WAL root holds, its
+/// Raft node id and, for a process on a WAL root, its process incarnation.
+/// As a client interceptor it stamps them on every request, and sends none
+/// while its node fence does not admit it. Cloning it is cheap: every Raft
+/// client holds one.
 #[derive(Debug, Clone)]
 pub struct PeerIdentity(Arc<IdentityValues>);
 
@@ -100,15 +117,44 @@ impl PeerIdentity {
         Self::fenced_by(node_id, cluster_id, NodeFence::unleased())
     }
 
-    /// The identity of a node whose Raft traffic `fence` gates.
+    /// The identity of a node whose Raft traffic `fence` gates, without a
+    /// process incarnation: it takes no part in the process fence
+    /// ([`crate::incarnation`]).
     pub fn fenced_by(node_id: u64, cluster_id: ClusterId, fence: NodeFence) -> Self {
+        Self::with(node_id, cluster_id, fence, None)
+    }
+
+    /// The identity of the process `incarnation` of node `node_id`, whose
+    /// Raft traffic `fence` gates: what a node on a WAL root binds.
+    pub fn of_process(
+        node_id: u64,
+        cluster_id: ClusterId,
+        fence: NodeFence,
+        incarnation: ProcessIncarnation,
+    ) -> Self {
+        Self::with(node_id, cluster_id, fence, Some(incarnation))
+    }
+
+    fn with(
+        node_id: u64,
+        cluster_id: ClusterId,
+        fence: NodeFence,
+        incarnation: Option<ProcessIncarnation>,
+    ) -> Self {
         Self(Arc::new(IdentityValues {
             node_id,
             cluster_value: cluster_id_value(&cluster_id),
             node_value: AsciiMetadataValue::from(node_id),
             cluster_id,
             fence,
+            incarnation,
+            incarnation_value: incarnation.map(crate::incarnation::incarnation_value),
         }))
+    }
+
+    /// This process's incarnation, `None` for a node without one.
+    pub fn incarnation(&self) -> Option<ProcessIncarnation> {
+        self.0.incarnation
     }
 
     /// The fence every Raft input and output of this node passes.
@@ -122,6 +168,11 @@ impl PeerIdentity {
 
     pub fn cluster_id(&self) -> &ClusterId {
         &self.0.cluster_id
+    }
+
+    /// Fences this process for good ([`supersede`]).
+    pub(crate) fn supersede(&self, why: Supersession) {
+        supersede(&self.0.fence, self.0.node_id, why);
     }
 }
 
@@ -142,6 +193,9 @@ impl Interceptor for PeerIdentity {
         let metadata = request.metadata_mut();
         metadata.insert(CLUSTER_ID_METADATA, self.0.cluster_value.clone());
         metadata.insert(NODE_ID_METADATA, self.0.node_value.clone());
+        if let Some(incarnation) = &self.0.incarnation_value {
+            metadata.insert(INCARNATION_METADATA, incarnation.clone());
+        }
         Ok(request)
     }
 }
@@ -199,12 +253,14 @@ pub enum PeerClusterError {
     MissingClusterId,
     #[error("the sender's {header} request metadata is malformed")]
     MalformedMetadata { header: &'static str },
-    /// This node's fence does not admit Raft traffic: its disk lease does
-    /// not hold, or it shuts down. Refused `FAILED_PRECONDITION` with
-    /// [`crate::target::FenceRefusal::Fenced`] and this node's id, which the
-    /// sender reads with [`crate::target::fence_refusal`].
-    #[error("node {node_id} is fenced and takes no Raft request")]
-    Fenced { node_id: u64 },
+    /// This node's process fence refused the request
+    /// ([`crate::incarnation`]): its node fence does not admit (its disk
+    /// lease does not hold, it shuts down or it is superseded), or the
+    /// request names another process of this node or comes from a stale
+    /// one. Refused `FAILED_PRECONDITION` with the refusal and this node's
+    /// id, which the sender reads with [`crate::target::fence_refusal`].
+    #[error("node {node_id} refused the Raft request: {}", refusal.as_str())]
+    Fence { node_id: u64, refusal: FenceRefusal },
     /// The peer belongs to another cluster.
     #[error(
         "peer cluster mismatch: node {peer_node_id} is in cluster {peer_cluster_id}, this node is \
@@ -224,12 +280,12 @@ impl From<PeerClusterError> for tonic::Status {
             PeerClusterError::NoLocalCluster => Self::unavailable(message),
             PeerClusterError::MissingClusterId => Self::failed_precondition(message),
             PeerClusterError::MalformedMetadata { .. } => Self::invalid_argument(message),
-            PeerClusterError::Fenced { node_id } => {
+            PeerClusterError::Fence { node_id, refusal } => {
                 let mut metadata = MetadataMap::new();
                 metadata.insert(NODE_ID_METADATA, AsciiMetadataValue::from(node_id));
                 metadata.insert(
                     crate::target::FENCE_METADATA,
-                    AsciiMetadataValue::from_static(crate::target::FenceRefusal::Fenced.as_str()),
+                    AsciiMetadataValue::from_static(refusal.as_str()),
                 );
                 Self::with_metadata(tonic::Code::FailedPrecondition, message, metadata)
             }
@@ -343,6 +399,8 @@ struct Misdeliveries {
 struct Bound {
     identity: PeerIdentity,
     peers: PeerDirectory,
+    /// The peers' processes this one has seen ([`crate::incarnation`]).
+    book: IncarnationBook,
 }
 
 /// This node's side of the cluster check, shared by its registry, its
@@ -356,9 +414,11 @@ impl PeerCluster {
     /// The engine factory binds the identity of the WAL it opens groups
     /// over, before any group starts.
     pub fn bind(&self, identity: PeerIdentity, peers: PeerDirectory) {
-        self.0
-            .bound
-            .store(Some(Arc::new(Bound { identity, peers })));
+        self.0.bound.store(Some(Arc::new(Bound {
+            identity,
+            peers,
+            book: IncarnationBook::default(),
+        })));
     }
 
     /// The configured peers last bound, this node among them.
@@ -408,16 +468,195 @@ impl PeerCluster {
             .map_or_else(NodeFence::unleased, |bound| bound.identity.fence().clone())
     }
 
-    /// The receiver's fence check of an inbound request or of the answer it
-    /// is about to send.
+    /// The receiver's fence check of the answer it is about to send.
     pub(crate) fn check_receiver_fence(&self) -> Result<(), PeerClusterError> {
         let bound = self.0.bound.load();
         match bound.as_deref() {
-            Some(bound) if !bound.identity.fence().admits_now() => Err(PeerClusterError::Fenced {
+            Some(bound) if !bound.identity.fence().admits_now() => Err(PeerClusterError::Fence {
                 node_id: bound.identity.node_id(),
+                refusal: FenceRefusal::Fenced,
             }),
             Some(_) | None => Ok(()),
         }
+    }
+
+    /// The receiver's check of an inbound request that `admitted` names the
+    /// sender and target processes of, after its protocol version, target
+    /// node and group lookup ([`crate::incarnation::receive`]): refused
+    /// while this node is fenced, and for its claims while it has a
+    /// process incarnation. A request whose target is a newer run of this
+    /// root supersedes this process.
+    pub(crate) fn receive(
+        &self,
+        admitted: Option<&AdmittedPeer>,
+        rpc: Rpc,
+    ) -> Result<(), PeerClusterError> {
+        let bound = self.0.bound.load();
+        let Some(bound) = bound.as_deref() else {
+            return Ok(());
+        };
+        if let Err(fenced) = self.check_receiver_fence() {
+            bound.book.counts().refused(FenceRefusal::Fenced);
+            return Err(fenced);
+        }
+        let Some(me) = bound.identity.incarnation() else {
+            return Ok(());
+        };
+        let sender = admitted.and_then(|peer| peer.sender.map(|sender| (peer.node, sender)));
+        let target = admitted.and_then(|peer| peer.target);
+        let refusal = match crate::incarnation::receive(me, sender, target, rpc, &bound.book) {
+            Received::Pass => return Ok(()),
+            Received::Refused(refusal) => refusal,
+            Received::Superseded => {
+                bound.identity.supersede(Supersession::NewerRun);
+                FenceRefusal::Fenced
+            }
+        };
+        bound.book.counts().refused(refusal);
+        if refusal == FenceRefusal::Unidentified {
+            tracing::error!(
+                peer_node_id = admitted.map(|peer| peer.node),
+                "a Raft request names no sender incarnation: refused unidentified"
+            );
+        }
+        Err(PeerClusterError::Fence {
+            node_id: bound.identity.node_id(),
+            refusal,
+        })
+    }
+
+    /// This node's stamp on its answers: its node id and incarnation.
+    pub(crate) fn stamp(&self) -> Stamp {
+        let identity = self.identity();
+        Stamp {
+            node: identity.as_ref().map(PeerIdentity::node_id),
+            incarnation: identity.as_ref().and_then(PeerIdentity::incarnation),
+        }
+    }
+
+    /// The incarnation this node holds for `target`, which its requests to
+    /// it name. `None` for a node without an incarnation of its own.
+    pub(crate) fn target_incarnation(&self, target: u64) -> Option<ProcessIncarnation> {
+        let bound = self.0.bound.load();
+        let bound = bound.as_deref()?;
+        bound.identity.incarnation()?;
+        bound.book.entry(target)
+    }
+
+    /// Writes the incarnation this node holds for `target` into a request's
+    /// `metadata`.
+    pub(crate) fn stamp_target(&self, target: u64, metadata: &mut MetadataMap) {
+        if let Some(incarnation) = self.target_incarnation(target) {
+            metadata.insert(
+                TARGET_INCARNATION_METADATA,
+                crate::incarnation::incarnation_value(incarnation),
+            );
+        }
+    }
+
+    /// The sender's check of an answer from `target` stamped `stamp`,
+    /// before it is decoded: this node's fence at the answer's arrival,
+    /// then the stamp's node and incarnation, which raises the table when
+    /// accepted. A node without an incarnation of its own checks only its
+    /// fence.
+    pub(crate) fn accept_responder(&self, target: u64, stamp: Stamp) -> Result<(), Discarded> {
+        let bound = self.0.bound.load();
+        let Some(bound) = bound.as_deref() else {
+            return Ok(());
+        };
+        if !bound.identity.fence().admits_now() {
+            return Err(Discarded::Fenced);
+        }
+        if bound.identity.incarnation().is_none() {
+            return Ok(());
+        }
+        let judged = match (stamp.node, stamp.incarnation) {
+            (Some(node), _) if node != target => Err(Discarded::OtherNode { node }),
+            (_, None) => Err(Discarded::Unstamped),
+            (_, Some(seen)) => match bound.book.observe(target, seen) {
+                Judgement::Accept => Ok(()),
+                judgement => Err(Discarded::Stale { judgement }),
+            },
+        };
+        match judged {
+            Ok(()) => bound.book.counts().accepted(),
+            Err(_) => bound.book.counts().discarded(),
+        }
+        judged
+    }
+
+    /// The sender's reading of a failed call to `target`, after the
+    /// protocol, cluster and misdelivery readings: the failure's stamp is
+    /// judged as an answer's is. A stamp of a process the table refuses
+    /// retires the channel ([`Effect::Retire`]), and a fence refusal from
+    /// the process it accepts takes its [`Effect`]. `None` for any other
+    /// failure.
+    pub(crate) fn observe_failure(&self, target: u64, status: &tonic::Status) -> Option<Effect> {
+        let refusal = crate::target::fence_refusal(status, target);
+        let stamp = Stamp::of(status.metadata());
+        if stamp.incarnation.is_none() && refusal.is_none() {
+            return None;
+        }
+        match self.accept_responder(target, stamp) {
+            Ok(()) => refusal.map(|refusal| self.observe_fence_refusal(target, refusal)),
+            Err(discarded) if discarded.retires() => Some(Effect::Retire),
+            Err(_) => None,
+        }
+    }
+
+    /// Takes a fence refusal by `target`'s process, which this node accepts
+    /// as the one running: counted, and a `stale_sender` supersedes this
+    /// process.
+    pub(crate) fn observe_fence_refusal(&self, target: u64, refusal: FenceRefusal) -> Effect {
+        let bound = self.0.bound.load();
+        let effect = crate::incarnation::effect(refusal);
+        let Some(bound) = bound.as_deref() else {
+            return effect;
+        };
+        bound.book.counts().refusal_received(refusal);
+        match effect {
+            Effect::Supersede => bound.identity.supersede(Supersession::OlderRun),
+            Effect::None if refusal != FenceRefusal::UnboundRoot => tracing::warn!(
+                peer_node_id = target,
+                refusal = refusal.as_str(),
+                "a peer refused this node's Raft request"
+            ),
+            Effect::None | Effect::Retire | Effect::Retry => {}
+        }
+        effect
+    }
+
+    /// Takes the roots `view` binds as the slots of the table. Whether the
+    /// view supersedes this process is the root guard's to judge
+    /// (`crate::meta::root::RootGuard::check_view`).
+    pub(crate) fn observe_view(&self, view: &ursula_control::PlacementView) {
+        let bound = self.0.bound.load();
+        let Some(bound) = bound.as_deref() else {
+            return;
+        };
+        let slots: BTreeMap<u64, RootSlot> = match view.state.as_ref() {
+            ursula_control::ControlPlaneState::Forming { registered } => registered
+                .iter()
+                .map(|(node, registration)| (node.get(), registration.root))
+                .collect(),
+            ursula_control::ControlPlaneState::Bootstrapped(cluster) => cluster
+                .nodes()
+                .iter()
+                .map(|(node, record)| (node.get(), record.root))
+                .collect(),
+            ursula_control::ControlPlaneState::FormationCut => BTreeMap::new(),
+        };
+        bound.book.set_slots(&slots);
+    }
+
+    /// The process fence's counters since start.
+    pub fn incarnation_counts(&self) -> IncarnationCounts {
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .map(|bound| bound.book.counts().snapshot())
+            .unwrap_or_default()
     }
 
     pub fn identity(&self) -> Option<PeerIdentity> {
@@ -464,9 +703,16 @@ impl PeerCluster {
             .and_then(|value| value.to_str().ok())
             .and_then(|text| text.parse::<u64>().ok())
             .ok_or_else(|| malformed(NODE_ID_METADATA))?;
+        let admitted = AdmittedPeer {
+            node: peer_node_id,
+            sender: crate::incarnation::incarnation_of(metadata, INCARNATION_METADATA)
+                .map_err(malformed)?,
+            target: crate::incarnation::incarnation_of(metadata, TARGET_INCARNATION_METADATA)
+                .map_err(malformed)?,
+        };
         // The common case compares bytes; only a mismatch is parsed.
         if cluster_value.as_bytes() == local.0.cluster_value.as_bytes() {
-            return Ok(AdmittedPeer(peer_node_id));
+            return Ok(admitted);
         }
         let cluster_id = cluster_value
             .to_str()
@@ -474,7 +720,7 @@ impl PeerCluster {
             .and_then(|text| ClusterId::new(text).ok())
             .ok_or_else(|| malformed(CLUSTER_ID_METADATA))?;
         if cluster_id == local.0.cluster_id {
-            return Ok(AdmittedPeer(peer_node_id));
+            return Ok(admitted);
         }
         self.0.refusals.fetch_add(1, Ordering::Relaxed);
         if self.record(
@@ -747,11 +993,54 @@ pub(crate) fn test_peer_cluster_with(node_id: u64, peers: PeerDirectory) -> Peer
     peer_cluster
 }
 
-/// The node id an admitted request names in its [`NODE_ID_METADATA`], which
-/// [`ClusterCheck`] puts in the request's extensions: the node a forwarded
-/// meta write comes from. A handler reads the sender only here.
+/// Why this process fences itself for good: another process may answer as
+/// this node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AdmittedPeer(pub(crate) u64);
+pub(crate) enum Supersession {
+    /// The meta group refused a registration of this root, which holds
+    /// state, for the slot `slot`.
+    OtherRoot { slot: RootSlot },
+    /// A view shows this root released.
+    Released,
+    /// A view confirmed by a meta read barrier binds this node id to
+    /// `root`.
+    BoundElsewhere { root: RootId },
+    /// A peer's request names a newer run of this root as its target.
+    NewerRun,
+    /// A peer refused this process as an older run of its root
+    /// (`stale_sender`).
+    OlderRun,
+}
+
+/// Fences the process of `fence`, running as node `node`, for good
+/// ([`NodeFence::supersede`]), logged once with `why`. Returns whether this
+/// call superseded it. Every supersession goes through here: the meta
+/// root guard's (`crate::meta::root::RootGuard::supersede`) and the
+/// incarnation table's ([`PeerIdentity::supersede`]).
+pub(crate) fn supersede(fence: &NodeFence, node: u64, why: Supersession) -> bool {
+    let first = fence.supersede();
+    if first {
+        tracing::error!(
+            node,
+            ?why,
+            "superseded: another process may answer as this node. This process takes part in no \
+             Raft traffic, writes nothing more to its WAL and answers clients 503 until it exits"
+        );
+    }
+    first
+}
+
+/// What an admitted request names, which [`ClusterCheck`] puts in the
+/// request's extensions: the sender's node id in [`NODE_ID_METADATA`] (the
+/// node a forwarded meta write comes from), its process in
+/// [`INCARNATION_METADATA`] and the process it is for in
+/// [`TARGET_INCARNATION_METADATA`]. A handler reads them only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmittedPeer {
+    pub(crate) node: u64,
+    pub(crate) sender: Option<ProcessIncarnation>,
+    pub(crate) target: Option<ProcessIncarnation>,
+}
 
 /// The server interceptor: admits a request only from a peer of this node's
 /// cluster ([`PeerCluster::admit`]), and puts the node id it names in its
@@ -764,12 +1053,12 @@ impl Interceptor for ClusterCheck {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
+        // The process fence runs in each handler, after its group lookup
+        // ([`PeerCluster::receive`]), so the startup format-epoch probe
+        // meets `NOT_FOUND` even at a fenced node.
         let admitted = self
             .0
             .admit(request.metadata(), request.remote_addr(), Instant::now())?;
-        // The receiver's first fence check, for every request and every
-        // `AppendStream` it opens.
-        self.0.check_receiver_fence()?;
         request.extensions_mut().insert(admitted);
         Ok(request)
     }

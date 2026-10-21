@@ -235,6 +235,7 @@ pub struct RaftGroupHandleRegistry {
 impl Default for RaftGroupHandleRegistry {
     fn default() -> Self {
         let (transport_shutdown, _) = watch::channel(false);
+        let peer_cluster = crate::peer_cluster::PeerCluster::default();
         Self {
             append_send_budget: Default::default(),
             append_receive_budget: Default::default(),
@@ -251,10 +252,10 @@ impl Default for RaftGroupHandleRegistry {
             snapshot_build: Arc::new(Mutex::new(SnapshotBuildCoordinator::new(1))),
             snapshot_install: SnapshotInstallCoordinator::new(1),
             wal_opening: Arc::new(Mutex::new(None)),
-            peer_cluster: crate::peer_cluster::PeerCluster::default(),
+            placement: crate::meta::watch::PlacementPublisher::for_peers(peer_cluster.clone()),
+            peer_cluster,
             follower_log_reversions: Default::default(),
             meta: Arc::default(),
-            placement: Default::default(),
             group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
         }
     }

@@ -680,3 +680,67 @@ async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
     server.abort();
     shutdown_all(&engines).await;
 }
+
+/// How each fence outcome of a forward classifies (rules 24): refused
+/// before the leader's handler, or not sent, is not proposed; an answer
+/// discarded after the handler may have run leaves a write's outcome
+/// unknown, so a stale view never turns a commit into a duplicate retry. A
+/// barrier the fence refused or discarded is no answer, asked again.
+#[test]
+fn fence_outcomes_of_a_forward_say_whether_the_leader_may_have_run_it() {
+    use ursula_runtime::ForwardedRpc;
+    use ursula_runtime::WriteEffect;
+
+    use crate::incarnation::Discarded;
+    use crate::incarnation::Judgement;
+    use crate::target::FenceRefusal;
+    let address = || "http://10.0.0.2:4437".to_owned();
+    let stale = Discarded::Stale {
+        judgement: Judgement::Older,
+    };
+    for (error, effect) in [
+        (
+            ForwardError::Fenced {
+                rpc: ForwardedRpc::GroupWrite,
+            },
+            WriteEffect::NotProposed,
+        ),
+        (
+            ForwardError::OtherIncarnation {
+                rpc: ForwardedRpc::GroupWrite,
+                address: address(),
+                refusal: FenceRefusal::StaleTarget,
+            },
+            WriteEffect::NotProposed,
+        ),
+        (
+            ForwardError::Discarded {
+                rpc: ForwardedRpc::GroupWrite,
+                address: address(),
+                discarded: stale,
+            },
+            WriteEffect::Unknown,
+        ),
+        (
+            ForwardError::Discarded {
+                rpc: ForwardedRpc::GroupRead,
+                address: address(),
+                discarded: stale,
+            },
+            WriteEffect::NotProposed,
+        ),
+    ] {
+        assert_eq!(error.write_effect(), effect, "{error:?}");
+        assert_eq!(
+            error.status(),
+            ursula_runtime::ErrorStatus::Temporary,
+            "{error:?}"
+        );
+    }
+    assert!(matches!(
+        crate::meta::confirm::BarrierFailure::from(
+            crate::grpc::RecoveryProbeError::OtherIncarnation
+        ),
+        crate::meta::confirm::BarrierFailure::Unreachable
+    ));
+}

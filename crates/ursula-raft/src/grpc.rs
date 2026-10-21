@@ -57,6 +57,7 @@ use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
 use crate::format_epoch::observe_outbound_status;
 use crate::format_epoch::record_format_epoch_mismatch;
 use crate::forward::write_commands_on_raft;
+use crate::incarnation::Rpc;
 use crate::memberships::BarrierAnswer;
 use crate::memberships::LeaderMemberships;
 use crate::peer_channel::peer_endpoint;
@@ -263,11 +264,60 @@ pub(crate) type RaftClient = raft_internal_proto::raft_internal_client::RaftInte
     InterceptedService<Channel, PeerIdentity>,
 >;
 
-/// A Raft gRPC server that admits only peers of this node's cluster.
+/// A Raft gRPC server that admits only peers of this node's cluster, and
+/// stamps its node id and process incarnation on every answer.
 pub type RaftGrpcServer<S> = InterceptedService<
-    raft_internal_proto::raft_internal_server::RaftInternalServer<S>,
+    StampAnswers<raft_internal_proto::raft_internal_server::RaftInternalServer<S>>,
     ClusterCheck,
 >;
+
+/// The responder's stamp on the Raft plane: this node's id and process
+/// incarnation ([`crate::incarnation::Stamp`]) in the headers of every
+/// answer and refusal a handler gives, `AppendStream` response headers
+/// included. It runs inside the cluster check, so a refusal for another
+/// cluster carries none.
+#[derive(Debug, Clone)]
+pub struct StampAnswers<S> {
+    inner: S,
+    peer_cluster: PeerCluster,
+}
+
+impl<S, B, R> tonic::codegen::Service<tonic::codegen::http::Request<B>> for StampAnswers<S>
+where
+    S: tonic::codegen::Service<
+            tonic::codegen::http::Request<B>,
+            Response = tonic::codegen::http::Response<R>,
+        >,
+    S::Future: Send + 'static,
+{
+    type Response = tonic::codegen::http::Response<R>;
+    type Error = S::Error;
+    type Future = tonic::codegen::BoxFuture<Self::Response, Self::Error>;
+
+    fn poll_ready(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: tonic::codegen::http::Request<B>) -> Self::Future {
+        let answer = self.inner.call(request);
+        let peer_cluster = self.peer_cluster.clone();
+        Box::pin(async move {
+            let mut response = answer.await?;
+            let headers = std::mem::take(response.headers_mut());
+            let mut metadata = tonic::metadata::MetadataMap::from_headers(headers);
+            peer_cluster.stamp().write(&mut metadata);
+            *response.headers_mut() = metadata.into_headers();
+            Ok(response)
+        })
+    }
+}
+
+impl<S: tonic::server::NamedService> tonic::server::NamedService for StampAnswers<S> {
+    const NAME: &'static str = S::NAME;
+}
 
 pub use ursula_proto::admin::QuorumPrefix;
 
@@ -293,6 +343,11 @@ pub(crate) enum RecoveryProbeError {
     /// The answer's memberships are not a live leader's.
     #[error("recovery answer: {0}")]
     Memberships(#[from] crate::memberships::MalformedMembership),
+    /// The peer's process fence refused the ask, or this node discarded its
+    /// answer as from another process than the one it holds for the peer:
+    /// no answer, asked again.
+    #[error("the recovery peer's answer is not from the process this node holds for it")]
+    OtherIncarnation,
 }
 
 /// How a barrier the gRPC recovery transport asked for failed: a peer not
@@ -302,7 +357,9 @@ pub(crate) enum RecoveryProbeError {
 impl From<RecoveryProbeError> for crate::meta::confirm::BarrierFailure {
     fn from(error: RecoveryProbeError) -> Self {
         match error {
-            RecoveryProbeError::Channel(_) => Self::Unreachable,
+            RecoveryProbeError::Channel(_) | RecoveryProbeError::OtherIncarnation => {
+                Self::Unreachable
+            }
             RecoveryProbeError::Rpc(status) => Self::of_status(&status),
             RecoveryProbeError::Payload(_)
             | RecoveryProbeError::OtherTarget { .. }
@@ -360,10 +417,15 @@ pub(crate) async fn probe_rejoin_vote_barrier(
         },
     ));
     request.set_timeout(timeout);
+    let peer_cluster = network.transport.peer_cluster.clone();
+    peer_cluster.stamp_target(leader_id, request.metadata_mut());
     let response = match client.rejoin_barrier(request).await {
         Ok(response) => {
-            crate::peer_cluster::check_sender_fence(network.transport.identity.fence())
-                .map_err(tonic::Status::from)?;
+            let stamp = crate::incarnation::Stamp::of(response.metadata());
+            if let Err(discarded) = peer_cluster.accept_responder(leader_id, stamp) {
+                network.discarded(discarded);
+                return Err(RecoveryProbeError::OtherIncarnation);
+            }
             response.into_inner()
         }
         Err(status) => {
@@ -372,12 +434,20 @@ pub(crate) async fn probe_rejoin_vote_barrier(
                 network.misdelivered(node);
                 return Err(RecoveryProbeError::OtherNode { node });
             }
-            network.transport.peer_cluster.observe_refusal(
+            if peer_cluster.observe_refusal(
                 leader_id,
                 &channel.endpoint,
                 &status,
                 crate::rt::time::Instant::now(),
-            );
+            ) {
+                return Err(status.into());
+            }
+            if let Some(effect) = peer_cluster.observe_failure(leader_id, &status) {
+                network.fence_effect(effect);
+            }
+            if crate::target::fence_refusal(&status, leader_id).is_some() {
+                return Err(RecoveryProbeError::OtherIncarnation);
+            }
             return Err(status.into());
         }
     };
@@ -430,10 +500,17 @@ pub(crate) async fn genesis_probe(
     let mut client = channel.client.clone();
     let mut request = tonic::Request::new(crate::meta::genesis::genesis_probe_request(peer, probe));
     request.set_timeout(timeout);
+    let peer_cluster = network.transport.peer_cluster.clone();
+    peer_cluster.stamp_target(peer, request.metadata_mut());
     let status = match client.genesis_probe(request).await {
-        // An answer reaching a fenced node is lost.
-        Ok(_) if !network.transport.identity.fence().admits_now() => return None,
         Ok(ack) => {
+            // An answer reaching a fenced node, or from another process
+            // than the one this node holds for the peer, is lost.
+            let stamp = crate::incarnation::Stamp::of(ack.metadata());
+            if let Err(discarded) = peer_cluster.accept_responder(peer, stamp) {
+                network.discarded(discarded);
+                return None;
+            }
             return match crate::meta::genesis::genesis_answer(&ack.into_inner()) {
                 Ok(answer) => Some(PeerGroupLog::from(answer)),
                 Err(error) => {
@@ -463,12 +540,11 @@ pub(crate) async fn genesis_probe(
         return None;
     }
     observe_outbound_status("GenesisProbe", &status);
-    network.transport.peer_cluster.observe_refusal(
-        peer,
-        &endpoint,
-        &status,
-        crate::rt::time::Instant::now(),
-    );
+    if !peer_cluster.observe_refusal(peer, &endpoint, &status, crate::rt::time::Instant::now())
+        && let Some(effect) = peer_cluster.observe_failure(peer, &status)
+    {
+        network.fence_effect(effect);
+    }
     None
 }
 
@@ -876,10 +952,13 @@ pub fn raft_grpc_service(registry: RaftGroupHandleRegistry) -> RaftGrpcServer<Ra
 pub fn raft_grpc_server<S>(service: S, peer_cluster: &PeerCluster) -> RaftGrpcServer<S>
 where S: raft_internal_proto::raft_internal_server::RaftInternal {
     InterceptedService::new(
-        raft_internal_proto::raft_internal_server::RaftInternalServer::new(service)
-            .accept_compressed(CompressionEncoding::Zstd)
-            .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
-            .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES),
+        StampAnswers {
+            inner: raft_internal_proto::raft_internal_server::RaftInternalServer::new(service)
+                .accept_compressed(CompressionEncoding::Zstd)
+                .max_decoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES)
+                .max_encoding_message_size(RAFT_GRPC_MAX_MESSAGE_BYTES),
+            peer_cluster: peer_cluster.clone(),
+        },
         peer_cluster.server_check(),
     )
 }
@@ -958,11 +1037,13 @@ async fn handle_append_envelope(
     registry: RaftGroupHandleRegistry,
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
     via: AppendVia,
+    admitted: Option<AdmittedPeer>,
 ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
     let replica = validate_raft_rpc_preamble_with(
         &registry,
         envelope.protocol_version,
         &envelope,
+        admitted.as_ref(),
         |target| match via {
             AppendVia::Unary => Ok(()),
             AppendVia::Stream(Some(plane)) if plane == target.plane() => Ok(()),
@@ -1001,22 +1082,26 @@ async fn handle_append_envelope(
 
 /// The responder's fence check, right before an answer leaves: while the
 /// node fence does not admit, the answer is discarded and the request is
-/// refused as at its arrival ([`crate::peer_cluster::PeerClusterError::Fenced`]).
+/// refused as at its arrival ([`crate::peer_cluster::PeerClusterError::Fence`]).
 fn answer_fence(
     registry: &RaftGroupHandleRegistry,
 ) -> Result<(), crate::peer_cluster::PeerClusterError> {
     registry.peer_cluster().check_receiver_fence()
 }
 
+/// One item of an `AppendStream` frame, checked against the stream's
+/// open-time identities (`admitted`). A fence refusal is `Err`: it ends the
+/// stream with that status, in its trailers, as an item cannot carry it.
 async fn handle_append_stream_item(
     registry: RaftGroupHandleRegistry,
     concurrency: Arc<Semaphore>,
     plane: Option<raft_internal_proto::RaftPlaneV1>,
+    admitted: Option<AdmittedPeer>,
     item: raft_internal_proto::RaftAppendStreamRequestItem,
-) -> raft_internal_proto::RaftAppendStreamResponseItem {
+) -> Result<raft_internal_proto::RaftAppendStreamResponseItem, tonic::Status> {
     let request_id = item.request_id;
     let Ok(_permit) = concurrency.acquire_owned().await else {
-        return raft_internal_proto::RaftAppendStreamResponseItem {
+        return Ok(raft_internal_proto::RaftAppendStreamResponseItem {
             request_id,
             result: Some(
                 raft_internal_proto::raft_append_stream_response_item::Result::Error(
@@ -1025,13 +1110,22 @@ async fn handle_append_stream_item(
                     )),
                 ),
             ),
-        };
+        });
     };
     let result = match item.envelope {
         Some(envelope) => {
-            match handle_append_envelope(registry, envelope, AppendVia::Stream(plane)).await {
+            match handle_append_envelope(registry, envelope, AppendVia::Stream(plane), admitted)
+                .await
+            {
                 Ok(ack) => {
                     Some(raft_internal_proto::raft_append_stream_response_item::Result::Ack(ack))
+                }
+                Err(status)
+                    if status
+                        .metadata()
+                        .contains_key(crate::target::FENCE_METADATA) =>
+                {
+                    return Err(status);
                 }
                 Err(status) => Some(
                     raft_internal_proto::raft_append_stream_response_item::Result::Error(
@@ -1048,7 +1142,7 @@ async fn handle_append_stream_item(
             ),
         ),
     };
-    raft_internal_proto::RaftAppendStreamResponseItem { request_id, result }
+    Ok(raft_internal_proto::RaftAppendStreamResponseItem { request_id, result })
 }
 
 #[tonic::async_trait]
@@ -1065,10 +1159,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let ack = handle_append_envelope(
             self.registry.clone(),
             request.into_inner(),
             AppendVia::Unary,
+            admitted,
         )
         .await?;
         Ok(tonic::Response::new(ack))
@@ -1080,6 +1176,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     ) -> Result<tonic::Response<Self::AppendStreamStream>, tonic::Status> {
         let registry = self.registry.clone();
         let plane = crate::target::stream_plane(request.metadata());
+        // The identities the stream opened with, which every item is
+        // checked against.
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let concurrency = Arc::new(Semaphore::new(64));
         // Decoded frames waiting for (or in) processing hold a share of this budget; the next
         // frame is not read off the stream until it fits, so a slow follower pushes back through
@@ -1135,18 +1234,21 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     // refusal in the trailers, before or after the frame's
                     // items ran, so the sender's pending items fail as lost.
                     answer_fence(&registry)?;
-                    let items = futures_util::stream::iter(request.items)
+                    let items: Vec<_> = futures_util::stream::iter(request.items)
                         .map(|item| {
                             handle_append_stream_item(
                                 registry.clone(),
                                 concurrency.clone(),
                                 plane,
+                                admitted,
                                 item,
                             )
                         })
                         .buffer_unordered(64)
                         .collect()
                         .await;
+                    // The first fence refusal ends the stream with it.
+                    let items = items.into_iter().collect::<Result<Vec<_>, _>>()?;
                     answer_fence(&registry)?;
                     Ok(raft_internal_proto::RaftAppendStreamResponse { items })
                 }
@@ -1159,9 +1261,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let envelope = request.into_inner();
-        let replica =
-            validate_raft_rpc_preamble(&self.registry, envelope.protocol_version, &envelope)?;
+        let replica = validate_raft_rpc_preamble(
+            &self.registry,
+            envelope.protocol_version,
+            &envelope,
+            admitted.as_ref(),
+        )?;
         let request: UrsulaVoteRequest =
             decode_rpc_payload(&envelope.payload, "raft vote request")?;
         let response = match replica {
@@ -1179,9 +1286,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let request = request.into_inner();
-        let replica =
-            validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
+        let replica = validate_raft_rpc_preamble(
+            &self.registry,
+            request.protocol_version,
+            &request,
+            admitted.as_ref(),
+        )?;
         let vote: VoteOf<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.vote, "full snapshot vote")?;
         let meta: SnapshotMetaOf<UrsulaRaftTypeConfig> =
@@ -1244,6 +1356,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .registry
                         .entry(placement.raft_group_id)
                         .map_err(group_rpc_status)?;
+                    self.registry
+                        .peer_cluster()
+                        .receive(admitted.as_ref(), Rpc::Forward)?;
                     let raft = entry.raft().clone();
                     let fence = raft.fence().clone();
                     let history = entry.core.history.clone();
@@ -1269,11 +1384,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .registry
                         .meta()
                         .ok_or_else(|| no_meta_replica("GroupWrite"))?;
-                    let AdmittedPeer(sender) = admitted.ok_or_else(|| {
+                    let AdmittedPeer { node: sender, .. } = admitted.ok_or_else(|| {
                         GrpcRpcError::invalid_argument(
                             "GroupWrite to the meta plane names no admitted sender",
                         )
                     })?;
+                    self.registry
+                        .peer_cluster()
+                        .receive(admitted.as_ref(), Rpc::Forward)?;
                     write_results(
                         meta.write_forwarded(
                             commands(&request)?,
@@ -1296,9 +1414,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::RejoinBarrierRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RejoinBarrierResponseV1>, tonic::Status> {
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let request = request.into_inner();
-        let replica =
-            validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
+        let replica = validate_raft_rpc_preamble(
+            &self.registry,
+            request.protocol_version,
+            &request,
+            admitted.as_ref(),
+        )?;
         let target = replica.target();
         let answer = match replica {
             LocalReplica::Data(group) => self.registry.confirm_recovery_barrier(group).await,
@@ -1321,9 +1444,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let request = request.into_inner();
-        let replica =
-            validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
+        let replica = validate_raft_rpc_preamble(
+            &self.registry,
+            request.protocol_version,
+            &request,
+            admitted.as_ref(),
+        )?;
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
         let response = match replica {
@@ -1353,6 +1481,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         &self,
         request: tonic::Request<raft_internal_proto::GenesisProbeRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::GenesisProbeAckV1>, tonic::Status> {
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         let request = request.into_inner();
         validate_grpc_metadata(request.protocol_version)?;
         crate::target::check_target_node(request.target_node, local_node(&self.registry)?)?;
@@ -1362,6 +1491,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             .registry
             .meta()
             .ok_or_else(|| no_meta_replica("GenesisProbe"))?;
+        self.registry
+            .peer_cluster()
+            .receive(admitted.as_ref(), Rpc::Raft)?;
         let answer = meta
             .answer_genesis_probe(probe)
             .await
@@ -1381,6 +1513,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         // Link this forwarded read to the originating request's trace.
         let span = tracing::info_span!("raft.group_read");
         span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         async move {
             let request = request.into_inner();
             validate_grpc_metadata(request.protocol_version)?;
@@ -1402,6 +1535,9 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .registry
                 .entry(placement.raft_group_id)
                 .map_err(group_rpc_status)?;
+            self.registry
+                .peer_cluster()
+                .receive(admitted.as_ref(), Rpc::Forward)?;
             let raft = entry.raft().clone();
             let read_barrier = entry.core.barrier.clone();
             let cold_store = self.cold_store.clone();
@@ -1572,13 +1708,47 @@ impl LocalReplica {
 /// protocol version, then the target (plane, group and target node,
 /// [`RaftTarget::parse`]), then the replica lookup, which answers
 /// `NOT_FOUND` for a group this node does not run and for the meta group on
-/// a node that runs no meta replica.
+/// a node that runs no meta replica, then the process fence on the sender
+/// and target processes `admitted` names ([`PeerCluster::receive`]). The
+/// startup format-epoch probe, for a group no node runs, meets `NOT_FOUND`
+/// before the fence, whatever it names.
 fn validate_raft_rpc_preamble<R: TargetedRequest>(
     registry: &RaftGroupHandleRegistry,
     protocol_version: u32,
     request: &R,
-) -> Result<LocalReplica, GrpcRpcError> {
-    validate_raft_rpc_preamble_with(registry, protocol_version, request, |_| Ok(()))
+    admitted: Option<&AdmittedPeer>,
+) -> Result<LocalReplica, PreambleRefusal> {
+    validate_raft_rpc_preamble_with(registry, protocol_version, request, admitted, |_| Ok(()))
+}
+
+/// Why the preamble refused an inbound Raft RPC: a malformed or
+/// misdelivered request or a group this node does not run, or the process
+/// fence.
+#[derive(Debug)]
+enum PreambleRefusal {
+    Rpc(GrpcRpcError),
+    Fence(crate::peer_cluster::PeerClusterError),
+}
+
+impl From<GrpcRpcError> for PreambleRefusal {
+    fn from(error: GrpcRpcError) -> Self {
+        Self::Rpc(error)
+    }
+}
+
+impl From<crate::peer_cluster::PeerClusterError> for PreambleRefusal {
+    fn from(error: crate::peer_cluster::PeerClusterError) -> Self {
+        Self::Fence(error)
+    }
+}
+
+impl From<PreambleRefusal> for tonic::Status {
+    fn from(refusal: PreambleRefusal) -> Self {
+        match refusal {
+            PreambleRefusal::Rpc(error) => error.into(),
+            PreambleRefusal::Fence(error) => error.into(),
+        }
+    }
 }
 
 /// [`validate_raft_rpc_preamble`] with `check` on the parsed target before
@@ -1587,22 +1757,28 @@ fn validate_raft_rpc_preamble_with<R: TargetedRequest>(
     registry: &RaftGroupHandleRegistry,
     protocol_version: u32,
     request: &R,
+    admitted: Option<&AdmittedPeer>,
     check: impl FnOnce(RaftTarget) -> Result<(), GrpcRpcError>,
-) -> Result<LocalReplica, GrpcRpcError> {
+) -> Result<LocalReplica, PreambleRefusal> {
     validate_grpc_metadata(protocol_version)?;
     let target = RaftTarget::parse(request, local_node(registry)?)?;
     check(target)?;
-    match target {
-        RaftTarget::Data(group) if registry.contains_group(group) => Ok(LocalReplica::Data(group)),
-        RaftTarget::Data(group) => Err(GrpcRpcError::not_found(format!(
-            "raft group {} is not registered on this node",
-            group.0
-        ))),
+    let replica = match target {
+        RaftTarget::Data(group) if registry.contains_group(group) => LocalReplica::Data(group),
+        RaftTarget::Data(group) => {
+            return Err(GrpcRpcError::not_found(format!(
+                "raft group {} is not registered on this node",
+                group.0
+            ))
+            .into());
+        }
         RaftTarget::Meta => registry
             .meta()
             .map(LocalReplica::Meta)
-            .ok_or_else(|| no_meta_replica(R::NAME)),
-    }
+            .ok_or_else(|| no_meta_replica(R::NAME))?,
+    };
+    registry.peer_cluster().receive(admitted, Rpc::Raft)?;
+    Ok(replica)
 }
 
 /// The refusal of a meta-plane `request` on a node that runs no meta
@@ -1704,6 +1880,9 @@ pub(crate) enum PeerRefusal {
     OtherCluster,
     /// The address dialed serves node `refusing_node` now.
     Misdelivered { refusing_node: u64 },
+    /// The peer's process fence refused the call, or its stamp names a
+    /// process the table refuses ([`crate::incarnation::Effect`]).
+    Fence { effect: crate::incarnation::Effect },
 }
 
 /// The owner-core channel a [`GrpcRaftNetwork`] sends on.
@@ -1881,6 +2060,40 @@ impl GrpcRaftNetwork {
         );
     }
 
+    /// Retires the channel and append session to the target: they reach a
+    /// process the table refuses, or a fenced one. The next call dials a
+    /// new connection, so a moved address resolves afresh.
+    fn retire(&mut self) {
+        let Ok(channel) = &self.channel else {
+            return;
+        };
+        let endpoint = channel.endpoint.clone();
+        let generation = channel.generation;
+        retire_append_session(&self.transport, &endpoint, generation);
+        self.consecutive_failures = 0;
+        self.channel = shared_raft_client(&self.transport, &endpoint, Some(generation)).map(
+            |(client, generation)| PeerChannel {
+                endpoint,
+                client,
+                generation,
+            },
+        );
+    }
+
+    /// Takes the sender table's answer to a fence refusal.
+    fn fence_effect(&mut self, effect: crate::incarnation::Effect) {
+        if effect == crate::incarnation::Effect::Retire {
+            self.retire();
+        }
+    }
+
+    /// Takes an answer this node discarded before decoding it.
+    fn discarded(&mut self, discarded: crate::incarnation::Discarded) {
+        if discarded.retires() {
+            self.retire();
+        }
+    }
+
     /// The Raft target this client's requests name.
     fn raft_target(&self) -> RaftTarget {
         self.raft_target
@@ -1959,11 +2172,20 @@ impl GrpcRaftNetwork {
             self.endpoint(),
             status
         );
+        // Read last, and only when neither of the above decided: the
+        // responder's stamp and a fence refusal.
+        let fence = (!other_cluster && refusing_node.is_none())
+            .then(|| {
+                self.transport
+                    .peer_cluster
+                    .observe_failure(self.target, &status)
+            })
+            .flatten();
         let error = match status.code() {
             tonic::Code::Unavailable | tonic::Code::Cancelled => {
                 RPCError::Unreachable(Unreachable::from_string(message))
             }
-            // A fenced peer refuses until its disk lease holds again.
+            // A fence refusal is a lost RPC: nothing ran for it.
             _ if other_cluster
                 || refusing_node.is_some()
                 || crate::target::fence_refusal(&status, self.target).is_some() =>
@@ -1972,9 +2194,11 @@ impl GrpcRaftNetwork {
             }
             _ => raft_rpc_network_error(message),
         };
-        let refusal = match refusing_node {
-            Some(refusing_node) => Some(PeerRefusal::Misdelivered { refusing_node }),
-            None => other_cluster.then_some(PeerRefusal::OtherCluster),
+        let refusal = match (refusing_node, fence) {
+            (Some(refusing_node), _) => Some(PeerRefusal::Misdelivered { refusing_node }),
+            (None, _) if other_cluster => Some(PeerRefusal::OtherCluster),
+            (None, Some(effect)) => Some(PeerRefusal::Fence { effect }),
+            (None, None) => None,
         };
         (error, refusal)
     }
@@ -2004,12 +2228,25 @@ impl GrpcRaftNetwork {
         let use_zstd = request.encoded_len() >= RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES;
         let mut request = tonic::Request::new(request);
         self.apply_rpc_timeout(&mut request, option);
+        self.transport
+            .peer_cluster
+            .stamp_target(self.target, request.metadata_mut());
         let mut client = self.client()?;
         if use_zstd {
             client = client.send_compressed(CompressionEncoding::Zstd);
         }
         match send(client, request).await {
             Ok(response) => {
+                // Never decoded unless its stamp is the target's process.
+                let stamp = crate::incarnation::Stamp::of(response.metadata());
+                if let Err(discarded) = self
+                    .transport
+                    .peer_cluster
+                    .accept_responder(self.target, stamp)
+                {
+                    self.discarded(discarded);
+                    return Err(RPCError::Unreachable(Unreachable::new(&discarded)));
+                }
                 self.note_success();
                 Ok(response.into_inner())
             }
@@ -2024,6 +2261,8 @@ impl GrpcRaftNetwork {
                     Some(PeerRefusal::Misdelivered { refusing_node }) => {
                         self.misdelivered(refusing_node);
                     }
+                    // A fence refusal is an answer over a working channel.
+                    Some(PeerRefusal::Fence { effect }) => self.fence_effect(effect),
                 }
                 Err(mapped)
             }
@@ -2128,9 +2367,16 @@ impl GrpcRaftNetwork {
                 let (mapped, refusal) = self.map_tonic_status("AppendStream", error.into());
                 // An item refused as meant for another node: the session
                 // streams to the wrong node, so the channel is dialed again.
-                if let Some(PeerRefusal::Misdelivered { refusing_node }) = refusal {
-                    self.misdelivered(refusing_node);
-                    return Err(mapped);
+                match refusal {
+                    Some(PeerRefusal::Misdelivered { refusing_node }) => {
+                        self.misdelivered(refusing_node);
+                        return Err(mapped);
+                    }
+                    Some(PeerRefusal::Fence { effect }) => {
+                        self.fence_effect(effect);
+                        return Err(mapped);
+                    }
+                    Some(PeerRefusal::OtherCluster) | None => {}
                 }
                 // The append stream's calls only see a refused stream close; the
                 // session recorded the refusal. Like a full queue, it is not a
@@ -2430,7 +2676,8 @@ type WireFrame = (
 );
 
 /// Where an append session records its peer's refusal to open it for
-/// another cluster id: the stream's calls only see it close.
+/// another cluster id, and its process fence's refusal that ends it: the
+/// stream's calls only see it close.
 struct PeerRefusals {
     peer_cluster: PeerCluster,
     target: u64,
@@ -2456,6 +2703,10 @@ async fn run_append_session(
     request
         .metadata_mut()
         .insert(crate::target::RAFT_PLANE_METADATA, plane);
+    let peer_cluster = &refusals.peer_cluster;
+    let target = refusals.target;
+    let sent = peer_cluster.target_incarnation(target);
+    peer_cluster.stamp_target(target, request.metadata_mut());
     let response = tokio::time::timeout(
         RAFT_GRPC_APPEND_STREAM_CONNECT_TIMEOUT,
         client.append_stream(request),
@@ -2463,6 +2714,16 @@ async fn run_append_session(
     .await;
     let mut responses = match response {
         Ok(Ok(response)) => {
+            // The stream binds one process at each end at its open: the one
+            // this node named, or, if it named none, one the table accepts.
+            // Otherwise the stamp raised or was discarded, and the session
+            // ends, so the next call opens one with the current table.
+            let stamp = crate::incarnation::Stamp::of(response.metadata());
+            let accepted = peer_cluster.accept_responder(target, stamp).is_ok();
+            if !accepted || sent.is_some_and(|sent| stamp.incarnation != Some(sent)) {
+                GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             GRPC_APPEND_STREAM_SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
             response.into_inner()
         }
@@ -2482,6 +2743,8 @@ async fn run_append_session(
         }
     };
 
+    // The process the stream is bound to, as the table holds it.
+    let bound = peer_cluster.target_incarnation(target);
     let mut wire_sender = Some(wire_sender);
     let mut pending = PendingAppends::default();
     let mut next_request_id = 1_u64;
@@ -2514,6 +2777,16 @@ async fn run_append_session(
             biased;
             response = responses.message() => {
                 match response {
+                    // The sender fenced, or its entry for the target rose
+                    // above the process the stream is bound to: the frame
+                    // is lost, and the session ends.
+                    Ok(Some(_))
+                        if !peer_cluster.fence().admits_now()
+                            || peer_cluster.target_incarnation(target) != bound =>
+                    {
+                        GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
                     Ok(Some(response)) => {
                         last_progress = tokio::time::Instant::now();
                         GRPC_APPEND_STREAM_RESPONSE_FRAMES.fetch_add(1, Ordering::Relaxed);
@@ -2543,8 +2816,13 @@ async fn run_append_session(
                         GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
                         break;
                     }
-                    Err(_status) => {
+                    Err(status) => {
                         GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
+                        // A fence refusal of the bound process ends the
+                        // stream: the sender table takes it.
+                        if let Some(refusal) = crate::target::fence_refusal(&status, target) {
+                            peer_cluster.observe_fence_refusal(target, refusal);
+                        }
                         break;
                     }
                 }
@@ -2674,7 +2952,6 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             })
             .await?;
         GRPC_VOTE_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-        self.check_fence()?;
         self.decode_rpc_ack("Vote", &ack.payload)
     }
 
@@ -2712,7 +2989,6 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
             ack = sent => ack.map_err(StreamingError::from)?,
         };
         GRPC_SNAPSHOT_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
-        self.check_fence()?;
         self.decode_rpc_ack("FullSnapshot", &ack.response)
             .map_err(StreamingError::from)
     }
@@ -2734,7 +3010,6 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
                 |mut client, request| async move { client.transfer_leader(request).await },
             )
             .await?;
-        self.check_fence()?;
         self.decode_rpc_ack("TransferLeader", &ack.response)
     }
 }
@@ -2879,7 +3154,10 @@ mod reconnect_tests {
         use crate::target::FenceRefusal;
 
         let net = fresh_network(8);
-        let receiver = tonic::Status::from(PeerClusterError::Fenced { node_id: 2 });
+        let receiver = tonic::Status::from(PeerClusterError::Fence {
+            node_id: 2,
+            refusal: FenceRefusal::Fenced,
+        });
         assert_eq!(
             crate::target::fence_refusal(&receiver, 2),
             Some(FenceRefusal::Fenced)
@@ -2932,12 +3210,129 @@ mod reconnect_tests {
             tonic::Request::new(()),
         )
         .unwrap();
-        let refused = tonic::service::Interceptor::call(&mut server.server_check(), request)
-            .expect_err("a fenced receiver takes no request");
+        // The cluster check admits it: the fence runs after the group
+        // lookup, so the format-epoch probe still meets `NOT_FOUND`.
+        let admitted = tonic::service::Interceptor::call(&mut server.server_check(), request)
+            .expect("the cluster check admits a peer of the cluster");
+        let admitted = admitted
+            .extensions()
+            .get::<AdmittedPeer>()
+            .copied()
+            .unwrap();
+        let refused = tonic::Status::from(
+            server
+                .receive(Some(&admitted), crate::incarnation::Rpc::Raft)
+                .expect_err("a fenced receiver takes no request"),
+        );
         assert_eq!(
             crate::target::fence_refusal(&refused, 2),
             Some(FenceRefusal::Fenced)
         );
+    }
+
+    /// The stamp layer and the fence's place in the preamble, over real
+    /// gRPC: every answer, a refusal included, names the responder's node
+    /// and process, which the sender's table takes; a fenced node still
+    /// answers the startup probe's group `NOT_FOUND`, and ends an
+    /// `AppendStream` at its first frame with its refusal in the trailers.
+    #[tokio::test]
+    async fn answers_carry_the_responder_s_process_and_the_fence_follows_the_group_lookup() {
+        use crate::incarnation::Stamp;
+        use crate::target::FenceRefusal;
+        let process = |run| ursula_proto::placement::ProcessIncarnation {
+            root: ursula_proto::placement::RootId::new(std::num::NonZeroU64::new(0x3a).unwrap()),
+            run,
+            nonce: 0x51,
+        };
+        let cluster_id =
+            ursula_headers::ClusterId::new(crate::peer_cluster::TEST_CLUSTER_ID).unwrap();
+        let identity = |node, fence, incarnation| {
+            PeerIdentity::of_process(node, cluster_id.clone(), fence, incarnation)
+        };
+        let unleased = ursula_runtime::NodeFence::unleased;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let registry = RaftGroupHandleRegistry::default();
+        registry.peer_cluster().bind(
+            identity(2, unleased(), process(7)),
+            crate::PeerDirectory::default(),
+        );
+        let served = registry.clone();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(raft_grpc_service(served))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await
+                .unwrap();
+        });
+        let sender = PeerCluster::default();
+        let sender_identity = identity(1, unleased(), process(1));
+        sender.bind(sender_identity.clone(), crate::PeerDirectory::default());
+        let transport = Arc::new(CoreRaftTransport::new(sender_identity, sender.clone()));
+        let mut network = test_network(transport, RaftGroupId(0), 2, address.clone());
+        let vote = || UrsulaVoteRequest::new(openraft::Vote::new(1, 1), None);
+        // A group node 2 does not run: `NOT_FOUND`, stamped, and the
+        // table takes node 2's process from it.
+        network
+            .vote(vote(), RPCOption::new(Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(sender.target_incarnation(2), Some(process(7)));
+        // Node 2 answers as an older process now: discarded, not raised.
+        registry.peer_cluster().bind(
+            identity(2, unleased(), process(6)),
+            crate::PeerDirectory::default(),
+        );
+        network
+            .vote(vote(), RPCOption::new(Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(sender.target_incarnation(2), Some(process(7)));
+        assert_eq!(sender.incarnation_counts().discarded, 1);
+
+        // A fenced node 2: the format-epoch probe's group meets `NOT_FOUND`
+        // before the fence, and a stream ends at its first frame.
+        let fenced = ursula_runtime::NodeFence::leased(Duration::from_secs(5));
+        registry.peer_cluster().bind(
+            identity(2, fenced, process(8)),
+            crate::PeerDirectory::default(),
+        );
+        let channel = Endpoint::from_shared(address)
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = raft_client(channel, &identity(1, unleased(), process(1)));
+        let mut probe = raft_internal_proto::RaftRpcEnvelopeV1 {
+            protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+            ..Default::default()
+        };
+        RaftTarget::Data(RaftGroupId(crate::format_epoch::FORMAT_EPOCH_PROBE_GROUP))
+            .stamp(2, &mut probe);
+        let status = client.vote(probe).await.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::NotFound);
+        assert_eq!(Stamp::of(status.metadata()), Stamp {
+            node: Some(2),
+            incarnation: Some(process(8)),
+        });
+        let (frames, receiver) = mpsc::channel(1);
+        frames
+            .send(raft_internal_proto::RaftAppendStreamRequest { items: vec![] })
+            .await
+            .unwrap();
+        let mut request = tonic::Request::new(ReceiverStream::new(receiver));
+        request.metadata_mut().insert(
+            crate::target::RAFT_PLANE_METADATA,
+            tonic::metadata::AsciiMetadataValue::from_static("data"),
+        );
+        let opened = client.append_stream(request).await.unwrap();
+        assert_eq!(Stamp::of(opened.metadata()).incarnation, Some(process(8)));
+        let ended = opened.into_inner().message().await.unwrap_err();
+        assert_eq!(
+            crate::target::fence_refusal(&ended, 2),
+            Some(FenceRefusal::Fenced)
+        );
+        server.abort();
     }
 
     #[test]

@@ -90,7 +90,13 @@
 //!   `ursula-target-incarnation` and `ursula-fence` with its six refusals,
 //!   which a sender reads only after the mismatch text, a cluster refusal
 //!   and a misdelivery, and a misdelivery only from a refusal that names
-//!   another node than the request's target;
+//!   another node than the request's target. Every Raft request but the
+//!   format-epoch probe names its sender's process, and the target's when
+//!   the sender holds one, an `AppendStream` at its open; every answer and
+//!   refusal a handler gives names the responder's node id and process in
+//!   `ursula-node-id` and `ursula-incarnation`; a receiver checks them after
+//!   its group lookup, and a sender decodes only an answer whose process its
+//!   table accepts;
 //! - two variant casings, each frozen with the epoch. The Raft-layer
 //!   envelopes (`StreamCommand`, `RaftCommand`, `MetaCommand`,
 //!   `MetaResponse` and `GenesisAnswer`) keep serde's default `PascalCase`

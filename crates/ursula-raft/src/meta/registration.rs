@@ -38,9 +38,9 @@ use super::pause::MetaPauses;
 use super::replica::ActiveMeta;
 use super::root::RootGuard;
 use super::root::RootStanding;
-use super::root::Supersession;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
+use crate::peer_cluster::Supersession;
 use crate::rt::sync::watch;
 
 /// How long a registered node goes without a meta leader before it

@@ -351,10 +351,11 @@ impl NodeFence {
 
     /// Closes the fence for good because another process may answer as
     /// this node. Unlike a shutdown's close, it keeps the run from
-    /// recording a clean end.
-    pub fn supersede(&self) {
-        self.0.superseded.store(true, Ordering::Release);
+    /// recording a clean end. Returns whether this call superseded it.
+    pub fn supersede(&self) -> bool {
+        let first = !self.0.superseded.swap(true, Ordering::AcqRel);
         self.0.closed.store(true, Ordering::Release);
+        first
     }
 
     /// Whether the fence closed for good ([`Self::close`],
@@ -563,7 +564,9 @@ mod tests {
         // a later shutdown's close keeps it superseded.
         let superseded = NodeFence::leased(L);
         superseded.record_probe(t, ProbeOutcome::Synced, t);
-        superseded.supersede();
+        // Only the first call supersedes.
+        assert!(superseded.supersede());
+        assert!(!superseded.supersede());
         superseded.record_probe(at(t, 100), ProbeOutcome::Synced, at(t, 100));
         superseded.close();
         assert_eq!(superseded.status(at(t, 200)), FenceStatus::Superseded);

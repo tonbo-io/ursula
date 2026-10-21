@@ -343,7 +343,7 @@ While the lease does not hold, the node fence refuses:
 
 - every Raft request and answer, in every group and meta: the sender refuses to
   send and drops an answer that arrives (`UNAVAILABLE`, no metadata), and the
-  receiver refuses a request at its arrival and an answer before it leaves
+  receiver refuses a request after its group lookup and an answer before it leaves
   (`FAILED_PRECONDITION` with `ursula-fence: fenced` and its node id), on unary
   calls, on each `AppendStream` frame (the stream ends with the refusal in its
   trailers) and in the in-process transport. A sender reads either as an
@@ -360,7 +360,10 @@ While the lease does not hold, the node fence refuses:
   and its job runs again later.
 - clients: the front door answers `503` with `Retry-After` and `NO_LEADER`,
   local reads included, and so do mutating admin routes. Readiness reports
-  `disk_lease_lost`. The process never exits.
+  `disk_lease_lost`, or `superseded` once the process is fenced for good
+  because another process may answer as this node (the root checks in
+  cluster-membership.md, the process identity on Raft RPCs in
+  thread-per-core-multiraft.md). The process never exits.
 
 A probe that started after the lease ended and succeeds lifts the fence with no
 restart. Journal write and sync errors still poison the writer: the lease says

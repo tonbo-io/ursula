@@ -30,6 +30,7 @@ use ursula_runtime::NodeFence;
 
 use super::watch::PlacementWatch;
 use crate::RaftGroupHandleRegistry;
+use crate::peer_cluster::Supersession;
 
 /// How this run stands on its root in meta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,19 +40,6 @@ pub(crate) enum RootStanding {
     Unbound,
     /// The root held state at its open, or meta bound it in this run.
     Bound,
-}
-
-/// Why this process fences itself for good.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Supersession {
-    /// The meta group refused a registration of this root, which holds
-    /// state, for the slot `slot`.
-    OtherRoot { slot: RootSlot },
-    /// A view shows this root released.
-    Released,
-    /// A view confirmed by a meta read barrier binds this node id to
-    /// `root`.
-    BoundElsewhere { root: RootId },
 }
 
 /// What a view's slot `slot` of this node says to a run standing on
@@ -156,21 +144,9 @@ impl RootGuard {
     /// Fences this process for good: another process may answer as this
     /// node.
     pub(crate) fn supersede(&self, why: Supersession) {
-        if self.0.fence.status(ursula_runtime::node_fence::fence_now())
-            == ursula_runtime::node_fence::FenceStatus::Superseded
-        {
-            return;
+        if crate::peer_cluster::supersede(&self.0.fence, self.0.node.get(), why) {
+            crate::predecessor_wait::sync_fence_shed(&self.0.registry, &self.0.fence);
         }
-        self.0.fence.supersede();
-        crate::predecessor_wait::sync_fence_shed(&self.0.registry, &self.0.fence);
-        tracing::error!(
-            node = %self.0.node,
-            root = %self.0.root,
-            ?why,
-            "superseded: the meta group binds this node id to another root or released this \
-             one. This process takes part in no Raft traffic, writes nothing more to its WAL and \
-             answers clients 503 until it exits"
-        );
     }
 }
 
@@ -191,8 +167,8 @@ mod tests {
     use ursula_proto::placement::RootSlot;
 
     use super::RootStanding;
-    use super::Supersession;
     use super::judge_slot;
+    use crate::peer_cluster::Supersession;
 
     /// Each slot a view can show, to each standing: an unbound root never
     /// fences itself, a bound one on its release in any view and on
