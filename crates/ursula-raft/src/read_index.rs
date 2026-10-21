@@ -23,9 +23,11 @@ use futures_util::FutureExt;
 use futures_util::future::BoxFuture;
 use futures_util::future::Shared;
 use openraft::LinearizerOption;
+use openraft::Raft;
 use openraft::ReadPolicy;
 use openraft::alias::LogIdOf;
 use openraft::rt::WatchReceiver;
+use openraft::storage::RaftStateMachine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::LinearizableReadBarrier;
@@ -35,7 +37,8 @@ use ursula_runtime::ReadIndexFuture;
 use crate::GroupLeadership;
 use crate::forward::unknown_leader;
 use crate::openraft_error::group_engine_linearizable_read_error;
-use crate::registry::RaftGroupHandle;
+use crate::state_machine::RaftGroupStateMachine;
+use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
 /// `Ok(Some(read_log_id))` once the confirmed leader has applied the
@@ -45,8 +48,12 @@ type Round = Shared<BoxFuture<'static, Outcome>>;
 
 const OPERATION: &str = "linearizable read";
 
-pub(crate) struct ReadIndexBarrier {
-    raft: crate::owner::OwnerRaftHandle,
+/// The barrier of one replica, of either plane: generic over its state
+/// machine, the data plane's by default.
+pub(crate) struct ReadIndexBarrier<
+    SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData> = RaftGroupStateMachine,
+> {
+    raft: crate::owner::OwnerRaftHandle<SM>,
     rounds: Arc<Mutex<Rounds>>,
 }
 
@@ -59,12 +66,12 @@ struct Rounds {
     open: bool,
 }
 
-impl ReadIndexBarrier {
-    pub(crate) fn owner(&self) -> &crate::owner::OwnerRaftHandle {
+impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>> ReadIndexBarrier<SM> {
+    pub(crate) fn owner(&self) -> &crate::owner::OwnerRaftHandle<SM> {
         &self.raft
     }
 
-    pub(crate) fn new(raft: RaftGroupHandle) -> Self {
+    pub(crate) fn new(raft: Raft<UrsulaRaftTypeConfig, SM>) -> Self {
         Self {
             raft: crate::owner::OwnerRaftHandle::new(raft),
             rounds: Arc::default(),
@@ -112,13 +119,17 @@ impl ReadIndexBarrier {
     }
 }
 
-impl std::fmt::Debug for ReadIndexBarrier {
+impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>> std::fmt::Debug
+    for ReadIndexBarrier<SM>
+{
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ReadIndexBarrier").finish_non_exhaustive()
     }
 }
 
-impl LinearizableReadBarrier for ReadIndexBarrier {
+impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>>
+    LinearizableReadBarrier for ReadIndexBarrier<SM>
+{
     fn confirm(&self) -> ReadIndexFuture {
         Box::pin(
             self.confirm_read_log_id()
@@ -137,7 +148,9 @@ impl LinearizableReadBarrier for ReadIndexBarrier {
 /// `ForwardToLeader` once this node steps down. The wait for the local apply
 /// is bounded by the same timeout and also ends in a 503, so a read never
 /// hangs on a stalled state machine.
-async fn confirm(raft: &RaftGroupHandle) -> Outcome {
+async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
+    raft: &Raft<UrsulaRaftTypeConfig, SM>,
+) -> Outcome {
     if !raft.is_leader() {
         return Ok(None);
     }

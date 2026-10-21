@@ -508,11 +508,14 @@ pub enum SelfElectionError {
 /// and a replica that applied that index holds every entry such an
 /// acknowledgement could have counted. A deposed leader fails the round, and
 /// the new leader's barrier takes its place.
-pub(crate) async fn confirm_recovery_barrier(
+pub(crate) async fn confirm_recovery_barrier<SM>(
     group: RaftGroupId,
-    raft: &OwnerRaftHandle,
+    raft: &OwnerRaftHandle<SM>,
     barrier: &dyn ursula_runtime::LinearizableReadBarrier,
-) -> Result<crate::BarrierAnswer, QuorumProofError> {
+) -> Result<crate::BarrierAnswer, QuorumProofError>
+where
+    SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
+{
     let before = raft.metrics().borrow_watched().clone();
     if before.current_leader != Some(before.id) || !before.vote.is_committed() {
         return Err(QuorumProofError::NotLeader { group });
