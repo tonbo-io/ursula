@@ -95,16 +95,19 @@ ever held the group never initializes it again.
 ## 3. Admin membership surface
 
 The admin plane binds `server.admin_listen`, which is pod loopback by default
-(`admin_router` in `crates/ursula/src/lib.rs`). Its per-group routes are:
+(`admin_router` in `crates/ursula/src/lib.rs`). Its per-group routes name a
+`{target}`, a data group's id or `meta`, the meta group
+(`parse_raft_target`). The membership and purge routes serve data groups only
+and answer `400` for `meta`:
 
 | Route | Purpose |
 | --- | --- |
-| `POST /__ursula/raft/{group}/membership?voters=` | Change the voter set. Only the leader accepts it, others answer `409`. |
-| `POST /__ursula/raft/{group}/leader/transfer/{node}` | Transfer leadership. |
-| `GET /__ursula/raft/{group}/quorum` | Confirm a fresh quorum prefix for this group. |
-| `POST /__ursula/raft/{group}/self-election` | Start an election on this replica while its term is unchanged. |
-| `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` | Open a stalled recovery gate for the log the operator observed. |
-| `POST /__ursula/raft/{group}/snapshot`, `.../purge` | Build a snapshot or purge the log. |
+| `POST /__ursula/raft/{target}/membership?voters=` | Change the voter set. Only the leader accepts it, others answer `409`. |
+| `POST /__ursula/raft/{target}/leader/transfer/{node}` | Transfer leadership. |
+| `GET /__ursula/raft/{target}/quorum` | Confirm a fresh quorum prefix for this group. |
+| `POST /__ursula/raft/{target}/self-election` | Start an election on this replica while its term is unchanged. |
+| `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` | Take a recovery plan for a stalled group. Its `floor` names the plane (`meta` or `seeded`), and a floor of the other plane is refused with `floor_other_plane` before the plan runs. |
+| `POST /__ursula/raft/{target}/snapshot`, `.../purge` | Build a snapshot or purge the log. |
 | `POST`/`DELETE /__ursula/leadership-shed/maintenance` | Set or clear the maintenance-drain mark. |
 
 Every server generates a fresh process incarnation at startup and publishes
