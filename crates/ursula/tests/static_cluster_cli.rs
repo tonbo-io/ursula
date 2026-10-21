@@ -22,7 +22,19 @@ use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+use ursula_control::Cluster;
+use ursula_control::ClusterView;
+use ursula_control::GroupPlacement;
+use ursula_control::MetaDamageKind;
+use ursula_control::MetaReplicaStatus;
+use ursula_control::MetaRole;
+use ursula_control::PlacementStatus;
+use ursula_control::RegistrationStatus;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::PlacementEpoch;
+use ursula_proto::placement::Registered;
 use ursula_runtime::ColdStore;
+use ursula_shard::RaftGroupId;
 
 struct ChildGuard {
     child: Child,
@@ -3640,6 +3652,1170 @@ async fn cli_sigterm_hands_off_leaders_and_bounds_quorum_loss() {
     sigterm_and_wait_for_clean_exit(&mut children[0]).await;
 }
 
+/// The data groups of every meta test cluster.
+const META_TEST_GROUPS: usize = 4;
+/// How long a meta test waits for one condition.
+const META_WAIT: Duration = Duration::from_secs(120);
+/// The meta voters every meta test configures.
+const META_VOTERS: &[u64] = &[1, 2, 3];
+
+/// One node of a meta test cluster. Its ports, config file and WAL
+/// directory stay the same across its restarts.
+struct MetaNode {
+    id: u64,
+    port: u16,
+    admin_port: u16,
+    config: PathBuf,
+    wal: PathBuf,
+    /// The cold-store root of an S3-backed node, `None` for memory.
+    cold_root: Option<String>,
+}
+
+impl MetaNode {
+    /// Nodes 1 to `count`, with their files under `root`.
+    fn cluster(root: &Path, count: u64) -> Vec<Self> {
+        (1..=count)
+            .map(|id| Self {
+                id,
+                port: free_port(),
+                admin_port: free_port(),
+                config: root.join(format!("node-{id}.toml")),
+                wal: root.join(format!("node-{id}-log")),
+                cold_root: None,
+            })
+            .collect()
+    }
+
+    fn url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn admin(&self) -> String {
+        format!("http://127.0.0.1:{}", self.admin_port)
+    }
+
+    fn peer(&self) -> (u64, String) {
+        (self.id, self.url())
+    }
+
+    /// The meta journal's directory, `raft-log/meta/` under the WAL root.
+    fn meta_dir(&self) -> PathBuf {
+        self.wal.join("raft-log").join("meta")
+    }
+
+    fn ctl(&self) -> ursula_ctl::NodeInfo {
+        ctl_node(self.id, self.admin_port, &self.url())
+    }
+
+    /// Writes the node's config with `peers` as its `raft.peers`. Node 1
+    /// initializes the data groups.
+    fn write(&self, peers: &[(u64, String)], meta: MetaToml<'_>) {
+        NodeToml {
+            port: self.port,
+            admin_port: self.admin_port,
+            node_id: self.id,
+            raft_group_count: META_TEST_GROUPS,
+            peers,
+            init_membership: self.id == 1,
+            wal_path: &self.wal,
+            cold_backend: if self.cold_root.is_some() {
+                "s3"
+            } else {
+                "memory"
+            },
+            cold_root: self.cold_root.as_deref(),
+            meta,
+        }
+        .write(&self.config);
+    }
+
+    fn spawn(&self, binary: &str) -> ChildGuard {
+        if self.cold_root.is_some() {
+            spawn_node_with_cluster_config_and_cold_s3(binary, &self.config)
+        } else {
+            spawn_node_with_cluster_config(binary, &self.config)
+        }
+    }
+}
+
+fn peers_of(nodes: &[MetaNode]) -> Vec<(u64, String)> {
+    nodes.iter().map(MetaNode::peer).collect()
+}
+
+/// The running processes of a meta test cluster, by node id.
+#[derive(Default)]
+struct Processes(BTreeMap<u64, ChildGuard>);
+
+impl Processes {
+    fn start(&mut self, binary: &str, node: &MetaNode) {
+        let running = self.0.insert(node.id, node.spawn(binary));
+        assert!(running.is_none(), "node {} already runs", node.id);
+    }
+
+    /// Stops node `id` by SIGTERM and waits for its clean exit.
+    async fn stop(&mut self, id: u64) {
+        let mut child = self.0.remove(&id).expect("the node runs");
+        sigterm_and_wait_for_clean_exit(&mut child).await;
+    }
+
+    /// Kills node `id`: it hands nothing off.
+    fn kill(&mut self, id: u64) {
+        drop(self.0.remove(&id).expect("the node runs"));
+    }
+
+    fn exited(&mut self) -> Option<String> {
+        self.0.values_mut().find_map(exited_report)
+    }
+
+    fn reports(&self) -> String {
+        self.0
+            .values()
+            .map(child_report)
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
+}
+
+/// Polls `probe` until it answers `Ok`, failing once a node of `procs`
+/// exited or after [`META_WAIT`], with the probe's last `Err`.
+async fn eventually<T>(
+    procs: &mut Processes,
+    what: &str,
+    mut probe: impl AsyncFnMut() -> Result<T, String>,
+) -> T {
+    let deadline = std::time::Instant::now().checked_add(META_WAIT).unwrap();
+    loop {
+        if let Some(report) = procs.exited() {
+            panic!("a node exited while waiting until {what}:\n{report}");
+        }
+        let last = match probe().await {
+            Ok(found) => return found,
+            Err(last) => last,
+        };
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never {what}: {last}\n{}",
+            procs.reports()
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Node `node`'s placement status from its client listener.
+async fn placement_status(
+    client: &reqwest::Client,
+    node: &MetaNode,
+) -> Result<PlacementStatus, String> {
+    let url = format!("{}/__ursula/placement", node.url());
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("GET {url}: {}", response.status()));
+    }
+    Ok(response.json().await.expect("placement status JSON"))
+}
+
+/// Node `node`'s placement status confirmed by a meta read barrier, on its
+/// admin listener.
+async fn confirmed_placement_status(
+    client: &reqwest::Client,
+    node: &MetaNode,
+) -> Result<PlacementStatus, String> {
+    let url = format!("{}/__ursula/placement?confirmed=true", node.admin());
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        let status = response.status();
+        let refusal: ursula_control::PlacementApiError =
+            response.json().await.expect("placement refusal JSON");
+        return Err(format!("GET {url}: {status} {refusal:?}"));
+    }
+    Ok(response.json().await.expect("placement status JSON"))
+}
+
+/// Waits until node `node`'s placement status satisfies `done`, and
+/// returns it.
+async fn wait_placement(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+    what: &str,
+    done: impl Fn(&PlacementStatus) -> bool,
+) -> PlacementStatus {
+    let what = format!("node {} {what}", node.id);
+    eventually(procs, &what, async || {
+        let status = placement_status(client, node).await?;
+        if done(&status) {
+            Ok(status)
+        } else {
+            Err(format!("{status:?}"))
+        }
+    })
+    .await
+}
+
+/// Waits until every node of `nodes` shows the bootstrapped cluster and
+/// knows a meta leader, and returns their statuses.
+async fn wait_bootstrapped(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+) -> Vec<PlacementStatus> {
+    let mut statuses = Vec::new();
+    for node in nodes {
+        let status = wait_placement(
+            client,
+            procs,
+            node,
+            "shows the bootstrapped cluster",
+            |status| bootstrapped(status).is_some() && meta_leader(status).is_some(),
+        )
+        .await;
+        statuses.push(status);
+    }
+    statuses
+}
+
+fn bootstrapped(status: &PlacementStatus) -> Option<&Cluster> {
+    match &status.view {
+        ClusterView::Bootstrapped(cluster) => Some(cluster),
+        _ => None,
+    }
+}
+
+/// The meta leader a node's running meta replica knows.
+fn meta_leader(status: &PlacementStatus) -> Option<u64> {
+    match &status.meta {
+        MetaReplicaStatus::Running { leader, .. } => leader.map(NodeId::get),
+        MetaReplicaStatus::Damaged { .. } | MetaReplicaStatus::Absent => None,
+    }
+}
+
+fn meta_role(status: &PlacementStatus) -> Option<MetaRole> {
+    match &status.meta {
+        MetaReplicaStatus::Running { role, .. } => Some(*role),
+        MetaReplicaStatus::Damaged { .. } | MetaReplicaStatus::Absent => None,
+    }
+}
+
+/// Every group's placement key.
+fn sinces(cluster: &Cluster) -> BTreeMap<RaftGroupId, PlacementEpoch> {
+    cluster
+        .groups()
+        .iter()
+        .map(|(group, placement)| (group, placement.since()))
+        .collect()
+}
+
+fn node_ids(ids: impl Iterator<Item = NodeId>) -> BTreeSet<u64> {
+    ids.map(NodeId::get).collect()
+}
+
+/// How many data groups node `node_id` leads with a live quorum, by its
+/// own metrics.
+fn leads(metrics: &ursula_proto::admin::NodeMetrics, node_id: u64) -> usize {
+    metrics
+        .groups
+        .iter()
+        .filter(|group| group.current_leader == Some(node_id) && group.leads_live)
+        .count()
+}
+
+/// The metrics of the node at `base_url`, or why they did not answer,
+/// for a poll that may start before the node listens.
+async fn try_node_metrics(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ursula_proto::admin::NodeMetrics, String> {
+    let url = format!("{base_url}/__ursula/metrics");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("GET {url}: {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))
+}
+
+/// Node `node`'s participation, from its cluster listener.
+async fn leadership_shed(
+    client: &reqwest::Client,
+    node: &MetaNode,
+) -> ursula_proto::admin::LeadershipShedStatus {
+    client
+        .get(format!("{}/__ursula/leadership-shed", node.url()))
+        .send()
+        .await
+        .expect("leadership-shed status")
+        .json()
+        .await
+        .expect("leadership-shed JSON")
+}
+
+fn sheds_placement_unavailable(shed: &ursula_proto::admin::LeadershipShedStatus) -> bool {
+    shed.state
+        .split('|')
+        .any(|reason| reason == ursula_raft::LeadershipShedReason::PlacementUnavailable.as_str())
+}
+
+/// S1 (#768): three nodes form the meta group over gRPC and bootstrap the
+/// cluster while the data groups form and serve. Each node is a meta voter
+/// of one bootstrapped cluster that seeds every group, and a follower's
+/// view confirmed by a meta read barrier, which the meta leader answers
+/// over gRPC, is that cluster. `ursulactl drain` of the meta leader hands
+/// its meta leadership away with its data leaderships. A full restart keeps
+/// every placement's `since`, and each node's registration is then
+/// answered by the meta leader, through a forward on the followers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_three_nodes_form_meta_and_keep_serving() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+
+    // 1. One bootstrapped cluster on every node, every node a meta voter.
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    assert_eq!(
+        node_ids(cluster.params().meta_voters.iter()),
+        BTreeSet::from([1, 2, 3])
+    );
+    assert_eq!(
+        node_ids(cluster.nodes().keys().copied()),
+        BTreeSet::from([1, 2, 3])
+    );
+    assert_eq!(cluster.groups().len(), META_TEST_GROUPS);
+    assert!(
+        cluster
+            .groups()
+            .iter()
+            .all(|(_, placement)| matches!(placement, GroupPlacement::Seeded { .. })),
+        "{cluster:?}"
+    );
+    for status in &formed {
+        assert_eq!(bootstrapped(status), Some(&cluster), "{status:?}");
+        assert_eq!(meta_role(status), Some(MetaRole::Voter), "{status:?}");
+        assert!(
+            matches!(status.registration, RegistrationStatus::Answered(_)),
+            "{status:?}"
+        );
+        assert_eq!(status.last_bootstrap_refusal, None, "{status:?}");
+    }
+    for node in &nodes {
+        let what = format!("node {} confirms its view", node.id);
+        let confirmed = eventually(&mut procs, &what, async || {
+            confirmed_placement_status(&client, node).await
+        })
+        .await;
+        assert_eq!(bootstrapped(&confirmed), Some(&cluster), "{confirmed:?}");
+    }
+
+    // 2. The data groups serve.
+    let stream = format!("{}/meta-cli/serving", nodes[1].url());
+    put_until_created(&client, &stream).await;
+    post_until_no_content(&client, &stream, "served-with-meta;").await;
+    let read = |node: &MetaNode| format!("{}/meta-cli/serving?offset=0&max_bytes=64", node.url());
+    read_until_matches(&client, &read(&nodes[2]), b"served-with-meta;").await;
+
+    // 3. Draining the meta leader moves meta's leadership off it.
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let ctl_nodes = nodes.iter().map(MetaNode::ctl).collect::<Vec<_>>();
+    let before = ctl.fetch_cluster(&ctl_nodes).await.expect("metrics");
+    let target = &before
+        .per_node
+        .iter()
+        .find(|view| view.leads_meta())
+        .expect("a node leads meta")
+        .node;
+    let leader = target.id;
+    let outcome = ursula_ctl::drain_node(&ctl_nodes, target, &ctl, &ursula_ctl::DrainOptions {
+        drain_timeout: Duration::from_secs(60),
+        ready_timeout: Duration::from_secs(60),
+        poll_interval: Duration::from_millis(200),
+        lag_tolerance: 16,
+        dry_run: false,
+    })
+    .await
+    .expect("drain the meta leader");
+    assert!(
+        matches!(outcome, ursula_ctl::DrainOutcome::Drained),
+        "{outcome:?}"
+    );
+    let drained = ctl.fetch_cluster(&ctl_nodes).await.expect("metrics");
+    assert!(!drained.meta_led_by(leader));
+    assert!(drained.groups_reported_led_by(leader).is_empty());
+    let other = nodes.iter().find(|node| node.id != leader).unwrap();
+    wait_placement(
+        &client,
+        &mut procs,
+        other,
+        "names another meta leader",
+        |status| meta_leader(status).is_some_and(|new| new != leader),
+    )
+    .await;
+    ursula_ctl::undrain_node(&ctl, target)
+        .await
+        .expect("undrain the node");
+
+    // 4. A full restart keeps every placement's key, and every node's
+    // registration is answered as a node with roles.
+    for node in &nodes {
+        procs.stop(node.id).await;
+    }
+    for node in &nodes {
+        procs.start(binary, node);
+    }
+    for status in wait_bootstrapped(&client, &mut procs, &nodes).await {
+        let restarted = bootstrapped(&status).unwrap();
+        assert_eq!(sinces(restarted), sinces(&cluster), "{status:?}");
+        assert_eq!(restarted.params(), cluster.params());
+    }
+    for node in &nodes {
+        wait_placement(
+            &client,
+            &mut procs,
+            node,
+            "registers with its roles",
+            |status| {
+                matches!(
+                    status.registration,
+                    RegistrationStatus::Answered(Registered::Referenced(_))
+                )
+            },
+        )
+        .await;
+    }
+    let what = "the stream reads back after the restart";
+    eventually(&mut procs, what, async || {
+        let body = client
+            .get(read(&nodes[0]))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?
+            .bytes()
+            .await
+            .map_err(|err| err.to_string())?;
+        if body.as_ref() == b"served-with-meta;" {
+            Ok(())
+        } else {
+            Err(format!("{body:?}"))
+        }
+    })
+    .await;
+}
+
+/// Integration 11's meta half (#768): five nodes with meta voters 1 to 3.
+/// Nodes 1 to 3 form meta and bootstrap over the `raft.peers` they list.
+/// Nodes 4 and 5 start before those `raft.peers` list them: they register,
+/// and the meta group records them, while no meta voter can dial them yet.
+/// Once nodes 1 to 3 restart one at a time with the full `raft.peers`, the
+/// meta leader replicates to nodes 4 and 5 as meta learners, and their
+/// views reach the bootstrapped cluster. The data groups stay on nodes 1 to
+/// 3.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_learn() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 5);
+    let all_peers = peers_of(&nodes);
+    let old_peers = peers_of(&nodes[..3]);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        data_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes[..3] {
+        node.write(&old_peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes[..3]).await;
+    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    assert_eq!(
+        node_ids(cluster.nodes().keys().copied()),
+        BTreeSet::from([1, 2, 3])
+    );
+
+    // 1. The late nodes register, and the meta group records them.
+    for node in &nodes[3..] {
+        node.write(&all_peers, meta);
+        procs.start(binary, node);
+    }
+    for node in &nodes[3..] {
+        wait_placement(
+            &client,
+            &mut procs,
+            node,
+            "registers without a role",
+            |status| {
+                matches!(
+                    status.registration,
+                    RegistrationStatus::Answered(Registered::Unreferenced(_))
+                )
+            },
+        )
+        .await;
+    }
+    wait_placement(
+        &client,
+        &mut procs,
+        &nodes[0],
+        "records nodes 4 and 5",
+        |status| {
+            bootstrapped(status).is_some_and(|cluster| {
+                node_ids(cluster.nodes().keys().copied()) == BTreeSet::from([1, 2, 3, 4, 5])
+            })
+        },
+    )
+    .await;
+
+    // 2. Nodes 1 to 3 restart one at a time with the full `raft.peers`.
+    for node in nodes[..3].iter().rev() {
+        procs.stop(node.id).await;
+        node.write(&all_peers, meta);
+        procs.start(binary, node);
+        wait_placement(
+            &client,
+            &mut procs,
+            node,
+            "rejoins as a meta voter",
+            |status| {
+                bootstrapped(status).is_some()
+                    && meta_role(status) == Some(MetaRole::Voter)
+                    && meta_leader(status).is_some()
+            },
+        )
+        .await;
+    }
+
+    // 3. Nodes 4 and 5 learn the cluster as meta learners.
+    for node in &nodes[3..] {
+        let status = wait_placement(
+            &client,
+            &mut procs,
+            node,
+            "learns as a meta learner",
+            |status| bootstrapped(status).is_some() && meta_role(status) == Some(MetaRole::Learner),
+        )
+        .await;
+        let learned = bootstrapped(&status).unwrap();
+        assert_eq!(learned.params(), cluster.params());
+        assert_eq!(sinces(learned), sinces(&cluster));
+    }
+    // Meta's membership keeps its voters and adds the late nodes as learners.
+    let meta_metrics = node_metrics(&client, &nodes[0].url())
+        .await
+        .meta
+        .expect("node 1 runs a meta replica");
+    assert_eq!(
+        meta_metrics.voter_configs,
+        vec![BTreeSet::from([1, 2, 3])],
+        "{meta_metrics:?}"
+    );
+    assert!(
+        [4, 5]
+            .iter()
+            .all(|id| meta_metrics.learner_ids.contains(id)),
+        "{meta_metrics:?}"
+    );
+}
+
+/// S1 acceptance (#768): a node whose meta journal does not read runs no
+/// meta replica, reports `Damaged { kind: journal }` and
+/// `placement-unavailable`, advertises on `/__ursula/leadership-shed` that
+/// it accepts no leadership transfer (the stance a peer reads before a
+/// handoff), and keeps serving data. Elected leader of every group while the only other node
+/// left is drained, it hands each group away once that node takes
+/// transfers again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let stream = |node: &MetaNode| format!("{}/meta-cli/damaged", node.url());
+    let read = |node: &MetaNode| format!("{}?offset=0&max_bytes=256", stream(node));
+    put_until_created(&client, &stream(&nodes[0])).await;
+    post_until_no_content(&client, &stream(&nodes[0]), "before-the-damage;").await;
+
+    // 1. Node 2 stops, and its meta journal's metadata no longer reads.
+    // Node 3 is drained, so node 1 leads every data group.
+    procs.stop(2).await;
+    std::fs::write(
+        nodes[1].meta_dir().join("journal.meta"),
+        b"not a meta journal",
+    )
+    .expect("damage the meta journal");
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    ctl.set_maintenance_drain(&nodes[2].ctl(), true)
+        .await
+        .expect("drain node 3");
+    eventually(&mut procs, "node 1 leads every data group", async || {
+        let led = leads(&try_node_metrics(&client, &nodes[0].url()).await?, 1);
+        if led == META_TEST_GROUPS {
+            Ok(())
+        } else {
+            Err(format!("node 1 leads {led} groups"))
+        }
+    })
+    .await;
+
+    // 2. Node 2 starts without a meta replica: it may campaign, advertises
+    // that it accepts no transfer, and serves data through node 1.
+    procs.start(binary, &nodes[1]);
+    let damaged = wait_placement(
+        &client,
+        &mut procs,
+        &nodes[1],
+        "reports its meta damaged",
+        |status| {
+            matches!(status.meta, MetaReplicaStatus::Damaged {
+                kind: MetaDamageKind::Journal,
+                ..
+            })
+        },
+    )
+    .await;
+    assert_eq!(damaged.applied, None, "{damaged:?}");
+    let shed = eventually(
+        &mut procs,
+        "node 2 marks placement-unavailable",
+        async || {
+            let shed = leadership_shed(&client, &nodes[1]).await;
+            if sheds_placement_unavailable(&shed) {
+                Ok(shed)
+            } else {
+                Err(format!("{shed:?}"))
+            }
+        },
+    )
+    .await;
+    assert!(shed.should_campaign, "{shed:?}");
+    assert!(!shed.should_accept_transfer, "{shed:?}");
+    post_until_no_content(&client, &stream(&nodes[1]), "through-the-damaged-node;").await;
+    read_until_matches(
+        &client,
+        &read(&nodes[1]),
+        b"before-the-damage;through-the-damaged-node;",
+    )
+    .await;
+
+    // 3. Node 1 dies. Node 3 may not campaign, so node 2 wins every group,
+    // and keeps them while no node takes a transfer.
+    procs.kill(1);
+    eventually(&mut procs, "node 2 leads every data group", async || {
+        let led = leads(&try_node_metrics(&client, &nodes[1].url()).await?, 2);
+        if led == META_TEST_GROUPS {
+            Ok(())
+        } else {
+            Err(format!("node 2 leads {led} groups"))
+        }
+    })
+    .await;
+    post_until_no_content(&client, &stream(&nodes[1]), "led-by-the-damaged-node;").await;
+
+    // 4. Node 3 takes transfers again: node 2 hands every group to it.
+    ctl.set_maintenance_drain(&nodes[2].ctl(), false)
+        .await
+        .expect("undrain node 3");
+    eventually(
+        &mut procs,
+        "node 2 hands every data group to node 3",
+        async || {
+            let kept = leads(&try_node_metrics(&client, &nodes[1].url()).await?, 2);
+            let taken = leads(&try_node_metrics(&client, &nodes[2].url()).await?, 3);
+            if kept == 0 && taken == META_TEST_GROUPS {
+                Ok(())
+            } else {
+                Err(format!("node 2 leads {kept} groups, node 3 {taken}"))
+            }
+        },
+    )
+    .await;
+    post_until_no_content(&client, &stream(&nodes[1]), "after-the-shed;").await;
+    read_until_matches(
+        &client,
+        &read(&nodes[2]),
+        b"before-the-damage;through-the-damaged-node;led-by-the-damaged-node;after-the-shed;",
+    )
+    .await;
+}
+
+/// S1, r1 H1 (#768): while node 3 claims another replication factor, the
+/// genesis node names node 3 and its claim, meta does not form, and the
+/// data groups form and serve. Node 3 restarts with the fixed claim while
+/// node 1's `raft.peers` names node 2's address for node 3: node 2 refuses
+/// the misdelivered genesis probes as meant for another node, which leave
+/// node 3 unanswered and are never read as a claim or a format mismatch,
+/// so meta still does not form. Node 1 restarts with the right address,
+/// and meta forms and bootstraps.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        let claim = if node.id == 3 {
+            MetaToml {
+                replication_factor: Some(2),
+                ..meta
+            }
+        } else {
+            meta
+        };
+        node.write(&peers, claim);
+        procs.start(binary, node);
+    }
+    let no_meta = |status: &PlacementStatus| {
+        matches!(status.view, ClusterView::MetaGenesis { .. }) && status.applied.is_none()
+    };
+
+    // 1. The genesis node names node 3's claim, and the data groups serve.
+    let held = wait_placement(
+        &client,
+        &mut procs,
+        &nodes[0],
+        "names node 3's claim",
+        |status| {
+            matches!(
+                &status.view,
+                ClusterView::MetaGenesis { genesis_mismatch, .. }
+                    if node_ids(genesis_mismatch.keys().copied()) == BTreeSet::from([3])
+            )
+        },
+    )
+    .await;
+    let ClusterView::MetaGenesis {
+        genesis_mismatch, ..
+    } = &held.view
+    else {
+        panic!("the wait matched a genesis view");
+    };
+    let claim = &genesis_mismatch[&NodeId::new(3)];
+    assert_eq!(claim.replication_factor.get(), 2, "{claim:?}");
+    assert_eq!(
+        node_ids(claim.meta_voters.iter()),
+        BTreeSet::from([1, 2, 3])
+    );
+    let stream = |node: &MetaNode| format!("{}/meta-cli/claims", node.url());
+    put_until_created(&client, &stream(&nodes[1])).await;
+    post_until_no_content(&client, &stream(&nodes[1]), "while-meta-waits;").await;
+    read_until_matches(
+        &client,
+        &format!("{}?offset=0&max_bytes=64", stream(&nodes[2])),
+        b"while-meta-waits;",
+    )
+    .await;
+    for node in &nodes {
+        let status = placement_status(&client, node)
+            .await
+            .expect("placement status");
+        assert!(no_meta(&status), "{status:?}");
+    }
+
+    // 2. Node 3 claims the same values again, but node 1's genesis probes
+    // of node 3 reach node 2. Node 1 stops first, so it never sees node 3's
+    // fixed claim at node 3's address.
+    procs.stop(1).await;
+    procs.stop(3).await;
+    nodes[2].write(&peers, meta);
+    procs.start(binary, &nodes[2]);
+    let misdelivering = peers
+        .iter()
+        .map(|(id, url)| {
+            if *id == 3 {
+                (3, nodes[1].url())
+            } else {
+                (*id, url.clone())
+            }
+        })
+        .collect::<Vec<_>>();
+    nodes[0].write(&misdelivering, meta);
+    procs.start(binary, &nodes[0]);
+    wait_placement(
+        &client,
+        &mut procs,
+        &nodes[0],
+        "waits for node 3 alone",
+        |status| {
+            matches!(
+                &status.view,
+                ClusterView::MetaGenesis { unanswered, genesis_mismatch }
+                    if genesis_mismatch.is_empty()
+                        && node_ids(unanswered.iter().copied()) == BTreeSet::from([3])
+            )
+        },
+    )
+    .await;
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for node in &nodes {
+            let status = placement_status(&client, node)
+                .await
+                .expect("placement status");
+            assert!(no_meta(&status), "{status:?}");
+        }
+    }
+    for node in &nodes[..2] {
+        let ready: ursula_proto::admin::ServingReadiness = client
+            .get(format!("{}/__ursula/ready", node.url()))
+            .send()
+            .await
+            .expect("readiness")
+            .json()
+            .await
+            .expect("readiness JSON");
+        assert!(!ready.format_epoch_mismatch, "node {}: {ready:?}", node.id);
+    }
+
+    // 3. Node 1 dials node 3 again: meta forms and bootstraps.
+    procs.stop(1).await;
+    nodes[0].write(&peers, meta);
+    procs.start(binary, &nodes[0]);
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let cluster = bootstrapped(&formed[0]).unwrap();
+    assert_eq!(cluster.params().replication_factor.get(), 3);
+    assert_eq!(
+        node_ids(cluster.nodes().keys().copied()),
+        BTreeSet::from([1, 2, 3])
+    );
+    for status in &formed {
+        assert_eq!(bootstrapped(status), Some(cluster), "{status:?}");
+    }
+}
+
+/// f2 (#768): every node loses its run state while stopped, as the
+/// cutting plan test of a data group does, so each meta replica opens
+/// recovering and keeps its vote. Every meta gate stalls and meta has no
+/// leader. `ursulactl recover-group --target meta --accept-loss` plans
+/// meta, meta answers again on every node, and the plan's history event
+/// keys every placement anew. The plan's restart of the meta replica marks
+/// no node `placement-unavailable` (r1 L12). The data groups are gated
+/// too and stay so: the test claims nothing about them.
+///
+/// A replica that lost its meta journal lost its vote with it, and refuses
+/// a plan (`missing_vote_floor`) until a live leader proves its vote, so
+/// a meta group where a majority of the voters lost their journals is not
+/// recovered by a plan. This test does not claim it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let before = bootstrapped(&formed[0]).unwrap().clone();
+
+    // 1. Every node stops and loses its run state, so how its last run
+    // ended is unknown.
+    for node in &nodes {
+        procs.stop(node.id).await;
+    }
+    for node in &nodes {
+        remove_test_path(node.wal.join("raft-log").join("run-state.bin"));
+    }
+    for node in &nodes {
+        procs.start(binary, node);
+    }
+
+    // 2. Every meta gate stalls and no node leads meta. The nodes were
+    // just started, so the poll tolerates a node that does not listen yet.
+    let replicas = eventually(&mut procs, "every meta gate stalls", async || {
+        let mut replicas = Vec::new();
+        for node in &nodes {
+            let replica = try_node_metrics(&client, &node.url()).await?.meta;
+            let gate = replica.as_ref().map(|replica| replica.recovery_gate);
+            if gate != Some(ursula_proto::admin::RecoveryGateStatus::Stalled) {
+                return Err(format!("node {}: {replica:?}", node.id));
+            }
+            replicas.push((node.id, replica));
+        }
+        Ok(replicas)
+    })
+    .await;
+    for (id, replica) in &replicas {
+        assert!(
+            replica.as_ref().is_some_and(|replica| !replica.leads_live),
+            "node {id}: {replica:?}"
+        );
+    }
+
+    // 3. The meta plan, as `ursulactl recover-group --target meta
+    // --accept-loss` sends it.
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let ctl_nodes = nodes.iter().map(MetaNode::ctl).collect::<Vec<_>>();
+    let outcome = ursula_ctl::recovery::recover_group(
+        &ctl,
+        &ctl_nodes,
+        ursula_ctl::recovery::RecoverTarget::Meta,
+        &ursula_ctl::recovery::RecoverOptions {
+            max_plans: 3,
+            settle_timeout: Duration::from_secs(120),
+            poll_interval: Duration::from_secs(1),
+            accept_timeout: Duration::from_secs(60),
+            accept_loss: true,
+        },
+    )
+    .await
+    .expect("the meta plan");
+    let ursula_ctl::recovery::RecoverOutcome::Satisfied { plan, stopped, .. } = outcome else {
+        panic!("the meta plan was not satisfied: {outcome:?}");
+    };
+    assert!(META_VOTERS.contains(&plan.leader), "{plan:?}");
+    assert!(stopped.is_empty(), "{stopped:?}");
+
+    // 4. Meta answers on every node, each placement keyed at one new
+    // epoch, the plan's history event.
+    let recovered = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let after = sinces(bootstrapped(&recovered[0]).unwrap());
+    let epochs = after.values().collect::<BTreeSet<_>>();
+    assert_eq!(epochs.len(), 1, "{after:?}");
+    for (group, since) in sinces(&before) {
+        assert_ne!(
+            after.get(&group),
+            Some(&since),
+            "group {group:?} kept its key"
+        );
+    }
+    for status in &recovered {
+        let cluster = bootstrapped(status).unwrap();
+        assert_eq!(sinces(cluster), after, "{status:?}");
+        assert_eq!(cluster.params(), before.params());
+        assert!(cluster.retirements().is_empty(), "{status:?}");
+        assert_eq!(meta_role(status), Some(MetaRole::Voter), "{status:?}");
+    }
+    for node in &nodes {
+        let shed = leadership_shed(&client, node).await;
+        assert!(
+            !sheds_placement_unavailable(&shed),
+            "node {}: {shed:?}",
+            node.id
+        );
+    }
+}
+
+/// S1(a), D7 (#768): on nodes whose snapshot store is S3, a meta snapshot
+/// is recorded inline, and meta puts no object in the node's S3 directory
+/// of group 0, where only data group 0's record names objects. A meta
+/// record rewritten to name an S3 object is refused at the restore as
+/// `Damaged { kind: pointer }`, and the node keeps serving data. Runs on
+/// real S3 in CI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_an_s3_backed_node_refuses_a_non_inline_meta_record() {
+    let _guard = static_cluster_cli_test_guard().await;
+    if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
+        tracing::warn!(
+            "skipping the S3 meta record test; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
+        );
+        return;
+    }
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the S3 meta record test");
+        return;
+    };
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let cold_root = match std::env::var("URSULA_S3_PREFIX") {
+        Ok(prefix) => format!("{prefix}/ursula-cli-s3-meta-inline/{suffix}"),
+        Err(_) => format!("ursula-cli-s3-meta-inline/{suffix}"),
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let mut nodes = MetaNode::cluster(root.path(), 3);
+    for node in &mut nodes {
+        node.cold_root = Some(cold_root.clone());
+    }
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    for node in &nodes {
+        node.write(&peers, meta);
+    }
+    let config = ursula_config::load_config(Some(&nodes[0].config), None, None)
+        .unwrap_or_else(|err| panic!("load config for the cold store: {err}"));
+    config
+        .validate()
+        .unwrap_or_else(|err| panic!("the node config is valid: {err}"));
+    let prefix = config.storage.snapshot.snapshot_prefix();
+    let cold_store = ColdStore::try_new(&config.storage.cold)
+        .unwrap_or_else(|err| panic!("{}", s3_failure("open the cold store", "", &err)));
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        procs.start(binary, node);
+    }
+    wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let stream = |node: &MetaNode| format!("{}/meta-cli/inline", node.url());
+    put_until_created(&client, &stream(&nodes[0])).await;
+    post_until_no_content(&client, &stream(&nodes[0]), "with-an-s3-store;").await;
+
+    // 1. Every node's meta snapshot record names its snapshot inline.
+    let record = |node: &MetaNode| node.meta_dir().join("group-0.snapshot.json");
+    for node in &nodes {
+        let response = admin_test_post(
+            &client,
+            format!("{}/__ursula/raft/meta/snapshot", node.admin()),
+        )
+        .await
+        .send()
+        .await
+        .expect("snapshot meta");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let what = format!("node {} records its meta snapshot", node.id);
+        let pointer = eventually(&mut procs, &what, async || {
+            let bytes = std::fs::read(record(node)).map_err(|err| err.to_string())?;
+            ursula_raft::persisted_snapshot_pointer(&bytes).map_err(|err| err.to_string())
+        })
+        .await;
+        assert!(
+            matches!(
+                pointer.location,
+                ursula_runtime::SnapshotLocation::Inline { .. }
+            ),
+            "node {}: {pointer:?}",
+            node.id
+        );
+    }
+
+    // 2. Each node's S3 directory of group 0 holds only what data group 0's
+    // record names.
+    let wal_dirs = nodes
+        .iter()
+        .map(|node| (node.id, node.wal.clone()))
+        .collect::<Vec<_>>();
+    let (view, names) = snapshot_ownership(&cold_store, &prefix, &wal_dirs).await;
+    for key in view.objects.keys() {
+        assert!(
+            names.iter().any(|node| node.named.contains(key)),
+            "{key} is no object data group 0 names: {names:?}"
+        );
+    }
+
+    // 3. Node 3's record is rewritten to name an object of its own S3
+    // directory: its restore refuses it, and it keeps serving data.
+    procs.stop(3).await;
+    let bytes = std::fs::read(record(&nodes[2])).expect("read node 3's meta record");
+    let pointer = ursula_runtime::SnapshotPointer {
+        snapshot_id: "meta-cli-not-inline".to_owned(),
+        location: ursula_runtime::SnapshotLocation::S3 {
+            key: format!(
+                "{}group-0/00000000000000000009-0123456789abcdef.snap",
+                ursula_runtime::snapshot_harness::node_directory(&prefix, 3)
+            ),
+            size_bytes: 4096,
+            stored_size_bytes: 1234,
+            compression: ursula_runtime::SnapshotCompression::Zstd,
+        },
+    };
+    std::fs::write(
+        record(&nodes[2]),
+        ursula_raft::snapshot_record_with_pointer(&bytes, &pointer)
+            .expect("re-encode node 3's meta record"),
+    )
+    .expect("write node 3's meta record");
+    procs.start(binary, &nodes[2]);
+    wait_placement(
+        &client,
+        &mut procs,
+        &nodes[2],
+        "refuses its meta record",
+        |status| {
+            matches!(status.meta, MetaReplicaStatus::Damaged {
+                kind: MetaDamageKind::Pointer,
+                ..
+            })
+        },
+    )
+    .await;
+    post_until_no_content(&client, &stream(&nodes[2]), "after-the-refusal;").await;
+    read_until_matches(
+        &client,
+        &format!("{}?offset=0&max_bytes=64", stream(&nodes[0])),
+        b"with-an-s3-store;after-the-refusal;",
+    )
+    .await;
+
+    drop(procs);
+    cold_store
+        .remove_all("")
+        .await
+        .unwrap_or_else(|err| panic!("{}", s3_failure("clear the test root", "", &err)));
+}
+
 async fn sigterm_and_wait_for_clean_exit(child: &mut ChildGuard) {
     let status = Command::new("kill")
         .arg("-TERM")
@@ -3690,8 +4866,8 @@ async fn static_cluster_cli_test_guard() -> tokio::sync::MutexGuard<'static, ()>
         .await
 }
 
-/// Port of 1-based `node_id` in the three-node `ports` array.
-fn node_port(ports: &[u16; 3], node_id: u64) -> u16 {
+/// Port of 1-based `node_id` in `ports`, one per node.
+fn node_port(ports: &[u16], node_id: u64) -> u16 {
     ports[usize::try_from(node_id.checked_sub(1).unwrap()).unwrap()]
 }
 
@@ -3722,107 +4898,179 @@ fn write_node_toml(
     cold_backend: &str,
     cold_root: Option<&str>,
 ) -> u16 {
-    use std::fmt::Write;
-
     let admin_port = free_port();
-    let mut config = String::new();
+    NodeToml {
+        port,
+        admin_port,
+        node_id,
+        raft_group_count,
+        peers,
+        init_membership,
+        wal_path,
+        cold_backend,
+        cold_root,
+        meta: MetaToml::default(),
+    }
+    .write(path);
+    admin_port
+}
 
-    writeln!(
-        config,
-        r#"[server]
+/// The meta and placement keys of a node config. `None` leaves a key out,
+/// so the server's default applies.
+#[derive(Debug, Clone, Copy, Default)]
+struct MetaToml<'a> {
+    /// `raft.meta_voters`.
+    meta_voters: Option<&'a [u64]>,
+    /// `raft.placement.replication_factor`.
+    replication_factor: Option<u8>,
+    /// The voters of every data group, one `[[raft.groups]]` entry each.
+    data_voters: Option<&'a [u64]>,
+}
+
+/// One node's config file, of a cluster of any number of nodes.
+struct NodeToml<'a> {
+    port: u16,
+    admin_port: u16,
+    node_id: u64,
+    raft_group_count: usize,
+    peers: &'a [(u64, String)],
+    init_membership: bool,
+    wal_path: &'a Path,
+    cold_backend: &'a str,
+    cold_root: Option<&'a str>,
+    meta: MetaToml<'a>,
+}
+
+impl NodeToml<'_> {
+    fn write(&self, path: &Path) {
+        use std::fmt::Write;
+
+        let Self {
+            port,
+            admin_port,
+            node_id,
+            raft_group_count,
+            peers,
+            init_membership,
+            wal_path,
+            cold_backend,
+            cold_root,
+            meta,
+        } = self;
+        let mut config = String::new();
+
+        writeln!(
+            config,
+            r#"[server]
 listen = "127.0.0.1:{port}"
 admin_listen = "127.0.0.1:{admin_port}"
 cluster_id = "static-cluster-cli"
 "#
-    )
-    .unwrap();
+        )
+        .unwrap();
 
-    writeln!(
-        config,
-        r#"[runtime]
+        writeln!(
+            config,
+            r#"[runtime]
 core_count = 1
 "#
-    )
-    .unwrap();
+        )
+        .unwrap();
 
-    writeln!(
-        config,
-        r#"[raft]
+        writeln!(
+            config,
+            r#"[raft]
 node_id = {node_id}
 group_count = {raft_group_count}
 init_membership = {init_membership}
 init_membership_per_group = false
 "#
-    )
-    .unwrap();
+        )
+        .unwrap();
+        if let Some(voters) = meta.meta_voters {
+            writeln!(config, "meta_voters = {voters:?}\n").unwrap();
+        }
 
-    writeln!(
-        config,
-        r#"[raft.wal]
-path = "{}"
-"#,
-        wal_path.display()
-    )
-    .unwrap();
-
-    for (peer_id, peer_url) in peers {
         writeln!(
             config,
-            r#"[[raft.peers]]
+            r#"[raft.wal]
+path = "{}"
+"#,
+            wal_path.display()
+        )
+        .unwrap();
+
+        if let Some(factor) = meta.replication_factor {
+            writeln!(config, "[raft.placement]\nreplication_factor = {factor}\n").unwrap();
+        }
+        if let Some(voters) = meta.data_voters {
+            for group in 0..*raft_group_count {
+                writeln!(
+                    config,
+                    "[[raft.groups]]\nraft_group_id = {group}\nvoters = {voters:?}\n"
+                )
+                .unwrap();
+            }
+        }
+
+        for (peer_id, peer_url) in *peers {
+            writeln!(
+                config,
+                r#"[[raft.peers]]
 node_id = {peer_id}
 url = "{peer_url}"
 "#
-        )
-        .unwrap();
-    }
+            )
+            .unwrap();
+        }
 
-    writeln!(
-        config,
-        r#"[storage.cold]
+        writeln!(
+            config,
+            r#"[storage.cold]
 backend = "{cold_backend}"
 flush_interval = "1s"
 gc_interval = "1s"
 "#
-    )
-    .unwrap();
-
-    if let Some(root) = cold_root {
-        writeln!(config, r#"root = "{root}""#).unwrap();
-    }
-
-    if cold_backend == "s3" {
-        writeln!(
-            config,
-            r#"
-[storage.cold.s3]"#
         )
         .unwrap();
-        for name in [
-            "URSULA_COLD_S3_BUCKET",
-            "URSULA_COLD_S3_REGION",
-            "URSULA_COLD_S3_ENDPOINT",
-            "URSULA_COLD_S3_ACCESS_KEY_ID",
-            "URSULA_COLD_S3_SECRET_ACCESS_KEY",
-            "URSULA_COLD_S3_SESSION_TOKEN",
-        ] {
-            if let Ok(value) = std::env::var(name) {
-                let key = name
-                    .strip_prefix("URSULA_COLD_S3_")
-                    .unwrap_or(name)
-                    .to_ascii_lowercase();
+
+        if let Some(root) = cold_root {
+            writeln!(config, r#"root = "{root}""#).unwrap();
+        }
+
+        if *cold_backend == "s3" {
+            writeln!(
+                config,
+                r#"
+[storage.cold.s3]"#
+            )
+            .unwrap();
+            for name in [
+                "URSULA_COLD_S3_BUCKET",
+                "URSULA_COLD_S3_REGION",
+                "URSULA_COLD_S3_ENDPOINT",
+                "URSULA_COLD_S3_ACCESS_KEY_ID",
+                "URSULA_COLD_S3_SECRET_ACCESS_KEY",
+                "URSULA_COLD_S3_SESSION_TOKEN",
+            ] {
+                if let Ok(value) = std::env::var(name) {
+                    let key = name
+                        .strip_prefix("URSULA_COLD_S3_")
+                        .unwrap_or(name)
+                        .to_ascii_lowercase();
+                    let escaped = toml::Value::String(value).to_string();
+                    writeln!(config, "{key} = {escaped}").unwrap();
+                }
+            }
+            // MinIO without a KMS rejects the default SSE-S3 header.
+            if let Ok(value) = std::env::var("URSULA_COLD_S3_SSE") {
                 let escaped = toml::Value::String(value).to_string();
-                writeln!(config, "{key} = {escaped}").unwrap();
+                writeln!(config, "server_side_encryption = {escaped}").unwrap();
             }
         }
-        // MinIO without a KMS rejects the default SSE-S3 header.
-        if let Ok(value) = std::env::var("URSULA_COLD_S3_SSE") {
-            let escaped = toml::Value::String(value).to_string();
-            writeln!(config, "server_side_encryption = {escaped}").unwrap();
-        }
-    }
 
-    std::fs::write(path, config).expect("write node toml config");
-    admin_port
+        std::fs::write(path, config).expect("write node toml config");
+    }
 }
 
 /// The WAL directory of node `node_id` under a test's `wal_root`.
@@ -4061,26 +5309,24 @@ fn child_report(child: &ChildGuard) -> String {
 }
 
 fn exited_child_report(children: &mut [ChildGuard]) -> Option<String> {
-    for child in children {
-        match child.child.try_wait() {
-            Ok(Some(status)) => {
-                return Some(format!(
-                    "{} exited with {status}; {}",
-                    child.label,
-                    child_report(child)
-                ));
-            }
-            Ok(None) => {}
-            Err(err) => {
-                return Some(format!(
-                    "{} try_wait failed: {err}; {}",
-                    child.label,
-                    child_report(child)
-                ));
-            }
-        }
+    children.iter_mut().find_map(exited_report)
+}
+
+/// `child`'s report once it exited, `None` while it runs.
+fn exited_report(child: &mut ChildGuard) -> Option<String> {
+    match child.child.try_wait() {
+        Ok(Some(status)) => Some(format!(
+            "{} exited with {status}; {}",
+            child.label,
+            child_report(child)
+        )),
+        Ok(None) => None,
+        Err(err) => Some(format!(
+            "{} try_wait failed: {err}; {}",
+            child.label,
+            child_report(child)
+        )),
     }
-    None
 }
 
 fn write_single_node_cluster_config(
