@@ -5,7 +5,8 @@
 //! may pass later and every failure to reach the leader with a capped
 //! back-off, and stops at a permanent refusal
 //! (`ursula_control::ControlError::requeue`). `NodeRemoved` makes the node
-//! treat itself as removed until it restarts.
+//! treat itself as removed until it restarts. Each answer is published as
+//! the node's [`RegistrationStatus`], which status reports read.
 
 use std::sync::Arc;
 use std::sync::Weak;
@@ -15,12 +16,14 @@ use openraft::rt::WatchReceiver;
 use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
 use ursula_control::ControlError;
+use ursula_control::RegistrationStatus;
 use ursula_control::Requeue;
 use ursula_proto::placement::NodeId;
-use ursula_proto::placement::Registered;
 
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
+use super::pause::MetaPausePoint;
+use super::pause::MetaPauses;
 use super::replica::ActiveMeta;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
@@ -34,18 +37,6 @@ pub(crate) const RETRY_MIN: Duration = Duration::from_millis(200);
 /// The longest pause before a registration is sent again.
 pub(crate) const RETRY_MAX: Duration = Duration::from_secs(5);
 
-/// Where this node's registration stands in this run.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Registration {
-    /// No answer yet.
-    Pending,
-    /// The meta group's last answer.
-    Answered(Registered),
-    /// The meta group refused the node as removed: it treats itself as
-    /// removed until it restarts.
-    Removed,
-}
-
 /// The next pause of a capped back-off.
 pub(crate) fn back_off(pause: Duration) -> Duration {
     pause.saturating_mul(2).min(RETRY_MAX)
@@ -58,18 +49,20 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
     handle: MetaHandle<T>,
     me: NodeId,
     registry: RaftGroupHandleRegistry,
-    status: watch::Sender<Registration>,
+    status: watch::Sender<RegistrationStatus>,
+    pauses: MetaPauses,
     stopped: impl Fn() -> bool,
 ) {
     let mut pause = RETRY_MIN;
     while !stopped() {
+        pauses.at(MetaPausePoint::Registration).await;
         let command = ControlCommand::RegisterNode {
             node: me,
             now_ms: ursula_runtime::unix_time_ms(),
         };
         match handle.submit(command).await {
             Ok(ControlApplied::NodeRegistered(registered)) => {
-                status.send_replace(Registration::Answered(registered));
+                status.send_replace(RegistrationStatus::Answered(registered));
                 pause = RETRY_MIN;
                 wait_without_leader(&registry, REREGISTER_AFTER).await;
                 continue;
@@ -83,11 +76,12 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
             }
             Err(MetaWriteError::Refused(ControlError::NodeRemoved { .. })) => {
                 tracing::warn!(node = %me, "meta registration: this node is removed");
-                status.send_replace(Registration::Removed);
+                status.send_replace(RegistrationStatus::Removed);
                 return;
             }
             Err(MetaWriteError::Refused(refusal)) if refusal.requeue() == Requeue::Permanent => {
                 tracing::error!(%refusal, "meta registration: refused for good");
+                status.send_replace(RegistrationStatus::Refused(refusal));
                 return;
             }
             Err(error) => {

@@ -150,7 +150,10 @@ pub async fn drain_node(
             }
         };
         let still_leads = snap.groups_reported_led_by(target.id);
-        if still_leads.is_empty() {
+        // The node's drain mark hands meta's leadership away on the node
+        // itself, so the drain waits for it to leave too.
+        let still_leads_meta = snap.meta_led_by(target.id);
+        if still_leads.is_empty() && !still_leads_meta {
             if let Err(err) = wait_cluster_ready(
                 "post-drain cluster readiness",
                 nodes,
@@ -180,8 +183,8 @@ pub async fn drain_node(
             clear_maintenance_drain(client, target).await;
             return Ok(DrainOutcome::Aborted {
                 reason: format!(
-                    "target still leads {} group(s), but no safe transfer target is available",
-                    still_leads.len()
+                    "target still leads {}, but no safe transfer target is available",
+                    led_summary(still_leads.len(), still_leads_meta)
                 ),
             });
         }
@@ -193,13 +196,22 @@ pub async fn drain_node(
             clear_maintenance_drain(client, target).await;
             return Ok(DrainOutcome::Aborted {
                 reason: format!(
-                    "drain timeout: target still leads {} group(s) after {:?}",
-                    still_leads.len(),
+                    "drain timeout: target still leads {} after {:?}",
+                    led_summary(still_leads.len(), still_leads_meta),
                     options.drain_timeout
                 ),
             });
         }
         tokio::time::sleep(options.poll_interval).await;
+    }
+}
+
+/// What a drained node still leads: its data groups, and the meta group.
+fn led_summary(groups: usize, meta: bool) -> String {
+    if meta {
+        format!("{groups} group(s) and the meta group")
+    } else {
+        format!("{groups} group(s)")
     }
 }
 
@@ -844,5 +856,28 @@ mod tests {
         let still_led = snapshot.groups_reported_led_by(1);
         assert_eq!(still_led.len(), 1);
         assert_eq!(still_led[0].raft_group_id, 7);
+    }
+
+    /// Meta's leadership is read apart from the data groups': node 1 leads
+    /// meta's group 0 while node 2 leads data group 0, and the drain of
+    /// node 1 waits for meta alone.
+    #[test]
+    fn drain_reads_the_meta_leadership_apart_from_data_group_zero() {
+        let mut leading =
+            crate::metrics::test_view(n(1, "10.0.0.1"), vec![group(0, 1, Some(2), 100, 100)]);
+        leading.meta = Some(group(0, 1, Some(1), 9, 9));
+        let mut following =
+            crate::metrics::test_view(n(2, "10.0.0.2"), vec![group(0, 2, Some(2), 100, 100)]);
+        following.meta = Some(group(0, 2, Some(1), 9, 9));
+        let snapshot = ClusterSnapshot {
+            per_node: vec![leading, following],
+        };
+
+        assert!(snapshot.groups_reported_led_by(1).is_empty());
+        assert!(snapshot.meta_led_by(1));
+        assert!(!snapshot.meta_led_by(2));
+        assert!(snapshot.node(1).unwrap().leads_meta());
+        assert!(!snapshot.node(2).unwrap().leads_meta());
+        assert_eq!(snapshot.groups_reported_led_by(2).len(), 1);
     }
 }

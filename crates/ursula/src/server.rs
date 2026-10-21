@@ -617,6 +617,32 @@ mod tests {
         assert_eq!(response.headers()["ursula-cluster-id"], "dev-local");
     }
 
+    /// `GET uri` on `router`, with its status and its JSON body.
+    async fn get_json(
+        router: &axum::Router,
+        uri: &str,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        use tower::ServiceExt;
+        let response = router
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
     /// A node reports how the WAL opened: a new WAL root is read strictly
     /// and its logs are complete.
     #[tokio::test]
@@ -653,8 +679,22 @@ mod tests {
         let metrics: serde_json::Value =
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
+        let mut wal_recovery = metrics["wal_recovery"].clone();
+        let meta = wal_recovery
+            .as_object_mut()
+            .unwrap()
+            .remove("meta")
+            .expect("the report carries the meta class");
+        // The meta class opens by its own record: a fresh node's meta
+        // journal opens normally, unread by nothing.
+        assert_eq!(meta["previous_run"], serde_json::json!({"kind": "absent"}));
+        assert_eq!(meta["recovery"], serde_json::json!({"state": "normal"}));
+        assert_eq!(meta["damage"], serde_json::Value::Null);
+        // Meta's replica reports apart from the data groups.
+        assert_eq!(metrics["meta"]["raft_group_id"], 0);
+        assert_eq!(metrics["meta"]["node_id"], 7);
         assert_eq!(
-            metrics["wal_recovery"],
+            wal_recovery,
             serde_json::json!({
                 "fsync": "never",
                 "previous_run": {"kind": "absent"},
@@ -730,6 +770,34 @@ mod tests {
         ]);
         let client =
             crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default());
+        let admin = crate::admin_router(state.clone());
+        // The placement status shows the bootstrapped cluster with this node
+        // the meta voter that leads, on both listeners. Only the admin
+        // listener confirms it by a meta read barrier.
+        let (status, placement) = get_json(&client, "/__ursula/placement").await;
+        assert_eq!(status, StatusCode::OK);
+        let placement: ursula_control::PlacementStatus = serde_json::from_value(placement).unwrap();
+        assert_eq!(placement.node, me);
+        assert_eq!(
+            placement.view,
+            ursula_control::ClusterView::Bootstrapped(cluster.clone())
+        );
+        assert_eq!(placement.meta, ursula_control::MetaReplicaStatus::Running {
+            role: ursula_control::MetaRole::Voter,
+            leader: Some(me),
+        });
+        assert!(matches!(
+            placement.registration,
+            ursula_control::RegistrationStatus::Answered(_)
+        ));
+        let (status, _) = get_json(&client, "/__ursula/placement?confirmed=true").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, confirmed) = get_json(&admin, "/__ursula/placement?confirmed=true").await;
+        assert_eq!(status, StatusCode::OK);
+        let confirmed: ursula_control::PlacementStatus = serde_json::from_value(confirmed).unwrap();
+        assert_eq!(confirmed.view, placement.view);
+        let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
+        assert_eq!(metrics["meta"]["current_leader"], 7);
         let ready = |client: axum::Router| async move {
             client
                 .oneshot(
@@ -830,16 +898,44 @@ mod tests {
         .unwrap();
 
         let state = start().await;
-        assert_eq!(
+        assert!(matches!(
             state
                 .meta()
                 .with(ursula_raft::meta::runtime::MetaRuntime::state),
-            Some(ursula_raft::meta::runtime::MetaRuntimeState::Damaged(
-                ursula_control::MetaDamageKind::Journal
-            ))
-        );
+            Some(ursula_raft::meta::runtime::MetaRuntimeState::Damaged {
+                kind: ursula_control::MetaDamageKind::Journal,
+                ..
+            })
+        ));
         let client =
             crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default());
+        // Its status names the damage, and the node takes no leadership
+        // transfer while it may still campaign.
+        let (status, placement) = get_json(&client, "/__ursula/placement").await;
+        assert_eq!(status, StatusCode::OK);
+        let placement: ursula_control::PlacementStatus = serde_json::from_value(placement).unwrap();
+        assert!(matches!(
+            placement.meta,
+            ursula_control::MetaReplicaStatus::Damaged {
+                kind: ursula_control::MetaDamageKind::Journal,
+                ..
+            }
+        ));
+        assert_eq!(placement.applied, None);
+        let registry = state.raft_registry().cloned().expect("a Raft node");
+        let shed = registry.leadership_shed_state();
+        assert!(shed.contains(ursula_raft::LeadershipShedState::PLACEMENT_UNAVAILABLE));
+        assert!(shed.should_campaign());
+        assert!(!shed.should_accept_transfer());
+        // A barrier has no replica to run on.
+        let (status, refusal) = get_json(
+            &crate::admin_router(state.clone()),
+            "/__ursula/placement?confirmed=true",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let refusal: ursula_control::PlacementApiError = serde_json::from_value(refusal).unwrap();
+        assert_eq!(refusal.reason, ursula_control::PlacementApiReason::Stopped);
         let ready = client
             .clone()
             .oneshot(

@@ -24,12 +24,14 @@ use ursula_raft::RaftGroupHandleRegistry;
 use crate::bootstrap::health_gate::ShedTargets;
 
 /// What a node's leadership-shed policy lets it do, as far as this node
-/// knows.
+/// knows. Every reader picks handoff targets, so a node's stance is
+/// whether it takes a leadership transfer (`should_accept_transfer`): it
+/// may campaign and runs a meta replica.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CampaignStance {
-    /// Its policy lets it campaign.
+    /// Its policy lets it campaign and take a transfer.
     MayCampaign,
-    /// It answered that its policy does not let it campaign.
+    /// It answered that its policy does not let it take a transfer.
     MayNotCampaign,
     /// It did not answer in time, or its answer could not be read.
     Unknown,
@@ -158,7 +160,7 @@ impl PeerParticipation {
         )
         .await;
         let mut by_node: BTreeMap<u64, CampaignStance> = answers.into_iter().collect();
-        let own = if registry.should_campaign() {
+        let own = if registry.should_accept_transfer() {
             CampaignStance::MayCampaign
         } else {
             CampaignStance::MayNotCampaign
@@ -218,7 +220,7 @@ impl PeerParticipation {
                 );
                 CampaignStance::Unknown
             }
-            Ok(status) if status.should_campaign => CampaignStance::MayCampaign,
+            Ok(status) if status.should_accept_transfer => CampaignStance::MayCampaign,
             Ok(_) => CampaignStance::MayNotCampaign,
             Err(err) => {
                 tracing::debug!(peer_id, %err, "unreadable leadership-shed state");

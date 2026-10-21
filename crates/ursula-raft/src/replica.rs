@@ -340,6 +340,87 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             .map_err(|source| IncomingTransferError::Raft { group, source })
     }
 
+    /// This replica's metrics snapshot as group `raft_group_id`: its Raft
+    /// metrics, recovery gate, history and apply health, with the log
+    /// progress since its last snapshot (`log`) and the membership its
+    /// state machine applied last (`applied`), which each plane tracks its
+    /// own way.
+    pub(crate) fn metrics_snapshot(
+        &self,
+        raft_group_id: u32,
+        election: &ElectionPolicy,
+        log: crate::snapshot_cadence::GroupLogProgress,
+        applied: StoredMembershipOf<C>,
+    ) -> crate::types::RaftGroupMetricsSnapshot {
+        let raft = self.owner();
+        let metrics = raft.metrics().borrow_watched().clone();
+        // `RaftMetrics` carry only the index of the last log id. The data
+        // metrics carry the whole id, so its term and index match.
+        let last_log = raft.data_metrics().borrow_watched().last_log;
+        let membership = metrics.membership_config.membership();
+        let apply_failure = self.apply_health.failure();
+        let apply_running = apply_failure.is_none();
+        let running = apply_running
+            && metrics.running_state.is_ok()
+            && metrics.state != openraft::ServerState::Shutdown;
+        let progress = crate::registry::log_progress_snapshot;
+        let recovery = self.recovery.as_deref();
+        crate::types::RaftGroupMetricsSnapshot {
+            apply_failure,
+            raft_group_id,
+            node_id: metrics.id,
+            current_term: metrics.current_term,
+            // A stopped replica leads nothing. Its last observation is
+            // stale, so leader counts and drains must not see it.
+            current_leader: metrics.current_leader.filter(|_| running),
+            last_log: last_log.map(progress),
+            committed: metrics.local_committed.map(progress),
+            last_applied: metrics.last_applied.map(progress),
+            snapshot: metrics.snapshot.map(progress),
+            purged: metrics.purged.map(progress),
+            voter_ids: membership.voter_ids().collect(),
+            voter_configurations: membership.get_joint_config().clone(),
+            committed_voter_configurations: crate::rejoin::kept_membership_of(
+                recovery,
+                metrics.local_committed.map(|id| id.index),
+                applied,
+            )
+            .membership()
+            .get_joint_config()
+            .clone(),
+            learner_ids: membership.learner_ids().collect(),
+            maintenance: crate::types::RaftGroupMaintenanceState {
+                running,
+                recovery_ready: apply_running && recovery.is_none_or(GroupRejoin::vote_gate_open),
+                accepting_transfers: apply_running && election.may_accept_transfer(recovery),
+                membership_joint: membership.get_joint_config().len() != 1,
+                membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
+                stopped_for_operator: recovery.is_some_and(|rejoin| rejoin.status().is_stalled()),
+            },
+            log,
+            history: self
+                .history
+                .applied()
+                .map(|event| ursula_proto::admin::RaftGroupHistory {
+                    event_index: event.event_index,
+                    imported: event.imported.is_some(),
+                }),
+            recovery: recovery
+                .and_then(GroupRejoin::recovery_record)
+                .map(|record| ursula_proto::admin::RaftGroupRecovery {
+                    leader: record.leader,
+                    point: record.point,
+                    leader_term: record.leader_term,
+                    cut_pending: matches!(record.cut, crate::log_store::PlanCut::Pending { .. }),
+                }),
+            leads_live: crate::rejoin::leads_live(&metrics),
+            recovery_gate: recovery.map_or(
+                ursula_proto::admin::RecoveryGateStatus::Open,
+                GroupRejoin::status,
+            ),
+        }
+    }
+
     /// The Raft metrics a handoff is checked against, from one read.
     pub(crate) fn handoff_view(&self) -> RaftMetrics<C> {
         self.owner().metrics().borrow_watched().clone()

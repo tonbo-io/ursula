@@ -26,6 +26,8 @@ use ursula_proto::placement::VoterSet;
 
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
+use super::pause::MetaPausePoint;
+use super::pause::MetaPauses;
 use super::registration::RETRY_MIN;
 use super::registration::back_off;
 use crate::RaftGroupHandleRegistry;
@@ -54,6 +56,7 @@ pub(crate) async fn run_formation<T: RecoveryTransport>(
     params: FormationParams,
     registry: RaftGroupHandleRegistry,
     refusal: watch::Sender<Option<ControlError>>,
+    pauses: MetaPauses,
     stopped: impl Fn() -> bool,
 ) {
     let mut watch = registry.placement_watch();
@@ -94,8 +97,13 @@ pub(crate) async fn run_formation<T: RecoveryTransport>(
             nodes: claim.peers.clone(),
             now_ms: ursula_runtime::unix_time_ms(),
         };
+        pauses.at(MetaPausePoint::Bootstrap).await;
         match handle.submit(command).await {
             Ok(_bootstrapped) => return,
+            // A view that lags an applied `Bootstrap`, after a leader
+            // change: the cluster bootstrapped, which is no refusal to
+            // report.
+            Err(MetaWriteError::Refused(ControlError::AlreadyBootstrapped)) => return,
             Err(MetaWriteError::Refused(error)) => {
                 tracing::warn!(%error, "meta formation: Bootstrap refused");
                 let requeue = error.requeue();

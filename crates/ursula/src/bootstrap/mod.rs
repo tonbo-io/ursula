@@ -16,6 +16,7 @@ mod format_epoch;
 mod health_gate;
 mod leadership;
 mod meta;
+mod meta_shed;
 mod participation;
 mod runtime;
 mod snapshot;

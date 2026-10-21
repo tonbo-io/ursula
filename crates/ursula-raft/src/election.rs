@@ -26,15 +26,20 @@ pub enum LeadershipShedReason {
     ColdHealth = 0b100,
     MaintenanceDrain = 0b1000,
     WalDiskPressure = 0b1_0000,
+    /// This node runs no meta replica (design 3.2): a group it leads would
+    /// never reconcile. It may campaign, so a group whose every voter lacks
+    /// meta still elects, but it takes no transfer.
+    PlacementUnavailable = 0b10_0000,
 }
 
 impl LeadershipShedReason {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::SnapshotDriverS3,
         Self::ClusterEgress,
         Self::ColdHealth,
         Self::MaintenanceDrain,
         Self::WalDiskPressure,
+        Self::PlacementUnavailable,
     ];
 
     pub(crate) const fn bit(self) -> u8 {
@@ -48,6 +53,7 @@ impl LeadershipShedReason {
             Self::ColdHealth => "cold-health",
             Self::MaintenanceDrain => "maintenance-drain",
             Self::WalDiskPressure => "wal-disk-pressure",
+            Self::PlacementUnavailable => "placement-unavailable",
         }
     }
 }
@@ -66,6 +72,7 @@ bitflags::bitflags! {
         const COLD_HEALTH = LeadershipShedReason::ColdHealth.bit();
         const MAINTENANCE_DRAIN = LeadershipShedReason::MaintenanceDrain.bit();
         const WAL_DISK_PRESSURE = LeadershipShedReason::WalDiskPressure.bit();
+        const PLACEMENT_UNAVAILABLE = LeadershipShedReason::PlacementUnavailable.bit();
     }
 }
 
@@ -84,10 +91,11 @@ impl LeadershipShedState {
         !self.is_empty()
     }
 
-    /// Transfers trigger an election, so they use the campaign policy too.
-    #[cfg(test)]
-    pub(crate) fn should_accept_transfer(self) -> bool {
-        self.should_campaign()
+    /// Whether this node may take a leadership transfer. A transfer
+    /// triggers an election, so it needs the campaign policy, and a node
+    /// without a meta replica takes none, while it may still campaign.
+    pub fn should_accept_transfer(self) -> bool {
+        self.should_campaign() && !self.contains(Self::PLACEMENT_UNAVAILABLE)
     }
 
     /// Whether local raft groups should be allowed to campaign.
@@ -120,6 +128,8 @@ impl LeadershipShedState {
             Some(LeadershipShedReason::WalDiskPressure)
         } else if self.contains(Self::SNAPSHOT_DRIVER_S3) {
             Some(LeadershipShedReason::SnapshotDriverS3)
+        } else if self.contains(Self::PLACEMENT_UNAVAILABLE) {
+            Some(LeadershipShedReason::PlacementUnavailable)
         } else {
             None
         }
@@ -160,6 +170,11 @@ impl ElectionPolicy {
     }
     pub fn may_campaign(&self, gate: Option<&GroupRejoin>) -> bool {
         self.state().should_campaign() && gate.is_none_or(GroupRejoin::may_campaign)
+    }
+    /// Whether a replica behind `gate` may take a leadership transfer
+    /// ([`LeadershipShedState::should_accept_transfer`]).
+    pub fn may_accept_transfer(&self, gate: Option<&GroupRejoin>) -> bool {
+        self.state().should_accept_transfer() && gate.is_none_or(GroupRejoin::may_campaign)
     }
     /// The one handoff policy: whether `target` can take over this node's
     /// leadership of `group` now. OpenRaft parks a leader whose transfer
@@ -214,7 +229,8 @@ impl ElectionPolicy {
     /// leader or from a self-election. A transfer to another node only
     /// drops this node's leader lease. A transfer to this node makes it
     /// campaign, so its campaign policy must allow that, and it must not
-    /// carry this node's own committed vote.
+    /// carry this node's own committed vote. A node without a meta replica
+    /// takes no transfer ([`LeadershipShedReason::PlacementUnavailable`]).
     ///
     /// OpenRaft acts on a transfer only while this node's vote equals the
     /// vote the transfer carries, and compares the two in its core as it
@@ -249,7 +265,7 @@ impl ElectionPolicy {
         if vote.is_committed() && *vote.leader_id().node_id() == node_id {
             return Err(IncomingTransferError::OwnCommittedVote { group, vote });
         }
-        if !self.may_campaign(gate) {
+        if !self.may_accept_transfer(gate) {
             return Err(IncomingTransferError::MayNotCampaign { group });
         }
         Ok(())
@@ -315,8 +331,8 @@ pub enum IncomingTransferError {
         vote: UrsulaVote,
     },
     #[error(
-        "node may not campaign for Raft group {group:?} (recovery gate closed or leadership \
-         shed); refusing a leadership transfer to itself"
+        "node may not take a leadership transfer of Raft group {group:?} (recovery gate closed, \
+         leadership shed or placement unavailable); refusing it"
     )]
     MayNotCampaign { group: RaftGroupId },
     #[error("OpenRaft could not take the leadership transfer for {group:?}: {source}")]

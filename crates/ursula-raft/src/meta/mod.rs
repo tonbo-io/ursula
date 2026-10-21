@@ -13,8 +13,10 @@
 //! [`state_machine`], [`watch`]) encode nothing of their own, and
 //! [`state_machine`]'s dispatch of the meta log is frozen with the epoch.
 //! The runtime and its tasks ([`runtime`], [`handle`], [`genesis_driver`],
-//! [`registration`], [`formation`], [`damage`] and the meta membership
-//! target) encode nothing either: they write only the commands above.
+//! [`registration`], [`formation`], [`damage`], [`pause`] and the meta
+//! membership target) encode nothing either: they write only the commands
+//! above. The placement status ([`status`]) and the placement routes'
+//! refusals (`api`) are admin JSON.
 //!
 //! `#[serde(other)]` is allowed only on admin JSON enums (the admin
 //! vocabulary of `ursula_proto::placement`), and forbidden on every type
@@ -24,10 +26,12 @@
 //!
 //! The Raft gRPC service routes the meta plane's RPCs to the replica the
 //! registry publishes ([`replica::ActiveMeta`]), which the meta runtime
-//! ([`runtime::MetaRuntime`]) opens. No server starts the runtime yet.
+//! ([`runtime::MetaRuntime`]) opens.
 //!
 //! Module map:
 //!
+//! - `api`: the placement routes' refusals of the meta plane's failures
+//!   (`ursula_control::PlacementApiError`), each built once.
 //! - [`confirm`]: why a meta read barrier confirmed no placement view
 //!   ([`confirm::MetaBarrierError`]), never encoded.
 //! - [`damage`]: which refusals of the commit screen damage the meta
@@ -39,6 +43,7 @@
 //!   probe, and what the probes last heard ([`genesis_driver::GenesisStatus`]).
 //! - [`handle`]: how this node writes to the meta group and confirms its
 //!   view ([`handle::MetaHandle`], [`handle::MetaWriteError`]).
+//! - [`pause`]: the pause points tests stop the meta runtime at.
 //! - [`registration`]: this node's registration with the meta group.
 //! - [`replica`]: this node's meta replica ([`replica::MetaReplica`]): its
 //!   Raft over the meta journal, the tasks it owns, its registry slot
@@ -48,6 +53,8 @@
 //! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, the
 //!   bound on its size, and the trigger that snapshots the meta group on
 //!   its journal's age rule.
+//! - [`status`]: this node's placement status
+//!   ([`status::MetaStatusReader`]) and its view's stage.
 //! - [`state_machine`]: the meta state machine ([`MetaStateMachine`]): its
 //!   dispatch of the meta log, its inline snapshot record and the views it
 //!   publishes.
@@ -56,17 +63,20 @@
 //! - [`watch`]: the node's placement views, which outlive every meta
 //!   replica, and one group's placement in them.
 
+mod api;
 pub mod confirm;
 pub mod damage;
 pub mod formation;
 pub mod genesis;
 pub mod genesis_driver;
 pub mod handle;
+pub mod pause;
 pub mod registration;
 pub mod replica;
 pub mod runtime;
 pub mod snapshot;
 pub mod state_machine;
+pub mod status;
 mod target;
 pub mod watch;
 

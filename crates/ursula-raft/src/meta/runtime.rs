@@ -18,8 +18,16 @@
 //! makes it so later: the supervisor stops the replica with its tasks,
 //! which clears the registry's slot. Every way into `Damaged` publishes the
 //! empty view (design 3.2), since a replica that restored or replayed its
-//! state before failing may have published a view no replica backs. The
-//! meta directory stays, and its discard is the operator's step.
+//! state before failing may have published a view no replica backs, and
+//! marks the node's `PlacementUnavailable` leadership shed for the rest of
+//! the run: a group this node led would never reconcile. A plan's restart
+//! that reopens the replica marks nothing, and neither does the time
+//! before the replica first opens nor a shutdown. The meta directory stays, and its discard is the
+//! operator's step.
+//!
+//! [`MetaRuntime::status_reader`] reads the node's placement status
+//! ([`super::status`]), and [`MetaRuntime::pauses`] holds the pause points
+//! tests stop the runtime at ([`super::pause`]).
 //!
 //! Generic over the network and the recovery transport, so a simulation
 //! runs it in process.
@@ -31,6 +39,7 @@ use openraft::RaftNetworkFactory;
 use ursula_control::ControlError;
 use ursula_control::MetaDamageKind;
 use ursula_control::PlacementView;
+use ursula_control::RegistrationStatus;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_proto::placement::GenesisClaim;
@@ -44,7 +53,7 @@ use super::formation::run_formation;
 use super::genesis_driver::GenesisStatus;
 use super::genesis_driver::genesis_gate_probe;
 use super::handle::MetaHandle;
-use super::registration::Registration;
+use super::pause::MetaPauses;
 use super::registration::run_registration;
 use super::replica::MetaDriverContext;
 use super::replica::MetaDrivers;
@@ -52,7 +61,9 @@ use super::replica::MetaReplicaConfig;
 use super::replica::MetaReplicaRestart;
 use super::replica::MetaReplicaTasks;
 use super::replica::MetaSnapshotTrigger;
+use super::status::MetaStatusReader;
 use super::target::MetaTargetSource;
+use crate::LeadershipShedReason;
 use crate::MetaOpenError;
 use crate::RaftEngineConfig;
 use crate::RaftGroupFileLogStore;
@@ -94,11 +105,15 @@ pub struct MetaJournal {
 }
 
 /// Whether this node runs a meta replica.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetaRuntimeState {
     Running,
-    /// No meta replica runs in this run, for `kind`.
-    Damaged(MetaDamageKind),
+    /// No meta replica runs in this run, for `kind`. `message` is the
+    /// rendered error.
+    Damaged {
+        kind: MetaDamageKind,
+        message: String,
+    },
 }
 
 /// The watches status reports read.
@@ -106,7 +121,7 @@ pub enum MetaRuntimeState {
 pub struct MetaRuntimeStatus {
     pub state: watch::Receiver<MetaRuntimeState>,
     pub genesis: watch::Receiver<GenesisStatus>,
-    pub registration: watch::Receiver<Registration>,
+    pub registration: watch::Receiver<RegistrationStatus>,
     /// Why the last `Bootstrap` this node submitted was refused.
     pub bootstrap_refusal: watch::Receiver<Option<ControlError>>,
     pub reconcile: watch::Receiver<ReconcileStatus>,
@@ -118,6 +133,8 @@ pub struct MetaRuntime<N> {
     state: watch::Sender<MetaRuntimeState>,
     replica: Arc<Mutex<Option<MetaReplicaRestart<N>>>>,
     registry: RaftGroupHandleRegistry,
+    reader: MetaStatusReader,
+    pauses: MetaPauses,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -147,33 +164,43 @@ where
         let (state, state_rx) = watch::channel(MetaRuntimeState::Running);
         let (genesis, genesis_rx) =
             watch::channel(GenesisStatus::before_answers(me, &config.claim));
-        let (registration, registration_rx) = watch::channel(Registration::Pending);
+        let (registration, registration_rx) = watch::channel(RegistrationStatus::Pending);
         let (refusal, refusal_rx) = watch::channel(None);
         let (reconcile, reconcile_rx) =
             watch::channel(crate::rejoin::initial_status(ursula_runtime::unix_time_ms()));
         let (damage, damage_rx) = watch::channel(None);
+        let status = MetaRuntimeStatus {
+            state: state_rx,
+            genesis: genesis_rx,
+            registration: registration_rx,
+            bootstrap_refusal: refusal_rx,
+            reconcile: reconcile_rx,
+        };
+        let handle = MetaHandle::new(me, registry.clone(), transport.clone(), &config.claim);
+        let pauses = MetaPauses::default();
         let mut runtime = Self {
-            status: MetaRuntimeStatus {
-                state: state_rx,
-                genesis: genesis_rx,
-                registration: registration_rx,
-                bootstrap_refusal: refusal_rx,
-                reconcile: reconcile_rx,
-            },
+            reader: MetaStatusReader::new(
+                me,
+                config.claim.clone(),
+                status.clone(),
+                registry.clone(),
+                handle.clone(),
+            ),
+            status,
             state,
             replica: Arc::new(Mutex::new(None)),
             registry: registry.clone(),
+            pauses: pauses.clone(),
             tasks: Vec::new(),
         };
         let store = match journal.opened {
             Ok(store) => store,
             Err(error) => {
                 tracing::error!(%error, "meta runtime: the meta journal did not open; this node runs no meta replica");
-                mark_damaged(&runtime.state, &registry, MetaDamageKind::Journal);
+                mark_damaged(&runtime.state, &registry, MetaDamageKind::Journal, &error);
                 return runtime;
             }
         };
-        let handle = MetaHandle::new(me, registry.clone(), transport.clone(), &config.claim);
         let tasks = MetaReplicaTasks {
             snapshots: config.snapshots,
             drivers: Some(Arc::new(ReplicaDrivers {
@@ -186,6 +213,7 @@ where
                 reconcile,
             })),
             damage: Some(damage),
+            pauses: pauses.clone(),
         };
         let replica_config = MetaReplicaConfig {
             node: config.node,
@@ -207,20 +235,21 @@ where
             Err(error) => {
                 let kind = opening_damage(&error);
                 tracing::error!(%error, ?kind, "meta runtime: the meta replica did not open; this node runs no meta replica");
-                mark_damaged(&runtime.state, &registry, kind);
+                mark_damaged(&runtime.state, &registry, kind, &error);
                 return runtime;
             }
         };
         *runtime.replica.lock().await = Some(restart);
         let stopped = {
             let state = runtime.status.state.clone();
-            move || matches!(*state.borrow(), MetaRuntimeState::Damaged(_))
+            move || matches!(*state.borrow(), MetaRuntimeState::Damaged { .. })
         };
         runtime.tasks.push(crate::rt::spawn(run_registration(
             handle.clone(),
             me,
             registry.clone(),
             registration,
+            pauses.clone(),
             stopped.clone(),
         )));
         runtime.tasks.push(crate::rt::spawn(run_formation(
@@ -230,6 +259,7 @@ where
             config.formation,
             registry.clone(),
             refusal,
+            pauses,
             stopped,
         )));
         runtime.tasks.push(crate::rt::spawn(supervise_damage(
@@ -248,7 +278,17 @@ where
 
     /// Whether this node runs a meta replica now.
     pub fn state(&self) -> MetaRuntimeState {
-        *self.status.state.borrow()
+        self.status.state.borrow().clone()
+    }
+
+    /// What this node's placement status reads.
+    pub fn status_reader(&self) -> &MetaStatusReader {
+        &self.reader
+    }
+
+    /// The pause points tests stop this runtime at.
+    pub fn pauses(&self) -> &MetaPauses {
+        &self.pauses
     }
 
     /// A recovery plan on this node's meta replica
@@ -271,7 +311,7 @@ where
             let kind = opening_damage(source);
             tracing::error!(%source, ?kind, "meta runtime: the meta replica did not reopen after a recovery plan; this node runs no meta replica");
             *replica = None;
-            mark_damaged(&self.state, &self.registry, kind);
+            mark_damaged(&self.state, &self.registry, kind, source);
         }
         accepted
     }
@@ -343,18 +383,24 @@ fn opening_damage(error: &super::replica::MetaReplicaError) -> MetaDamageKind {
     error.damage_kind().unwrap_or(MetaDamageKind::Start)
 }
 
-/// Marks the runtime damaged for `kind` and publishes the empty view, the
-/// one way into `Damaged` (see the module docs). Callers stop or drop the
-/// replica first, so no replica publishes after the empty view.
+/// Marks the runtime damaged for `kind` by `error`, publishes the empty
+/// view and sheds the node's leaderships, the one way into `Damaged` (see
+/// the module docs). Callers stop or drop the replica first, so no replica
+/// publishes after the empty view.
 fn mark_damaged(
     state: &watch::Sender<MetaRuntimeState>,
     registry: &RaftGroupHandleRegistry,
     kind: MetaDamageKind,
+    error: &(dyn std::error::Error + 'static),
 ) {
-    state.send_replace(MetaRuntimeState::Damaged(kind));
+    state.send_replace(MetaRuntimeState::Damaged {
+        kind,
+        message: ursula_runtime::ErrorChain(error).to_string(),
+    });
     registry
         .placement_publisher()
         .publish(PlacementView::empty());
+    registry.mark_leadership_shed(LeadershipShedReason::PlacementUnavailable);
 }
 
 /// Waits for a for-good refusal of the commit screen, then stops the
@@ -368,14 +414,14 @@ async fn supervise_damage<N>(
     N: RaftNetworkFactory<C> + Clone + Send + Sync + 'static,
     N::Network: openraft::RaftNetworkV2<C, SnapshotData = SnapshotData>,
 {
-    loop {
-        if damage.borrow().is_some() {
-            break;
+    let damaged = loop {
+        if let Some(damaged) = damage.borrow().clone() {
+            break damaged;
         }
         if damage.changed().await.is_err() {
             return;
         }
-    }
+    };
     // No replica here: a failed plan restart already made the runtime
     // damaged.
     let Some(stopped) = replica.lock().await.take() else {
@@ -384,7 +430,12 @@ async fn supervise_damage<N>(
     if let Err(error) = stopped.shutdown().await {
         tracing::error!(%error, "meta runtime: the damaged meta replica did not stop cleanly");
     }
-    mark_damaged(&state, &registry, MetaDamageKind::CommitScreen);
+    mark_damaged(
+        &state,
+        &registry,
+        MetaDamageKind::CommitScreen,
+        &damaged.refusal,
+    );
 }
 
 /// The gate drivers and the reconcile shell of every meta replica the
@@ -413,8 +464,7 @@ impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
         let peers: BTreeSet<u64> = self.claim.peers.iter().map(NodeId::get).collect();
         let voters: BTreeSet<u64> = self.claim.meta_voters.iter().map(NodeId::get).collect();
         let mut recovery = self.recovery.clone();
-        // Only the smallest claimed meta voter initializes the meta group.
-        recovery.initialize = self.claim.meta_voters.min() == self.node;
+        recovery.initialize = self.claim.is_genesis_node(self.node);
         let probe = genesis_gate_probe(
             self.transport.clone(),
             self.claim.clone(),

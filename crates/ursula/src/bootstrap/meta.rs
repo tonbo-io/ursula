@@ -1,8 +1,9 @@
 //! The meta group on a server node: the spawn path binds the node's peer
 //! identity and opens the meta journal ([`open_meta`]), before the runtime
 //! starts and so before any data group of the run opens. `init_state`
-//! then starts the meta runtime on that journal ([`SpawnedMeta::start`])
-//! and keeps it in a [`MetaSlot`] until shutdown.
+//! then starts the meta runtime on that journal ([`SpawnedMeta::start`]),
+//! with the meta shed of a cluster node ([`super::meta_shed`]), and keeps
+//! both in a [`MetaSlot`] until shutdown.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -25,13 +26,16 @@ use ursula_raft::meta::replica::MetaSnapshotTrigger;
 use ursula_raft::meta::runtime::GrpcMetaRuntime;
 use ursula_raft::meta::runtime::MetaJournal;
 use ursula_raft::meta::runtime::MetaRuntimeConfig;
+use ursula_raft::meta::status::MetaStatusReader;
 use ursula_shard::ShardMapError;
 
+use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::topology::Topology;
 
 /// What the spawn path prepared for the meta runtime: the opened meta
-/// journal, the node's peer identity, WAL and registry, and the meta
-/// runtime's config.
+/// journal, the node's peer identity, WAL and registry, the meta runtime's
+/// config, and a cluster node's view of its peers' participation, which
+/// the meta shed hands leaderships by.
 #[derive(Debug)]
 pub struct SpawnedMeta {
     journal: MetaJournal,
@@ -39,11 +43,17 @@ pub struct SpawnedMeta {
     wal: RaftWal,
     registry: RaftGroupHandleRegistry,
     config: MetaRuntimeConfig,
+    participation: Option<PeerParticipation>,
+    /// The meta journal's WAL counters.
+    wal_metrics: ursula_runtime::RuntimeMetrics,
 }
 
 impl SpawnedMeta {
-    /// Starts the meta runtime over gRPC on the prepared journal.
+    /// Starts the meta runtime over gRPC on the prepared journal, and on a
+    /// cluster node its meta shed.
     pub(crate) async fn start(self) -> MetaSlot {
+        let node_id = self.config.node;
+        let registry = self.registry.clone();
         let runtime = GrpcMetaRuntime::start_over_grpc(
             self.config,
             self.journal,
@@ -52,18 +62,66 @@ impl SpawnedMeta {
             self.identity,
         )
         .await;
-        MetaSlot(Arc::new(Mutex::new(Some(runtime))))
+        let shed = self.participation.map(|participation| {
+            super::meta_shed::spawn_meta_shed(
+                registry,
+                participation,
+                runtime.status_reader().clone(),
+                node_id,
+            )
+        });
+        MetaSlot(Arc::new(Mutex::new(Some(ServerMeta {
+            runtime,
+            shed,
+            wal_metrics: self.wal_metrics,
+        }))))
     }
+}
+
+/// The meta runtime and the meta shed task of a server node.
+#[derive(Debug)]
+struct ServerMeta {
+    runtime: GrpcMetaRuntime,
+    shed: Option<tokio::task::JoinHandle<()>>,
+    wal_metrics: ursula_runtime::RuntimeMetrics,
 }
 
 /// Where the server keeps its meta runtime until shutdown takes it.
 #[derive(Debug, Clone, Default)]
-pub struct MetaSlot(Arc<Mutex<Option<GrpcMetaRuntime>>>);
+pub struct MetaSlot(Arc<Mutex<Option<ServerMeta>>>);
 
 impl MetaSlot {
-    /// The meta runtime, once: shutdown stops it.
+    /// The meta runtime, once: shutdown stops it. The meta shed stops
+    /// here.
     pub(crate) fn take(&self) -> Option<GrpcMetaRuntime> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+        let meta = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()?;
+        if let Some(shed) = meta.shed {
+            shed.abort();
+        }
+        Some(meta.runtime)
+    }
+
+    /// The meta journal's WAL counters, while the meta runtime runs.
+    pub(crate) fn wal_metrics(&self) -> Option<ursula_runtime::RuntimeMetrics> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|meta| meta.wal_metrics.clone())
+    }
+
+    /// What this node's placement status reads, while the meta runtime
+    /// runs.
+    pub(crate) fn status_reader(&self) -> Option<MetaStatusReader> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|meta| meta.runtime.status_reader().clone())
     }
 
     /// Reads the meta runtime, if it still runs.
@@ -73,7 +131,7 @@ impl MetaSlot {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
-            .map(read)
+            .map(|meta| read(&meta.runtime))
     }
 }
 
@@ -90,6 +148,7 @@ pub(crate) fn open_meta(
     shard_map: &ursula_shard::StaticShardMap,
     engine: RaftEngineConfig,
     snapshots: MetaSnapshotTrigger,
+    participation: Option<PeerParticipation>,
 ) -> Result<SpawnedMeta, ShardMapError> {
     let raft = &config.raft;
     let (node_id, directory) = node_and_peers(config, topology);
@@ -109,12 +168,15 @@ pub(crate) fn open_meta(
         peers,
         group_count,
     };
-    let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+    // The meta journal's own counters, apart from the data groups'.
+    let wal_metrics = ursula_runtime::RuntimeMetrics::new(1, 1);
+    let metrics = wal_metrics.group_engine_metrics();
     Ok(SpawnedMeta {
         journal: MetaJournal {
             opened: wal.open_meta(metrics.clone()),
             metrics,
         },
+        wal_metrics,
         identity,
         wal: wal.clone(),
         registry: registry.clone(),
@@ -127,6 +189,7 @@ pub(crate) fn open_meta(
             engine,
             snapshots: Some(snapshots),
         },
+        participation,
     })
 }
 

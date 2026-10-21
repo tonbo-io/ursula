@@ -418,6 +418,15 @@ impl NodeMetricsView {
             .iter()
             .filter(move |g| g.current_leader == Some(self_id))
     }
+
+    /// Whether this node reports that it leads the meta group. Meta is
+    /// never one of [`Self::led_groups`], where its group 0 would meet data
+    /// group 0.
+    pub fn leads_meta(&self) -> bool {
+        self.meta
+            .as_ref()
+            .is_some_and(|meta| meta.current_leader == Some(self.node.id))
+    }
 }
 
 pub use ursula_proto::admin::RaftGroupMetrics as RaftGroupView;
@@ -455,6 +464,15 @@ impl ClusterSnapshot {
         groups.into_values().collect()
     }
 
+    /// Whether any node reports `node_id` as the meta leader.
+    pub fn meta_led_by(&self, node_id: u64) -> bool {
+        self.per_node.iter().any(|view| {
+            view.meta
+                .as_ref()
+                .is_some_and(|meta| meta.current_leader == Some(node_id))
+        })
+    }
+
     /// Peers' view of a raft group, keyed by reporting node_id, excluding the target.
     pub fn peer_views(
         &self,
@@ -484,6 +502,7 @@ pub(crate) fn test_metrics(
         process_incarnation: identity.expect("complete fixture identity"),
         process_node_id: Some(id),
         groups: vec![],
+        meta: None,
         raft_maintenance: None,
     }
 }
@@ -574,6 +593,7 @@ pub(crate) fn test_view(node: NodeInfo, groups: Vec<RaftGroupView>) -> NodeMetri
         process_incarnation: ProcessIncarnation::from_bits(1),
         process_node_id,
         groups,
+        meta: None,
         raft_maintenance,
     })
 }

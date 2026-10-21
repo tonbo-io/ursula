@@ -206,6 +206,7 @@ pub fn spawn_runtime(
                     )
                     .removal_floor,
                 },
+                participation.clone(),
             )
             .map_err(RuntimeError::from)?,
         ),

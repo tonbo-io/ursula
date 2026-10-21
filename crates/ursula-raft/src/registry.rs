@@ -584,6 +584,35 @@ impl RaftGroupHandleRegistry {
             .validate_handoff(&self.election, group, target, &metrics)
     }
 
+    /// [`Self::transfer_leader`] on this node's meta replica.
+    pub async fn transfer_meta_leader(&self, target: u64) -> Result<(), LeadershipTransferError> {
+        let group = crate::meta::state_machine::META_GROUP;
+        let meta = self
+            .meta()
+            .ok_or(LeadershipTransferError::NotRegistered { group })?;
+        meta.core
+            .transfer_leader(&self.election, group, target)
+            .await
+    }
+
+    /// How long a handoff of the meta leadership takes to move it, at
+    /// most, when this node runs a meta replica.
+    pub fn meta_handoff_settle_time(&self) -> Option<std::time::Duration> {
+        self.meta()
+            .map(|meta| meta.core.owner().handoff_settle_time())
+    }
+
+    /// [`Self::check_handoff`] on this node's meta replica.
+    pub fn check_meta_handoff(&self, target: u64) -> Result<(), LeadershipTransferError> {
+        let group = crate::meta::state_machine::META_GROUP;
+        let meta = self
+            .meta()
+            .ok_or(LeadershipTransferError::NotRegistered { group })?;
+        let metrics = meta.core.handoff_view();
+        meta.core
+            .validate_handoff(&self.election, group, target, &metrics)
+    }
+
     /// One registry entry, so the gate checked is the gate of the Raft that
     /// transfers.
     fn handoff_view(
@@ -1128,6 +1157,12 @@ impl RaftGroupHandleRegistry {
         self.election.may_campaign(None) && self.recovery_barriers_ready()
     }
 
+    /// Whether this node may take a planned leadership handoff: it may
+    /// campaign and runs a meta replica.
+    pub fn should_accept_transfer(&self) -> bool {
+        self.election.may_accept_transfer(None) && self.recovery_barriers_ready()
+    }
+
     /// This node's leadership-shed state, as a node of `cluster_id` answers
     /// it. A node cannot receive a planned leadership handoff until the
     /// recovery gate of every registered group is open.
@@ -1136,13 +1171,12 @@ impl RaftGroupHandleRegistry {
         cluster_id: ursula_headers::ClusterId,
     ) -> ursula_proto::admin::LeadershipShedStatus {
         let state = self.election.state();
-        let should_campaign = self.should_campaign();
         ursula_proto::admin::LeadershipShedStatus {
             cluster_id,
             bits: state.bits(),
             state: state.to_string(),
-            should_accept_transfer: should_campaign,
-            should_campaign,
+            should_accept_transfer: self.should_accept_transfer(),
+            should_campaign: self.should_campaign(),
             recovery_barriers_ready: self.recovery_barriers_ready(),
             should_shed_current_leaders: state.should_shed_current_leaders(),
         }
@@ -1210,97 +1244,45 @@ impl RaftGroupHandleRegistry {
                 }
             };
             let raft = entry.raft();
-            let health = &entry.core.apply_health;
-            let metrics = raft.metrics().borrow_watched().clone();
             // A removal's debt lasts until the log is purged through the
             // snapshot that dropped it (#669).
-            entry
-                .log_gauge
-                .observe_purged(metrics.purged.map(|purged| purged.index));
-            let log = entry.log_gauge.progress();
-            // `RaftMetrics` carry only the index of the last log id. The data
-            // metrics carry the whole id, so its term and index match.
-            let last_log = raft.data_metrics().borrow_watched().last_log;
-            let membership = metrics.membership_config.membership();
-            let apply_failure = health.failure();
-            let apply_running = apply_failure.is_none();
-            let running = apply_running
-                && metrics.running_state.is_ok()
-                && metrics.state != openraft::ServerState::Shutdown;
-            snapshots.push(RaftGroupMetricsSnapshot {
-                apply_failure,
+            entry.log_gauge.observe_purged(
+                raft.metrics()
+                    .borrow_watched()
+                    .purged
+                    .map(|purged| purged.index),
+            );
+            snapshots.push(entry.core.metrics_snapshot(
                 raft_group_id,
-                node_id: metrics.id,
-                current_term: metrics.current_term,
-                // A stopped replica leads nothing. Its last observation is
-                // stale, so leader counts and drains must not see it.
-                current_leader: metrics.current_leader.filter(|_| running),
-                last_log: last_log.map(log_progress_snapshot),
-                committed: metrics.local_committed.map(log_progress_snapshot),
-                last_applied: metrics.last_applied.map(log_progress_snapshot),
-                snapshot: metrics.snapshot.map(log_progress_snapshot),
-                purged: metrics.purged.map(log_progress_snapshot),
-                voter_ids: membership.voter_ids().collect(),
-                voter_configurations: membership.get_joint_config().clone(),
-                committed_voter_configurations: crate::rejoin::kept_membership_of(
-                    entry.core.recovery.as_deref(),
-                    metrics.local_committed.map(|id| id.index),
-                    entry.log_gauge.applied_membership(),
-                )
-                .membership()
-                .get_joint_config()
-                .clone(),
-                learner_ids: membership.learner_ids().collect(),
-                maintenance: crate::types::RaftGroupMaintenanceState {
-                    running,
-                    recovery_ready: apply_running
-                        && entry
-                            .core
-                            .recovery
-                            .as_ref()
-                            .is_none_or(|rejoin| rejoin.vote_gate_open()),
-                    accepting_transfers: apply_running
-                        && self.election.may_campaign(entry.core.recovery.as_deref()),
-                    membership_joint: membership.get_joint_config().len() != 1,
-                    membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
-                    stopped_for_operator: entry
-                        .core
-                        .recovery
-                        .as_ref()
-                        .is_some_and(|rejoin| rejoin.status().is_stalled()),
-                },
-                log,
-                history: entry.core.history.applied().map(|event| {
-                    ursula_proto::admin::RaftGroupHistory {
-                        event_index: event.event_index,
-                        imported: event.imported.is_some(),
-                    }
-                }),
-                recovery: entry
-                    .core
-                    .recovery
-                    .as_ref()
-                    .and_then(|rejoin| rejoin.recovery_record())
-                    .map(|record| ursula_proto::admin::RaftGroupRecovery {
-                        leader: record.leader,
-                        point: record.point,
-                        leader_term: record.leader_term,
-                        cut_pending: matches!(
-                            record.cut,
-                            crate::log_store::PlanCut::Pending { .. }
-                        ),
-                    }),
-                leads_live: crate::rejoin::leads_live(&metrics),
-                recovery_gate: entry
-                    .core
-                    .recovery
-                    .as_ref()
-                    .map_or(ursula_proto::admin::RecoveryGateStatus::Open, |rejoin| {
-                        rejoin.status()
-                    }),
-            });
+                &self.election,
+                entry.log_gauge.progress(),
+                entry.log_gauge.applied_membership(),
+            ));
         }
         snapshots
+    }
+
+    /// This node's meta replica's metrics snapshot, apart from
+    /// [`Self::metrics_snapshot`], where its group 0 would meet data group
+    /// 0. Its log progress since a snapshot is not tracked, and the
+    /// membership it keeps on a plan's cut is read from its committed
+    /// membership.
+    pub fn meta_metrics_snapshot(&self) -> Option<RaftGroupMetricsSnapshot> {
+        let meta = self.meta()?;
+        let committed = openraft::alias::StoredMembershipOf::<UrsulaRaftTypeConfig>::clone(
+            &meta
+                .core
+                .owner()
+                .metrics()
+                .borrow_watched()
+                .committed_membership_config,
+        );
+        Some(meta.core.metrics_snapshot(
+            crate::meta::state_machine::META_GROUP.0,
+            &self.election,
+            crate::snapshot_cadence::GroupLogProgress::default(),
+            committed,
+        ))
     }
 
     pub(crate) fn entry(&self, group: RaftGroupId) -> Result<Arc<ActiveGroup>, GroupEngineError> {
@@ -3149,6 +3131,28 @@ mod tests {
             wal_disk_shed.transfer_rejection_reason(),
             Some(LeadershipShedReason::WalDiskPressure)
         );
+
+        // A node without a meta replica campaigns, takes no transfer and
+        // hands its leaderships away.
+        let placement_shed = LeadershipShedState::from(LeadershipShedReason::PlacementUnavailable);
+        assert!(!placement_shed.should_accept_transfer());
+        assert!(placement_shed.should_campaign());
+        assert!(placement_shed.should_shed_current_leaders());
+        assert_eq!(
+            placement_shed.transfer_rejection_reason(),
+            Some(LeadershipShedReason::PlacementUnavailable)
+        );
+        let status = registry_with(LeadershipShedReason::PlacementUnavailable)
+            .participation_status(ursula_headers::ClusterId::new("placement-shed").unwrap());
+        assert!(status.should_campaign);
+        assert!(!status.should_accept_transfer);
+        assert!(status.should_shed_current_leaders);
+    }
+
+    fn registry_with(reason: LeadershipShedReason) -> RaftGroupHandleRegistry {
+        let registry = RaftGroupHandleRegistry::default();
+        registry.mark_leadership_shed(reason);
+        registry
     }
 
     #[test]

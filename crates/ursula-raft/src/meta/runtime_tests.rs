@@ -8,7 +8,11 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ursula_control::ClusterView;
+use ursula_control::MetaReplicaStatus;
+use ursula_control::MetaRole;
 use ursula_control::MoveLimit;
+use ursula_control::RegistrationStatus;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::GroupCount;
 use ursula_proto::placement::NodeId;
@@ -19,7 +23,6 @@ use ursula_proto::placement::VoterSet;
 
 use super::formation::FormationParams;
 use super::handle::MetaHandle;
-use super::registration::Registration;
 use super::runtime::MetaJournal;
 use super::runtime::MetaRuntime;
 use super::runtime::MetaRuntimeConfig;
@@ -103,12 +106,28 @@ async fn a_single_node_forms_meta_at_once() {
         panic!("a bootstrapped view applied its genesis");
     };
     assert!(history < applied, "the genesis came before the Bootstrap");
+    // The status shows the bootstrapped cluster, this node the meta voter
+    // that leads, and its registration answered.
+    let status = runtime.status_reader().placement_status();
+    assert_eq!(status.node, me);
+    assert_eq!(status.view, ClusterView::Bootstrapped(cluster.clone()));
+    assert_eq!(status.applied, Some(applied));
+    assert_eq!(status.meta, MetaReplicaStatus::Running {
+        role: MetaRole::Voter,
+        leader: Some(me),
+    });
     assert!(matches!(
-        *runtime.status().registration.borrow(),
-        Registration::Answered(_)
+        status.registration,
+        RegistrationStatus::Answered(_)
     ));
+    assert_eq!(status.last_bootstrap_refusal, None);
     assert!(runtime.status().genesis.borrow().unanswered.is_empty());
-    assert_eq!(*runtime.status().bootstrap_refusal.borrow(), None);
+    // Running meta marks no shed.
+    assert!(
+        !registry
+            .leadership_shed_state()
+            .contains(crate::LeadershipShedState::PLACEMENT_UNAVAILABLE)
+    );
 
     // The leader confirms its own view.
     let confirmed = MetaHandle::new(me, registry.clone(), transport, &claim)
@@ -116,6 +135,12 @@ async fn a_single_node_forms_meta_at_once() {
         .await
         .unwrap();
     assert_eq!(confirmed.stamp().history, history);
+    let confirmed = runtime
+        .status_reader()
+        .confirmed_placement_status()
+        .await
+        .unwrap();
+    assert_eq!(confirmed.view, status.view);
 
     runtime.shutdown().await.unwrap();
     assert!(registry.meta().is_none());

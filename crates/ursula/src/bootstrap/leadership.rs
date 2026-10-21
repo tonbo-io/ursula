@@ -133,6 +133,10 @@ pub(crate) fn plan_leadership_balance_with_eligible_nodes(
 }
 
 /// Best-effort shutdown handoff while Raft transport is still available.
+/// It waits for the data groups' leaderships and the meta group's to leave:
+/// it hands the data groups' away itself, and the drain mark it sets makes
+/// the meta shed hand meta's away (`super::meta_shed`), the one place meta's
+/// leadership is handed off.
 /// The caller bounds the whole operation, including peer discovery and waiting
 /// for observed leadership changes. Enqueuing a transfer is not completion.
 pub(crate) async fn handoff_shutdown_leadership(
@@ -147,6 +151,13 @@ pub(crate) async fn handoff_shutdown_leadership(
         .filter(|snapshot| snapshot.current_leader == Some(node_id))
         .map(|snapshot| snapshot.raft_group_id)
         .collect();
+    let led_meta = crate::bootstrap::meta_shed::leads_meta(registry, node_id);
+    // Meta counts until another node leads it, as a data group does.
+    let meta_remains = || {
+        registry.meta_metrics_snapshot().is_some_and(|meta| {
+            meta.current_leader == Some(node_id) || (led_meta && meta.current_leader.is_none())
+        })
+    };
     let remaining_leaders = || {
         registry
             .metrics_snapshot()
@@ -157,6 +168,7 @@ pub(crate) async fn handoff_shutdown_leadership(
                         && snapshot.current_leader.is_none())
             })
             .count()
+            .saturating_add(usize::from(meta_remains()))
     };
     if remaining_leaders() == 0 {
         return 0;
@@ -174,15 +186,7 @@ pub(crate) async fn handoff_shutdown_leadership(
     let mut submitted = HashSet::new();
     loop {
         let snapshots = registry.metrics_snapshot();
-        let remaining = snapshots
-            .iter()
-            .filter(|snapshot| {
-                snapshot.current_leader == Some(node_id)
-                    || (led_groups.contains(&snapshot.raft_group_id)
-                        && snapshot.current_leader.is_none())
-            })
-            .count();
-        if remaining == 0 {
+        if remaining_leaders() == 0 {
             return 0;
         }
         let eligible = participation.campaign_eligible_nodes(registry).await;
