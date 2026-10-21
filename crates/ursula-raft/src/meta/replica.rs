@@ -286,14 +286,20 @@ impl ActiveMeta {
 
     /// Writes `commands` to the meta group from `origin`, as one batch. A
     /// `RegisterNode` that names another node than `origin`'s refuses the
-    /// batch before anything is proposed.
+    /// batch before anything is proposed. Only control commands are
+    /// proposed: a stream command is refused as of the other plane
+    /// (`OtherPlane`) and a history event as one only the history driver
+    /// proposes (`NewHistory`), both before anything is proposed.
     pub async fn write(
         &self,
-        commands: Vec<ControlCommand>,
+        commands: Vec<RaftCommand>,
         origin: WriteOrigin,
     ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, MetaWriteError> {
         for command in &commands {
-            if let ControlCommand::RegisterNode { node, .. } = command
+            if let RaftCommand::Meta(MetaCommand::Control(ControlCommand::RegisterNode {
+                node,
+                ..
+            })) = command
                 && *node != origin.node()
             {
                 return Err(MetaWriteError::OtherNode {
@@ -303,10 +309,6 @@ impl ActiveMeta {
             }
         }
         self.core.apply_health.check(META_GROUP)?;
-        let commands = commands
-            .into_iter()
-            .map(|command| RaftCommand::Meta(MetaCommand::Control(command)))
-            .collect();
         let history = Arc::clone(&self.core.history);
         let answers = self
             .core
@@ -317,6 +319,31 @@ impl ActiveMeta {
             .await
             .map_err(crate::owner::owner_stopped)??;
         Ok(answers)
+    }
+
+    /// A write another node forwarded, which `admitted` names, answered as
+    /// both transports send it back (design 3.7): each command's answer,
+    /// the meta group's refusal of the whole batch as each command's
+    /// answer, and the guard's refusal of a `RegisterNode` naming another
+    /// node as an `INVALID_ARGUMENT` refusal of the request, before anything
+    /// is proposed, which the sender reads as permanent
+    /// ([`crate::ForwardError::status`]).
+    pub(crate) async fn write_forwarded(
+        &self,
+        commands: Vec<RaftCommand>,
+        admitted: NodeId,
+    ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, tonic::Status> {
+        let count = commands.len();
+        match self
+            .write(commands, WriteOrigin::Forwarded { admitted })
+            .await
+        {
+            Ok(answers) => Ok(answers),
+            Err(MetaWriteError::Engine(refusal)) => Ok(vec![Err(refusal); count]),
+            Err(refusal @ MetaWriteError::OtherNode { .. }) => {
+                Err(crate::grpc::GrpcRpcError::invalid_argument(refusal.to_string()).into())
+            }
+        }
     }
 
     /// Lets the node's election policy decide again whether this replica

@@ -59,6 +59,7 @@ use crate::forward::write_commands_on_raft;
 use crate::memberships::BarrierAnswer;
 use crate::memberships::LeaderMemberships;
 use crate::peer_channel::peer_endpoint;
+use crate::peer_cluster::AdmittedPeer;
 use crate::peer_cluster::ClusterCheck;
 use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::PeerIdentity;
@@ -1107,54 +1108,64 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         // Link this forwarded write to the originating request's trace.
         let span = tracing::info_span!("raft.group_write");
         span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
+        // The node the cluster check admitted the request from, which a
+        // forwarded meta write comes from.
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         async move {
             let request = request.into_inner();
             validate_grpc_metadata(request.protocol_version)?;
-            let RaftTarget::Data(group) = RaftTarget::parse(&request, local_node(&self.registry)?)?
-            else {
-                return Err(no_meta_replica("GroupWrite").into());
-            };
-            let placement = placement_from_parts(
-                request.core_id,
-                request.shard_id,
-                group.0,
-                "group_write_request",
-            )?;
-            let entry = self
-                .registry
-                .entry(placement.raft_group_id)
-                .map_err(group_rpc_status)?;
-            let raft = entry.raft().clone();
-            let history = entry.core.history.clone();
+            let target = RaftTarget::parse(&request, local_node(&self.registry)?)?;
             let commands = request
                 .command_payloads
                 .iter()
                 .map(|payload| decode_rpc_payload(payload, "group command"))
                 .collect::<Result<Vec<_>, _>>()?;
-            let count = commands.len();
-            // A refusal of the whole batch answers each command with it, so
-            // the sender keeps the leader's typed answer (a pending history,
-            // an unknown outcome).
-            let results =
-                raft.call(move |raft| async move {
-                    write_commands_on_raft(raft, &history, commands).await
-                })
-                .await
-                .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
-                .unwrap_or_else(|refusal| vec![Err(refusal); count]);
-            let results = results
-                .into_iter()
-                .map(|result| match result {
-                    Ok(response) => raft_internal_proto::GroupWriteResultV1 {
-                        ok: true,
-                        payload: encode_wire(&response),
-                    },
-                    Err(err) => raft_internal_proto::GroupWriteResultV1 {
-                        ok: false,
-                        payload: encode_wire(&err),
-                    },
-                })
-                .collect();
+            let results = match target {
+                RaftTarget::Data(group) => {
+                    let placement = placement_from_parts(
+                        request.core_id,
+                        request.shard_id,
+                        group.0,
+                        "group_write_request",
+                    )?;
+                    let entry = self
+                        .registry
+                        .entry(placement.raft_group_id)
+                        .map_err(group_rpc_status)?;
+                    let raft = entry.raft().clone();
+                    let history = entry.core.history.clone();
+                    let count = commands.len();
+                    // A refusal of the whole batch answers each command with
+                    // it, so the sender keeps the leader's typed answer (a
+                    // pending history, an unknown outcome).
+                    let results = raft
+                        .call(move |raft| async move {
+                            write_commands_on_raft(raft, &history, commands).await
+                        })
+                        .await
+                        .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
+                        .unwrap_or_else(|refusal| vec![Err(refusal); count]);
+                    write_results(results)
+                }
+                RaftTarget::Meta => {
+                    let AdmittedPeer(sender) = admitted.ok_or_else(|| {
+                        GrpcRpcError::invalid_argument(
+                            "GroupWrite to the meta plane names no admitted sender",
+                        )
+                    })?;
+                    let meta = self
+                        .registry
+                        .meta()
+                        .ok_or_else(|| no_meta_replica("GroupWrite"))?;
+                    write_results(
+                        meta.write_forwarded(
+                            commands,
+                            ursula_proto::placement::NodeId::new(sender),
+                        )
+                        .await?,
+                    )
+                }
+            };
             Ok(tonic::Response::new(
                 raft_internal_proto::GroupWriteResponseV1 { results },
             ))
@@ -1331,6 +1342,26 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         .instrument(span)
         .await
     }
+}
+
+/// The answers of a forwarded write as `GroupWrite` sends them back: each
+/// command's response, or the leader's typed refusal of it.
+fn write_results<T: serde::Serialize>(
+    results: Vec<Result<T, ursula_runtime::GroupEngineError>>,
+) -> Vec<raft_internal_proto::GroupWriteResultV1> {
+    results
+        .into_iter()
+        .map(|result| match result {
+            Ok(response) => raft_internal_proto::GroupWriteResultV1 {
+                ok: true,
+                payload: encode_wire(&response),
+            },
+            Err(err) => raft_internal_proto::GroupWriteResultV1 {
+                ok: false,
+                payload: encode_wire(&err),
+            },
+        })
+        .collect()
 }
 
 /// Server half of a forwarded HEAD: a client HEAD stays linearizable on the

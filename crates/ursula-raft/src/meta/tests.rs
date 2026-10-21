@@ -113,6 +113,11 @@ fn register(node: u64) -> ControlCommand {
 
 /// A meta state machine over the meta journal's store in `wal`, and the
 /// publisher of its views.
+/// `command` as the meta log carries it.
+fn control(command: ControlCommand) -> RaftCommand {
+    RaftCommand::Meta(MetaCommand::Control(command))
+}
+
 fn state_machine(
     wal: &RaftWal,
 ) -> (
@@ -575,13 +580,19 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
     };
 
     let written = active
-        .write(vec![register(1)], WriteOrigin::Local(NodeId::new(1)))
+        .write(
+            vec![control(register(1))],
+            WriteOrigin::Local(NodeId::new(1)),
+        )
         .await
         .unwrap();
     assert!(matches!(written.as_slice(), [Ok(Ok(_))]), "{written:?}");
     let last = replica.raft().metrics().borrow_watched().last_log_index;
     let refused = active
-        .write(vec![register(2)], WriteOrigin::Local(NodeId::new(1)))
+        .write(
+            vec![control(register(2))],
+            WriteOrigin::Local(NodeId::new(1)),
+        )
         .await
         .expect_err("a node registers only itself");
     assert!(matches!(refused, MetaWriteError::OtherNode {
@@ -594,7 +605,7 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
         "nothing was proposed"
     );
     let forwarded = active
-        .write(vec![register(2)], WriteOrigin::Forwarded {
+        .write(vec![control(register(2))], WriteOrigin::Forwarded {
             admitted: NodeId::new(2),
         })
         .await
@@ -609,7 +620,7 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
         .await
         .unwrap();
     let forwarded = active
-        .write(vec![register(3)], WriteOrigin::Forwarded {
+        .write(vec![control(register(3))], WriteOrigin::Forwarded {
             admitted: NodeId::new(3),
         })
         .await

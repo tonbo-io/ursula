@@ -11,9 +11,12 @@ use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
+use ursula_control::ControlCommand;
+use ursula_control::ControlResponse;
 use ursula_runtime::AnswerProblem;
 use ursula_runtime::CommittedLeader;
 use ursula_runtime::ErrorChain;
+use ursula_runtime::ErrorStatus;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::ForwardFailure;
 use ursula_runtime::ForwardedRpc;
@@ -30,6 +33,7 @@ use ursula_runtime::PurgeBucketResponse;
 use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::ResponseKind;
+use ursula_runtime::WriteEffect;
 use ursula_shard::BucketStreamId;
 use ursula_shard::ShardPlacement;
 
@@ -42,6 +46,7 @@ use crate::grpc::RAFT_GRPC_MAX_MESSAGE_BYTES;
 use crate::grpc::RAFT_GRPC_PROTOCOL_VERSION;
 use crate::grpc::RaftClient;
 use crate::meta::MetaCommand;
+use crate::meta::MetaForwardError;
 use crate::meta::MetaResponse;
 use crate::peer_channel::peer_endpoint;
 use crate::peer_cluster::PeerCluster;
@@ -239,14 +244,7 @@ pub(crate) async fn forward_purge_bucket_to_leader(
     )
     .await
     .map_err(ForwardError::into_engine_error)?;
-    let [result] = <[_; 1]>::try_from(response.results).map_err(|results| {
-        GroupEngineError::Infra(GroupInfraError::ForwardedAnswerInvalid {
-            rpc: ForwardedRpc::GroupWrite,
-            problem: AnswerProblem::ResultCount {
-                results: u64::try_from(results.len()).unwrap_or(u64::MAX),
-            },
-        })
-    })?;
+    let result = single_write_answer(response.results)?;
     let response: GroupWriteResponse = forwarded_answer(
         ForwardedRpc::GroupWrite,
         result.ok,
@@ -254,6 +252,69 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         "bucket purge answer",
     )?;
     PurgeBucketResponse::try_from(response)
+}
+
+/// Forwards one control command to the meta leader `route` names: a
+/// `GroupWrite` of the meta plane, with core and shard 0 and the command as
+/// its one `RaftCommand::Meta(Control(_))`. The meta leader answers it as a
+/// data leader answers a forwarded write, and refuses (`INVALID_ARGUMENT`,
+/// before anything is proposed) a `RegisterNode` naming another node than
+/// this one, whose admitted id the call carries.
+pub(crate) async fn forward_control_to_leader(
+    route: &LeaderRoute,
+    command: ControlCommand,
+) -> Result<ControlResponse, MetaForwardError> {
+    let mut request = raft_internal_proto::GroupWriteRequestV1 {
+        core_id: 0,
+        shard_id: 0,
+        command_payloads: vec![encode_wire(&RaftCommand::Meta(MetaCommand::Control(
+            command,
+        )))],
+        protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
+        ..Default::default()
+    };
+    RaftTarget::Meta.stamp(route.leader_id, &mut request);
+    let response = call_leader(
+        route,
+        RaftTarget::Meta,
+        ForwardedRpc::GroupWrite,
+        request,
+        |mut client, request| async move { client.group_write(request).await },
+    )
+    .await
+    .map_err(MetaForwardError::Transport)?;
+    let result = single_write_answer(response.results).map_err(MetaForwardError::Leader)?;
+    forwarded_answer(
+        ForwardedRpc::GroupWrite,
+        result.ok,
+        &result.payload,
+        "control answer",
+    )
+    .map_err(MetaForwardError::Leader)
+}
+
+/// The one answer of a forwarded write of one command, or the refusal of an
+/// answer with another count.
+fn single_write_answer<T>(results: Vec<T>) -> Result<T, GroupEngineError> {
+    let [result] = <[_; 1]>::try_from(results).map_err(|results| {
+        GroupEngineError::Infra(GroupInfraError::ForwardedAnswerInvalid {
+            rpc: ForwardedRpc::GroupWrite,
+            problem: AnswerProblem::ResultCount {
+                results: u64::try_from(results.len()).unwrap_or(u64::MAX),
+            },
+        })
+    })?;
+    Ok(result)
+}
+
+/// [`single_write_answer`] of a meta write answered in this process, as
+/// [`forward_control_to_leader`] reads the same answer off the wire.
+pub(crate) fn single_control_answer(
+    answers: Vec<Result<ControlResponse, GroupEngineError>>,
+) -> Result<ControlResponse, MetaForwardError> {
+    single_write_answer(answers)
+        .and_then(|answer| answer)
+        .map_err(MetaForwardError::Leader)
 }
 
 /// Deadline of one forwarded leader RPC, connect included. It ends a call
@@ -264,9 +325,12 @@ pub(crate) async fn forward_purge_bucket_to_leader(
 /// the client gets this node's retryable answer.
 const FORWARD_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Why a forwarded leader RPC got no answer from the leader's group.
+/// Why a forwarded leader RPC got no answer from the leader's group. Never
+/// encoded: the forwarder classifies it ([`Self::write_effect`],
+/// [`Self::status`]), and a data-plane forward answers its client with
+/// [`Self::into_engine_error`].
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ForwardError {
+pub enum ForwardError {
     /// This replica runs without the gRPC transport, so it has no identity
     /// to stamp on the call: nothing was sent.
     #[error("{rpc} cannot be forwarded: this replica has no Raft gRPC identity")]
@@ -328,6 +392,34 @@ pub(crate) enum ForwardError {
 }
 
 impl ForwardError {
+    /// Whether the leader refused the request itself as one it refuses
+    /// again: `INVALID_ARGUMENT`, which a leader answers only before it
+    /// proposes anything (a malformed request, or a forwarded
+    /// `RegisterNode` naming another node than the sender). Retrying it is
+    /// pointless.
+    fn refused_for_good(&self) -> bool {
+        matches!(self, Self::Refused { source, .. } if source.code() == tonic::Code::InvalidArgument)
+    }
+
+    /// What the forwarded write did: nothing for a request the leader
+    /// refused for good, else what the engine-level answer
+    /// ([`Self::into_engine_error`]) says.
+    pub fn write_effect(&self) -> WriteEffect {
+        if self.refused_for_good() {
+            return WriteEffect::NotProposed;
+        }
+        self.engine_error().write_effect()
+    }
+
+    /// Whether retrying may succeed: permanent for a request the leader
+    /// refused for good, else what the engine-level answer says.
+    pub fn status(&self) -> ErrorStatus {
+        if self.refused_for_good() {
+            return ErrorStatus::Permanent;
+        }
+        self.engine_error().status()
+    }
+
     /// True when this node could not reach the leader, or the leader could
     /// not serve: retrying once the connection or the election settles may
     /// succeed.
@@ -351,8 +443,17 @@ impl ForwardError {
     /// leader-unknown (HTTP 503 with `Retry-After`), retried once the
     /// election or the connection settles. The native error is logged here
     /// and stays out of the answer, which names no internal address.
-    fn into_engine_error(self) -> GroupEngineError {
-        let (rpc, failure) = match &self {
+    pub(crate) fn into_engine_error(self) -> GroupEngineError {
+        let error = self.engine_error();
+        if matches!(error, GroupEngineError::Infra(_)) {
+            tracing::warn!(error = %ErrorChain(&self), "forwarded leader RPC failed");
+        }
+        error
+    }
+
+    /// [`Self::into_engine_error`], without the log.
+    fn engine_error(&self) -> GroupEngineError {
+        let (rpc, failure) = match self {
             // Nothing ran on the refusing node. To the client it is a leader
             // this node cannot use, so it answers 503 with Retry-After while
             // the group elects a leader of this cluster.
@@ -368,8 +469,8 @@ impl ForwardError {
             Self::OtherNode { .. } => {
                 return unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
             }
-            // A purge whose request reached the leader's socket may have
-            // committed there.
+            // A write (a purge, a control command) whose request reached the
+            // leader's socket may have committed there.
             Self::Transport {
                 rpc: ForwardedRpc::GroupWrite,
                 ..
@@ -392,7 +493,6 @@ impl ForwardError {
                 grpc_code: i32::from(source.code()),
             }),
         };
-        tracing::warn!(error = %ErrorChain(&self), "forwarded leader RPC failed");
         GroupEngineError::Infra(GroupInfraError::ForwardFailed { rpc, failure })
     }
 }
