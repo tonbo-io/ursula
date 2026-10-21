@@ -82,9 +82,10 @@
 //!   names the root and whether it was `empty` at open (no journal record,
 //!   vote or snapshot record, data or meta), `ReleaseRoot` releases a bound
 //!   root by compare-and-set, a slot changes only as its table says, a root
-//!   registered as holding state never takes a released slot, a released
-//!   root never binds again, and `OtherRoot` is retried while `StaleRoot`
-//!   confirms a view;
+//!   registered as holding state never takes a released slot, the root a
+//!   released slot names never binds again (the release rule, a disk
+//!   revoked, keeps a root released earlier out), and `OtherRoot` is
+//!   retried while `StaleRoot` confirms a view;
 //! - the Raft metadata of the process fence: `ursula-incarnation`,
 //!   `ursula-target-incarnation` and `ursula-fence` with its six refusals,
 //!   which a sender reads only after the mismatch text, a cluster refusal

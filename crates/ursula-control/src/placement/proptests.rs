@@ -12,7 +12,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::collections::HashSet;
 
 use proptest::prelude::ProptestConfig;
 use proptest::test_runner::RngSeed;
@@ -85,8 +84,6 @@ struct Run {
     node_count: u64,
     /// Bootstraps accepted so far.
     bootstraps: u32,
-    /// Every root a slot has held released, by node.
-    released: HashSet<(NodeId, RootId)>,
 }
 
 impl Run {
@@ -95,7 +92,6 @@ impl Run {
             driver: Driver::new(),
             node_count,
             bootstraps: 0,
-            released: HashSet::new(),
         }
     }
 
@@ -338,7 +334,7 @@ impl Run {
         }
         ensure(self.bootstraps <= 1, || "K11: two bootstraps".to_owned())?;
         check_transition(&before, after, at, &step, &outcome)?;
-        check_slots(&before, after, &step, &mut self.released)?;
+        check_slots(&before, after, &step)?;
         invariants(after)
     }
 }
@@ -366,7 +362,6 @@ pub(super) fn reachable(
         driver,
         node_count,
         bootstraps: 1,
-        released: HashSet::new(),
     };
     for (op, x, y, z) in steps.iter().copied() {
         let step = run.generate(op, x, y, z);
@@ -1115,14 +1110,16 @@ fn slots(state: &ControlPlaneState) -> BTreeMap<NodeId, (RootSlot, u64)> {
 
 /// K17 to K19 for one step, before and after Bootstrap: a slot changes only
 /// as the slot table of 2.3 says, by the command that names its node; a
-/// root registered as holding state never takes a released slot; and no
-/// root a slot ever held released binds again. `released` gathers those
-/// roots across the run. A slot change leaves the time.
+/// root registered as holding state never takes a released slot; and the
+/// root a released slot names never binds again. One slot per id remembers
+/// only the latest release: a root released earlier is kept out by the
+/// release rule (its disk revoked), not by the kernel, so an empty root
+/// under an earlier released id may bind again and is not checked here. A
+/// slot change leaves the time.
 fn check_slots(
     before: &ControlPlaneState,
     after: &ControlPlaneState,
     step: &Step,
-    released: &mut HashSet<(NodeId, RootId)>,
 ) -> Result<(), String> {
     let old = slots(before);
     let new = slots(after);
@@ -1133,8 +1130,9 @@ fn check_slots(
     }
     for (id, (slot, since_ms)) in &new {
         let previous = old.get(id).copied();
-        if let RootSlot::Bound(bound) = slot {
-            ensure(!released.contains(&(*id, *bound)), || {
+        if let (RootSlot::Bound(bound), Some((RootSlot::Released(released), _))) = (slot, previous)
+        {
+            ensure(*bound != released, || {
                 format!("K19: node {id} bound its released root {bound} on {step:?}")
             })?;
         }
@@ -1186,10 +1184,6 @@ fn check_slots(
             })?;
         }
     }
-    released.extend(new.iter().filter_map(|(id, (slot, _))| match slot {
-        RootSlot::Released(root) => Some((*id, *root)),
-        RootSlot::Bound(_) => None,
-    }));
     Ok(())
 }
 

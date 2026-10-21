@@ -785,8 +785,11 @@ impl Cluster {
 /// (`None` for a node without one), or its refusal: the one slot table of
 /// `RegisterNode`, before Bootstrap and after. An unbound id binds, its own
 /// root changes nothing, and only an `empty` root other than the released
-/// one takes a released slot (K18). A released root never binds again
-/// (K19), and neither does a root while another holds the slot.
+/// one takes a released slot (K18). The root a released slot names never
+/// binds again (K19), and neither does a root while another holds the slot.
+/// One slot per id remembers only the latest release: the release rule (a
+/// root is released only once its disk is revoked) keeps a root released
+/// earlier out, since such a root, empty, would bind again here.
 fn register_slot(
     node: NodeId,
     slot: Option<RootSlot>,

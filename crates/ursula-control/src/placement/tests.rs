@@ -500,8 +500,8 @@ fn release(id: u64, root_id: u64) -> ControlCommand {
 
 /// The slot table of 2.3 before Bootstrap and after, node 1 being a meta
 /// voter: K17 (a slot changes only as the table says), K18 (a root that
-/// holds state never takes a released slot) and K19 (a released root never
-/// binds again).
+/// holds state never takes a released slot) and K19 (the root a released
+/// slot names never binds again).
 #[test]
 fn other_root_refuses_a_root_its_slot_does_not_take() {
     for bootstrapped in [false, true] {
@@ -526,7 +526,7 @@ fn other_root_refuses_a_root_its_slot_does_not_take() {
         driver.apply(release(1, 1)).unwrap();
         let released = RootSlot::Released(root(1));
         assert_eq!(slot_of(&driver, 1), (released, since_ms));
-        // K19: the released root never binds again, empty or not.
+        // K19: the root the released slot names never binds again, empty or not.
         for empty in [false, true] {
             let error = driver.refused(register_root(1, 1, empty));
             assert!(

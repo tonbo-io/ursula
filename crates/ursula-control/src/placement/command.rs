@@ -80,9 +80,10 @@ pub enum ControlCommand {
         created_at: MetaLogId,
     },
     /// An operator releases `root`, the root `node` is bound to, once its
-    /// disk is revoked (`replace-disk`): a compare-and-set on the slot. The
-    /// released root never binds again. It carries no time, since a slot
-    /// change dates nothing.
+    /// disk is revoked (`replace-disk`): a compare-and-set on the slot.
+    /// While the slot names it, the released root never binds again, and
+    /// the release rule (its disk revoked) keeps a root released earlier
+    /// out. It carries no time, since a slot change dates nothing.
     ReleaseRoot {
         node: NodeId,
         root: RootId,

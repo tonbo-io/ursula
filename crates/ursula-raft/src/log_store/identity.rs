@@ -158,9 +158,11 @@ mod tests {
     /// Every start counts itself in `identity.bin` before `start` returns,
     /// which is before the node can bind its peer identity: the file holds
     /// the run the incarnation names, whatever the run before recorded, and
-    /// a later run names itself above it on the same root.
+    /// a later run names itself above it on the same root. The record is
+    /// `state_file::write`'s, which syncs it. This test reads the file back
+    /// and does not lose power, so it shows the record, not its sync.
     #[tokio::test]
-    async fn the_run_counter_is_durable_before_the_start_returns() {
+    async fn the_run_counter_is_recorded_before_the_start_returns() {
         let dir = tempfile::tempdir().unwrap();
         let topology = StaticShardMap::new(1, 2).unwrap();
         let wal = RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
@@ -175,7 +177,7 @@ mod tests {
         assert!(wal.empty_at_open());
         wal.shutdown().await.unwrap();
         drop(wal);
-        // A clean end does not shorten the wait the run before owed.
+        // The root is still empty, so its predecessor may live.
         let wal = RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
         let second = wal.incarnation();
         assert_eq!((second.root, second.run), (first.root, 2));
@@ -196,7 +198,9 @@ mod tests {
 
     /// A root whose metadata holds a vote is not empty, so after a clean
     /// end its predecessor is gone and, once no wait is owed, the run
-    /// records none. An empty root's predecessor may live whatever ended.
+    /// records none. An empty root's predecessor may live whatever ended,
+    /// and a wait the identity file still owes outlasts a clean end on a
+    /// root that is not empty.
     #[tokio::test]
     async fn a_root_with_a_vote_after_a_clean_end_owes_no_wait() {
         use openraft::storage::RaftLogStorage;
@@ -238,12 +242,24 @@ mod tests {
         drop(store);
         wal.shutdown().await.unwrap();
         drop(wal);
-        waited(5);
+        // The root is no longer empty and the run before ended cleanly, so
+        // only the wait the identity file still owes decides: a clean end
+        // never shortens it.
+        let wal = RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
+        assert!(!wal.empty_at_open());
+        assert_eq!(wal.predecessor(), Predecessor::MayLive);
+        assert_eq!(identity(dir.path()), IdentityFile {
+            run: 6,
+            predecessor_wait: true,
+        });
+        wal.shutdown().await.unwrap();
+        drop(wal);
+        waited(6);
         let wal = RaftWal::start(dir.path(), WalFsync::Never, &topology).unwrap();
         assert!(!wal.empty_at_open());
         assert_eq!(wal.predecessor(), Predecessor::Gone);
         assert_eq!(identity(dir.path()), IdentityFile {
-            run: 6,
+            run: 7,
             predecessor_wait: false,
         });
         wal.shutdown().await.unwrap();
