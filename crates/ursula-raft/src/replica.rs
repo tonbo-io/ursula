@@ -528,7 +528,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         // m1 (#581 review): the job, with its rollback, runs in a task of
         // its own, so a caller that stops waiting never cancels it half
         // way. The restart that follows a cut runs in the caller's future:
-        // the HTTP route runs in the admin fence's own task (n6).
+        // the HTTP route runs the plan in a task of its own (n6).
         let job = crate::rt::spawn(async move {
             owner
                 .call(move |raft| async move {

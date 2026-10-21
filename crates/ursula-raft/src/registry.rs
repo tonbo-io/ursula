@@ -65,6 +65,7 @@ use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::SnapshotBuildCoordinator;
 use crate::state_machine::SnapshotInstallCoordinator;
 use crate::state_machine::group_snapshot_id;
+use crate::target::WireTarget;
 use crate::types::RaftGroupMetricsSnapshot;
 use crate::types::RaftLogProgressSnapshot;
 use crate::types::SnapshotData;
@@ -633,12 +634,26 @@ impl RaftGroupHandleRegistry {
         group: RaftGroupId,
     ) -> Result<ursula_proto::admin::QuorumPrefix, QuorumProofError> {
         let answer = self.confirm_recovery_barrier(group).await?;
-        Ok(ursula_proto::admin::QuorumPrefix {
-            raft_group_id: group.0,
-            leader_id: *answer.vote.leader_id().node_id(),
-            leader_term: answer.vote.leader_id().term(),
-            required_applied_index: answer.index,
-        })
+        Ok(quorum_prefix(group, &answer))
+    }
+
+    /// [`Self::confirm_quorum_prefix`] on this node's meta replica, which
+    /// answers as group 0.
+    pub async fn confirm_meta_quorum_prefix(
+        &self,
+    ) -> Result<ursula_proto::admin::QuorumPrefix, QuorumProofError> {
+        let group = crate::meta::state_machine::META_GROUP;
+        let meta = self
+            .meta()
+            .ok_or(QuorumProofError::NotRegistered { group })?;
+        let answer = meta.core.confirm_barrier(group).await?;
+        Ok(quorum_prefix(group, &answer))
+    }
+
+    /// This node's meta Raft, while it runs a meta replica: what the admin
+    /// snapshot route triggers and waits on.
+    pub fn meta_raft(&self) -> Option<OwnerRaftHandle<crate::meta::MetaStateMachine>> {
+        self.meta().map(|meta| meta.core.owner().clone())
     }
 
     pub(crate) async fn confirm_recovery_barrier(
@@ -774,18 +789,17 @@ impl RaftGroupHandleRegistry {
         plan: &RecoveryPlanRequest,
         restart: &mut dyn crate::rejoin::ReplicaRestart,
     ) -> Result<RecoveryPlanReport, RecoveryGateError> {
+        let group = RaftTarget::Data(raft_group_id);
+        check_plan_floor(group, plan)?;
         let entry = self
             .groups
             .load()
             .get(&raft_group_id.0)
             .and_then(|entry| entry.active().cloned())
-            .ok_or(RecoveryGateError::NotRegistered {
-                group: RaftTarget::Data(raft_group_id),
-            })?;
+            .ok_or(RecoveryGateError::NotRegistered { group })?;
         let core = entry.core.clone();
         let applied = entry.log_gauge.applied_membership();
         drop(entry);
-        let group = RaftTarget::Data(raft_group_id);
         core.accept_plan(&self.election, group, plan, applied, move || {
             futures_util::FutureExt::boxed(async move {
                 let Some(restarted) =
@@ -1134,6 +1148,7 @@ impl RaftGroupHandleRegistry {
         N::Network: RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
     {
         let group = RaftTarget::Meta;
+        check_plan_floor(group, plan)?;
         let core = self
             .meta()
             .ok_or(RecoveryGateError::NotRegistered { group })?
@@ -1486,23 +1501,28 @@ impl RaftGroupHandleRegistry {
         current_term: u64,
     ) -> Result<(), SelfElectionError> {
         let entry = self.entry(group).map_err(IncomingTransferError::Group)?;
-        let observed = entry.raft().metrics().borrow_watched().clone();
-        if let Err(source) = observed.running_state {
-            return Err(IncomingTransferError::Raft { group, source }.into());
-        }
-        if observed.current_term != current_term {
-            return Err(SelfElectionError::TermChanged {
-                group,
-                requested: current_term,
-                observed: observed.current_term,
-            });
-        }
-        let request = TransferLeaderRequest::new(observed.vote, observed.id, None);
-        entry
-            .core
-            .deliver_transfer(&self.election, group, request)
-            .await?
-            .map_err(|source| SelfElectionError::Rejected { group, source })
+        self_election(&self.election, group, &entry.core, current_term).await
+    }
+
+    /// [`Self::request_self_election`] on this node's meta replica, refused
+    /// as group 0 when the node runs none.
+    pub async fn request_meta_self_election(
+        &self,
+        current_term: u64,
+    ) -> Result<(), SelfElectionError> {
+        let group = crate::meta::state_machine::META_GROUP;
+        let meta = self
+            .meta()
+            .ok_or(IncomingTransferError::Group(GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::RaftGroupNotRegistered {
+                    group: RaftTarget::Meta,
+                },
+            )))?;
+        meta.core
+            .apply_health
+            .check(RaftTarget::Meta)
+            .map_err(IncomingTransferError::Group)?;
+        self_election(&self.election, group, &meta.core, current_term).await
     }
 
     /// Builds a snapshot outside OpenRaft's own build path, which OpenRaft
@@ -1765,6 +1785,62 @@ fn uncopied(
     _location: &SnapshotLocation,
 ) -> Option<OwnedPointer> {
     None
+}
+
+/// The admin answer of a confirmed quorum barrier of `group`.
+fn quorum_prefix(
+    group: RaftGroupId,
+    answer: &crate::BarrierAnswer,
+) -> ursula_proto::admin::QuorumPrefix {
+    ursula_proto::admin::QuorumPrefix {
+        raft_group_id: group.0,
+        leader_id: *answer.vote.leader_id().node_id(),
+        leader_term: answer.vote.leader_id().term(),
+        required_applied_index: answer.index,
+    }
+}
+
+/// A self-election of `core`, a replica of `group`, while it is in
+/// `current_term` ([`RaftGroupHandleRegistry::request_self_election`]).
+async fn self_election<SM>(
+    election: &ElectionPolicy,
+    group: RaftGroupId,
+    core: &ReplicaCore<SM>,
+    current_term: u64,
+) -> Result<(), SelfElectionError>
+where
+    SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
+{
+    let observed = core.owner().metrics().borrow_watched().clone();
+    if let Err(source) = observed.running_state {
+        return Err(IncomingTransferError::Raft { group, source }.into());
+    }
+    if observed.current_term != current_term {
+        return Err(SelfElectionError::TermChanged {
+            group,
+            requested: current_term,
+            observed: observed.current_term,
+        });
+    }
+    let request = TransferLeaderRequest::new(observed.vote, observed.id, None);
+    core.deliver_transfer(election, group, request)
+        .await?
+        .map_err(|source| SelfElectionError::Rejected { group, source })
+}
+
+/// Refuses a recovery plan for `group` whose floor is of the other plane
+/// ([`WireTarget::takes_floor`]), before anything runs.
+fn check_plan_floor(
+    group: RaftTarget,
+    plan: &RecoveryPlanRequest,
+) -> Result<(), RecoveryGateError> {
+    if group.takes_floor(plan.floor) {
+        return Ok(());
+    }
+    Err(RecoveryGateError::FloorOtherPlane {
+        group,
+        floor: plan.floor,
+    })
 }
 
 pub(crate) fn log_progress_snapshot(

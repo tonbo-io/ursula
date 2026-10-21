@@ -126,9 +126,9 @@ pub struct ReplicaLogView {
     pub current_term: u64,
 }
 
-/// The body of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`:
-/// a recovery plan that accepts the loss of the group's unsynced tail
-/// (#581 section 4.5). The tool reads every reachable member and refuses
+/// The body of `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss`,
+/// where `target` is `meta` or a data group's id: a recovery plan that
+/// accepts the loss of the group's unsynced tail (#581 section 4.5). The tool reads every reachable member and refuses
 /// unless a majority of the voters answer. It sends the plan to the leader
 /// first ([`PlanStep::Lead`]), which answers its plan term, and then to every
 /// other reachable member ([`PlanStep::Follow`] with that term). A member
@@ -150,6 +150,10 @@ pub struct RecoveryPlanRequest {
     pub cut: bool,
     /// Whether this replica leads the plan or follows it.
     pub step: PlanStep,
+    /// What the plan keeps at least, by the plane it is for. A replica
+    /// refuses a floor of the other plane
+    /// ([`RecoveryPlanRefusal::FloorOtherPlane`]).
+    pub floor: PlanFloor,
     /// With a cut whose `point` is above the plan leader's own commit
     /// marker: the id of the entry at `point`, which another replica reported
     /// committed (#613). The leader keeps its log up to `point` only if it
@@ -159,6 +163,21 @@ pub struct RecoveryPlanRequest {
     pub point_entry: Option<EntryId>,
     /// This replica's log as the tool read it.
     pub expected: ReplicaLogView,
+}
+
+/// What a recovery plan keeps at least, by the plane it is for. Required in
+/// every plan: the tool decides it before it sends anything.
+///
+/// - `meta`: a plan of the meta group. Meta is planned first, since the
+///   floor of a data group is read from a confirmed meta view.
+/// - `seeded`: a plan of a data group that a confirmed meta view shows
+///   seeded, so no membership change of the group was ever certified and
+///   nothing above the plan's own cut needs keeping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanFloor {
+    Meta,
+    Seeded,
 }
 
 /// The id of one log entry: its leader's term and node, and its index is
@@ -255,6 +274,9 @@ pub enum RecoveryPlanRefusal {
     /// A `follow` names a plan term below the vote term the tool read on
     /// this replica: the term did not come from the plan's leader.
     PlanTermBelowVote,
+    /// The plan's `floor` is of the other plane: `meta` sent to a data
+    /// group, or `seeded` sent to the meta group. It changed nothing.
+    FloorOtherPlane,
 }
 
 /// Whether a replica's voter sets, of its effective membership and of the
@@ -273,10 +295,14 @@ pub fn single_voter<'a>(sets: impl IntoIterator<Item = &'a BTreeSet<u64>>) -> bo
 impl RecoveryPlanRefusal {
     /// Whether no plan can fix the refusal: a replica that lost its vote
     /// needs a quorum's proof first, and a step that is not the replica's
-    /// is a bug in the tool. `leader_not_voter` is not one: a plan read
-    /// from the current membership names another leader (#613).
+    /// is a bug in the tool, as is a floor of the other plane.
+    /// `leader_not_voter` is not one: a plan read from the current
+    /// membership names another leader (#613).
     pub fn no_plan_fixes(&self) -> bool {
-        matches!(self, Self::MissingVoteFloor | Self::StepMismatch)
+        matches!(
+            self,
+            Self::MissingVoteFloor | Self::StepMismatch | Self::FloorOtherPlane
+        )
     }
 }
 
@@ -291,8 +317,8 @@ pub enum RecoveryPlanOutcome {
     Follows,
 }
 
-/// The answer of `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss`
-/// on one node.
+/// The answer of `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss`
+/// on one node. The meta group answers as group 0.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryPlanReport {
     pub raft_group_id: u32,
@@ -385,6 +411,7 @@ mod tests {
             point: 12,
             cut: true,
             step: PlanStep::Follow { leader_term: 9 },
+            floor: super::PlanFloor::Seeded,
             expected: ReplicaLogView {
                 last_log_index: Some(14),
                 last_log_term: Some(3),
@@ -393,17 +420,27 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string(&plan).unwrap(),
-            r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+            r#"{"leader":2,"point":12,"cut":true,"step":{"follow":{"leader_term":9}},"floor":"seeded","expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
         );
         let lead = RecoveryPlanRequest {
             point_entry: None,
             step: PlanStep::Lead { highest_term: 8 },
+            floor: super::PlanFloor::Meta,
             ..plan
         };
         assert_eq!(
             serde_json::to_string(&lead).unwrap(),
-            r#"{"leader":2,"point":12,"cut":true,"step":{"lead":{"highest_term":8}},"expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
+            r#"{"leader":2,"point":12,"cut":true,"step":{"lead":{"highest_term":8}},"floor":"meta","expected":{"last_log_index":14,"last_log_term":3,"current_term":5}}"#
         );
+        for request in [plan, lead] {
+            assert_eq!(
+                serde_json::from_str::<RecoveryPlanRequest>(
+                    &serde_json::to_string(&request).unwrap()
+                )
+                .unwrap(),
+                request
+            );
+        }
         let refused = super::RecoveryPlanRefused {
             raft_group_id: 4,
             node_id: 3,
@@ -417,6 +454,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&super::RecoveryPlanRefusal::ReplicaChanged).unwrap(),
             r#"{"reason":"replica_changed"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&super::RecoveryPlanRefusal::FloorOtherPlane).unwrap(),
+            r#"{"reason":"floor_other_plane"}"#
         );
         let report = RecoveryPlanReport {
             raft_group_id: 4,
@@ -457,6 +498,7 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<RecoveryPlanRequest>(
                 r#"{"leader": 2, "point": 12, "cut": false, "step": {"lead": {"highest_term": 4}},
+                    "floor": "seeded",
                     "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#
             )
             .unwrap(),
@@ -466,6 +508,7 @@ mod tests {
                 point: 12,
                 cut: false,
                 step: super::PlanStep::Lead { highest_term: 4 },
+                floor: super::PlanFloor::Seeded,
                 expected: ReplicaLogView {
                     last_log_index: Some(12),
                     last_log_term: Some(3),
@@ -490,11 +533,20 @@ mod tests {
                 {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
             r#"{"leader": 2, "point": 12, "cut": false, "expected":
                 {"last_log_index": 12, "current_term": 4}}"#,
-            r#"{"leader": 2, "point": 12, "cut": false, "force": true, "expected":
+            r#"{"leader": 2, "point": 12, "cut": false, "floor": "seeded", "force": true,
+                "step": {"lead": {"highest_term": 4}}, "expected":
                 {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
+            // A 0.9 plan names no floor.
+            r#"{"leader": 2, "point": 12, "cut": false, "step": {"lead": {"highest_term": 4}},
+                "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
+            r#"{"leader": 2, "point": 12, "cut": false, "step": {"lead": {"highest_term": 4}},
+                "floor": "certified",
+                "expected": {"last_log_index": 12, "last_log_term": 3, "current_term": 4}}"#,
         ] {
-            serde_json::from_str::<RecoveryPlanRequest>(invalid)
-                .expect_err("a 0.7 body, an incomplete plan or an unknown field is refused");
+            serde_json::from_str::<RecoveryPlanRequest>(invalid).expect_err(
+                "a 0.7 or 0.9 body, an incomplete plan, an unknown floor or an unknown field is \
+                 refused",
+            );
         }
     }
 
