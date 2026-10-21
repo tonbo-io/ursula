@@ -343,40 +343,61 @@ impl Run {
                         .observe(&self.cluster, &mut self.trace, "meta_plan");
                 }
                 Ok(None) => {
-                    let members: Vec<String> = self
-                        .cluster
-                        .plan_members(nodes)
-                        .iter()
-                        .map(|member| {
-                            format!(
-                                "node {} gate {:?} leader {:?} last {:?} committed {:?} plan {:?}",
-                                member.node_id,
-                                member.gate,
-                                member.current_leader,
-                                member.log.last_log_index,
-                                member.committed,
-                                member.plan,
-                            )
-                        })
-                        .collect();
+                    let members = self.describe_meta(nodes);
                     meta_checks::fail(
                         &mut self.trace,
                         meta_checks::PLAN,
                         "meta_plan",
                         format!(
-                            "no meta plan was satisfied within {within:?}: {state:?}; members: \
-                             {members:?}"
+                            "no meta plan was satisfied within {within:?}: {state:?}; {members}"
                         ),
                     );
                 }
-                Err(error) => meta_checks::fail(
-                    &mut self.trace,
-                    meta_checks::PLAN,
-                    "meta_plan",
-                    format!("the meta recovery stopped: {error}"),
-                ),
+                Err(error) => {
+                    let members = self.describe_meta(nodes);
+                    meta_checks::fail(
+                        &mut self.trace,
+                        meta_checks::PLAN,
+                        "meta_plan",
+                        format!("the meta recovery stopped: {error}; {state:?}; {members}"),
+                    );
+                }
             }
         }
+    }
+
+    /// What the recovery tool and each node's status show of meta on
+    /// `nodes`, for a failure's message.
+    fn describe_meta(&self, nodes: &[u64]) -> String {
+        let members = self.cluster.plan_members(nodes);
+        nodes
+            .iter()
+            .map(|node_id| {
+                let status = self
+                    .cluster
+                    .runtimes
+                    .get(node_id)
+                    .map(|runtime| runtime.status_reader().placement_status().meta);
+                let member = members
+                    .iter()
+                    .find(|member| member.node_id == *node_id)
+                    .map(|member| {
+                        format!(
+                            "running {} gate {:?} leader {:?} last {:?} committed {:?} voters {:?} \
+                             plan {:?}",
+                            member.running,
+                            member.gate,
+                            member.current_leader,
+                            member.log.last_log_index,
+                            member.committed,
+                            member.voter_configs,
+                            member.plan,
+                        )
+                    });
+                format!("node {node_id}: status {status:?}, member {member:?}")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
     }
 
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
