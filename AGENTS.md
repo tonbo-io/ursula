@@ -339,11 +339,11 @@ The `ursula-stream` crate uses `proptest` for state machine property testing in 
 10. **Madsim-only code**: when a change touches `cfg(madsim)` code or `ursula-sim`, check it with `RUSTFLAGS="--cfg madsim" cargo check -p ursula-raft -p ursula-sim --all-targets` on the final head. Pull request CI builds no other madsim target.
 11. **Docs and claims match the final head**: `docs/architecture`, module docs, code comments, the epoch change list in `ursula-stream/src/format.rs` and the PR body describe the code as merged. Reread the PR body after the last fix commit.
 12. **Freeze impact**: for every new persisted, wire or admin type, field, variant, error or apply-time rule, state what the next minor's tag freezes (encoding, apply semantics or admin JSON) and check it:
-    - every size and count is bounded;
-    - an admin JSON enum tolerates an unknown variant, so a same-minor reader survives a patch;
-    - `#[serde(other)]` appears only on admin JSON types, never in the replicated, persisted or RPC closure;
-    - variant casing follows the documented rule for its encoding;
-    - every time field means what its doc says.
+    - every size and count is bounded
+    - an admin JSON enum tolerates an unknown variant, so a same-minor reader survives a patch
+    - `#[serde(other)]` appears only on admin JSON types, never in the replicated, persisted or RPC closure
+    - variant casing follows the documented rule for its encoding
+    - every time field means what its doc says
 
 ## Architecture Boundaries
 
