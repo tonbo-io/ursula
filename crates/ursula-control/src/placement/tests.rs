@@ -26,6 +26,7 @@ use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
 use super::MaintenanceAuthority;
+use super::MetaDamageKind;
 use super::MetaLeaderReport;
 use super::MoveLimit;
 use super::MoveLimitRequest;
@@ -936,6 +937,22 @@ fn every_root_round_trips_through_messagepack_and_json() {
         last_bootstrap_refusal: None,
         oldest_move_age_ms: None,
     });
+    for kind in [
+        MetaDamageKind::Journal,
+        MetaDamageKind::Pointer,
+        MetaDamageKind::Restore,
+        MetaDamageKind::Start,
+        MetaDamageKind::CommitScreen,
+    ] {
+        // A new kind fails to compile here until it is sampled.
+        match kind {
+            MetaDamageKind::Journal
+            | MetaDamageKind::Pointer
+            | MetaDamageKind::Restore
+            | MetaDamageKind::Start
+            | MetaDamageKind::CommitScreen => round_trip(&kind),
+        }
+    }
     for reason in [
         PlacementApiReason::NoLeader,
         PlacementApiReason::ForwardFailed { leader: node(2) },
