@@ -786,7 +786,8 @@ pub enum RaftWalError {
     /// The journal holds no log of the group that `admission` may open: an
     /// `Open` of a group the core's metadata does not name, or any open of
     /// a retired log ([`super::CoreJournalError::NotHeld`]). Nothing was
-    /// written.
+    /// written for the group, and an `Open` on a core that holds nothing
+    /// did not open the core.
     #[error(
         "raft group {:?} on core {:?} holds no log here that may open as {:?}",
         .placement.raft_group_id,

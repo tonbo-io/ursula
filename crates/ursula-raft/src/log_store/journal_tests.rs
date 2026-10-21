@@ -3585,9 +3585,11 @@ fn core_metadata(wal: &super::RaftWal, group: u32) -> CoreMetadata {
 
 /// `Open` refuses a group the metadata does not name and a retired log, and
 /// `Create` refuses the retired log too, each before writing anything: the
-/// metadata stays as it was. `Create` of an unknown group opens a fresh log
+/// metadata stays as it was, and an `Open` on core 0, which holds nothing,
+/// leaves no journal there. `Create` of an unknown group opens a fresh log
 /// as before, and `Open` opens a named one. Catches an `Open` that creates,
-/// or an open that hands out a retired log.
+/// a refusal that opens (so creates) the core's journal first, or an open
+/// that hands out a retired log.
 #[tokio::test]
 async fn an_open_refuses_what_the_journal_does_not_hold() {
     let dir = tempfile::tempdir().unwrap();
@@ -3625,6 +3627,7 @@ async fn an_open_refuses_what_the_journal_does_not_hold() {
         (5, Admission::Open),
         (5, Admission::Create),
         (9, Admission::Open),
+        (4, Admission::Open),
     ] {
         let placement = admission_placement(group);
         let refused = wal
@@ -3640,6 +3643,10 @@ async fn an_open_refuses_what_the_journal_does_not_hold() {
         );
     }
     assert_eq!(core_metadata(&wal, 1), before, "a refusal writes nothing");
+    assert!(
+        !wal.core_dir(CoreId(0)).exists(),
+        "an `Open` on a core that holds nothing does not open it"
+    );
 
     let fresh = wal
         .open(
@@ -3690,10 +3697,11 @@ async fn a_group_known_only_by_its_record_opens_recovering() {
 /// `Unknown` while the others open: here core 0 holds nothing, core 1 only
 /// metadata (a vote), core 2 a lone snapshot record and core 3 a sealed
 /// segment whose last frame is incomplete. A held core's writer then
-/// outlives its last store, so its groups stay listed, while a core that a
-/// store opened later lists nothing once that store goes. Catches a failed
-/// core that stops the start, a held writer that drops with its last
-/// store, and groups read from the wrong source.
+/// outlives its last store, so its groups stay listed, and so does the
+/// writer of a core a store opened after the start. Catches a failed core
+/// that stops the start, a writer that drops with its last store (which
+/// would leave a group the journal names unlisted), and groups read from
+/// the wrong source.
 #[tokio::test]
 async fn held_cores_open_and_a_core_that_fails_stays_unknown() {
     let dir = tempfile::tempdir().unwrap();
@@ -3766,6 +3774,6 @@ async fn held_cores_open_and_a_core_that_fails_stays_unknown() {
     let after = wal.local_groups().unwrap();
     assert_eq!(after.get(RaftGroupId(2)), Some(LocalLog::Holding));
     assert_eq!(after.get(RaftGroupId(1)), Some(LocalLog::Empty));
-    assert_eq!(after.get(RaftGroupId(4)), None);
+    assert_eq!(after.get(RaftGroupId(4)), Some(LocalLog::Empty));
     stop_cleanly(wal).await;
 }
