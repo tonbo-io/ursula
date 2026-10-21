@@ -886,7 +886,7 @@ mod tests {
         .await
         .expect("meta bootstraps the cluster");
         let admin = crate::admin_router(state.clone());
-        let incarnation = state.process_incarnation.as_str().to_owned();
+        let incarnation = state.process_incarnation.to_string();
         let post = |uri: String, plan: RecoveryPlanRequest| {
             let admin = admin.clone();
             let incarnation = incarnation.clone();
