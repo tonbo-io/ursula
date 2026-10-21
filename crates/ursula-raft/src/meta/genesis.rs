@@ -39,10 +39,6 @@ pub enum GenesisAnswer {
 }
 
 /// The `GenesisProbe` request for `target_node` carrying `probe`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the meta group's genesis driver sends it (#768)")
-)]
 pub(crate) fn genesis_probe_request(
     target_node: u64,
     probe: &GenesisProbe,
@@ -56,10 +52,6 @@ pub(crate) fn genesis_probe_request(
 
 /// The answer a `GenesisProbe` ack carries. An empty answer does not
 /// decode: it is a malformed ack, never an answer.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the meta group's genesis driver reads it (#768)")
-)]
 pub(crate) fn genesis_answer(
     ack: &pb::GenesisProbeAckV1,
 ) -> Result<GenesisAnswer, WireDecodeError> {

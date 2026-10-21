@@ -464,6 +464,7 @@ fn config() -> MetaReplicaConfig {
     MetaReplicaConfig {
         node: 1,
         engine: crate::RaftEngineConfig::default(),
+        claim: samples::sample_genesis_claim(),
     }
 }
 

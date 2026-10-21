@@ -9,6 +9,7 @@ use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
 use openraft::storage::RaftStateMachine;
+use ursula_proto::placement::GenesisClaim;
 
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
@@ -19,7 +20,7 @@ use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
 
 /// What one probed voter reported about a group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PeerGroupLog {
     /// No history, and the minimum genesis vote floor is durable.
     Empty,
@@ -27,6 +28,11 @@ pub enum PeerGroupLog {
     Unprepared,
     /// The peer holds committed entries or follows a leader.
     Initialized,
+    /// The peer would start the meta group with other values, `claim`: the
+    /// meta group must not form until every node claims the same. Not an
+    /// answer for the bootstrap decision, which waits, and not empty for
+    /// the genesis vote floor.
+    GenesisMismatch { claim: GenesisClaim },
 }
 
 impl PeerGroupLog {
@@ -63,7 +69,9 @@ pub fn bootstrap_decision<'a>(
         match answer {
             Some(PeerGroupLog::Initialized) => return BootstrapDecision::Rejoin,
             Some(PeerGroupLog::Empty) => {}
-            None | Some(PeerGroupLog::Unprepared) => all_answered = false,
+            None | Some(PeerGroupLog::Unprepared | PeerGroupLog::GenesisMismatch { .. }) => {
+                all_answered = false;
+            }
         }
     }
     if all_answered {

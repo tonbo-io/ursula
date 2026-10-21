@@ -381,6 +381,73 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     })
 }
 
+/// Asks `peer` with this node's genesis probe, at the cluster URL
+/// `raft.peers` lists for it, and reads its answer: what it holds of the
+/// meta group when it claims the same values (`Vote`), or the values it
+/// claims (`GenesisMismatch`). A peer whose binary has no genesis probe
+/// (`UNIMPLEMENTED`) is of another format epoch: recorded as such, and not
+/// empty. A peer not listed, one that runs no meta replica (`NOT_FOUND`), an
+/// address that serves another node, one of another cluster, a malformed
+/// answer and a transport failure are no answer (`None`). An address that
+/// serves another node rebuilds the pooled channel, as every Raft client
+/// does.
+pub(crate) async fn genesis_probe(
+    transport: Arc<CoreRaftTransport>,
+    peer: u64,
+    probe: &crate::meta::genesis::GenesisProbe,
+    timeout: Duration,
+) -> Option<crate::rejoin::PeerGroupLog> {
+    use crate::meta::genesis::GenesisAnswer;
+    use crate::rejoin::PeerGroupLog;
+    let mut network = GrpcRaftNetwork::new(transport, RaftTarget::Meta, peer);
+    let channel = network.channel.as_ref().ok()?;
+    let endpoint = channel.endpoint.clone();
+    let mut client = channel.client.clone();
+    let mut request = tonic::Request::new(crate::meta::genesis::genesis_probe_request(peer, probe));
+    request.set_timeout(timeout);
+    let status = match client.genesis_probe(request).await {
+        Ok(ack) => {
+            return match crate::meta::genesis::genesis_answer(&ack.into_inner()) {
+                Ok(GenesisAnswer::Vote(response)) => {
+                    Some(PeerGroupLog::from_vote_response(&response))
+                }
+                Ok(GenesisAnswer::Mismatch(claim)) => Some(PeerGroupLog::GenesisMismatch { claim }),
+                Err(error) => {
+                    tracing::debug!(
+                        peer,
+                        error = %ErrorChain(&error),
+                        "a genesis probe's answer does not decode"
+                    );
+                    None
+                }
+            };
+        }
+        Err(status) => status,
+    };
+    if status.code() == tonic::Code::Unimplemented {
+        record_format_epoch_mismatch(
+            "outbound",
+            &format!(
+                "GenesisProbe: peer {peer} at {endpoint} has no genesis probe: {}",
+                status.message()
+            ),
+        );
+        return Some(PeerGroupLog::Initialized);
+    }
+    if let Some(node) = crate::target::refusing_node(&status) {
+        network.misdelivered(node);
+        return None;
+    }
+    observe_outbound_status("GenesisProbe", &status);
+    network.transport.peer_cluster.observe_refusal(
+        peer,
+        &endpoint,
+        &status,
+        crate::rt::time::Instant::now(),
+    );
+    None
+}
+
 #[derive(Debug, Clone)]
 struct SharedRaftChannel {
     generation: u64,
@@ -1223,13 +1290,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         ))
     }
 
-    /// The meta group's genesis probe, checked as 0.10 checks it: the
-    /// protocol version first, then the target node, then the probe, which
-    /// must decode. The answer comes from the meta replica's recovery gate
-    /// and this node's genesis claim, which the meta runtime brings (#768).
-    /// No node runs a meta replica yet, so every probe is refused as one for
-    /// a group this node does not run (`NOT_FOUND`), never `UNIMPLEMENTED`,
-    /// which a prober records as another format epoch.
+    /// The meta group's genesis probe, checked in the preamble's order: the
+    /// protocol version, then the target node, then the probe, which must
+    /// decode, then the meta replica, `NOT_FOUND` on a node that runs none
+    /// (never `UNIMPLEMENTED`, which a prober records as another format
+    /// epoch). The replica answers with its claim or its gate's answer to
+    /// the probe vote ([`crate::meta::replica::ActiveMeta`]).
     async fn genesis_probe(
         &self,
         request: tonic::Request<raft_internal_proto::GenesisProbeRequestV1>,
@@ -1237,9 +1303,21 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         let request = request.into_inner();
         validate_grpc_metadata(request.protocol_version)?;
         crate::target::check_target_node(request.target_node, local_node(&self.registry)?)?;
-        let _probe: crate::meta::genesis::GenesisProbe =
+        let probe: crate::meta::genesis::GenesisProbe =
             decode_rpc_payload(&request.probe, "genesis probe")?;
-        Err(no_meta_replica("GenesisProbe").into())
+        let meta = self
+            .registry
+            .meta()
+            .ok_or_else(|| no_meta_replica("GenesisProbe"))?;
+        let answer = meta
+            .answer_genesis_probe(probe)
+            .await
+            .map_err(group_rpc_status)?;
+        Ok(tonic::Response::new(
+            raft_internal_proto::GenesisProbeAckV1 {
+                answer: encode_wire(&answer),
+            },
+        ))
     }
 
     async fn group_read(

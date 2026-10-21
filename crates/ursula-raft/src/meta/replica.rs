@@ -43,6 +43,7 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
@@ -50,6 +51,8 @@ use ursula_runtime::HistoryPublisher;
 use ursula_runtime::SnapshotPointer;
 
 use super::MetaCommand;
+use super::genesis::GenesisAnswer;
+use super::genesis::GenesisProbe;
 use super::snapshot::MetaSnapshotError;
 use super::snapshot::MetaSnapshotPointer;
 use super::state_machine::META_GROUP;
@@ -89,6 +92,9 @@ pub struct MetaReplicaConfig {
     /// The node's Raft engine settings, which the meta Raft's config takes
     /// as the data groups' do.
     pub engine: RaftEngineConfig,
+    /// The values this node would start the meta group with, which it
+    /// answers a genesis probe with when the prober claims others.
+    pub claim: GenesisClaim,
 }
 
 /// The tasks a meta replica runs and owns besides its history driver, which
@@ -187,6 +193,7 @@ pub struct ActiveMeta {
     /// token until it ends; closed once the replica begins to stop.
     installs: Arc<WorkAdmission>,
     election: ElectionPolicy,
+    claim: GenesisClaim,
 }
 
 impl ActiveMeta {
@@ -261,6 +268,20 @@ impl ActiveMeta {
                     .map_err(crate::owner::owner_stopped)
             })
             .map_err(SnapshotInstallError::Group)
+    }
+
+    /// The answer to a peer's genesis probe: this node's own claim when the
+    /// prober claims other values, else this replica's answer to the probe
+    /// vote, through the recovery gate's vote screen as a data group's
+    /// bootstrap probe vote is answered.
+    pub(crate) async fn answer_genesis_probe(
+        &self,
+        probe: GenesisProbe,
+    ) -> Result<GenesisAnswer, GroupEngineError> {
+        if probe.claim != self.claim {
+            return Ok(GenesisAnswer::Mismatch(self.claim.clone()));
+        }
+        Ok(GenesisAnswer::Vote(self.vote(probe.vote).await?))
     }
 
     /// A leadership transfer this node received, once the election policy
@@ -446,6 +467,7 @@ impl MetaReplica {
                 core,
                 installs,
                 election,
+                claim: config.claim.clone(),
             }),
             raft: raft.clone(),
             tasks: RecoveryGate::default(),
