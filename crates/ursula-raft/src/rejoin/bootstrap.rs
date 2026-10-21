@@ -5,13 +5,15 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
+use openraft::storage::RaftStateMachine;
 
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
-use crate::registry::RaftGroupHandle;
+use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
@@ -89,24 +91,28 @@ pub enum GroupBootstrap {
 }
 
 /// Membership bootstrap of a group's initializer whose replica holds nothing
-/// of the group. It runs `Initialize` only once every other configured voter
-/// answered that it is empty too and no leader was seen. `probe` asks one
-/// peer, by node id, with the bootstrap probe vote.
-pub async fn run_group_bootstrap<P, F>(
+/// of the group. It runs `Initialize` with `members` only once every other
+/// node of `probed` answered that it is empty too and no leader was seen.
+/// `probe` asks one peer, by node id, with the bootstrap probe. A data
+/// group probes and initializes its configured voters. Any state machine's
+/// replica runs it.
+pub async fn run_group_bootstrap<SM, P, F>(
     node_id: u64,
-    raft: RaftGroupHandle,
+    raft: Raft<UrsulaRaftTypeConfig, SM>,
     rejoin: Arc<GroupRejoin>,
-    nodes: BTreeSet<u64>,
+    probed: BTreeSet<u64>,
+    members: BTreeSet<u64>,
     probe: P,
     interval: Duration,
     warn_every: Duration,
 ) -> GroupBootstrap
 where
+    SM: RaftStateMachine<UrsulaRaftTypeConfig>,
     P: Fn(u64) -> F,
     F: Future<Output = Option<PeerGroupLog>>,
 {
     let group = rejoin.raft_group_id().0;
-    let peers = nodes
+    let peers = probed
         .iter()
         .copied()
         .filter(|peer_id| *peer_id != node_id)
@@ -159,7 +165,7 @@ where
                     );
                     return GroupBootstrap::Stopped;
                 }
-                if let Err(err) = raft.initialize(nodes).await {
+                if let Err(err) = raft.initialize(members).await {
                     tracing::error!(
                         "raft bootstrap: node {node_id} group {group} failed to initialize membership: {err}"
                     );

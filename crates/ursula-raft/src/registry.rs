@@ -135,10 +135,6 @@ pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
 /// A group's shared cold-index page cache.
 pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>;
 
-/// How long a recovery plan's accept waits for a restarted replica to
-/// publish the membership it rebuilt from its cut log (#613).
-const RESTARTED_MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Resources published atomically with a live owner handle. Only cache and
 /// recovery are optional capabilities; every registered group has a barrier.
 #[derive(Debug, Clone)]
@@ -754,6 +750,9 @@ impl RaftGroupHandleRegistry {
     /// recovery plan (#581 section 4.5; see
     /// [`GroupRejoin::accept_recovery_plan`]) as one owner job, its group's
     /// leader fence learns the plan, and the group's elections follow it.
+    /// The replica core runs the plan ([`ReplicaCore::accept_plan`]). A
+    /// plan that cuts restarts the replica through `restart`, and the core
+    /// carries on with the replica this registry then holds.
     pub async fn accept_recovery_plan(
         &self,
         raft_group_id: RaftGroupId,
@@ -766,124 +765,36 @@ impl RaftGroupHandleRegistry {
             .get(&raft_group_id.0)
             .and_then(|entry| entry.active().cloned())
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let rejoin = entry
-            .core
-            .recovery
-            .clone()
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let owner = entry.raft().clone();
-        let plan = *plan;
-        let job = rejoin.clone();
-        let history = entry.core.history.clone();
+        let core = entry.core.clone();
         let applied = entry.log_gauge.applied_membership();
-        // m1 (#581 review): the job, with its rollback, runs in a task of
-        // its own, so a caller that stops waiting never cancels it half
-        // way. The restart that follows a cut runs in the caller's future:
-        // the HTTP route runs in the admin fence's own task (n6).
-        let job = crate::rt::spawn(async move {
-            owner
-                .call(move |raft| async move {
-                    let core = crate::rejoin::RaftPlanCore {
-                        raft: &raft,
-                        raft_group_id,
-                    };
-                    job.accept_recovery_plan(&plan, &core, &history, applied)
+        drop(entry);
+        core.accept_plan(&self.election, raft_group_id, plan, applied, move || {
+            Box::pin(async move {
+                let Some(restarted) =
+                    restart
+                        .restart_replica(raft_group_id)
                         .await
-                })
-                .await
-                .map_err(|source| RecoveryGateError::OwnerStopped {
-                    raft_group_id,
-                    source,
-                })?
-        });
-        let taken = job
-            .await
-            .map_err(|_aborted| RecoveryGateError::JobAborted { raft_group_id })
-            .and_then(|taken| taken);
-        // m6 (#581 review): the job stopped the core campaigning; the
-        // node's election policy decides again, taken or refused.
-        self.refresh_group_elections(raft_group_id);
-        let report = match taken? {
-            crate::rejoin::PlanTaken::Holds(report) => report,
-            // B1 (#581 review): the cut runs before the plan answers. The
-            // group's engine stops, its log store closes, and the new
-            // replica's recovery gate cuts the log before its Raft core
-            // starts, then takes the plan's gate. A cut that cannot run
-            // drops the plan and closes the gate (m3).
-            crate::rejoin::PlanTaken::Restart(report) => {
-                drop(entry);
-                drop(rejoin);
-                let restarted = restart
-                    .restart_replica(raft_group_id)
-                    .await
-                    .map_err(|source| RecoveryGateError::Restart {
-                        raft_group_id,
-                        source: Box::new(source),
-                    })?
-                    .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-                if let Some((committed, held)) = restarted.cut_refused() {
-                    return Err(RecoveryGateError::CutRefused {
-                        raft_group_id,
-                        committed,
-                        held,
-                    });
-                }
-                // #613: the restart rebuilt the membership from the cut log.
-                // A plan's leader that it leaves no voter can never
-                // campaign: drop the plan rather than wedge its members.
-                // The restarted core publishes the membership it rebuilt
-                // once it runs; until then its metrics hold none.
-                // Off under the R2 negative control, as before #613.
-                let checks_kept = !ursula_stream::sim_controls::off(
-                    ursula_stream::sim_controls::Defence::PlanKeptMembership,
-                );
-                if checks_kept && plan.cut && plan.leader == report.node_id {
-                    let entry = self
-                        .groups
-                        .load()
-                        .get(&raft_group_id.0)
-                        .and_then(|entry| entry.active().cloned())
-                        .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-                    let published = entry
-                        .raft()
-                        .wait(Some(RESTARTED_MEMBERSHIP_WAIT))
-                        .metrics(
-                            |metrics| metrics.membership_config.log_id().is_some(),
-                            "the restarted replica publishes its membership",
-                        )
-                        .await;
-                    // A restart whose membership never shows cannot be
-                    // shown to campaign: fail closed, as for no vote.
-                    let refusal = match published {
-                        Ok(metrics)
-                            if metrics
-                                .membership_config
-                                .membership()
-                                .voter_ids()
-                                .any(|voter| voter == plan.leader) =>
-                        {
-                            None
-                        }
-                        Ok(_left_without_vote) => {
-                            Some(RecoveryGateError::CutLeftNoVote { raft_group_id })
-                        }
-                        Err(_timed_out) => {
-                            Some(RecoveryGateError::CutMembershipUnknown { raft_group_id })
-                        }
-                    };
-                    if let Some(refusal) = refusal {
-                        restarted
-                            .drop_plan_left_without_vote(&entry.core.history)
-                            .await?;
-                        self.refresh_group_elections(raft_group_id);
-                        return Err(refusal);
-                    }
-                }
-                report
-            }
-        };
-        self.refresh_group_elections(raft_group_id);
-        Ok(report)
+                        .map_err(|source| RecoveryGateError::Restart {
+                            raft_group_id,
+                            source: Box::new(source),
+                        })?
+                else {
+                    return Ok(None);
+                };
+                // The replica this registry holds after the restart, with
+                // the recovery gate the restart returned.
+                Ok(self
+                    .groups
+                    .load()
+                    .get(&raft_group_id.0)
+                    .and_then(|entry| entry.active().cloned())
+                    .map(|entry| ReplicaCore {
+                        recovery: Some(restarted),
+                        ..entry.core.clone()
+                    }))
+            })
+        })
+        .await
     }
 
     /// The recovery gate of every group that has one on this node.
