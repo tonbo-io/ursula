@@ -2773,11 +2773,28 @@ fn files_named(dir: &Path, name: &str) -> Vec<PathBuf> {
     found
 }
 
-/// The object keys that the snapshot record of group 0 in `wal_dir`
-/// (`group-0.snapshot.json`) names, decoded as a restore decodes it: none
-/// before the node wrote a record, else its one S3 key (#687).
+/// The object keys that the snapshot record of data group 0 in `wal_dir`
+/// (`group-0.snapshot.json` under a `raft-log/core-*` directory) names,
+/// decoded as a restore decodes it: none before the node wrote a record,
+/// else its one S3 key (#687). The meta group's own record, also
+/// `group-0.snapshot.json` but under `raft-log/meta/`, is always inline
+/// and is not looked at.
 fn named_snapshot_keys(wal_dir: &Path) -> BTreeSet<String> {
-    let records = files_named(wal_dir, "group-0.snapshot.json");
+    let cores = std::fs::read_dir(wal_dir.join("raft-log"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("core-"))
+        });
+    let records: Vec<PathBuf> = cores
+        .flat_map(|core| files_named(&core, "group-0.snapshot.json"))
+        .collect();
     assert!(records.len() <= 1, "{records:?}");
     let Some(record) = records.first() else {
         return BTreeSet::new();
