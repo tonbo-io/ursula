@@ -29,8 +29,11 @@
 //!   groups' (`RaftCommand`), whose data entries keep their epoch-5 bytes;
 //! - the meta state machine's dispatch of that payload: it stops its apply
 //!   on a stream entry, applies nothing for a history event whose
-//!   `previous` is not its current history, and applies control commands
-//!   through the placement kernel at their entry's log id;
+//!   `previous` is not its current history, makes an event whose
+//!   `previous` names its current history the history and begins the
+//!   placement kernel's history (`begin_history`) at the event's entry's
+//!   log id with the event's cause, and applies control commands through
+//!   the placement kernel at their entry's log id;
 //! - the placement kernel's state, commands and answers, and the meta
 //!   group's state, history event and inline snapshot record. A meta
 //!   snapshot's state is bounded by

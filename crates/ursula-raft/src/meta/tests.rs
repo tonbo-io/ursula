@@ -646,9 +646,8 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
 
 /// The meta snapshot record lives in the meta journal's directory, apart
 /// from data group 0's record in its core's directory, and data group 0's
-/// engine opens, restores and stops beside it leaving it byte for byte as
-/// it was. Data group 0's owned-object passes delete only objects of its
-/// snapshot store, and a meta snapshot is never one.
+/// engine opens and stops beside it leaving it byte for byte as it was.
+/// Data group 0 builds no snapshot here and has no record to restore.
 #[tokio::test]
 async fn data_group_zero_never_touches_the_meta_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -703,7 +702,7 @@ async fn data_group_zero_never_touches_the_meta_record() {
             },
         )
     };
-    // Data group 0 opens, restores, runs and stops beside the meta record.
+    // Data group 0 opens and stops beside the meta record.
     let engine = data_engine(&wal).await.unwrap();
     engine.shutdown().await.unwrap();
     assert_eq!(std::fs::read(meta_record.path()).unwrap(), recorded);
