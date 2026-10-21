@@ -2031,6 +2031,19 @@ pub fn persisted_snapshot_pointer(bytes: &[u8]) -> Result<SnapshotPointer, Snaps
     SnapshotPointer::decode(&persisted.pointer_bytes)
 }
 
+/// The snapshot record `bytes` with its pointer replaced by `pointer`, its
+/// generation and snapshot meta kept: a record its node never wrote, for
+/// tests that check what a restore refuses.
+#[cfg(any(madsim, feature = "test-support"))]
+pub fn snapshot_record_with_pointer(
+    bytes: &[u8],
+    pointer: &SnapshotPointer,
+) -> Result<Vec<u8>, SnapshotStoreError> {
+    let mut persisted = decode_snapshot_envelope::<PersistedSnapshot>(bytes)?;
+    persisted.pointer_bytes = pointer.encode_binary()?;
+    encode_binary_envelope(&persisted)
+}
+
 impl RaftGroupStateMachine {
     fn stop_apply(
         &self,

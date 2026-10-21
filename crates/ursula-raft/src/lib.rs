@@ -276,6 +276,8 @@ pub use state_machine::SnapshotRecordError;
 pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::persisted_snapshot_pointer;
+#[cfg(any(madsim, feature = "test-support"))]
+pub use state_machine::snapshot_record_with_pointer;
 pub use target::FENCE_METADATA;
 pub use target::FenceRefusal;
 pub use target::INCARNATION_METADATA;
