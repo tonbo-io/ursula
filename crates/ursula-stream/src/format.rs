@@ -22,10 +22,15 @@
 //!   record;
 //! - two rules for how a Raft WAL journal opens: a journal read below its
 //!   class's recovery epoch opens its groups recovering, and the meta
-//!   journal's group opens recovering when the meta journal (its metadata
-//!   file, or a record) is gone while a data journal holds records;
+//!   journal's group opens recovering when the meta journal holds neither
+//!   its metadata file nor a record while a data journal holds records or
+//!   the meta group's snapshot record remains;
 //! - a Raft entry payload with the meta group's commands beside the data
 //!   groups' (`RaftCommand`), whose data entries keep their epoch-5 bytes;
+//! - the meta state machine's dispatch of that payload: it stops its apply
+//!   on a stream entry, applies nothing for a history event whose
+//!   `previous` is not its current history, and applies control commands
+//!   through the placement kernel at their entry's log id;
 //! - the placement kernel's state, commands and answers, and the meta
 //!   group's state, history event and inline snapshot record. A meta
 //!   snapshot's state is bounded by
