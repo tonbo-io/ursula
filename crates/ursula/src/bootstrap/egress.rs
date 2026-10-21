@@ -31,17 +31,42 @@ const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
 /// keeps measuring its own egress, so recovery is self-evident even though
 /// egress-only loss leaves its inbound replication looking healthy. That is
 /// what prevents the flap that a commit-stall step-down suffers.
+///
+/// The egress probe of one tick: every peer of this node's groups, probed
+/// once whatever the group count, and each group judged by how many of its
+/// other voters answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ClusterEgressProbeScope {
-    Global,
-    Group(RaftGroupId),
+pub(crate) struct ClusterEgressProbePlan {
+    /// The cluster URL of every peer to probe, by node id.
+    pub peer_urls: BTreeMap<u64, String>,
+    /// This node's groups, each with the peers it needs answers from.
+    pub groups: Vec<ClusterEgressProbeGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClusterEgressProbeGroup {
-    pub scope: ClusterEgressProbeScope,
-    pub peer_urls: Vec<String>,
+    pub raft_group_id: RaftGroupId,
+    /// The group's voters other than this node that `raft.peers` lists.
+    pub peers: BTreeSet<u64>,
     pub needed_peers: usize,
+}
+
+impl ClusterEgressProbePlan {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.groups.is_empty()
+    }
+
+    /// The first group that fewer of its peers answered than its quorum
+    /// needs, with how many did.
+    pub(crate) fn degraded(
+        &self,
+        answered: &BTreeSet<u64>,
+    ) -> Option<(&ClusterEgressProbeGroup, usize)> {
+        self.groups.iter().find_map(|group| {
+            let healthy = group.peers.intersection(answered).count();
+            (healthy < group.needed_peers).then_some((group, healthy))
+        })
+    }
 }
 
 fn remote_peers_needed_for_quorum(total_voters: usize) -> usize {
@@ -49,55 +74,50 @@ fn remote_peers_needed_for_quorum(total_voters: usize) -> usize {
     total_voters / 2
 }
 
-pub(crate) fn cluster_egress_probe_groups(
+/// The probe plan of `node_id` over `voter_table`: the groups it votes in,
+/// of those it registered once any is registered.
+pub(crate) fn cluster_egress_probe_plan(
     node_id: u64,
     peers: &PeerDirectory,
-    per_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    voter_table: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
     snapshots: &[RaftGroupMetricsSnapshot],
-) -> Vec<ClusterEgressProbeGroup> {
-    if per_group_voters.is_empty() {
-        let peer_urls: Vec<String> = peers
-            .iter()
-            .filter(|(id, _)| *id != node_id)
-            .map(|(_, endpoints)| endpoints.cluster_url().to_owned())
-            .collect();
-        if peer_urls.is_empty() {
-            return Vec::new();
-        }
-        return vec![ClusterEgressProbeGroup {
-            scope: ClusterEgressProbeScope::Global,
-            peer_urls,
-            needed_peers: remote_peers_needed_for_quorum(peers.len()),
-        }];
-    }
-
+) -> ClusterEgressProbePlan {
     let registered_groups: BTreeSet<RaftGroupId> = snapshots
         .iter()
         .map(|snapshot| RaftGroupId(snapshot.raft_group_id))
         .collect();
 
-    per_group_voters
+    let mut peer_urls = BTreeMap::new();
+    let groups = voter_table
         .iter()
         .filter(|(raft_group_id, voters)| {
             voters.contains(&node_id)
                 && (registered_groups.is_empty() || registered_groups.contains(raft_group_id))
         })
         .filter_map(|(raft_group_id, voters)| {
-            let peer_urls: Vec<String> = voters
+            let group_peers: BTreeSet<u64> = voters
                 .iter()
-                .filter(|id| **id != node_id)
-                .filter_map(|id| peers.cluster_url(*id).map(str::to_owned))
+                .copied()
+                .filter(|id| *id != node_id)
+                .filter(|id| match peers.cluster_url(*id) {
+                    Some(url) => {
+                        peer_urls.entry(*id).or_insert_with(|| url.to_owned());
+                        true
+                    }
+                    None => false,
+                })
                 .collect();
-            if peer_urls.is_empty() {
+            if group_peers.is_empty() {
                 return None;
             }
             Some(ClusterEgressProbeGroup {
-                scope: ClusterEgressProbeScope::Group(*raft_group_id),
-                peer_urls,
+                raft_group_id: *raft_group_id,
+                peers: group_peers,
                 needed_peers: remote_peers_needed_for_quorum(voters.len()),
             })
         })
-        .collect()
+        .collect();
+    ClusterEgressProbePlan { peer_urls, groups }
 }
 
 /// Config-driven cluster egress gate. It probes `probe_peers` and, while it
@@ -112,7 +132,7 @@ pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
     probe_peers: &PeerDirectory,
-    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    voter_table: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
     let node_id = participation.node_id();
@@ -120,9 +140,7 @@ pub fn spawn_egress_gate(
     if interval_ms == 0 {
         return;
     }
-    let initial_probe_groups =
-        cluster_egress_probe_groups(node_id, probe_peers, &per_group_voters, &[]);
-    if initial_probe_groups.is_empty() {
+    if cluster_egress_probe_plan(node_id, probe_peers, &voter_table, &[]).is_empty() {
         return;
     }
     let probe_bytes = cp_cfg.probe_size.as_bytes() as usize;
@@ -164,32 +182,28 @@ pub fn spawn_egress_gate(
         loop {
             tokio::time::sleep(interval).await;
             let snaps = registry.metrics_snapshot();
-            let probe_groups =
-                cluster_egress_probe_groups(node_id, &peers, &per_group_voters, &snaps);
-            if probe_groups.is_empty() {
+            let plan = cluster_egress_probe_plan(node_id, &peers, &voter_table, &snaps);
+            if plan.is_empty() {
                 continue;
             }
-            let mut degraded_probe = None;
-            for group in &probe_groups {
-                let mut healthy_peers = 0usize;
-                for url in &group.peer_urls {
-                    let probe_url = format!("{url}{}", crate::CLUSTER_PROBE_PATH);
-                    if let Ok(resp) = client.post(&probe_url).body(payload.clone()).send().await
-                        && resp.status().is_success()
-                    {
-                        healthy_peers = healthy_peers.saturating_add(1);
-                    }
-                }
-                if healthy_peers < group.needed_peers {
-                    degraded_probe = Some((
-                        group.scope.clone(),
-                        healthy_peers,
-                        group.peer_urls.len(),
-                        group.needed_peers,
-                    ));
-                    break;
+            // Each peer once per tick, whatever the group count.
+            let mut answered = BTreeSet::new();
+            for (peer_id, url) in &plan.peer_urls {
+                let probe_url = format!("{url}{}", crate::CLUSTER_PROBE_PATH);
+                if let Ok(resp) = client.post(&probe_url).body(payload.clone()).send().await
+                    && resp.status().is_success()
+                {
+                    answered.insert(*peer_id);
                 }
             }
+            let degraded_probe = plan.degraded(&answered).map(|(group, healthy_peers)| {
+                (
+                    group.raft_group_id,
+                    healthy_peers,
+                    group.peers.len(),
+                    group.needed_peers,
+                )
+            });
             let tick = if degraded_probe.is_none() {
                 TickHealth::Good
             } else {
@@ -197,10 +211,11 @@ pub fn spawn_egress_gate(
             };
             match hysteresis.observe(tick) {
                 HealthTransition::Shed => {
-                    if let Some((scope, healthy_peers, peer_count, needed_peers)) = &degraded_probe
+                    if let Some((group, healthy_peers, peer_count, needed_peers)) = &degraded_probe
                     {
                         tracing::warn!(
-                            "cluster-egress: node {node_id} {scope:?} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
+                            "cluster-egress: node {node_id} group {} egress degraded (reached {healthy_peers}/{peer_count} peers, need {needed_peers}); yielding leadership",
+                            group.0,
                         );
                     }
                     shed.begin();

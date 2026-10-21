@@ -93,14 +93,10 @@ group_count = 16
 # Use a human-readable size.  Omit to disable the admission.
 # max_uncommitted_size_per_group = "64MiB"
 
-# Bootstrap the initial Raft membership once on startup.  Only needed for
-# the very first cluster formation; set to false after the first run.
-init_membership = false
-
-# Bootstrap per-group Raft membership on startup.  When true, each group
-# initializes its own membership independently (useful for heterogeneous
-# clusters where different groups have different voter sets).
-init_membership_per_group = false
+# Each data group runs on min(raft.placement.replication_factor, N)
+# consecutive peers in ascending node id, from index `group mod N`, and the
+# first of them initializes it.  Keep raft.peers fixed for the life of a
+# cluster: the peers' ids decide every group's voters.
 
 # A group's initializer that holds nothing of the group initializes it only
 # once every voter reports an empty group.  How often it logs that it is
@@ -179,20 +175,6 @@ init_membership_per_group = false
 # [[raft.peers]]
 # node_id = 3
 # url = "http://10.0.0.3:4437"
-
-# ------------------------------------------------------------------------------
-# [raft.groups]  — Per-group voter assignments (repeatable table, optional)
-# ------------------------------------------------------------------------------
-# When omitted, every Raft group uses all peers as voters (homogeneous
-# cluster).  When supplied, every group in 0..group_count must have an
-# entry and each entry's voters must be a non-empty subset of peers.
-#
-# [[raft.groups]]
-# raft_group_id = 0
-# voters = [1, 2, 3]
-# [[raft.groups]]
-# raft_group_id = 1
-# voters = [2, 3, 4]
 
 # ------------------------------------------------------------------------------
 # [storage.cold]  — Cold-tier (object store) flush, GC, and cache

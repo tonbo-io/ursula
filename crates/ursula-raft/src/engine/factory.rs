@@ -20,6 +20,7 @@ use ursula_shard::ShardPlacement;
 
 use super::RaftGroupEngine;
 use super::RaftGroupEngineOptions;
+use crate::ConfigSeeds;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::RaftWal;
 use crate::peer_directory::PeerDirectory;
@@ -293,9 +294,8 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     node_id: u64,
     /// `raft.peers`, this node among them.
     peers: PeerDirectory,
-    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
-    initialize_membership: bool,
-    initialize_membership_per_group: bool,
+    /// The voters and the initializer of every group.
+    seeds: ConfigSeeds,
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
     log_stores: RaftWal,
@@ -311,11 +311,13 @@ impl StaticGrpcRaftGroupEngineFactory {
     /// the identity bound in `registry`'s peer cluster
     /// ([`crate::PeerCluster::bind`]), which the caller binds before any
     /// group opens: a group of a node with none bound, or bound as another
-    /// node, is refused as an invalid configuration.
+    /// node, is refused as an invalid configuration. Each group runs with
+    /// the voters `seeds` gives it, and only its seed initializer may
+    /// initialize it.
     pub fn new(
         node_id: u64,
         peers: PeerDirectory,
-        initialize_membership: bool,
+        seeds: ConfigSeeds,
         registry: RaftGroupHandleRegistry,
         log_stores: RaftWal,
     ) -> Self {
@@ -324,9 +326,7 @@ impl StaticGrpcRaftGroupEngineFactory {
             transports: Arc::default(),
             node_id,
             peers,
-            per_group_voters: BTreeMap::new(),
-            initialize_membership,
-            initialize_membership_per_group: false,
+            seeds,
             registry,
             cold_store: None,
             log_stores,
@@ -368,16 +368,6 @@ impl StaticGrpcRaftGroupEngineFactory {
         self
     }
 
-    pub fn with_per_group_membership_initializers(mut self, enabled: bool) -> Self {
-        self.initialize_membership_per_group = enabled;
-        self
-    }
-
-    pub fn with_per_group_voters(mut self, voters: BTreeMap<RaftGroupId, BTreeSet<u64>>) -> Self {
-        self.per_group_voters = voters;
-        self
-    }
-
     pub fn with_engine_config(mut self, config: RaftEngineConfig) -> Self {
         self.registry
             .set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
@@ -386,15 +376,11 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 
     /// The node ids that make up the voters of `placement`'s group: its
-    /// configured voters, or every peer when no per-group voters are
-    /// configured. Configuration load refuses a voter config this refuses,
-    /// so the refusal is an invalid configuration of the group's open.
+    /// seed voters. A group with no seed, or with a seed voter outside
+    /// `raft.peers`, is refused as an invalid configuration of its open.
     fn group_voters(&self, placement: ShardPlacement) -> Result<BTreeSet<u64>, GroupEngineError> {
-        if self.per_group_voters.is_empty() {
-            return Ok(self.peers.node_ids().collect());
-        }
-        self.per_group_voters
-            .get(&placement.raft_group_id)
+        self.seeds
+            .voters(placement.raft_group_id)
             .filter(|voters| {
                 !voters.is_empty() && voters.iter().all(|node_id| self.peers.contains(*node_id))
             })
@@ -402,47 +388,15 @@ impl StaticGrpcRaftGroupEngineFactory {
             .ok_or_else(|| invalid_configuration(placement))
     }
 
-    fn membership_initializer_ids(&self, raft_group_id: RaftGroupId) -> Option<Vec<u64>> {
-        if self.per_group_voters.is_empty() {
-            return Some(self.peers.node_ids().collect());
-        }
-        self.per_group_voters
-            .get(&raft_group_id)
-            .map(|voters| voters.iter().copied().collect())
-    }
-
+    /// Whether this node initializes `raft_group_id`: it is the group's
+    /// seed initializer.
     fn should_initialize_membership(&self, raft_group_id: RaftGroupId) -> bool {
-        if !self.initialize_membership {
-            return false;
-        }
-        if !self.per_group_voters.is_empty()
-            && !self
-                .per_group_voters
-                .get(&raft_group_id)
-                .is_some_and(|voters| voters.contains(&self.node_id))
-        {
-            return false;
-        }
-        if !self.initialize_membership_per_group {
-            return true;
-        }
-        let Some(initializer_ids) = self
-            .membership_initializer_ids(raft_group_id)
-            .filter(|ids| !ids.is_empty())
-        else {
-            return false;
-        };
-        usize::try_from(raft_group_id.0)
-            .expect("raft group id fits usize")
-            .checked_rem(initializer_ids.len())
-            .and_then(|initializer_index| initializer_ids.get(initializer_index))
-            .is_some_and(|node_id| *node_id == self.node_id)
+        self.seeds.initializer(raft_group_id) == Some(self.node_id)
     }
 }
 
-/// The refusal of a group whose static voter config this node cannot run:
-/// configuration load refuses such a config, so it reaches a group's open
-/// only as an invalid configuration.
+/// The refusal of a group whose seed this node cannot run: it reaches a
+/// group's open only as an invalid configuration.
 fn invalid_configuration(placement: ShardPlacement) -> GroupEngineError {
     GroupEngineError::Infra(GroupInfraError::WalOpen {
         core_id: placement.core_id,
@@ -453,14 +407,7 @@ fn invalid_configuration(placement: ShardPlacement) -> GroupEngineError {
 
 impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
-        if self.per_group_voters.is_empty() {
-            return true;
-        }
-        if self
-            .per_group_voters
-            .get(&placement.raft_group_id)
-            .is_some_and(|voters| voters.contains(&self.node_id))
-        {
+        if self.seeds.hosts(self.node_id, placement.raft_group_id) {
             return true;
         }
         self.registry
@@ -611,28 +558,28 @@ mod tests {
 
     use super::*;
 
-    #[cfg(not(madsim))]
-    fn per_group_voters(groups: &[(u32, &[u64])]) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
-        groups
-            .iter()
-            .map(|(group_id, voters)| (RaftGroupId(*group_id), voters.iter().copied().collect()))
-            .collect()
-    }
-
+    /// Node `node_id` of four nodes with two groups, at the default
+    /// replication factor 3.
     #[cfg(not(madsim))]
     fn factory_for_node(
         node_id: u64,
         wal_root: &tempfile::TempDir,
     ) -> StaticGrpcRaftGroupEngineFactory {
+        let peers = PeerDirectory::new((1..=4).map(|node_id| {
+            (
+                node_id,
+                crate::PeerEndpoints::shared(format!("http://node-{node_id}")),
+            )
+        }));
+        let seeds = ConfigSeeds::new(
+            &peers,
+            2,
+            ursula_config::PlacementConfig::default().replication_factor,
+        );
         StaticGrpcRaftGroupEngineFactory::new(
             node_id,
-            PeerDirectory::new((1..=4).map(|node_id| {
-                (
-                    node_id,
-                    crate::PeerEndpoints::shared(format!("http://node-{node_id}")),
-                )
-            })),
-            true,
+            peers,
+            seeds,
             RaftGroupHandleRegistry::default(),
             RaftWal::start(
                 wal_root.path().join(format!("node-{node_id}")),
@@ -641,12 +588,14 @@ mod tests {
             )
             .expect("start the WAL"),
         )
-        .with_per_group_voters(per_group_voters(&[(0, &[1, 2, 3]), (1, &[2, 3, 4])]))
     }
 
+    /// The seed rule over four nodes: group `g`'s voters are three
+    /// consecutive ids from index `g mod 4`, and a group without a seed is
+    /// refused rather than run on every peer.
     #[cfg(not(madsim))]
     #[test]
-    fn per_group_static_voters_override_default_peer_set() {
+    fn groups_take_their_seed_voters() {
         let wal_root = tempfile::tempdir().expect("WAL root");
         let factory = factory_for_node(1, &wal_root);
 
@@ -663,9 +612,11 @@ mod tests {
             factory.group_voters(placement(1)).unwrap(),
             BTreeSet::from([2, 3, 4])
         );
+        assert!(factory.hosts_group(placement(0)));
+        assert!(!factory.hosts_group(placement(1)));
         let err = factory
             .group_voters(placement(2))
-            .expect_err("partial per-group voter config must not fall back to all peers");
+            .expect_err("a group without a seed must not fall back to all peers");
         assert_eq!(
             err,
             GroupEngineError::Infra(GroupInfraError::WalOpen {
@@ -676,19 +627,25 @@ mod tests {
         );
     }
 
+    /// Only a group's seed initializer, the first node of its window,
+    /// initializes it.
     #[cfg(not(madsim))]
     #[test]
-    fn per_group_initializers_are_chosen_from_group_voters() {
+    fn only_the_seed_initializer_initializes_a_group() {
         let wal_root = tempfile::tempdir().expect("WAL root");
-        let node_1 = factory_for_node(1, &wal_root).with_per_group_membership_initializers(true);
-        let node_3 = factory_for_node(3, &wal_root).with_per_group_membership_initializers(true);
-        let node_4 = factory_for_node(4, &wal_root).with_per_group_membership_initializers(true);
-
-        assert!(node_1.should_initialize_membership(RaftGroupId(0)));
-        assert!(!node_4.should_initialize_membership(RaftGroupId(0)));
-
-        assert!(node_3.should_initialize_membership(RaftGroupId(1)));
-        assert!(!node_1.should_initialize_membership(RaftGroupId(1)));
+        let nodes: Vec<_> = (1..=4)
+            .map(|node_id| factory_for_node(node_id, &wal_root))
+            .collect();
+        let initializers: Vec<Vec<u64>> = (0..2)
+            .map(|group| {
+                nodes
+                    .iter()
+                    .filter(|node| node.should_initialize_membership(RaftGroupId(group)))
+                    .map(|node| node.node_id)
+                    .collect()
+            })
+            .collect();
+        assert_eq!(initializers, vec![vec![1], vec![2]]);
     }
 
     #[test]

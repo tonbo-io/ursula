@@ -1,9 +1,12 @@
 {{- $replicas := int .Values.server.replicaCount -}}
 {{- $maxUnavailable := int .Values.server.podDisruptionBudget.maxUnavailable -}}
-{{- $maxSafeUnavailable := sub (div (add $replicas 1) 2) 1 -}}
+{{- /* Each data group has at most three voters (the default
+       raft.placement.replication_factor), so a second disruption can take
+       two of a group's three voters whatever the replica count. */ -}}
+{{- $maxSafeUnavailable := min 1 (sub (div (add $replicas 1) 2) 1) -}}
 {{- if and .Values.server.podDisruptionBudget.enabled (gt $replicas 1) -}}
 {{- if gt $maxUnavailable $maxSafeUnavailable -}}
-{{- fail (printf "server.podDisruptionBudget.maxUnavailable=%d is unsafe for server.replicaCount=%d; must be <= %d to preserve Raft quorum" $maxUnavailable $replicas $maxSafeUnavailable) -}}
+{{- fail (printf "server.podDisruptionBudget.maxUnavailable=%d is unsafe for server.replicaCount=%d; must be <= %d to preserve each Raft group's quorum of its three voters" $maxUnavailable $replicas $maxSafeUnavailable) -}}
 {{- end -}}
 apiVersion: policy/v1
 kind: PodDisruptionBudget

@@ -28,15 +28,10 @@ Cluster readiness test:
 {{ end }}
 
 Bootstrap:
-  raft.initMembershipPerGroup is {{ .Values.raft.initMembershipPerGroup }}.
-{{- if .Values.raft.initMembershipPerGroup }}
-  Each Raft group initializes once every configured voter reports it empty and
-  no leader. Keep this value true across restarts and upgrades: a replica that
-  ever held its group never initializes it again.
-{{- else }}
-  With raft.initMembership also false, the groups of a fresh cluster never
-  initialize and elect no leader.
-{{- end }}
+  Each Raft group runs on three consecutive pods by node id (all pods when
+  there are three or fewer), and the first of them initializes it once every
+  voter reports it empty and no leader. A replica that ever held its group
+  never initializes it again.
 
 Static membership warning:
   server.replicaCount controls the initial voter set for a fresh cluster. Changing it

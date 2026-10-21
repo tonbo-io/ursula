@@ -216,7 +216,7 @@ node, which most CNIs admit whatever the policy says.
 
 ## Bootstrap Behavior
 
-`raft.initMembershipPerGroup` defaults to `true` so a fresh cluster can initialize per-group Raft membership automatically. Deployments can keep it enabled across restarts and upgrades: a replica that ever held its group never initializes it again, and a replica that holds nothing initializes the group only once every configured voter reports an empty group and no leader.
+Each Raft group runs on three consecutive pods in node id order, starting at the pod of index `group mod replicaCount`, so a three-pod cluster runs every group on every pod. The first pod of a group's window initializes it, and only once every voter of the group reports it empty and no leader. A replica that ever held its group never initializes it again, so restarts and upgrades need no setting. Keep `server.replicaCount` fixed for the life of a cluster: the pods' node ids decide every group's voters.
 
 ### Raft WAL fsync policy and recovery
 
@@ -447,7 +447,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.probes.readiness` | `{periodSeconds: 5, timeoutSeconds: 2}` | HTTP `GET /__ursula/ready` probe, always rendered since it paces `RollingUpdate`. It removes the pod from service while the WAL free-space guard is active, or after a Raft protocol (format-epoch) mismatch with a peer until the pod restarts (`format_epoch_mismatch`). |
 | `server.probes.liveness` | `{enabled: true, periodSeconds: 10, timeoutSeconds: 2}` | TCP liveness probe enabled after startup succeeds. |
 | `server.podDisruptionBudget.enabled` | `true` | Render a PDB for multi-node clusters. The chart omits the PDB when `server.replicaCount=1`. |
-| `server.podDisruptionBudget.maxUnavailable` | `1` | Maximum voluntary disruptions. The template fails if this value would allow loss of Raft quorum. |
+| `server.podDisruptionBudget.maxUnavailable` | `1` | Maximum voluntary disruptions, at most `1`: each Raft group has three voters, and two disruptions can take two of them. |
 | `server.scheduling.nodeSelector` | `{}` | Node selector labels for server pods. |
 | `server.scheduling.tolerations` | `[]` | Tolerations for server pods. |
 | `server.scheduling.affinity` | `{}` | Affinity rules for server pods. Empty uses the chart's default soft hostname anti-affinity when `server.replicaCount > 1`; set a non-empty value to override. |
@@ -464,7 +464,6 @@ container receives only chart-managed container settings plus explicit
 | Value | Default | Description |
 | --- | --- | --- |
 | `raft.groupCount` | `64` | Number of Raft groups. Helm tests expect every node to report this count. |
-| `raft.initMembershipPerGroup` | `true` | Idempotent per-group membership bootstrap flag; persistent groups may keep it enabled across restarts. |
 | `raft.logDir` | `/var/lib/ursula/raft` | Raft log directory mounted to the `raft-data` PVC. Renders `raft.wal.path`. Must be non-empty. |
 | `raft.walFsync` | `never` | When Raft WAL appends reach stable storage. `never` acknowledges once the write is in the page cache: a host crash can cost this replica its unsynced tail, and it rejoins through the recovery gate. `always` acknowledges a batch after `fsync`. Votes, group log states and the run state are always written with `fsync`. Renders `raft.wal.fsync`. |
 | `raft.walSegmentBytes` | `67108864` | Size at which each core's journal starts a new segment. Purge deletes whole segments, so this is also how much disk space comes back at a time. Renders `raft.wal.segment_size`. |

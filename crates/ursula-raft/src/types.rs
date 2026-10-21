@@ -263,12 +263,82 @@ impl RaftGroupMetricsSnapshot {
 
 pub use ursula_proto::admin::RaftGroupMaintenanceState;
 
-/// Static gRPC Raft cluster membership configuration.
+/// The voters and the initializer of every data group of a static cluster:
+/// the kernel's seed rule ([`ursula_control::seed_voters`] and
+/// [`ursula_control::initializer`]) over the `raft.peers` ids, at the
+/// configured replication factor, at most the node count.
 ///
-/// Used by the bootstrap layer when constructing a
-/// [`StaticGrpcRaftGroupEngineFactory`].
-#[derive(Debug, Clone, Default)]
-pub struct StaticGrpcRaftMembershipConfig {
-    pub initialize_membership_per_group: bool,
-    pub per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+/// Interim: removed in S2(h), where meta's seeds decide what a node hosts.
+/// Meta's `Bootstrap` seeds the same rule over the genesis claim's peers,
+/// which are the `raft.peers` ids at genesis. The two agree only while
+/// `raft.peers` keeps those ids, so `raft.peers` may not grow until then.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConfigSeeds {
+    groups: BTreeMap<RaftGroupId, GroupSeed>,
+}
+
+/// One data group's seed: its voters and the voter that initializes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GroupSeed {
+    voters: BTreeSet<u64>,
+    initializer: u64,
+}
+
+impl ConfigSeeds {
+    /// The seeds of groups `0..group_count` over the node ids of `peers`.
+    /// No peers seed nothing.
+    pub fn new(
+        peers: &crate::PeerDirectory,
+        group_count: usize,
+        replication_factor: ursula_proto::placement::ReplicationFactor,
+    ) -> Self {
+        let ids = peers
+            .node_ids()
+            .map(ursula_proto::placement::NodeId::new)
+            .collect();
+        let Ok(nodes) = ursula_proto::placement::NodeSet::new(ids) else {
+            return Self::default();
+        };
+        let replication_factor =
+            ursula_control::effective_replication_factor(replication_factor, &nodes);
+        let groups = (0..group_count)
+            .map_while(|group| u32::try_from(group).ok())
+            .map(|group| {
+                let group = RaftGroupId(group);
+                let seed = GroupSeed {
+                    voters: ursula_control::seed_voters(group, replication_factor, &nodes)
+                        .iter()
+                        .map(ursula_proto::placement::NodeId::get)
+                        .collect(),
+                    initializer: ursula_control::initializer(group, &nodes).get(),
+                };
+                (group, seed)
+            })
+            .collect();
+        Self { groups }
+    }
+
+    /// The voters `group` is seeded on.
+    pub fn voters(&self, group: RaftGroupId) -> Option<&BTreeSet<u64>> {
+        self.groups.get(&group).map(|seed| &seed.voters)
+    }
+
+    /// The node that initializes `group`.
+    pub fn initializer(&self, group: RaftGroupId) -> Option<u64> {
+        self.groups.get(&group).map(|seed| seed.initializer)
+    }
+
+    /// Whether `node_id` is one of `group`'s seed voters.
+    pub fn hosts(&self, node_id: u64, group: RaftGroupId) -> bool {
+        self.voters(group)
+            .is_some_and(|voters| voters.contains(&node_id))
+    }
+
+    /// The seed voters of every group.
+    pub fn voter_table(&self) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
+        self.groups
+            .iter()
+            .map(|(group, seed)| (*group, seed.voters.clone()))
+            .collect()
+    }
 }

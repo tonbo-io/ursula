@@ -88,9 +88,6 @@ pub fn load_config(
     if let Some(id) = node_id {
         config.raft.node_id = id;
     }
-    if config.raft.init_membership_per_group {
-        config.raft.init_membership = true;
-    }
     config.validate()?;
     Ok(config)
 }

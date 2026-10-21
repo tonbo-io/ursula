@@ -20,7 +20,6 @@ use tower::ServiceExt;
 use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftLogProgressSnapshot;
 use ursula_raft::StaticGrpcRaftGroupEngineFactory;
-use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
@@ -489,33 +488,6 @@ fn query_parser_decodes_membership_and_learner_values() {
     assert_eq!(query.get("blocking").map(String::as_str), Some("false"));
 }
 
-#[test]
-fn static_grpc_membership_config_rejects_partial_group_voters() {
-    let result = crate::bootstrap::Topology::static_cluster(
-        1,
-        crate::shared_peers([
-            (1, "http://node-1".to_owned()),
-            (2, "http://node-2".to_owned()),
-            (3, "http://node-3".to_owned()),
-        ]),
-        2,
-        true,
-        StaticGrpcRaftMembershipConfig {
-            initialize_membership_per_group: true,
-            per_group_voters: BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]),
-        },
-    );
-
-    let Err(err) = result else {
-        panic!("partial static per-group voter config should be rejected");
-    };
-    let RuntimeError::StaticMembershipConfig { message } = err else {
-        panic!("expected static membership config error, got {err}");
-    };
-    assert!(message.contains("partial raft_group_voters config is not supported"));
-    assert!(message.contains("missing raft group 1"));
-}
-
 /// Single-node groups on a fresh WAL under `wal_root`, registered in
 /// `registry`, and that WAL. Shut it down with [`shutdown_test_wal`] before
 /// `wal_root` goes.
@@ -604,8 +576,9 @@ struct StaticGrpcTestNodeStorage {
     /// appends against (`None`: off, the runtime's default).
     cold_max_hot_bytes_per_group: Option<u64>,
     engine_config: Option<ursula_raft::RaftEngineConfig>,
-    per_group_initializers: bool,
-    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
+    /// The replication factor the node seeds its groups at (`None`: the
+    /// default, 3).
+    replication_factor: Option<ursula_proto::placement::ReplicationFactor>,
     start_maintenance_drained: bool,
     /// Faulty code every replica of one group runs.
     apply_fault: Option<(RaftGroupId, ursula_raft::apply_failure::ApplyFault)>,
@@ -624,7 +597,6 @@ async fn spawn_static_grpc_test_node(
     listener: tokio::net::TcpListener,
     factory_peers: Vec<(u64, String)>,
     router_peers: Vec<(u64, String)>,
-    initialize_membership: bool,
     raft_group_count: usize,
     storage: StaticGrpcTestNodeStorage,
 ) -> StaticGrpcTestNode {
@@ -670,15 +642,24 @@ async fn spawn_static_grpc_test_node(
         ursula_raft::PeerIdentity::new(node_id, log_stores.cluster_id().clone()),
         crate::shared_peers(factory_peers.clone()),
     );
+    // The seed rule over the factory's peers, as the server seeds its
+    // groups over `raft.peers`.
+    let factory_peers = crate::shared_peers(factory_peers);
+    let seeds = ursula_raft::ConfigSeeds::new(
+        &factory_peers,
+        raft_group_count,
+        storage
+            .replication_factor
+            .unwrap_or(ursula_config::PlacementConfig::default().replication_factor),
+    );
+    let voter_table = seeds.voter_table();
     let mut factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
-        crate::shared_peers(factory_peers),
-        initialize_membership,
+        factory_peers,
+        seeds,
         registry.clone(),
         log_stores.clone(),
     );
-    factory = factory.with_per_group_membership_initializers(storage.per_group_initializers);
-    factory = factory.with_per_group_voters(storage.per_group_voters.clone());
     factory = factory.with_cold_store(storage.cold_store.clone());
     if let Some(engine_config) = storage.engine_config {
         factory = factory.with_engine_config(engine_config);
@@ -699,7 +680,7 @@ async fn spawn_static_grpc_test_node(
             registry.clone(),
             Some(node_id),
             crate::shared_peers(router_peers),
-            storage.per_group_voters,
+            voter_table,
         )
         .with_configured_cluster_id(Some(static_test_cluster_id())),
     );
@@ -1917,10 +1898,8 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
             1,
             crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
-            true,
-            Default::default(),
-        )
-        .expect("valid static cluster topology"),
+            ursula_config::PlacementConfig::default().replication_factor,
+        ),
     )
     .expect("runtime");
     let runtime = spawned.runtime;
@@ -2002,8 +1981,12 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             Persistence::Raft {
                 log_dir: raft_root.as_path().into(),
             },
-            Topology::static_cluster(1, peers.clone(), 1, true, Default::default())
-                .expect("valid static cluster topology"),
+            Topology::static_cluster(
+                1,
+                peers.clone(),
+                1,
+                ursula_config::PlacementConfig::default().replication_factor,
+            ),
         )
         .expect("runtime");
         let runtime = spawned.runtime;
@@ -2060,8 +2043,12 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             Persistence::Raft {
                 log_dir: raft_root.as_path().into(),
             },
-            Topology::static_cluster(1, peers.clone(), 1, false, Default::default())
-                .expect("valid static cluster topology"),
+            Topology::static_cluster(
+                1,
+                peers.clone(),
+                1,
+                ursula_config::PlacementConfig::default().replication_factor,
+            ),
         )
         .expect("restarted runtime");
         let runtime = spawned.runtime;
@@ -2224,7 +2211,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
+async fn static_grpc_seed_initializers_distribute_leaders() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
     for node_id in 1..=3u64 {
@@ -2245,12 +2232,8 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 6,
-                StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
-                    ..Default::default()
-                },
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -2271,7 +2254,7 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
             raft.wait(Some(Duration::from_secs(5)))
                 .current_leader(
                     expected_leader,
-                    "per-group initializer should become group leader",
+                    "the seed initializer should become group leader",
                 )
                 .await
                 .expect("wait for distributed leader");
@@ -2361,7 +2344,11 @@ async fn static_grpc_per_group_membership_initializers_distribute_leaders() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
+/// The seed rule over four nodes at replication factor 3: group 0 is seeded
+/// on nodes 1 to 3 and initialized by node 1, group 1 on nodes 2 to 4 and
+/// initialized by node 2. Each group forms with its seed voters, and its
+/// initializer leads it.
+async fn static_grpc_seed_voters_create_distinct_initial_memberships() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
     for node_id in 1..=4u64 {
@@ -2386,13 +2373,8 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 2,
-                StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
-                    per_group_voters: group_voters.clone(),
-                    ..Default::default()
-                },
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -2416,17 +2398,14 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
     }
 
     for (raw_group_id, expected_voters, expected_leader) in
-        [(0, vec![1, 2, 3], 1), (1, vec![2, 3, 4], 3)]
+        [(0, vec![1, 2, 3], 1), (1, vec![2, 3, 4], 2)]
     {
         let raft_group_id = RaftGroupId(raw_group_id);
         for node_id in &expected_voters {
             let node = &nodes[usize::try_from(*node_id - 1).expect("node id index fits usize")];
             let raft = node.registry.get(raft_group_id).expect("registered group");
             raft.wait(Some(Duration::from_secs(5)))
-                .current_leader(
-                    expected_leader,
-                    "configured group should elect its initializer",
-                )
+                .current_leader(expected_leader, "a seeded group elects its initializer")
                 .await
                 .expect("wait for configured group leader");
             let expected_voters_for_wait = expected_voters.clone();
@@ -2438,7 +2417,7 @@ async fn static_grpc_per_group_voters_create_distinct_initial_memberships() {
                             .voter_ids()
                             .eq(expected_voters_for_wait.iter().copied())
                     },
-                    "configured group should expose its static voter set",
+                    "a seeded group runs with its seed voters",
                 )
                 .await
                 .expect("wait for configured group membership");
@@ -2463,6 +2442,7 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
         listeners.push(listener);
     }
 
+    // The 4-node seeds of groups 0 and 1 at replication factor 3.
     let group_voters = BTreeMap::from([
         (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
         (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
@@ -2476,13 +2456,8 @@ async fn static_grpc_non_voter_redirects_request_without_creating_group() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 2,
-                StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
-                    per_group_voters: group_voters.clone(),
-                    ..Default::default()
-                },
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -2668,7 +2643,6 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 1,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -2861,7 +2835,6 @@ async fn static_grpc_follower_redirects_writes_without_a_not_applied_marker() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 1,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -3009,7 +2982,6 @@ async fn static_grpc_follower_redirects_inline_and_external_creates() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 1,
                 StaticGrpcTestNodeStorage {
                     cold_store: Some(cold_store.clone()),
@@ -3084,7 +3056,6 @@ async fn static_grpc_follower_redirects_inline_and_external_creates() {
 async fn start_durable_cluster(
     root: &std::path::Path,
     addresses: &[std::net::SocketAddr],
-    initialize: bool,
     apply_fault: Option<(RaftGroupId, ursula_raft::apply_failure::ApplyFault)>,
 ) -> Vec<StaticGrpcTestNode> {
     let peers = (1..=3u64)
@@ -3102,7 +3073,6 @@ async fn start_durable_cluster(
                 listener,
                 peers.clone(),
                 peers.clone(),
-                initialize && node_id == 1,
                 2,
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(root.join(format!("node-{node_id}"))),
@@ -3202,7 +3172,7 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
         .build()
         .unwrap();
 
-    let nodes = start_durable_cluster(root.path(), &addresses, true, None).await;
+    let nodes = start_durable_cluster(root.path(), &addresses, None).await;
     let stream_of = |group: u32, name: &str| {
         (0..10_000)
             .map(|index| BucketStreamId::new("poison", format!("{name}-{index}")))
@@ -3255,13 +3225,7 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
     // A buggy binary now fails on the committed record, which every replica
     // replays at startup.
     let fault = ursula_raft::apply_failure::ApplyFault::PanicAfterMutation { index: poison };
-    let nodes = start_durable_cluster(
-        root.path(),
-        &addresses,
-        false,
-        Some((RaftGroupId(0), fault)),
-    )
-    .await;
+    let nodes = start_durable_cluster(root.path(), &addresses, Some((RaftGroupId(0), fault))).await;
     for node in &nodes {
         let groups = node.registry.metrics_snapshot();
         let stopped = groups
@@ -3323,7 +3287,7 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
     }
 
     // Corrected code replays the retained record on every voter.
-    let nodes = start_durable_cluster(root.path(), &addresses, false, None).await;
+    let nodes = start_durable_cluster(root.path(), &addresses, None).await;
     ursula_ctl::observe::wait_ready(
         &ctl,
         &manifest,
@@ -3364,7 +3328,6 @@ async fn static_grpc_follower_serves_replicated_catch_up_read_without_leader_pro
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 1,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -3496,7 +3459,6 @@ async fn static_grpc_follower_answers_only_the_chunks_it_can_mark() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 1,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -3651,12 +3613,8 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 6,
-                StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
-                    ..Default::default()
-                },
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -3683,7 +3641,7 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
             raft.wait(Some(Duration::from_secs(5)))
                 .current_leader(
                     expected_leader,
-                    "per-group initializer should become group leader",
+                    "the seed initializer should become group leader",
                 )
                 .await
                 .expect("wait for distributed leader");
@@ -3859,12 +3817,8 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
         stale_listener,
         peers.clone(),
         peers.clone(),
-        true,
         6,
-        StaticGrpcTestNodeStorage {
-            per_group_initializers: true,
-            ..Default::default()
-        },
+        StaticGrpcTestNodeStorage::default(),
     )
     .await;
     stale_replacement
@@ -3896,12 +3850,8 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
         restarted_listener,
         peers.clone(),
         peers.clone(),
-        true,
         6,
-        StaticGrpcTestNodeStorage {
-            per_group_initializers: true,
-            ..Default::default()
-        },
+        StaticGrpcTestNodeStorage::default(),
     )
     .await;
     restarted
@@ -3928,6 +3878,55 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
     }
 }
 
+/// Moves the leadership of each of the first `groups` groups of `nodes`,
+/// node `i + 1` at index `i`, to node 1. Each group's seed initializer
+/// leads it first, and the initializers rotate over the nodes.
+///
+/// A handoff goes out only while node 1 takes transfers, every recovery
+/// gate on it open, the stance a production planner reads from
+/// `/__ursula/leadership-shed` before it hands off. A replica that did not
+/// initialize its group starts gated and refuses a transfer until a
+/// leader's barrier opens its gate. A leader whose transfer is refused
+/// stays parked, sending no heartbeats, until its transfer deadline, so a
+/// handoff sent to a gated node 1 only stalls the group that would open
+/// its gate.
+async fn move_every_leadership_to_node_1(nodes: &[StaticGrpcTestNode], groups: u32) {
+    for group in (0..groups).map(RaftGroupId) {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(30))
+            .expect("deadline");
+        let raft = nodes[0].registry.get(group).expect("registered group");
+        loop {
+            let leader = raft.metrics().borrow_watched().current_leader;
+            match leader {
+                Some(1) => break,
+                Some(other) if nodes[0].registry.should_accept_transfer() => {
+                    let leader =
+                        &nodes[usize::try_from(other.checked_sub(1).expect("node ids start at 1"))
+                            .expect("node index")];
+                    if let Err(err) = leader.registry.transfer_leader(group, 1).await {
+                        tracing::debug!(group = group.0, %err, "transfer to node 1 refused");
+                    }
+                }
+                // No leader yet, or node 1 does not take transfers yet.
+                Some(_) | None => {}
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node 1 never leads group {}",
+                group.0
+            );
+            if let Err(err) = raft
+                .wait(Some(Duration::from_secs(1)))
+                .current_leader(1, "node 1 leads the group")
+                .await
+            {
+                tracing::debug!(group = group.0, %err, "node 1 does not lead yet");
+            }
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn static_grpc_raft_group_engine_replicates_between_routers() {
     let mut listeners = Vec::new();
@@ -3950,7 +3949,6 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 4,
                 StaticGrpcTestNodeStorage::default(),
             )
@@ -3968,6 +3966,7 @@ async fn static_grpc_raft_group_engine_replicates_between_routers() {
         .await
         .expect("warm initializing leader groups timed out")
         .expect("warm initializing leader groups");
+    move_every_leadership_to_node_1(&nodes, 4).await;
 
     for raw_group_id in 0..4 {
         let raft_group_id = RaftGroupId(raw_group_id);
@@ -4272,7 +4271,6 @@ async fn static_grpc_raft_group_engine_replicates_with_core_journals() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 2,
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(node_root),
@@ -4293,6 +4291,7 @@ async fn static_grpc_raft_group_engine_replicates_with_core_journals() {
         .await
         .expect("warm initializing leader groups timed out")
         .expect("warm initializing leader groups");
+    move_every_leadership_to_node_1(&nodes, 2).await;
 
     for raw_group_id in 0..2 {
         let raft_group_id = RaftGroupId(raw_group_id);
@@ -4415,7 +4414,6 @@ async fn static_grpc_raft_durable_cold_flush_replicates_manifest() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                node_id == 1,
                 1,
                 StaticGrpcTestNodeStorage {
                     raft_log_dir: Some(node_root),
@@ -4613,21 +4611,23 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
             format!("http://{}", listener3.local_addr().expect("node 3 addr")),
         ),
     ];
-    // Every node lists all three in `raft.peers`, as a deployment does. The
-    // group's configured voters are 1 and 2: the leader never adds node 3
-    // by itself, so the test adds it.
-    let two_voters = BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2]))]);
+    // Every node lists all three in `raft.peers`, as a deployment does.
+    // Nodes 1 and 2 seed the group at replication factor 2, so its voters
+    // are 1 and 2: the leader never adds node 3 by itself, so the test adds
+    // it.
+    let two_voters = Some(ursula_proto::placement::ReplicationFactor::new(
+        std::num::NonZeroU8::new(2).expect("non-zero"),
+    ));
     let mut nodes = vec![
         spawn_static_grpc_test_node(
             1,
             listener1,
             peers.clone(),
             peers.clone(),
-            true,
             1,
             StaticGrpcTestNodeStorage {
                 raft_log_dir: raft_root.as_ref().map(|root| root.join("node-1")),
-                per_group_voters: two_voters.clone(),
+                replication_factor: two_voters,
                 ..Default::default()
             },
         )
@@ -4637,11 +4637,10 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
             listener2,
             peers.clone(),
             peers.clone(),
-            false,
             1,
             StaticGrpcTestNodeStorage {
                 raft_log_dir: raft_root.as_ref().map(|root| root.join("node-2")),
-                per_group_voters: two_voters,
+                replication_factor: two_voters,
                 ..Default::default()
             },
         )
@@ -4742,7 +4741,6 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
             listener3,
             peers.clone(),
             peers.clone(),
-            false,
             1,
             StaticGrpcTestNodeStorage {
                 raft_log_dir: raft_root.as_ref().map(|root| root.join("node-3")),
@@ -5957,10 +5955,8 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 1,
                 StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
                     start_maintenance_drained: index == 2,
                     ..Default::default()
                 },
@@ -7451,10 +7447,8 @@ mod snapshot_driver {
             1,
             crate::shared_peers([(1, "http://127.0.0.1:4437".to_owned())]),
             4,
-            true,
-            Default::default(),
-        )
-        .expect("topology");
+            ursula_config::PlacementConfig::default().replication_factor,
+        );
         assert!(cluster.uses_snapshot_store(true));
         assert!(!cluster.uses_snapshot_store(false));
         assert_eq!(
@@ -8112,7 +8106,6 @@ mod snapshot_driver {
             listener,
             peers.clone(),
             peers,
-            true,
             group_count(),
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
@@ -8599,7 +8592,6 @@ mod snapshot_driver {
             listener,
             peers.clone(),
             peers,
-            true,
             2,
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
@@ -8874,7 +8866,6 @@ mod snapshot_driver {
             listener,
             peers.clone(),
             peers,
-            true,
             2,
             StaticGrpcTestNodeStorage {
                 engine_config: Some(RaftEngineConfig {
@@ -9030,7 +9021,6 @@ mod snapshot_driver {
             listener,
             peers.clone(),
             peers,
-            true,
             2,
             StaticGrpcTestNodeStorage {
                 snapshot_store: Some(store.clone()),
@@ -9815,7 +9805,6 @@ mod snapshot_driver {
     async fn blackholed_store_node(
         store: &Arc<BlackholedGets>,
         raft_log_dir: &std::path::Path,
-        initialize_membership: bool,
     ) -> StaticGrpcTestNode {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9832,7 +9821,6 @@ mod snapshot_driver {
             listener,
             peers.clone(),
             peers,
-            initialize_membership,
             1,
             StaticGrpcTestNodeStorage {
                 raft_log_dir: Some(raft_log_dir.to_path_buf()),
@@ -9863,7 +9851,7 @@ mod snapshot_driver {
         let raft_log_dir = tempfile::tempdir().expect("WAL root");
 
         // A snapshot object the next open restores.
-        let node = blackholed_store_node(&store, raft_log_dir.path(), true).await;
+        let node = blackholed_store_node(&store, raft_log_dir.path()).await;
         tokio::time::timeout(Duration::from_secs(30), node.runtime.warm_all_groups())
             .await
             .expect("warm the groups in time")
@@ -9912,7 +9900,7 @@ mod snapshot_driver {
         // restore.
         store.blackholed.send_replace(true);
         let gets = *store.gets.borrow();
-        let node = blackholed_store_node(&store, raft_log_dir.path(), false).await;
+        let node = blackholed_store_node(&store, raft_log_dir.path()).await;
         let warm = tokio::spawn({
             let runtime = node.runtime.clone();
             async move { runtime.warm_all_groups().await }
@@ -10166,12 +10154,11 @@ mod cluster_egress {
     use ursula_raft::RaftGroupMetricsSnapshot;
     use ursula_shard::RaftGroupId;
 
-    use crate::bootstrap::ClusterEgressProbeScope;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedDrain;
     use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::ShedTargets;
-    use crate::bootstrap::cluster_egress_probe_groups;
+    use crate::bootstrap::cluster_egress_probe_plan;
 
     /// The egress gate's first plan: every group `node_id` leads, with no
     /// cap, to any voter that may campaign and that `can_take_over` accepts.
@@ -10232,42 +10219,72 @@ mod cluster_egress {
             (2, "http://node2/".to_owned()),
             (3, "http://node3//".to_owned()),
         ]);
-        let groups = cluster_egress_probe_groups(1, &peers, &BTreeMap::new(), &[]);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].peer_urls, vec!["http://node2", "http://node3"]);
+        let voters = BTreeMap::from([(RaftGroupId(0), BTreeSet::from([1, 2, 3]))]);
+        let plan = cluster_egress_probe_plan(1, &peers, &voters, &[]);
+        assert_eq!(
+            plan.peer_urls,
+            BTreeMap::from([
+                (2, "http://node2".to_owned()),
+                (3, "http://node3".to_owned())
+            ])
+        );
     }
 
+    /// Each group is judged by its own voters: node 1 votes in group 0
+    /// only, so it probes nodes 2 and 3 and needs one of them.
     #[test]
     fn per_group_probe_plan_uses_only_that_groups_voters() {
-        let per_group_voters = BTreeMap::from([
+        let voters = BTreeMap::from([
             (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
             (RaftGroupId(1), BTreeSet::from([2, 3, 4])),
         ]);
         let snaps = vec![snap(0, vec![1, 2, 3]), snap(1, vec![2, 3, 4])];
 
-        let groups = cluster_egress_probe_groups(1, &peers(), &per_group_voters, &snaps);
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters, &snaps);
 
-        assert_eq!(groups.len(), 1);
-        assert_eq!(
-            groups[0].scope,
-            ClusterEgressProbeScope::Group(RaftGroupId(0))
-        );
-        assert_eq!(groups[0].peer_urls, vec!["http://node2", "http://node3"]);
-        assert_eq!(groups[0].needed_peers, 1);
+        assert_eq!(plan.groups.len(), 1);
+        assert_eq!(plan.groups[0].raft_group_id, RaftGroupId(0));
+        assert_eq!(plan.groups[0].peers, BTreeSet::from([2, 3]));
+        assert_eq!(plan.groups[0].needed_peers, 1);
+        assert_eq!(plan.peer_urls.keys().copied().collect::<Vec<_>>(), vec![
+            2, 3
+        ]);
     }
 
+    /// The plan probes each peer once whatever the group count: 1,024
+    /// groups seeded over four nodes still probe nodes 2, 3 and 4 once
+    /// each, not once per group.
     #[test]
-    fn global_probe_plan_is_preserved_without_per_group_voters() {
-        let groups = cluster_egress_probe_groups(1, &peers(), &BTreeMap::new(), &[]);
+    fn one_probe_per_peer_whatever_the_group_count() {
+        let seeds = ursula_raft::ConfigSeeds::new(
+            &peers(),
+            1024,
+            ursula_config::PlacementConfig::default().replication_factor,
+        );
+        let plan = cluster_egress_probe_plan(1, &peers(), &seeds.voter_table(), &[]);
 
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].scope, ClusterEgressProbeScope::Global);
-        assert_eq!(groups[0].peer_urls, vec![
-            "http://node2",
-            "http://node3",
-            "http://node4"
+        // Node 1 is in three of every four seed windows.
+        assert_eq!(plan.groups.len(), 768);
+        assert_eq!(plan.peer_urls.keys().copied().collect::<Vec<_>>(), vec![
+            2, 3, 4
         ]);
-        assert_eq!(groups[0].needed_peers, 2);
+    }
+
+    /// A group short of a quorum of answers degrades the tick, and only
+    /// the answers of its own voters count.
+    #[test]
+    fn a_group_is_degraded_by_its_own_voters_answers() {
+        let voters = BTreeMap::from([
+            (RaftGroupId(0), BTreeSet::from([1, 2, 3])),
+            (RaftGroupId(1), BTreeSet::from([1, 3, 4])),
+        ]);
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters, &[]);
+
+        assert!(plan.degraded(&BTreeSet::from([3])).is_none());
+        let (group, healthy) = plan
+            .degraded(&BTreeSet::from([2]))
+            .expect("node 2 is no voter of group 1");
+        assert_eq!((group.raft_group_id, healthy), (RaftGroupId(1), 0));
     }
 
     #[test]
@@ -10429,6 +10446,17 @@ mod leadership_shed {
     const GROUPS: u32 = 12;
     const PER_TICK: usize = 4;
 
+    /// The seed voters of the [`GROUPS`] groups over `peers`, as the server
+    /// hands them to its egress gate.
+    fn seed_voters(peers: &ursula_raft::PeerDirectory) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
+        ursula_raft::ConfigSeeds::new(
+            peers,
+            usize::try_from(GROUPS).unwrap(),
+            ursula_config::PlacementConfig::default().replication_factor,
+        )
+        .voter_table()
+    }
+
     struct Cluster {
         nodes: Vec<StaticGrpcTestNode>,
         peers: Vec<(u64, String)>,
@@ -10461,7 +10489,6 @@ mod leadership_shed {
                         listener,
                         peers.clone(),
                         peers.clone(),
-                        node_id == 1,
                         usize::try_from(GROUPS).unwrap(),
                         StaticGrpcTestNodeStorage {
                             cold_store: cold_store.clone(),
@@ -10632,13 +10659,19 @@ mod leadership_shed {
             led_by(&self.node_1().registry, node_id)
         }
 
+        /// Moves `group`'s leadership to node 1. A handoff goes out only
+        /// while node 1 takes transfers, every recovery gate on it open, as
+        /// in `move_every_leadership_to_node_1`. The seed initializers
+        /// rotate over the nodes, and a handoff refused by a gated node 1
+        /// parks the leader until its transfer deadline, which stalls the
+        /// barrier that would open node 1's gate.
         async fn move_leadership_to_node_1(&self, group: u32) {
             let deadline = deadline(Duration::from_secs(60));
             loop {
                 let leader = self.leaders().get(&group).copied().flatten();
                 match leader {
                     Some(1) => return,
-                    Some(other) => {
+                    Some(other) if self.node_1().registry.should_accept_transfer() => {
                         if let Err(err) = self
                             .node(other)
                             .registry
@@ -10648,7 +10681,8 @@ mod leadership_shed {
                             tracing::debug!(group, %err, "transfer to node 1 refused");
                         }
                     }
-                    None => {}
+                    // No leader yet, or node 1 does not take transfers yet.
+                    Some(_) | None => {}
                 }
                 assert!(
                     Instant::now() < deadline,
@@ -11105,7 +11139,7 @@ mod leadership_shed {
             &node_1.registry,
             &participation,
             &peers,
-            BTreeMap::new(),
+            seed_voters(&peers),
             &ursula_config::ClusterProbeConfig {
                 interval: ursula_config::HumanDuration::sec(5),
                 unhealthy_ticks: 1,
@@ -11258,7 +11292,7 @@ mod leadership_shed {
             &node_1.registry,
             &participation,
             &peers,
-            BTreeMap::new(),
+            seed_voters(&peers),
             &ursula_config::ClusterProbeConfig {
                 interval: ursula_config::HumanDuration::sec(1),
                 unhealthy_ticks: 1,
@@ -12346,12 +12380,8 @@ async fn cluster_wide_purge_reaches_every_distributed_group_leader() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 6,
-                StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
-                    ..Default::default()
-                },
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );
@@ -13265,10 +13295,8 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
             1,
             crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
-            true,
-            Default::default(),
-        )
-        .unwrap(),
+            ursula_config::PlacementConfig::default().replication_factor,
+        ),
     )
     .unwrap();
     let runtime = spawned.runtime;
@@ -13336,10 +13364,8 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
             1,
             crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
-            true,
-            Default::default(),
-        )
-        .unwrap(),
+            ursula_config::PlacementConfig::default().replication_factor,
+        ),
     )
     .unwrap();
     let runtime = spawned.runtime;
@@ -13432,12 +13458,8 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
                 listener,
                 peers.clone(),
                 peers.clone(),
-                true,
                 1,
-                StaticGrpcTestNodeStorage {
-                    per_group_initializers: true,
-                    ..Default::default()
-                },
+                StaticGrpcTestNodeStorage::default(),
             )
             .await,
         );

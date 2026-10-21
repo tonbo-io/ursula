@@ -73,10 +73,8 @@ async fn an_external_append_whose_leadership_ended_during_its_put_answers_503_an
             1,
             crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
-            true,
-            Default::default(),
-        )
-        .expect("topology"),
+            ursula_config::PlacementConfig::default().replication_factor,
+        ),
     )
     .expect("runtime");
     let runtime = spawned.runtime;

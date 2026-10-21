@@ -405,8 +405,6 @@ async function startCluster(): Promise<Stack> {
 				"[raft]",
 				`node_id = ${node.id}`,
 				`group_count = ${groups}`,
-				`init_membership = ${node.id === 1}`,
-				"init_membership_per_group = false",
 				"",
 				"[raft.wal]",
 				`path = "${join(nodeDir, "wal")}"`,

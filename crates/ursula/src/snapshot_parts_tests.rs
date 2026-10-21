@@ -1823,10 +1823,8 @@ async fn a_new_raft_term_lists_the_stream_again() {
             1,
             crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
             1,
-            true,
-            Default::default(),
-        )
-        .expect("topology"),
+            ursula_config::PlacementConfig::default().replication_factor,
+        ),
     )
     .expect("runtime");
     let runtime = spawned.runtime;

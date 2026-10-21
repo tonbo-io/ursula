@@ -81,7 +81,7 @@ async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
     std::fs::create_dir_all(&root).expect("create temp root");
     let config_path = root.join("cluster.toml");
     let log_dir = root.join("raft-log");
-    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, &log_dir);
 
     let mut child = spawn_node_with_cluster_config(binary, &config_path);
     let client = reqwest::Client::new();
@@ -174,9 +174,9 @@ async fn cli_static_grpc_raft_cluster_forwards_follower_writes() {
 
     let wal_root = tempfile::tempdir().expect("WAL root");
     let children = vec![
-        spawn_node(binary, 2, ports[1], &peers, false, wal_root.path()),
-        spawn_node(binary, 3, ports[2], &peers, false, wal_root.path()),
-        spawn_node(binary, 1, ports[0], &peers, true, wal_root.path()),
+        spawn_node(binary, 2, ports[1], &peers, wal_root.path()),
+        spawn_node(binary, 3, ports[2], &peers, wal_root.path()),
+        spawn_node(binary, 1, ports[0], &peers, wal_root.path()),
     ];
 
     let client = reqwest::Client::new();
@@ -287,9 +287,9 @@ async fn cli_static_grpc_raft_cluster_splits_the_cluster_plane() {
         .collect();
     let wal_root = tempfile::tempdir().expect("WAL root");
     let mut children = vec![
-        spawn_split_plane_node(binary, &planes, 2, false, wal_root.path()),
-        spawn_split_plane_node(binary, &planes, 3, false, wal_root.path()),
-        spawn_split_plane_node(binary, &planes, 1, true, wal_root.path()),
+        spawn_split_plane_node(binary, &planes, 2, wal_root.path()),
+        spawn_split_plane_node(binary, &planes, 3, wal_root.path()),
+        spawn_split_plane_node(binary, &planes, 1, wal_root.path()),
     ];
 
     let client = reqwest::Client::new();
@@ -424,7 +424,7 @@ async fn cli_a_cluster_port_moved_after_initialization_serves() {
     let port = free_port();
     let base = format!("http://127.0.0.1:{port}");
     let config = root.path().join("server.toml");
-    write_single_node_cluster_config(&config, port, 1, 2, &base, true, &root.path().join("wal"));
+    write_single_node_cluster_config(&config, port, 1, 2, &base, &root.path().join("wal"));
     let mut command = Command::new(binary);
     command.arg("server").arg("--config").arg(&config);
     let mut children = vec![spawn_child(command, "shared-port".to_owned())];
@@ -494,9 +494,9 @@ async fn cli_a_node_moved_to_a_new_cluster_port_rejoins_after_a_full_restart() {
     let wal_root = tempfile::tempdir().expect("WAL root");
     let spawn_all = |planes: &[SplitPlanePorts]| {
         vec![
-            spawn_split_plane_node(binary, planes, 2, false, wal_root.path()),
-            spawn_split_plane_node(binary, planes, 3, false, wal_root.path()),
-            spawn_split_plane_node(binary, planes, 1, true, wal_root.path()),
+            spawn_split_plane_node(binary, planes, 2, wal_root.path()),
+            spawn_split_plane_node(binary, planes, 3, wal_root.path()),
+            spawn_split_plane_node(binary, planes, 1, wal_root.path()),
         ]
     };
     let client = reqwest::Client::new();
@@ -670,7 +670,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
     // on every platform; under `never` a platform without a boot id reads the
     // kill as a host crash and the single voter waits for an operator
     // (`cli_single_voter_with_an_unknown_history_serves_after_accept_unsynced_loss`).
-    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, &log_dir);
     set_wal_fsync(&config_path, "always");
     {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
@@ -696,7 +696,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
     let wal_root = log_dir.join("raft-log");
     let before = std::fs::read(wal_root.join("run-state.bin")).unwrap();
     for key in ["core_count", "group_count"] {
-        write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+        write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, &log_dir);
         set_wal_fsync(&config_path, "always");
         let config = std::fs::read_to_string(&config_path).unwrap();
         std::fs::write(
@@ -722,7 +722,7 @@ async fn cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_rest
         );
     }
 
-    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, &log_dir);
     set_wal_fsync(&config_path, "always");
     {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
@@ -769,15 +769,8 @@ async fn cli_single_voter_passes_verify_cluster_and_wait_node() {
     let base_url = format!("http://127.0.0.1:{port}");
     let root = tempfile::tempdir().expect("single-voter root");
     let config = root.path().join("cluster.toml");
-    let admin_port = write_single_node_cluster_config(
-        &config,
-        port,
-        1,
-        1,
-        &base_url,
-        true,
-        &root.path().join("wal"),
-    );
+    let admin_port =
+        write_single_node_cluster_config(&config, port, 1, 1, &base_url, &root.path().join("wal"));
     let mut child = spawn_node_with_cluster_config(env!("CARGO_BIN_EXE_ursula"), &config);
     let http = reqwest::Client::new();
     wait_until_ready(&http, &base_url, std::slice::from_mut(&mut child)).await;
@@ -853,15 +846,8 @@ async fn cli_three_voters_run_a_cutting_plan_through_their_in_process_restarts()
     for (index, (node_id, _)) in peers.iter().enumerate() {
         let config_path = root.path().join(format!("node-{node_id}.toml"));
         let log_dir = root.path().join(format!("node-{node_id}-log"));
-        let admin_port = write_cluster_config(
-            &config_path,
-            ports[index],
-            *node_id,
-            1,
-            &peers,
-            *node_id == 1,
-            &log_dir,
-        );
+        let admin_port =
+            write_cluster_config(&config_path, ports[index], *node_id, 1, &peers, &log_dir);
         configs.push(config_path);
         admins.push(format!("http://127.0.0.1:{admin_port}"));
     }
@@ -1065,7 +1051,7 @@ async fn single_voter_recovery_plan(cut: bool) {
     let config_path = root.path().join("cluster.toml");
     let log_dir = root.path().join("raft-log");
     let admin_port =
-        write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+        write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, &log_dir);
     let admin_url = format!("http://127.0.0.1:{admin_port}");
     let client = reqwest::Client::new();
     let stream_url = format!("{base_url}/benchcmp/cli-unknown-history");
@@ -1304,15 +1290,7 @@ async fn cli_static_grpc_raft_log_dir_replicates_between_nodes() {
     for (index, (node_id, _)) in peers.iter().enumerate() {
         let config_path = root.join(format!("node-{node_id}.toml"));
         let log_dir = root.join(format!("node-{node_id}-log"));
-        write_cluster_config(
-            &config_path,
-            ports[index],
-            *node_id,
-            4,
-            &peers,
-            *node_id == 1,
-            &log_dir,
-        );
+        write_cluster_config(&config_path, ports[index], *node_id, 4, &peers, &log_dir);
         configs.push(config_path);
     }
 
@@ -1441,7 +1419,6 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
             *node_id,
             2,
             &peers,
-            *node_id == 1,
             &root.join(format!("node-{node_id}-log")),
         );
         configs.push(config_path);
@@ -1866,16 +1843,15 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
     for (node_id, port) in (1_u64..).zip(ports) {
         let config = root.join(format!("node-{node_id}.toml"));
         let wal_dir = root.join(format!("node-{node_id}-log"));
-        let admin_port =
-            write_cluster_config(&config, port, node_id, 1, &peers, node_id == 1, &wal_dir);
+        let admin_port = write_cluster_config(&config, port, node_id, 1, &peers, &wal_dir);
         let text = std::fs::read_to_string(&config).expect("read node config");
         assert!(text.contains("[raft.wal]\n"));
-        assert!(text.contains("init_membership_per_group = false\n"));
+        assert!(text.contains("[raft]\n"));
         std::fs::write(
             &config,
             text.replace(
-                "init_membership_per_group = false\n",
-                "init_membership_per_group = false\ndeleted_data_max_age = \"90s\"\n\
+                "[raft]\n",
+                "[raft]\ndeleted_data_max_age = \"90s\"\n\
                  install_snapshot_timeout = \"10s\"\n",
             )
             .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n"),
@@ -2019,14 +1995,14 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
     let max_age = Duration::from_secs(16);
     let config = root.join("node.toml");
     let wal_dir = root.join("node-log");
-    let admin_port = write_cluster_config(&config, port, 1, 1, &[], false, &wal_dir);
+    let admin_port = write_cluster_config(&config, port, 1, 1, &[], &wal_dir);
     let text = std::fs::read_to_string(&config).expect("read node config");
     assert!(text.contains("[raft.wal]\n"));
     std::fs::write(
         &config,
         text.replace(
-            "init_membership_per_group = false\n",
-            "init_membership_per_group = false\ndeleted_data_max_age = \"16s\"\n\
+            "[raft]\n",
+            "[raft]\ndeleted_data_max_age = \"16s\"\n\
              install_snapshot_timeout = \"2s\"\n",
         )
         .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n"),
@@ -2270,20 +2246,19 @@ async fn cli_deleted_stream_leaves_s3_snapshot_objects_within_the_bound() {
             node_id,
             1,
             &peers,
-            node_id == 1,
             &wal_dir,
             "s3",
             Some(&cold_root),
         );
         let text = std::fs::read_to_string(&config).expect("read node config");
-        assert!(text.contains("init_membership_per_group = false\n"));
+        assert!(text.contains("[raft]\n"));
         assert!(text.contains("flush_interval = \"1s\"\n"));
         // Keep the records hot, so that the snapshots hold them.
         std::fs::write(
             &config,
             text.replace(
-                "init_membership_per_group = false\n",
-                "init_membership_per_group = false\ndeleted_data_max_age = \"160s\"\n\
+                "[raft]\n",
+                "[raft]\ndeleted_data_max_age = \"160s\"\n\
                  install_snapshot_timeout = \"20s\"\n",
             )
             .replace("flush_interval = \"1s\"\n", "flush_interval = \"1h\"\n")
@@ -2761,18 +2736,17 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
             node_id,
             1,
             &peers,
-            node_id == 1,
             &wal_dir,
             "s3",
             Some(&cold_root),
         );
         let text = std::fs::read_to_string(&config).expect("read node config");
-        assert!(text.contains("init_membership_per_group = false\n"));
+        assert!(text.contains("[raft]\n"));
         std::fs::write(
             &config,
             text.replace(
-                "init_membership_per_group = false\n",
-                "init_membership_per_group = false\ninstall_snapshot_timeout = \"40s\"\n",
+                "[raft]\n",
+                "[raft]\ninstall_snapshot_timeout = \"40s\"\n",
             )
                 // A short request timeout, so a lost request fails fast.
                 + "\n[storage.snapshot]\ns3_timeout = \"3s\"\ns3_max_retries = 1\n",
@@ -2997,7 +2971,6 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
             *node_id,
             1,
             &peers,
-            *node_id == 1,
             &log_dir,
             "s3",
             Some(&cold_root),
@@ -3066,7 +3039,6 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
             *node_id,
             1,
             &peers,
-            false,
             &log_dir,
             "s3",
             Some(&cold_root),
@@ -3510,20 +3482,10 @@ fn spawn_per_group_node(
         node_id,
         6,
         peers,
-        true,
         &node_wal_dir(wal_root, node_id),
         "memory",
         None,
     );
-    let config = std::fs::read_to_string(&config_path).expect("read node config");
-    std::fs::write(
-        &config_path,
-        config.replace(
-            "init_membership_per_group = false",
-            "init_membership_per_group = true",
-        ),
-    )
-    .expect("enable per-group membership initialization");
     let mut command = Command::new(binary);
     command.arg("server").arg("--config").arg(&config_path);
     command.env("RUST_LOG", "info");
@@ -3707,8 +3669,8 @@ impl MetaNode {
         ctl_node(self.id, self.admin_port, &self.url())
     }
 
-    /// Writes the node's config with `peers` as its `raft.peers`. Node 1
-    /// initializes the data groups.
+    /// Writes the node's config with `peers` as its `raft.peers`. Each data
+    /// group's seed initializer initializes it.
     fn write(&self, peers: &[(u64, String)], meta: MetaToml<'_>) {
         NodeToml {
             port: self.port,
@@ -3716,7 +3678,6 @@ impl MetaNode {
             node_id: self.id,
             raft_group_count: META_TEST_GROUPS,
             peers,
-            init_membership: self.id == 1,
             wal_path: &self.wal,
             cold_backend: if self.cold_root.is_some() {
                 "s3"
@@ -4135,8 +4096,9 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
 /// and the meta group records them, while no meta voter can dial them yet.
 /// Once nodes 1 to 3 restart one at a time with the full `raft.peers`, the
 /// meta leader replicates to nodes 4 and 5 as meta learners, and their
-/// views reach the bootstrapped cluster. The data groups stay on nodes 1 to
-/// 3.
+/// views reach the bootstrapped cluster. Until placement decides hosting,
+/// the data groups follow the seed rule over `raft.peers`, which this test
+/// grows, so it asserts nothing of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_learn() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -4150,7 +4112,6 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
     let old_peers = peers_of(&nodes[..3]);
     let meta = MetaToml {
         meta_voters: Some(META_VOTERS),
-        data_voters: Some(META_VOTERS),
         ..MetaToml::default()
     };
     let client = reqwest::Client::new();
@@ -4283,18 +4244,37 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
     put_until_created(&client, &stream(&nodes[0])).await;
     post_until_no_content(&client, &stream(&nodes[0]), "before-the-damage;").await;
 
-    // 1. Node 2 stops, and its meta journal's metadata no longer reads.
-    // Node 3 is drained, so node 1 leads every data group.
+    // 1. Node 3 is drained, which hands its leaderships away. Node 2 stops,
+    // and its shutdown hands its leaderships to node 1, the only node left
+    // that takes transfers, so node 1 leads every data group. The seed
+    // initializers rotate over the nodes, so each node led some groups
+    // before. Node 2's meta journal's metadata no longer reads.
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let ctl_nodes = nodes.iter().map(MetaNode::ctl).collect::<Vec<_>>();
+    let outcome = ursula_ctl::drain_node(
+        &ctl_nodes,
+        &nodes[2].ctl(),
+        &ctl,
+        &ursula_ctl::DrainOptions {
+            drain_timeout: Duration::from_secs(60),
+            ready_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(200),
+            lag_tolerance: 16,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("drain node 3");
+    assert!(
+        matches!(outcome, ursula_ctl::DrainOutcome::Drained),
+        "{outcome:?}"
+    );
     procs.stop(2).await;
     std::fs::write(
         nodes[1].meta_dir().join("journal.meta"),
         b"not a meta journal",
     )
     .expect("damage the meta journal");
-    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
-    ctl.set_maintenance_drain(&nodes[2].ctl(), true)
-        .await
-        .expect("drain node 3");
     eventually(&mut procs, "node 1 leads every data group", async || {
         let led = leads(&try_node_metrics(&client, &nodes[0].url()).await?, 1);
         if led == META_TEST_GROUPS {
@@ -4893,7 +4873,6 @@ fn write_node_toml(
     node_id: u64,
     raft_group_count: usize,
     peers: &[(u64, String)],
-    init_membership: bool,
     wal_path: &Path,
     cold_backend: &str,
     cold_root: Option<&str>,
@@ -4905,7 +4884,6 @@ fn write_node_toml(
         node_id,
         raft_group_count,
         peers,
-        init_membership,
         wal_path,
         cold_backend,
         cold_root,
@@ -4923,8 +4901,6 @@ struct MetaToml<'a> {
     meta_voters: Option<&'a [u64]>,
     /// `raft.placement.replication_factor`.
     replication_factor: Option<u8>,
-    /// The voters of every data group, one `[[raft.groups]]` entry each.
-    data_voters: Option<&'a [u64]>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -4934,7 +4910,6 @@ struct NodeToml<'a> {
     node_id: u64,
     raft_group_count: usize,
     peers: &'a [(u64, String)],
-    init_membership: bool,
     wal_path: &'a Path,
     cold_backend: &'a str,
     cold_root: Option<&'a str>,
@@ -4951,7 +4926,6 @@ impl NodeToml<'_> {
             node_id,
             raft_group_count,
             peers,
-            init_membership,
             wal_path,
             cold_backend,
             cold_root,
@@ -4982,8 +4956,6 @@ core_count = 1
             r#"[raft]
 node_id = {node_id}
 group_count = {raft_group_count}
-init_membership = {init_membership}
-init_membership_per_group = false
 "#
         )
         .unwrap();
@@ -5002,15 +4974,6 @@ path = "{}"
 
         if let Some(factor) = meta.replication_factor {
             writeln!(config, "[raft.placement]\nreplication_factor = {factor}\n").unwrap();
-        }
-        if let Some(voters) = meta.data_voters {
-            for group in 0..*raft_group_count {
-                writeln!(
-                    config,
-                    "[[raft.groups]]\nraft_group_id = {group}\nvoters = {voters:?}\n"
-                )
-                .unwrap();
-            }
         }
 
         for (peer_id, peer_url) in *peers {
@@ -5083,7 +5046,6 @@ fn spawn_node(
     node_id: u64,
     port: u16,
     peers: &[(u64, String)],
-    init_membership: bool,
     wal_root: &Path,
 ) -> ChildGuard {
     let config_path = std::env::temp_dir().join(format!(
@@ -5099,7 +5061,6 @@ fn spawn_node(
         node_id,
         4,
         peers,
-        init_membership,
         &node_wal_dir(wal_root, node_id),
         "memory",
         None,
@@ -5135,7 +5096,6 @@ fn spawn_split_plane_node(
     binary: &str,
     planes: &[SplitPlanePorts],
     node_id: u64,
-    init_membership: bool,
     wal_root: &Path,
 ) -> ChildGuard {
     use std::fmt::Write;
@@ -5158,8 +5118,6 @@ core_count = 1
 [raft]
 node_id = {node_id}
 group_count = 4
-init_membership = {init_membership}
-init_membership_per_group = false
 
 [raft.wal]
 path = "{wal}"
@@ -5335,28 +5293,16 @@ fn write_single_node_cluster_config(
     node_id: u64,
     raft_group_count: usize,
     base_url: &str,
-    init_membership: bool,
     log_dir: &Path,
 ) -> u16 {
-    let admin_port = write_cluster_config(
+    write_cluster_config(
         path,
         port,
         node_id,
         raft_group_count,
         &[(node_id, base_url.to_owned())],
-        init_membership,
         log_dir,
-    );
-    let config = std::fs::read_to_string(path).expect("read single-node cluster config");
-    std::fs::write(
-        path,
-        config.replace(
-            "init_membership_per_group = false",
-            "init_membership_per_group = true",
-        ),
     )
-    .expect("enable per-group membership initialization");
-    admin_port
 }
 
 /// Sets `raft.wal.fsync` in the node config at `path`.
@@ -5382,7 +5328,6 @@ fn write_cluster_config(
     node_id: u64,
     raft_group_count: usize,
     peers: &[(u64, String)],
-    init_membership: bool,
     log_dir: &Path,
 ) -> u16 {
     write_node_toml(
@@ -5391,7 +5336,6 @@ fn write_cluster_config(
         node_id,
         raft_group_count,
         peers,
-        init_membership,
         log_dir,
         "memory",
         None,

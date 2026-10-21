@@ -144,7 +144,8 @@ server:
   podDisruptionBudget:
     # Enable quorum-friendly PDB for multi-node clusters.
     enabled: true
-    # Maximum voluntary disruptions for replicaCount > 1.
+    # Maximum voluntary disruptions for replicaCount > 1. At most 1: each
+    # data group has three voters, and two disruptions can take two of them.
     maxUnavailable: 1
   scheduling:
     nodeSelector: {}
@@ -157,13 +158,6 @@ server:
 raft:
   # Number of Raft groups. Defaults to a lighter quickstart than production docs.
   groupCount: 64
-  # Let every voter bootstrap every group, with the same empty-voter check as below.
-  # initMembershipPerGroup: true turns this on as well.
-  initMembership: false
-  # Idempotent per-group bootstrap flag. Persistent groups may keep this enabled across restarts:
-  # a replica that ever held its group never initializes it again, and a replica that holds
-  # nothing initializes only once every voter reports an empty group.
-  initMembershipPerGroup: true
   # Raft log directory, mounted from each pod's raft-data PVC. Must be non-empty.
   logDir: /var/lib/ursula/raft
   # When Raft WAL appends reach stable storage. never acknowledges once

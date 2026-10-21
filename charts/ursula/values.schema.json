@@ -458,7 +458,9 @@
             },
             "maxUnavailable": {
               "type": "integer",
-              "minimum": 0
+              "minimum": 0,
+              "maximum": 1,
+              "description": "Maximum voluntary disruptions. At most 1: each data group has three voters."
             }
           },
           "required": [
@@ -1036,14 +1038,6 @@
           "type": "integer",
           "minimum": 1,
           "description": "Number of Raft groups."
-        },
-        "initMembership": {
-          "type": "boolean",
-          "description": "Membership bootstrap from every voter, with the same empty-voter check as initMembershipPerGroup, which turns it on as well."
-        },
-        "initMembershipPerGroup": {
-          "type": "boolean",
-          "description": "Idempotent per-group membership bootstrap. A replica that ever held its group never initializes it again; one that holds nothing initializes only once every voter reports an empty group."
         },
         "logDir": {
           "type": "string",
