@@ -349,6 +349,29 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         )
     }
 
+    /// Hands this replica's leadership to `target` under the one handoff
+    /// policy ([`Self::validate_handoff`] on one view of the metrics), and
+    /// abandons the transfer once its deadline passed without moving the
+    /// leadership. The receiver checks its own recovery gate and OpenRaft
+    /// never reports its refusal, so the deadline is the only answer.
+    pub(crate) async fn transfer_leader(
+        &self,
+        election: &ElectionPolicy,
+        group: RaftGroupId,
+        target: u64,
+    ) -> Result<(), LeadershipTransferError> {
+        let metrics = self.handoff_view();
+        self.validate_handoff(election, group, target, &metrics)?;
+        let owner = self.owner();
+        owner
+            .trigger()
+            .transfer_leader(target)
+            .await
+            .map_err(|source| LeadershipTransferError::Raft { group, source })?;
+        owner.abandon_stalled_transfer(metrics.vote, target);
+        Ok(())
+    }
+
     /// The recovery barrier this replica answers as its group's leader. A
     /// leader whose history is pending confirms no barrier: a gate opened on
     /// its state would follow a history it has not settled (#581 section

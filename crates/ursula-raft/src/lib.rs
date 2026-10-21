@@ -59,7 +59,9 @@
 //!   the group's history is pending and its obligation to propose the
 //!   history event (genesis, recovery plans).
 //! - [`rejoin`]: the recovery gate of a replica that may be missing entries
-//!   it acknowledged, the leader-side heal driver, and the bootstrap probe.
+//!   it acknowledged, the leader-side heal driver, the membership reconcile
+//!   shell around the pure membership planner ([`MembershipTargetSource`],
+//!   [`PeerGates`]), and the bootstrap probe.
 //! - [`replica`]: one replica of either plane: the gate screens of every
 //!   inbound RPC, the recovery barrier with its history fence, and the
 //!   recovery plan's orchestration, generic over the state machine.
@@ -229,6 +231,9 @@ pub use registry::SnapshotInstallError;
 pub use rejoin::GateOpenError;
 pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;
+pub use rejoin::MembershipTargetSource;
+pub use rejoin::NoPeerGates;
+pub use rejoin::PeerGates;
 pub use rejoin::PeerGroupLog;
 pub use rejoin::PlanAnswer;
 pub use rejoin::RECOVERY_STALL_AFTER;
@@ -238,6 +243,7 @@ pub use rejoin::RecoveryGateError;
 pub use rejoin::RecoveryGateStatus;
 pub use rejoin::RecoveryTransport;
 pub use rejoin::ReplicaRestart;
+pub use rejoin::TargetRead;
 pub use rejoin::bootstrap_probe_vote;
 pub use rejoin::leads_live;
 pub use rejoin::run_group_bootstrap;

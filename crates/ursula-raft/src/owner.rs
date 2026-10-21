@@ -20,7 +20,9 @@ use openraft::error::Fatal;
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
 use openraft::metrics::RaftDataMetrics;
+use openraft::metrics::RaftServerMetrics;
 use openraft::raft::ClientWriteResponse;
+use openraft::raft::Precondition;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::rt::WatchReceiver;
@@ -64,6 +66,7 @@ pub struct OwnerRaftHandle<
     mailbox: Arc<Mailbox<SM>>,
     metrics: WatchReceiverOf<C, RaftMetrics<C>>,
     data_metrics: WatchReceiverOf<C, RaftDataMetrics<C>>,
+    server_metrics: WatchReceiverOf<C, RaftServerMetrics<C>>,
     handoff_ack_window: Duration,
     transfer_deadline: Duration,
 }
@@ -74,6 +77,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHa
             mailbox: self.mailbox.clone(),
             metrics: self.metrics.clone(),
             data_metrics: self.data_metrics.clone(),
+            server_metrics: self.server_metrics.clone(),
             handoff_ack_window: self.handoff_ack_window,
             transfer_deadline: self.transfer_deadline,
         }
@@ -95,6 +99,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     pub(crate) fn new(raft: Raft<C, SM>) -> Self {
         let metrics = raft.metrics();
         let data_metrics = raft.data_metrics();
+        let server_metrics = raft.server_metrics();
         let handoff_ack_window = Duration::from_millis(raft.config().election_timeout_min);
         let transfer_deadline = Duration::from_millis(
             raft.config()
@@ -120,6 +125,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
             mailbox: Arc::new(Mailbox { sender, task }),
             metrics,
             data_metrics,
+            server_metrics,
             handoff_ack_window,
             transfer_deadline,
         }
@@ -278,6 +284,12 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         self.data_metrics.clone()
     }
 
+    /// OpenRaft's server metrics, which change only with the server state
+    /// and the leader, so a follower's driver waits on them.
+    pub fn server_metrics(&self) -> WatchReceiverOf<C, RaftServerMetrics<C>> {
+        self.server_metrics.clone()
+    }
+
     pub fn wait(&self, timeout: Option<Duration>) -> openraft::metrics::Wait<C> {
         openraft::metrics::Wait {
             timeout,
@@ -355,6 +367,27 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
         self.call(move |raft| async move { raft.add_learner(id, EmptyNode {}, blocking).await })
             .await?
+    }
+    /// Proposes the membership change `members` only while every one of
+    /// `preconditions` holds (OpenRaft's `change_membership_if`), once this
+    /// leader's first quorum acknowledgement arrived, as every other
+    /// proposal waits for it. A voter change is a joint and a uniform entry
+    /// from one future: the preconditions guard the first, and OpenRaft
+    /// guards the second with the joint entry's log id and the caller's
+    /// committed leader id. Dropping the returned future drops only the
+    /// wait for the answer: the change is queued and runs under its guard.
+    pub async fn change_membership_if(
+        &self,
+        members: ChangeMembers<u64, EmptyNode>,
+        retain: bool,
+        preconditions: Vec<Precondition<C>>,
+    ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
+        crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
+        self.call(move |raft| async move {
+            raft.change_membership_if(members, retain, preconditions)
+                .await
+        })
+        .await?
     }
     /// Makes `voters` the group's voter set and removes every learner
     /// outside it, in one joint change, so a member that configuration no

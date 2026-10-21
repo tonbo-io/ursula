@@ -541,17 +541,11 @@ impl RaftGroupHandleRegistry {
         group: RaftGroupId,
         target: u64,
     ) -> Result<(), LeadershipTransferError> {
-        let (entry, metrics) = self.handoff_view(group)?;
+        let (entry, _metrics) = self.handoff_view(group)?;
         entry
             .core
-            .validate_handoff(&self.election, group, target, &metrics)?;
-        let raft = entry.raft();
-        raft.trigger()
-            .transfer_leader(target)
+            .transfer_leader(&self.election, group, target)
             .await
-            .map_err(|source| LeadershipTransferError::Raft { group, source })?;
-        raft.abandon_stalled_transfer(metrics.vote, target);
-        Ok(())
     }
 
     /// Whether this node could hand its leadership of `group` to `target`

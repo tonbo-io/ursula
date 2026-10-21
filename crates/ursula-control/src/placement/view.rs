@@ -58,6 +58,16 @@ pub struct ConfirmedStamp {
     pub applied: MetaLogId,
 }
 
+impl ConfirmedStamp {
+    /// Whether a view at `stage` carries this stamp, by the rule
+    /// [`ConfirmedView::new`] confirms with: a reader that holds only the
+    /// stamp, such as a group leader's reconciler, keeps its confirmation
+    /// while every view it reads carries the stamp.
+    pub fn covers(&self, stage: ViewStage) -> bool {
+        covers(stage, *self).is_ok()
+    }
+}
+
 /// A view a meta read barrier confirmed current.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmedView {

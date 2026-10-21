@@ -98,7 +98,7 @@ impl LeaderMemberships {
 
 /// `membership` as the kernel's config: one voter config is uniform, two are
 /// joint, and every listed node outside them is a learner.
-fn membership_config(
+pub(crate) fn membership_config(
     membership: &Membership,
     kind: MembershipKind,
 ) -> Result<MembershipConfig, MalformedMembership> {
