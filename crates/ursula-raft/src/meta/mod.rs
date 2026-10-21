@@ -18,9 +18,10 @@
 //! MessagePack closure: an unknown variant decoding as "other" would hide a
 //! format mismatch.
 //!
-//! No server runs the meta group yet: the meta runtime that opens the
-//! replica at start-up, routes the meta plane's RPCs to it and forms the
-//! group lands later.
+//! The Raft gRPC service routes the meta plane's RPCs to the replica the
+//! registry publishes ([`replica::ActiveMeta`]). No server opens one yet:
+//! the meta runtime that opens the replica at start-up and forms the group
+//! lands later.
 //!
 //! Module map:
 //!

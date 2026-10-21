@@ -867,7 +867,7 @@ async fn handle_append_envelope(
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
     via: AppendVia,
 ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
-    let raft_group_id = validate_raft_rpc_preamble_with(
+    let replica = validate_raft_rpc_preamble_with(
         &registry,
         envelope.protocol_version,
         &envelope,
@@ -882,23 +882,25 @@ async fn handle_append_envelope(
     )?;
     let request: UrsulaAppendEntriesRequest =
         decode_rpc_payload(&envelope.payload, "raft append request")?;
-    // A data group's log takes no command of the meta plane: refused before
+    // A group's log takes no command of the other plane: refused before
     // OpenRaft sees it.
-    let target = RaftTarget::Data(raft_group_id);
+    let target = replica.target();
     if request.entries.iter().any(|entry| match &entry.payload {
         openraft::EntryPayload::Normal(command) => !target.admits(command),
         openraft::EntryPayload::Blank | openraft::EntryPayload::Membership(_) => false,
     }) {
         return Err(GrpcRpcError::invalid_argument(format!(
-            "an append to raft group {} carries a command of another plane",
-            raft_group_id.0
+            "an append to plane {:?} raft group {} carries a command of another plane",
+            target.plane(),
+            target.wire_group_id()
         ))
         .into());
     }
-    let response = registry
-        .append_entries(raft_group_id, request)
-        .await
-        .map_err(group_rpc_status)?;
+    let response = match replica {
+        LocalReplica::Data(group) => registry.append_entries(group, request).await,
+        LocalReplica::Meta(meta) => meta.append_entries(request).await,
+    }
+    .map_err(group_rpc_status)?;
     Ok(raft_internal_proto::RaftRpcAckV1 {
         payload: encode_wire(&response),
     })
@@ -1051,15 +1053,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
-        let raft_group_id =
+        let replica =
             validate_raft_rpc_preamble(&self.registry, envelope.protocol_version, &envelope)?;
         let request: UrsulaVoteRequest =
             decode_rpc_payload(&envelope.payload, "raft vote request")?;
-        let response = self
-            .registry
-            .vote(raft_group_id, request)
-            .await
-            .map_err(group_rpc_status)?;
+        let response = match replica {
+            LocalReplica::Data(group) => self.registry.vote(group, request).await,
+            LocalReplica::Meta(meta) => meta.vote(request).await,
+        }
+        .map_err(group_rpc_status)?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         }))
@@ -1070,7 +1072,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
         let request = request.into_inner();
-        let raft_group_id =
+        let replica =
             validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
         let vote: VoteOf<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.vote, "full snapshot vote")?;
@@ -1080,11 +1082,17 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             meta,
             snapshot: SnapshotData::new(request.snapshot_payload.to_vec()),
         };
-        let response = self
-            .registry
-            .install_full_snapshot(raft_group_id, vote, snapshot)
-            .await
-            .map_err(tonic::Status::from)?;
+        // A meta pointer that is not inline is refused (`INVALID_ARGUMENT`)
+        // before OpenRaft sees it, through the install error's one conversion.
+        let response = match replica {
+            LocalReplica::Data(group) => {
+                self.registry
+                    .install_full_snapshot(group, vote, snapshot)
+                    .await
+            }
+            LocalReplica::Meta(meta) => meta.install_full_snapshot(vote, snapshot).await,
+        }
+        .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
@@ -1102,10 +1110,10 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         async move {
             let request = request.into_inner();
             validate_grpc_metadata(request.protocol_version)?;
-            let group = data_group(
-                RaftTarget::parse(&request, local_node(&self.registry)?)?,
-                "GroupWrite",
-            )?;
+            let RaftTarget::Data(group) = RaftTarget::parse(&request, local_node(&self.registry)?)?
+            else {
+                return Err(no_meta_replica("GroupWrite").into());
+            };
             let placement = placement_from_parts(
                 request.core_id,
                 request.shard_id,
@@ -1160,13 +1168,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RejoinBarrierRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RejoinBarrierResponseV1>, tonic::Status> {
         let request = request.into_inner();
-        let group = validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
-        let answer = self
-            .registry
-            .confirm_recovery_barrier(group)
-            .await
-            .map_err(tonic::Status::from)?;
-        let target = RaftTarget::Data(group);
+        let replica =
+            validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
+        let target = replica.target();
+        let answer = match replica {
+            LocalReplica::Data(group) => self.registry.confirm_recovery_barrier(group).await,
+            LocalReplica::Meta(meta) => meta.confirm_recovery_barrier().await,
+        }
+        .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&answer.vote),
@@ -1183,15 +1192,19 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
         let request = request.into_inner();
-        let raft_group_id =
+        let replica =
             validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
-        let response = self
-            .registry
-            .handle_transfer_leader(raft_group_id, openraft_request)
-            .await
-            .map_err(tonic::Status::from)?;
+        let response = match replica {
+            LocalReplica::Data(group) => {
+                self.registry
+                    .handle_transfer_leader(group, openraft_request)
+                    .await
+            }
+            LocalReplica::Meta(meta) => meta.handle_transfer_leader(openraft_request).await,
+        }
+        .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {
                 response: encode_wire(&response),
@@ -1374,15 +1387,33 @@ fn decode_rpc_payload<T: DeserializeOwned>(
         .map_err(|err| GrpcRpcError::invalid_argument(ErrorChain(&err).to_string()))
 }
 
+/// The replica of this node an inbound Raft RPC is for: a data group it
+/// runs, or its meta replica as the registry published it when the request
+/// arrived.
+enum LocalReplica {
+    Data(RaftGroupId),
+    Meta(Arc<crate::meta::replica::ActiveMeta>),
+}
+
+impl LocalReplica {
+    fn target(&self) -> RaftTarget {
+        match self {
+            Self::Data(group) => RaftTarget::Data(*group),
+            Self::Meta(_) => RaftTarget::Meta,
+        }
+    }
+}
+
 /// Validates the preamble of an inbound Raft RPC in its one order: the
 /// protocol version, then the target (plane, group and target node,
-/// [`RaftTarget::parse`]), then the group lookup, which answers `NOT_FOUND`
-/// for a group this node does not run.
-pub(crate) fn validate_raft_rpc_preamble<R: TargetedRequest>(
+/// [`RaftTarget::parse`]), then the replica lookup, which answers
+/// `NOT_FOUND` for a group this node does not run and for the meta group on
+/// a node that runs no meta replica.
+fn validate_raft_rpc_preamble<R: TargetedRequest>(
     registry: &RaftGroupHandleRegistry,
     protocol_version: u32,
     request: &R,
-) -> Result<RaftGroupId, GrpcRpcError> {
+) -> Result<LocalReplica, GrpcRpcError> {
     validate_raft_rpc_preamble_with(registry, protocol_version, request, |_| Ok(()))
 }
 
@@ -1393,33 +1424,26 @@ fn validate_raft_rpc_preamble_with<R: TargetedRequest>(
     protocol_version: u32,
     request: &R,
     check: impl FnOnce(RaftTarget) -> Result<(), GrpcRpcError>,
-) -> Result<RaftGroupId, GrpcRpcError> {
+) -> Result<LocalReplica, GrpcRpcError> {
     validate_grpc_metadata(protocol_version)?;
     let target = RaftTarget::parse(request, local_node(registry)?)?;
     check(target)?;
-    let raft_group_id = data_group(target, R::NAME)?;
-    if !registry.contains_group(raft_group_id) {
-        return Err(GrpcRpcError::not_found(format!(
-            "raft group {} is not registered on this node",
-            raft_group_id.0
-        )));
-    }
-    Ok(raft_group_id)
-}
-
-/// The data group `target` names. No node runs a meta group replica yet, so
-/// a request for the meta group is answered as one for a group this node
-/// does not run.
-fn data_group(target: RaftTarget, request: &str) -> Result<RaftGroupId, GrpcRpcError> {
     match target {
-        RaftTarget::Data(group) => Ok(group),
-        RaftTarget::Meta => Err(no_meta_replica(request)),
+        RaftTarget::Data(group) if registry.contains_group(group) => Ok(LocalReplica::Data(group)),
+        RaftTarget::Data(group) => Err(GrpcRpcError::not_found(format!(
+            "raft group {} is not registered on this node",
+            group.0
+        ))),
+        RaftTarget::Meta => registry
+            .meta()
+            .map(LocalReplica::Meta)
+            .ok_or_else(|| no_meta_replica(R::NAME)),
     }
 }
 
-/// The refusal of a meta-plane `request`: this node runs no meta group
+/// The refusal of a meta-plane `request` on a node that runs no meta
 /// replica, as a group lookup that finds none answers.
-fn no_meta_replica(request: &str) -> GrpcRpcError {
+pub(crate) fn no_meta_replica(request: &str) -> GrpcRpcError {
     GrpcRpcError::not_found(format!(
         "{request} names the meta group, and this node runs no meta group replica"
     ))
@@ -3071,7 +3095,7 @@ mod reconnect_tests {
     /// unknown one or the meta plane has each data item refused
     /// (`INVALID_ARGUMENT`) before the group lookup, which answers a data
     /// stream's item for a group this node does not run `NOT_FOUND`, and a
-    /// meta stream's meta item likewise, as no node runs the meta group yet.
+    /// meta stream's meta item likewise, as this node runs no meta replica.
     #[tokio::test]
     async fn an_append_stream_refuses_items_of_another_plane_than_its_own() {
         let (endpoint, _registry, server) = spawn_append_stream_server().await;
@@ -3125,7 +3149,7 @@ mod reconnect_tests {
         )
         .await
         .expect("a meta frame does not wait for the data budget");
-        // No node runs the meta group yet.
+        // This node runs no meta replica.
         assert_eq!(
             tonic::Code::from_i32(answered[0].code),
             tonic::Code::NotFound
