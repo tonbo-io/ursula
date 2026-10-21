@@ -74,7 +74,7 @@ fn metrics() -> GroupEngineMetrics {
     ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics()
 }
 
-fn start_wal(root: &std::path::Path) -> RaftWal {
+pub(super) fn start_wal(root: &std::path::Path) -> RaftWal {
     RaftWal::start(root, WalFsync::Always, &StaticShardMap::new(1, 1).unwrap()).unwrap()
 }
 
@@ -104,7 +104,7 @@ fn new_history(id: u64, previous: u64, cause: HistoryCause) -> MetaCommand {
     }
 }
 
-fn register(node: u64) -> ControlCommand {
+pub(super) fn register(node: u64) -> ControlCommand {
     ControlCommand::RegisterNode {
         node: NodeId::new(node),
         now_ms: 10_u64.saturating_add(node),
@@ -113,6 +113,11 @@ fn register(node: u64) -> ControlCommand {
 
 /// A meta state machine over the meta journal's store in `wal`, and the
 /// publisher of its views.
+/// `command` as the meta log carries it.
+pub(super) fn control(command: ControlCommand) -> RaftCommand {
+    RaftCommand::Meta(MetaCommand::Control(command))
+}
+
 fn state_machine(
     wal: &RaftWal,
 ) -> (
@@ -459,6 +464,7 @@ fn config() -> MetaReplicaConfig {
     MetaReplicaConfig {
         node: 1,
         engine: crate::RaftEngineConfig::default(),
+        claim: samples::sample_genesis_claim(),
     }
 }
 
@@ -541,18 +547,11 @@ async fn view_applied_above(
     .expect("the view moves")
 }
 
-/// One meta replica on a real journal: it forms alone, its history driver
-/// proposes the genesis, it writes, refuses a registration of another node
-/// before proposing it, snapshots, stops, and a restart of the WAL brings
-/// back its state, its history and its view from the record and the
-/// committed log above it.
-/// The meta group stays out of the registry's data structures throughout.
-#[tokio::test]
-async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
-    let dir = tempfile::tempdir().unwrap();
-    let registry = RaftGroupHandleRegistry::default();
-    let wal = start_wal(dir.path());
-    let replica = open(&wal, &registry).await.unwrap();
+/// Node 1's meta replica on `wal`, published in `registry` and formed
+/// alone: its gate opened for a fresh bootstrap, its Raft initialized with
+/// itself, and its genesis history event applied.
+pub(super) async fn form_alone(wal: &RaftWal, registry: &RaftGroupHandleRegistry) -> MetaReplica {
+    let replica = open(wal, registry).await.unwrap();
     let active = Arc::clone(replica.active());
     active
         .core
@@ -569,19 +568,42 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
         .initialize(BTreeSet::from([1]))
         .await
         .unwrap();
-    let genesis = view_applied_above(&registry, 0).await;
+    view_applied_above(registry, 0).await;
+    replica
+}
+
+/// One meta replica on a real journal: it forms alone, its history driver
+/// proposes the genesis, it writes, refuses a registration of another node
+/// before proposing it, snapshots, stops, and a restart of the WAL brings
+/// back its state, its history and its view from the record and the
+/// committed log above it.
+/// The meta group stays out of the registry's data structures throughout.
+#[tokio::test]
+async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = RaftGroupHandleRegistry::default();
+    let wal = start_wal(dir.path());
+    let replica = form_alone(&wal, &registry).await;
+    let active = Arc::clone(replica.active());
+    let genesis = registry.placement_watch().current();
     let ViewStage::Applied { history, .. } = genesis.stage else {
         panic!("the genesis applied");
     };
 
     let written = active
-        .write(vec![register(1)], WriteOrigin::Local(NodeId::new(1)))
+        .write(
+            vec![control(register(1))],
+            WriteOrigin::Local(NodeId::new(1)),
+        )
         .await
         .unwrap();
     assert!(matches!(written.as_slice(), [Ok(Ok(_))]), "{written:?}");
     let last = replica.raft().metrics().borrow_watched().last_log_index;
     let refused = active
-        .write(vec![register(2)], WriteOrigin::Local(NodeId::new(1)))
+        .write(
+            vec![control(register(2))],
+            WriteOrigin::Local(NodeId::new(1)),
+        )
         .await
         .expect_err("a node registers only itself");
     assert!(matches!(refused, MetaWriteError::OtherNode {
@@ -594,7 +616,7 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
         "nothing was proposed"
     );
     let forwarded = active
-        .write(vec![register(2)], WriteOrigin::Forwarded {
+        .write(vec![control(register(2))], WriteOrigin::Forwarded {
             admitted: NodeId::new(2),
         })
         .await
@@ -609,7 +631,7 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
         .await
         .unwrap();
     let forwarded = active
-        .write(vec![register(3)], WriteOrigin::Forwarded {
+        .write(vec![control(register(3))], WriteOrigin::Forwarded {
             admitted: NodeId::new(3),
         })
         .await

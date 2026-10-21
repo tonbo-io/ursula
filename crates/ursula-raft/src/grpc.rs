@@ -59,12 +59,14 @@ use crate::forward::write_commands_on_raft;
 use crate::memberships::BarrierAnswer;
 use crate::memberships::LeaderMemberships;
 use crate::peer_channel::peer_endpoint;
+use crate::peer_cluster::AdmittedPeer;
 use crate::peer_cluster::ClusterCheck;
 use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::PeerIdentity;
 use crate::raft_internal_proto;
 use crate::target::RaftTarget;
 use crate::target::TargetedRequest;
+use crate::types::RaftCommand;
 use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
@@ -90,7 +92,7 @@ pub struct CoreRaftTransport {
     /// Stamped on every request this transport sends.
     identity: PeerIdentity,
     /// Where a peer's refusal for another cluster id is recorded.
-    peer_cluster: PeerCluster,
+    pub(crate) peer_cluster: PeerCluster,
     channels: Mutex<BTreeMap<String, SharedRaftChannel>>,
     sessions: Mutex<BTreeMap<String, SharedAppendSession>>,
 }
@@ -292,6 +294,26 @@ pub(crate) enum RecoveryProbeError {
     Memberships(#[from] crate::memberships::MalformedMembership),
 }
 
+/// How a barrier the gRPC recovery transport asked for failed: a peer not
+/// listed, or a call that failed at the transport, is unreachable; an
+/// answer that does not decode, names another target or carries malformed
+/// memberships is malformed.
+impl From<RecoveryProbeError> for crate::meta::confirm::BarrierFailure {
+    fn from(error: RecoveryProbeError) -> Self {
+        match error {
+            RecoveryProbeError::Channel(_) => Self::Unreachable,
+            RecoveryProbeError::Rpc(status) => Self::of_status(&status),
+            RecoveryProbeError::Payload(_)
+            | RecoveryProbeError::OtherTarget { .. }
+            | RecoveryProbeError::Memberships(_) => Self::Malformed,
+            RecoveryProbeError::NotLeader => Self::NotLeader,
+            RecoveryProbeError::OtherNode { node } => Self::OtherNode {
+                node: ursula_proto::placement::NodeId::new(node),
+            },
+        }
+    }
+}
+
 /// Confirm a group's current quorum without issuing an application write.
 /// This is a point-in-time observation, not a maintenance reservation or a
 /// promise that another participant cannot disrupt a voter immediately after.
@@ -378,6 +400,69 @@ pub(crate) async fn probe_rejoin_vote_barrier(
         index: response.index,
         memberships,
     })
+}
+
+/// Asks `peer` with this node's genesis probe, at the cluster URL
+/// `raft.peers` lists for it, and reads its answer: what it holds of the
+/// meta group when it claims the same values (`Vote`), or the values it
+/// claims (`GenesisMismatch`). A peer whose binary has no genesis probe
+/// (`UNIMPLEMENTED`) is of another format epoch: recorded as such, and not
+/// empty. A peer not listed, one that runs no meta replica (`NOT_FOUND`), an
+/// address that serves another node, one of another cluster, a malformed
+/// answer and a transport failure are no answer (`None`). An address that
+/// serves another node rebuilds the pooled channel, as every Raft client
+/// does.
+pub(crate) async fn genesis_probe(
+    transport: Arc<CoreRaftTransport>,
+    peer: u64,
+    probe: &crate::meta::genesis::GenesisProbe,
+    timeout: Duration,
+) -> Option<crate::rejoin::PeerGroupLog> {
+    use crate::rejoin::PeerGroupLog;
+    let mut network = GrpcRaftNetwork::new(transport, RaftTarget::Meta, peer);
+    let channel = network.channel.as_ref().ok()?;
+    let endpoint = channel.endpoint.clone();
+    let mut client = channel.client.clone();
+    let mut request = tonic::Request::new(crate::meta::genesis::genesis_probe_request(peer, probe));
+    request.set_timeout(timeout);
+    let status = match client.genesis_probe(request).await {
+        Ok(ack) => {
+            return match crate::meta::genesis::genesis_answer(&ack.into_inner()) {
+                Ok(answer) => Some(PeerGroupLog::from(answer)),
+                Err(error) => {
+                    tracing::debug!(
+                        peer,
+                        error = %ErrorChain(&error),
+                        "a genesis probe's answer does not decode"
+                    );
+                    None
+                }
+            };
+        }
+        Err(status) => status,
+    };
+    if status.code() == tonic::Code::Unimplemented {
+        record_format_epoch_mismatch(
+            "outbound",
+            &format!(
+                "GenesisProbe: peer {peer} at {endpoint} has no genesis probe: {}",
+                status.message()
+            ),
+        );
+        return Some(PeerGroupLog::Initialized);
+    }
+    if let Some(node) = crate::target::refusing_node(&status) {
+        network.misdelivered(node);
+        return None;
+    }
+    observe_outbound_status("GenesisProbe", &status);
+    network.transport.peer_cluster.observe_refusal(
+        peer,
+        &endpoint,
+        &status,
+        crate::rt::time::Instant::now(),
+    );
+    None
 }
 
 #[derive(Debug, Clone)]
@@ -867,7 +952,7 @@ async fn handle_append_envelope(
     envelope: raft_internal_proto::RaftRpcEnvelopeV1,
     via: AppendVia,
 ) -> Result<raft_internal_proto::RaftRpcAckV1, tonic::Status> {
-    let raft_group_id = validate_raft_rpc_preamble_with(
+    let replica = validate_raft_rpc_preamble_with(
         &registry,
         envelope.protocol_version,
         &envelope,
@@ -882,23 +967,25 @@ async fn handle_append_envelope(
     )?;
     let request: UrsulaAppendEntriesRequest =
         decode_rpc_payload(&envelope.payload, "raft append request")?;
-    // A data group's log takes no command of the meta plane: refused before
+    // A group's log takes no command of the other plane: refused before
     // OpenRaft sees it.
-    let target = RaftTarget::Data(raft_group_id);
+    let target = replica.target();
     if request.entries.iter().any(|entry| match &entry.payload {
         openraft::EntryPayload::Normal(command) => !target.admits(command),
         openraft::EntryPayload::Blank | openraft::EntryPayload::Membership(_) => false,
     }) {
         return Err(GrpcRpcError::invalid_argument(format!(
-            "an append to raft group {} carries a command of another plane",
-            raft_group_id.0
+            "an append to plane {:?} raft group {} carries a command of another plane",
+            target.plane(),
+            target.wire_group_id()
         ))
         .into());
     }
-    let response = registry
-        .append_entries(raft_group_id, request)
-        .await
-        .map_err(group_rpc_status)?;
+    let response = match replica {
+        LocalReplica::Data(group) => registry.append_entries(group, request).await,
+        LocalReplica::Meta(meta) => meta.append_entries(request).await,
+    }
+    .map_err(group_rpc_status)?;
     Ok(raft_internal_proto::RaftRpcAckV1 {
         payload: encode_wire(&response),
     })
@@ -1051,15 +1138,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftRpcEnvelopeV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftRpcAckV1>, tonic::Status> {
         let envelope = request.into_inner();
-        let raft_group_id =
+        let replica =
             validate_raft_rpc_preamble(&self.registry, envelope.protocol_version, &envelope)?;
         let request: UrsulaVoteRequest =
             decode_rpc_payload(&envelope.payload, "raft vote request")?;
-        let response = self
-            .registry
-            .vote(raft_group_id, request)
-            .await
-            .map_err(group_rpc_status)?;
+        let response = match replica {
+            LocalReplica::Data(group) => self.registry.vote(group, request).await,
+            LocalReplica::Meta(meta) => meta.vote(request).await,
+        }
+        .map_err(group_rpc_status)?;
         Ok(tonic::Response::new(raft_internal_proto::RaftRpcAckV1 {
             payload: encode_wire(&response),
         }))
@@ -1070,7 +1157,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftFullSnapshotRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftFullSnapshotAckV1>, tonic::Status> {
         let request = request.into_inner();
-        let raft_group_id =
+        let replica =
             validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
         let vote: VoteOf<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.vote, "full snapshot vote")?;
@@ -1080,11 +1167,17 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             meta,
             snapshot: SnapshotData::new(request.snapshot_payload.to_vec()),
         };
-        let response = self
-            .registry
-            .install_full_snapshot(raft_group_id, vote, snapshot)
-            .await
-            .map_err(tonic::Status::from)?;
+        // A meta pointer that is not inline is refused (`INVALID_ARGUMENT`)
+        // before OpenRaft sees it, through the install error's one conversion.
+        let response = match replica {
+            LocalReplica::Data(group) => {
+                self.registry
+                    .install_full_snapshot(group, vote, snapshot)
+                    .await
+            }
+            LocalReplica::Meta(meta) => meta.install_full_snapshot(vote, snapshot).await,
+        }
+        .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftFullSnapshotAckV1 {
                 response: encode_wire(&response),
@@ -1099,54 +1192,72 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         // Link this forwarded write to the originating request's trace.
         let span = tracing::info_span!("raft.group_write");
         span.set_parent(crate::telemetry::extract_parent_context(request.metadata()));
+        // The node the cluster check admitted the request from, which a
+        // forwarded meta write comes from.
+        let admitted = request.extensions().get::<AdmittedPeer>().copied();
         async move {
             let request = request.into_inner();
             validate_grpc_metadata(request.protocol_version)?;
-            let group = data_group(
-                RaftTarget::parse(&request, local_node(&self.registry)?)?,
-                "GroupWrite",
-            )?;
-            let placement = placement_from_parts(
-                request.core_id,
-                request.shard_id,
-                group.0,
-                "group_write_request",
-            )?;
-            let entry = self
-                .registry
-                .entry(placement.raft_group_id)
-                .map_err(group_rpc_status)?;
-            let raft = entry.raft().clone();
-            let history = entry.core.history.clone();
-            let commands = request
-                .command_payloads
-                .iter()
-                .map(|payload| decode_rpc_payload(payload, "group command"))
-                .collect::<Result<Vec<_>, _>>()?;
-            let count = commands.len();
-            // A refusal of the whole batch answers each command with it, so
-            // the sender keeps the leader's typed answer (a pending history,
-            // an unknown outcome).
-            let results =
-                raft.call(move |raft| async move {
-                    write_commands_on_raft(raft, &history, commands).await
-                })
-                .await
-                .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
-                .unwrap_or_else(|refusal| vec![Err(refusal); count]);
-            let results = results
-                .into_iter()
-                .map(|result| match result {
-                    Ok(response) => raft_internal_proto::GroupWriteResultV1 {
-                        ok: true,
-                        payload: encode_wire(&response),
-                    },
-                    Err(err) => raft_internal_proto::GroupWriteResultV1 {
-                        ok: false,
-                        payload: encode_wire(&err),
-                    },
-                })
-                .collect();
+            let target = RaftTarget::parse(&request, local_node(&self.registry)?)?;
+            // The commands decode once the replica is found, so a request
+            // for a group this node does not run is `NOT_FOUND` either way.
+            let commands = |request: &raft_internal_proto::GroupWriteRequestV1| {
+                request
+                    .command_payloads
+                    .iter()
+                    .map(|payload| decode_rpc_payload(payload, "group command"))
+                    .collect::<Result<Vec<RaftCommand>, _>>()
+            };
+            let results = match target {
+                RaftTarget::Data(group) => {
+                    let placement = placement_from_parts(
+                        request.core_id,
+                        request.shard_id,
+                        group.0,
+                        "group_write_request",
+                    )?;
+                    let entry = self
+                        .registry
+                        .entry(placement.raft_group_id)
+                        .map_err(group_rpc_status)?;
+                    let raft = entry.raft().clone();
+                    let history = entry.core.history.clone();
+                    let commands = commands(&request)?;
+                    let count = commands.len();
+                    // A refusal of the whole batch answers each command with
+                    // it, so the sender keeps the leader's typed answer (a
+                    // pending history, an unknown outcome).
+                    let results = raft
+                        .call(move |raft| async move {
+                            write_commands_on_raft(raft, &history, commands).await
+                        })
+                        .await
+                        .map_err(|fatal| group_rpc_status(crate::owner::owner_stopped(fatal)))?
+                        .unwrap_or_else(|refusal| vec![Err(refusal); count]);
+                    write_results(results)
+                }
+                RaftTarget::Meta => {
+                    // Target, replica, then payload, as every RPC checks
+                    // them: a node without a meta replica answers
+                    // `NOT_FOUND` whoever sent the write.
+                    let meta = self
+                        .registry
+                        .meta()
+                        .ok_or_else(|| no_meta_replica("GroupWrite"))?;
+                    let AdmittedPeer(sender) = admitted.ok_or_else(|| {
+                        GrpcRpcError::invalid_argument(
+                            "GroupWrite to the meta plane names no admitted sender",
+                        )
+                    })?;
+                    write_results(
+                        meta.write_forwarded(
+                            commands(&request)?,
+                            ursula_proto::placement::NodeId::new(sender),
+                        )
+                        .await?,
+                    )
+                }
+            };
             Ok(tonic::Response::new(
                 raft_internal_proto::GroupWriteResponseV1 { results },
             ))
@@ -1160,13 +1271,14 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RejoinBarrierRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RejoinBarrierResponseV1>, tonic::Status> {
         let request = request.into_inner();
-        let group = validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
-        let answer = self
-            .registry
-            .confirm_recovery_barrier(group)
-            .await
-            .map_err(tonic::Status::from)?;
-        let target = RaftTarget::Data(group);
+        let replica =
+            validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
+        let target = replica.target();
+        let answer = match replica {
+            LocalReplica::Data(group) => self.registry.confirm_recovery_barrier(group).await,
+            LocalReplica::Meta(meta) => meta.confirm_recovery_barrier().await,
+        }
+        .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RejoinBarrierResponseV1 {
                 vote: encode_wire(&answer.vote),
@@ -1183,15 +1295,19 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         request: tonic::Request<raft_internal_proto::RaftTransferLeaderRequestV1>,
     ) -> Result<tonic::Response<raft_internal_proto::RaftTransferLeaderAckV1>, tonic::Status> {
         let request = request.into_inner();
-        let raft_group_id =
+        let replica =
             validate_raft_rpc_preamble(&self.registry, request.protocol_version, &request)?;
         let openraft_request: TransferLeaderRequest<UrsulaRaftTypeConfig> =
             decode_rpc_payload(&request.request, "transfer leader request")?;
-        let response = self
-            .registry
-            .handle_transfer_leader(raft_group_id, openraft_request)
-            .await
-            .map_err(tonic::Status::from)?;
+        let response = match replica {
+            LocalReplica::Data(group) => {
+                self.registry
+                    .handle_transfer_leader(group, openraft_request)
+                    .await
+            }
+            LocalReplica::Meta(meta) => meta.handle_transfer_leader(openraft_request).await,
+        }
+        .map_err(tonic::Status::from)?;
         Ok(tonic::Response::new(
             raft_internal_proto::RaftTransferLeaderAckV1 {
                 response: encode_wire(&response),
@@ -1199,13 +1315,12 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         ))
     }
 
-    /// The meta group's genesis probe, checked as 0.10 checks it: the
-    /// protocol version first, then the target node, then the probe, which
-    /// must decode. The answer comes from the meta replica's recovery gate
-    /// and this node's genesis claim, which the meta runtime brings (#768).
-    /// No node runs a meta replica yet, so every probe is refused as one for
-    /// a group this node does not run (`NOT_FOUND`), never `UNIMPLEMENTED`,
-    /// which a prober records as another format epoch.
+    /// The meta group's genesis probe, checked in the preamble's order: the
+    /// protocol version, then the target node, then the probe, which must
+    /// decode, then the meta replica, `NOT_FOUND` on a node that runs none
+    /// (never `UNIMPLEMENTED`, which a prober records as another format
+    /// epoch). The replica answers with its claim or its gate's answer to
+    /// the probe vote ([`crate::meta::replica::ActiveMeta`]).
     async fn genesis_probe(
         &self,
         request: tonic::Request<raft_internal_proto::GenesisProbeRequestV1>,
@@ -1213,9 +1328,21 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
         let request = request.into_inner();
         validate_grpc_metadata(request.protocol_version)?;
         crate::target::check_target_node(request.target_node, local_node(&self.registry)?)?;
-        let _probe: crate::meta::genesis::GenesisProbe =
+        let probe: crate::meta::genesis::GenesisProbe =
             decode_rpc_payload(&request.probe, "genesis probe")?;
-        Err(no_meta_replica("GenesisProbe").into())
+        let meta = self
+            .registry
+            .meta()
+            .ok_or_else(|| no_meta_replica("GenesisProbe"))?;
+        let answer = meta
+            .answer_genesis_probe(probe)
+            .await
+            .map_err(group_rpc_status)?;
+        Ok(tonic::Response::new(
+            raft_internal_proto::GenesisProbeAckV1 {
+                answer: encode_wire(&answer),
+            },
+        ))
     }
 
     async fn group_read(
@@ -1320,6 +1447,26 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
     }
 }
 
+/// The answers of a forwarded write as `GroupWrite` sends them back: each
+/// command's response, or the leader's typed refusal of it.
+fn write_results<T: serde::Serialize>(
+    results: Vec<Result<T, ursula_runtime::GroupEngineError>>,
+) -> Vec<raft_internal_proto::GroupWriteResultV1> {
+    results
+        .into_iter()
+        .map(|result| match result {
+            Ok(response) => raft_internal_proto::GroupWriteResultV1 {
+                ok: true,
+                payload: encode_wire(&response),
+            },
+            Err(err) => raft_internal_proto::GroupWriteResultV1 {
+                ok: false,
+                payload: encode_wire(&err),
+            },
+        })
+        .collect()
+}
+
 /// Server half of a forwarded HEAD: a client HEAD stays linearizable on the
 /// leader, an internal one reads the leader's applied state (D10).
 pub(crate) fn head_stream_request_from_v1(
@@ -1374,15 +1521,33 @@ fn decode_rpc_payload<T: DeserializeOwned>(
         .map_err(|err| GrpcRpcError::invalid_argument(ErrorChain(&err).to_string()))
 }
 
+/// The replica of this node an inbound Raft RPC is for: a data group it
+/// runs, or its meta replica as the registry published it when the request
+/// arrived.
+enum LocalReplica {
+    Data(RaftGroupId),
+    Meta(Arc<crate::meta::replica::ActiveMeta>),
+}
+
+impl LocalReplica {
+    fn target(&self) -> RaftTarget {
+        match self {
+            Self::Data(group) => RaftTarget::Data(*group),
+            Self::Meta(_) => RaftTarget::Meta,
+        }
+    }
+}
+
 /// Validates the preamble of an inbound Raft RPC in its one order: the
 /// protocol version, then the target (plane, group and target node,
-/// [`RaftTarget::parse`]), then the group lookup, which answers `NOT_FOUND`
-/// for a group this node does not run.
-pub(crate) fn validate_raft_rpc_preamble<R: TargetedRequest>(
+/// [`RaftTarget::parse`]), then the replica lookup, which answers
+/// `NOT_FOUND` for a group this node does not run and for the meta group on
+/// a node that runs no meta replica.
+fn validate_raft_rpc_preamble<R: TargetedRequest>(
     registry: &RaftGroupHandleRegistry,
     protocol_version: u32,
     request: &R,
-) -> Result<RaftGroupId, GrpcRpcError> {
+) -> Result<LocalReplica, GrpcRpcError> {
     validate_raft_rpc_preamble_with(registry, protocol_version, request, |_| Ok(()))
 }
 
@@ -1393,33 +1558,26 @@ fn validate_raft_rpc_preamble_with<R: TargetedRequest>(
     protocol_version: u32,
     request: &R,
     check: impl FnOnce(RaftTarget) -> Result<(), GrpcRpcError>,
-) -> Result<RaftGroupId, GrpcRpcError> {
+) -> Result<LocalReplica, GrpcRpcError> {
     validate_grpc_metadata(protocol_version)?;
     let target = RaftTarget::parse(request, local_node(registry)?)?;
     check(target)?;
-    let raft_group_id = data_group(target, R::NAME)?;
-    if !registry.contains_group(raft_group_id) {
-        return Err(GrpcRpcError::not_found(format!(
-            "raft group {} is not registered on this node",
-            raft_group_id.0
-        )));
-    }
-    Ok(raft_group_id)
-}
-
-/// The data group `target` names. No node runs a meta group replica yet, so
-/// a request for the meta group is answered as one for a group this node
-/// does not run.
-fn data_group(target: RaftTarget, request: &str) -> Result<RaftGroupId, GrpcRpcError> {
     match target {
-        RaftTarget::Data(group) => Ok(group),
-        RaftTarget::Meta => Err(no_meta_replica(request)),
+        RaftTarget::Data(group) if registry.contains_group(group) => Ok(LocalReplica::Data(group)),
+        RaftTarget::Data(group) => Err(GrpcRpcError::not_found(format!(
+            "raft group {} is not registered on this node",
+            group.0
+        ))),
+        RaftTarget::Meta => registry
+            .meta()
+            .map(LocalReplica::Meta)
+            .ok_or_else(|| no_meta_replica(R::NAME)),
     }
 }
 
-/// The refusal of a meta-plane `request`: this node runs no meta group
+/// The refusal of a meta-plane `request` on a node that runs no meta
 /// replica, as a group lookup that finds none answers.
-fn no_meta_replica(request: &str) -> GrpcRpcError {
+pub(crate) fn no_meta_replica(request: &str) -> GrpcRpcError {
     GrpcRpcError::not_found(format!(
         "{request} names the meta group, and this node runs no meta group replica"
     ))
@@ -3071,7 +3229,7 @@ mod reconnect_tests {
     /// unknown one or the meta plane has each data item refused
     /// (`INVALID_ARGUMENT`) before the group lookup, which answers a data
     /// stream's item for a group this node does not run `NOT_FOUND`, and a
-    /// meta stream's meta item likewise, as no node runs the meta group yet.
+    /// meta stream's meta item likewise, as this node runs no meta replica.
     #[tokio::test]
     async fn an_append_stream_refuses_items_of_another_plane_than_its_own() {
         let (endpoint, _registry, server) = spawn_append_stream_server().await;
@@ -3125,7 +3283,7 @@ mod reconnect_tests {
         )
         .await
         .expect("a meta frame does not wait for the data budget");
-        // No node runs the meta group yet.
+        // This node runs no meta replica.
         assert_eq!(
             tonic::Code::from_i32(answered[0].code),
             tonic::Code::NotFound

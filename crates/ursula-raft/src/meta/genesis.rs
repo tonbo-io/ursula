@@ -38,11 +38,18 @@ pub enum GenesisAnswer {
     Mismatch(GenesisClaim),
 }
 
+/// What a genesis answer says of the meta group on the node that gave it,
+/// as the bootstrap decision and the genesis vote floor read it.
+impl From<GenesisAnswer> for crate::rejoin::PeerGroupLog {
+    fn from(answer: GenesisAnswer) -> Self {
+        match answer {
+            GenesisAnswer::Vote(response) => Self::from_vote_response(&response),
+            GenesisAnswer::Mismatch(claim) => Self::GenesisMismatch { claim },
+        }
+    }
+}
+
 /// The `GenesisProbe` request for `target_node` carrying `probe`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the meta group's genesis driver sends it (#768)")
-)]
 pub(crate) fn genesis_probe_request(
     target_node: u64,
     probe: &GenesisProbe,
@@ -56,10 +63,6 @@ pub(crate) fn genesis_probe_request(
 
 /// The answer a `GenesisProbe` ack carries. An empty answer does not
 /// decode: it is a malformed ack, never an answer.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the meta group's genesis driver reads it (#768)")
-)]
 pub(crate) fn genesis_answer(
     ack: &pb::GenesisProbeAckV1,
 ) -> Result<GenesisAnswer, WireDecodeError> {

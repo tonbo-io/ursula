@@ -863,11 +863,14 @@ async fn build_three_node_cluster_gating(
             )
             .await
             .expect("wait for selected leader actor");
-        let (vote, _) = registry
-            .confirm_recovery_barrier(leader_id, placement().raft_group_id)
+        let answer = registry
+            .confirm_recovery_barrier(
+                leader_id,
+                crate::RaftTarget::Data(placement().raft_group_id),
+            )
             .await
             .expect("selected leader confirms a fresh quorum before fixture writes");
-        assert_eq!(*vote.leader_id().node_id(), leader_id);
+        assert_eq!(*answer.vote.leader_id().node_id(), leader_id);
         leader_id
     })
     .await
@@ -1441,7 +1444,7 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
                     asked.len()
                 };
                 rounds.send_replace(count);
-                Err::<(UrsulaVote, u64), _>("refused")
+                Err::<crate::BarrierAnswer, _>("refused")
             }
         },
         Duration::from_millis(100),

@@ -7,13 +7,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use openraft::rt::WatchReceiver;
+use ursula_control::ControlCommand;
+use ursula_control::ControlResponse;
 
 use super::GroupRejoin;
 use super::PeerGroupLog;
 use super::run_group_bootstrap;
 use super::run_rejoin_heal;
 use super::run_rejoin_vote_barrier;
+use crate::BarrierAnswer;
+use crate::RaftTarget;
+use crate::meta::MetaForwardError;
+use crate::meta::confirm::BarrierFailure;
+use crate::meta::genesis::GenesisProbe;
 use crate::registry::RaftGroupHandleRegistry;
+use crate::replica::ReplicaStateMachine;
 use crate::types::UrsulaVote;
 
 #[cfg(madsim)]
@@ -135,16 +143,37 @@ pub(super) async fn wait_change<T: Send + Sync>(
     }
 }
 
-/// Transport required by recovery, shared by native and simulated wiring.
+/// Transport required by recovery, shared by native and simulated wiring:
+/// the one seam through which a replica's gate, the meta runtime and its
+/// drivers ask other nodes, over gRPC or in process.
 pub trait RecoveryTransport: Clone + Send + Sync + 'static {
-    type Error: fmt::Debug + Send;
-    /// Asks `peer` with the bootstrap probe vote.
+    /// Why a barrier failed, which a meta read barrier classifies.
+    type Error: fmt::Debug + Send + Into<BarrierFailure>;
+    /// Asks `peer` with the bootstrap probe vote, about the transport's own
+    /// data group.
     fn probe(&self, peer: u64) -> impl Future<Output = Option<PeerGroupLog>> + Send;
-    /// Asks `leader` for a fresh quorum barrier.
+    /// Asks `peer` with this node's genesis probe: what it holds of the
+    /// meta group, or the values it claims when they differ.
+    fn genesis_probe(
+        &self,
+        peer: u64,
+        probe: &GenesisProbe,
+    ) -> impl Future<Output = Option<PeerGroupLog>> + Send;
+    /// Asks `leader` for a fresh quorum barrier of `target`, answered with
+    /// the memberships of the leader view it confirmed.
     fn barrier(
         &self,
         leader: u64,
-    ) -> impl Future<Output = Result<(UrsulaVote, u64), Self::Error>> + Send;
+        target: RaftTarget,
+    ) -> impl Future<Output = Result<BarrierAnswer, Self::Error>> + Send;
+    /// Forwards `command` to the meta leader `leader`, as this node: a
+    /// `RegisterNode` naming another node is refused for good, before
+    /// anything is proposed.
+    fn forward_control(
+        &self,
+        leader: u64,
+        command: ControlCommand,
+    ) -> impl Future<Output = Result<ControlResponse, MetaForwardError>> + Send;
 }
 
 #[derive(Debug, Clone)]
@@ -221,13 +250,11 @@ impl RecoveryGate {
         transport: T,
         config: RecoveryConfig,
     ) where
-        SM: openraft::storage::RaftStateMachine<
-                crate::UrsulaRaftTypeConfig,
-                SnapshotData = crate::types::SnapshotData,
-            >,
+        SM: ReplicaStateMachine,
         T: RecoveryTransport,
     {
         rejoin.set_stall_after(config.stall_after);
+        let target = SM::target(rejoin.raft_group_id);
         self.push(crate::rt::spawn(run_rejoin_vote_barrier(
             owner,
             rejoin.clone(),
@@ -235,7 +262,7 @@ impl RecoveryGate {
             candidates.clone(),
             move |leader| {
                 let transport = transport.clone();
-                async move { transport.barrier(leader).await }
+                async move { transport.barrier(leader, target).await }
             },
             config.barrier_timeout,
             config.interval,

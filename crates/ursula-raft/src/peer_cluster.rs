@@ -353,13 +353,13 @@ impl PeerCluster {
     }
 
     /// Admits an inbound request from `remote`, at `now`, whose metadata
-    /// names this node's cluster.
+    /// names this node's cluster, and returns the node id it names.
     pub(crate) fn admit(
         &self,
         metadata: &MetadataMap,
         remote: Option<SocketAddr>,
         now: Instant,
-    ) -> Result<(), PeerClusterError> {
+    ) -> Result<AdmittedPeer, PeerClusterError> {
         let bound = self.0.bound.load();
         let Some(local) = bound.as_deref().map(|bound| &bound.identity) else {
             return Err(PeerClusterError::NoLocalCluster);
@@ -385,7 +385,7 @@ impl PeerCluster {
             .ok_or_else(|| malformed(NODE_ID_METADATA))?;
         // The common case compares bytes; only a mismatch is parsed.
         if cluster_value.as_bytes() == local.0.cluster_value.as_bytes() {
-            return Ok(());
+            return Ok(AdmittedPeer(peer_node_id));
         }
         let cluster_id = cluster_value
             .to_str()
@@ -393,7 +393,7 @@ impl PeerCluster {
             .and_then(|text| ClusterId::new(text).ok())
             .ok_or_else(|| malformed(CLUSTER_ID_METADATA))?;
         if cluster_id == local.0.cluster_id {
-            return Ok(());
+            return Ok(AdmittedPeer(peer_node_id));
         }
         self.0.refusals.fetch_add(1, Ordering::Relaxed);
         if self.record(
@@ -655,15 +655,27 @@ pub(crate) fn test_peer_cluster_with(node_id: u64, peers: PeerDirectory) -> Peer
     peer_cluster
 }
 
+/// The node id an admitted request names in its [`NODE_ID_METADATA`], which
+/// [`ClusterCheck`] puts in the request's extensions: the node a forwarded
+/// meta write comes from. A handler reads the sender only here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AdmittedPeer(pub(crate) u64);
+
 /// The server interceptor: admits a request only from a peer of this node's
-/// cluster ([`PeerCluster::admit`]).
+/// cluster ([`PeerCluster::admit`]), and puts the node id it names in its
+/// extensions ([`AdmittedPeer`]).
 #[derive(Debug, Clone)]
 pub struct ClusterCheck(PeerCluster);
 
 impl Interceptor for ClusterCheck {
-    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        self.0
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        let admitted = self
+            .0
             .admit(request.metadata(), request.remote_addr(), Instant::now())?;
+        request.extensions_mut().insert(admitted);
         Ok(request)
     }
 }

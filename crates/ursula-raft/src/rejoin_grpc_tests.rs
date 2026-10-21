@@ -1749,7 +1749,7 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
             async move {
                 let response = peer.screen_vote(&crate::bootstrap_probe_vote()).unwrap();
                 let state = crate::PeerGroupLog::from_vote_response(&response);
-                observations.send(state).unwrap();
+                observations.send(state.clone()).unwrap();
                 Some(state)
             }
         },

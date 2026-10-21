@@ -2,8 +2,9 @@
 //! [`crate::RaftCommand::Meta`], the state its state machine holds and
 //! snapshots, and the answers it gives.
 //!
-//! Every type of this module itself, and of [`genesis`] and [`snapshot`],
-//! is format (format epoch 6): persisted in the meta log and its snapshot
+//! Every type of this module itself but [`MetaForwardError`], which stays
+//! in the forwarding process, and of [`genesis`] and [`snapshot`], is
+//! format (format epoch 6): persisted in the meta log and its snapshot
 //! record, replicated, or sent between nodes, so its field order and
 //! variant names are the encoding (`ursula_stream::msgpack`). No type here
 //! uses `default`, `skip_serializing_if`, `flatten` or an untagged enum. The
@@ -18,9 +19,10 @@
 //! MessagePack closure: an unknown variant decoding as "other" would hide a
 //! format mismatch.
 //!
-//! No server runs the meta group yet: the meta runtime that opens the
-//! replica at start-up, routes the meta plane's RPCs to it and forms the
-//! group lands later.
+//! The Raft gRPC service routes the meta plane's RPCs to the replica the
+//! registry publishes ([`replica::ActiveMeta`]). No server opens one yet:
+//! the meta runtime that opens the replica at start-up and forms the group
+//! lands later.
 //!
 //! Module map:
 //!
@@ -55,13 +57,21 @@ pub use state_machine::MetaStateMachine;
 
 #[cfg(test)]
 #[cfg(not(madsim))]
+mod grpc_tests;
+#[cfg(test)]
+#[cfg(not(madsim))]
 mod tests;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
 use ursula_control::HistoryCause;
+use ursula_runtime::ErrorStatus;
+use ursula_runtime::GroupEngineError;
+use ursula_runtime::WriteEffect;
 use ursula_stream::HistoryEvent;
 use ursula_stream::HistoryLeader;
+
+use crate::ForwardError;
 
 /// A command of the meta group's log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +109,60 @@ impl std::fmt::Display for MetaCommand {
             }
             Self::Control(command) => write!(f, "meta_control:{command:?}"),
         }
+    }
+}
+
+/// Why a control command forwarded to the meta leader got no answer of the
+/// meta group's. Never encoded: the forwarding node builds it from its
+/// transport's answer, over gRPC or in process alike.
+#[derive(Debug, thiserror::Error)]
+pub enum MetaForwardError {
+    /// The meta leader's refusal of the command, or of the whole write.
+    #[error("the meta leader refused the forwarded control command")]
+    Leader(#[source] GroupEngineError),
+    /// The forward got no answer of the meta group: the leader was not
+    /// reached, or refused the request itself.
+    #[error("the forwarded control command got no answer from the meta leader")]
+    Transport(#[source] ForwardError),
+}
+
+impl MetaForwardError {
+    /// What the forwarded command did.
+    pub fn write_effect(&self) -> WriteEffect {
+        match self {
+            Self::Leader(error) => error.write_effect(),
+            Self::Transport(error) => error.write_effect(),
+        }
+    }
+
+    /// Whether forwarding the command again may succeed.
+    pub fn status(&self) -> ErrorStatus {
+        match self {
+            Self::Leader(error) => error.status(),
+            Self::Transport(error) => error.status(),
+        }
+    }
+
+    /// The answer when the meta leader cannot be reached, so nothing was
+    /// sent: a leader this node does not know, nothing proposed.
+    pub fn leader_unreachable() -> Self {
+        Self::Leader(crate::forward::unknown_leader(
+            ursula_runtime::LeadershipReason::LeaderUnreachable,
+            ursula_runtime::Proposal::NotProposed,
+        ))
+    }
+
+    /// The refusal `status` of the meta leader `leader` answered in this
+    /// process, classified as the same refusal over gRPC is: the in-process
+    /// seam's answer to a write the leader refused itself, such as a
+    /// `RegisterNode` naming another node than the sender.
+    #[cfg(any(test, madsim))]
+    pub(crate) fn refused_in_process(leader: u64, status: tonic::Status) -> Self {
+        Self::Transport(ForwardError::Refused {
+            rpc: ursula_runtime::ForwardedRpc::GroupWrite,
+            address: format!("in-process node {leader}"),
+            source: status,
+        })
     }
 }
 

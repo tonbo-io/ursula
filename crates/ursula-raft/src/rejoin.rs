@@ -2760,10 +2760,10 @@ mod tests {
 
     #[test]
     fn bootstrap_initializes_only_when_every_voter_is_empty() {
-        let empty = Some(PeerGroupLog::Empty);
-        let initialized = Some(PeerGroupLog::Initialized);
+        let empty = || Some(PeerGroupLog::Empty);
+        let initialized = || Some(PeerGroupLog::Initialized);
         assert_eq!(
-            bootstrap_decision(&[empty, empty]),
+            bootstrap_decision(&[empty(), empty()]),
             BootstrapDecision::Initialize
         );
         assert_eq!(
@@ -2772,18 +2772,30 @@ mod tests {
         );
         // An empty voter must finish its durable floor before initialization.
         assert_eq!(
-            bootstrap_decision(&[empty, Some(PeerGroupLog::Unprepared)]),
+            bootstrap_decision(&[empty(), Some(PeerGroupLog::Unprepared)]),
             BootstrapDecision::Wait
         );
         // A silent voter might hold the group: wait for it.
-        assert_eq!(bootstrap_decision(&[empty, None]), BootstrapDecision::Wait);
+        assert_eq!(
+            bootstrap_decision(&[empty(), None]),
+            BootstrapDecision::Wait
+        );
+        // A node that claims other genesis values is no answer: wait until
+        // every node claims the same.
+        let mismatch = Some(PeerGroupLog::GenesisMismatch {
+            claim: ursula_control::samples::sample_genesis_claim(),
+        });
+        assert_eq!(
+            bootstrap_decision(&[empty(), mismatch]),
+            BootstrapDecision::Wait
+        );
         // One voter with entries or a leader is enough to rejoin.
         assert_eq!(
-            bootstrap_decision(&[None, initialized]),
+            bootstrap_decision(&[None, initialized()]),
             BootstrapDecision::Rejoin
         );
         assert_eq!(
-            bootstrap_decision(&[empty, initialized]),
+            bootstrap_decision(&[empty(), initialized()]),
             BootstrapDecision::Rejoin
         );
     }

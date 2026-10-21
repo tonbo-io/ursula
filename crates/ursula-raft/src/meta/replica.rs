@@ -43,6 +43,7 @@ use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
@@ -50,6 +51,8 @@ use ursula_runtime::HistoryPublisher;
 use ursula_runtime::SnapshotPointer;
 
 use super::MetaCommand;
+use super::genesis::GenesisAnswer;
+use super::genesis::GenesisProbe;
 use super::snapshot::MetaSnapshotError;
 use super::snapshot::MetaSnapshotPointer;
 use super::state_machine::META_GROUP;
@@ -89,6 +92,9 @@ pub struct MetaReplicaConfig {
     /// The node's Raft engine settings, which the meta Raft's config takes
     /// as the data groups' do.
     pub engine: RaftEngineConfig,
+    /// The values this node would start the meta group with, which it
+    /// answers a genesis probe with when the prober claims others.
+    pub claim: GenesisClaim,
 }
 
 /// The tasks a meta replica runs and owns besides its history driver, which
@@ -187,6 +193,7 @@ pub struct ActiveMeta {
     /// token until it ends; closed once the replica begins to stop.
     installs: Arc<WorkAdmission>,
     election: ElectionPolicy,
+    claim: GenesisClaim,
 }
 
 impl ActiveMeta {
@@ -263,6 +270,20 @@ impl ActiveMeta {
             .map_err(SnapshotInstallError::Group)
     }
 
+    /// The answer to a peer's genesis probe: this node's own claim when the
+    /// prober claims other values, else this replica's answer to the probe
+    /// vote, through the recovery gate's vote screen as a data group's
+    /// bootstrap probe vote is answered.
+    pub(crate) async fn answer_genesis_probe(
+        &self,
+        probe: GenesisProbe,
+    ) -> Result<GenesisAnswer, GroupEngineError> {
+        if probe.claim != self.claim {
+            return Ok(GenesisAnswer::Mismatch(self.claim.clone()));
+        }
+        Ok(GenesisAnswer::Vote(self.vote(probe.vote).await?))
+    }
+
     /// A leadership transfer this node received, once the election policy
     /// accepts it against this replica's own gate.
     pub async fn handle_transfer_leader(
@@ -286,14 +307,20 @@ impl ActiveMeta {
 
     /// Writes `commands` to the meta group from `origin`, as one batch. A
     /// `RegisterNode` that names another node than `origin`'s refuses the
-    /// batch before anything is proposed.
+    /// batch before anything is proposed. Only control commands are
+    /// proposed: a stream command is refused as of the other plane
+    /// (`OtherPlane`) and a history event as one only the history driver
+    /// proposes (`NewHistory`), both before anything is proposed.
     pub async fn write(
         &self,
-        commands: Vec<ControlCommand>,
+        commands: Vec<RaftCommand>,
         origin: WriteOrigin,
     ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, MetaWriteError> {
         for command in &commands {
-            if let ControlCommand::RegisterNode { node, .. } = command
+            if let RaftCommand::Meta(MetaCommand::Control(ControlCommand::RegisterNode {
+                node,
+                ..
+            })) = command
                 && *node != origin.node()
             {
                 return Err(MetaWriteError::OtherNode {
@@ -303,10 +330,6 @@ impl ActiveMeta {
             }
         }
         self.core.apply_health.check(META_GROUP)?;
-        let commands = commands
-            .into_iter()
-            .map(|command| RaftCommand::Meta(MetaCommand::Control(command)))
-            .collect();
         let history = Arc::clone(&self.core.history);
         let answers = self
             .core
@@ -317,6 +340,31 @@ impl ActiveMeta {
             .await
             .map_err(crate::owner::owner_stopped)??;
         Ok(answers)
+    }
+
+    /// A write another node forwarded, which `admitted` names, answered as
+    /// both transports send it back (design 3.7): each command's answer,
+    /// the meta group's refusal of the whole batch as each command's
+    /// answer, and the guard's refusal of a `RegisterNode` naming another
+    /// node as an `INVALID_ARGUMENT` refusal of the request, before anything
+    /// is proposed, which the sender reads as permanent
+    /// ([`crate::ForwardError::status`]).
+    pub(crate) async fn write_forwarded(
+        &self,
+        commands: Vec<RaftCommand>,
+        admitted: NodeId,
+    ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, tonic::Status> {
+        let count = commands.len();
+        match self
+            .write(commands, WriteOrigin::Forwarded { admitted })
+            .await
+        {
+            Ok(answers) => Ok(answers),
+            Err(MetaWriteError::Engine(refusal)) => Ok(vec![Err(refusal); count]),
+            Err(refusal @ MetaWriteError::OtherNode { .. }) => {
+                Err(crate::grpc::GrpcRpcError::invalid_argument(refusal.to_string()).into())
+            }
+        }
     }
 
     /// Lets the node's election policy decide again whether this replica
@@ -419,6 +467,7 @@ impl MetaReplica {
                 core,
                 installs,
                 election,
+                claim: config.claim.clone(),
             }),
             raft: raft.clone(),
             tasks: RecoveryGate::default(),

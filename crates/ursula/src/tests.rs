@@ -6656,7 +6656,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
             gate.clone(),
             registry.election_policy(),
             BTreeSet::new(),
-            |_leader| async { Err::<(ursula_raft::UrsulaVote, u64), _>("no leader".to_owned()) },
+            |_leader| async { Err::<ursula_raft::BarrierAnswer, _>("no leader".to_owned()) },
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(10),
             std::time::Duration::from_millis(50),
