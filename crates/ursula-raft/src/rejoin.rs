@@ -45,10 +45,11 @@
 //!   and the conflict still counts as its acknowledgement of the leader, so
 //!   the leader keeps its quorum. That is safe because the leader holds
 //!   every committed entry and the follower votes for no one until its gate
-//!   opens. The heal driver (`run_rejoin_heal`) observes each reversion
-//!   in the replication metrics, counts it per follower and logs it, and
-//!   brings the membership back to the configured voters when an operator
-//!   or a recovery plan left one out.
+//!   opens. Every leader-side membership driver runs on one leader tick
+//!   (`leader_tick`), which observes each reversion in the replication
+//!   metrics, counts it per follower and logs it. The heal driver
+//!   (`run_rejoin_heal`) brings the membership back to the configured
+//!   voters when an operator or a recovery plan left one out.
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
 //!   configured voter answers a probe `Vote` with an empty log and no
@@ -3360,6 +3361,7 @@ mod attach;
 mod barrier;
 mod bootstrap;
 mod heal;
+mod leader_tick;
 pub use attach::RecoveryConfig;
 pub use attach::RecoveryGate;
 pub use attach::RecoveryTransport;
@@ -3372,15 +3374,15 @@ pub use bootstrap::PeerGroupLog;
 use bootstrap::bootstrap_decision;
 pub use bootstrap::bootstrap_probe_vote;
 pub use bootstrap::run_group_bootstrap;
-pub(crate) use heal::FollowerLogReversions;
 #[cfg(test)]
 use heal::HealStep;
 #[cfg(test)]
 use heal::HealView;
 #[cfg(test)]
-use heal::LogReversion;
-#[cfg(test)]
-use heal::ReversionWatch;
-#[cfg(test)]
 use heal::plan_heal_step;
 pub(crate) use heal::run_rejoin_heal;
+pub(crate) use leader_tick::FollowerLogReversions;
+#[cfg(test)]
+use leader_tick::LogReversion;
+#[cfg(test)]
+use leader_tick::ReversionWatch;
