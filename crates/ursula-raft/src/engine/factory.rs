@@ -410,14 +410,16 @@ impl GroupEngineFactory for PlacedRaftGroupEngineFactory {
             let node_id = identity.node_id();
             let peers = self.registry.peer_cluster().directory();
             // A group the node does not host, or whose voters it cannot
-            // dial, never opens.
+            // dial, never opens, and a replica is created only with
+            // voters. A held replica opens without placed voters: it then
+            // asks only the members of its own membership.
             let admission = self
                 .inputs
                 .admission(group)
                 .ok_or_else(|| invalid_configuration(placement))?;
             let voters = self.inputs.nodes(group).voters();
             if !peers.contains(node_id)
-                || voters.is_empty()
+                || (admission == Admission::Create && voters.is_empty())
                 || !voters.iter().all(|voter| peers.contains(*voter))
             {
                 return Err(invalid_configuration(placement));

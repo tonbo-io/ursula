@@ -101,6 +101,7 @@ pub use placement::plan_membership_step;
 pub use placement::samples;
 pub use placement::seed_role;
 pub use placement::seed_voters;
+pub use placement::shown_seed_role;
 pub use ursula_proto::placement::EmptyNodeSet;
 pub use ursula_proto::placement::GenesisClaim;
 pub use ursula_proto::placement::GroupCount;
