@@ -88,6 +88,29 @@ jobs:
             echo "::endgroup::"
           done
 
+  madsim-check:
+    name: Madsim check
+    # Fork PRs run on GitHub-hosted runners: RunsOn runners run inside our AWS account.
+    runs-on: ${{ github.event.pull_request.head.repo.fork && 'ubuntu-24.04' || format('runs-on={0}/cpu=8/ram=32/family=m7a+m8a/image=ubuntu24-full-x64/extras=s3-cache', github.run_id) }}
+    steps:
+      # Sends actions/cache to the RunsOn S3 cache. A no-op on GitHub-hosted runners.
+      - name: Use the RunsOn cache
+        uses: runs-on/action@17b59092eb37ebfdbb034460892887c09100eaa3 # v2.5.0
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ""
+
+      # Code behind cfg(madsim) builds nowhere else on a pull request. The
+      # simulation itself runs in dst-nightly.yml. A target directory of its
+      # own keeps the madsim build apart from the regular one.
+      - name: Check ursula-raft and ursula-sim under cfg(madsim)
+        run: RUSTFLAGS="--cfg madsim" CARGO_TARGET_DIR=target/madsim cargo check --locked -p ursula-raft -p ursula-sim --all-targets
+
   rust-test:
     name: Rust tests (${{ matrix.arch }})
     runs-on: ${{ github.event.pull_request.head.repo.fork && matrix.hosted || format(matrix.runs-on, github.run_id) }}
