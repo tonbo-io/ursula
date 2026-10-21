@@ -925,8 +925,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 client_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             }],
         )
         .unwrap();
@@ -1035,8 +1033,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 client_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             }],
         )
         .unwrap();
@@ -1148,8 +1144,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 client_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             }],
         )
         .unwrap();
@@ -1223,8 +1217,6 @@ mod tests {
             http_url: None,
             metrics_url: None,
             client_url: None,
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         };
         let metrics = MetricsClient::new(std::time::Duration::from_secs(1)).unwrap();
         let client = BackupClient::new(metrics, vec![node.clone(), node]).unwrap();

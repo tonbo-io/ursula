@@ -31,7 +31,6 @@ The naive procedure of "restart followers, then leader" does **not** wait for `a
 | `drain --node N` | Mark the node draining and transfer away every leadership it holds. The mark persists (the node attracts no leaderships) until `undrain`. `--dry-run` prints the transfer plan |
 | `undrain --node N` | Clear the drain mark so the node may hold leaderships again |
 | `wait --node N` | Block until the node is a voter in every group and within `--lag-tolerance` of peers. Progress-gated: a node that keeps advancing is never timed out |
-| `pin-incarnations` | Save required process identities in a manifest for subsequent commands |
 | `status` | Per-node group counts and leadership distribution |
 | `wait-ready` | Wait for complete maintenance evidence and local serving health on every node |
 | `verify-cluster` | Require every configured voter to be present and caught up in two consecutive samples before the next rollout step |
@@ -46,34 +45,7 @@ Mutating verbs exit `0` on success and `2` on an abort (drain timeout, no safe t
 
 ## Process identity across commands
 
-Each CLI invocation pins the first observed server instance. A process change makes subsequent observations fail, and mutations retain the original `x-ursula-process-incarnation` header. To preserve the same plan across invocations:
-
-```bash
-ursulactl pin-incarnations --config cluster.json > pinned-cluster.json
-ursulactl drain --config pinned-cluster.json --node 3
-```
-
-The saved nodes carry `expected_process_incarnation`. After an admitted Pod replacement, `pin-incarnations --replace-node 3` can bind that one replacement. Every survivor must still match its saved identity. Resuming the same replacement validates its saved process instead of refreshing it after a container restart. It stops on a missing saved plan, changed survivor, or another unadmitted replacement.
-
-`pin-incarnations` requires a process incarnation from every node, including an explicitly selected replacement. Nodes that do not report one are refused. `verify-quorum` records the identity of every observed process, and reservation steps compare that map with the saved plan. Instance identity does not serialize concurrent executors or prove a failed host is physically fenced.
-
-## Maintenance executor admission
-
-A reviewed cell reservation consumer can add one immutable `maintenance_fence` object at the manifest root: `reservation_id` and `executor_id` are 32 lowercase hexadecimal characters, and `generation` is a nonzero cell-wide monotonically increasing integer. Every saved node carries that same token as `expected_maintenance_fence`; inconsistent or partially populated plans are rejected. The lifecycle commands require saved process identities for every configured voter:
-
-```bash
-ursulactl activate-maintenance-fence --config admitted-cluster.json
-ursulactl drain --config admitted-cluster.json --node 3
-# After replacement and reconciliation of its physical lifecycle:
-ursulactl retire-maintenance-fence --config admitted-cluster.json
-ursulactl verify-quorum --config admitted-cluster.json --expected-groups 256
-```
-
-These commands install or retire the supplied token; they do not acquire a shared reservation, choose generations, authorize Pod deletion, or establish provider-host fencing. A multi-node command may stop after partial acknowledgement. Keep the external operation reserved, resume its same identities, and require all relevant acknowledgements before advancing. Expiry is not authority to select another voter. A new executor uses the higher generation admitted by the external CAS operation; CLI never adopts a token discovered in metrics or refreshes it after 412/428.
-
-Activation waits for admitted mutation handlers and then confirms prior messages were processed by each captured local Raft API queue. Caller cancellation leaves its admitted handler running; abnormal handler termination latches that process closed. Failed or cancelled activation/retirement stays closed until the same pending lifecycle completes or an externally admitted higher generation activates. Retirement retains its generation and cannot be reopened by the same token. This confirms submission ordering, not completion of asynchronous replication, snapshot work, or physical operations. Fresh all-replica prefix certification and external lifecycle reconciliation remain required before releasing the reservation.
-
-New processes start `unclaimed`, explicitly uncertified until admission. An explicit `pin-incarnations --replace-node` can bind only that selected unclaimed replacement while preserving the token. Other voters must still match the active saved authority. Once activated, all mutating admin requests require `x-ursula-maintenance-fence` as `reservation_id:generation:executor_id` in addition to the process-incarnation header. Metrics report `maintenance_fence` and `maintenance_fence_uncertain`. `verify-quorum` schema 3 records `maintenance_executor_certified` only when every observed process matches the same caller-supplied active token. A subsequent proof can inspect the same retired token and reports `maintenance_executor_retired_certified` only when all observed processes have retired it. A mix of active and retired nodes certifies neither state. These flags certify process-local admission or retirement, not the external reservation or physical fencing. Existing chart and Cloud consumers are uncertified until their shared reservation integration is complete.
+Each invocation remembers the first server instance it observes on each node. A later observation of another instance on that node fails, and every mutation carries the remembered `x-ursula-process-incarnation`, so the server refuses it with `412` once the node restarted. A command therefore stops when a node restarts under it. Run each step of a plan as its own invocation, with `ursulactl wait` between steps. `verify-quorum` records the incarnation of every process it observed.
 
 ## The admin plane
 
@@ -140,7 +112,7 @@ Per-node fields, all optional except `id`:
 
 - `admin_port` (default `4438`) or an explicit `admin_url`: the admin plane to reach, directly or through your forward.
 - `host`: address shown in reports. Falls back to the admin URL's host.
-- `http_url`: the node's Raft URL (its `[[raft.peers]].url`). It is the default `host` and part of a pinned plan. Nodes take each other's addresses from `[[raft.peers]]`, never from it.
+- `http_url`: the node's Raft URL (its `[[raft.peers]].url`). It is the default `host`. Nodes take each other's addresses from `[[raft.peers]]`, never from it.
 - `client_url`: the node's client-plane URL (its `server.listen`), used for metrics and readiness when no `metrics_url` is set. The chart's manifest sets it.
 - `metrics_url`: optional metrics and readiness endpoint, for example the same tunnel as `admin_url`. It overrides that access without changing `http_url`.
 
@@ -170,13 +142,13 @@ node 3 (10.0.0.3): groups=4 leaders={1: 2, 2: 2}
 
 ## `wait-ready`
 
-Wait until every node reports `--expected-groups` initialized Raft groups with leaders, a complete uniform voter set in `raft_maintenance`, and no uncertain maintenance fence. Each node must also return 200 from `/__ursula/ready`, read from the same address as its metrics.
+Wait until every node reports `--expected-groups` initialized Raft groups with leaders, and a complete uniform voter set in `raft_maintenance`. Each node must also return 200 from `/__ursula/ready`, read from the same address as its metrics.
 
 ```bash
 ursulactl wait-ready --config cluster.json --expected-groups 4
 ```
 
-Exits non-zero with the maintenance report or serving refusal when the timeout passes. Connection failures are retried until the timeout, so the wait can start while a node restarts. Every poll observes the processes afresh. Only a node whose process differs from its pinned `expected_process_incarnation`, or an invalid response, stops the wait early with its original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
+Exits non-zero with the maintenance report or serving refusal when the timeout passes. Connection failures are retried until the timeout, so the wait can start while a node restarts. Every poll observes the processes afresh, so a node may restart during the wait. Only an invalid response stops the wait early with its original cause. Healthy survivors can serve while a replica rebuilds, but `wait-ready` still rejects a second maintenance operation until full redundancy returns.
 
 ## Underlying HTTP surface
 
@@ -228,7 +200,7 @@ The prefix is confirmed through the incarnation-bound admin route
 and has no dependency on `ursula-raft`. Quorum proof and self-election requests
 require process identity; servers without the admin protocol are unsupported.
 
-A successful observation is not a maintenance reservation, a continuously refreshed health claim or physical fencing permission. Independent maintenance workflows still need to serialize disruptions and bind replacement to the actual Pod/process/host incarnation.
+A successful observation holds for the moment it was taken. It is not a continuously refreshed health claim. Disrupt one voter at a time and observe again before the next disruption.
 
 ## `verify-survivors`
 
@@ -240,21 +212,5 @@ ursulactl verify-survivors --config cluster.json --excluded-node-id 3 --expected
 
 Every group must still have the complete uniform three-voter membership, no learners and open participation gates on both observed replicas. Both survivors must agree on a reachable leader and apply each newly confirmed fixed prefix. The command rejects a second missing replica, an unknown exclusion or a changed topology. It never shrinks the configured membership to fit observations.
 
-The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Hard fencing and an exclusive maintenance reservation remain prerequisites for physical replacement, and the complete `verify-quorum` check is required before any subsequent disruption.
+The output is scoped as `surviving_quorum`, records the configured and observed voter sets, and always reports `full_redundancy_restored=false`. Excluding a voter from observation does not prove its old process or host is stopped. Run the complete `verify-quorum` check before any subsequent disruption.
 
-### Shared reservation proposals
-
-Reservation stores have one schema, version 1, for Pod replacement, host recovery and candidate restaging. Host inventory is optional data, and publishing it keeps the version. `ursulactl` refuses a store with any other version.
-
-`reservation-propose --cell cell.json --snapshot before.json --request request.json`
-produces a whole-ConfigMap CAS proposal without contacting Kubernetes.
-`reservation-acknowledge` takes the same inputs plus `--response response.json` and
-validates the exact successful update receipt. Conflicts stop without refreshing
-authority, and missing stores do not initialize themselves.
-
-The policy covers sticky, one-source planned Pod replacement, current-token fresh
-prefix admission and all-retired completion after the original Pod UID is gone.
-Its inputs are operational evidence, not authentication. No component drives
-planned Pod replacement or host recovery through it, none calls a provider to
-terminate an instance, and this offline interface alone grants no disruption authority. The full protocol is
-documented in `docs/architecture/cluster-membership.md`.

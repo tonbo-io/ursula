@@ -1,5 +1,5 @@
-//! Request surface removed in 0.6.0 that must fail loudly instead of being
-//! ignored.
+//! Request surface removed in an earlier release that must fail loudly
+//! instead of being ignored.
 //!
 //! - `Stream-Snapshot-Match` answers 400. Ignoring it would turn a
 //!   conditional snapshot publish into an unconditional one.
@@ -32,6 +32,11 @@
 //!   could key as immutable into an ordinary read of the tail. The answer
 //!   names the path form, `{stream}/incarnation/{token}/chunk/{offset}` and
 //!   `{stream}/incarnation/{token}/snapshot/{offset}`.
+//! - The `x-ursula-maintenance-fence` header (removed in 0.10.0) answers 400
+//!   on every admin mutation. The admin plane admitted a mutation that
+//!   carried it only under the matching fence. Ignoring it would run the
+//!   mutation unfenced while the tooling that sent it believes it holds the
+//!   fence.
 //!
 //! The removed names live only in this file, which the release's "nothing
 //! left" check allowlists.
@@ -50,6 +55,9 @@ const HEADER_STREAM_SNAPSHOT_MATCH: &str = "stream-snapshot-match";
 
 /// The removed compare-and-append precondition on JSON appends.
 const HEADER_STREAM_RECORD_MATCH: &str = "stream-record-match";
+
+/// The removed admin executor fence.
+const HEADER_MAINTENANCE_FENCE: &str = "x-ursula-maintenance-fence";
 
 /// The removed record-coordinate read parameters.
 const RECORD_READ_PARAMETERS: [&str; 4] = ["record", "tail_records", "max_records", "record_view"];
@@ -123,6 +131,19 @@ pub(crate) fn reject_removed_snapshot_headers(headers: &HeaderMap) -> Result<(),
             StatusCode::BAD_REQUEST,
             ErrorCode::Unsupported,
             "Stream-Snapshot-Match is not supported",
+        )));
+    }
+    Ok(())
+}
+
+/// Rejects an admin mutation that carries the removed maintenance fence.
+pub(crate) fn reject_removed_admin_headers(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    if headers.contains_key(HEADER_MAINTENANCE_FENCE) {
+        return Err(Box::new(error_response(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::Unsupported,
+            "x-ursula-maintenance-fence is not supported; the maintenance fence was removed in \
+             0.10.0",
         )));
     }
     Ok(())
@@ -326,6 +347,37 @@ mod tests {
 
         let response = send(&app, "PUT", "/removed/$transaction", &json, "").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// An admin mutation that carries the removed fence header runs
+    /// nothing: it would otherwise run unfenced while its sender believes
+    /// it holds the fence.
+    #[tokio::test]
+    async fn the_maintenance_fence_header_answers_400_and_mutates_nothing() {
+        let registry = ursula_raft::RaftGroupHandleRegistry::default();
+        let state = crate::HttpState::with_raft_registry(
+            ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"),
+            registry.clone(),
+        );
+        let incarnation = state.process_incarnation.as_str().to_owned();
+        let admin = crate::admin_router(state);
+        let path = "/__ursula/leadership-shed/maintenance";
+        let incarnation_header = (
+            ursula_proto::admin::PROCESS_INCARNATION_HEADER,
+            incarnation.as_str(),
+        );
+        let fenced = [incarnation_header, (HEADER_MAINTENANCE_FENCE, "fence")];
+        let response = send(&admin, "POST", path, &fenced, "").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = crate::render::error_body_of(response).await;
+        assert_eq!(body.code, ErrorCode::Unsupported);
+        assert!(body.message.contains("maintenance fence was removed"));
+        assert!(!registry.leadership_shed_state().is_shed());
+
+        // Without it, the same mutation runs.
+        let response = send(&admin, "POST", path, &[incarnation_header], "").await;
+        assert!(response.status().is_success(), "{}", response.status());
+        assert!(registry.leadership_shed_state().is_shed());
     }
 
     #[tokio::test]

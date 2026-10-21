@@ -98,8 +98,6 @@ pub enum ReadinessRefusal {
         node_id: u64,
         report: Option<ursula_proto::admin::RaftMaintenanceReport>,
     },
-    #[error("node {node_id} has uncertain maintenance authority")]
-    FenceUncertain { node_id: u64 },
     #[error("node {node_id} is not serving (HTTP {status}): {reason:?}")]
     Serving {
         node_id: u64,
@@ -123,11 +121,6 @@ pub fn check_maintenance_snapshot(
     expected_groups: usize,
 ) -> std::result::Result<(), ReadinessRefusal> {
     for view in &snapshot.per_node {
-        if view.maintenance_fence_uncertain {
-            return Err(ReadinessRefusal::FenceUncertain {
-                node_id: view.node.id,
-            });
-        }
         if !view
             .raft_maintenance
             .as_ref()
@@ -151,12 +144,11 @@ pub fn check_maintenance_snapshot(
 }
 
 /// Wait for complete metrics evidence and the local serving probe. Transport
-/// failures are retried until the deadline. Decoding failures and a process
-/// that differs from the manifest's pinned identity are terminal. Every error
-/// retains its original source.
+/// failures are retried until the deadline. Decoding failures are terminal.
+/// Every error retains its original source.
 ///
-/// Each poll observes the processes afresh with `client`'s HTTP settings. A
-/// node without a pinned identity may therefore restart during the wait.
+/// Each poll observes the processes afresh with `client`'s HTTP settings, so
+/// a node may restart during the wait.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
@@ -302,7 +294,7 @@ mod tests {
     async fn wait_ready_uses_existing_probes_and_preserves_refusal_causes() {
         use axum::response::IntoResponse;
         use ursula_proto::admin::ServingReadinessReason;
-        for mode in 0..9 {
+        for mode in [0, 2, 3, 4, 5, 6, 7, 8] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let mut metrics = crate::metrics::test_metrics(
@@ -314,9 +306,6 @@ mod tests {
             metrics.groups.push(replica);
             metrics.raft_maintenance =
                 Some(crate::metrics::test_maintenance_report(1, &metrics.groups));
-            if mode == 1 {
-                metrics.maintenance_fence_uncertain = true;
-            }
             if mode == 2 {
                 metrics
                     .raft_maintenance
@@ -409,10 +398,6 @@ mod tests {
             } else {
                 let error = result.unwrap_err();
                 match mode {
-                    1 => assert!(matches!(
-                        error.downcast_ref::<ReadinessRefusal>(),
-                        Some(ReadinessRefusal::FenceUncertain { node_id: 1 })
-                    )),
                     2 => assert!(matches!(
                         error.downcast_ref::<ReadinessRefusal>(),
                         Some(ReadinessRefusal::Maintenance { node_id: 1, .. })
@@ -449,7 +434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_ready_follows_an_unpinned_restart_but_not_a_pinned_one() {
+    async fn wait_ready_follows_a_restart() {
         use std::sync::Arc;
         use std::sync::atomic::AtomicU64;
         use std::sync::atomic::Ordering;
@@ -530,29 +515,11 @@ mod tests {
             ProcessIncarnation::from_bits(2)
         );
 
-        // A plan pinned to the first process must not accept its replacement.
-        polls.store(0, Ordering::SeqCst);
-        node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
-        let started = Instant::now();
-        let error = wait_ready(&client, &[node], 1, timeout, Duration::from_millis(1))
-            .await
-            .unwrap_err();
-        assert!(
-            error.downcast_ref::<ReadinessRefusal>().is_none(),
-            "{error:#}"
-        );
-        assert!(
-            error.downcast_ref::<reqwest::Error>().is_none(),
-            "{error:#}"
-        );
-        assert!(started.elapsed() < timeout);
         task.abort();
     }
 
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id,
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),

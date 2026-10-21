@@ -3,7 +3,6 @@
 //!
 //! Module map:
 //!
-//! - [`admin_fence`]: process-local executor ordering for administrative mutations.
 //! - [`admission`]: client-plane ingress admission: a write's size before its
 //!   handler, and its pressure checks, which a write routed before its body
 //!   meets after routing.
@@ -27,7 +26,6 @@
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
 
-mod admin_fence;
 mod admission;
 mod bootstrap;
 mod cold_snapshot;
@@ -64,7 +62,6 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
 pub use admission::IngressAdmission;
-use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
@@ -128,8 +125,6 @@ use ursula_headers::names;
 use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
 use ursula_proto::ContentFaultV1;
-use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
-use ursula_proto::admin::MaintenanceFence;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_raft::IncomingTransferError;
@@ -373,7 +368,6 @@ mod http_state_fields {
     use crate::HttpMetrics;
     use crate::NodeMemoryMonitor;
     use crate::WallClock;
-    use crate::admin_fence;
     use crate::snapshot_parts;
     use crate::staged_parts;
     use crate::wal_disk::WalDiskMonitor;
@@ -382,7 +376,6 @@ mod http_state_fields {
     #[derive(Clone)]
     pub struct HttpStateFields {
         pub(crate) process_incarnation: ProcessIncarnation,
-        pub(crate) admin_fence: admin_fence::AdminMutationFence,
         pub(crate) configured_node_id: Option<u64>,
         pub(crate) runtime: ShardRuntime,
         pub(crate) raft_registry: Option<RaftGroupHandleRegistry>,
@@ -582,14 +575,6 @@ impl HttpState {
         self
     }
 
-    pub(crate) fn with_startup_maintenance_fence(
-        mut self,
-        fence: ursula_proto::admin::MaintenanceFenceState,
-    ) -> Self {
-        self.fields_mut().admin_fence = admin_fence::AdminMutationFence::from_startup(fence);
-        self
-    }
-
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
         self.fields_mut().configured_node_id = Some(node_id);
         self
@@ -599,7 +584,6 @@ impl HttpState {
         let staged_parts = staged_parts::StagedParts::observing(&runtime, None);
         HttpStateFields {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
-            admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             runtime,
             raft_registry: None,
@@ -627,7 +611,6 @@ impl HttpState {
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
         HttpStateFields {
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
-            admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
@@ -679,7 +662,6 @@ impl HttpState {
                 per_group_voters,
             )),
             process_incarnation: ProcessIncarnation::from_bits(rand::random()),
-            admin_fence: admin_fence::AdminMutationFence::default(),
             configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -1289,14 +1271,6 @@ pub fn admin_router(state: HttpState) -> Router {
 fn admin_ops_router(state: HttpState) -> Router {
     let router = Router::new()
         .route(
-            "/__ursula/maintenance/fence/activate",
-            post(activate_admin_fence),
-        )
-        .route(
-            "/__ursula/maintenance/fence/retire",
-            post(retire_admin_fence),
-        )
-        .route(
             "/__ursula/flush-cold/{bucket}/{stream}",
             post(flush_cold_stream),
         )
@@ -1395,82 +1369,14 @@ async fn require_admin_incarnation(
         *request.method(),
         Method::GET | Method::HEAD | Method::OPTIONS
     ) {
+        if let Err(response) = removed_surface::reject_removed_admin_headers(request.headers()) {
+            return *response;
+        }
         if let Some(response) = reject_admin_incarnation(&state, request.headers()) {
             return response;
         }
-        // Lifecycle handlers take the write guard themselves. They remain
-        // process-bound and validate the supplied immutable executor token.
-        if *request.method() == Method::POST
-            && matches!(
-                request.uri().path(),
-                "/__ursula/maintenance/fence/activate" | "/__ursula/maintenance/fence/retire"
-            )
-        {
-            return next.run(request).await;
-        }
-        let fence_header = match request.headers().get(MAINTENANCE_FENCE_HEADER) {
-            Some(header) => match header.to_str() {
-                Ok(value) => Some(value),
-                Err(_) => return admin_fence::FenceRejection::Changed.response(),
-            },
-            None => None,
-        };
-        let guard = match state.admin_fence.admit_mutation(fence_header).await {
-            Ok(guard) => guard,
-            Err(rejection) => return rejection.response(),
-        };
-        // Dropping the caller's response future must not cancel an admitted
-        // actor/Core mutation and release its guard before its reply arrives.
-        return match tokio::spawn(async move {
-            let response = next.run(request).await;
-            guard.complete();
-            response
-        })
-        .await
-        {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::error!(%error, "admitted admin mutation task failed");
-                admin_fence::FenceRejection::Uncertain.response()
-            }
-        };
     }
     next.run(request).await
-}
-
-async fn confirm_admin_command_submission(state: &HttpState) -> Result<(), String> {
-    if let Some(registry) = &state.raft_registry {
-        registry.confirm_admin_command_submission().await?;
-    }
-    Ok(())
-}
-
-async fn activate_admin_fence(
-    State(state): State<HttpState>,
-    Json(fence): Json<MaintenanceFence>,
-) -> Response {
-    match state
-        .admin_fence
-        .activate(fence, confirm_admin_command_submission(&state))
-        .await
-    {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(rejection) => rejection.response(),
-    }
-}
-
-async fn retire_admin_fence(
-    State(state): State<HttpState>,
-    Json(fence): Json<MaintenanceFence>,
-) -> Response {
-    match state
-        .admin_fence
-        .retire(fence, confirm_admin_command_submission(&state))
-        .await
-    {
-        Ok(snapshot) => Json(snapshot).into_response(),
-        Err(rejection) => rejection.response(),
-    }
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
@@ -2177,8 +2083,6 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     axum::Json(render::MetricsResponse {
         node: ursula_proto::admin::NodeMetrics {
             cluster_id: state.cluster_id().clone(),
-            maintenance_fence: state.admin_fence.snapshot().await,
-            maintenance_fence_uncertain: state.admin_fence.is_uncertain(),
             process_incarnation: state.process_incarnation.clone(),
             process_node_id: state
                 .node_id()

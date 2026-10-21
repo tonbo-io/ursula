@@ -192,8 +192,6 @@ impl RollingRestartValidator {
                     process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(
                         u128::from(node_id),
                     ),
-                    maintenance_fence: ursula_proto::admin::MaintenanceFenceState::Unclaimed,
-                    maintenance_fence_uncertain: false,
                     groups: vec![{
                         let fixture_term = metrics.current_term;
                         let fixture_committed = metrics.local_committed.map(|log_id| log_id.index);
@@ -278,8 +276,6 @@ impl RollingRestartValidator {
 
 fn synthetic_node_info(node_id: u64) -> NodeInfo {
     NodeInfo {
-        expected_process_incarnation: None,
-        expected_maintenance_fence: None,
         id: node_id,
         // The planner never reaches over the network in this validator; we
         // synthesise the admin URL so NodeInfo's invariants are satisfied.

@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use ursula_shard::RaftGroupId;
 use crate::HttpState;
 use crate::Persistence;
 use crate::Topology;
-use crate::bootstrap::spawn_runtime_with_maintenance_drain;
+use crate::bootstrap::spawn_runtime;
 use crate::client_router_with_admission;
 use crate::cluster_router_from_state;
 
@@ -77,60 +76,7 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset.unwrap_or(Preset::Default)
     );
 
-    let mut start_maintenance_drained = parse_start_maintenance_drained(
-        std::env::var_os("URSULA_START_MAINTENANCE_DRAINED").as_deref(),
-    )?;
     let boot = ursula_proto::admin::ProcessIncarnation::from_bits(rand::random());
-    let mut startup_admission = None;
-    match std::env::var("URSULA_STARTUP_RESERVATION") {
-        Ok(value) if value == "true" => {
-            validate_startup_topology(&config)?;
-            let helper = std::env::current_exe()?.with_file_name("ursulactl");
-            let mut helper_command = tokio::process::Command::new(helper);
-            helper_command
-                .args([
-                    "startup-admit",
-                    "--node-id",
-                    &config.raft.node_id.to_string(),
-                    "--group-count",
-                    &config.raft.group_count.to_string(),
-                    "--core-count",
-                    &config.runtime.core_count.to_string(),
-                    "--process-incarnation",
-                    boot.as_str(),
-                ])
-                .kill_on_drop(true);
-            let output =
-                tokio::time::timeout(Duration::from_secs(65), helper_command.output()).await??;
-            if !output.status.success() {
-                return Err(std::io::Error::other(format!(
-                    "startup reservation refused: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ))
-                .into());
-            }
-            let admission: ursula_proto::admin::StartupAdmission =
-                serde_json::from_slice(&output.stdout)?;
-            admission.validate().map_err(std::io::Error::other)?;
-            if admission.process_incarnation != boot {
-                return Err(std::io::Error::other(
-                    "startup helper changed the fresh process incarnation",
-                )
-                .into());
-            }
-            start_maintenance_drained |= admission.start_maintenance_drained();
-            startup_admission = Some(admission);
-        }
-        Ok(value) if value == "false" => (),
-        Err(std::env::VarError::NotPresent) => (),
-        _ => {
-            return Err(std::io::Error::other(
-                "URSULA_STARTUP_RESERVATION must be exactly true or false",
-            )
-            .into());
-        }
-    }
-    // No format stamps, Raft actors, transport or listeners exist before admission.
     let wal_dir = if runs_raft(&config, preset) {
         Some(RaftWalDir::resolve(&config.raft.wal)?)
     } else {
@@ -142,14 +88,9 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         None => Persistence::InMemory,
     };
-    let mut state = init_state(&config, persistence, start_maintenance_drained)
+    let state = init_state(&config, persistence)
         .await?
         .with_process_incarnation(boot);
-    if let Some(admission) = startup_admission {
-        // No admin requests can enter the Raft API queue before this gate is
-        // installed: all listeners are opened by serve.
-        state = state.with_startup_maintenance_fence(admission.maintenance_fence);
-    }
     state.register_otel_metrics();
     let wal_shutdown = serve(state, &config).await?;
     if let Some(wal_dir) = wal_dir {
@@ -242,17 +183,9 @@ fn init_telemetry(
 async fn init_state(
     config: &ursula_config::UrsulaConfig,
     persistence: Persistence,
-    start_maintenance_drained: bool,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
     // The one source of every configured peer address.
     let raft_peers = ursula_raft::PeerDirectory::from_config(&config.raft.peers);
-    if start_maintenance_drained && raft_peers.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "URSULA_START_MAINTENANCE_DRAINED requires a static Raft cluster",
-        )
-        .into());
-    }
 
     let per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>> = config
         .raft
@@ -288,12 +221,7 @@ async fn init_state(
     let log_dir = persistence.log_dir().map(std::path::Path::to_path_buf);
     crate::bootstrap::check_and_stamp_format_epoch(config, &raft_peers, log_dir.as_deref()).await?;
 
-    let spawned = spawn_runtime_with_maintenance_drain(
-        config,
-        persistence,
-        topology,
-        start_maintenance_drained,
-    )?;
+    let spawned = spawn_runtime(config, persistence, topology)?;
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal;
     // Meta's Raft starts before the warm-up, on the journal the spawn path
@@ -377,42 +305,6 @@ async fn init_state(
         );
     }
     Ok(state)
-}
-
-fn parse_start_maintenance_drained(value: Option<&OsStr>) -> Result<bool, std::io::Error> {
-    match value.and_then(OsStr::to_str) {
-        None if value.is_none() => Ok(false),
-        Some("true") => Ok(true),
-        Some("false") => Ok(false),
-        _ => Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "URSULA_START_MAINTENANCE_DRAINED must be exactly true or false",
-        )),
-    }
-}
-
-fn validate_startup_topology(config: &ursula_config::UrsulaConfig) -> Result<(), std::io::Error> {
-    let voters = BTreeSet::from([1, 2, 3]);
-    if config.raft.peers.len() != 3
-        || config
-            .raft
-            .peers
-            .iter()
-            .map(|peer| peer.node_id)
-            .collect::<BTreeSet<_>>()
-            != voters
-        || !voters.contains(&config.raft.node_id)
-        || config.raft.groups.iter().any(|group| {
-            group.voters.iter().copied().collect::<BTreeSet<_>>() != voters
-                || group.voters.len() != 3
-        })
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "startup ownership requires the fixed three-voter topology on every group",
-        ));
-    }
-    Ok(())
 }
 
 fn static_grpc_node_hosts_group(
@@ -657,62 +549,12 @@ fn spawn_shutdown_signal_task(
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::OsStr;
     use std::io::Write;
-
-    use super::parse_start_maintenance_drained;
 
     #[test]
     fn bounded_shutdown_phases_leave_time_to_close_the_wal() {
         let phases = super::SHUTDOWN_HANDOFF_GRACE.saturating_add(super::SHUTDOWN_DRAIN_GRACE);
         assert!(phases < super::SHUTDOWN_GRACE, "{phases:?}");
-    }
-
-    #[test]
-    fn startup_maintenance_drain_is_strict_and_opt_in() {
-        assert!(!parse_start_maintenance_drained(None).unwrap());
-        assert!(parse_start_maintenance_drained(Some(OsStr::new("true"))).unwrap());
-        assert!(!parse_start_maintenance_drained(Some(OsStr::new("false"))).unwrap());
-        parse_start_maintenance_drained(Some(OsStr::new("1")))
-            .expect_err("a startup drain flag other than true or false must be rejected");
-    }
-
-    #[test]
-    fn startup_ownership_refuses_topologies_outside_the_catalogued_cell() {
-        use ursula_config::RaftGroupConfig;
-        use ursula_config::RaftPeerConfig;
-        use ursula_config::UrsulaConfig;
-
-        let mut config = UrsulaConfig::default();
-        config.raft.node_id = 1;
-        config.raft.group_count = 1;
-        assert!(super::validate_startup_topology(&config).is_err());
-        config.raft.peers = (1..=3)
-            .map(|node_id| RaftPeerConfig {
-                node_id,
-                url: format!("http://node-{node_id}:50051"),
-                client_url: None,
-            })
-            .collect();
-        super::validate_startup_topology(&config).expect("a three-voter cell must be accepted");
-        config.raft.groups = vec![RaftGroupConfig {
-            raft_group_id: 0,
-            voters: vec![1, 2, 3],
-        }];
-        super::validate_startup_topology(&config)
-            .expect("a three-voter group over the full cell must be accepted");
-        for voters in [vec![1], vec![1, 2], vec![1, 2, 4], vec![1, 2, 2, 3]] {
-            config.raft.groups[0].voters = voters;
-            assert!(super::validate_startup_topology(&config).is_err());
-        }
-        config.raft.groups.clear();
-        config.raft.node_id = 4;
-        assert!(super::validate_startup_topology(&config).is_err());
-        config.raft.node_id = 1;
-        config.raft.peers[2].node_id = 2;
-        assert!(super::validate_startup_topology(&config).is_err());
-        config.raft.peers.truncate(1);
-        assert!(super::validate_startup_topology(&config).is_err());
     }
 
     #[tokio::test]
@@ -730,9 +572,7 @@ mod tests {
         let persistence = crate::Persistence::Raft {
             log_dir: wal.path().join("raft-log"),
         };
-        let state = super::init_state(&config, persistence, false)
-            .await
-            .unwrap();
+        let state = super::init_state(&config, persistence).await.unwrap();
         let response = crate::admin_router(state)
             .oneshot(
                 Request::builder()
@@ -761,7 +601,7 @@ mod tests {
         config.runtime.core_count = 1;
         config.raft.group_count = 1;
         config.server.cluster_id = Some(ursula_headers::ClusterId::new("dev-local").unwrap());
-        let state = super::init_state(&config, crate::Persistence::InMemory, false)
+        let state = super::init_state(&config, crate::Persistence::InMemory)
             .await
             .unwrap();
         let response =
@@ -798,9 +638,7 @@ mod tests {
         let persistence = crate::Persistence::Raft {
             log_dir: wal_dir.log_dir(),
         };
-        let state = super::init_state(&config, persistence, false)
-            .await
-            .unwrap();
+        let state = super::init_state(&config, persistence).await.unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let response = crate::admin_router(state.clone())
             .oneshot(
@@ -859,9 +697,7 @@ mod tests {
         let persistence = crate::Persistence::Raft {
             log_dir: wal_dir.log_dir(),
         };
-        let state = super::init_state(&config, persistence, false)
-            .await
-            .unwrap();
+        let state = super::init_state(&config, persistence).await.unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let registry = state.raft_registry().cloned().expect("a Raft node");
         // The spawn path opened the meta journal before any data group: the
@@ -964,13 +800,9 @@ mod tests {
             .unwrap()
             .log_dir();
         let start = || async {
-            super::init_state(
-                &config,
-                crate::Persistence::Raft {
-                    log_dir: log_dir.clone(),
-                },
-                false,
-            )
+            super::init_state(&config, crate::Persistence::Raft {
+                log_dir: log_dir.clone(),
+            })
             .await
             .unwrap()
         };
@@ -1058,13 +890,9 @@ mod tests {
         let root = root.clone();
         let log_dir = wal_dir.log_dir();
         assert_eq!(log_dir, root.join("raft-log"));
-        let state = super::init_state(
-            &config,
-            crate::Persistence::Raft {
-                log_dir: log_dir.clone(),
-            },
-            false,
-        )
+        let state = super::init_state(&config, crate::Persistence::Raft {
+            log_dir: log_dir.clone(),
+        })
         .await
         .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("the node runs Raft");

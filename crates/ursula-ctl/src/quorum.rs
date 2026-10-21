@@ -1,7 +1,6 @@
 //! Fresh, fixed-prefix verification for recovery measurements and maintenance.
 //!
-//! This evidence is scoped to one observation. Physical disruption still needs
-//! an exclusive reservation and incarnation-aware lifecycle fencing.
+//! This evidence is scoped to one observation.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -13,8 +12,6 @@ use anyhow::bail;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
-use ursula_proto::admin::MaintenanceFence;
-use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::ProcessIncarnation;
 use ursula_proto::admin::QuorumPrefix;
 
@@ -34,45 +31,14 @@ pub struct QuorumVerificationOptions {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QuorumVerification {
-    pub version: ursula_proto::admin::SchemaVersion<3>,
+    pub version: ursula_proto::admin::SchemaVersion<4>,
     pub process_incarnations: BTreeMap<u64, ProcessIncarnation>,
-    /// Process-local admission only, not proof of an external CAS reservation.
-    pub maintenance_executor_certified: bool,
-    pub maintenance_executor_retired_certified: bool,
-    pub maintenance_fence: Option<MaintenanceFence>,
     pub prefixes: BTreeMap<u32, QuorumPrefix>,
     pub applied: BTreeMap<u64, BTreeMap<u32, u64>>,
 }
 
-fn certified_executor(snapshot: &ClusterSnapshot, retired: bool) -> Option<MaintenanceFence> {
-    let expected = snapshot
-        .per_node
-        .first()?
-        .node
-        .expected_maintenance_fence
-        .as_ref()?;
-    let expected_state = if retired {
-        MaintenanceFenceState::Retired {
-            fence: expected.clone(),
-        }
-    } else {
-        MaintenanceFenceState::Active {
-            fence: expected.clone(),
-        }
-    };
-    snapshot
-        .per_node
-        .iter()
-        .all(|node| {
-            node.node.expected_maintenance_fence.as_ref() == Some(expected)
-                && node.maintenance_fence == expected_state
-                && !node.maintenance_fence_uncertain
-        })
-        .then(|| expected.clone())
-}
-
 /// Evidence from the two observed survivors, not restored three-voter
-/// redundancy or evidence that the excluded physical host is fenced.
+/// redundancy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurvivingQuorumVerification {
@@ -307,13 +273,8 @@ async fn verify_observed_quorum(
                         .iter()
                         .map(|node| (node.node.id, node.process_incarnation.clone()))
                         .collect::<BTreeMap<_, _>>();
-                    let active_fence = certified_executor(&snapshot, false);
-                    let retired_fence = certified_executor(&snapshot, true);
                     return Ok(QuorumVerification {
                         version: ursula_proto::admin::SchemaVersion,
-                        maintenance_executor_certified: active_fence.is_some(),
-                        maintenance_executor_retired_certified: retired_fence.is_some(),
-                        maintenance_fence: active_fence.or(retired_fence),
                         process_incarnations,
                         prefixes,
                         applied,
@@ -336,29 +297,32 @@ mod tests {
         let proof = super::QuorumVerification {
             version: ursula_proto::admin::SchemaVersion,
             process_incarnations: Default::default(),
-            maintenance_executor_certified: false,
-            maintenance_executor_retired_certified: false,
-            maintenance_fence: None,
             prefixes: Default::default(),
             applied: Default::default(),
         };
         let value = serde_json::to_value(proof).unwrap();
-        assert_eq!(value["version"], 3);
-        for field in ["participation_certified", "process_incarnations_certified"] {
+        assert_eq!(value["version"], 4);
+        for field in [
+            "participation_certified",
+            "process_incarnations_certified",
+            "maintenance_executor_certified",
+            "maintenance_executor_retired_certified",
+            "maintenance_fence",
+        ] {
             assert!(value.get(field).is_none());
             let mut legacy = value.clone();
             legacy[field] = serde_json::Value::Bool(true);
             let error = serde_json::from_value::<super::QuorumVerification>(legacy).unwrap_err();
             assert_eq!(error.classify(), serde_json::error::Category::Data);
         }
-        for version in [0, 1, 2, 4, u32::MAX] {
+        for version in [0, 1, 2, 3, 5, u32::MAX] {
             let mut unknown = value.clone();
             unknown["version"] = serde_json::Value::from(version);
             let error = serde_json::from_value::<super::QuorumVerification>(unknown).unwrap_err();
             assert_eq!(error.classify(), serde_json::error::Category::Data);
         }
         let decoded: super::QuorumVerification = serde_json::from_value(value).unwrap();
-        assert_eq!(u32::from(decoded.version), 3);
+        assert_eq!(u32::from(decoded.version), 4);
     }
 
     use tokio::time::Instant;
@@ -370,8 +334,6 @@ mod tests {
             per_node: (1..=3)
                 .map(|id| {
                     let node = NodeInfo {
-                        expected_process_incarnation: None,
-                        expected_maintenance_fence: None,
                         id,
                         admin_url: format!("http://node-{id}:4438").parse().unwrap(),
                         http_url: Some(format!("http://node-{id}:4437").parse().unwrap()),
@@ -396,42 +358,6 @@ mod tests {
                 })
                 .collect(),
         }
-    }
-
-    #[test]
-    fn executor_evidence_requires_same_saved_token_and_healthy_admission_everywhere() {
-        let fence = MaintenanceFence::new(format!("{:032x}", 1), format!("{:032x}", 2), 3).unwrap();
-        let mut state = snapshot();
-        assert_eq!(certified_executor(&state, false), None);
-        for node in &mut state.per_node {
-            node.process_incarnation = ProcessIncarnation::from_bits(u128::from(node.node.id));
-            node.node.expected_maintenance_fence = Some(fence.clone());
-            node.maintenance_fence = MaintenanceFenceState::Active {
-                fence: fence.clone(),
-            };
-        }
-        assert_eq!(certified_executor(&state, false), Some(fence.clone()));
-        state.per_node[1].maintenance_fence_uncertain = true;
-        assert_eq!(certified_executor(&state, false), None);
-        state.per_node[1].maintenance_fence_uncertain = false;
-        state.per_node[1].maintenance_fence = MaintenanceFenceState::Retired { fence };
-        assert_eq!(certified_executor(&state, false), None);
-        assert_eq!(certified_executor(&state, true), None);
-        let token = state.per_node[0]
-            .node
-            .expected_maintenance_fence
-            .clone()
-            .unwrap();
-        for node in &mut state.per_node {
-            node.maintenance_fence = MaintenanceFenceState::Retired {
-                fence: token.clone(),
-            };
-        }
-        assert_eq!(certified_executor(&state, false), None);
-        assert_eq!(certified_executor(&state, true), Some(token));
-        state.per_node[1].maintenance_fence = state.per_node[0].maintenance_fence.clone();
-        state.per_node[1].node.expected_maintenance_fence = None;
-        assert_eq!(certified_executor(&state, false), None);
     }
 
     fn prefixes(index: u64) -> BTreeMap<u32, QuorumPrefix> {

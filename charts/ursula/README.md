@@ -90,8 +90,8 @@ ursulactl wait-ready \
 ```
 
 `wait-ready` succeeds only when every configured node reports the expected Raft
-group count and leaders, its metrics certify the complete configured voter set
-and an unambiguous maintenance fence, and `GET /__ursula/ready` returns 200.
+group count and leaders, its metrics certify the complete configured voter set,
+and `GET /__ursula/ready` returns 200.
 
 ## Access Locally
 

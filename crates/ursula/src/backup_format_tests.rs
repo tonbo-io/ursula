@@ -95,8 +95,6 @@ async fn serve(app: &Router) -> (BackupClient, tokio::task::JoinHandle<()>) {
             http_url: None,
             metrics_url: None,
             client_url: None,
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         }],
     )
     .expect("backup client");
