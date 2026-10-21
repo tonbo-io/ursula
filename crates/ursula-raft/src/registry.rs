@@ -233,6 +233,11 @@ impl GroupEntry {
 pub struct RaftGroupHandleRegistry {
     pub(crate) append_send_budget: crate::grpc::AppendTransportBudget,
     pub(crate) append_receive_budget: crate::grpc::AppendTransportBudget,
+    /// The meta plane's own append budgets
+    /// ([`crate::grpc::META_APPEND_BUDGET_BYTES`]), apart from the data
+    /// plane's, which [`Self::with_append_transport_budget_bytes`] sets.
+    pub(crate) meta_append_send_budget: crate::grpc::AppendTransportBudget,
+    pub(crate) meta_append_receive_budget: crate::grpc::AppendTransportBudget,
     groups: Arc<arc_swap::ArcSwap<BTreeMap<u32, Arc<GroupEntry>>>>,
     dynamic_hosted_groups: Arc<Mutex<BTreeSet<RaftGroupId>>>,
     election: ElectionPolicy,
@@ -256,6 +261,12 @@ impl Default for RaftGroupHandleRegistry {
         Self {
             append_send_budget: Default::default(),
             append_receive_budget: Default::default(),
+            meta_append_send_budget: crate::grpc::AppendTransportBudget::new(
+                crate::grpc::META_APPEND_BUDGET_BYTES,
+            ),
+            meta_append_receive_budget: crate::grpc::AppendTransportBudget::new(
+                crate::grpc::META_APPEND_BUDGET_BYTES,
+            ),
             groups: Arc::new(arc_swap::ArcSwap::from_pointee(BTreeMap::new())),
             dynamic_hosted_groups: Arc::new(Mutex::new(BTreeSet::new())),
             election: ElectionPolicy::default(),
@@ -529,7 +540,8 @@ pub use crate::election::IncomingTransferError;
 pub use crate::election::LeadershipTransferError;
 
 impl RaftGroupHandleRegistry {
-    /// Configure the node-wide budget for each direction before constructing transports.
+    /// Configure the node-wide budget of the data plane for each direction before constructing
+    /// transports. The meta plane keeps its own.
     pub fn with_append_transport_budget_bytes(mut self, bytes: usize) -> Self {
         self.append_send_budget = crate::grpc::AppendTransportBudget::new(bytes);
         self.append_receive_budget = crate::grpc::AppendTransportBudget::new(bytes);

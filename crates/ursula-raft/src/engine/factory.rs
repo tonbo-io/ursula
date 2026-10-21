@@ -493,8 +493,11 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     ))
                 })
                 .clone();
-            let network = GrpcRaftNetworkFactory::new(transport.clone(), placement.raft_group_id)
-                .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures);
+            let network = GrpcRaftNetworkFactory::new(
+                transport.clone(),
+                crate::RaftTarget::Data(placement.raft_group_id),
+            )
+            .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures);
             let apply_stop_signal = store.apply_stop_signal();
             let snapshot_record = store.snapshot_record();
             let health = crate::apply_failure::ApplyHealth::default();
@@ -544,7 +547,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 voters,
                 crate::recovery_transport::GrpcRecoveryTransport {
                     transport,
-                    placement,
+                    target: crate::RaftTarget::Data(placement.raft_group_id),
                     timeout: self.engine_config.bootstrap_peer_connect,
                 },
                 crate::rejoin::RecoveryConfig {

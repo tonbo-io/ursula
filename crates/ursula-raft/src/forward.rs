@@ -197,10 +197,11 @@ pub(crate) async fn forward_group_read_to_leader(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
         ..Default::default()
     };
-    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
+    let target = RaftTarget::Data(placement.raft_group_id);
+    target.stamp(route.leader_id, &mut request);
     call_leader(
         route,
-        placement,
+        target,
         ForwardedRpc::GroupRead,
         request,
         |mut client, request| async move { client.group_read(request).await },
@@ -228,10 +229,11 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         protocol_version: RAFT_GRPC_PROTOCOL_VERSION,
         ..Default::default()
     };
-    RaftTarget::Data(placement.raft_group_id).stamp(route.leader_id, &mut request);
+    let target = RaftTarget::Data(placement.raft_group_id);
+    target.stamp(route.leader_id, &mut request);
     let response = call_leader(
         route,
-        placement,
+        target,
         ForwardedRpc::GroupWrite,
         request,
         |mut client, request| async move { client.group_write(request).await },
@@ -337,6 +339,14 @@ impl ForwardError {
         )
     }
 
+    /// True when the cached channel to the leader's address is of no more
+    /// use: the leader is unreachable over it, or the address serves
+    /// another node now, which `raft.peers` or a moved address can fix
+    /// without a restart. The next call connects afresh.
+    fn drops_channel(&self) -> bool {
+        self.leader_unreachable() || matches!(self, Self::OtherNode { .. })
+    }
+
     /// The engine-level answer, decided here only. A leader this node
     /// cannot reach is, to the client, a leader it does not know:
     /// leader-unknown (HTTP 503 with `Retry-After`), retried once the
@@ -404,10 +414,11 @@ fn is_transport_failure(status: &tonic::Status) -> bool {
 }
 
 /// One forwarded leader RPC under [`FORWARD_RPC_TIMEOUT`]. A call that fails
-/// at the transport drops its cached channel, so the next one reconnects.
+/// at the transport, or that the leader's address refused as meant for
+/// another node, drops its cached channel, so the next one reconnects.
 async fn call_leader<Req, Resp, Fut>(
     route: &LeaderRoute,
-    placement: ShardPlacement,
+    target: RaftTarget,
     rpc: ForwardedRpc,
     request: Req,
     send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
@@ -453,6 +464,7 @@ where
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
                     if let Some(node) = crate::target::refusing_node(&status) {
+                        peer_cluster.observe_misdelivery(route.leader_id, address, node);
                         ForwardError::OtherNode {
                             rpc,
                             address: address.to_owned(),
@@ -487,20 +499,34 @@ where
                 Err(_elapsed) => timed_out(),
             };
             dropped_channel =
-                error.leader_unreachable() && LEADER_CHANNELS.evict(address, leader.generation);
+                error.drops_channel() && LEADER_CHANNELS.evict(address, leader.generation);
             error
         }
     };
-    if dropped_channel {
+    // A leader unreachable over its channel warns on each drop. An address
+    // that serves another node drops its channel at debug:
+    // `observe_misdelivery` already warned once for that change, and every
+    // later forward to the same address repeats the drop.
+    if dropped_channel && error.leader_unreachable() {
         tracing::warn!(
-            group = placement.raft_group_id.0,
+            plane = ?target.plane(),
+            group = target.wire_group_id(),
             leader = address,
             error = %ErrorChain(&error),
-            "dropped the forwarding channel to a group leader after a transport failure"
+            "dropped the forwarding channel to a group leader: the leader is unreachable over it"
+        );
+    } else if dropped_channel {
+        tracing::debug!(
+            plane = ?target.plane(),
+            group = target.wire_group_id(),
+            leader = address,
+            error = %ErrorChain(&error),
+            "dropped the forwarding channel to a group leader: its address serves another node now"
         );
     } else {
         tracing::debug!(
-            group = placement.raft_group_id.0,
+            plane = ?target.plane(),
+            group = target.wire_group_id(),
             leader = address,
             error = %ErrorChain(&error),
             "forwarded leader RPC failed"

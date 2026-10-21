@@ -24,6 +24,11 @@ use crate::raft_internal_proto as pb;
 use crate::raft_internal_proto::raft_internal_server::RaftInternal;
 use crate::rejoin::GroupRejoin;
 
+/// The data group every test here runs, as a Raft target.
+fn data_target() -> crate::RaftTarget {
+    crate::RaftTarget::Data(placement().raft_group_id)
+}
+
 #[derive(Clone)]
 struct RecoveryTestService {
     inner: RaftGrpcService,
@@ -255,7 +260,7 @@ async fn new_recovery_engine(
         placement(),
         id,
         config,
-        GrpcRaftNetworkFactory::new(transport, placement().raft_group_id),
+        GrpcRaftNetworkFactory::new(transport, data_target()),
         store.clone(),
         RaftGroupEngineOptions {
             recovery: Some(gate.clone()),
@@ -383,7 +388,7 @@ async fn fresh_proof(
     retry_transient(step, replicas, async |remaining| {
         probe_rejoin_vote_barrier(
             probe_transport(endpoints),
-            placement(),
+            data_target(),
             leader_id,
             PROBE_TIMEOUT.min(remaining),
         )
@@ -830,7 +835,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         assert!(
             probe_rejoin_vote_barrier(
                 probe_transport(&endpoints),
-                placement(),
+                data_target(),
                 2,
                 Duration::from_millis(150)
             )
@@ -861,7 +866,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     // Peers without the explicit protocol fail closed; no HEAD bridge remains.
     services[1].reject_barrier.store(true, Ordering::SeqCst);
     let unsupported =
-        probe_rejoin_vote_barrier(probe_transport(&endpoints), placement(), 2, PROBE_TIMEOUT)
+        probe_rejoin_vote_barrier(probe_transport(&endpoints), data_target(), 2, PROBE_TIMEOUT)
             .await
             .expect_err("unsupported recovery protocol is refused");
     assert!(
@@ -980,7 +985,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
     engines[2].raft.runtime_config().tick(true);
     services[1].reject_barrier.store(true, Ordering::SeqCst);
     assert!(
-        probe_rejoin_vote_barrier(probe_transport(&endpoints), placement(), 2, PROBE_TIMEOUT)
+        probe_rejoin_vote_barrier(probe_transport(&endpoints), data_target(), 2, PROBE_TIMEOUT)
             .await
             .is_err(),
         "an unsupported peer cannot supply a fresh proof"
@@ -994,7 +999,7 @@ async fn delayed_pre_restart_append_cannot_restore_voting_or_campaigning_over_gr
         async |remaining| {
             probe_rejoin_vote_barrier(
                 probe_transport(&endpoints),
-                placement(),
+                data_target(),
                 3,
                 PROBE_TIMEOUT.min(remaining),
             )

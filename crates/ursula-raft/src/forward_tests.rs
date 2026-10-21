@@ -580,6 +580,19 @@ async fn a_forward_to_an_address_that_serves_another_node_is_leader_unknown() {
     let peer_cluster = follower.peer_cluster.as_ref().expect("a gRPC replica");
     assert!(peer_cluster.mismatches().is_empty());
     assert_eq!(peer_cluster.refusals(), 0);
+    // Each misdelivery is counted for the leader, and drops the forwarding
+    // channel to its address: the next forward connects afresh to the
+    // address `raft.peers` lists then.
+    let leader_id = u64::try_from(leader_index)
+        .ok()
+        .and_then(|index| index.checked_add(1))
+        .expect("node ids start at 1");
+    assert!(
+        peer_cluster.misdeliveries(leader_id) >= 2,
+        "{}",
+        peer_cluster.misdeliveries(leader_id)
+    );
+    assert!(!crate::forward::has_leader_channel(&url));
 
     server.abort();
     shutdown_all(&engines).await;

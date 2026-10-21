@@ -25,7 +25,15 @@
 //! that this node has configured ([`PeerCluster::mismatches`]). None of it
 //! changes readiness: a misconfigured node must not take its healthy peers
 //! out of service, nor hide why a node is unready.
+//!
+//! A peer that refuses a request as meant for another node (the address
+//! dialed serves another node now, [`crate::target::refusing_node`]) is not
+//! a cluster refusal: `raft.peers` or a moved address can fix it without a
+//! restart, so the sender dials the target again. Misdeliveries are counted
+//! per dialed node, and each change of the address or the refusing node is
+//! logged once ([`PeerCluster::observe_misdelivery`]).
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -255,6 +263,19 @@ struct PeerClusterState {
     unidentified_refusals: AtomicU64,
     /// Member node ids `raft.peers` does not list, each logged once.
     unlisted: Mutex<BTreeSet<u64>>,
+    /// Misdelivery refusals by the node id dialed. Keys are the nodes this
+    /// node sends Raft traffic to, so the map stays as small as the
+    /// memberships it serves.
+    misdelivered: Mutex<BTreeMap<u64, Misdeliveries>>,
+}
+
+/// The misdelivery refusals of one dialed node: how many since start, and
+/// the last address and refusing node, logged once per change.
+#[derive(Debug)]
+struct Misdeliveries {
+    count: u64,
+    address: String,
+    refusing_node: u64,
 }
 
 /// What [`PeerCluster::bind`] stores: this node's identity and its
@@ -533,6 +554,66 @@ impl PeerCluster {
     /// id.
     pub fn unidentified_refusals(&self) -> u64 {
         self.0.unidentified_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Records that the address dialed for node `node_id` refused a request
+    /// as meant for another node: it serves `refusing_node` now. Counted per
+    /// dialed node, and logged once for each change of the address or the
+    /// refusing node, so a sender that keeps dialing the wrong address logs
+    /// one line. Returns whether it logged.
+    pub(crate) fn observe_misdelivery(
+        &self,
+        node_id: u64,
+        address: &str,
+        refusing_node: u64,
+    ) -> bool {
+        let mut misdelivered = self
+            .0
+            .misdelivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let changed = match misdelivered.get_mut(&node_id) {
+            Some(seen) => {
+                seen.count = seen.count.saturating_add(1);
+                let changed = seen.address != address || seen.refusing_node != refusing_node;
+                if changed {
+                    address.clone_into(&mut seen.address);
+                    seen.refusing_node = refusing_node;
+                }
+                changed
+            }
+            None => {
+                misdelivered.insert(node_id, Misdeliveries {
+                    count: 1,
+                    address: address.to_owned(),
+                    refusing_node,
+                });
+                true
+            }
+        };
+        drop(misdelivered);
+        if changed {
+            tracing::warn!(
+                peer_node_id = node_id,
+                peer_address = address,
+                refusing_node,
+                "the address raft.peers lists for node {node_id} serves node {refusing_node} \
+                 now: dialing node {node_id} again at the address raft.peers lists then; check \
+                 raft.peers on this node"
+            );
+        }
+        changed
+    }
+
+    /// Requests to node `node_id` refused since start as meant for another
+    /// node: the address dialed served another node.
+    pub fn misdeliveries(&self, node_id: u64) -> u64 {
+        self.0
+            .misdelivered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&node_id)
+            .map_or(0, |seen| seen.count)
     }
 }
 
@@ -902,5 +983,22 @@ mod tests {
         );
         assert_eq!(url_ip("http://[::1]:4437/"), Some("::1".parse().unwrap()));
         assert_eq!(url_ip("http://ursula-2.ursula:4437"), None);
+    }
+
+    /// A misdelivery is counted per dialed node and logged once per change
+    /// of the address or the refusing node. It is no cluster refusal.
+    #[test]
+    fn a_misdelivery_is_counted_per_node_and_logged_once_per_change() {
+        let sender = bound(2, "a");
+        assert!(sender.observe_misdelivery(1, "http://10.0.0.1:4437", 9));
+        assert!(!sender.observe_misdelivery(1, "http://10.0.0.1:4437", 9));
+        assert!(sender.observe_misdelivery(1, "http://10.0.0.1:4437", 8));
+        assert!(sender.observe_misdelivery(1, "http://10.0.0.9:4437", 8));
+        assert!(sender.observe_misdelivery(3, "http://10.0.0.3:4437", 9));
+        assert_eq!(sender.misdeliveries(1), 4);
+        assert_eq!(sender.misdeliveries(3), 1);
+        assert_eq!(sender.misdeliveries(2), 0);
+        assert_eq!(sender.refusals(), 0);
+        assert!(sender.mismatches().is_empty());
     }
 }
