@@ -3387,11 +3387,8 @@ mod barrier;
 mod bootstrap;
 mod heal;
 mod leader_tick;
-#[expect(
-    dead_code,
-    reason = "S1(e) starts the shell on the meta replica, and S3 on data groups"
-)]
 mod reconcile;
+pub(crate) use attach::GateProbe;
 pub use attach::RecoveryConfig;
 pub use attach::RecoveryGate;
 pub use attach::RecoveryTransport;
@@ -3419,4 +3416,6 @@ use leader_tick::ReversionWatch;
 pub use reconcile::MembershipTargetSource;
 pub use reconcile::NoPeerGates;
 pub use reconcile::PeerGates;
+pub(crate) use reconcile::ReconcileShell;
 pub use reconcile::TargetRead;
+pub(crate) use reconcile::initial_status;

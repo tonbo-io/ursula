@@ -9,7 +9,9 @@
 //!   `ursula_runtime` write types.
 //! - [`meta`]: the meta group: its replicated types (its commands, its
 //!   state, its snapshot pointer and its genesis probe), its state machine,
-//!   this node's meta replica and the placement views it publishes.
+//!   this node's meta replica and the placement views it publishes, and the
+//!   meta runtime that forms the group, registers the node and bootstraps
+//!   the cluster.
 //! - [`target`]: the typed target of every Raft RPC (plane, group and target
 //!   node), its one encoder and parser, and the misdelivery refusal.
 //! - [`memberships`]: the memberships a recovery barrier answers with, which

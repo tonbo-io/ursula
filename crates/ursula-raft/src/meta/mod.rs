@@ -12,6 +12,9 @@
 //! The replica, its state machine and its views ([`replica`],
 //! [`state_machine`], [`watch`]) encode nothing of their own, and
 //! [`state_machine`]'s dispatch of the meta log is frozen with the epoch.
+//! The runtime and its tasks ([`runtime`], [`handle`], [`genesis_driver`],
+//! [`registration`], [`formation`], [`damage`] and the meta membership
+//! target) encode nothing either: they write only the commands above.
 //!
 //! `#[serde(other)]` is allowed only on admin JSON enums (the admin
 //! vocabulary of `ursula_proto::placement`), and forbidden on every type
@@ -20,33 +23,51 @@
 //! format mismatch.
 //!
 //! The Raft gRPC service routes the meta plane's RPCs to the replica the
-//! registry publishes ([`replica::ActiveMeta`]). No server opens one yet:
-//! the meta runtime that opens the replica at start-up and forms the group
-//! lands later.
+//! registry publishes ([`replica::ActiveMeta`]), which the meta runtime
+//! ([`runtime::MetaRuntime`]) opens. No server starts the runtime yet.
 //!
 //! Module map:
 //!
 //! - [`confirm`]: why a meta read barrier confirmed no placement view
 //!   ([`confirm::MetaBarrierError`]), never encoded.
+//! - [`damage`]: which refusals of the commit screen damage the meta
+//!   replica for good.
+//! - [`formation`]: the meta leader's `Bootstrap` of the cluster.
 //! - [`genesis`]: the genesis probe a node sends before the meta group
 //!   forms, and its answer.
+//! - [`genesis_driver`]: the meta replica's gate drivers with the genesis
+//!   probe, and what the probes last heard ([`genesis_driver::GenesisStatus`]).
+//! - [`handle`]: how this node writes to the meta group and confirms its
+//!   view ([`handle::MetaHandle`], [`handle::MetaWriteError`]).
+//! - [`registration`]: this node's registration with the meta group.
 //! - [`replica`]: this node's meta replica ([`replica::MetaReplica`]): its
 //!   Raft over the meta journal, the tasks it owns, its registry slot
 //!   ([`replica::ActiveMeta`]) and its restart for a recovery plan.
+//! - [`runtime`]: the meta runtime ([`runtime::MetaRuntime`]): the replica
+//!   with every task it owns, the node tasks and the damage supervisor.
 //! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, the
 //!   bound on its size, and the trigger that snapshots the meta group on
 //!   its journal's age rule.
 //! - [`state_machine`]: the meta state machine ([`MetaStateMachine`]): its
 //!   dispatch of the meta log, its inline snapshot record and the views it
 //!   publishes.
+//! - `target`: the meta group's membership target, which the reconcile
+//!   shell pursues on the meta leader.
 //! - [`watch`]: the node's placement views, which outlive every meta
-//!   replica.
+//!   replica, and one group's placement in them.
 
 pub mod confirm;
+pub mod damage;
+pub mod formation;
 pub mod genesis;
+pub mod genesis_driver;
+pub mod handle;
+pub mod registration;
 pub mod replica;
+pub mod runtime;
 pub mod snapshot;
 pub mod state_machine;
+mod target;
 pub mod watch;
 
 use std::num::NonZeroU64;
@@ -58,6 +79,9 @@ pub use state_machine::MetaStateMachine;
 #[cfg(test)]
 #[cfg(not(madsim))]
 mod grpc_tests;
+#[cfg(test)]
+#[cfg(not(madsim))]
+mod runtime_tests;
 #[cfg(test)]
 #[cfg(not(madsim))]
 mod tests;

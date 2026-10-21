@@ -41,8 +41,10 @@ use openraft::raft::TransferLeaderRequest;
 use openraft::raft::TransferLeaderResponse;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
+use openraft::rt::WatchReceiver;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_control::MetaDamageKind;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_runtime::GroupEngineError;
@@ -51,8 +53,12 @@ use ursula_runtime::HistoryPublisher;
 use ursula_runtime::SnapshotPointer;
 
 use super::MetaCommand;
+use super::damage::CommitScreenDamage;
+use super::damage::Screened;
+use super::damage::commit_screen_damage;
 use super::genesis::GenesisAnswer;
 use super::genesis::GenesisProbe;
+use super::handle::MetaWriteError;
 use super::snapshot::MetaSnapshotError;
 use super::snapshot::MetaSnapshotPointer;
 use super::state_machine::META_GROUP;
@@ -63,6 +69,7 @@ use crate::IncomingTransferError;
 use crate::MetaOpenError;
 use crate::QuorumProofError;
 use crate::RaftEngineConfig;
+use crate::RaftGroupFileLogStore;
 use crate::RaftGroupHandleRegistry;
 use crate::RaftWal;
 use crate::SnapshotInstallError;
@@ -78,6 +85,7 @@ use crate::openraft_work::WorkKind;
 use crate::read_index::ReadIndexBarrier;
 use crate::rejoin::RecoveryGate;
 use crate::replica::ReplicaCore;
+use crate::rt::sync::watch;
 use crate::types::RaftCommand;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig as C;
@@ -104,6 +112,27 @@ pub struct MetaReplicaTasks {
     /// The meta snapshot trigger ([`super::snapshot::run_meta_snapshot_trigger`]),
     /// if the replica runs one.
     pub snapshots: Option<MetaSnapshotTrigger>,
+    /// The gate drivers and the membership reconcile shell, which the meta
+    /// runtime gives every replica it opens.
+    pub(crate) drivers: Option<Arc<dyn MetaDrivers>>,
+    /// Where the replica reports a for-good refusal of its commit screen.
+    pub(crate) damage: Option<watch::Sender<Option<CommitScreenDamage>>>,
+}
+
+/// Spawns a meta replica's gate drivers and reconcile shell onto its
+/// tasks. Type-erased, so the replica's tasks do not name the transport.
+pub(crate) trait MetaDrivers: Send + Sync + std::fmt::Debug {
+    fn spawn(&self, replica: MetaDriverContext<'_>);
+}
+
+/// What a meta replica's drivers run on.
+pub(crate) struct MetaDriverContext<'a> {
+    pub(crate) raft: &'a Raft<C, MetaStateMachine>,
+    pub(crate) core: &'a ReplicaCore<MetaStateMachine>,
+    pub(crate) gate: &'a Arc<GroupRejoin>,
+    pub(crate) election: &'a ElectionPolicy,
+    pub(crate) registry: &'a RaftGroupHandleRegistry,
+    pub(crate) tasks: &'a RecoveryGate,
 }
 
 /// How often the meta snapshot trigger runs, and the journal age rule it
@@ -153,6 +182,24 @@ pub enum MetaReplicaError {
     Stop(#[source] GroupEngineError),
 }
 
+impl MetaReplicaError {
+    /// How a replica that did not open is damaged, as status reports name
+    /// it. `None` for a stop, which is no failure to open.
+    pub fn damage_kind(&self) -> Option<MetaDamageKind> {
+        match self {
+            Self::Open(_) => Some(MetaDamageKind::Journal),
+            Self::Pointer(_) => Some(MetaDamageKind::Pointer),
+            Self::Record(_) | Self::LogBelowSnapshot(_) | Self::State(_) => {
+                Some(MetaDamageKind::Restore)
+            }
+            Self::Gate(_) | Self::Config(_) | Self::Raft(_) | Self::Bind(_) => {
+                Some(MetaDamageKind::Start)
+            }
+            Self::Stop(_) => None,
+        }
+    }
+}
+
 /// Who asks the meta group to write: this node, or another node that
 /// forwarded the write, as its admitted node id names it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,19 +217,6 @@ impl WriteOrigin {
     }
 }
 
-/// Why a meta write was refused. It stays in this process: a forwarded
-/// write's refusal reaches the forwarding node classified by its transport.
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum MetaWriteError {
-    /// A `RegisterNode` names another node than the one the write comes
-    /// from: a node registers only itself. Nothing was proposed.
-    #[error("a write from node {origin} registers node {named}")]
-    OtherNode { origin: NodeId, named: NodeId },
-    /// The meta group refused the write.
-    #[error(transparent)]
-    Engine(#[from] GroupEngineError),
-}
-
 /// This node's running meta replica, as the registry publishes it to the
 /// inbound RPCs and the meta runtime: the gate screens every RPC passes,
 /// and the write path.
@@ -194,6 +228,10 @@ pub struct ActiveMeta {
     installs: Arc<WorkAdmission>,
     election: ElectionPolicy,
     claim: GenesisClaim,
+    /// This node's id.
+    node: NodeId,
+    /// Where a for-good refusal of the commit screen is reported.
+    damage: Option<watch::Sender<Option<CommitScreenDamage>>>,
 }
 
 impl ActiveMeta {
@@ -203,7 +241,37 @@ impl ActiveMeta {
         request: AppendEntriesRequest<C>,
     ) -> Result<AppendEntriesResponse<C>, GroupEngineError> {
         self.core.apply_health.check(META_GROUP)?;
-        self.core.append_entries(META_GROUP, request).await
+        let vote = request.vote;
+        let answer = self.core.append_entries(META_GROUP, request).await;
+        if let Err(GroupEngineError::Infra(refusal)) = &answer {
+            self.screened(Screened::Append, refusal, &vote);
+        }
+        answer
+    }
+
+    /// Reports the commit screen's `refusal` of a `screened` request that
+    /// carried `vote` when it damaged this replica for good
+    /// ([`super::damage`]).
+    fn screened(
+        &self,
+        screened: Screened,
+        refusal: &ursula_runtime::GroupInfraError,
+        vote: &UrsulaVote,
+    ) {
+        let own = WatchReceiver::borrow_watched(&self.core.owner().metrics()).vote;
+        if !commit_screen_damage(screened, refusal, vote, &own) {
+            return;
+        }
+        tracing::error!(
+            %refusal,
+            "meta replica: the commit screen refused the meta leader for good; this node runs no \
+             meta replica until the operator discards its meta directory"
+        );
+        if let Some(damage) = &self.damage {
+            damage.send_replace(Some(CommitScreenDamage {
+                refusal: refusal.clone(),
+            }));
+        }
     }
 
     /// An inbound vote, through the recovery gate's vote screen.
@@ -218,6 +286,18 @@ impl ActiveMeta {
     /// before the screens and before OpenRaft sees it. The commit screen
     /// reads the history the snapshot's state holds.
     pub async fn install_full_snapshot(
+        &self,
+        vote: UrsulaVote,
+        snapshot: UrsulaSnapshot,
+    ) -> Result<SnapshotResponse<C>, SnapshotInstallError> {
+        let answer = self.install_screened(vote, snapshot).await;
+        if let Err(SnapshotInstallError::Group(GroupEngineError::Infra(refusal))) = &answer {
+            self.screened(Screened::Install, refusal, &vote);
+        }
+        answer
+    }
+
+    async fn install_screened(
         &self,
         vote: UrsulaVote,
         snapshot: UrsulaSnapshot,
@@ -310,36 +390,37 @@ impl ActiveMeta {
     /// batch before anything is proposed. Only control commands are
     /// proposed: a stream command is refused as of the other plane
     /// (`OtherPlane`) and a history event as one only the history driver
-    /// proposes (`NewHistory`), both before anything is proposed.
+    /// proposes (`NewHistory`), both before anything is proposed. The
+    /// replica's own refusal names this node as the leader that refused.
     pub async fn write(
         &self,
         commands: Vec<RaftCommand>,
         origin: WriteOrigin,
     ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, MetaWriteError> {
-        for command in &commands {
-            if let RaftCommand::Meta(MetaCommand::Control(ControlCommand::RegisterNode {
-                node,
-                ..
-            })) = command
-                && *node != origin.node()
-            {
-                return Err(MetaWriteError::OtherNode {
-                    origin: origin.node(),
-                    named: *node,
-                });
-            }
+        if let Some(refusal) = guard_registration(&commands, origin) {
+            return Err(refusal);
         }
+        self.propose(commands)
+            .await
+            .map_err(|source| MetaWriteError::Leader {
+                leader: self.node,
+                source,
+            })
+    }
+
+    async fn propose(
+        &self,
+        commands: Vec<RaftCommand>,
+    ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, GroupEngineError> {
         self.core.apply_health.check(META_GROUP)?;
         let history = Arc::clone(&self.core.history);
-        let answers = self
-            .core
+        self.core
             .owner()
             .call(move |raft| async move {
                 crate::forward::write_commands_on_raft(raft, &history, commands).await
             })
             .await
-            .map_err(crate::owner::owner_stopped)??;
-        Ok(answers)
+            .map_err(crate::owner::owner_stopped)?
     }
 
     /// A write another node forwarded, which `admitted` names, answered as
@@ -354,17 +435,14 @@ impl ActiveMeta {
         commands: Vec<RaftCommand>,
         admitted: NodeId,
     ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, tonic::Status> {
-        let count = commands.len();
-        match self
-            .write(commands, WriteOrigin::Forwarded { admitted })
-            .await
-        {
-            Ok(answers) => Ok(answers),
-            Err(MetaWriteError::Engine(refusal)) => Ok(vec![Err(refusal); count]),
-            Err(refusal @ MetaWriteError::OtherNode { .. }) => {
-                Err(crate::grpc::GrpcRpcError::invalid_argument(refusal.to_string()).into())
-            }
+        if let Some(refusal) = guard_registration(&commands, WriteOrigin::Forwarded { admitted }) {
+            return Err(crate::grpc::GrpcRpcError::invalid_argument(refusal.to_string()).into());
         }
+        let count = commands.len();
+        Ok(self
+            .propose(commands)
+            .await
+            .unwrap_or_else(|refusal| vec![Err(refusal); count]))
     }
 
     /// Lets the node's election policy decide again whether this replica
@@ -372,6 +450,22 @@ impl ActiveMeta {
     pub(crate) fn refresh_elections(&self) {
         self.core.refresh_elections(&self.election);
     }
+}
+
+/// The refusal of a batch with a `RegisterNode` that names another node
+/// than the one `origin` names: a node registers only itself.
+fn guard_registration(commands: &[RaftCommand], origin: WriteOrigin) -> Option<MetaWriteError> {
+    commands.iter().find_map(|command| match command {
+        RaftCommand::Meta(MetaCommand::Control(ControlCommand::RegisterNode { node, .. }))
+            if *node != origin.node() =>
+        {
+            Some(MetaWriteError::OtherNode {
+                origin: origin.node(),
+                named: *node,
+            })
+        }
+        RaftCommand::Meta(_) | RaftCommand::Stream(_) => None,
+    })
 }
 
 /// This node's meta replica (see the module docs).
@@ -412,6 +506,23 @@ impl MetaReplica {
         N::Network: openraft::RaftNetworkV2<C, SnapshotData = SnapshotData>,
     {
         let store = wal.open_meta(metrics).map_err(MetaReplicaError::Open)?;
+        Self::open_on(config, store, wal, network, registry, tasks).await
+    }
+
+    /// [`Self::open`] over `store`, the meta group's log store already
+    /// opened on `wal`'s meta journal.
+    pub async fn open_on<N>(
+        config: &MetaReplicaConfig,
+        store: Arc<RaftGroupFileLogStore>,
+        wal: &RaftWal,
+        network: N,
+        registry: &RaftGroupHandleRegistry,
+        tasks: &MetaReplicaTasks,
+    ) -> Result<Self, MetaReplicaError>
+    where
+        N: RaftNetworkFactory<C>,
+        N::Network: openraft::RaftNetworkV2<C, SnapshotData = SnapshotData>,
+    {
         // The recovery gate goes first: a gated replica's Raft starts with
         // elections disabled, and a plan's cut runs before it reads the log.
         let gate = Arc::new(
@@ -468,6 +579,8 @@ impl MetaReplica {
                 installs,
                 election,
                 claim: config.claim.clone(),
+                node: NodeId::new(config.node),
+                damage: tasks.damage.clone(),
             }),
             raft: raft.clone(),
             tasks: RecoveryGate::default(),
@@ -485,6 +598,16 @@ impl MetaReplica {
                 raft.clone(),
                 history,
             )));
+        if let Some(drivers) = &tasks.drivers {
+            drivers.spawn(MetaDriverContext {
+                raft: &raft,
+                core: &replica.active.core,
+                gate: &gate,
+                election: &replica.active.election,
+                registry,
+                tasks: &replica.tasks,
+            });
+        }
         if let Some(trigger) = tasks.snapshots {
             replica.tasks.push(crate::rt::spawn(
                 super::snapshot::run_meta_snapshot_trigger(
@@ -593,15 +716,25 @@ where
         registry: RaftGroupHandleRegistry,
         tasks: MetaReplicaTasks,
     ) -> Result<Self, MetaReplicaError> {
-        let replica = MetaReplica::open(
-            &config,
-            &wal,
-            metrics.clone(),
-            network.clone(),
-            &registry,
-            &tasks,
-        )
-        .await?;
+        let store = wal
+            .open_meta(metrics.clone())
+            .map_err(MetaReplicaError::Open)?;
+        Self::open_on(config, store, wal, metrics, network, registry, tasks).await
+    }
+
+    /// [`Self::open`] over `store`, the meta group's log store already
+    /// opened on `wal`'s meta journal: a restart reopens it on the journal.
+    pub async fn open_on(
+        config: MetaReplicaConfig,
+        store: Arc<RaftGroupFileLogStore>,
+        wal: RaftWal,
+        metrics: GroupEngineMetrics,
+        network: N,
+        registry: RaftGroupHandleRegistry,
+        tasks: MetaReplicaTasks,
+    ) -> Result<Self, MetaReplicaError> {
+        let replica =
+            MetaReplica::open_on(&config, store, &wal, network.clone(), &registry, &tasks).await?;
         Ok(Self {
             config,
             wal,
