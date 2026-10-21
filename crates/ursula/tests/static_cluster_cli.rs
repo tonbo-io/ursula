@@ -2860,6 +2860,8 @@ async fn cli_a_wiped_node_installs_its_own_snapshot_copy_and_every_node_restores
         &configs[2],
     ));
     wait_until_ready(&client, &peers[2].1, &mut children).await;
+    // The empty disk is refused while the lost one is bound.
+    wait_root_refused(&client, &peers[2].1, &mut children).await;
     let ctl_nodes = peers
         .iter()
         .zip(&admins)
@@ -3177,15 +3179,18 @@ impl Drop for RaftProxy {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
+async fn cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_released() {
     // A voter replaced on an empty WAL directory (its disk was lost) must not
     // re-run per-group Initialize for the groups it bootstraps (2 and 5 of 6
     // for node 3): it must never become eligible to vote with nothing applied.
-    // The leaders see it lost the entries it had acknowledged and rewind it in
-    // place: it stays a voter and catches up with no operator.
+    // The meta group refuses the empty root under the live id until an
+    // operator releases the lost one (`ursulactl node replace-disk`). Then
+    // the leaders see it lost the entries it had acknowledged and rewind it
+    // in place: it stays a voter and catches up with no further operator
+    // step.
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
-        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping restart self-heal test");
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the empty-WAL voter test");
         return;
     };
     let ports = [free_port(), free_port(), free_port()];
@@ -3327,7 +3332,9 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     child.config_path = Some(replacement_config);
     children.push(child);
     wait_until_ready(&client, &public(3), &mut children).await;
-    // The empty disk binds once the lost one is released.
+    // The empty disk is refused while the lost one is bound, and binds once
+    // it is released.
+    wait_root_refused(&client, &public(3), &mut children).await;
     replace_lost_disk(&nodes, 3, lost_root).await;
 
     tokio::time::timeout(
@@ -3496,11 +3503,110 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
         .await;
     }
 
+    // The rejoined voter takes leaderships back. The proof needs every
+    // group's leader known on every node, so it waits for that to settle.
+    wait_leadership_balanced(&ctl, &nodes, 6).await;
     let proof = ursula_ctl::quorum::verify_quorum(&nodes, &ctl, &options)
         .await
         .expect("current process full prefix proof");
     assert_eq!(proof.process_incarnations.len(), nodes.len());
     drop(children);
+}
+
+/// Waits until the leadership balancer has nothing left to move: in two
+/// samples in a row every node names the same leader for each of the
+/// `group_count` groups, and no node leads more than its fair share. Each
+/// handoff to a rejoined voter is an election that leaves the group without
+/// a known leader for a moment.
+async fn wait_leadership_balanced(
+    ctl: &ursula_ctl::MetricsClient,
+    nodes: &[ursula_ctl::NodeInfo],
+    group_count: u64,
+) {
+    let fair = group_count.div_ceil(u64::try_from(nodes.len()).unwrap());
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    let mut streak = 0_u32;
+    loop {
+        let snapshot = ctl.fetch_cluster(nodes).await.expect("fetch cluster");
+        let mut led = BTreeMap::<u64, u64>::new();
+        let agreed = (0..group_count).all(|group_id| {
+            let leaders = snapshot
+                .per_node
+                .iter()
+                .map(|view| view.group(group_id).and_then(|group| group.current_leader))
+                .collect::<BTreeSet<_>>();
+            match leaders.into_iter().collect::<Vec<_>>().as_slice() {
+                [Some(leader)] => {
+                    let count = led.entry(*leader).or_default();
+                    *count = count.saturating_add(1);
+                    true
+                }
+                _ => false,
+            }
+        });
+        let balanced = agreed
+            && snapshot.per_node.len() == nodes.len()
+            && led.values().all(|count| *count <= fair);
+        streak = if balanced {
+            streak.saturating_add(1)
+        } else {
+            0
+        };
+        if streak >= 2 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "leadership never settled at {fair} groups per node: {led:?}, {snapshot:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits until the node at `base_url`, started on an empty disk under its
+/// live id, reports `root_refused`: the meta group binds the id to the lost
+/// root until an operator releases it.
+async fn wait_root_refused(client: &reqwest::Client, base_url: &str, children: &mut [ChildGuard]) {
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(60))
+        .unwrap();
+    let mut last = String::from("no attempts made");
+    loop {
+        if let Some(report) = exited_child_report(children) {
+            panic!("node {base_url} exited before its root was refused: {last}\n{report}");
+        }
+        match client
+            .get(format!("{base_url}/__ursula/ready"))
+            .send()
+            .await
+        {
+            Ok(response) => {
+                let status = response.status();
+                match response
+                    .json::<ursula_proto::admin::ServingReadiness>()
+                    .await
+                {
+                    Ok(ready)
+                        if ready.reason
+                            == Some(ursula_proto::admin::ServingReadinessReason::RootRefused) =>
+                    {
+                        assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                        return;
+                    }
+                    Ok(ready) => last = format!("{status}: {ready:?}"),
+                    Err(error) => last = format!("{status}: {error}"),
+                }
+            }
+            Err(error) => last = error.to_string(),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "node {base_url} never reported root_refused: {last}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn spawn_per_group_node(
