@@ -64,7 +64,7 @@ done
 
 These are the primitives `ursulactl` and any custom operator tooling builds on. They live on the **admin plane** (`server.admin_listen`, loopback `127.0.0.1:4438` by default), not the public client plane. Nodes expose no cluster-mutation surface on the network. Reach them over a tunnel to the admin port (see [ursulactl's operation providers](/docs/cli#the-admin-plane)). The examples below assume a forward from local `4438` to the node's admin plane. Each call is local to one node. To act on every group, loop over the IDs in metrics.
 
-Every admin mutation requires `x-ursula-process-incarnation`, pinned from `GET /__ursula/metrics` before the operation. Missing identity returns `428`; a restarted target returns `412` before the handler changes state. Keep the same identity for the entire plan and stop on either response. This precondition is public instance identity, not authentication or an exclusive maintenance reservation. Updated `ursulactl` attaches it automatically and refuses to refresh it during an operation.
+Every admin mutation requires `x-ursula-process-incarnation`, pinned from `GET /__ursula/metrics` before the operation. Missing identity returns `428`; a restarted target returns `412` before the handler changes state. Keep the same identity for the entire plan and stop on either response. This precondition is public instance identity, not authentication. Updated `ursulactl` attaches it automatically and refuses to refresh it during an operation.
 
 ```bash
 # Observe once for this operation; do not refresh after a 412.

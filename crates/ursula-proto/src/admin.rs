@@ -2,7 +2,6 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::str::FromStr;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -72,9 +71,6 @@ pub enum ApplyFailureKind {
 /// A mutation must carry the incarnation observed before its maintenance plan.
 pub const PROCESS_INCARNATION_HEADER: &str = "x-ursula-process-incarnation";
 
-/// The immutable executor token admitted by the cell's maintenance reservation.
-pub const MAINTENANCE_FENCE_HEADER: &str = "x-ursula-maintenance-fence";
-
 /// A fresh identity for one server instance, shared by its HTTP listeners.
 /// This is an identity precondition, not a credential or maintenance lease.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -111,127 +107,6 @@ fn canonical_identity(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
-
-/// One admitted executor of a maintenance operation. Generations increase
-/// across both takeovers and subsequent operations for the entire cell.
-/// This token supplies ordering, not authentication or a reservation store.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "MaintenanceFenceFields")]
-pub struct MaintenanceFence {
-    reservation_id: String,
-    executor_id: String,
-    generation: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct MaintenanceFenceFields {
-    reservation_id: String,
-    executor_id: String,
-    generation: u64,
-}
-
-impl MaintenanceFence {
-    pub fn new(
-        reservation_id: String,
-        executor_id: String,
-        generation: u64,
-    ) -> Result<Self, &'static str> {
-        if !canonical_identity(&reservation_id) || !canonical_identity(&executor_id) {
-            return Err("maintenance identities must be 32 lowercase hexadecimal characters");
-        }
-        if generation == 0 {
-            return Err("maintenance generation must be nonzero");
-        }
-        Ok(Self {
-            reservation_id,
-            executor_id,
-            generation,
-        })
-    }
-
-    pub fn reservation_id(&self) -> &str {
-        &self.reservation_id
-    }
-
-    pub fn executor_id(&self) -> &str {
-        &self.executor_id
-    }
-
-    pub fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn header_value(&self) -> String {
-        format!(
-            "{}:{}:{}",
-            self.reservation_id, self.generation, self.executor_id
-        )
-    }
-}
-
-impl TryFrom<MaintenanceFenceFields> for MaintenanceFence {
-    type Error = &'static str;
-
-    fn try_from(value: MaintenanceFenceFields) -> Result<Self, Self::Error> {
-        Self::new(value.reservation_id, value.executor_id, value.generation)
-    }
-}
-
-impl FromStr for MaintenanceFence {
-    type Err = &'static str;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        let mut parts = value.split(':');
-        let reservation = parts.next().ok_or("missing reservation identity")?;
-        let generation_text = parts.next().ok_or("missing maintenance generation")?;
-        let executor = parts.next().ok_or("missing executor identity")?;
-        let generation = generation_text
-            .parse::<u64>()
-            .map_err(|_invalid| "invalid maintenance generation")?;
-        if parts.next().is_some() || generation.to_string() != generation_text {
-            return Err("maintenance fence header is not canonical");
-        }
-        Self::new(reservation.to_owned(), executor.to_owned(), generation)
-    }
-}
-
-/// Process-local executor admission. Retirement retains the generation so a
-/// delayed activation cannot reopen the released executor's authority.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
-pub enum MaintenanceFenceState {
-    /// No reservation protocol has been installed; this is uncertified.
-    #[default]
-    Unclaimed,
-    /// The persistent ownership protocol is installed, with no completed
-    /// reservation yet. Mutations remain closed until an executor activates.
-    AwaitingReservation,
-    Active {
-        fence: MaintenanceFence,
-    },
-    Activating {
-        fence: MaintenanceFence,
-    },
-    Retiring {
-        fence: MaintenanceFence,
-    },
-    Retired {
-        fence: MaintenanceFence,
-    },
-}
-
-impl MaintenanceFenceState {
-    pub fn fence(&self) -> Option<&MaintenanceFence> {
-        match self {
-            Self::Unclaimed | Self::AwaitingReservation => None,
-            Self::Active { fence }
-            | Self::Activating { fence }
-            | Self::Retiring { fence }
-            | Self::Retired { fence } => Some(fence),
-        }
-    }
 }
 
 /// A replica's log as the recovery tool read it in `GET /__ursula/metrics`:
@@ -441,34 +316,6 @@ where
     Option::deserialize(deserializer)
 }
 
-/// A trusted startup helper's acknowledged ownership, loaded before listeners.
-/// The server generates the incarnation; the helper must return it unchanged.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct StartupAdmission {
-    pub process_incarnation: ProcessIncarnation,
-    pub maintenance_fence: MaintenanceFenceState,
-}
-
-impl StartupAdmission {
-    /// Startup never grants active mutation authority or uncertified admission.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        match self.maintenance_fence {
-            MaintenanceFenceState::AwaitingReservation
-            | MaintenanceFenceState::Activating { .. }
-            | MaintenanceFenceState::Retired { .. } => Ok(()),
-            _ => Err("startup admission must retain closed maintenance authority"),
-        }
-    }
-
-    pub fn start_maintenance_drained(&self) -> bool {
-        matches!(
-            self.maintenance_fence,
-            MaintenanceFenceState::Activating { .. }
-        )
-    }
-}
-
 impl From<ProcessIncarnation> for String {
     fn from(value: ProcessIncarnation) -> Self {
         value.0
@@ -479,7 +326,6 @@ impl From<ProcessIncarnation> for String {
 mod tests {
     use super::ApplyFailure;
     use super::ApplyFailureKind;
-    use super::MaintenanceFence;
     use super::ProcessIncarnation;
     use super::RaftMaintenanceIssue;
     use super::RaftMaintenanceReport;
@@ -649,28 +495,6 @@ mod tests {
         ] {
             serde_json::from_str::<RecoveryPlanRequest>(invalid)
                 .expect_err("a 0.7 body, an incomplete plan or an unknown field is refused");
-        }
-    }
-
-    #[test]
-    fn fence_header_rejects_ambiguous_generations_and_identities() {
-        let id = "00000000000000000000000000000001";
-        let fence = MaintenanceFence::new(id.to_owned(), id.to_owned(), u64::MAX).unwrap();
-        assert_eq!(fence.header_value().parse::<MaintenanceFence>(), Ok(fence));
-        for generation in ["0", "01", "+1", "-1", " 1", "18446744073709551616", ""] {
-            format!("{id}:{generation}:{id}")
-                .parse::<MaintenanceFence>()
-                .expect_err("a non-canonical or out-of-range generation must be rejected");
-        }
-        for value in [
-            format!("{id}:1"),
-            format!("{id}:1:{id}:extra"),
-            format!("bad:1:{id}"),
-            format!("{id}:1:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
-        ] {
-            value
-                .parse::<MaintenanceFence>()
-                .expect_err("a malformed fence header must be rejected");
         }
     }
 
@@ -967,8 +791,6 @@ pub struct NodeMetrics {
     pub process_incarnation: ProcessIncarnation,
     #[serde(deserialize_with = "Option::deserialize")]
     pub process_node_id: Option<u64>,
-    pub maintenance_fence: MaintenanceFenceState,
-    pub maintenance_fence_uncertain: bool,
     #[serde(rename = "raft_groups")]
     pub groups: Vec<RaftGroupMetrics>,
     #[serde(deserialize_with = "Option::deserialize")]
@@ -1084,8 +906,6 @@ mod metrics_contract_tests {
             cluster_id: ursula_headers::ClusterId::new("prod-eu-1").unwrap(),
             process_incarnation: ProcessIncarnation::from_bits(1),
             process_node_id: Some(1),
-            maintenance_fence: MaintenanceFenceState::Unclaimed,
-            maintenance_fence_uncertain: false,
             raft_maintenance: Some(RaftMaintenanceReport {
                 version: SchemaVersion,
                 node_id: 1,
@@ -1163,8 +983,6 @@ mod metrics_contract_tests {
         let wire = serde_json::to_value(complete()).unwrap();
         for path in [
             "/process_incarnation",
-            "/maintenance_fence",
-            "/maintenance_fence_uncertain",
             "/raft_groups",
             "/raft_groups/0/current_term",
             "/raft_groups/0/maintenance",

@@ -6,8 +6,6 @@ use anyhow::bail;
 use serde::Deserialize;
 use serde::Serialize;
 use url::Url;
-use ursula_proto::admin::MaintenanceFence;
-use ursula_proto::admin::ProcessIncarnation;
 
 /// Default admin-plane port; must match `server.admin_listen`'s default.
 const DEFAULT_ADMIN_PORT: u16 = 4438;
@@ -26,7 +24,7 @@ pub struct NodeInfo {
     pub host: String,
     /// Advertised Raft address: the node's peer `url`, on its cluster
     /// listener when it sets `server.cluster_listen`. Its host is the default
-    /// `host`, and it is part of a pinned plan. Nodes take each other's addresses
+    /// `host`. Nodes take each other's addresses
     /// from `raft.peers`, never from it. Never read for metrics or
     /// readiness, since a cluster listener serves neither.
     #[serde(default)]
@@ -41,14 +39,6 @@ pub struct NodeInfo {
     /// replacement can be inspected before its cluster DNS record resolves.
     #[serde(default)]
     pub metrics_url: Option<Url>,
-    /// Identity retained by a maintenance plan across CLI invocations. A
-    /// mismatch is terminal; callers must not refresh it after failure.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_process_incarnation: Option<ProcessIncarnation>,
-    /// Immutable token from the admitted cell reservation; never refreshed
-    /// from server metrics or after a precondition failure.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expected_maintenance_fence: Option<MaintenanceFence>,
 }
 
 #[expect(
@@ -133,35 +123,12 @@ impl NodeProvider for StaticNodeProvider {
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
-    #[serde(default)]
-    maintenance_fence: Option<MaintenanceFence>,
     nodes: Vec<RawNode>,
 }
 
 impl RawConfig {
     fn into_nodes(self) -> Result<Vec<NodeInfo>> {
-        let mut nodes = self
-            .nodes
-            .into_iter()
-            .map(RawNode::into_node)
-            .collect::<Result<Vec<_>>>()?;
-        if let Some(fence) = self.maintenance_fence {
-            for node in &mut nodes {
-                if node
-                    .expected_maintenance_fence
-                    .as_ref()
-                    .is_some_and(|expected| expected != &fence)
-                {
-                    bail!(
-                        "node {} executor token disagrees with the cell token",
-                        node.id
-                    );
-                }
-                node.expected_maintenance_fence = Some(fence.clone());
-            }
-        }
-        validate_maintenance_fences(&nodes)?;
-        Ok(nodes)
+        self.nodes.into_iter().map(RawNode::into_node).collect()
     }
 }
 
@@ -178,10 +145,6 @@ struct RawNode {
     client_url: Option<String>,
     #[serde(default)]
     metrics_url: Option<String>,
-    #[serde(default)]
-    expected_process_incarnation: Option<ProcessIncarnation>,
-    #[serde(default)]
-    expected_maintenance_fence: Option<MaintenanceFence>,
     #[serde(default)]
     host: Option<String>,
 }
@@ -242,24 +205,8 @@ impl RawNode {
             http_url,
             client_url,
             metrics_url,
-            expected_process_incarnation: self.expected_process_incarnation,
-            expected_maintenance_fence: self.expected_maintenance_fence,
         })
     }
-}
-
-/// Saved node lists and programmatic consumers must describe one cell token.
-pub(crate) fn validate_maintenance_fences(nodes: &[NodeInfo]) -> Result<()> {
-    let expected = nodes
-        .first()
-        .and_then(|node| node.expected_maintenance_fence.as_ref());
-    if nodes
-        .iter()
-        .any(|node| node.expected_maintenance_fence.as_ref() != expected)
-    {
-        bail!("configured voters must share one immutable maintenance executor token");
-    }
-    Ok(())
 }
 
 fn non_empty(value: &str) -> Option<&str> {
@@ -270,26 +217,6 @@ fn non_empty(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn manifests_round_trip_pinned_incarnations_and_refuse_malformed_identity() {
-        let json = br#"{"nodes":[{"id":1,"host":"node","expected_process_incarnation":"00000000000000000000000000000001"}]}"#;
-        let provider = StaticNodeProvider::from_bytes(json).unwrap();
-        let serialized = serde_json::to_vec(&serde_json::json!({"nodes":provider.nodes})).unwrap();
-        let restored = StaticNodeProvider::from_bytes(&serialized).unwrap();
-        assert_eq!(
-            restored.nodes[0]
-                .expected_process_incarnation
-                .as_ref()
-                .unwrap()
-                .as_str(),
-            "00000000000000000000000000000001"
-        );
-        StaticNodeProvider::from_bytes(
-            br#"{"nodes":[{"id":1,"host":"node","expected_process_incarnation":"invalid"}]}"#,
-        )
-        .expect_err("an invalid process incarnation must be rejected");
-    }
 
     #[tokio::test]
     async fn json_manifest_defaults_admin_url_from_host() {
@@ -362,48 +289,5 @@ admin_url = "http://127.0.0.1:5442"
         assert_eq!(nodes[0].admin_url.as_str(), "http://127.0.0.1:5441/");
         // host falls back to the admin URL's host when not given.
         assert_eq!(nodes[1].host, "127.0.0.1");
-    }
-}
-
-#[cfg(test)]
-mod fence_tests {
-    use serde_json::json;
-
-    use super::StaticNodeProvider;
-
-    #[test]
-    fn cell_token_survives_saved_nodes_and_rejects_inconsistent_plans() {
-        let token = json!({"reservation_id": format!("{:032x}", 1), "executor_id": format!("{:032x}", 2), "generation": 3});
-        let manifest = json!({"maintenance_fence": token, "nodes": [{"id": 1, "host": "a"}, {"id": 2, "host": "b"}]});
-        let provider =
-            StaticNodeProvider::from_bytes(&serde_json::to_vec(&manifest).unwrap()).unwrap();
-        assert!(
-            provider
-                .nodes
-                .iter()
-                .all(|node| node.expected_maintenance_fence.is_some())
-        );
-        let saved = json!({"nodes": provider.nodes});
-        let resumed = StaticNodeProvider::from_bytes(&serde_json::to_vec(&saved).unwrap()).unwrap();
-        assert_eq!(
-            resumed.nodes[0].expected_maintenance_fence,
-            resumed.nodes[1].expected_maintenance_fence
-        );
-        let mut inconsistent = saved.clone();
-        inconsistent["nodes"][1]["expected_maintenance_fence"]["generation"] = json!(4);
-        StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap())
-            .expect_err("inconsistent maintenance fences must be rejected");
-        inconsistent = saved;
-        inconsistent["nodes"][1]
-            .as_object_mut()
-            .unwrap()
-            .remove("expected_maintenance_fence");
-        StaticNodeProvider::from_bytes(&serde_json::to_vec(&inconsistent).unwrap())
-            .expect_err("a missing maintenance fence on one node must be rejected");
-        let mut conflict = manifest;
-        conflict["nodes"][0]["expected_maintenance_fence"] = token;
-        conflict["nodes"][0]["expected_maintenance_fence"]["generation"] = json!(4);
-        StaticNodeProvider::from_bytes(&serde_json::to_vec(&conflict).unwrap())
-            .expect_err("a conflicting maintenance fence must be rejected");
     }
 }

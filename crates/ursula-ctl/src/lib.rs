@@ -1,7 +1,7 @@
 //! Operational library behind the `ursulactl` CLI.
 //!
 //! ursulactl manages logical cluster state over Ursula's admin and metrics
-//! HTTP APIs: leadership placement, readiness, and maintenance ownership. It
+//! HTTP APIs: leadership placement, readiness, recovery and backups. It
 //! executes nothing on hosts. Physical lifecycle (deploying, restarting, and
 //! scaling processes) belongs to the platform, such as Helm and OpenTofu on
 //! Kubernetes or systemd on hosts, and the operator brings their own tunnel
@@ -18,8 +18,6 @@
 //! - [`provider`]: cluster manifest loading and node addressing.
 //! - [`quorum`]: fresh fixed-prefix verification with explicit configured inventory.
 //! - [`recovery`]: recovery plans for a group stalled after an accepted loss.
-//! - [`startup`]: pre-transport Kubernetes startup binding through the shared CAS.
-//! - [`reservation`]: pure shared maintenance ownership and ConfigMap CAS proposals.
 
 pub mod backup;
 pub mod maintenance;
@@ -29,8 +27,6 @@ pub mod plan;
 pub mod provider;
 pub mod quorum;
 pub mod recovery;
-pub mod reservation;
-pub mod startup;
 
 pub use maintenance::CatchUpOptions;
 pub use maintenance::CatchUpOutcome;

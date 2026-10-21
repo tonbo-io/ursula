@@ -11,8 +11,6 @@ use anyhow::bail;
 use reqwest::Client;
 use reqwest::Method;
 use reqwest::RequestBuilder;
-use ursula_proto::admin::MAINTENANCE_FENCE_HEADER;
-use ursula_proto::admin::MaintenanceFenceState;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
 use ursula_proto::admin::ProcessIncarnation;
 pub use ursula_proto::admin::TransferLeaderResponse;
@@ -47,17 +45,9 @@ impl MetricsClient {
         &self.client
     }
 
+    /// Remembers the first incarnation this client observed for a node and
+    /// refuses another one, so a command stops when a node restarts under it.
     fn pin_incarnation(&self, node: &NodeInfo, observed: &ProcessIncarnation) -> Result<()> {
-        if node
-            .expected_process_incarnation
-            .as_ref()
-            .is_some_and(|expected| observed != expected)
-        {
-            bail!(
-                "node {} process incarnation differs from its maintenance plan",
-                node.id
-            );
-        }
         let mut pins = self
             .incarnations
             .lock()
@@ -96,130 +86,10 @@ impl MetricsClient {
         url: url::Url,
     ) -> Result<RequestBuilder> {
         let incarnation = self.observed_incarnation(node).await?;
-        let mut request = self
+        Ok(self
             .client
             .request(method, url)
-            .header(PROCESS_INCARNATION_HEADER, incarnation.as_str());
-        if let Some(fence) = &node.expected_maintenance_fence {
-            request = request.header(MAINTENANCE_FENCE_HEADER, fence.header_value());
-        }
-        Ok(request)
-    }
-
-    /// Install/retire the caller's already-admitted token on one fixed process.
-    /// This does not acquire a cell reservation or refresh either identity.
-    pub async fn set_maintenance_fence(
-        &self,
-        node: &NodeInfo,
-        retire: bool,
-    ) -> Result<MaintenanceFenceState> {
-        let fence = node
-            .expected_maintenance_fence
-            .as_ref()
-            .context("maintenance lifecycle requires a saved executor token")?;
-        node.expected_process_incarnation
-            .as_ref()
-            .context("maintenance lifecycle requires a saved process identity")?;
-        let mut observed = node.clone();
-        // Lifecycle admission intentionally handles Unclaimed/pending/Retired
-        // metrics, but must preserve the immutable process pin.
-        observed.expected_maintenance_fence = None;
-        self.fetch_node(&observed).await?;
-        let operation = if retire { "retire" } else { "activate" };
-        let url = node
-            .admin_url
-            .join(&format!("/__ursula/maintenance/fence/{operation}"))?;
-        let response = self
-            .admin_request(&observed, Method::POST, url)
-            .await?
-            .json(fence)
-            .send()
-            .await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            bail!(
-                "maintenance {operation} at node {} returned {status}: {body}; stop without refreshing authority",
-                node.id
-            );
-        }
-        let reported: MaintenanceFenceState = serde_json::from_str(&body)?;
-        let expected = if retire {
-            MaintenanceFenceState::Retired {
-                fence: fence.clone(),
-            }
-        } else {
-            MaintenanceFenceState::Active {
-                fence: fence.clone(),
-            }
-        };
-        if reported != expected {
-            bail!(
-                "node {} acknowledged a different maintenance executor state",
-                node.id
-            );
-        }
-        Ok(reported)
-    }
-
-    /// Return a manifest pinned to each observed server instance. Refreshing
-    /// one explicit replacement never refreshes another voter's authority.
-    pub async fn pin_nodes(
-        &self,
-        nodes: &[NodeInfo],
-        replacement: Option<u64>,
-    ) -> Result<Vec<NodeInfo>> {
-        crate::provider::validate_maintenance_fences(nodes)?;
-        let ids = nodes.iter().map(|node| node.id).collect::<BTreeSet<_>>();
-        if ids.len() != nodes.len()
-            || nodes.is_empty()
-            || replacement.is_some_and(|id| !ids.contains(&id))
-        {
-            bail!("incarnation binding requires unique configured voters and a known replacement");
-        }
-        let mut pinned = Vec::with_capacity(nodes.len());
-        for configured in nodes {
-            let mut node = configured.clone();
-            if replacement == Some(node.id) {
-                node.expected_process_incarnation = None;
-            }
-            let mut observed = node.clone();
-            if replacement == Some(node.id) {
-                observed.expected_maintenance_fence = None;
-            }
-            let view = self.fetch_node(&observed).await?;
-            if replacement == Some(node.id)
-                && let Some(expected) = &node.expected_maintenance_fence
-            {
-                let unclaimed = view.maintenance_fence == MaintenanceFenceState::Unclaimed;
-                let same = view.maintenance_fence
-                    == (MaintenanceFenceState::Active {
-                        fence: expected.clone(),
-                    });
-                if (!unclaimed && !same) || view.maintenance_fence_uncertain {
-                    bail!(
-                        "replacement node {} has another or unresolved maintenance authority",
-                        node.id
-                    );
-                }
-            }
-            if replacement.is_some()
-                && replacement != Some(node.id)
-                && let Some(expected) = &node.expected_maintenance_fence
-                && view.maintenance_fence
-                    != (MaintenanceFenceState::Active {
-                        fence: expected.clone(),
-                    })
-            {
-                bail!(
-                    "surviving node {} lacks the saved active maintenance authority",
-                    node.id
-                );
-            }
-            node.expected_process_incarnation = Some(view.process_incarnation.clone());
-            pinned.push(node);
-        }
-        Ok(pinned)
+            .header(PROCESS_INCARNATION_HEADER, incarnation.as_str()))
     }
 
     pub async fn serving_readiness(
@@ -278,21 +148,10 @@ impl MetricsClient {
             .into());
         }
         self.pin_incarnation(node, &body.process_incarnation)?;
-        if let Some(expected) = &node.expected_maintenance_fence {
-            let bound = matches!(&body.maintenance_fence,
-                MaintenanceFenceState::Active { fence } | MaintenanceFenceState::Retired { fence } if fence == expected);
-            if !bound || body.maintenance_fence_uncertain {
-                bail!(
-                    "node {} maintenance executor differs from the saved plan or has unresolved work",
-                    node.id
-                );
-            }
-        }
         Ok(NodeMetricsView::new(node.clone(), body))
     }
 
     pub async fn fetch_cluster(&self, nodes: &[NodeInfo]) -> Result<ClusterSnapshot> {
-        crate::provider::validate_maintenance_fences(nodes)?;
         let mut per_node = Vec::with_capacity(nodes.len());
         for node in nodes {
             per_node.push(self.fetch_node(node).await?);
@@ -624,8 +483,6 @@ pub(crate) fn test_metrics(
         cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
         process_incarnation: identity.expect("complete fixture identity"),
         process_node_id: Some(id),
-        maintenance_fence: MaintenanceFenceState::Unclaimed,
-        maintenance_fence_uncertain: false,
         groups: vec![],
         raft_maintenance: None,
     }
@@ -707,7 +564,7 @@ pub(crate) fn test_group(
     }
 }
 
-/// An unclaimed node whose maintenance report expects exactly its groups.
+/// A node whose maintenance report expects exactly its groups.
 #[cfg(test)]
 pub(crate) fn test_view(node: NodeInfo, groups: Vec<RaftGroupView>) -> NodeMetricsView {
     let raft_maintenance = Some(test_maintenance_report(node.id, &groups));
@@ -716,8 +573,6 @@ pub(crate) fn test_view(node: NodeInfo, groups: Vec<RaftGroupView>) -> NodeMetri
         cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
         process_incarnation: ProcessIncarnation::from_bits(1),
         process_node_id,
-        maintenance_fence: MaintenanceFenceState::Unclaimed,
-        maintenance_fence_uncertain: false,
         groups,
         raft_maintenance,
     })
@@ -795,8 +650,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 client_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             },
             current,
             applied,
@@ -806,12 +659,7 @@ mod tests {
 
     #[tokio::test]
     async fn metrics_client_rejects_missing_safety_fields_and_unknown_versions() {
-        for missing in [
-            Some("maintenance_fence_uncertain"),
-            Some("maintenance_fence"),
-            Some("raft_maintenance"),
-            None,
-        ] {
+        for missing in [Some("raft_maintenance"), None] {
             let mut wire =
                 serde_json::to_value(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
                     .unwrap();
@@ -840,8 +688,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 client_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             };
             let result = MetricsClient::new(Duration::from_secs(1))
                 .unwrap()
@@ -885,76 +731,7 @@ mod tests {
                 .to_string()
                 .contains("changed during")
         );
-        let mut refresh = node.clone();
-        refresh.expected_process_incarnation = Some(ProcessIncarnation::from_bits(2));
-        assert!(
-            client
-                .set_maintenance_drain(&refresh, true)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("maintenance plan")
-        );
         assert_eq!(pinned, ProcessIncarnation::from_bits(1));
-        task.abort();
-    }
-
-    #[tokio::test]
-    async fn saved_manifest_binds_survivors_and_only_explicit_replacement_can_change() {
-        let (a, a_identity, _, a_task) =
-            incarnation_node(1, Some(ProcessIncarnation::from_bits(1))).await;
-        let (b, b_identity, _, b_task) =
-            incarnation_node(2, Some(ProcessIncarnation::from_bits(2))).await;
-        let nodes = MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .pin_nodes(&[a, b], None)
-            .await
-            .unwrap();
-        *a_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(3));
-        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
-        client
-            .pin_nodes(&nodes, None)
-            .await
-            .expect_err("a changed process incarnation must not match the saved manifest");
-        let replaced = MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .pin_nodes(&nodes, Some(1))
-            .await
-            .unwrap();
-        assert_eq!(
-            replaced[0].expected_process_incarnation,
-            Some(ProcessIncarnation::from_bits(3))
-        );
-        assert_eq!(
-            replaced[1].expected_process_incarnation,
-            nodes[1].expected_process_incarnation
-        );
-        *b_identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(4));
-        MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .pin_nodes(&nodes, Some(1))
-            .await
-            .expect_err("a changed survivor incarnation must not be replaced silently");
-        a_task.abort();
-        b_task.abort();
-    }
-
-    #[tokio::test]
-    async fn missing_identity_cannot_be_pinned_even_for_an_explicit_replacement() {
-        let (mut node, _, _, task) = incarnation_node(1, None).await;
-        let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
-        for replacement in [None, Some(1)] {
-            client
-                .pin_nodes(&[node.clone()], replacement)
-                .await
-                .expect_err("missing identity cannot authorize a maintenance participant");
-        }
-        node.expected_process_incarnation = Some(ProcessIncarnation::from_bits(1));
-        MetricsClient::new(Duration::from_secs(1))
-            .unwrap()
-            .fetch_node(&node)
-            .await
-            .expect_err("a legacy identity must never match a saved pin");
         task.abort();
     }
 
@@ -1040,8 +817,6 @@ mod tests {
             http_url: None,
             metrics_url: None,
             client_url: None,
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         };
         let error = MetricsClient::new(Duration::from_secs(1))
             .unwrap()
@@ -1098,8 +873,6 @@ mod tests {
             http_url: None,
             metrics_url: None,
             client_url: None,
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
         };
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         client.fetch_node(&node).await.unwrap();
@@ -1157,8 +930,6 @@ mod tests {
                 http_url: None,
                 metrics_url: None,
                 client_url: None,
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
             };
             let result = MetricsClient::new(Duration::from_secs(1))
                 .unwrap()
@@ -1187,8 +958,6 @@ mod tests {
         let tunnel = Url::parse(&format!("http://{address}")).unwrap();
         let advertised = Url::parse("http://replacement.invalid:4437").unwrap();
         let node = NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: tunnel.clone(),
             host: "replacement".to_owned(),
@@ -1243,8 +1012,6 @@ mod tests {
                 .unwrap();
             });
             let node = NodeInfo {
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
                 id: 1,
                 admin_url: Url::parse(&format!("http://{address}")).unwrap(),
                 host: address.to_string(),
@@ -1284,8 +1051,6 @@ mod tests {
     #[test]
     fn metrics_use_client_url_when_available() {
         let node = NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),
@@ -1306,8 +1071,6 @@ mod tests {
     #[test]
     fn metrics_fall_back_to_admin_url_for_legacy_manifests() {
         let node = NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id: 1,
             admin_url: Url::parse("http://127.0.0.1:4438").expect("admin url"),
             host: "127.0.0.1".to_owned(),

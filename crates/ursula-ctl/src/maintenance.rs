@@ -622,8 +622,6 @@ mod tests {
             });
             let url = url::Url::parse(&format!("http://{address}")).unwrap();
             nodes.push(NodeInfo {
-                expected_process_incarnation: None,
-                expected_maintenance_fence: None,
                 id: node_id,
                 admin_url: url.clone(),
                 host: address.to_string(),
@@ -637,8 +635,6 @@ mod tests {
 
     fn n(id: u64, host: &str) -> NodeInfo {
         NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id,
             admin_url: url::Url::parse(&format!("http://{host}:4438")).unwrap(),
             host: host.to_owned(),

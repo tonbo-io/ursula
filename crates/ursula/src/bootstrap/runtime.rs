@@ -105,17 +105,6 @@ pub fn spawn_runtime(
     persistence: Persistence,
     topology: Topology,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
-    spawn_runtime_with_maintenance_drain(config, persistence, topology, false)
-}
-
-/// Spawn a runtime and install the operator drain fence before any Raft core
-/// or background leadership worker can observe the process.
-pub(crate) fn spawn_runtime_with_maintenance_drain(
-    config: &ursula_config::UrsulaConfig,
-    persistence: Persistence,
-    topology: Topology,
-    start_maintenance_drained: bool,
-) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let mut runtime_config =
         RuntimeConfig::from_ursula_config(&config.runtime, topology.raft_group_count());
     runtime_config.raft_max_uncommitted_bytes_per_group =
@@ -151,9 +140,6 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
             config.raft.snapshot_install_max_concurrency,
             config.raft.install_snapshot_timeout.as_duration(),
         );
-    if start_maintenance_drained {
-        registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
-    }
 
     let cold_store = if config.storage.cold.backend != ColdBackend::None {
         Some(Arc::new(ColdStore::try_new(&config.storage.cold).map_err(

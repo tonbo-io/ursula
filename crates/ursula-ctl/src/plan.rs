@@ -273,8 +273,6 @@ mod tests {
 
     fn node(id: u64) -> NodeInfo {
         NodeInfo {
-            expected_process_incarnation: None,
-            expected_maintenance_fence: None,
             id,
             admin_url: Url::parse(&format!("http://10.0.0.{id}:4438")).unwrap(),
             host: format!("10.0.0.{id}"),

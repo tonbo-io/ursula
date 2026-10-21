@@ -31,7 +31,6 @@ pub use meta::SpawnedMeta;
 pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
-pub(crate) use runtime::spawn_runtime_with_maintenance_drain;
 pub use snapshot::SnapshotDriveSettings;
 pub use snapshot::SnapshotDriver;
 // Internals the crate's unit tests exercise directly.
