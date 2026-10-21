@@ -161,6 +161,21 @@ pub enum Defence {
     /// leadership, so an upload that waited across a re-election commits
     /// under the next one.
     UploadFence,
+    /// Before the meta group forms, the genesis node's drivers ask every
+    /// `raft.peers` node with the genesis probe, so a node that holds meta
+    /// history but is no meta voter holds the genesis back (design 3.5). Off,
+    /// they ask only the claimed meta voters, so meta voters that lost
+    /// everything form a second meta group beside the learners' history.
+    GenesisEveryPeer,
+    /// A node whose data journals hold records opens a lost meta journal
+    /// `Recovering` (D9's S1 rule), so its closed gate rejoins the meta group
+    /// it belonged to. Off, it opens the lost journal empty, so meta voters
+    /// whose meta directories are gone form a second meta group.
+    MetaOverDataHistory,
+    /// The meta journal syncs every append, whatever the data journals run.
+    /// Off, it runs the data journals' policy, so a power loss under `never`
+    /// loses acknowledged meta writes.
+    MetaAlwaysSync,
 }
 
 #[cfg(madsim)]
@@ -170,8 +185,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 33]> = const { Cell::new([false; 33]) };
-        static FIRED: Cell<[u64; 33]> = const { Cell::new([0; 33]) };
+        static OFF: Cell<[bool; 36]> = const { Cell::new([false; 36]) };
+        static FIRED: Cell<[u64; 36]> = const { Cell::new([0; 36]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -209,6 +224,9 @@ mod switches {
             Defence::SnapshotGc => 30,
             Defence::NoPassBeforeRestore => 31,
             Defence::UploadFence => 32,
+            Defence::GenesisEveryPeer => 33,
+            Defence::MetaOverDataHistory => 34,
+            Defence::MetaAlwaysSync => 35,
         }
     }
 
@@ -231,7 +249,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 33]));
+        FIRED.with(|fired| fired.set([0; 36]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

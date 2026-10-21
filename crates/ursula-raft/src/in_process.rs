@@ -343,6 +343,163 @@ impl InProcessRegistry<RaftGroupStateMachine> {
     }
 }
 
+/// The meta plane delivers through each node's production registry, to the
+/// meta replica it publishes when the RPC arrives ([`ActiveMeta`]), as the
+/// gRPC service routes the meta plane's RPCs. A node whose registry
+/// publishes no meta replica answers as an engine that stopped. A full
+/// snapshot goes through [`ActiveMeta::install_full_snapshot`], which
+/// refuses a pointer that is not inline before OpenRaft sees it.
+///
+/// The registry holds no meta Raft by node, since a meta replica restarts
+/// under its node's registry for a recovery plan. So the network delivers
+/// no meta leadership transfer and records no meta conflict below a matched
+/// index: nothing in a simulation transfers meta's leadership.
+///
+/// [`ActiveMeta`]: crate::meta::replica::ActiveMeta
+/// [`ActiveMeta::install_full_snapshot`]: crate::meta::replica::ActiveMeta::install_full_snapshot
+impl InProcessEndpoint for crate::meta::MetaStateMachine {
+    type Endpoint = crate::RaftGroupHandleRegistry;
+
+    fn gate(registry: &Self::Endpoint) -> Option<RecoveryGateStatus> {
+        registry
+            .meta()?
+            .core
+            .recovery
+            .as_ref()
+            .map(|gate| gate.status())
+    }
+
+    fn append_entries(
+        registry: &Self::Endpoint,
+        rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
+    ) -> impl Future<
+        Output = Result<
+            AppendEntriesResponse<UrsulaRaftTypeConfig>,
+            ursula_runtime::GroupEngineError,
+        >,
+    > + Send {
+        let meta = registry.meta();
+        async move {
+            match meta {
+                Some(meta) => meta.append_entries(rpc).await,
+                None => Err(no_meta_replica()),
+            }
+        }
+    }
+
+    fn vote(
+        registry: &Self::Endpoint,
+        rpc: VoteRequest<UrsulaRaftTypeConfig>,
+    ) -> impl Future<
+        Output = Result<VoteResponse<UrsulaRaftTypeConfig>, ursula_runtime::GroupEngineError>,
+    > + Send {
+        let meta = registry.meta();
+        async move {
+            match meta {
+                Some(meta) => meta.vote(rpc).await,
+                None => Err(no_meta_replica()),
+            }
+        }
+    }
+
+    fn install_full_snapshot(
+        registry: &Self::Endpoint,
+        vote: VoteOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
+    ) -> impl Future<Output = Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError>> + Send
+    {
+        let meta = registry.meta();
+        async move {
+            match meta {
+                Some(meta) => meta.install_full_snapshot(vote, snapshot).await,
+                None => Err(SnapshotInstallError::Group(no_meta_replica())),
+            }
+        }
+    }
+
+    fn validate_incoming_transfer(
+        _registry: &Self::Endpoint,
+        _target: u64,
+        _request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
+    ) -> Result<(), crate::IncomingTransferError> {
+        // Never asked: the registry holds no meta Raft to transfer to.
+        Ok(())
+    }
+}
+
+/// The refusal of a node whose registry publishes no meta replica.
+fn no_meta_replica() -> ursula_runtime::GroupEngineError {
+    ursula_runtime::GroupEngineError::Infra(ursula_runtime::GroupInfraError::OwnerStopped)
+}
+
+/// The meta plane's in-process registry: each node's production registry.
+pub type InProcessMetaRegistry = InProcessRegistry<crate::meta::MetaStateMachine>;
+
+/// The meta plane's in-process network factory.
+pub type InProcessMetaNetworkFactory = InProcessNetworkFactory<crate::meta::MetaStateMachine>;
+
+impl InProcessRegistry<crate::meta::MetaStateMachine> {
+    /// Makes `registry`, node `node_id`'s production registry, the one the
+    /// meta plane's RPCs to the node go through.
+    pub fn register(&self, node_id: u64, registry: &crate::RaftGroupHandleRegistry) {
+        self.endpoints
+            .lock()
+            .expect("endpoint registry")
+            .insert(node_id, registry.clone());
+    }
+
+    /// The genesis probe RPC on `node_id` ([`genesis_probe_in_process`]).
+    pub async fn genesis_probe(
+        &self,
+        node_id: u64,
+        probe: crate::meta::genesis::GenesisProbe,
+    ) -> Option<crate::PeerGroupLog> {
+        let endpoint = self.endpoint(node_id)?;
+        genesis_probe_in_process(&endpoint, probe).await
+    }
+
+    /// The bootstrap probe vote on `node_id`'s meta replica, screened by its
+    /// gate: no answer from a node that runs none.
+    pub async fn probe(&self, node_id: u64) -> Option<crate::PeerGroupLog> {
+        let meta = self.endpoint(node_id)?.meta()?;
+        meta.vote(crate::bootstrap_probe_vote())
+            .await
+            .ok()
+            .map(|response| crate::PeerGroupLog::from_vote_response(&response))
+    }
+
+    /// The meta barrier RPC's server side on `node_id`: a node that runs no
+    /// meta replica confirms none.
+    pub async fn confirm_recovery_barrier(
+        &self,
+        node_id: u64,
+    ) -> Result<crate::BarrierAnswer, crate::QuorumProofError> {
+        let not_registered = crate::QuorumProofError::NotRegistered {
+            group: crate::meta::state_machine::META_GROUP,
+        };
+        let meta = self
+            .endpoint(node_id)
+            .and_then(|registry| registry.meta())
+            .ok_or(not_registered)?;
+        meta.confirm_recovery_barrier().await
+    }
+
+    /// A control command `sender` forwards to the meta leader `node_id`
+    /// ([`forward_control_in_process`]). A node that is not registered is a
+    /// leader that cannot be reached.
+    pub async fn write_meta(
+        &self,
+        node_id: u64,
+        command: ursula_control::ControlCommand,
+        sender: ursula_proto::placement::NodeId,
+    ) -> Result<ursula_control::ControlResponse, crate::meta::MetaForwardError> {
+        let Some(endpoint) = self.endpoint(node_id) else {
+            return Err(crate::meta::MetaForwardError::leader_unreachable());
+        };
+        forward_control_in_process(&endpoint, node_id, command, sender).await
+    }
+}
+
 /// The genesis probe as the node whose production registry is `registry`
 /// answers it, and as the gRPC sender reads the answer: no answer from a
 /// node that runs no meta replica or whose replica refuses the probe vote.

@@ -360,10 +360,25 @@ impl JournalCluster {
         for node_id in 1..=voters {
             cluster.start_node(node_id).await;
         }
+        cluster.form_groups().await;
+        cluster
+    }
+
+    /// `nodes` nodes, `1..=nodes`, every one a voter of every group, whose
+    /// WALs run with `tuning`, provisioned and not started: a caller that
+    /// runs more on each node (the meta harness) starts each node itself,
+    /// then forms the groups ([`Self::form_groups`]). The other
+    /// constructors and their draws stay as they are.
+    pub(super) fn provisioned(name: &str, tuning: JournalTuning, nodes: u64) -> Self {
+        Self::unstarted_voters(name, tuning, nodes, 0)
+    }
+
+    /// Creates each group's stream through its leader once every voter
+    /// started, and waits until every gate opened.
+    pub(super) async fn form_groups(&mut self) {
         for group in JOURNAL_GROUPS {
-            let leader = cluster.leader(group).await;
-            cluster
-                .engines
+            let leader = self.leader(group).await;
+            self.engines
                 .get_mut(&(group, leader))
                 .expect("leader replica")
                 .create_stream(
@@ -375,11 +390,10 @@ impl JournalCluster {
                 .expect("create the group's stream");
         }
         // The followers' gates open once they applied the leader's barrier.
-        cluster.wait_gates_open(Duration::from_secs(5)).await;
+        self.wait_gates_open(Duration::from_secs(5)).await;
         // The first election of a new group may take the votes of replicas
         // whose history is still unknown; scenarios check the votes after it.
-        cluster.votes.clear();
-        cluster
+        self.votes.clear();
     }
 
     #[cfg(test)]
@@ -808,6 +822,15 @@ impl JournalCluster {
     /// Appends `count` payloads through the group's leader, retrying while
     /// leadership moves.
     pub(super) async fn append(&mut self, group: u32, count: usize) {
+        assert!(
+            self.try_append(group, count).await,
+            "group {group} accepts no append"
+        );
+    }
+
+    /// [`Self::append`], answering `false` at the first payload the group
+    /// does not accept instead of panicking.
+    pub(super) async fn try_append(&mut self, group: u32, count: usize) -> bool {
         for _ in 0..count {
             let acknowledged = self.acknowledged.entry(group).or_default();
             let payload = format!("g{group}-{};", acknowledged.len()).into_bytes();
@@ -829,12 +852,15 @@ impl JournalCluster {
                 }
                 madsim::time::sleep(Duration::from_millis(50)).await;
             }
-            assert!(appended, "group {group} accepts no append");
+            if !appended {
+                return false;
+            }
             self.acknowledged
                 .entry(group)
                 .or_default()
                 .extend_from_slice(&payload);
         }
+        true
     }
 
     /// Whether OpenRaft stopped the replica after a storage error.

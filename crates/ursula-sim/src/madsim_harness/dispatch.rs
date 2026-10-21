@@ -52,6 +52,8 @@ use super::introspect::has_cold_read_fault_in_fault_plan;
 use super::leader_reads::run_leader_read_linearizability_inner;
 use super::membership_rollback::Controls as MembershipRollbackControls;
 use super::membership_rollback::run_membership_rollback_inner;
+use super::placement_move::Controls as PlacementMoveControls;
+use super::placement_move::run_placement_move_inner;
 use super::routing::Controls as RoutingControls;
 use super::routing::run_routing_before_body_inner;
 use super::run_cold_delete_fault_inner;
@@ -79,6 +81,7 @@ use super::run_runtime_raft_snapshot_install_inner;
 use super::run_runtime_seeded_interleaving_inner;
 use super::run_snapshot_catch_up_inner;
 use super::run_with_madsim;
+use super::run_with_madsim_for;
 use super::runtime_interleaving_plan_from_fault_plan;
 use super::runtime_raft_network_workload_plan_from_fault_plan;
 use super::snapshot_objects::Controls as SnapshotObjectsControls;
@@ -86,6 +89,9 @@ use super::snapshot_objects::run_snapshot_objects_inner;
 use super::write_keys::Controls;
 use super::write_keys::run_idle_expiry_cannot_reopen_an_epoch_inner;
 use super::write_keys::run_producer_repeats_are_exactly_once_inner;
+
+/// The simulated time a placement-move run may take.
+const PLACEMENT_MOVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(150);
 
 /// Runs one scenario workload under a fresh madsim runtime for `seed` and
 /// wraps the outcome into a `SimReport`.
@@ -317,7 +323,26 @@ impl ThreeNodeRaftSim {
                     SnapshotObjectsControls::default(),
                 )
             }
+            SimScenario::PlacementMove => Self::run_placement_move_with_controls_report(
+                config,
+                PlacementMoveControls::default(),
+            ),
         }
+    }
+
+    /// Runs the placement-move family's meta seeds with `controls`, with
+    /// room for the meta group's elections (up to 3 s each) in every phase.
+    pub(super) fn run_placement_move_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: PlacementMoveControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        run_with_madsim_for(seed, PLACEMENT_MOVE_LIMIT, async move {
+            SimReport {
+                scenario: SimScenario::PlacementMove,
+                outcome: run_placement_move_inner(config, controls).await,
+            }
+        })
     }
 
     /// Runs the snapshot-ownership scenario (#687) with `controls`.

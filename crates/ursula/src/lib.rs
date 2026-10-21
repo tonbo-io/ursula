@@ -144,6 +144,7 @@ use ursula_raft::RAFT_GRPC_REJOIN_BARRIER_PATH;
 use ursula_raft::RAFT_GRPC_TRANSFER_LEADER_PATH;
 use ursula_raft::RAFT_GRPC_VOTE_PATH;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_raft::RaftGrpcService;
 use ursula_raft::SelfElectionError;
 use ursula_raft::SnapshotStartError;
@@ -2183,12 +2184,15 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
             process_node_id: state
                 .node_id()
                 .or_else(|| raft_groups.first().map(|group| group.node_id)),
-            groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
+            groups: raft_groups
+                .iter()
+                .map(RaftGroupMetricsSnapshot::to_admin)
+                .collect(),
             meta: state
                 .raft_registry()
                 .and_then(RaftGroupHandleRegistry::meta_metrics_snapshot)
                 .as_ref()
-                .map(render::raft_group_metrics),
+                .map(RaftGroupMetricsSnapshot::to_admin),
             raft_maintenance: state.raft_maintenance_report(),
         },
         runtime: render_metrics(

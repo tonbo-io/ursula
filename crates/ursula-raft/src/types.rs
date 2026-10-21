@@ -223,6 +223,44 @@ pub struct RaftGroupMetricsSnapshot {
     pub leads_live: bool,
 }
 
+impl RaftGroupMetricsSnapshot {
+    /// The replica's metrics as the admin JSON of `GET /__ursula/raft`
+    /// renders them, and as `ursulactl recover-group` reads them.
+    pub fn to_admin(&self) -> ursula_proto::admin::RaftGroupMetrics {
+        ursula_proto::admin::RaftGroupMetrics {
+            raft_group_id: u64::from(self.raft_group_id),
+            node_id: self.node_id,
+            current_term: self.current_term,
+            current_leader: self.current_leader,
+            committed_index: self.committed.map(|progress| progress.index),
+            last_applied_index: self.last_applied.map(|progress| progress.index),
+            voter_ids: self.voter_ids.clone(),
+            voter_configs: self.voter_configurations.clone(),
+            committed_voter_configs: self.committed_voter_configurations.clone(),
+            learner_ids: self.learner_ids.clone(),
+            maintenance: self.maintenance.clone(),
+            last_log_index: self.last_log.map(|progress| progress.index),
+            last_log_term: self.last_log.map(|progress| progress.term),
+            committed_term: self.committed.map(|progress| progress.term),
+            committed_node: self.committed.map(|progress| progress.node_id),
+            last_applied_term: self.last_applied.map(|progress| progress.term),
+            snapshot_term: self.snapshot.map(|progress| progress.term),
+            snapshot_index: self.snapshot.map(|progress| progress.index),
+            purged_term: self.purged.map(|progress| progress.term),
+            purged_index: self.purged.map(|progress| progress.index),
+            log_bytes_since_snapshot: self.log.log_bytes,
+            log_entries_since_snapshot: self.log.log_entries,
+            last_snapshot_bytes: self.log.last_snapshot_bytes,
+            has_snapshot: self.log.has_snapshot,
+            apply_failure: self.apply_failure.clone(),
+            history: self.history,
+            recovery: self.recovery,
+            recovery_gate: self.recovery_gate,
+            leads_live: self.leads_live,
+        }
+    }
+}
+
 pub use ursula_proto::admin::RaftGroupMaintenanceState;
 
 /// Static gRPC Raft cluster membership configuration.

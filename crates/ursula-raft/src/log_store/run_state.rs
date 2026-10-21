@@ -1216,8 +1216,7 @@ impl NodeWal {
                 }
             })?;
         let snapshot_record = dir.join(super::file::snapshot_record_file(raft_group_id.0));
-        let lost = matches!(self.data_history, JournalHistory::Records { .. })
-            || Disk::exists(&snapshot_record);
+        let lost = held_data_history(self.data_history) || Disk::exists(&snapshot_record);
         let marked = lost && metadata.initialize(raft_group_id.0, GroupLogState::Recovering);
         if missing || marked {
             metadata
@@ -1253,6 +1252,24 @@ impl NodeWal {
             })?;
         Ok(CleanExit { _lock: lock })
     }
+}
+
+/// Whether the data journals held records at start, so a lost meta journal
+/// is meta history that was lost (D9's S1 rule). A negative control turns
+/// it off (`Defence::MetaOverDataHistory`).
+fn held_data_history(data_history: JournalHistory) -> bool {
+    let held = matches!(data_history, JournalHistory::Records { .. });
+    if held
+        && ursula_stream::sim_controls::off(
+            ursula_stream::sim_controls::Defence::MetaOverDataHistory,
+        )
+    {
+        ursula_stream::sim_controls::note_fired(
+            ursula_stream::sim_controls::Defence::MetaOverDataHistory,
+        );
+        return false;
+    }
+    held
 }
 
 /// A run-state file with distinct values in the fields of one type, for the

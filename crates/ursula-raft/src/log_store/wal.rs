@@ -462,7 +462,7 @@ impl RaftWal {
             previous_run: opening.previous_run,
             core: META_PLACEMENT.core_id,
             tuning: JournalTuning {
-                fsync: META_FSYNC,
+                fsync: meta_fsync(self.tuning.fsync),
                 segment_bytes: self.tuning.segment_bytes,
                 group_cache_bytes: META_CACHE_BYTES,
             },
@@ -646,6 +646,21 @@ impl PredecessorWait {
 pub struct WalMaintenance {
     lagging: Arc<LaggingGroups>,
     journals: MaintainedJournals,
+}
+
+/// The meta journal's policy: `always`, whatever the data journals run
+/// (`data`). A negative control turns it off (`Defence::MetaAlwaysSync`),
+/// and the meta journal then runs the data journals' policy.
+fn meta_fsync(data: WalFsync) -> WalFsync {
+    if data != META_FSYNC
+        && ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::MetaAlwaysSync)
+    {
+        ursula_stream::sim_controls::note_fired(
+            ursula_stream::sim_controls::Defence::MetaAlwaysSync,
+        );
+        return data;
+    }
+    META_FSYNC
 }
 
 /// The journals a [`WalMaintenance`] maintains.

@@ -1039,46 +1039,15 @@ pub(crate) fn render_metrics(
     }
 }
 
-pub(crate) fn raft_group_metrics(
-    value: &RaftGroupMetricsSnapshot,
-) -> ursula_proto::admin::RaftGroupMetrics {
-    ursula_proto::admin::RaftGroupMetrics {
-        raft_group_id: u64::from(value.raft_group_id),
-        node_id: value.node_id,
-        current_term: value.current_term,
-        current_leader: value.current_leader,
-        committed_index: value.committed.map(|progress| progress.index),
-        last_applied_index: value.last_applied.map(|progress| progress.index),
-        voter_ids: value.voter_ids.clone(),
-        voter_configs: value.voter_configurations.clone(),
-        committed_voter_configs: value.committed_voter_configurations.clone(),
-        learner_ids: value.learner_ids.clone(),
-        maintenance: value.maintenance.clone(),
-        last_log_index: value.last_log.map(|progress| progress.index),
-        last_log_term: value.last_log.map(|progress| progress.term),
-        committed_term: value.committed.map(|progress| progress.term),
-        committed_node: value.committed.map(|progress| progress.node_id),
-        last_applied_term: value.last_applied.map(|progress| progress.term),
-        snapshot_term: value.snapshot.map(|progress| progress.term),
-        snapshot_index: value.snapshot.map(|progress| progress.index),
-        purged_term: value.purged.map(|progress| progress.term),
-        purged_index: value.purged.map(|progress| progress.index),
-        log_bytes_since_snapshot: value.log.log_bytes,
-        log_entries_since_snapshot: value.log.log_entries,
-        last_snapshot_bytes: value.log.last_snapshot_bytes,
-        has_snapshot: value.log.has_snapshot,
-        apply_failure: value.apply_failure.clone(),
-        history: value.history,
-        recovery: value.recovery,
-        recovery_gate: value.recovery_gate,
-        leads_live: value.leads_live,
-    }
-}
-
 #[cfg(test)]
 pub(crate) fn render_raft_group_metrics_array(values: &[RaftGroupMetricsSnapshot]) -> Value {
-    serde_json::to_value(values.iter().map(raft_group_metrics).collect::<Vec<_>>())
-        .unwrap_or(Value::Null)
+    serde_json::to_value(
+        values
+            .iter()
+            .map(RaftGroupMetricsSnapshot::to_admin)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or(Value::Null)
 }
 
 pub(crate) fn should_base64_encode_sse_data(content_type: &str) -> bool {

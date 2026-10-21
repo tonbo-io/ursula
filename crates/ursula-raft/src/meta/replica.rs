@@ -252,6 +252,11 @@ impl ActiveMeta {
         answer
     }
 
+    /// The meta history event this replica applied last, if any.
+    pub fn applied_history(&self) -> Option<ursula_stream::HistoryEvent> {
+        self.core.history.applied()
+    }
+
     /// Reports the commit screen's `refusal` of a `screened` request that
     /// carried `vote` when it damaged this replica for good
     /// ([`super::damage`]).

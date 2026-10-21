@@ -165,7 +165,6 @@ impl SimNodeWal {
     /// Opens the meta group's log store from the node's meta journal, kept
     /// apart from data group 0's store. A meta journal that does not open is
     /// reported, as the production WAL reports it.
-    #[expect(dead_code, reason = "the meta harness opens the meta group's store")]
     pub(super) fn open_meta(
         &self,
         metrics: GroupEngineMetrics,
