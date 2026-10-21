@@ -44,8 +44,8 @@ pub struct SpawnedRuntime {
     pub raft_wal: Option<RaftWal>,
     /// The meta journal, opened before the runtime started, with what the
     /// meta runtime starts with, when the node runs Raft. The server
-    /// starts it ([`SpawnedMeta::start`]); a caller that does not runs no
-    /// meta, and the journal closes when this drops.
+    /// starts it ([`SpawnedMeta::start`]). A caller that does not start it
+    /// runs no meta, and the WAL's shutdown closes the journal.
     pub meta: Option<SpawnedMeta>,
 }
 
@@ -207,6 +207,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         GroupStorage::Raft(wal) => Some(
             meta::open_meta(
                 config,
+                &topology,
                 wal,
                 &registry,
                 &shard_map,

@@ -28,6 +28,8 @@ use ursula_raft::meta::runtime::MetaJournal;
 use ursula_raft::meta::runtime::MetaRuntimeConfig;
 use ursula_shard::ShardMapError;
 
+use crate::bootstrap::topology::Topology;
+
 /// What the spawn path prepared for the meta runtime: the opened meta
 /// journal, the node's peer identity, WAL and registry, and the meta
 /// runtime's config.
@@ -77,12 +79,13 @@ impl MetaSlot {
 }
 
 /// Binds this node's peer identity, its Raft node id and the cluster id
-/// of its WAL root, with its address book
-/// ([`ursula_config::RaftConfig::address_book`]), then opens the meta
-/// journal under `raft-log/meta/`. A journal that does not open is handed
-/// on as such: the meta runtime then runs `Damaged` and the node serves.
+/// of its WAL root, with its peers, both read from `topology` alone
+/// ([`node_and_peers`]), then opens the meta journal under
+/// `raft-log/meta/`. A journal that does not open is handed on as such:
+/// the meta runtime then runs `Damaged` and the node serves.
 pub(crate) fn open_meta(
     config: &ursula_config::UrsulaConfig,
+    topology: &Topology,
     wal: &RaftWal,
     registry: &RaftGroupHandleRegistry,
     shard_map: &ursula_shard::StaticShardMap,
@@ -90,14 +93,11 @@ pub(crate) fn open_meta(
     snapshots: MetaSnapshotTrigger,
 ) -> Result<SpawnedMeta, ShardMapError> {
     let raft = &config.raft;
-    let identity = PeerIdentity::new(raft.node_id, wal.cluster_id().clone());
-    let book = raft.address_book(&self_url(&config.server));
-    registry
-        .peer_cluster()
-        .bind(identity.clone(), PeerDirectory::from_config(&book));
+    let (node_id, directory) = node_and_peers(config, topology);
+    let identity = PeerIdentity::new(node_id, wal.cluster_id().clone());
+    let peers = NodeSet::from_first(NodeId::new(node_id), directory.node_ids().map(NodeId::new));
+    registry.peer_cluster().bind(identity.clone(), directory);
 
-    let me = NodeId::new(raft.node_id);
-    let peers = NodeSet::from_first(me, book.iter().map(|peer| NodeId::new(peer.node_id)));
     let group_count = NonZeroU32::new(shard_map.raft_group_count())
         .map(GroupCount::new)
         .ok_or(ShardMapError::ZeroRaftGroups)?;
@@ -120,7 +120,7 @@ pub(crate) fn open_meta(
         wal: wal.clone(),
         registry: registry.clone(),
         config: MetaRuntimeConfig {
-            node: raft.node_id,
+            node: node_id,
             claim,
             formation: FormationParams {
                 max_concurrent_moves: raft.placement.max_concurrent_moves,
@@ -130,6 +130,24 @@ pub(crate) fn open_meta(
             snapshots: Some(snapshots),
         },
     })
+}
+
+/// The node this process runs as and its peers, from the topology the
+/// runtime spawns with, so the bound identity and the data groups' static
+/// factory read one source: a static cluster's node id and peers, or, on a
+/// single node, `raft.node_id` with its address book
+/// ([`ursula_config::RaftConfig::address_book`]).
+fn node_and_peers(
+    config: &ursula_config::UrsulaConfig,
+    topology: &Topology,
+) -> (u64, PeerDirectory) {
+    match topology {
+        Topology::StaticCluster { node_id, peers, .. } => (*node_id, peers.clone()),
+        Topology::SingleNode { .. } => (
+            config.raft.node_id,
+            PeerDirectory::from_config(&config.raft.address_book(&self_url(&config.server))),
+        ),
+    }
 }
 
 /// The cluster URL of a node whose `raft.peers` is empty, for its own
