@@ -297,8 +297,8 @@ impl NodeFence {
         self.0.origin.checked_add(Duration::from_nanos(lifted))
     }
 
-    /// The check right before a PUT or DELETE of `object` at `path` is
-    /// sent, retries included.
+    /// The check before a store call that PUTs or DELETEs `object` at
+    /// `path`. The store's own retries of the call are not checked again.
     pub fn check_write(
         &self,
         object: FencedObject,
@@ -324,6 +324,11 @@ impl NodeFence {
     /// clean end of the run.
     pub fn close(&self) {
         self.0.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the fence closed for good ([`Self::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::Acquire)
     }
 
     /// Whether a predecessor of this run may still run and is not waited

@@ -28,8 +28,9 @@ use ursula_runtime::node_fence::FenceStatus;
 use ursula_runtime::node_fence::fence_now;
 
 use crate::LeadershipShedReason;
+use crate::PredecessorWait;
 use crate::RaftGroupHandleRegistry;
-use crate::RaftWal;
+use crate::RaftWalError;
 use crate::WaitFrom;
 use crate::rt::sync::watch;
 
@@ -89,18 +90,22 @@ pub async fn run_fence_gate(registry: RaftGroupHandleRegistry, fence: NodeFence)
     }
 }
 
-/// Waits out the predecessor of `wal`'s run, if the run owes it a wait,
-/// then records the wait finished and lifts the leadership shed. An empty
-/// root's wait starts with the first answer `registration` publishes.
+/// Waits out the predecessor of a run that owes it a wait
+/// ([`crate::RaftWal::predecessor_wait`]), then records the wait finished
+/// and lifts the leadership shed. An empty root's wait starts with the
+/// first answer `registration` publishes. The shutdown ends this task
+/// before it closes the WAL, and a record after the fence closed is
+/// refused, so no end of a wait is written once a successor may run.
 pub async fn run_predecessor_wait(
-    wal: RaftWal,
+    wait: Option<PredecessorWait>,
     registry: RaftGroupHandleRegistry,
     mut registration: watch::Receiver<RegistrationStatus>,
 ) {
-    let Some(from) = wal.predecessor_wait() else {
+    let Some(wait) = wait else {
         return;
     };
-    let fence = wal.fence();
+    let from = wait.from();
+    let fence = wait.fence().clone();
     sync_fence_shed(&registry, &fence);
     let started = match from {
         WaitFrom::Open(opened) => Some(opened),
@@ -131,7 +136,15 @@ pub async fn run_predecessor_wait(
         let waited = fence_now().saturating_duration_since(started);
         crate::rt::time::sleep(PREDECESSOR_WAIT.saturating_sub(waited)).await;
     }
-    while let Err(error) = wal.finish_predecessor_wait() {
+    while let Err(error) = wait.finish() {
+        if let RaftWalError::Fenced {
+            status: FenceStatus::Closed,
+            ..
+        } = error
+        {
+            tracing::info!("the run shut down before its predecessor wait was recorded finished");
+            return;
+        }
         tracing::error!(
             error = %ursula_runtime::ErrorChain(&error),
             "could not record the predecessor wait finished; trying again"

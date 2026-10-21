@@ -3576,6 +3576,45 @@ async fn shard_runtime_restarts_one_group_engine_from_its_log_store() {
     assert_eq!(read.payload, b"kept+more");
 }
 
+/// The single-node factory hands its engines the WAL's fence, so the one
+/// leader predicate stops a fenced single node's leader-gated jobs as it
+/// does a cluster node's. Catches an engine whose leadership reads an
+/// unleased fence because its factory gave it no peer cluster.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_node_engine_leads_nothing_once_its_wal_fence_closes() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let registry = RaftGroupHandleRegistry::default();
+    let wal = RaftWal::start_in_cluster(
+        wal_root.path(),
+        crate::JournalTuning::new(WalFsync::Never),
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        ursula_proto::placement::NodeId::new(1),
+        None,
+        ursula_runtime::NodeFence::leased(Duration::from_secs(5)),
+    )
+    .expect("start the Raft WAL");
+    let factory = DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone());
+    let runtime = ShardRuntime::spawn_with_engine_factory(hosted_config(1, 1), factory)
+        .expect("spawn runtime with raft group engine factory");
+    let stream_id = bsid("fenced-single-node");
+    runtime
+        .create_stream(create_req(stream_id.clone()))
+        .await
+        .expect("create");
+    let raft_group_id = runtime.locate(&stream_id).raft_group_id;
+    let owner = registry
+        .entry(raft_group_id)
+        .expect("the group's engine is registered")
+        .raft()
+        .clone();
+    assert!(owner.is_leader(), "the single node leads its group");
+    assert!(owner.leadership().upload_fence().is_some());
+    wal.fence().close();
+    assert!(!owner.is_leader(), "a fenced single node leads nothing");
+    assert_eq!(owner.leadership().upload_fence(), None);
+}
+
 /// A restart whose old engine's OpenRaft work does not end keeps the group
 /// closed (#709): the shutdown fails typed, a request that would start the
 /// group again is refused at once, typed, while that work runs, and the

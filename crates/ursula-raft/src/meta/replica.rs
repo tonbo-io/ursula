@@ -572,10 +572,7 @@ impl MetaReplica {
         let ledger = wal.engine_work_ledger();
         ledger.record_meta(openraft_work.ended());
         let core = ReplicaCore {
-            barrier: Arc::new(ReadIndexBarrier::new(
-                raft.clone(),
-                registry.peer_cluster().fence(),
-            )),
+            barrier: Arc::new(ReadIndexBarrier::new(raft.clone(), wal.fence())),
             recovery: Some(Arc::clone(&gate)),
             history: Arc::clone(&history),
             apply_health,

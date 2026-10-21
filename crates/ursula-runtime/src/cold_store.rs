@@ -264,7 +264,8 @@ pub struct ColdStore {
     delay_fn: Arc<Mutex<ColdStoreDelayFn>>,
     /// LIST requests issued (F14d: compaction discovery issues none).
     list_requests: Arc<std::sync::atomic::AtomicU64>,
-    /// Checked right before each PUT and DELETE is sent.
+    /// Checked before each PUT and DELETE store call. The store's own
+    /// retries of one call are not checked again.
     fence: NodeFence,
 }
 

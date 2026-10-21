@@ -943,8 +943,8 @@ pub type SharedSnapshotStore = Arc<dyn SnapshotStore>;
 
 /// A snapshot store whose object PUTs and DELETEs are sent only while the
 /// node fence admits them and no predecessor wait is owed. The check runs
-/// right before each is sent, after the LIST or state read it rests on
-/// returned, so a garbage pass that began inside the lease deletes nothing
+/// before each store call, after the LIST or state read it rests on
+/// returned (the store's own retries of one call are not checked again), so a garbage pass that began inside the lease deletes nothing
 /// once it ended.
 #[derive(Debug)]
 pub struct FencedSnapshotStore {

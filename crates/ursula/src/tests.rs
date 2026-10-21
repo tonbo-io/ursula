@@ -550,9 +550,11 @@ fn registered_durable_factory(
 /// core writer fails the writer's next journal write, which stops the
 /// process.
 async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
-    assert_eq!(
-        crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
-        crate::server::WalShutdown::Clean,
+    assert!(
+        matches!(
+            crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
+            crate::server::WalShutdown::Clean(_)
+        ),
         "the Raft WAL shuts down cleanly"
     );
 }

@@ -20,6 +20,7 @@ use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
+use crate::log_store::CleanExit;
 use crate::log_store::CoreFileLogWriter;
 use crate::log_store::CoreJournalError;
 use crate::log_store::CoreJournalOptions;
@@ -232,15 +233,15 @@ impl RaftWal {
     }
 
     /// The wait this run owes a predecessor that may still run, if it owes
-    /// one.
-    pub fn predecessor_wait(&self) -> Option<WaitFrom> {
-        self.node.wait()
-    }
-
-    /// Records the predecessor wait finished, `fsync`ed, then ends it on the
-    /// fence.
-    pub fn finish_predecessor_wait(&self) -> Result<(), RaftWalError> {
-        self.node.finish_wait()
+    /// one, as a handle that holds neither the root's lock nor any journal
+    /// ([`PredecessorWait`]).
+    pub fn predecessor_wait(&self) -> Option<PredecessorWait> {
+        self.node.wait().map(|from| PredecessorWait {
+            from,
+            root: self.root().to_owned(),
+            fence: self.node.fence().clone(),
+            node: Arc::downgrade(&self.node),
+        })
     }
 
     /// Whether the root held no journal record, no vote and no snapshot
@@ -525,11 +526,13 @@ impl RaftWal {
     }
 
     /// Ends this run cleanly: closes every core writer and the meta
-    /// journal's, each of which `fsync`s its journal, and only then records a
-    /// clean shutdown. Stop the Raft groups first; a write after this fails
-    /// and no journal opens again. When a writer cannot close, the run is not
-    /// recorded as clean.
-    pub async fn shutdown(&self) -> Result<(), RaftWalError> {
+    /// journal's, each of which `fsync`s its journal, and only then closes
+    /// the node fence for good and records a clean shutdown. Stop the Raft
+    /// groups and the predecessor wait first; a write after this fails and
+    /// no journal opens again. When a writer cannot close, the run is not
+    /// recorded as clean. The root's lock of a clean run comes back as a
+    /// [`CleanExit`], which the process holds until it exits.
+    pub async fn shutdown(&self) -> Result<CleanExit, RaftWalError> {
         let slots = {
             let mut core_writers = self
                 .core_writers
@@ -587,14 +590,52 @@ impl RaftWal {
         for mut exited in exits {
             while exited.changed().await.is_ok() {}
         }
-        self.node.record_clean()?;
+        let exit = self.node.record_clean()?;
         tracing::info!(
             root = %self.root().display(),
             cores = writers.len(),
             meta = meta_closed,
             "shut down the Raft WAL cleanly"
         );
-        Ok(())
+        Ok(exit)
+    }
+}
+
+/// The predecessor wait a run owes ([`RaftWal::predecessor_wait`]): where
+/// it is measured from, and the record of its end. It holds neither the
+/// root's lock nor any journal, so a wait task never keeps the run's WAL
+/// alive, and it records the end only through a WAL that still runs.
+#[derive(Debug, Clone)]
+pub struct PredecessorWait {
+    from: WaitFrom,
+    root: PathBuf,
+    fence: NodeFence,
+    node: Weak<NodeWal>,
+}
+
+impl PredecessorWait {
+    /// Where the wait is measured from.
+    pub fn from(&self) -> WaitFrom {
+        self.from
+    }
+
+    /// The run's fence, which carries the wait.
+    pub fn fence(&self) -> &NodeFence {
+        &self.fence
+    }
+
+    /// Records the wait finished, `fsync`ed, then ends it on the fence.
+    /// Refused while the fence does not admit ([`RaftWalError::Fenced`]),
+    /// and for good once the run shut down or its WAL is gone, as by a
+    /// closed fence.
+    pub fn finish(&self) -> Result<(), RaftWalError> {
+        match self.node.upgrade() {
+            Some(node) => node.finish_wait(),
+            None => Err(RaftWalError::Fenced {
+                root: self.root.clone(),
+                status: ursula_runtime::node_fence::FenceStatus::Closed,
+            }),
+        }
     }
 }
 
@@ -1034,5 +1075,71 @@ mod tests {
                 .is_some()
         );
         wal.shutdown().await.unwrap();
+    }
+
+    fn leased_start(
+        root: &Path,
+        topology: &ursula_shard::StaticShardMap,
+    ) -> Result<RaftWal, RaftWalError> {
+        RaftWal::start_in_cluster(
+            root,
+            JournalTuning::new(WalFsync::Never),
+            topology,
+            NodeId::new(1),
+            None,
+            NodeFence::leased(Duration::from_secs(5)),
+        )
+    }
+
+    /// A clean end keeps the root locked until the process lets go of it
+    /// (`CleanExit`), whatever still holds the run's WAL, and the run's
+    /// predecessor wait records nothing after it: a record after the end
+    /// would rewrite a successor's identity file. Catches a `record_clean`
+    /// that drops the lock or a wait record that skips the fence check.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_clean_end_keeps_the_root_locked_and_records_no_wait_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = leased_start(dir.path(), &topology).unwrap();
+        // A fresh root owes its wait from its binding.
+        let wait = wal.predecessor_wait().expect("a fresh root owes a wait");
+        let held = wal.clone();
+        let exit = wal.shutdown().await.unwrap();
+        drop(wal);
+        drop(held);
+        assert!(matches!(
+            leased_start(dir.path(), &topology),
+            Err(RaftWalError::Locked { .. })
+        ));
+        assert!(matches!(
+            wait.finish(),
+            Err(RaftWalError::Fenced {
+                status: ursula_runtime::node_fence::FenceStatus::Closed,
+                ..
+            })
+        ));
+        drop(exit);
+        let next = leased_start(dir.path(), &topology).unwrap();
+        assert_eq!(
+            next.opening().previous_run,
+            crate::wal::diagnostics::PreviousRun::Clean
+        );
+        drop(next.shutdown().await.unwrap());
+    }
+
+    /// The lease's probe file opens at the start, under the root's lock, and
+    /// a start whose probe file does not open fails: the probe never opens
+    /// it by path later, where another attachment of the volume may be.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn a_start_whose_probe_file_does_not_open_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        std::fs::create_dir(dir.path().join(super::super::lease::PROBE_FILE)).unwrap();
+        assert!(matches!(
+            leased_start(dir.path(), &topology),
+            Err(RaftWalError::LeaseProbe { .. })
+        ));
     }
 }

@@ -199,7 +199,7 @@ where
         // root that held state ends its wait without meta.
         runtime.tasks.push(crate::rt::spawn(
             crate::predecessor_wait::run_predecessor_wait(
-                wal.clone(),
+                wal.predecessor_wait(),
                 registry.clone(),
                 runtime.status.registration.clone(),
             ),
@@ -324,7 +324,9 @@ where
         }
     }
 
-    /// Stops the node tasks, then the meta replica with its own tasks.
+    /// Stops the node tasks, then the meta replica with its own tasks. The
+    /// predecessor wait is one of the node tasks, so it ends here, before
+    /// the WAL's shutdown closes the fence and records the clean end.
     pub async fn shutdown(self) -> Result<(), super::replica::MetaReplicaError> {
         for task in &self.tasks {
             task.abort();

@@ -248,6 +248,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
                         metrics: Some(metrics),
                         cold_store: self.cold_store.clone(),
                         snapshot_record: Some(snapshot_record),
+                        fence: Some(self.log_stores.fence()),
                         snapshot_build: self
                             .registry
                             .as_ref()
@@ -546,6 +547,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     snapshot_record: Some(snapshot_record),
                     recovery: Some(rejoin.clone()),
                     peer_cluster: Some(self.registry.peer_cluster().clone()),
+                    fence: Some(self.log_stores.fence()),
                     #[cfg(test)]
                     work_stop_timeout: None,
                     engine_work: Some(self.log_stores.engine_work_ledger()),

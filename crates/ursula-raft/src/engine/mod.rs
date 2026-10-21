@@ -188,6 +188,11 @@ pub struct RaftGroupEngineOptions {
     /// the reads and purges it forwards to a leader, and where a leader's
     /// refusal is recorded. `None` for a replica without a gRPC transport.
     pub peer_cluster: Option<crate::PeerCluster>,
+    /// The node fence the replica's one leader predicate reads
+    /// ([`crate::GroupLeadership::of`]): its WAL's ([`crate::RaftWal::fence`]),
+    /// which every engine factory passes, single-node or not. `None`, for an
+    /// engine a test builds by hand, is an unleased fence.
+    pub fence: Option<ursula_runtime::NodeFence>,
     /// How long the engine's shutdown waits for OpenRaft's work, for tests;
     /// [`crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT`] otherwise.
     #[cfg(test)]
@@ -209,6 +214,7 @@ impl RaftGroupEngineOptions {
     pub fn recording_work_in(self, wal: &crate::RaftWal) -> Self {
         Self {
             engine_work: Some(wal.engine_work_ledger()),
+            fence: Some(wal.fence()),
             ..self
         }
     }
@@ -795,6 +801,7 @@ impl RaftGroupEngine {
             snapshot_record,
             recovery,
             peer_cluster,
+            fence,
             #[cfg(test)]
             work_stop_timeout,
             engine_work,
@@ -917,10 +924,7 @@ impl RaftGroupEngine {
             metadata_serial,
             read_barrier: Arc::new(ReadIndexBarrier::new(
                 raft.clone(),
-                peer_cluster.as_ref().map_or_else(
-                    ursula_runtime::NodeFence::unleased,
-                    crate::PeerCluster::fence,
-                ),
+                fence.unwrap_or_else(ursula_runtime::NodeFence::unleased),
             )),
             raft,
             placement,

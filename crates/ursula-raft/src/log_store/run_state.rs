@@ -52,6 +52,8 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -60,6 +62,7 @@ use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ProcessIncarnation;
 use ursula_runtime::NodeFence;
 use ursula_runtime::node_fence::FenceInstant;
+use ursula_runtime::node_fence::FenceStatus;
 use ursula_runtime::node_fence::ProbeOutcome;
 use ursula_runtime::node_fence::fence_now;
 
@@ -775,6 +778,11 @@ pub enum RaftWalError {
     },
     #[error("Raft WAL state mutex poisoned")]
     LockPoisoned,
+    /// The run's node fence does not admit, so the run records nothing
+    /// more on its root: its disk lease does not hold, or the run shut
+    /// down ([`FenceStatus::Closed`], for good).
+    #[error("the Raft WAL root '{}' is fenced ({status:?}): this run writes nothing more to it", .root.display())]
+    Fenced { root: PathBuf, status: FenceStatus },
     /// The OpenRaft work of the group's previous engine still runs (#709).
     #[error(
         "raft group {:?} on core {:?} does not open: OpenRaft work of its previous engine still runs",
@@ -850,10 +858,31 @@ pub(crate) struct NodeWal {
     /// The probe of a leased fence.
     _probe: Option<super::lease::LeaseProbe>,
     /// Keeps a second process off the root, so two runs never interleave
-    /// their run-state writes, and no successor reads this run's clean end
-    /// while this process still answers. Released only when the node's WAL
-    /// is dropped, a clean shutdown included.
+    /// their run-state writes. Released when the node's WAL is dropped, as
+    /// at a crash. A clean end hands it to the process, which holds it
+    /// until it exits ([`CleanExit`]), so no successor reads this run's
+    /// clean end while this process still runs.
+    lock: Mutex<Option<DiskLock>>,
+}
+
+/// The root's lock of a run that recorded its clean end
+/// ([`super::RaftWal::shutdown`]). The process holds it until it exits
+/// ([`Self::hold_until_exit`]), so no successor opens the root, reads the
+/// clean end and waits for nothing beside a process that still runs: a
+/// task or thread that outlived the shutdown, a group that did not stop.
+/// Dropping it stands for the process's exit, as a test that starts the
+/// root again in the same process does.
+#[derive(Debug)]
+pub struct CleanExit {
     _lock: DiskLock,
+}
+
+impl CleanExit {
+    /// Holds the root's lock until the process exits, when the operating
+    /// system releases it.
+    pub fn hold_until_exit(self) {
+        let _held: &'static mut Self = Box::leak(Box::new(self));
+    }
 }
 
 /// Where the predecessor wait of a run is measured from.
@@ -987,6 +1016,18 @@ impl NodeWal {
         // reads the next start's predecessor as gone without the wait this
         // one owes: the identity file keeps it.
         let predecessor = Predecessor::of(opening.previous_run, identity.predecessor_wait(), empty);
+        // The lease's probe file, opened here under the root's lock and
+        // never again by path: a probe that reopened it after the disk went
+        // away could open a later attachment's file at the same path, and
+        // its success would lift a fence that must stay closed.
+        let probe_file = fence
+            .lease_length()
+            .map(|_| super::lease::open(&root))
+            .transpose()
+            .map_err(|source| RaftWalError::LeaseProbe {
+                root: root.clone(),
+                source,
+            })?;
         let opened = fence_now();
         let (_, incarnation) = super::identity::advance(&root, bound.root, identity, predecessor)?;
         // The synced identity write is the lease's first success.
@@ -1026,9 +1067,8 @@ impl NodeWal {
         run_state
             .record(RunStatus::Running, "running")
             .map_err(RaftWalError::RecordRunState)?;
-        let probe = fence
-            .lease_length()
-            .map(|_| super::lease::spawn(&root, fence.clone()))
+        let probe = probe_file
+            .map(|file| super::lease::spawn(&root, file, fence.clone()))
             .transpose()
             .map_err(|source| RaftWalError::LeaseProbe {
                 root: root.clone(),
@@ -1048,7 +1088,7 @@ impl NodeWal {
             wait,
             fence,
             _probe: probe,
-            _lock: lock,
+            lock: Mutex::new(Some(lock)),
         })
     }
 
@@ -1064,7 +1104,20 @@ impl NodeWal {
 
     /// Records the predecessor wait finished, `fsync`ed, so no later run
     /// owes it again, then lets the fence admit snapshot objects and votes.
+    /// Refused while the fence does not admit ([`RaftWalError::Fenced`]):
+    /// a run whose lease lapsed writes nothing by path, where another
+    /// attachment of the volume may be mounted now, and a run that shut
+    /// down writes nothing after its clean end.
     pub(crate) fn finish_wait(&self) -> Result<(), RaftWalError> {
+        match self.fence.status(fence_now()) {
+            FenceStatus::Admits => {}
+            status => {
+                return Err(RaftWalError::Fenced {
+                    root: self.root.clone(),
+                    status,
+                });
+            }
+        }
         super::identity::finish_wait(&self.root, self.incarnation.run)?;
         self.fence.end_wait();
         Ok(())
@@ -1181,16 +1234,24 @@ impl NodeWal {
         &self.run_state
     }
 
-    /// Records a clean end of this run, once every journal is `fsync`ed.
-    /// The fence closes for good first, so no successor reads this end
-    /// beside a process that still answers, and the root's lock stays held
-    /// until the WAL is dropped.
-    pub(crate) fn record_clean(&self) -> Result<(), RaftWalError> {
+    /// Records a clean end of this run, once every journal is `fsync`ed,
+    /// and hands the root's lock to the process ([`CleanExit`]). The fence
+    /// closes for good first, so the run answers nothing and writes no
+    /// object once a successor could read this end.
+    pub(crate) fn record_clean(&self) -> Result<CleanExit, RaftWalError> {
         self.fence.close();
         self.run_state
             .record(RunStatus::Clean, "clean")
-            .map(|_bytes| ())
-            .map_err(RaftWalError::RecordRunState)
+            .map_err(RaftWalError::RecordRunState)?;
+        let lock = self
+            .lock
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .ok_or_else(|| RaftWalError::ShutDown {
+                root: self.root.clone(),
+            })?;
+        Ok(CleanExit { _lock: lock })
     }
 }
 

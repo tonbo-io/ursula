@@ -307,8 +307,11 @@ whose predecessor may still run stays silent longer than any lease.
 
 **Disk lease.** Every second a probe rewrites the 8 bytes of `lease.probe` in
 place and syncs them, on a thread of its own (a simulated task under madsim),
-so it never waits behind the hot path. It reads the monotonic clock before it
-writes. The lease holds while no probe failed since the last success and the
+so it never waits behind the hot path. It writes through the one file the start
+opened under the root's lock, and a start whose probe file does not open fails.
+It never opens the file by path again, since after the disk went away the path
+may name a later attachment of the volume. It reads the monotonic clock before
+it writes. The lease holds while no probe failed since the last success and the
 clock is below that success's start plus `raft.wal.lease`. The synced
 `identity.bin` write at the start is the first success. Measured from the
 start, a late success never extends the lease, and a hung probe does not hold
@@ -323,24 +326,27 @@ While the lease does not hold, the node fence refuses:
   calls, on each `AppendStream` frame (the stream ends with the refusal in its
   trailers) and in the in-process transport. A sender reads either as an
   unreachable peer, never as a misdelivery or another format epoch.
-- leadership: the one leader predicate (`GroupLeadership::of`) answers no
-  leader, so cold flush, compaction, GC, the index repair, the orphan sweep and
-  every other leader-gated job skip. After the lease holds again, a replica
+- leadership: the one leader predicate (`GroupLeadership::of`), which every
+  group's engine, a single node's included, and the meta replica read with the
+  WAL's fence, answers no leader, so cold flush, compaction, GC, the index
+  repair, the orphan sweep and every other leader-gated job skip. After the lease holds again, a replica
   leads only once a quorum acknowledged an RPC it sent after the lift, or at
   once as its own quorum.
-- every PUT and DELETE to the cold and snapshot stores, checked right before
-  each is sent, after the listing it rests on returned. A refused one fails as
-  a store call does and its job runs again later.
+- every PUT and DELETE to the cold and snapshot stores, checked before each
+  store call, after the listing it rests on returned. The store's own retries
+  of one call are not checked again. A refused call fails as a store call does
+  and its job runs again later.
 - clients: the front door answers `503` with `Retry-After` and `NO_LEADER`,
   local reads included, and so do mutating admin routes. Readiness reports
   `disk_lease_lost`. The process never exits.
 
 A probe that started after the lease ended and succeeds lifts the fence with no
 restart. Journal write and sync errors still poison the writer: the lease says
-nothing about what a page cache lost during a hang. A shutdown closes the fence
-for good before it records `clean`, and the root's lock stays held until the
-process exits, so no successor reads `clean` beside a process that still
-answers.
+nothing about what a page cache lost during a hang. A shutdown ends the
+predecessor wait, then closes the fence for good before it records `clean`, and
+the root's lock stays held until the process exits, so no successor reads
+`clean` beside a process that still answers. A wait's end is never recorded
+once the fence closed.
 
 **Predecessor wait.** A run that reads `may_live` waits 12 s before it grants a
 vote (the bootstrap probe vote is still answered), campaigns, takes a

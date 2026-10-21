@@ -1,12 +1,16 @@
 //! The disk lease's probe.
 //!
 //! Every [`PROBE_INTERVAL`] the probe rewrites the 8 bytes of
-//! [`PROBE_FILE`] at the WAL root in place and syncs them, through one file
-//! it keeps open, and records the outcome in the node's fence with the
-//! time it started ([`ursula_runtime::NodeFence::record_probe`]). It runs on
-//! a thread of its own in production and as a simulated task under madsim,
-//! as the journal writer does, so it never waits behind the hot path and
-//! the hot path never waits for it.
+//! [`PROBE_FILE`] at the WAL root in place and syncs them, through the one
+//! file the run's start opened under the root's lock ([`open`]), and
+//! records the outcome in the node's fence with the time it started
+//! ([`ursula_runtime::NodeFence::record_probe`]). It never opens the file
+//! by path again: after the disk went away the path may name a later
+//! attachment of the volume, and a success there would lift a fence that
+//! must stay closed. It runs on a thread of its own in production and as a
+//! simulated task under madsim, as the journal writer does, so it never
+//! waits behind the hot path and the hot path never waits for it. It ends
+//! once the fence closed for good, at the shutdown.
 
 use std::path::Path;
 use std::time::Duration;
@@ -45,19 +49,18 @@ impl Drop for LeaseProbe {
     }
 }
 
-/// One probe: rewrite, sync, record.
-fn probe(file: &mut Option<DiskFile>, path: &Path, fence: &NodeFence, beat: &mut u64) {
+/// Opens the probe file of `root`, creating it when missing. A run's start
+/// calls it once, under the root's lock, and fails if it fails.
+pub(crate) fn open(root: &Path) -> std::io::Result<DiskFile> {
+    Disk::open_overwrite(&root.join(PROBE_FILE))
+}
+
+/// One probe: rewrite, sync, record. An error keeps the file: the probe
+/// never opens another.
+fn probe(file: &mut DiskFile, path: &Path, fence: &NodeFence, beat: &mut u64) {
     let started = fence_now();
     *beat = beat.wrapping_add(1);
-    let written = match file {
-        Some(file) => file.overwrite_start(&beat.to_le_bytes()),
-        None => Disk::open_overwrite(path).and_then(|mut opened| {
-            opened.overwrite_start(&beat.to_le_bytes())?;
-            *file = Some(opened);
-            Ok(())
-        }),
-    };
-    let outcome = match written {
+    let outcome = match file.overwrite_start(&beat.to_le_bytes()) {
         Ok(()) => ProbeOutcome::Synced,
         Err(error) => {
             tracing::error!(
@@ -77,17 +80,17 @@ fn probe(file: &mut Option<DiskFile>, path: &Path, fence: &NodeFence, beat: &mut
     }
 }
 
-/// Starts the probe of `root` for `fence`.
+/// Starts the probe of `root` for `fence`, over `file` ([`open`]).
 #[cfg(not(madsim))]
-pub(crate) fn spawn(root: &Path, fence: NodeFence) -> std::io::Result<LeaseProbe> {
+pub(crate) fn spawn(root: &Path, file: DiskFile, fence: NodeFence) -> std::io::Result<LeaseProbe> {
     let path = root.join(PROBE_FILE);
     let (stop, stopped) = std::sync::mpsc::channel::<()>();
     let thread = std::thread::Builder::new()
         .name("ursula-disk-lease".to_owned())
         .spawn(move || {
-            let mut file = None;
+            let mut file = file;
             let mut beat = 0_u64;
-            loop {
+            while !fence.is_closed() {
                 probe(&mut file, &path, &fence, &mut beat);
                 match stopped.recv_timeout(PROBE_INTERVAL) {
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -101,16 +104,20 @@ pub(crate) fn spawn(root: &Path, fence: NodeFence) -> std::io::Result<LeaseProbe
     })
 }
 
-/// Starts the probe of `root` for `fence`, as a simulated task.
+/// Starts the probe of `root` for `fence`, over `file` ([`open`]), as a
+/// simulated task.
 #[cfg(madsim)]
-pub(crate) fn spawn(root: &Path, fence: NodeFence) -> std::io::Result<LeaseProbe> {
+pub(crate) fn spawn(root: &Path, file: DiskFile, fence: NodeFence) -> std::io::Result<LeaseProbe> {
     let path = root.join(PROBE_FILE);
     Ok(LeaseProbe {
         task: crate::rt::spawn(async move {
-            let mut file = None;
+            let mut file = file;
             let mut beat = 0_u64;
             loop {
                 crate::rt::time::sleep(PROBE_INTERVAL).await;
+                if fence.is_closed() {
+                    return;
+                }
                 probe(&mut file, &path, &fence, &mut beat);
             }
         }),
