@@ -1737,8 +1737,8 @@ async fn a_chain_of_redirects_reaches_the_answering_node() {
 }
 
 /// A redirect from a node that hosts no replica of the group names the
-/// group alone (#581 section 5.7). The gateway follows it as a leader
-/// redirect, and the client never sees it.
+/// group alone (#581 section 5.7). The gateway follows the host its
+/// `Location` names as a hint, and the client never sees the redirect.
 #[tokio::test]
 async fn the_gateway_follows_a_redirect_from_a_node_that_hosts_no_replica() {
     let (outsider, replica) = (Scripted::spawn().await, Scripted::spawn().await);
@@ -2112,6 +2112,139 @@ async fn a_named_upstream_that_cannot_connect_ends_the_request() {
     assert_eq!(c.hits(), 0);
     let metrics = gateway.metrics_snapshot();
     assert_eq!((metrics.leader_redirects, metrics.leader_searches), (2, 0));
+}
+
+/// A redirect from a node that hosts no replica of the group, naming
+/// `host` (`307` with `x-ursula-raft-group` alone).
+fn not_hosted_redirect(host: &str) -> (StatusCode, HeaderMap) {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        LOCATION,
+        HeaderValue::from_str(&format!("{host}/bucket/stream")).expect("redirect target"),
+    );
+    headers.insert(names::X_URSULA_RAFT_GROUP, HeaderValue::from_static("3"));
+    (StatusCode::TEMPORARY_REDIRECT, headers)
+}
+
+/// A listener whose accept queue is full: it never accepts, and a connect
+/// to it gets no answer, as one to a blackholed host does, until the
+/// connector's timeout. Linux and macOS both drop a `SYN` to a full queue.
+async fn blackholed_upstream() -> (String, Blackholed) {
+    let socket = tokio::net::TcpSocket::new_v4().expect("socket");
+    socket
+        .bind("127.0.0.1:0".parse().expect("loopback"))
+        .expect("bind");
+    let addr = socket.local_addr().expect("local addr");
+    let listener = socket.listen(1).expect("listen");
+    let mut queued = Vec::new();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_millis(200),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
+        {
+            Ok(connected) => queued.push(connected.expect("a queued connect")),
+            Err(_elapsed) => break,
+        }
+        assert!(queued.len() < 64, "the accept queue never filled");
+    }
+    (format!("http://{addr}"), Blackholed {
+        _listener: listener,
+        _queued: queued,
+    })
+}
+
+/// Holds [`blackholed_upstream`]'s listener and the connects that fill its
+/// queue.
+struct Blackholed {
+    _listener: tokio::net::TcpListener,
+    _queued: Vec<tokio::net::TcpStream>,
+}
+
+/// A `NotHosted` redirect names a host as a hint, often the dead node its
+/// group moves away from. When the named upstream cannot be connected to,
+/// stopped or blackholed, the request goes on to an upstream it has not
+/// tried and reaches the hosting one within the hop budget, unlike a leader
+/// redirect's target ([`a_named_upstream_that_cannot_connect_ends_the_request`]).
+///
+/// The connect timeout is lowered to 500 ms because the search after a
+/// blackholed hint starts only when the failed connect ends inside
+/// `LEADER_REDIRECT_DEADLINE` (5 s). With the default `--connect-timeout 5`
+/// the request that pays the blackholed connect ends with `503`, and only
+/// later requests pass the ejected host
+/// ([`a_blackholed_not_hosted_hint_costs_one_connect_before_its_ejection`]).
+#[tokio::test]
+async fn a_not_hosted_hint_that_cannot_connect_searches_on_to_the_host() {
+    let (stopped, _refusing) = refusing_upstream().await;
+    let (blackholed, _blackholed) = blackholed_upstream().await;
+    for (name, dead) in [("stopped", stopped), ("blackholed", blackholed)] {
+        let (outsider, host) = (Scripted::spawn().await, Scripted::spawn().await);
+        outsider.answers(not_hosted_redirect(&dead));
+        let mut config = test_config(vec![outsider.url(), dead.clone(), host.url()]);
+        config.connect_timeout = Duration::from_millis(500);
+        let gateway = gateway_with(config, &outsider);
+
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "{name}");
+        assert_eq!((outsider.hits(), host.hits()), (1, 1), "{name}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(
+            (
+                metrics.leader_redirects,
+                metrics.leader_searches,
+                metrics.upstream_ejections
+            ),
+            (2, 1, 1),
+            "{name}"
+        );
+        assert_eq!(cached_route(&gateway), Some(host.url()), "{name}");
+    }
+}
+
+/// A blackholed host that `NotHosted` redirects keep naming costs one
+/// connect: it is ejected, and later hints to it go to an upstream not
+/// ejected instead, with no connect to it, while its window lasts.
+#[tokio::test]
+async fn a_blackholed_not_hosted_hint_costs_one_connect_before_its_ejection() {
+    let (blackholed, _blackholed) = blackholed_upstream().await;
+    let (outsider, host) = (Scripted::spawn().await, Scripted::spawn().await);
+    outsider.answers(not_hosted_redirect(&blackholed));
+    let connect_timeout = Duration::from_millis(500);
+    let mut config = test_config(vec![outsider.url(), blackholed.clone(), host.url()]);
+    config.connect_timeout = connect_timeout;
+    let gateway = gateway_with(config, &outsider);
+
+    let response = gateway.handle(post_path("/bucket/stream")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(
+        (metrics.leader_redirects, metrics.upstream_ejections),
+        (2, 1)
+    );
+
+    for i in 1..=3 {
+        gateway.remember_leader("/bucket/stream".to_owned(), outsider.url());
+        let started = std::time::Instant::now();
+
+        let response = gateway.handle(post_path("/bucket/stream")).await;
+
+        assert_eq!(response.status(), StatusCode::OK, "request {i}");
+        assert!(started.elapsed() < connect_timeout, "request {i}");
+        let metrics = gateway.metrics_snapshot();
+        // One hop each, a search hop past the ejected hint.
+        assert_eq!(
+            (
+                metrics.leader_redirects,
+                metrics.leader_searches,
+                metrics.upstream_ejections
+            ),
+            (2 + i, 1 + i, 1),
+            "request {i}"
+        );
+    }
+    assert_eq!((outsider.hits(), host.hits()), (4, 4));
 }
 
 /// A search starts at the upstream after the one that redirected, in the
