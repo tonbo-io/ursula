@@ -20,6 +20,10 @@
 //! - a run state with one record per journal class, and a log generation on
 //!   every Raft WAL journal record, core metadata entry and group snapshot
 //!   record;
+//! - two rules for how a Raft WAL journal opens: a journal read below its
+//!   class's recovery epoch opens its groups recovering, and the meta
+//!   journal's group opens recovering when the meta journal's directory is
+//!   gone while a data journal holds records;
 //! - a Raft entry payload with the meta group's commands beside the data
 //!   groups' (`RaftCommand`), whose data entries keep their epoch-5 bytes;
 //! - the placement kernel's state, commands and answers, and the meta
