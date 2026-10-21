@@ -80,6 +80,8 @@ use openraft::alias::VoteOf;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use ursula_config::WalFsync;
+use ursula_control::Admission;
+use ursula_control::LocalLog;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::WalJournalSample;
 use ursula_runtime::WalMemorySample;
@@ -93,6 +95,7 @@ use super::RaftGroupLogRecord;
 use super::core_meta::CoreMetadata;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::HeldLogState;
 use super::core_meta::LogGeneration;
 use super::core_meta::RecoveryRecord;
 use super::core_meta::ReplayGenerations;
@@ -275,6 +278,20 @@ pub enum CoreJournalError {
         journal: PathBuf,
         raft_group_id: RaftGroupId,
     },
+    /// The journal holds no log of the group that `admission` may open: an
+    /// `Open` of a group the metadata does not name, or any open of a
+    /// retired log. Nothing was written.
+    #[error(
+        "raft group {} holds no log on OpenRaft core journal '{}' that may open as {:?}",
+        .raft_group_id.0,
+        .journal.display(),
+        .admission
+    )]
+    NotHeld {
+        journal: PathBuf,
+        raft_group_id: RaftGroupId,
+        admission: Admission,
+    },
     #[cfg(not(madsim))]
     #[error("spawn the OpenRaft core journal writer: {source}")]
     SpawnWriter {
@@ -361,6 +378,7 @@ impl From<CoreJournalError> for io::Error {
             CoreJournalError::Locked { .. } | CoreJournalError::GroupAlreadyOpen { .. } => {
                 io::ErrorKind::AlreadyExists
             }
+            CoreJournalError::NotHeld { .. } => io::ErrorKind::NotFound,
             CoreJournalError::RecordTooLarge(_) => io::ErrorKind::InvalidInput,
             CoreJournalError::InvalidRecord { source, .. } => source.kind(),
             CoreJournalError::InconsistentLog { .. } => io::ErrorKind::InvalidData,
@@ -421,8 +439,10 @@ pub(crate) struct CoreFileLogWriter {
 #[derive(Debug, Default)]
 struct CoreGroups {
     logs: BTreeMap<u32, Arc<Mutex<GroupLog>>>,
+    /// What the metadata names of every group no store holds open.
     recorded: BTreeMap<u32, GroupMetadata>,
-    opened: BTreeSet<u32>,
+    /// The groups a store holds open, with the log state each opened in.
+    opened: BTreeMap<u32, HeldLogState>,
 }
 
 /// What a group's store opens with.
@@ -430,11 +450,53 @@ struct CoreGroups {
 pub(crate) struct OpenedGroup {
     pub(crate) log: Arc<Mutex<GroupLog>>,
     pub(crate) vote: Option<VoteOf<UrsulaRaftTypeConfig>>,
-    pub(crate) state: GroupLogState,
+    pub(crate) state: HeldLogState,
     pub(crate) recovery: Option<RecoveryRecord>,
     /// The generation of the group's log, which every record the store
     /// writes carries and its snapshot record names.
     pub(crate) generation: LogGeneration,
+}
+
+/// Records recovering every empty group of the journal in `dir` whose
+/// snapshot record is of the generation the metadata names: the record is
+/// history of the group on this replica, as a frame is, even when the
+/// metadata lost the group or never recorded its first purge. A record
+/// that does not read counts too, and the group's restore reports it. A
+/// record of another generation restores nothing and changes nothing here.
+/// Returns whether the metadata changed.
+fn recover_recorded_groups(
+    dir: &Path,
+    metadata: &mut CoreMetadata,
+) -> Result<bool, CoreJournalError> {
+    let entries = Disk::read_dir(dir).map_err(|source| CoreJournalError::io(dir, source))?;
+    let mut changed = false;
+    for path in entries {
+        let Some(group_id) = super::file::snapshot_record_group(&path) else {
+            continue;
+        };
+        let group = metadata.group(group_id);
+        if group.log != GroupLogState::Empty {
+            continue;
+        }
+        match crate::state_machine::snapshot_record_generation(&path) {
+            Ok(generation) if generation != group.generation => continue,
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                raft_group_id = group_id,
+                error = %ursula_runtime::ErrorChain(&error),
+                "the group's snapshot record does not read; the group opens recovering"
+            ),
+        }
+        tracing::warn!(
+            path = %dir.display(),
+            raft_group_id = group_id,
+            "raft group holds a snapshot record but no log on this replica; it recovers before \
+             it votes"
+        );
+        changed |= metadata.initialize(group_id, GroupLogState::Recovering);
+    }
+    Ok(changed)
 }
 
 /// Closes once a core writer's worker has stopped. The last handle's drop
@@ -764,6 +826,7 @@ impl CoreFileLogWriter {
             );
             metadata_changed |= metadata.set_log_state(group_id, GroupLogState::Recovering);
         }
+        metadata_changed |= recover_recorded_groups(&dir, &mut metadata)?;
         if metadata_changed {
             metadata.store(&metadata_path)?;
         }
@@ -805,7 +868,7 @@ impl CoreFileLogWriter {
                 .map(|(group_id, log)| (group_id, Arc::new(Mutex::new(log))))
                 .collect(),
             recorded: metadata.groups().collect(),
-            opened: BTreeSet::new(),
+            opened: BTreeMap::new(),
         }));
         let (tx, rx) = mpsc::unbounded_channel();
         #[cfg(madsim)]
@@ -884,37 +947,105 @@ impl CoreFileLogWriter {
         self.replay_mode
     }
 
-    /// Hands out a group's log and what the metadata file recorded for it.
-    /// A group opens once per writer: a store opened again would miss what
-    /// the closed one wrote.
+    /// Hands out a group's log and what the metadata file recorded for it,
+    /// as `admission` allows. A group opens once per writer: a store opened
+    /// again would miss what the closed one wrote.
+    ///
+    /// Either admission opens a log the metadata names, unless it is
+    /// retired. Only [`Admission::Create`] opens a group the metadata does
+    /// not name, with a fresh log. A retired log is refused either way
+    /// until its reopen lands, and so is an [`Admission::Open`] of a group
+    /// the metadata does not name ([`CoreJournalError::NotHeld`]), before
+    /// anything is written.
     pub(crate) fn open_group(
         &self,
         raft_group_id: RaftGroupId,
+        admission: Admission,
     ) -> Result<OpenedGroup, CoreJournalError> {
         let mut groups = self
             .groups
             .lock()
             .map_err(|_poisoned| CoreJournalError::LockPoisoned)?;
-        if !groups.opened.insert(raft_group_id.0) {
+        if groups.opened.contains_key(&raft_group_id.0) {
             return Err(CoreJournalError::GroupAlreadyOpen {
                 journal: self.dir.clone(),
                 raft_group_id,
             });
         }
+        let recorded = match (groups.recorded.get(&raft_group_id.0), admission) {
+            (Some(recorded), _) => *recorded,
+            (None, Admission::Create) => GroupMetadata::default(),
+            (None, Admission::Open) => {
+                return Err(self.not_held(raft_group_id, admission));
+            }
+        };
+        let Some(state) = recorded.log.held() else {
+            return Err(self.not_held(raft_group_id, admission));
+        };
+        groups.recorded.remove(&raft_group_id.0);
+        groups.opened.insert(raft_group_id.0, state);
         let cache_bytes = self.group_cache_bytes;
         let log = groups
             .logs
             .entry(raft_group_id.0)
             .or_insert_with(|| Arc::new(Mutex::new(GroupLog::new(cache_bytes))))
             .clone();
-        let recorded = groups.recorded.remove(&raft_group_id.0).unwrap_or_default();
         Ok(OpenedGroup {
             log,
             vote: recorded.vote,
-            state: recorded.log,
+            state,
             recovery: recorded.recovery,
             generation: recorded.generation,
         })
+    }
+
+    fn not_held(&self, raft_group_id: RaftGroupId, admission: Admission) -> CoreJournalError {
+        CoreJournalError::NotHeld {
+            journal: self.dir.clone(),
+            raft_group_id,
+            admission,
+        }
+    }
+
+    /// What this journal holds of each group it names: the groups the
+    /// metadata names and those a store holds open. A group's log is
+    /// `Holding` once it holds history (initialized or recovering, or an
+    /// entry or a purge since its store opened), `Empty` before, and
+    /// `Retired` after a teardown.
+    pub(crate) fn local_logs(&self) -> Result<BTreeMap<RaftGroupId, LocalLog>, CoreJournalError> {
+        // The logs are read after the groups' lock goes: the writer locks a
+        // log before it looks up another group.
+        let named = {
+            let groups = self
+                .groups
+                .lock()
+                .map_err(|_poisoned| CoreJournalError::LockPoisoned)?;
+            let recorded = groups
+                .recorded
+                .iter()
+                .map(|(group_id, group)| (*group_id, group.log));
+            let opened = groups
+                .opened
+                .iter()
+                .map(|(group_id, state)| (*group_id, state.durable()));
+            recorded
+                .chain(opened)
+                .map(|(group_id, state)| (group_id, state, groups.logs.get(&group_id).cloned()))
+                .collect::<Vec<_>>()
+        };
+        Ok(named
+            .into_iter()
+            .map(|(group_id, state, log)| {
+                let holds_log = || log.as_deref().is_some_and(|log| lock_log(log).holds_log());
+                let local = match state {
+                    GroupLogState::Retired => LocalLog::Retired,
+                    GroupLogState::Initialized | GroupLogState::Recovering => LocalLog::Holding,
+                    GroupLogState::Empty if holds_log() => LocalLog::Holding,
+                    GroupLogState::Empty => LocalLog::Empty,
+                };
+                (RaftGroupId(group_id), local)
+            })
+            .collect())
     }
 
     /// Takes back a group whose store closed, with what that store recorded
@@ -925,7 +1056,7 @@ impl CoreFileLogWriter {
             .groups
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if groups.opened.remove(&raft_group_id.0) {
+        if groups.opened.remove(&raft_group_id.0).is_some() {
             groups.recorded.insert(raft_group_id.0, recorded);
         }
     }
@@ -2743,12 +2874,14 @@ mod frozen_gc_tests {
                 placement(1),
                 metrics.group_engine_metrics(),
                 writer.clone(),
+                ursula_control::Admission::Create,
             )
             .unwrap();
             let mut healthy = RaftGroupFileLogStore::open(
                 placement(2),
                 metrics.group_engine_metrics(),
                 writer.clone(),
+                ursula_control::Admission::Create,
             )
             .unwrap();
             append(&mut quiet, 1).await;

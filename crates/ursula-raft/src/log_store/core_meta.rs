@@ -95,6 +95,38 @@ impl GroupLogState {
     pub fn is_initialized(self) -> bool {
         self != Self::Empty
     }
+
+    /// The state of a log a store may open: every state but
+    /// [`Self::Retired`], which no store opens.
+    pub(crate) fn held(self) -> Option<HeldLogState> {
+        match self {
+            Self::Empty => Some(HeldLogState::Empty),
+            Self::Initialized => Some(HeldLogState::Initialized),
+            Self::Recovering => Some(HeldLogState::Recovering),
+            Self::Retired => None,
+        }
+    }
+}
+
+/// The state of a log a store holds open: a [`GroupLogState`] other than
+/// `Retired`. A retired log opens only through its reopen, which records it
+/// recovering first, so no store runs on one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldLogState {
+    Empty,
+    Initialized,
+    Recovering,
+}
+
+impl HeldLogState {
+    /// The state as the metadata file records it.
+    pub(crate) fn durable(self) -> GroupLogState {
+        match self {
+            Self::Empty => GroupLogState::Empty,
+            Self::Initialized => GroupLogState::Initialized,
+            Self::Recovering => GroupLogState::Recovering,
+        }
+    }
 }
 
 /// A recovery plan this replica holds (#581 section 4.5): it votes only for
@@ -194,6 +226,13 @@ impl CoreMetadata {
         self.groups
             .iter()
             .map(|(group_id, group)| (*group_id, *group))
+    }
+
+    /// Replaces `group_id`'s entry with `group`, for tests that set up a
+    /// state no write records yet, such as a retired log.
+    #[cfg(all(test, not(madsim)))]
+    pub(crate) fn set_group(&mut self, group_id: u32, group: GroupMetadata) {
+        self.groups.insert(group_id, group);
     }
 
     /// Records `vote` for `group_id`; whether anything changed.

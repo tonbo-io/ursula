@@ -24,6 +24,8 @@ use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
 use openraft::vote::leader_id_adv::CommittedLeaderId;
 use ursula_config::WalFsync;
+use ursula_control::Admission;
+use ursula_control::LocalLog;
 use ursula_proto::placement::NodeId;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::BucketStreamId;
@@ -46,6 +48,7 @@ use super::RecoveryState;
 use super::RunState;
 use super::RunStatus;
 use super::core_meta::CoreMetadata;
+use super::core_meta::GroupMetadata;
 use super::core_meta::MarkRecoveringError;
 use super::core_meta::core_metadata_path;
 use super::file::LIMITED_READ_BYTES;
@@ -208,6 +211,7 @@ impl Core {
             placement(group),
             self.metrics.group_engine_metrics(),
             writer.clone(),
+            Admission::Create,
         )
         .expect("open a group store")
     }
@@ -2064,6 +2068,7 @@ async fn a_group_opens_once_while_its_store_lives_and_again_after_it_closed() {
         placement(1),
         core.metrics.group_engine_metrics(),
         writer.clone(),
+        Admission::Create,
     )
     .expect_err("a group must not open twice while its store lives");
     assert!(matches!(err, CoreJournalError::GroupAlreadyOpen {
@@ -2428,6 +2433,7 @@ async fn missing_run_state_advances_past_every_surviving_core_epoch() {
         let open = |wal: &super::RaftWal, group: u32| {
             wal.open(
                 map.placement(RaftGroupId(group)).unwrap(),
+                Admission::Create,
                 metrics.group_engine_metrics(),
             )
             .unwrap()
@@ -2501,7 +2507,9 @@ async fn missing_run_state_refuses_unreadable_or_exhausted_core_epochs() {
             .unwrap();
             let wal = super::RaftWal::start(root, fsync, &map).unwrap();
             assert_eq!(wal.opening().recovery_epoch, u64::MAX);
-            let mut store = wal.open(placement, metrics.group_engine_metrics()).unwrap();
+            let mut store = wal
+                .open(placement, Admission::Create, metrics.group_engine_metrics())
+                .unwrap();
             append(&mut store, [blank_entry(1)]).await;
             assert_eq!(core_verified_epoch(&wal, 0), u64::MAX);
             drop((store, wal));
@@ -2654,7 +2662,7 @@ async fn the_meta_class_decides_on_its_own_journal_history() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-    let mut store = wal.open(data, group_metrics()).unwrap();
+    let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     append(&mut store, [blank_entry(1)]).await;
     drop(store);
     stop_cleanly(wal).await;
@@ -2708,7 +2716,7 @@ async fn a_data_host_crash_under_never_opens_meta_strictly() {
     let wal = super::RaftWal::start(root, WalFsync::Never, &map).unwrap();
     let mut meta = wal.open_meta(group_metrics()).unwrap();
     append(&mut meta, [blank_entry(1)]).await;
-    let mut store = wal.open(data, group_metrics()).unwrap();
+    let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     append(&mut store, [blank_entry(1)]).await;
     drop((meta, store));
     let path = root.join(super::RUN_STATE_FILE);
@@ -2746,7 +2754,7 @@ async fn a_data_host_crash_under_never_opens_meta_strictly() {
     assert_eq!(wal.meta_replay_mode(), Some(JournalReplayMode::Strict));
     assert_eq!(store.log_state(), GroupLogState::Initialized);
     assert_eq!(log_ids(&store).await, [1]);
-    let data_store = wal.open(data, group_metrics()).unwrap();
+    let data_store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     assert_eq!(data_store.log_state(), GroupLogState::Recovering);
 }
 
@@ -2841,7 +2849,7 @@ async fn a_corrupt_meta_metadata_or_segment_header_still_starts_the_node() {
         for index in 1..=30 {
             append(&mut meta, [payload_entry(index, 512)]).await;
         }
-        let mut store = wal.open(data, group_metrics()).unwrap();
+        let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
         append(&mut store, [blank_entry(1)]).await;
         drop((meta, store));
         stop_cleanly(wal).await;
@@ -2857,7 +2865,7 @@ async fn a_corrupt_meta_metadata_or_segment_header_still_starts_the_node() {
         let wal = super::RaftWal::start_with(root, tuning, &map)
             .expect("a damaged meta journal never stops the start");
         let mut store = wal
-            .open(data, group_metrics())
+            .open(data, Admission::Create, group_metrics())
             .expect("the data journals open");
         append(&mut store, [blank_entry(2)]).await;
         assert_eq!(log_ids(&store).await, [1, 2]);
@@ -2903,7 +2911,7 @@ async fn an_absent_meta_journal_over_data_history_opens_recovering() {
     let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
     let data = map.placement(RaftGroupId(0)).unwrap();
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-    let mut store = wal.open(data, group_metrics()).unwrap();
+    let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     append(&mut store, [blank_entry(1)]).await;
     drop(store);
     stop_cleanly(wal).await;
@@ -2920,7 +2928,7 @@ async fn an_absent_meta_journal_over_data_history_opens_recovering() {
     let meta = wal.open_meta(group_metrics()).unwrap();
     assert_eq!(meta.log_state(), GroupLogState::Recovering);
     // Data group 0 keeps its own state.
-    let store = wal.open(data, group_metrics()).unwrap();
+    let store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     assert_eq!(store.log_state(), GroupLogState::Initialized);
     assert_eq!(log_ids(&store).await, [1]);
 }
@@ -2938,7 +2946,7 @@ async fn an_existing_empty_meta_journal_over_data_history_opens_empty() {
     // The first open put the new journal's metadata file in place, so the
     // journal exists although it holds no record.
     assert!(core_metadata_path(&meta_journal(root)).exists());
-    let mut store = wal.open(data, group_metrics()).unwrap();
+    let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     append(&mut store, [blank_entry(1)]).await;
     drop(store);
     stop_cleanly(wal).await;
@@ -2961,7 +2969,7 @@ async fn a_meta_directory_without_its_metadata_over_data_history_opens_recoverin
         let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
         let data = map.placement(RaftGroupId(0)).unwrap();
         let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-        let mut store = wal.open(data, group_metrics()).unwrap();
+        let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
         append(&mut store, [blank_entry(1)]).await;
         drop(store);
         stop_cleanly(wal).await;
@@ -2998,7 +3006,7 @@ async fn an_absent_meta_journal_on_a_node_without_data_history_opens_empty() {
     let meta = wal.open_meta(group_metrics()).unwrap();
     assert_eq!(meta.log_state(), GroupLogState::Empty);
     drop(meta);
-    drop(wal.open(data, group_metrics()).unwrap());
+    drop(wal.open(data, Admission::Create, group_metrics()).unwrap());
     stop_cleanly(wal).await;
     fs::remove_dir_all(meta_journal(root)).unwrap();
 
@@ -3064,7 +3072,7 @@ async fn a_journal_read_below_its_class_epoch_opens_recovering() {
     let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
     let data = map.placement(RaftGroupId(0)).unwrap();
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-    let mut store = wal.open(data, group_metrics()).unwrap();
+    let mut store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     append(&mut store, [blank_entry(1)]).await;
     let mut meta = wal.open_meta(group_metrics()).unwrap();
     append(&mut meta, [blank_entry(1)]).await;
@@ -3089,7 +3097,7 @@ async fn a_journal_read_below_its_class_epoch_opens_recovering() {
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
     assert_eq!(wal.opening().recovery, RecoveryState::Normal);
     assert_eq!(wal.meta_opening().opening().recovery, RecoveryState::Normal);
-    let store = wal.open(data, group_metrics()).unwrap();
+    let store = wal.open(data, Admission::Create, group_metrics()).unwrap();
     assert_eq!(store.log_state(), GroupLogState::Recovering);
     assert_eq!(core_verified_epoch(&wal, 0), 3);
     let meta = wal.open_meta(group_metrics()).unwrap();
@@ -3522,4 +3530,250 @@ fn a_small_append_costs_a_bounded_number_of_wal_bytes() {
         grown <= SMALL_APPEND_WAL_BYTES,
         "a 16-byte append takes {grown} WAL bytes"
     );
+}
+
+/// A WAL root of four cores and twelve groups (core `c` holds groups `c`,
+/// `c + 4` and `c + 8`) with segments small enough that a few entries
+/// rotate.
+fn admission_wal(root: &Path) -> super::RaftWal {
+    super::RaftWal::start_with(
+        root,
+        JournalTuning {
+            fsync: WalFsync::Always,
+            segment_bytes: SEGMENT_BYTES,
+            group_cache_bytes: 1024,
+        },
+        &ursula_shard::StaticShardMap::new(4, 12).expect("valid topology"),
+    )
+    .expect("start the WAL")
+}
+
+fn admission_metrics() -> ursula_runtime::GroupEngineMetrics {
+    RuntimeMetrics::new(4, 12).group_engine_metrics()
+}
+
+/// Where the WAL's shard map places `group`.
+fn admission_placement(group: u32) -> ShardPlacement {
+    ursula_shard::StaticShardMap::new(4, 12)
+        .expect("valid topology")
+        .placement(RaftGroupId(group))
+        .expect("a group of the map")
+}
+
+/// Writes a snapshot record of `group` in `generation` beside its core's
+/// journal, as a snapshot publish leaves it.
+fn write_snapshot_record(wal: &super::RaftWal, group: u32, generation: LogGeneration) {
+    let dir = wal.core_dir(admission_placement(group).core_id);
+    fs::create_dir_all(&dir).expect("core dir");
+    let meta = openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
+        last_log_id: Some(log_id(4)),
+        last_membership: Default::default(),
+    };
+    fs::write(
+        dir.join(super::file::snapshot_record_file(group)),
+        crate::state_machine::snapshot_record_bytes(generation, meta, vec![0x91, 0x07]),
+    )
+    .expect("write the snapshot record");
+}
+
+fn core_metadata(wal: &super::RaftWal, group: u32) -> CoreMetadata {
+    CoreMetadata::load(&core_metadata_path(
+        &wal.core_dir(admission_placement(group).core_id),
+    ))
+    .expect("read core metadata")
+}
+
+/// `Open` refuses a group the metadata does not name and a retired log, and
+/// `Create` refuses the retired log too, each before writing anything: the
+/// metadata stays as it was, and an `Open` on core 0, which holds nothing,
+/// leaves no journal there. `Create` of an unknown group opens a fresh log
+/// as before, and `Open` opens a named one. Catches an `Open` that creates,
+/// a refusal that opens (so creates) the core's journal first, or an open
+/// that hands out a retired log.
+#[tokio::test]
+async fn an_open_refuses_what_the_journal_does_not_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = admission_wal(dir.path());
+    // Group 1 is named by its vote, group 5 (same core) is retired.
+    let mut named = wal
+        .open(
+            admission_placement(1),
+            Admission::Create,
+            admission_metrics(),
+        )
+        .expect("create group 1");
+    named
+        .save_vote(&crate::types::UrsulaVote::new(3, 1))
+        .await
+        .expect("save a vote");
+    drop(named);
+    let mut metadata = core_metadata(&wal, 1);
+    metadata.set_group(5, GroupMetadata {
+        vote: None,
+        log: GroupLogState::Retired,
+        recovery: None,
+        generation: LogGeneration::new(1),
+    });
+    metadata
+        .store(&core_metadata_path(&wal.core_dir(CoreId(1))))
+        .expect("store metadata");
+
+    let named = wal
+        .open(admission_placement(1), Admission::Open, admission_metrics())
+        .expect("open a named group");
+    assert_eq!(named.log_state(), GroupLogState::Empty);
+    let before = core_metadata(&wal, 1);
+    for (group, admission) in [
+        (5, Admission::Open),
+        (5, Admission::Create),
+        (9, Admission::Open),
+        (4, Admission::Open),
+    ] {
+        let placement = admission_placement(group);
+        let refused = wal
+            .open(placement, admission, admission_metrics())
+            .unwrap_err();
+        assert!(
+            matches!(
+                refused,
+                super::RaftWalError::NotHeld { placement: at, admission: as_ }
+                    if at == placement && as_ == admission
+            ),
+            "{refused}"
+        );
+    }
+    assert_eq!(core_metadata(&wal, 1), before, "a refusal writes nothing");
+    assert!(
+        !wal.core_dir(CoreId(0)).exists(),
+        "an `Open` on a core that holds nothing does not open it"
+    );
+
+    let fresh = wal
+        .open(
+            admission_placement(2),
+            Admission::Create,
+            admission_metrics(),
+        )
+        .expect("create an unknown group");
+    assert_eq!(fresh.log_state(), GroupLogState::Empty);
+    assert!(log_ids(&fresh).await.is_empty());
+}
+
+/// A group the metadata does not name, but whose snapshot record is of its
+/// generation, is held: `Open` opens it, recovering, and the metadata then
+/// names it so. A record of another generation restores nothing and holds
+/// nothing. Catches a repair that ignores the record or its generation.
+#[tokio::test]
+async fn a_group_known_only_by_its_record_opens_recovering() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = admission_wal(dir.path());
+    write_snapshot_record(&wal, 2, LogGeneration::FIRST);
+    write_snapshot_record(&wal, 6, LogGeneration::new(1));
+
+    let store = wal
+        .open(admission_placement(2), Admission::Open, admission_metrics())
+        .expect("a recorded group is held");
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert_eq!(
+        core_metadata(&wal, 2).group(2).log,
+        GroupLogState::Recovering
+    );
+    assert!(matches!(
+        wal.open(admission_placement(6), Admission::Open, admission_metrics()),
+        Err(super::RaftWalError::NotHeld { .. })
+    ));
+    let other = wal
+        .open(
+            admission_placement(6),
+            Admission::Create,
+            admission_metrics(),
+        )
+        .expect("create over another generation's record");
+    assert_eq!(other.log_state(), GroupLogState::Empty);
+}
+
+/// `open_held_cores` opens each core that holds metadata, a segment or a
+/// snapshot record, and a core that does not open leaves its groups
+/// `Unknown` while the others open: here core 0 holds nothing, core 1 only
+/// metadata (a vote), core 2 a lone snapshot record and core 3 a sealed
+/// segment whose last frame is incomplete. A held core's writer then
+/// outlives its last store, so its groups stay listed, and so does the
+/// writer of a core a store opened after the start. Catches a failed core
+/// that stops the start, a writer that drops with its last store (which
+/// would leave a group the journal names unlisted), and groups read from
+/// the wrong source.
+#[tokio::test]
+async fn held_cores_open_and_a_core_that_fails_stays_unknown() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = admission_wal(dir.path());
+    let mut voted = wal
+        .open(
+            admission_placement(1),
+            Admission::Create,
+            admission_metrics(),
+        )
+        .unwrap();
+    voted
+        .save_vote(&crate::types::UrsulaVote::new(3, 1))
+        .await
+        .unwrap();
+    let mut broken = wal
+        .open(
+            admission_placement(3),
+            Admission::Create,
+            admission_metrics(),
+        )
+        .unwrap();
+    for index in 1..=30 {
+        append(&mut broken, [payload_entry(index, 512)]).await;
+    }
+    drop((voted, broken));
+    write_snapshot_record(&wal, 2, LogGeneration::FIRST);
+    let core_3 = wal.core_dir(CoreId(3));
+    stop_cleanly(wal).await;
+    append_raw(&segment_path(&core_3, SegmentId(1)), &[200, 0, 0]);
+
+    let wal = admission_wal(dir.path());
+    let held = wal
+        .open_held_cores(admission_metrics())
+        .expect("held cores");
+    let expected = [
+        (RaftGroupId(1), LocalLog::Empty),
+        (RaftGroupId(2), LocalLog::Holding),
+        (RaftGroupId(3), LocalLog::Unknown),
+        (RaftGroupId(7), LocalLog::Unknown),
+        (RaftGroupId(11), LocalLog::Unknown),
+    ];
+    assert_eq!(held.iter().collect::<Vec<_>>(), expected);
+    // A lazy open of the failed core retries and fails again.
+    assert!(matches!(
+        wal.open(admission_placement(3), Admission::Open, admission_metrics()),
+        Err(super::RaftWalError::OpenCore {
+            core: CoreId(3),
+            ..
+        })
+    ));
+
+    let recorded = wal
+        .open(admission_placement(2), Admission::Open, admission_metrics())
+        .expect("the recorded group opens on its held core");
+    assert_eq!(recorded.log_state(), GroupLogState::Recovering);
+    drop(recorded);
+    let lazy = wal
+        .open(
+            admission_placement(4),
+            Admission::Create,
+            admission_metrics(),
+        )
+        .expect("a group of a core that held nothing");
+    assert_eq!(
+        wal.local_groups().unwrap().get(RaftGroupId(4)),
+        Some(LocalLog::Empty)
+    );
+    drop(lazy);
+    let after = wal.local_groups().unwrap();
+    assert_eq!(after.get(RaftGroupId(2)), Some(LocalLog::Holding));
+    assert_eq!(after.get(RaftGroupId(1)), Some(LocalLog::Empty));
+    assert_eq!(after.get(RaftGroupId(4)), Some(LocalLog::Empty));
+    stop_cleanly(wal).await;
 }

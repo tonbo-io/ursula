@@ -160,6 +160,7 @@ fn open_core_journal_store(root: &Path) -> Result<Arc<RaftGroupFileLogStore>, cr
     }
     RaftWal::start(root, WalFsync::Always, &topology())?.open(
         placement(),
+        ursula_control::Admission::Create,
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
 }
@@ -187,6 +188,7 @@ fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
     .expect("start the Raft WAL")
     .open(
         placement(),
+        ursula_control::Admission::Create,
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store");
@@ -205,6 +207,7 @@ fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
     .expect("start the Raft WAL")
     .open(
         placement(),
+        ursula_control::Admission::Create,
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store")
@@ -3715,7 +3718,9 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
     let release = Arc::new(crate::rt::sync::Notify::new());
-    let store = wal.open(placement(), metrics()).unwrap();
+    let store = wal
+        .open(placement(), ursula_control::Admission::Create, metrics())
+        .unwrap();
     let record = store.snapshot_record();
     let started = RaftGroupEngine::new_single_node(
         placement(),
@@ -3739,7 +3744,7 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
         ))
     ));
     assert!(matches!(
-        wal.open(placement(), metrics()),
+        wal.open(placement(), ursula_control::Admission::Create, metrics()),
         Err(crate::log_store::RaftWalError::PreviousEngineRunning { placement: refused })
             if refused == placement()
     ));
@@ -3747,7 +3752,7 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
     release.notify_one();
     wal.engine_work_ended(placement().raft_group_id).await;
     let store = wal
-        .open(placement(), metrics())
+        .open(placement(), ursula_control::Admission::Create, metrics())
         .expect("the group opens once the failed start's work ended");
     drop(store);
     wal.shutdown().await.unwrap();
@@ -3764,7 +3769,9 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
-    let store = wal.open(placement(), metrics()).unwrap();
+    let store = wal
+        .open(placement(), ursula_control::Admission::Create, metrics())
+        .unwrap();
     let record = store.snapshot_record();
     let engine = RaftGroupEngine::new_single_node(
         placement(),
@@ -3800,7 +3807,7 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
 
     drop(engine);
     assert!(matches!(
-        wal.open(placement(), metrics()),
+        wal.open(placement(), ursula_control::Admission::Create, metrics()),
         Err(crate::log_store::RaftWalError::PreviousEngineRunning { placement: refused })
             if refused == placement()
     ));
@@ -3814,7 +3821,7 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
     .await
     .expect("the dropped engine's work ends");
     let store = wal
-        .open(placement(), metrics())
+        .open(placement(), ursula_control::Admission::Create, metrics())
         .expect("the group opens once the dropped engine's work ended");
     drop(store);
     drop(kept);
@@ -5394,6 +5401,7 @@ async fn reopen_journal_engine_with(
 fn reopen_journal_store(wal: &RaftWal) -> Arc<RaftGroupFileLogStore> {
     wal.open(
         placement(),
+        ursula_control::Admission::Create,
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("the group's log store opens")
@@ -5927,6 +5935,7 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
     let reopened = wal
         .open(
             placement(),
+            ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("the stopped engine released the group's log store");
@@ -6003,6 +6012,7 @@ async fn a_shutdown_that_does_not_wait_leaves_the_queued_work_running() {
     assert!(matches!(
         wal.open(
             placement(),
+            ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         ),
         Err(crate::log_store::RaftWalError::OpenGroup {
@@ -6055,6 +6065,7 @@ async fn engine_shutdown_names_openraft_work_that_does_not_end() {
     assert!(matches!(
         wal.open(
             placement(),
+            ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         ),
         Err(crate::log_store::RaftWalError::OpenGroup {
@@ -6069,6 +6080,7 @@ async fn engine_shutdown_names_openraft_work_that_does_not_end() {
     let store = wal
         .open(
             placement(),
+            ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("the ended work released the group's log store");

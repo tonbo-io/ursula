@@ -253,7 +253,9 @@ mod tests {
         });
         let placement = topology.placement(ursula_shard::RaftGroupId(1)).unwrap();
         let metrics = ursula_runtime::RuntimeMetrics::new(1, 2).group_engine_metrics();
-        let mut store = wal.open(placement, metrics).unwrap();
+        let mut store = wal
+            .open(placement, ursula_control::Admission::Create, metrics)
+            .unwrap();
         store
             .save_vote(&crate::types::UrsulaVote::new(3, 1))
             .await

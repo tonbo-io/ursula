@@ -27,6 +27,7 @@ serde_json = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "sync"] }
 ursula-config = { workspace = true }
+ursula-control = { workspace = true }
 ursula-proto = { workspace = true }
 ursula-raft = { workspace = true }
 ursula-runtime = { workspace = true }

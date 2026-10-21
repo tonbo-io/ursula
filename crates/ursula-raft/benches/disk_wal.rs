@@ -156,6 +156,7 @@ fn disk_wal_benches(c: &mut Criterion) {
                         let reopened = factory
                             .open(
                                 placement(0),
+                                ursula_control::Admission::Create,
                                 RuntimeMetrics::new(1, 1).group_engine_metrics(),
                             )
                             .expect("open shared-core benchmark WAL");
@@ -212,7 +213,11 @@ fn setup_stores(backend: Backend, group_count: usize) -> Stores {
             (0..group_count_u32)
                 .map(|group_id| {
                     factory
-                        .open(placement(group_id), metrics.group_engine_metrics())
+                        .open(
+                            placement(group_id),
+                            ursula_control::Admission::Create,
+                            metrics.group_engine_metrics(),
+                        )
                         .expect("open shared-core benchmark WAL")
                         .into()
                 })
@@ -346,6 +351,7 @@ fn open_shared_store(root: &std::path::Path, group_id: u32) -> Arc<RaftGroupFile
     .expect("start the benchmark WAL")
     .open(
         placement(group_id),
+        ursula_control::Admission::Create,
         RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open shared-core benchmark WAL")
@@ -362,6 +368,7 @@ async fn prepare_recovery_journal(entries: usize, payload_size: usize) -> TempDi
     let mut store = factory
         .open(
             placement(0),
+            ursula_control::Admission::Create,
             RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("open shared-core benchmark WAL");

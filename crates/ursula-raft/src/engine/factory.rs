@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use openraft::Config;
 use openraft::SnapshotPolicy;
+use ursula_control::Admission;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::GroupEngineCreateFuture;
@@ -225,7 +226,7 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
             )?);
             let log_store = self
                 .log_stores
-                .open_waiting(placement, metrics.clone())
+                .open_waiting(placement, Admission::Create, metrics.clone())
                 .await
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let apply_stop_signal = log_store.apply_stop_signal();
@@ -434,7 +435,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             // Raft core starts with elections disabled.
             let store = self
                 .log_stores
-                .open_waiting(placement, metrics.clone())
+                .open_waiting(placement, Admission::Create, metrics.clone())
                 .await
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let rejoin = Arc::new(

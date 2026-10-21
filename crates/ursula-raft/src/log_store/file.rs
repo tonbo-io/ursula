@@ -32,6 +32,7 @@ use openraft::storage::LogState;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use openraft::vote::RaftLeaderId;
+use ursula_control::Admission;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::WalReadSample;
 use ursula_shard::ShardPlacement;
@@ -40,6 +41,7 @@ use super::CoreJournalRecord;
 use super::RaftGroupLogRecord;
 use super::core_meta::GroupLogState;
 use super::core_meta::GroupMetadata;
+use super::core_meta::HeldLogState;
 use super::core_meta::LogGeneration;
 use super::core_meta::PlanCut;
 use super::core_meta::RecoveryRecord;
@@ -123,38 +125,34 @@ enum StoreLog {
     Empty(EmptyHistory),
     Initialized,
     Recovering,
-    /// A retired log ([`GroupLogState::Retired`]). Only its reopen leaves
-    /// it, which no store performs: nothing retires a log before replica
-    /// teardown lands, and then a retired log opens only through the reopen.
-    Retired,
 }
 
 impl StoreLog {
-    fn new(log: GroupLogState) -> Self {
+    fn new(log: HeldLogState) -> Self {
         match log {
-            GroupLogState::Empty => Self::Empty(EmptyHistory::New),
-            GroupLogState::Initialized => Self::Initialized,
-            GroupLogState::Recovering => Self::Recovering,
-            GroupLogState::Retired => Self::Retired,
+            HeldLogState::Empty => Self::Empty(EmptyHistory::New),
+            HeldLogState::Initialized => Self::Initialized,
+            HeldLogState::Recovering => Self::Recovering,
+        }
+    }
+
+    fn held(self) -> HeldLogState {
+        match self {
+            Self::Empty(_) => HeldLogState::Empty,
+            Self::Initialized => HeldLogState::Initialized,
+            Self::Recovering => HeldLogState::Recovering,
         }
     }
 
     fn durable(self) -> GroupLogState {
-        match self {
-            Self::Empty(_) => GroupLogState::Empty,
-            Self::Initialized => GroupLogState::Initialized,
-            Self::Recovering => GroupLogState::Recovering,
-            Self::Retired => GroupLogState::Retired,
-        }
+        self.held().durable()
     }
 
     /// What the group's first entry or purge records.
-    fn first_entry(self) -> GroupLogState {
+    fn first_entry(self) -> HeldLogState {
         match self {
-            Self::Empty(EmptyHistory::New) | Self::Initialized => GroupLogState::Initialized,
-            Self::Empty(EmptyHistory::Unknown) | Self::Recovering | Self::Retired => {
-                GroupLogState::Recovering
-            }
+            Self::Empty(EmptyHistory::New) | Self::Initialized => HeldLogState::Initialized,
+            Self::Empty(EmptyHistory::Unknown) | Self::Recovering => HeldLogState::Recovering,
         }
     }
 }
@@ -285,14 +283,14 @@ pub(crate) fn snapshot_record_file(raft_group_id: u32) -> String {
     format!("group-{raft_group_id}.snapshot.json")
 }
 
-/// Whether `path` names a group's snapshot record
-/// ([`snapshot_record_file`]).
-pub(crate) fn is_snapshot_record_file(path: &Path) -> bool {
+/// The group whose snapshot record `path` names ([`snapshot_record_file`]),
+/// if it names one.
+pub(crate) fn snapshot_record_group(path: &Path) -> Option<u32> {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("group-"))
         .and_then(|rest| rest.strip_suffix(".snapshot.json"))
-        .is_some_and(|group| group.parse::<u32>().is_ok())
+        .and_then(|group| group.parse::<u32>().ok())
 }
 
 /// A recovery cut that did not run.
@@ -343,12 +341,15 @@ impl RaftGroupFileLogStore {
         self.core_writer.abort_simulated();
     }
 
+    /// Opens the group's store on its core's writer, as `admission` allows
+    /// ([`CoreFileLogWriter::open_group`]).
     pub(crate) fn open(
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
         core_writer: Arc<CoreFileLogWriter>,
+        admission: Admission,
     ) -> Result<Arc<Self>, CoreJournalError> {
-        let opened = core_writer.open_group(placement.raft_group_id)?;
+        let opened = core_writer.open_group(placement.raft_group_id, admission)?;
         Ok(Arc::new(Self {
             placement,
             metrics,
@@ -366,6 +367,12 @@ impl RaftGroupFileLogStore {
     /// The group's durable log state on this replica.
     pub fn log_state(&self) -> GroupLogState {
         self.store_log().durable()
+    }
+
+    /// The group's log state on this replica, which is never retired while
+    /// a store holds it.
+    pub(crate) fn held_log_state(&self) -> HeldLogState {
+        self.store_log().held()
     }
 
     /// Whether this replica ever persisted an entry or a purge of the group.
@@ -486,12 +493,7 @@ impl RaftGroupFileLogStore {
     pub(crate) async fn record_recovered(&self) -> Result<(), CoreJournalError> {
         let _order = self.write_order.lock().await;
         match self.store_log() {
-            // A gate does not reopen a retired log. The `Retired` arm is
-            // unreachable until replica teardown records it, and S2's
-            // `NotHeld` (#768) removes it.
-            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) | StoreLog::Retired => {
-                Ok(())
-            }
+            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) => Ok(()),
             StoreLog::Empty(EmptyHistory::Unknown) => {
                 self.set_store_log(StoreLog::Empty(EmptyHistory::New));
                 Ok(())
@@ -538,9 +540,7 @@ impl RaftGroupFileLogStore {
             StoreLog::Empty(EmptyHistory::Unknown) => {
                 self.set_store_log(StoreLog::Empty(EmptyHistory::New));
             }
-            // `Retired` is unreachable until replica teardown records it,
-            // and S2's `NotHeld` (#768) removes this arm.
-            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) | StoreLog::Retired => {}
+            StoreLog::Initialized | StoreLog::Empty(EmptyHistory::New) => {}
         }
         Ok(())
     }
@@ -755,7 +755,7 @@ impl RaftGroupFileLogStore {
                     generation: self.generation,
                     record,
                 },
-                first,
+                first: first.durable(),
                 log: self.log.clone(),
             })
             .await?;
@@ -1117,7 +1117,7 @@ impl RaftLogStorage<UrsulaRaftTypeConfig> for Arc<RaftGroupFileLogStore> {
                     generation: self.generation,
                     record,
                 },
-                first,
+                first: first.durable(),
                 log: self.log.clone(),
             },
             move |result| {

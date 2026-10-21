@@ -132,6 +132,28 @@ group's highest generation among its frames, the group opens `recovering`,
 and the rewritten `journal.meta` names that generation. Every group stays at
 generation 0 until replica teardown writes `retired`.
 
+A core's open also records `recovering` every `empty` group whose snapshot
+record is of the generation `journal.meta` names. A group the replica knows
+only by its record then opens as a held log that stays out of elections until
+its gate opens, as a group whose `journal.meta` was lost does.
+
+A group's store opens with an admission. `Open` opens only a log
+`journal.meta` names, and `Create` also opens a group it does not name, with a
+fresh log. A `retired` log is refused either way, and so is an `Open` of a
+group `journal.meta` does not name, before anything is written for the group.
+An `Open` never creates a core's journal: on a core that holds nothing it is
+refused before the core opens. The engine factories open with `Create` until
+placement decides what a node hosts.
+
+`RaftWal::open_held_cores` opens the writer of every core whose directory
+holds `journal.meta`, a segment record or a snapshot record, and the run keeps
+each of those writers until it shuts down. A core that does not open stops
+nothing: its groups read as unknown until an open of one of them opens the
+writer. From then on the run also keeps every core writer it opens, so
+`RaftWal::local_groups` lists every group a journal names. Before it runs, a
+core opens on its first group and closes with its last store. The server does
+not call it yet.
+
 `run-state.bin` holds one record per journal class, each with the class's
 `fsync` policy and recovery epoch, beside the node-wide boot id, root device and
 status.

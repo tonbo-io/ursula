@@ -111,6 +111,7 @@ async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::
     .expect("start the WAL")
     .open(
         placement(),
+        ursula_control::Admission::Create,
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store");

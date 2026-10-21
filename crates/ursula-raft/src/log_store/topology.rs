@@ -449,7 +449,13 @@ mod tests {
         let placement = original.placement(RaftGroupId(4)).unwrap();
         let metrics = RuntimeMetrics::new(4, 8).group_engine_metrics();
         let wal = RaftWal::start(dir.path(), WalFsync::Always, &original).unwrap();
-        let mut store = wal.open(placement, metrics.clone()).unwrap();
+        let mut store = wal
+            .open(
+                placement,
+                ursula_control::Admission::Create,
+                metrics.clone(),
+            )
+            .unwrap();
         let vote = crate::types::UrsulaVote::new(7, 1);
         store.save_vote(&vote).await.unwrap();
         type LeaderId = <UrsulaRaftTypeConfig as openraft::RaftTypeConfig>::LeaderId;
@@ -483,7 +489,9 @@ mod tests {
             assert!(!dir.path().join("core-4").exists());
         }
         let wal = RaftWal::start(dir.path(), WalFsync::Always, &original).unwrap();
-        let mut store = wal.open(placement, metrics).unwrap();
+        let mut store = wal
+            .open(placement, ursula_control::Admission::Create, metrics)
+            .unwrap();
         assert_eq!(store.read_vote().await.unwrap(), Some(vote));
         assert_eq!(store.try_get_log_entries(1..=1).await.unwrap().len(), 1);
         assert!(

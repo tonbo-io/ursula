@@ -2138,6 +2138,7 @@ mod tests {
             .unwrap()
             .open(
                 placement,
+                ursula_control::Admission::Create,
                 ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
             )
             .unwrap(),
@@ -2204,6 +2205,7 @@ mod tests {
                 shard_id: ursula_shard::ShardId(0),
                 raft_group_id: RaftGroupId(7),
             },
+            ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
         )
         .unwrap();

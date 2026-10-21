@@ -206,7 +206,11 @@ async fn run_async(args: &WalArgs, name: &str, sink: &mut Sink) -> Result<Outcom
                 Ok(Group {
                     id,
                     store: factory
-                        .open(placement(id), metrics.group_engine_metrics())
+                        .open(
+                            placement(id),
+                            ursula_control::Admission::Create,
+                            metrics.group_engine_metrics(),
+                        )
                         .with_context(|| format!("open group {id}"))?,
                     last: 0,
                     purged: 0,
