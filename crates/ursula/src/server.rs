@@ -1060,6 +1060,18 @@ mod tests {
             }
         ));
         assert_eq!(placement.applied, None);
+        // The first run started on an empty root and may stop before the
+        // meta group answers its registration, which leaves its predecessor
+        // wait owed: this run then waits it out from its open, without
+        // meta, and campaigns only after it. The wait's end clears the
+        // fence's shed in the same step.
+        let fence = state.raft_wal().expect("a disk WAL starts").fence();
+        tokio::time::timeout(
+            ursula_raft::predecessor_wait::PREDECESSOR_WAIT.saturating_mul(2),
+            fence.waited(),
+        )
+        .await
+        .expect("the predecessor wait ends without meta");
         let registry = state.raft_registry().cloned().expect("a Raft node");
         let shed = registry.leadership_shed_state();
         assert!(shed.contains(ursula_raft::LeadershipShedState::PLACEMENT_UNAVAILABLE));
