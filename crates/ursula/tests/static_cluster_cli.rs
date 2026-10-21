@@ -5219,7 +5219,7 @@ async fn cli_a_wal_root_started_under_another_node_id_is_refused() {
     let config_path = root.path().join("node.toml");
     let port = free_port();
     let base_url = format!("http://127.0.0.1:{port}");
-    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, true, &log_dir);
+    write_single_node_cluster_config(&config_path, port, 1, 1, &base_url, &log_dir);
     {
         let mut child = spawn_node_with_cluster_config(binary, &config_path);
         let client = reqwest::Client::new();
@@ -5229,7 +5229,7 @@ async fn cli_a_wal_root_started_under_another_node_id_is_refused() {
     let topology = log_dir.join("raft-log").join("topology.bin");
     let before = std::fs::read(&topology).expect("node 1 created the WAL topology");
 
-    write_single_node_cluster_config(&config_path, port, 2, 1, &base_url, true, &log_dir);
+    write_single_node_cluster_config(&config_path, port, 2, 1, &base_url, &log_dir);
     let mut child = spawn_node_with_cluster_config(binary, &config_path);
     let status = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
