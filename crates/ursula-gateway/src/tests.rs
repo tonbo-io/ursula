@@ -1737,8 +1737,8 @@ async fn a_chain_of_redirects_reaches_the_answering_node() {
 }
 
 /// A redirect from a node that hosts no replica of the group names the
-/// group alone (#581 section 5.7). The gateway follows it as a leader
-/// redirect, and the client never sees it.
+/// group alone (#581 section 5.7). The gateway follows the host its
+/// `Location` names as a hint, and the client never sees the redirect.
 #[tokio::test]
 async fn the_gateway_follows_a_redirect_from_a_node_that_hosts_no_replica() {
     let (outsider, replica) = (Scripted::spawn().await, Scripted::spawn().await);
@@ -2167,6 +2167,13 @@ struct Blackholed {
 /// stopped or blackholed, the request goes on to an upstream it has not
 /// tried and reaches the hosting one within the hop budget, unlike a leader
 /// redirect's target ([`a_named_upstream_that_cannot_connect_ends_the_request`]).
+///
+/// The connect timeout is lowered to 500 ms because the search after a
+/// blackholed hint starts only when the failed connect ends inside
+/// `LEADER_REDIRECT_DEADLINE` (5 s). With the default `--connect-timeout 5`
+/// the request that pays the blackholed connect ends with `503`, and only
+/// later requests pass the ejected host
+/// ([`a_blackholed_not_hosted_hint_costs_one_connect_before_its_ejection`]).
 #[tokio::test]
 async fn a_not_hosted_hint_that_cannot_connect_searches_on_to_the_host() {
     let (stopped, _refusing) = refusing_upstream().await;

@@ -135,6 +135,10 @@ alone in `x-ursula-raft-group`:
   to it that cannot connect sent nothing, so the gateway searches on as it
   does after a search hop that cannot connect. A blackholed host costs one
   connect, after which it is ejected and later hints to it are passed over.
+  The search after that connect starts only when the connect timeout is
+  shorter than the 5 s redirect deadline. With the default `--connect-timeout 5`,
+  the request that pays the blackholed connect ends with `503` and
+  `Retry-After`, and only later requests pass the ejected host.
 - Otherwise, and when the `Location` names no upstream because `--upstream`
   names the nodes otherwise than their client URLs, it searches: it sends the
   request to the next upstream it has not tried yet, starting after the one
