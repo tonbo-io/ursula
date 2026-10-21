@@ -413,6 +413,14 @@ pub struct GenesisClaim {
     pub replication_factor: ReplicationFactor,
 }
 
+impl GenesisClaim {
+    /// Whether node `node` is the genesis node, the one that initializes
+    /// the meta group: the smallest claimed meta voter.
+    pub fn is_genesis_node(&self, node: NodeId) -> bool {
+        self.meta_voters.min() == node
+    }
+}
+
 /// A node's role in one group's placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

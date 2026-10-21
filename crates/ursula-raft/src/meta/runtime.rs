@@ -464,8 +464,7 @@ impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
         let peers: BTreeSet<u64> = self.claim.peers.iter().map(NodeId::get).collect();
         let voters: BTreeSet<u64> = self.claim.meta_voters.iter().map(NodeId::get).collect();
         let mut recovery = self.recovery.clone();
-        // Only the smallest claimed meta voter initializes the meta group.
-        recovery.initialize = self.claim.meta_voters.min() == self.node;
+        recovery.initialize = self.claim.is_genesis_node(self.node);
         let probe = genesis_gate_probe(
             self.transport.clone(),
             self.claim.clone(),

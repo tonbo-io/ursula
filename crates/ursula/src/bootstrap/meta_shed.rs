@@ -5,12 +5,17 @@
 //!   still campaigns but takes no transfer, and the drain here hands its
 //!   data leaderships away, again every [`PLACEMENT_SHED_AGAIN`], as it may
 //!   win elections meanwhile.
-//! - A node that sheds, for any reason, the maintenance drain mark of
-//!   `ursulactl drain` and of a shutdown included, hands its meta
-//!   leadership away too. The data drain
-//!   (`ShedDrain`) follows data group ids, where meta's group 0 would meet
-//!   data group 0, so meta's one leadership is handed off here, to a meta
-//!   voter that takes transfers, by the registry's handoff check.
+//! - A node that sheds for a reason that refuses transfers, the
+//!   maintenance drain mark of `ursulactl drain` and of a shutdown
+//!   included, hands its meta leadership away too, for as long as that
+//!   reason holds. The data drain (`ShedDrain`) follows data group ids,
+//!   where meta's group 0 would meet data group 0, so meta's one
+//!   leadership is handed off here, to a meta voter that takes transfers,
+//!   by the registry's handoff check. A node that sheds only for cold
+//!   health still takes transfers and keeps meta: when every node sheds
+//!   for cold health (an object store outage), handing meta on would move
+//!   it from voter to voter once per settle time, and its writes and
+//!   barriers would keep finding no leader.
 //!
 //! Cold health, commit stall and egress read only the data groups'
 //! metrics, so meta never makes a node shed.
@@ -66,9 +71,7 @@ pub(crate) fn spawn_meta_shed(
                 placement.begin();
                 placement_began = Some(now);
             }
-            let hand_off_meta = registry
-                .leadership_shed_state()
-                .should_shed_current_leaders()
+            let hand_off_meta = !registry.leadership_shed_state().should_accept_transfer()
                 && leads_meta(&registry, node_id)
                 && meta_settles.is_none_or(|settles| now >= settles);
             if !placement.is_draining() && !hand_off_meta {

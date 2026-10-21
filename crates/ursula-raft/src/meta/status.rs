@@ -143,8 +143,8 @@ impl MetaStatusReader {
 /// ids and the claimed peers not registered yet. An empty view gives
 /// `MetaCatchingUp` when the replica sees a leader or a vote above term 0
 /// (`formed_elsewhere`), else `MetaGenesis`: from `genesis` on the genesis
-/// node (the smallest claimed meta voter, which initializes the meta
-/// group), and with every other peer unanswered elsewhere.
+/// node ([`GenesisClaim::is_genesis_node`]), and with every other peer
+/// unanswered elsewhere.
 pub(crate) fn cluster_view(
     view: &PlacementView,
     claim: &GenesisClaim,
@@ -169,7 +169,7 @@ pub(crate) fn cluster_view(
     if formed_elsewhere {
         return ClusterView::MetaCatchingUp;
     }
-    let unanswered = if claim.meta_voters.min() == me {
+    let unanswered = if claim.is_genesis_node(me) {
         genesis.unanswered.clone()
     } else {
         claim.peers.iter().filter(|peer| *peer != me).collect()

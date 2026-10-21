@@ -28,11 +28,11 @@ binds itself alone, at its cluster listener. To move a node, change `raft.peers`
 entries, snapshot records and installed snapshots name each member by node ID
 only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 
-There is no runtime membership authority for data groups. Every node that
-runs Raft runs a replica of the meta Raft group, unless its meta journal or
-replica is damaged, which forms over the nodes of `raft.peers` and records the
-cluster's bootstrap, but no data group reads its placements, and the server
-never moves a group to another node or changes its voter count.
+There is no runtime membership authority for data groups. The meta Raft
+group forms over the nodes of `raft.peers` and records the cluster's
+bootstrap. Every node that runs Raft runs a replica of it, unless its meta
+journal or replica is damaged. No data group reads its placements, and the
+server never moves a group to another node or changes its voter count.
 `GET /__ursula/placement`, on the client and the admin listener, reports what
 the node's meta replica applied, its role and leader, and its registration
 (`crates/ursula-raft/src/meta/status.rs`). With `?confirmed=true`, on the
@@ -41,8 +41,10 @@ runs no meta replica marks the `placement-unavailable` leadership shed. It
 still campaigns, so a group whose every voter lacks meta still elects, but it
 takes no leadership transfer and hands the leaderships it holds to its peers,
 again every 30 seconds (`crates/ursula/src/bootstrap/meta_shed.rs`). A node
-that sheds for any reason hands its meta leadership away too. The
-configured voter set is the target that the heal driver restores
+that sheds for a reason that refuses transfers, such as the maintenance
+drain, hands its meta leadership away too. A node that sheds only for cold
+health keeps it, so an object store outage that every node sheds for does
+not pass meta from voter to voter. The configured voter set is the target that the heal driver restores
 (section 2). The admin routes (section 3) can change a group's OpenRaft
 membership directly, and the heal driver adds a configured voter that is
 missing back as a learner and promotes it.

@@ -617,8 +617,6 @@ mod tests {
         assert_eq!(response.headers()["ursula-cluster-id"], "dev-local");
     }
 
-    /// A node reports how the WAL opened: a new WAL root is read strictly
-    /// and its logs are complete.
     /// `GET uri` on `router`, with its status and its JSON body.
     async fn get_json(
         router: &axum::Router,
@@ -645,6 +643,8 @@ mod tests {
         )
     }
 
+    /// A node reports how the WAL opened: a new WAL root is read strictly
+    /// and its logs are complete.
     #[tokio::test]
     async fn boot_reports_how_the_wal_opened() {
         use axum::body::Body;

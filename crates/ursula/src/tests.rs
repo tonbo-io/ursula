@@ -13486,8 +13486,22 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
     let term = raft.metrics().borrow_watched().current_term;
     let refused = self_election(term).await;
     assert_eq!(refused.status(), StatusCode::CONFLICT);
-    let reason = String::from_utf8(body_bytes(refused).await.to_vec()).unwrap();
-    assert!(reason.contains("may not campaign"), "{reason}");
+    // The route answers in text, so the refusal's variant is read from the
+    // registry call the route makes. It is refused before OpenRaft sees it.
+    let error = follower
+        .registry
+        .request_self_election(group, term)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ursula_raft::SelfElectionError::Transfer(
+                ursula_raft::IncomingTransferError::MayNotCampaign { group: refused }
+            ) if refused == group
+        ),
+        "{error}"
+    );
     assert_eq!(raft.metrics().borrow_watched().current_leader, Some(1));
     follower
         .registry
