@@ -221,28 +221,42 @@ async fn init_state(
     };
 
     if !raft_peers.is_empty() {
-        for raw_group_id in 0..config.raft.group_count {
-            let raft_group_id = u32::try_from(raw_group_id)
-                .expect("runtime config validates raft group ids fit u32");
-            if seeds.hosts(config.raft.node_id, RaftGroupId(raft_group_id))
-                && let Err(error) = runtime.warm_group(RaftGroupId(raft_group_id)).await
-            {
-                // A group whose replay stopped, or whose snapshot store
-                // did not answer its restore, stays closed on its core,
-                // which reopens the latter after a back-off.
-                if !error.leaves_group_closed() {
-                    return Err(error.into());
-                }
-                if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
-                    error: ursula_runtime::GroupEngineError::Infra(
-                        ursula_runtime::GroupInfraError::ApplyStopped { .. }
-                    ),
-                    ..
-                }) {
-                    tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
-                } else {
-                    tracing::warn!(raft_group_id, %error, "the snapshot store did not answer the group's restore; other groups remain available");
-                }
+        // The hosted groups open concurrently, as `warm_all_groups` opens
+        // every group, so startup waits for the slowest open, not their sum.
+        let hosted: Vec<RaftGroupId> = (0..config.raft.group_count)
+            .map(|raw_group_id| {
+                RaftGroupId(
+                    u32::try_from(raw_group_id)
+                        .expect("runtime config validates raft group ids fit u32"),
+                )
+            })
+            .filter(|raft_group_id| seeds.hosts(config.raft.node_id, *raft_group_id))
+            .collect();
+        let results = futures_util::future::join_all(
+            hosted
+                .iter()
+                .map(|raft_group_id| runtime.warm_group(*raft_group_id)),
+        )
+        .await;
+        for (RaftGroupId(raft_group_id), result) in hosted.into_iter().zip(results) {
+            let Err(error) = result else {
+                continue;
+            };
+            // A group whose replay stopped, or whose snapshot store did not
+            // answer its restore, stays closed on its core, which reopens the
+            // latter after a back-off.
+            if !error.leaves_group_closed() {
+                return Err(error.into());
+            }
+            if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
+                error: ursula_runtime::GroupEngineError::Infra(
+                    ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                ),
+                ..
+            }) {
+                tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
+            } else {
+                tracing::warn!(raft_group_id, %error, "the snapshot store did not answer the group's restore; other groups remain available");
             }
         }
     }
