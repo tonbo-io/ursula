@@ -1171,11 +1171,20 @@ fn process_crash_under_never_reads_strictly_and_loses_nothing() {
     }
 }
 
-/// The run state is replaced through a temporary file, an `fsync`, a rename
-/// and a directory `fsync`. A power loss at any step leaves the old or the
-/// new version, never a torn one: a run that could not publish its run state
-/// fails to start, and after the power loss the next run reads the clean
-/// shutdown before it.
+/// A start counts its run in the identity file, then publishes its run
+/// state, each replaced through a temporary file, an `fsync`, a rename and a
+/// directory `fsync`. A power loss at any step leaves the old or the new
+/// version of each, never a torn one: a run that could not publish its run
+/// state fails to start, and after the power loss the next run reads the
+/// clean shutdown before it and counts itself above every run counted
+/// before.
+///
+/// The identity file is recorded first, so a fault on the run state leaves
+/// the failed start's count durable, and the next run skips it. Both files
+/// live in the root, so a fault on the root's directory `fsync` stops the
+/// start at the identity file and leaves the old count: the run state's own
+/// directory `fsync` is never reached under a one-shot fault, and the
+/// rename fault covers the run state's last step before it.
 #[test]
 fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
     let _guard = sim_test_guard();
@@ -1190,22 +1199,30 @@ fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
                 )
             };
             let temp = root.join("run-state.running.tmp");
-            start()
-                .expect("a first run")
-                .shutdown()
-                .await
-                .expect("ends cleanly");
-            for (path, fault) in [
-                (temp.clone(), SimDiskFault::Write),
-                (temp.clone(), SimDiskFault::Sync),
-                (root.clone(), SimDiskFault::Sync),
+            let first = start().expect("a first run");
+            let mut last_run = first.incarnation().run;
+            first.shutdown().await.expect("ends cleanly");
+            for (path, fault, counted) in [
+                (temp.clone(), SimDiskFault::Write, true),
+                (temp.clone(), SimDiskFault::Sync, true),
+                (root.join(RUN_STATE_FILE), SimDiskFault::Rename, true),
+                (root.clone(), SimDiskFault::Sync, false),
             ] {
                 SimDisk::inject_fault(&path, fault).expect("arm the fault");
                 let err = start().expect_err("the run state is not published");
-                assert!(
-                    matches!(err, RaftWalError::RecordRunState(_)),
-                    "seed {seed} {fault:?}: {err}"
-                );
+                if counted {
+                    assert!(
+                        matches!(err, RaftWalError::RecordRunState(_)),
+                        "seed {seed} {fault:?} on {}: {err}",
+                        path.display()
+                    );
+                } else {
+                    assert!(
+                        matches!(err, RaftWalError::RecordIdentity(_)),
+                        "seed {seed} {fault:?} on {}: {err}",
+                        path.display()
+                    );
+                }
                 SimDisk::power_loss(&root).expect("power loss");
                 let run = start().expect("the old run state still reads");
                 assert_eq!(
@@ -1213,22 +1230,31 @@ fn the_run_state_is_the_old_or_the_new_version_after_a_power_loss() {
                     PreviousRun::Clean,
                     "seed {seed} {fault:?}"
                 );
+                // The failed start's count is the new version when it was
+                // recorded and the old one otherwise.
+                let expected = last_run + if counted { 2 } else { 1 };
+                assert_eq!(
+                    run.incarnation().run,
+                    expected,
+                    "seed {seed} {fault:?} on {}",
+                    path.display()
+                );
+                last_run = expected;
                 run.shutdown().await.expect("ends cleanly");
             }
 
             // A published run state survives the power loss.
             drop(start().expect("a run that crashes"));
             SimDisk::power_loss(&root).expect("power loss");
+            let run = start().expect("the new run state reads");
             assert_eq!(
-                start()
-                    .expect("the new run state reads")
-                    .opening()
-                    .previous_run,
+                run.opening().previous_run,
                 PreviousRun::HostCrash {
                     fsync: WalFsync::Never
                 },
                 "seed {seed}"
             );
+            assert_eq!(run.incarnation().run, last_run + 2, "seed {seed}");
         });
     }
 }
