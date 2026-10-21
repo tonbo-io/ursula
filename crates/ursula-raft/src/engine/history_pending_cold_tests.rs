@@ -61,6 +61,7 @@ fn history_of(
     registry
         .entry(runtime.locate(stream).raft_group_id)
         .expect("the group published its resources")
+        .core
         .history
         .clone()
 }

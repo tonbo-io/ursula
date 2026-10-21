@@ -13,6 +13,7 @@ use futures_util::future::BoxFuture;
 use futures_util::stream::FuturesUnordered;
 use openraft::ChangeMembers;
 use openraft::EmptyNode;
+use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::error::ClientWriteError;
 use openraft::error::Fatal;
@@ -23,15 +24,16 @@ use openraft::raft::ClientWriteResponse;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
 use openraft::rt::WatchReceiver;
+use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
 
 use crate::leadership::GroupLeadership;
-use crate::registry::RaftGroupHandle;
 use crate::rt::sync::mpsc;
 use crate::rt::sync::oneshot;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
 use crate::types::UrsulaRaftTypeConfig as C;
@@ -40,27 +42,42 @@ use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
 use crate::types::UrsulaVoteResponse;
 
-type Job = Box<dyn FnOnce(RaftGroupHandle) -> BoxFuture<'static, ()> + Send>;
+type Job<SM> = Box<dyn FnOnce(Raft<C, SM>) -> BoxFuture<'static, ()> + Send>;
 
-struct Mailbox {
-    sender: mpsc::UnboundedSender<Job>,
+struct Mailbox<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> {
+    sender: mpsc::UnboundedSender<Job<SM>>,
     task: crate::rt::task::JoinHandle<()>,
 }
 
-impl Drop for Mailbox {
+impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Drop for Mailbox<SM> {
     fn drop(&mut self) {
         self.task.abort();
     }
 }
 
 /// A cloneable command endpoint, with no cross-thread raw Raft handle.
-#[derive(Clone)]
-pub struct OwnerRaftHandle {
-    mailbox: Arc<Mailbox>,
+/// Generic over the state machine, so every plane's replica uses one
+/// mailbox. The default is the data plane's.
+pub struct OwnerRaftHandle<
+    SM: RaftStateMachine<C, SnapshotData = SnapshotData> = RaftGroupStateMachine,
+> {
+    mailbox: Arc<Mailbox<SM>>,
     metrics: WatchReceiverOf<C, RaftMetrics<C>>,
     data_metrics: WatchReceiverOf<C, RaftDataMetrics<C>>,
     handoff_ack_window: Duration,
     transfer_deadline: Duration,
+}
+
+impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHandle<SM> {
+    fn clone(&self) -> Self {
+        Self {
+            mailbox: self.mailbox.clone(),
+            metrics: self.metrics.clone(),
+            data_metrics: self.data_metrics.clone(),
+            handoff_ack_window: self.handoff_ack_window,
+            transfer_deadline: self.transfer_deadline,
+        }
+    }
 }
 
 /// How many maximum election timeouts a submitted leadership transfer may
@@ -68,14 +85,14 @@ pub struct OwnerRaftHandle {
 /// election timeout for its log, then campaigns.
 const TRANSFER_DEADLINE_ELECTION_TIMEOUTS: u64 = 2;
 
-impl std::fmt::Debug for OwnerRaftHandle {
+impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> std::fmt::Debug for OwnerRaftHandle<SM> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OwnerRaftHandle").finish_non_exhaustive()
     }
 }
 
-impl OwnerRaftHandle {
-    pub(crate) fn new(raft: RaftGroupHandle) -> Self {
+impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
+    pub(crate) fn new(raft: Raft<C, SM>) -> Self {
         let metrics = raft.metrics();
         let data_metrics = raft.data_metrics();
         let handoff_ack_window = Duration::from_millis(raft.config().election_timeout_min);
@@ -84,7 +101,7 @@ impl OwnerRaftHandle {
                 .election_timeout_max
                 .saturating_mul(TRANSFER_DEADLINE_ELECTION_TIMEOUTS),
         );
-        let (sender, mut receiver) = mpsc::unbounded_channel::<Job>();
+        let (sender, mut receiver) = mpsc::unbounded_channel::<Job<SM>>();
         let task = crate::rt::spawn(async move {
             let mut jobs = FuturesUnordered::new();
             loop {
@@ -140,7 +157,7 @@ impl OwnerRaftHandle {
     pub(crate) fn abandon_stalled_transfer(&self, vote: UrsulaVote, target: u64) {
         let deadline = self.transfer_deadline;
         let retry = self.handoff_ack_window;
-        let job: Job = Box::new(move |raft| {
+        let job: Job<SM> = Box::new(move |raft| {
             Box::pin(async move {
                 let mut wait = deadline;
                 loop {
@@ -221,7 +238,7 @@ impl OwnerRaftHandle {
 
     pub(crate) async fn call<F, Fut, R>(&self, operation: F) -> Result<R, Fatal<C>>
     where
-        F: FnOnce(RaftGroupHandle) -> Fut + Send + 'static,
+        F: FnOnce(Raft<C, SM>) -> Fut + Send + 'static,
         Fut: Future<Output = R> + Send + 'static,
         R: Send + 'static,
     {
@@ -277,7 +294,7 @@ impl OwnerRaftHandle {
         self.metrics.borrow_watched().current_leader
     }
 
-    pub fn trigger(&self) -> OwnerTrigger {
+    pub fn trigger(&self) -> OwnerTrigger<SM> {
         OwnerTrigger(self.clone())
     }
 
@@ -401,7 +418,7 @@ impl OwnerRaftHandle {
     }
     pub async fn with_state_machine<F, R>(&self, f: F) -> Result<R, Fatal<C>>
     where
-        F: FnOnce(&mut RaftGroupStateMachine) -> BoxFuture<'_, R> + Send + 'static,
+        F: FnOnce(&mut SM) -> BoxFuture<'_, R> + Send + 'static,
         R: Send + 'static,
     {
         self.call(move |raft| async move { raft.with_state_machine(f).await })
@@ -463,8 +480,8 @@ pub enum StepDownError {
 /// itself [`transfer_step_down`], which drops the leader state as for any
 /// follower, and campaigns only then. `target` must be another node
 /// ([`StepDownError::TargetIsSelf`]).
-pub(crate) async fn step_down_and_campaign(
-    raft: &RaftGroupHandle,
+pub(crate) async fn step_down_and_campaign<SM: RaftStateMachine<C>>(
+    raft: &Raft<C, SM>,
     vote: UrsulaVote,
     target: u64,
 ) -> Result<StepDown, StepDownError> {
@@ -489,7 +506,9 @@ pub(crate) async fn step_down_and_campaign(
 }
 
 /// Administrative triggers execute on the owner, including their task creation.
-pub struct OwnerTrigger(OwnerRaftHandle);
+pub struct OwnerTrigger<
+    SM: RaftStateMachine<C, SnapshotData = SnapshotData> = RaftGroupStateMachine,
+>(OwnerRaftHandle<SM>);
 
 macro_rules! trigger {
     ($name:ident ( $($arg:ident : $ty:ty),* )) => {
@@ -498,7 +517,7 @@ macro_rules! trigger {
         }
     };
 }
-impl OwnerTrigger {
+impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerTrigger<SM> {
     trigger!(snapshot());
     trigger!(elect(pre_vote: bool));
     trigger!(heartbeat());

@@ -1117,7 +1117,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .entry(placement.raft_group_id)
                 .map_err(group_rpc_status)?;
             let raft = entry.raft().clone();
-            let history = entry.history.clone();
+            let history = entry.core.history.clone();
             let commands = request
                 .command_payloads
                 .iter()
@@ -1247,7 +1247,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                 .entry(placement.raft_group_id)
                 .map_err(group_rpc_status)?;
             let raft = entry.raft().clone();
-            let read_barrier = entry.barrier.clone();
+            let read_barrier = entry.core.barrier.clone();
             let cold_store = self.cold_store.clone();
             let cold_index_cache = entry.cache.clone().or_else(|| {
                 cold_store.as_ref().map(|cold_store| {
@@ -1257,8 +1257,8 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     ))
                 })
             });
-            let apply_health = entry.apply_health.clone();
-            let history = entry.history.clone();
+            let apply_health = entry.core.apply_health.clone();
+            let history = entry.core.history.clone();
             let peer_cluster = Some(self.registry.peer_cluster().clone());
             let log_gauge = entry.log_gauge.clone();
             let snapshots = entry.snapshots.clone();

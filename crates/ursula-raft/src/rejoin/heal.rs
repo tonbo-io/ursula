@@ -9,18 +9,19 @@ use std::time::Duration;
 
 use openraft::ChangeMembers;
 use openraft::EmptyNode;
+use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::ServerState;
 use openraft::alias::LogIdOf;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
+use openraft::storage::RaftStateMachine;
 
 use super::GroupRejoin;
 use super::REJOIN_HEAL_STEP_TIMEOUT;
 use super::attach::Wake;
 use super::attach::wait_change;
 use super::log_index;
-use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 
@@ -223,8 +224,8 @@ struct PlanInputs {
 /// membership back to the configured voters (add a missing one as a
 /// learner, promote it once caught up, flatten a stale joint config).
 /// Returns once the Raft stops.
-pub(crate) async fn run_rejoin_heal(
-    raft: RaftGroupHandle,
+pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
+    raft: Raft<UrsulaRaftTypeConfig, SM>,
     rejoin: Arc<GroupRejoin>,
     configured: BTreeSet<u64>,
     interval: Duration,

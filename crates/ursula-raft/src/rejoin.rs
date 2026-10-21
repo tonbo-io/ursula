@@ -91,11 +91,13 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::Instant as _;
+use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::alias::LogIdOf;
 use openraft::alias::VoteOf;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
+use openraft::storage::RaftStateMachine;
 use openraft::type_config::TypeConfigExt;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::type_config::alias::WatchSenderOf;
@@ -112,7 +114,6 @@ use crate::log_store::GroupLogState;
 use crate::log_store::PlanCut;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RecoveryRecord;
-use crate::registry::RaftGroupHandle;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
@@ -973,13 +974,14 @@ pub(crate) struct CoreState {
     pub(crate) server_state: openraft::ServerState,
 }
 
-/// [`PlanCore`] for a group's Raft core, inside its owner job.
-pub(crate) struct RaftPlanCore<'a> {
-    pub(crate) raft: &'a RaftGroupHandle,
+/// [`PlanCore`] for a group's Raft core, of any state machine, inside its
+/// owner job.
+pub(crate) struct RaftPlanCore<'a, SM: RaftStateMachine<UrsulaRaftTypeConfig>> {
+    pub(crate) raft: &'a Raft<UrsulaRaftTypeConfig, SM>,
     pub(crate) raft_group_id: RaftGroupId,
 }
 
-impl PlanCore for RaftPlanCore<'_> {
+impl<SM: RaftStateMachine<UrsulaRaftTypeConfig>> PlanCore for RaftPlanCore<'_, SM> {
     fn disable_elections(&self) {
         self.raft.runtime_config().elect(false);
     }
@@ -1308,9 +1310,9 @@ impl GroupRejoin {
 
     /// Attach the group's Raft metrics. Call once the Raft exists and before
     /// it is reachable from the network.
-    pub(crate) fn bind(
+    pub(crate) fn bind<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
         &self,
-        raft: &RaftGroupHandle,
+        raft: &Raft<UrsulaRaftTypeConfig, SM>,
     ) -> Result<(), ursula_runtime::GroupEngineError> {
         let expected = raft.metrics().borrow_watched().id;
         if self.node_id != expected {

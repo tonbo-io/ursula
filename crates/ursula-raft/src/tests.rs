@@ -3890,7 +3890,7 @@ async fn a_history_event_ends_a_live_read_pinned_to_the_old_token() {
     let point = openraft::rt::WatchReceiver::borrow_watched(&entry.raft().metrics())
         .last_log_index
         .expect("a log");
-    entry.history.set_plan(Some(RecoveryRecord {
+    entry.core.history.set_plan(Some(RecoveryRecord {
         leader: 1,
         point,
         leader_term: 0,

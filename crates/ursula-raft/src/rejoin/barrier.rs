@@ -8,11 +8,14 @@ use std::time::Duration;
 
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
+use openraft::storage::RaftStateMachine;
 
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
 use crate::owner::OwnerRaftHandle;
+use crate::types::SnapshotData;
+use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 
 /// Opens a gated replica's recovery gate from fresh outbound leader proofs.
@@ -23,9 +26,10 @@ use crate::types::UrsulaVote;
 /// nothing reports its group stalled. Once the gate is open, here or through
 /// an operator, the group's election policy is refreshed and the driver
 /// returns. Transport-independent so simulation exercises the production
-/// driver.
-pub async fn run_rejoin_vote_barrier<P, F, E>(
-    raft: OwnerRaftHandle,
+/// driver, and generic over the state machine so every plane's replica
+/// runs it.
+pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
+    raft: OwnerRaftHandle<SM>,
     rejoin: Arc<GroupRejoin>,
     election: crate::ElectionPolicy,
     nodes: BTreeSet<u64>,
@@ -34,6 +38,7 @@ pub async fn run_rejoin_vote_barrier<P, F, E>(
     interval: Duration,
     stall_after: Duration,
 ) where
+    SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
     P: Fn(u64) -> F,
     F: Future<Output = Result<(UrsulaVote, u64), E>>,
     E: fmt::Debug,

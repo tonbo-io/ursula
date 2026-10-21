@@ -1,4 +1,10 @@
 //! In-process fault-injection network for tests and deterministic simulation.
+//!
+//! The registry and the network are generic over the state machine: each
+//! one delivers to the replicas of one plane, through what the plane's
+//! state machine registers to answer RPCs ([`InProcessEndpoint`]). The data
+//! plane keeps its names ([`InProcessRaftRegistry`],
+//! [`InProcessRaftNetworkFactory`], [`InProcessRaftNetwork`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -27,6 +33,7 @@ use openraft::raft::TransferLeaderRequest;
 use openraft::raft::VoteRequest;
 use openraft::raft::VoteResponse;
 use openraft::rt::WatchReceiver;
+use openraft::storage::RaftStateMachine;
 
 use crate::registry::SnapshotInstallError;
 use crate::rejoin::GroupRejoin;
@@ -36,16 +43,193 @@ use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaSnapshot;
 
-#[derive(Debug, Clone, Default)]
-pub struct InProcessRaftRegistry {
-    endpoints:
-        Arc<Mutex<BTreeMap<u64, (ursula_shard::RaftGroupId, crate::RaftGroupHandleRegistry)>>>,
-    nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>>>>,
-    barriers: Arc<Mutex<BTreeMap<u64, Arc<crate::read_index::ReadIndexBarrier>>>>,
+/// How the in-process network delivers RPCs to the replicas of one state
+/// machine: what a node registers to answer them, and the production entry
+/// point each RPC goes through on it.
+pub trait InProcessEndpoint:
+    RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>
+{
+    /// What a node registers to answer this plane's RPCs.
+    type Endpoint: Clone + Send + Sync + 'static;
+
+    /// The target's recovery gate, as status reports show it.
+    fn gate(endpoint: &Self::Endpoint) -> Option<RecoveryGateStatus>;
+
+    fn append_entries(
+        endpoint: &Self::Endpoint,
+        rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
+    ) -> impl Future<
+        Output = Result<
+            AppendEntriesResponse<UrsulaRaftTypeConfig>,
+            ursula_runtime::GroupEngineError,
+        >,
+    > + Send;
+
+    fn vote(
+        endpoint: &Self::Endpoint,
+        rpc: VoteRequest<UrsulaRaftTypeConfig>,
+    ) -> impl Future<
+        Output = Result<VoteResponse<UrsulaRaftTypeConfig>, ursula_runtime::GroupEngineError>,
+    > + Send;
+
+    fn install_full_snapshot(
+        endpoint: &Self::Endpoint,
+        vote: VoteOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
+    ) -> impl Future<Output = Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError>> + Send;
+
+    /// The target's own check of a leadership transfer to `target`, before
+    /// OpenRaft sees it.
+    fn validate_incoming_transfer(
+        endpoint: &Self::Endpoint,
+        target: u64,
+        request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
+    ) -> Result<(), crate::IncomingTransferError>;
+}
+
+/// The data plane delivers through each node's production registry.
+impl InProcessEndpoint for RaftGroupStateMachine {
+    type Endpoint = (ursula_shard::RaftGroupId, crate::RaftGroupHandleRegistry);
+
+    fn gate((group, registry): &Self::Endpoint) -> Option<RecoveryGateStatus> {
+        registry.rejoin(*group).map(|rejoin| rejoin.status())
+    }
+
+    fn append_entries(
+        (group, registry): &Self::Endpoint,
+        rpc: AppendEntriesRequest<UrsulaRaftTypeConfig>,
+    ) -> impl Future<
+        Output = Result<
+            AppendEntriesResponse<UrsulaRaftTypeConfig>,
+            ursula_runtime::GroupEngineError,
+        >,
+    > + Send {
+        registry.append_entries(*group, rpc)
+    }
+
+    fn vote(
+        (group, registry): &Self::Endpoint,
+        rpc: VoteRequest<UrsulaRaftTypeConfig>,
+    ) -> impl Future<
+        Output = Result<VoteResponse<UrsulaRaftTypeConfig>, ursula_runtime::GroupEngineError>,
+    > + Send {
+        registry.vote(*group, rpc)
+    }
+
+    fn install_full_snapshot(
+        (group, registry): &Self::Endpoint,
+        vote: VoteOf<UrsulaRaftTypeConfig>,
+        snapshot: UrsulaSnapshot,
+    ) -> impl Future<Output = Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError>> + Send
+    {
+        registry.install_full_snapshot(*group, vote, snapshot)
+    }
+
+    fn validate_incoming_transfer(
+        (group, registry): &Self::Endpoint,
+        target: u64,
+        request: &TransferLeaderRequest<UrsulaRaftTypeConfig>,
+    ) -> Result<(), crate::IncomingTransferError> {
+        registry.election_policy().validate_incoming_transfer(
+            *group,
+            target,
+            request,
+            registry.rejoin(*group).as_deref(),
+        )
+    }
+}
+
+/// The in-process registry of one plane's replicas, by node id.
+pub struct InProcessRegistry<SM: InProcessEndpoint> {
+    endpoints: Arc<Mutex<BTreeMap<u64, SM::Endpoint>>>,
+    nodes: Arc<Mutex<BTreeMap<u64, Raft<UrsulaRaftTypeConfig, SM>>>>,
+    barriers: Arc<Mutex<BTreeMap<u64, Arc<crate::read_index::ReadIndexBarrier<SM>>>>>,
     full_snapshot_calls: Arc<Mutex<BTreeMap<u64, usize>>>,
 }
 
-impl InProcessRaftRegistry {
+/// The data plane's in-process registry.
+pub type InProcessRaftRegistry = InProcessRegistry<RaftGroupStateMachine>;
+
+impl<SM: InProcessEndpoint> Clone for InProcessRegistry<SM> {
+    fn clone(&self) -> Self {
+        Self {
+            endpoints: self.endpoints.clone(),
+            nodes: self.nodes.clone(),
+            barriers: self.barriers.clone(),
+            full_snapshot_calls: self.full_snapshot_calls.clone(),
+        }
+    }
+}
+
+impl<SM: InProcessEndpoint> Default for InProcessRegistry<SM> {
+    fn default() -> Self {
+        Self {
+            endpoints: Arc::default(),
+            nodes: Arc::default(),
+            barriers: Arc::default(),
+            full_snapshot_calls: Arc::default(),
+        }
+    }
+}
+
+impl<SM: InProcessEndpoint> Debug for InProcessRegistry<SM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InProcessRegistry").finish_non_exhaustive()
+    }
+}
+
+impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
+    pub fn unregister(&self, node_id: u64) -> Option<Raft<UrsulaRaftTypeConfig, SM>> {
+        self.barriers
+            .lock()
+            .expect("in-process barrier mutex")
+            .remove(&node_id);
+        self.endpoints
+            .lock()
+            .expect("endpoint registry")
+            .remove(&node_id);
+        self.nodes
+            .lock()
+            .expect("in-process raft registry mutex")
+            .remove(&node_id)
+    }
+
+    pub fn get(&self, node_id: u64) -> Option<Raft<UrsulaRaftTypeConfig, SM>> {
+        self.nodes
+            .lock()
+            .expect("in-process raft registry mutex")
+            .get(&node_id)
+            .cloned()
+    }
+
+    fn endpoint(&self, node_id: u64) -> Option<SM::Endpoint> {
+        self.endpoints
+            .lock()
+            .expect("endpoint registry")
+            .get(&node_id)
+            .cloned()
+    }
+
+    pub fn full_snapshot_count(&self, node_id: u64) -> usize {
+        self.full_snapshot_calls
+            .lock()
+            .expect("in-process raft full snapshot calls mutex")
+            .get(&node_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    fn record_full_snapshot(&self, node_id: u64) {
+        let mut calls = self
+            .full_snapshot_calls
+            .lock()
+            .expect("in-process raft full snapshot calls mutex");
+        let count = calls.entry(node_id).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+}
+
+impl InProcessRegistry<RaftGroupStateMachine> {
     pub fn register(&self, node_id: u64, engine: &crate::RaftGroupEngine) {
         let raft = engine.raft_handle();
         self.barriers
@@ -62,32 +246,6 @@ impl InProcessRaftRegistry {
             .lock()
             .expect("in-process raft registry mutex")
             .insert(node_id, raft);
-    }
-
-    pub fn unregister(
-        &self,
-        node_id: u64,
-    ) -> Option<Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>> {
-        self.barriers
-            .lock()
-            .expect("in-process barrier mutex")
-            .remove(&node_id);
-        self.endpoints
-            .lock()
-            .expect("endpoint registry")
-            .remove(&node_id);
-        self.nodes
-            .lock()
-            .expect("in-process raft registry mutex")
-            .remove(&node_id)
-    }
-
-    pub fn get(&self, node_id: u64) -> Option<Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>> {
-        self.nodes
-            .lock()
-            .expect("in-process raft registry mutex")
-            .get(&node_id)
-            .cloned()
     }
 
     /// The barrier RPC's server side on `node_id`, through the node's
@@ -122,17 +280,6 @@ impl InProcessRaftRegistry {
         endpoint.accept_recovery_plan(group, plan, restart).await
     }
 
-    fn endpoint(
-        &self,
-        node_id: u64,
-    ) -> Option<(ursula_shard::RaftGroupId, crate::RaftGroupHandleRegistry)> {
-        self.endpoints
-            .lock()
-            .expect("endpoint registry")
-            .get(&node_id)
-            .cloned()
-    }
-
     /// Production inbound vote dispatch, also used by simulated recovery probes.
     pub async fn vote(
         &self,
@@ -151,35 +298,38 @@ impl InProcessRaftRegistry {
         let (group, endpoint) = self.endpoint(node_id)?;
         endpoint.rejoin(group)
     }
-
-    pub fn full_snapshot_count(&self, node_id: u64) -> usize {
-        self.full_snapshot_calls
-            .lock()
-            .expect("in-process raft full snapshot calls mutex")
-            .get(&node_id)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    fn record_full_snapshot(&self, node_id: u64) {
-        let mut calls = self
-            .full_snapshot_calls
-            .lock()
-            .expect("in-process raft full snapshot calls mutex");
-        let count = calls.entry(node_id).or_insert(0);
-        *count = count.saturating_add(1);
-    }
 }
 
-#[derive(Debug, Clone)]
-pub struct InProcessRaftNetworkFactory {
-    registry: InProcessRaftRegistry,
+/// The in-process network factory of one plane.
+pub struct InProcessNetworkFactory<SM: InProcessEndpoint> {
+    registry: InProcessRegistry<SM>,
     source: Option<u64>,
     policy: InProcessRaftNetworkPolicy,
 }
 
-impl InProcessRaftNetworkFactory {
-    pub fn new(registry: InProcessRaftRegistry) -> Self {
+/// The data plane's in-process network factory.
+pub type InProcessRaftNetworkFactory = InProcessNetworkFactory<RaftGroupStateMachine>;
+
+impl<SM: InProcessEndpoint> Clone for InProcessNetworkFactory<SM> {
+    fn clone(&self) -> Self {
+        Self {
+            registry: self.registry.clone(),
+            source: self.source,
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+impl<SM: InProcessEndpoint> Debug for InProcessNetworkFactory<SM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InProcessNetworkFactory")
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<SM: InProcessEndpoint> InProcessNetworkFactory<SM> {
+    pub fn new(registry: InProcessRegistry<SM>) -> Self {
         Self {
             registry,
             source: None,
@@ -198,11 +348,13 @@ impl InProcessRaftNetworkFactory {
     }
 }
 
-impl RaftNetworkFactory<UrsulaRaftTypeConfig> for InProcessRaftNetworkFactory {
-    type Network = InProcessRaftNetwork;
+impl<SM: InProcessEndpoint> RaftNetworkFactory<UrsulaRaftTypeConfig>
+    for InProcessNetworkFactory<SM>
+{
+    type Network = InProcessNetwork<SM>;
 
     async fn new_client(&mut self, target: u64, _node: &EmptyNode) -> Self::Network {
-        InProcessRaftNetwork {
+        InProcessNetwork {
             source: self.source,
             target,
             registry: self.registry.clone(),
@@ -606,15 +758,38 @@ impl InProcessRaftNetworkDecision {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct InProcessRaftNetwork {
+/// The in-process network of one plane, from one source to one target.
+pub struct InProcessNetwork<SM: InProcessEndpoint> {
     source: Option<u64>,
     target: u64,
-    registry: InProcessRaftRegistry,
+    registry: InProcessRegistry<SM>,
     policy: InProcessRaftNetworkPolicy,
 }
 
-impl InProcessRaftNetwork {
+/// The data plane's in-process network.
+pub type InProcessRaftNetwork = InProcessNetwork<RaftGroupStateMachine>;
+
+impl<SM: InProcessEndpoint> Clone for InProcessNetwork<SM> {
+    fn clone(&self) -> Self {
+        Self {
+            source: self.source,
+            target: self.target,
+            registry: self.registry.clone(),
+            policy: self.policy.clone(),
+        }
+    }
+}
+
+impl<SM: InProcessEndpoint> Debug for InProcessNetwork<SM> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InProcessNetwork")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
     fn missing_target_error(&self) -> Unreachable<UrsulaRaftTypeConfig> {
         Unreachable::from_string(format!(
             "in-process raft node {} is not registered",
@@ -695,7 +870,7 @@ impl InProcessRaftNetwork {
     }
 }
 
-impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
+impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNetwork<SM> {
     type SnapshotData = SnapshotData;
 
     async fn append_entries(
@@ -711,7 +886,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         {
             sleep_in_process_raft_network(delay).await;
         }
-        let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
+        let target = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -727,8 +902,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         });
         let matched = self.matched_by_sender(&rpc.vote);
         let conflict_index = rpc.prev_log_id.map(|log_id| log_id.index);
-        let target_gate = target.rejoin(group).map(|rejoin| rejoin.status());
-        let response = target.append_entries(group, rpc).await.map_err(|err| {
+        let target_gate = SM::gate(&target);
+        let response = SM::append_entries(&target, rpc).await.map_err(|err| {
             let message = format!("remote AppendEntries on node {}: {err}", self.target);
             if refuses_overwrite(&err) {
                 RPCError::Unreachable(Unreachable::from_string(message))
@@ -767,7 +942,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_rpc(InProcessRaftRpcKind::Vote)
             .await
             .map_err(RPCError::Unreachable)?;
-        let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
+        let target = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -781,9 +956,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::Vote,
         });
-        let target_rejoin = self.registry.rejoin(self.target);
-        let target_gate = target_rejoin.as_ref().map(|rejoin| rejoin.status());
-        let response = target.vote(group, rpc).await.map_err(|err| {
+        let target_gate = SM::gate(&target);
+        let response = SM::vote(&target, rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!("remote vote: {err}")))
         })?;
         self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
@@ -806,7 +980,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         self.before_streaming_rpc(InProcessRaftRpcKind::FullSnapshot, cancel.as_mut())
             .await?;
         self.registry.record_full_snapshot(self.target);
-        let (group, target) = self.registry.endpoint(self.target).ok_or_else(|| {
+        let target = self.registry.endpoint(self.target).ok_or_else(|| {
             self.policy
                 .notify(InProcessRaftNetworkEvent::RpcMissingTarget {
                     source: self.source,
@@ -847,7 +1021,7 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
         };
         // RaftCore cancels a send it no longer wants, and every send once it
         // stops, as the gRPC network honours it (#709).
-        let install = std::pin::pin!(target.install_full_snapshot(group, vote, snapshot));
+        let install = std::pin::pin!(SM::install_full_snapshot(&target, vote, snapshot));
         let installed = match futures_util::future::select(install, cancel).await {
             futures_util::future::Either::Left((installed, _cancel)) => installed,
             futures_util::future::Either::Right((closed, _install)) => {
@@ -893,13 +1067,8 @@ impl RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessRaftNetwork {
             target: self.target,
             kind: InProcessRaftRpcKind::TransferLeader,
         });
-        if let Some((group, endpoint)) = self.registry.endpoint(self.target)
-            && let Err(refusal) = endpoint.election_policy().validate_incoming_transfer(
-                group,
-                self.target,
-                &req,
-                endpoint.rejoin(group).as_deref(),
-            )
+        if let Some(endpoint) = self.registry.endpoint(self.target)
+            && let Err(refusal) = SM::validate_incoming_transfer(&endpoint, self.target, &req)
         {
             return Err(RPCError::Network(NetworkError::new(&refusal)));
         }

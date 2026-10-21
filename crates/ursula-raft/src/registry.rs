@@ -53,10 +53,10 @@ pub use crate::election::LeadershipShedReason;
 pub use crate::election::LeadershipShedState;
 use crate::log_store::WalOpening;
 use crate::owner::OwnerRaftHandle;
-use crate::read_index::ReadIndexBarrier;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RecoveryGateError;
 use crate::rejoin::RecoveryGateStatus;
+use crate::replica::ReplicaCore;
 use crate::snapshot_codec::decode_group_snapshot;
 use crate::snapshot_holds::HeldWriteError;
 use crate::snapshot_holds::SnapshotHolds;
@@ -135,24 +135,17 @@ pub type RaftGroupHandle = Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>;
 /// A group's shared cold-index page cache.
 pub type GroupColdIndexCache = Arc<ColdIndexPageCache<ColdStoreColdIndexPageStore>>;
 
-/// How long a recovery plan's accept waits for a restarted replica to
-/// publish the membership it rebuilt from its cut log (#613).
-const RESTARTED_MEMBERSHIP_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
-
 /// Resources published atomically with a live owner handle. Only cache and
 /// recovery are optional capabilities; every registered group has a barrier.
 #[derive(Debug, Clone)]
 pub(crate) struct ActiveGroup {
-    pub(crate) apply_health: crate::apply_failure::ApplyHealth,
+    /// The replica's barrier, recovery gate, history and apply health,
+    /// which every plane's replica has.
+    pub(crate) core: ReplicaCore,
     /// The engine's admission of snapshot installs and of the GC passes
     /// that run on its holds, closed once the engine begins to shut down.
     pub(crate) snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
     pub(crate) cache: Option<GroupColdIndexCache>,
-    pub(crate) barrier: Arc<ReadIndexBarrier>,
-    pub(crate) recovery: Option<Arc<GroupRejoin>>,
-    /// The group's history on this replica (#581 section 4.5): a leader
-    /// whose history is pending proposes, serves and confirms nothing.
-    pub(crate) history: Arc<crate::history::GroupHistory>,
     /// The state machine's log gauge and applied membership (#613).
     pub(crate) log_gauge: Arc<crate::snapshot_cadence::GroupLogGauge>,
     /// The engine's snapshot store, install coordinator and holds: an
@@ -176,28 +169,7 @@ pub(crate) struct GroupSnapshots {
 
 impl ActiveGroup {
     pub(crate) fn raft(&self) -> &OwnerRaftHandle {
-        self.barrier.owner()
-    }
-    fn check_recovery_vote(
-        &self,
-        group: RaftGroupId,
-        vote: crate::UrsulaVote,
-    ) -> Result<Option<crate::UrsulaVote>, GroupEngineError> {
-        let Some(rejoin) = &self.recovery else {
-            return Ok(None);
-        };
-        // A replica restarting for a plan takes no replication, and one
-        // holding a plan none from a leader elected before it (M1, #581
-        // review).
-        if let Some(refusal) = rejoin.replication_refusal(&vote) {
-            return Err(GroupEngineError::Infra(refusal));
-        }
-        let floor = rejoin.recovery_vote().ok_or(GroupEngineError::Infra(
-            ursula_runtime::GroupInfraError::RecoveryVoteFloor {
-                raft_group_id: group,
-            },
-        ))?;
-        Ok((vote < floor).then_some(floor))
+        self.core.owner()
     }
 }
 
@@ -222,10 +194,10 @@ impl GroupEntry {
     /// longer open, and it must not hold back the node's other groups.
     fn participating_gate(&self) -> Option<&Arc<GroupRejoin>> {
         let active = self.active()?;
-        if active.apply_health.failure().is_some() {
+        if active.core.apply_health.failure().is_some() {
             return None;
         }
-        active.recovery.as_ref()
+        active.core.recovery.as_ref()
     }
 }
 
@@ -508,11 +480,14 @@ pub enum SelfElectionError {
 /// and a replica that applied that index holds every entry such an
 /// acknowledgement could have counted. A deposed leader fails the round, and
 /// the new leader's barrier takes its place.
-pub(crate) async fn confirm_recovery_barrier(
+pub(crate) async fn confirm_recovery_barrier<SM>(
     group: RaftGroupId,
-    raft: &OwnerRaftHandle,
+    raft: &OwnerRaftHandle<SM>,
     barrier: &dyn ursula_runtime::LinearizableReadBarrier,
-) -> Result<crate::BarrierAnswer, QuorumProofError> {
+) -> Result<crate::BarrierAnswer, QuorumProofError>
+where
+    SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
+{
     let before = raft.metrics().borrow_watched().clone();
     if before.current_leader != Some(before.id) || !before.vote.is_committed() {
         return Err(QuorumProofError::NotLeader { group });
@@ -554,7 +529,7 @@ impl RaftGroupHandleRegistry {
 
     pub fn may_campaign(&self, group: RaftGroupId) -> bool {
         self.entry(group)
-            .is_ok_and(|entry| self.election.may_campaign(entry.recovery.as_deref()))
+            .is_ok_and(|entry| self.election.may_campaign(entry.core.recovery.as_deref()))
     }
 
     /// Submit a handoff after checking it against the handoff policy
@@ -567,7 +542,9 @@ impl RaftGroupHandleRegistry {
         target: u64,
     ) -> Result<(), LeadershipTransferError> {
         let (entry, metrics) = self.handoff_view(group)?;
-        self.validate_handoff(group, target, &entry, &metrics)?;
+        entry
+            .core
+            .validate_handoff(&self.election, group, target, &metrics)?;
         let raft = entry.raft();
         raft.trigger()
             .transfer_leader(target)
@@ -586,7 +563,9 @@ impl RaftGroupHandleRegistry {
         target: u64,
     ) -> Result<(), LeadershipTransferError> {
         let (entry, metrics) = self.handoff_view(group)?;
-        self.validate_handoff(group, target, &entry, &metrics)
+        entry
+            .core
+            .validate_handoff(&self.election, group, target, &metrics)
     }
 
     /// One registry entry, so the gate checked is the gate of the Raft that
@@ -602,30 +581,8 @@ impl RaftGroupHandleRegistry {
             .get(&group.0)
             .and_then(|entry| entry.active().cloned())
             .ok_or(LeadershipTransferError::NotRegistered { group })?;
-        let metrics = entry.raft().metrics().borrow_watched().clone();
+        let metrics = entry.core.handoff_view();
         Ok((entry, metrics))
-    }
-
-    fn validate_handoff(
-        &self,
-        group: RaftGroupId,
-        target: u64,
-        entry: &ActiveGroup,
-        metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
-    ) -> Result<(), LeadershipTransferError> {
-        let target_ack_age = metrics
-            .heartbeat
-            .as_ref()
-            .and_then(|acks| acks.get(&target))
-            .and_then(|acked| acked.as_ref())
-            .map(|acked| openraft::Instant::elapsed(&**acked));
-        self.election.validate_handoff(
-            group,
-            target,
-            metrics,
-            target_ack_age,
-            entry.raft().handoff_ack_window(),
-        )
     }
 
     pub async fn confirm_quorum_prefix(
@@ -645,7 +602,7 @@ impl RaftGroupHandleRegistry {
         &self,
         group: RaftGroupId,
     ) -> Result<crate::BarrierAnswer, QuorumProofError> {
-        let (raft, barrier, history) = {
+        let core = {
             let groups = self.groups.load();
             let entry = groups
                 .get(&group.0)
@@ -653,18 +610,9 @@ impl RaftGroupHandleRegistry {
             let entry = entry
                 .active()
                 .ok_or(QuorumProofError::NotRegistered { group })?;
-            let raft = entry.raft().clone();
-            let barrier = entry.barrier.clone();
-            (raft, barrier, entry.history.clone())
+            entry.core.clone()
         };
-        // A leader whose history is pending confirms no barrier: a gate
-        // opened on its state would follow a history it has not settled
-        // (#581 section 4.5, #577 N1). It waits for the event a moment, as
-        // a fenced proposal does.
-        if history.admit_on(raft.metrics()).await.is_err() {
-            return Err(QuorumProofError::HistoryPending { group });
-        }
-        confirm_recovery_barrier(group, &raft, barrier.as_ref()).await
+        core.confirm_barrier(group).await
     }
 
     /// Records how this node's Raft WAL opened.
@@ -732,18 +680,20 @@ impl RaftGroupHandleRegistry {
     /// Publish all group resources together, before any transport can find its Raft handle.
     pub(crate) fn register_engine(&self, engine: &crate::RaftGroupEngine) {
         let entry = Arc::new(GroupEntry::Active(Arc::new(ActiveGroup {
-            apply_health: engine.apply_health.clone(),
+            core: ReplicaCore {
+                barrier: engine.read_barrier.clone(),
+                recovery: engine
+                    .rejoin
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+                history: engine.history.clone(),
+                apply_health: engine.apply_health.clone(),
+            },
             snapshot_installs: engine.snapshot_installs.clone(),
             cache: engine.cold_index_cache.clone(),
-            barrier: engine.read_barrier.clone(),
-            history: engine.history.clone(),
             log_gauge: engine.log_gauge.clone(),
             snapshots: engine.snapshots.clone(),
-            recovery: engine
-                .rejoin
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone(),
         })));
         self.groups.rcu(|groups| {
             let mut groups = (**groups).clone();
@@ -792,7 +742,7 @@ impl RaftGroupHandleRegistry {
         self.groups
             .load()
             .get(&raft_group_id.0)
-            .and_then(|entry| entry.active()?.recovery.clone())
+            .and_then(|entry| entry.active()?.core.recovery.clone())
     }
 
     /// Operator recovery when a majority of the group's voters are gated
@@ -800,6 +750,9 @@ impl RaftGroupHandleRegistry {
     /// recovery plan (#581 section 4.5; see
     /// [`GroupRejoin::accept_recovery_plan`]) as one owner job, its group's
     /// leader fence learns the plan, and the group's elections follow it.
+    /// The replica core runs the plan ([`ReplicaCore::accept_plan`]). A
+    /// plan that cuts restarts the replica through `restart`, and the core
+    /// carries on with the replica this registry then holds.
     pub async fn accept_recovery_plan(
         &self,
         raft_group_id: RaftGroupId,
@@ -812,123 +765,37 @@ impl RaftGroupHandleRegistry {
             .get(&raft_group_id.0)
             .and_then(|entry| entry.active().cloned())
             .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let rejoin = entry
-            .recovery
-            .clone()
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-        let owner = entry.raft().clone();
-        let plan = *plan;
-        let job = rejoin.clone();
-        let history = entry.history.clone();
+        let core = entry.core.clone();
         let applied = entry.log_gauge.applied_membership();
-        // m1 (#581 review): the job, with its rollback, runs in a task of
-        // its own, so a caller that stops waiting never cancels it half
-        // way. The restart that follows a cut runs in the caller's future:
-        // the HTTP route runs in the admin fence's own task (n6).
-        let job = crate::rt::spawn(async move {
-            owner
-                .call(move |raft| async move {
-                    let core = crate::rejoin::RaftPlanCore {
-                        raft: &raft,
-                        raft_group_id,
-                    };
-                    job.accept_recovery_plan(&plan, &core, &history, applied)
+        drop(entry);
+        core.accept_plan(&self.election, raft_group_id, plan, applied, move || {
+            futures_util::FutureExt::boxed(async move {
+                let Some(restarted) =
+                    restart
+                        .restart_replica(raft_group_id)
                         .await
-                })
-                .await
-                .map_err(|source| RecoveryGateError::OwnerStopped {
-                    raft_group_id,
-                    source,
-                })?
-        });
-        let taken = job
-            .await
-            .map_err(|_aborted| RecoveryGateError::JobAborted { raft_group_id })
-            .and_then(|taken| taken);
-        // m6 (#581 review): the job stopped the core campaigning; the
-        // node's election policy decides again, taken or refused.
-        self.refresh_group_elections(raft_group_id);
-        let report = match taken? {
-            crate::rejoin::PlanTaken::Holds(report) => report,
-            // B1 (#581 review): the cut runs before the plan answers. The
-            // group's engine stops, its log store closes, and the new
-            // replica's recovery gate cuts the log before its Raft core
-            // starts, then takes the plan's gate. A cut that cannot run
-            // drops the plan and closes the gate (m3).
-            crate::rejoin::PlanTaken::Restart(report) => {
-                drop(entry);
-                drop(rejoin);
-                let restarted = restart
-                    .restart_replica(raft_group_id)
-                    .await
-                    .map_err(|source| RecoveryGateError::Restart {
-                        raft_group_id,
-                        source: Box::new(source),
-                    })?
-                    .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-                if let Some((committed, held)) = restarted.cut_refused() {
-                    return Err(RecoveryGateError::CutRefused {
-                        raft_group_id,
-                        committed,
-                        held,
-                    });
-                }
-                // #613: the restart rebuilt the membership from the cut log.
-                // A plan's leader that it leaves no voter can never
-                // campaign: drop the plan rather than wedge its members.
-                // The restarted core publishes the membership it rebuilt
-                // once it runs; until then its metrics hold none.
-                // Off under the R2 negative control, as before #613.
-                let checks_kept = !ursula_stream::sim_controls::off(
-                    ursula_stream::sim_controls::Defence::PlanKeptMembership,
-                );
-                if checks_kept && plan.cut && plan.leader == report.node_id {
-                    let entry = self
-                        .groups
+                        .map_err(|source| RecoveryGateError::Restart {
+                            raft_group_id,
+                            source: Box::new(source),
+                        })?
+                else {
+                    return Ok(None);
+                };
+                // The replica this registry holds after the restart, with
+                // the recovery gate the restart returned.
+                Ok::<_, RecoveryGateError>(
+                    self.groups
                         .load()
                         .get(&raft_group_id.0)
                         .and_then(|entry| entry.active().cloned())
-                        .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
-                    let published = entry
-                        .raft()
-                        .wait(Some(RESTARTED_MEMBERSHIP_WAIT))
-                        .metrics(
-                            |metrics| metrics.membership_config.log_id().is_some(),
-                            "the restarted replica publishes its membership",
-                        )
-                        .await;
-                    // A restart whose membership never shows cannot be
-                    // shown to campaign: fail closed, as for no vote.
-                    let refusal = match published {
-                        Ok(metrics)
-                            if metrics
-                                .membership_config
-                                .membership()
-                                .voter_ids()
-                                .any(|voter| voter == plan.leader) =>
-                        {
-                            None
-                        }
-                        Ok(_left_without_vote) => {
-                            Some(RecoveryGateError::CutLeftNoVote { raft_group_id })
-                        }
-                        Err(_timed_out) => {
-                            Some(RecoveryGateError::CutMembershipUnknown { raft_group_id })
-                        }
-                    };
-                    if let Some(refusal) = refusal {
-                        restarted
-                            .drop_plan_left_without_vote(&entry.history)
-                            .await?;
-                        self.refresh_group_elections(raft_group_id);
-                        return Err(refusal);
-                    }
-                }
-                report
-            }
-        };
-        self.refresh_group_elections(raft_group_id);
-        Ok(report)
+                        .map(|entry| ReplicaCore {
+                            recovery: Some(restarted),
+                            ..entry.core.clone()
+                        }),
+                )
+            })
+        })
+        .await
     }
 
     /// The recovery gate of every group that has one on this node.
@@ -1173,7 +1040,8 @@ impl RaftGroupHandleRegistry {
     fn set_registered_group_elections(&self) {
         let groups = self.groups.load();
         for entry in groups.values().filter_map(|entry| entry.active()) {
-            self.election.refresh(entry.raft(), entry.recovery.clone());
+            self.election
+                .refresh(entry.raft(), entry.core.recovery.clone());
         }
     }
 
@@ -1181,7 +1049,8 @@ impl RaftGroupHandleRegistry {
     pub(crate) fn refresh_group_elections(&self, group: RaftGroupId) {
         let groups = self.groups.load();
         if let Some(entry) = groups.get(&group.0).and_then(|entry| entry.active()) {
-            self.election.refresh(entry.raft(), entry.recovery.clone());
+            self.election
+                .refresh(entry.raft(), entry.core.recovery.clone());
         }
     }
 
@@ -1277,7 +1146,7 @@ impl RaftGroupHandleRegistry {
                 }
             };
             let raft = entry.raft();
-            let health = &entry.apply_health;
+            let health = &entry.core.apply_health;
             let metrics = raft.metrics().borrow_watched().clone();
             // A removal's debt lasts until the log is purged through the
             // snapshot that dropped it (#669).
@@ -1310,7 +1179,7 @@ impl RaftGroupHandleRegistry {
                 voter_ids: membership.voter_ids().collect(),
                 voter_configurations: membership.get_joint_config().clone(),
                 committed_voter_configurations: crate::rejoin::kept_membership_of(
-                    entry.recovery.as_deref(),
+                    entry.core.recovery.as_deref(),
                     metrics.local_committed.map(|id| id.index),
                     entry.log_gauge.applied_membership(),
                 )
@@ -1322,26 +1191,29 @@ impl RaftGroupHandleRegistry {
                     running,
                     recovery_ready: apply_running
                         && entry
+                            .core
                             .recovery
                             .as_ref()
                             .is_none_or(|rejoin| rejoin.vote_gate_open()),
                     accepting_transfers: apply_running
-                        && self.election.may_campaign(entry.recovery.as_deref()),
+                        && self.election.may_campaign(entry.core.recovery.as_deref()),
                     membership_joint: membership.get_joint_config().len() != 1,
                     membership_log_index: metrics.membership_config.log_id().map(|id| id.index()),
                     stopped_for_operator: entry
+                        .core
                         .recovery
                         .as_ref()
                         .is_some_and(|rejoin| rejoin.status().is_stalled()),
                 },
                 log,
-                history: entry.history.applied().map(|event| {
+                history: entry.core.history.applied().map(|event| {
                     ursula_proto::admin::RaftGroupHistory {
                         event_index: event.event_index,
                         imported: event.imported.is_some(),
                     }
                 }),
                 recovery: entry
+                    .core
                     .recovery
                     .as_ref()
                     .and_then(|rejoin| rejoin.recovery_record())
@@ -1356,6 +1228,7 @@ impl RaftGroupHandleRegistry {
                     }),
                 leads_live: crate::rejoin::leads_live(&metrics),
                 recovery_gate: entry
+                    .core
                     .recovery
                     .as_ref()
                     .map_or(ursula_proto::admin::RecoveryGateStatus::Open, |rejoin| {
@@ -1375,7 +1248,7 @@ impl RaftGroupHandleRegistry {
         ))?;
         match entry.as_ref() {
             GroupEntry::Active(active) => {
-                active.apply_health.check(group)?;
+                active.core.apply_health.check(group)?;
                 Ok(active.clone())
             }
             GroupEntry::ApplyStopped { stopped, .. } => Err(stopped.error(group)),
@@ -1388,40 +1261,7 @@ impl RaftGroupHandleRegistry {
         request: AppendEntriesRequest<UrsulaRaftTypeConfig>,
     ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let entry = self.entry(raft_group_id)?;
-        if let Some(floor) = entry.check_recovery_vote(raft_group_id, request.vote)? {
-            return Ok(AppendEntriesResponse::HigherVote(floor));
-        }
-        let raft = entry.raft().clone();
-        let rejoin = entry.recovery.clone();
-        raft.call(move |raft| async move {
-            if let Some(rejoin) = rejoin {
-                // A recovery plan may have closed the replica since the
-                // check above: an entry it acknowledged now would be cut, or
-                // come from a leader elected before the plan.
-                if let Some(refusal) = rejoin.replication_refusal(&request.vote) {
-                    return Err(refusal);
-                }
-                let marker = rejoin
-                    .effective_marker(&openraft::rt::WatchReceiver::borrow_watched(
-                        &raft.metrics(),
-                    ))
-                    .inspect_err(|refusal| {
-                        tracing::warn!(%refusal, "recovery: refused an append while the log lags");
-                    })?;
-                if let Some(refusal) =
-                    rejoin.committed_overwrite(crate::rejoin::Incoming::Append(&request), marker)
-                {
-                    tracing::error!(%refusal, "recovery: refused an append below the commit marker");
-                    return Err(refusal);
-                }
-                rejoin.observe_inbound_append(&request);
-            }
-            Ok(raft.append_entries(request).await)
-        })
-        .await
-        .map_err(crate::owner::owner_stopped)?
-        .map_err(GroupEngineError::Infra)?
-        .map_err(crate::owner::owner_raft_error)
+        entry.core.append_entries(raft_group_id, request).await
     }
 
     pub async fn vote(
@@ -1430,17 +1270,7 @@ impl RaftGroupHandleRegistry {
         request: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let entry = self.entry(raft_group_id)?;
-        let raft = entry.raft().clone();
-        let rejoin = entry.recovery.clone();
-        raft.call(move |raft| async move {
-            if let Some(refusal) = rejoin.and_then(|rejoin| rejoin.screen_vote(&request)) {
-                return Ok(refusal);
-            }
-            raft.vote(request).await
-        })
-        .await
-        .map_err(crate::owner::owner_stopped)?
-        .map_err(crate::owner::owner_raft_error)
+        entry.core.vote(request).await
     }
 
     pub async fn install_full_snapshot(
@@ -1454,10 +1284,11 @@ impl RaftGroupHandleRegistry {
         // falls below it, so Raft refuses a vote the floor overtakes while
         // this request waits.
         let entry = self.entry(raft_group_id)?;
-        if let Some(floor) = entry.check_recovery_vote(raft_group_id, vote)? {
+        if let Some(floor) = entry.core.check_recovery_vote(raft_group_id, vote)? {
             return Ok(SnapshotResponse::new(floor));
         }
         if let Some(refusal) = entry
+            .core
             .recovery
             .as_ref()
             .and_then(|rejoin| rejoin.refused_snapshot(snapshot.meta.last_log_id))
@@ -1473,8 +1304,7 @@ impl RaftGroupHandleRegistry {
         let serial = lock.lock_owned().await;
         let permit = self.snapshot_install.acquire(raft_group_id).await?;
         let raft = entry.raft().clone();
-        let rejoin = entry.recovery.clone();
-        let history = entry.history.clone();
+        let core = entry.core.clone();
         let snapshots = entry.snapshots.clone();
         let lifetime =
             entry
@@ -1524,55 +1354,8 @@ impl RaftGroupHandleRegistry {
             let incoming_history = prefetched.history;
             let result = raft
                 .call(move |raft| async move {
-                    // A recovery plan may have closed the replica while the
-                    // install waited.
-                    if let Some(refusal) = rejoin
-                        .as_ref()
-                        .and_then(|rejoin| rejoin.replication_refusal(&vote))
-                    {
-                        return Err(refusal);
-                    }
-                    // #613: like an append, a snapshot never replaces entries
-                    // this replica knows are committed.
-                    if let Some(incoming) = incoming_history
-                        && let Some(rejoin) = rejoin.as_ref()
-                    {
-                        // The marker and the applied index, read once: the
-                        // history at the marker is read against them.
-                        let (marker, applied_index) = {
-                            let watched = raft.metrics();
-                            let metrics = openraft::rt::WatchReceiver::borrow_watched(&watched);
-                            (
-                                rejoin.effective_marker(&metrics),
-                                metrics.last_applied.map(|applied| applied.index),
-                            )
-                        };
-                        let marker = marker.inspect_err(|refusal| {
-                            tracing::warn!(
-                                %refusal,
-                                "recovery: refused a snapshot install while the log lags"
-                            );
-                        })?;
-                        let local = rejoin
-                            .history_at_marker(history.applied(), applied_index, marker)
-                            .await;
-                        if let Some(refusal) = rejoin.committed_overwrite(
-                            crate::rejoin::Incoming::Snapshot {
-                                last: snapshot.meta.last_log_id,
-                                history: incoming,
-                                local,
-                            },
-                            marker,
-                        ) {
-                            tracing::error!(
-                                %refusal,
-                                "recovery: refused a snapshot install that would replace \
-                                 committed entries"
-                            );
-                            rejoin.record_refused_snapshot(snapshot.meta.last_log_id, &refusal);
-                            return Err(refusal);
-                        }
-                    }
+                    core.screen_install(vote, snapshot.meta.last_log_id, incoming_history)
+                        .await?;
                     Ok(raft.install_full_snapshot(vote, snapshot).await)
                 })
                 .await
@@ -1603,7 +1386,10 @@ impl RaftGroupHandleRegistry {
     ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, IncomingTransferError>
     {
         let entry = self.entry(raft_group_id)?;
-        self.deliver_transfer(raft_group_id, &entry, request).await
+        entry
+            .core
+            .deliver_transfer(&self.election, raft_group_id, request)
+            .await
     }
 
     /// Starts an election on this node's replica of `group` while it is in
@@ -1637,34 +1423,11 @@ impl RaftGroupHandleRegistry {
             });
         }
         let request = TransferLeaderRequest::new(observed.vote, observed.id, None);
-        self.deliver_transfer(group, &entry, request)
+        entry
+            .core
+            .deliver_transfer(&self.election, group, request)
             .await?
             .map_err(|source| SelfElectionError::Rejected { group, source })
-    }
-
-    /// Hands `request` to the entry's Raft once
-    /// [`ElectionPolicy::validate_incoming_transfer`] accepts it, so the gate
-    /// checked is the gate of the Raft that takes the transfer.
-    async fn deliver_transfer(
-        &self,
-        group: RaftGroupId,
-        entry: &ActiveGroup,
-        request: TransferLeaderRequest<UrsulaRaftTypeConfig>,
-    ) -> Result<openraft::raft::TransferLeaderResponse<UrsulaRaftTypeConfig>, IncomingTransferError>
-    {
-        let raft = entry.raft();
-        // Read first: a metrics guard held through the policy check would hold up the core's
-        // next metrics update while the check takes the recovery gate's locks.
-        let node_id = raft.metrics().borrow_watched().id;
-        self.election.validate_incoming_transfer(
-            group,
-            node_id,
-            &request,
-            entry.recovery.as_deref(),
-        )?;
-        raft.handle_transfer_leader(request)
-            .await
-            .map_err(|source| IncomingTransferError::Raft { group, source })
     }
 
     /// Builds a snapshot outside OpenRaft's own build path, which OpenRaft
@@ -1975,7 +1738,7 @@ mod tests {
                 engine.cold_index_cache.as_ref().unwrap()
             ));
             assert!(Arc::ptr_eq(
-                &registry.entry(group).unwrap().barrier,
+                &registry.entry(group).unwrap().core.barrier,
                 &engine.read_barrier
             ));
             assert!(Arc::ptr_eq(

@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::raft::TransferLeaderRequest;
+use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
 use ursula_shard::RaftGroupId;
@@ -14,6 +15,7 @@ use crate::UrsulaRaftTypeConfig;
 use crate::UrsulaVote;
 use crate::owner::OwnerRaftHandle;
 use crate::rejoin::GroupRejoin;
+use crate::types::SnapshotData;
 
 pub type LeadershipShedFlag = Arc<AtomicU8>;
 
@@ -253,7 +255,8 @@ impl ElectionPolicy {
         Ok(())
     }
 
-    pub(crate) fn refresh(&self, raft: &OwnerRaftHandle, gate: Option<Arc<GroupRejoin>>) {
+    pub(crate) fn refresh<SM>(&self, raft: &OwnerRaftHandle<SM>, gate: Option<Arc<GroupRejoin>>)
+    where SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData> {
         let policy = self.clone();
         raft.elect(move || policy.may_campaign(gate.as_deref()));
     }

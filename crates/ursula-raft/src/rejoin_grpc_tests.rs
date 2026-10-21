@@ -570,11 +570,12 @@ async fn recovery_publication_keeps_one_gate_bound_to_one_engine() {
         ))
     ));
     registry.register_engine(&other);
-    assert!(Arc::ptr_eq(original.recovery.as_ref().unwrap(), &gate));
+    assert!(Arc::ptr_eq(original.core.recovery.as_ref().unwrap(), &gate));
     assert!(Arc::ptr_eq(
         registry
             .entry(placement().raft_group_id)
             .unwrap()
+            .core
             .recovery
             .as_ref()
             .unwrap(),
@@ -1741,6 +1742,7 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
         first.raft_handle(),
         first_gate,
         BTreeSet::from([1, 2]),
+        BTreeSet::from([1, 2]),
         move |_id| {
             let peer = peer.clone();
             let observations = observations.clone();
@@ -1783,4 +1785,63 @@ async fn genesis_waits_for_the_last_empty_voters_durable_floor() {
     assert!(first.raft.is_initialized().await.unwrap());
     first.shutdown().await.unwrap();
     second.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_bootstrap_driver_probes_its_probed_peers_and_initializes_its_members() {
+    let config = Arc::new(
+        Config {
+            enable_tick: false,
+            ..Default::default()
+        }
+        .validate()
+        .unwrap(),
+    );
+    let registry = RaftGroupHandleRegistry::default();
+    let (engine, _store, gate, _root) = new_recovery_engine(1, config, &registry).await;
+    gate.establish_vote_floor(UrsulaVote::new(0, 0))
+        .await
+        .unwrap();
+    let asked = Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let probe_asked = asked.clone();
+    // Node 3 is probed but is no initial member, as a plane that asks every
+    // peer before it initializes a smaller voter set.
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::run_group_bootstrap(
+            1,
+            engine.raft_handle(),
+            gate,
+            BTreeSet::from([1, 2, 3]),
+            BTreeSet::from([1, 2]),
+            move |peer| {
+                probe_asked.lock().unwrap().insert(peer);
+                async { Some(crate::PeerGroupLog::Empty) }
+            },
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(outcome, crate::GroupBootstrap::Initialized);
+    assert_eq!(*asked.lock().unwrap(), BTreeSet::from([2, 3]));
+    let metrics = engine
+        .raft
+        .wait(Some(Duration::from_secs(5)))
+        .metrics(
+            |metrics| metrics.membership_config.log_id().is_some(),
+            "the initialized membership is published",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics
+            .membership_config
+            .membership()
+            .voter_ids()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([1, 2])
+    );
+    engine.shutdown().await.unwrap();
 }

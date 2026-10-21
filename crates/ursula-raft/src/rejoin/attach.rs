@@ -157,7 +157,16 @@ pub struct RecoveryConfig {
     pub bootstrap_warn_after: Duration,
 }
 
+/// How a replica's gate drivers ask a peer whether it holds the group: the
+/// data plane's bootstrap probe vote, or another plane's probe.
+pub(crate) type GateProbe = Arc<
+    dyn Fn(u64) -> futures_util::future::BoxFuture<'static, Option<PeerGroupLog>> + Send + Sync,
+>;
+
 impl RecoveryGate {
+    /// Publishes a data replica's recovery gate, then spawns its heal driver
+    /// and its gate drivers (`spawn_gate_drivers`) with the
+    /// transport's bootstrap probe vote.
     pub fn attach<T: RecoveryTransport>(
         &self,
         engine: &crate::RaftGroupEngine,
@@ -168,8 +177,6 @@ impl RecoveryGate {
         config: RecoveryConfig,
     ) -> Result<(), ursula_runtime::GroupEngineError> {
         engine.publish_recovery(rejoin.clone(), registry)?;
-        let election = registry.election_policy();
-        let barrier_transport = transport.clone();
         self.push(crate::rt::spawn(run_rejoin_heal(
             engine.raft_handle(),
             rejoin.clone(),
@@ -177,14 +184,57 @@ impl RecoveryGate {
             config.interval,
             registry.follower_log_reversion_counter(),
         )));
+        let probe_transport = transport.clone();
+        let probe: GateProbe = Arc::new(move |peer| {
+            let transport = probe_transport.clone();
+            Box::pin(async move { transport.probe(peer).await })
+        });
+        self.spawn_gate_drivers(
+            engine.raft_handle(),
+            engine.read_barrier.owner().clone(),
+            rejoin,
+            registry.election_policy(),
+            nodes.clone(),
+            nodes,
+            probe,
+            transport,
+            config,
+        );
+        Ok(())
+    }
+
+    /// Spawns the drivers that open one replica's recovery gate, for a
+    /// replica of any state machine: the barrier driver, which asks
+    /// `candidates` for a leader's barrier, the genesis vote floor task,
+    /// which records the floor once every other candidate answers `probe`
+    /// empty, and, for an initializer, the bootstrap driver, which
+    /// initializes `members` once every other candidate does.
+    pub(crate) fn spawn_gate_drivers<SM, T>(
+        &self,
+        raft: openraft::Raft<crate::UrsulaRaftTypeConfig, SM>,
+        owner: crate::owner::OwnerRaftHandle<SM>,
+        rejoin: Arc<GroupRejoin>,
+        election: crate::ElectionPolicy,
+        candidates: BTreeSet<u64>,
+        members: BTreeSet<u64>,
+        probe: GateProbe,
+        transport: T,
+        config: RecoveryConfig,
+    ) where
+        SM: openraft::storage::RaftStateMachine<
+                crate::UrsulaRaftTypeConfig,
+                SnapshotData = crate::types::SnapshotData,
+            >,
+        T: RecoveryTransport,
+    {
         rejoin.set_stall_after(config.stall_after);
         self.push(crate::rt::spawn(run_rejoin_vote_barrier(
-            engine.read_barrier.owner().clone(),
+            owner,
             rejoin.clone(),
             election,
-            nodes.clone(),
+            candidates.clone(),
             move |leader| {
-                let transport = barrier_transport.clone();
+                let transport = transport.clone();
                 async move { transport.barrier(leader).await }
             },
             config.barrier_timeout,
@@ -193,15 +243,15 @@ impl RecoveryGate {
         )));
         if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
             let rejoin = rejoin.clone();
-            let nodes = nodes.clone();
-            let transport = transport.clone();
+            let candidates = candidates.clone();
+            let probe = probe.clone();
             self.push(crate::rt::spawn(async move {
                 while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
                     let mut all_empty = true;
-                    for peer in &nodes {
+                    for peer in &candidates {
                         if *peer != rejoin.node_id
                             && !matches!(
-                                transport.probe(*peer).await,
+                                probe(*peer).await,
                                 Some(PeerGroupLog::Empty | PeerGroupLog::Unprepared)
                             )
                         {
@@ -223,23 +273,19 @@ impl RecoveryGate {
             }));
         }
         if config.initialize && !rejoin.holds_group_history() {
-            let raft = engine.raft_handle();
             self.push(crate::rt::spawn(async move {
                 run_group_bootstrap(
                     rejoin.node_id,
                     raft,
                     rejoin,
-                    nodes,
-                    move |peer| {
-                        let transport = transport.clone();
-                        async move { transport.probe(peer).await }
-                    },
+                    candidates,
+                    members,
+                    &*probe,
                     config.bootstrap_interval,
                     config.bootstrap_warn_after,
                 )
                 .await;
             }));
         }
-        Ok(())
     }
 }
