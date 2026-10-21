@@ -10659,13 +10659,19 @@ mod leadership_shed {
             led_by(&self.node_1().registry, node_id)
         }
 
+        /// Moves `group`'s leadership to node 1. A handoff goes out only
+        /// while node 1 takes transfers, every recovery gate on it open, as
+        /// in `move_every_leadership_to_node_1`. The seed initializers
+        /// rotate over the nodes, and a handoff refused by a gated node 1
+        /// parks the leader until its transfer deadline, which stalls the
+        /// barrier that would open node 1's gate.
         async fn move_leadership_to_node_1(&self, group: u32) {
             let deadline = deadline(Duration::from_secs(60));
             loop {
                 let leader = self.leaders().get(&group).copied().flatten();
                 match leader {
                     Some(1) => return,
-                    Some(other) => {
+                    Some(other) if self.node_1().registry.should_accept_transfer() => {
                         if let Err(err) = self
                             .node(other)
                             .registry
@@ -10675,7 +10681,8 @@ mod leadership_shed {
                             tracing::debug!(group, %err, "transfer to node 1 refused");
                         }
                     }
-                    None => {}
+                    // No leader yet, or node 1 does not take transfers yet.
+                    Some(_) | None => {}
                 }
                 assert!(
                     Instant::now() < deadline,
