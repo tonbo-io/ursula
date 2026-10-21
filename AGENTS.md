@@ -226,6 +226,17 @@ Every crate `lib.rs` should contain a module map in its top-level doc comment ex
 
 ## Testing Strategy
 
+### Test Policy
+
+Spend tests where they find bugs, and verify behaviour at the cheapest layer that is faithful to the real system.
+
+- Unit-test a single unit of real complexity (a state machine's `apply`, a planner's decision function, an encoder and its decoder) or code with side effects (storage writes, deletions, the classification of a refusal). Do not unit-test glue, forwarding or what the type system already enforces.
+- Verify behaviour that crosses components end to end. Anything involving OpenRaft, the transport, recovery or crash points runs under DST with the real OpenRaft and real stores, or in `static_cluster_cli.rs` with real processes.
+- Do not build test doubles of an external system beyond what the code under test needs. When a review finds that a test proves less than it claims, narrow the claim or move the check to an end-to-end test. Never grow the double to make the claim true. An abstract Raft model that chased OpenRaft's behaviour cost more review rounds than the planners it tested.
+- Name the bug each property or negative test catches. A negative control turns its rule off only inside its scenario and must fail there, not during setup.
+- Keep coverage-counter assertions out of pull request CI unless the counter is far from its threshold. A path that a unit run reaches only a few times belongs in DST or an integration test.
+- Sample every variant of a persisted or wire type through an exhaustive `match`, nested variants included, so a new variant fails to compile until it has a sample. Give every field of a sample a distinct value, so reordering two fields changes the bytes.
+
 Ursula employs multiple testing layers:
 
 ### 1. Unit Tests
@@ -325,6 +336,14 @@ The `ursula-stream` crate uses `proptest` for state machine property testing in 
 7. **Semantic PR titles**: PR titles must follow the same semantic commit message format (including component scope where applicable), because squash merge uses the PR title as the resulting commit's first line.
 8. **No co-author information**: Do not include co-author information or `Co-authored-by` trailers in commit messages or PR descriptions.
 9. **Concise commit bodies**: Keep any explanation after the first line brief and focused on the reason for the change and essential context. Omit redundant details, exhaustive change lists, and work logs; omit the body when the subject is sufficient.
+10. **Madsim-only code**: when a change touches `cfg(madsim)` code or `ursula-sim`, check it with `RUSTFLAGS="--cfg madsim" cargo check -p ursula-raft -p ursula-sim --all-targets` on the final head. Pull request CI builds no other madsim target.
+11. **Docs and claims match the final head**: `docs/architecture`, module docs, code comments, the epoch change list in `ursula-stream/src/format.rs` and the PR body describe the code as merged. Reread the PR body after the last fix commit.
+12. **Freeze impact**: for every new persisted, wire or admin type, field, variant, error or apply-time rule, state what the next minor's tag freezes (encoding, apply semantics or admin JSON) and check it:
+    - every size and count is bounded;
+    - an admin JSON enum tolerates an unknown variant, so a same-minor reader survives a patch;
+    - `#[serde(other)]` appears only on admin JSON types, never in the replicated, persisted or RPC closure;
+    - variant casing follows the documented rule for its encoding;
+    - every time field means what its doc says.
 
 ## Architecture Boundaries
 
