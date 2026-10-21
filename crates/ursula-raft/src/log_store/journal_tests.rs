@@ -2945,6 +2945,35 @@ async fn an_absent_meta_journal_on_a_node_without_data_history_opens_empty() {
     assert_eq!(meta.log_state(), GroupLogState::Empty);
 }
 
+/// A meta snapshot record is written only once the meta journal exists, so
+/// one left without its journal is meta history whose vote was lost: the
+/// group opens recovering, on a node without data history too, and does not
+/// vote freely over the state it restores. Its absence, under the same
+/// start, opens empty (`an_absent_meta_journal_on_a_node_without_data_history_opens_empty`).
+#[tokio::test]
+async fn a_meta_snapshot_record_without_its_journal_opens_recovering() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    let record = meta.snapshot_record().path().to_path_buf();
+    drop(meta);
+    stop_cleanly(wal).await;
+    // The journal is lost, and the record survives it.
+    fs::write(&record, b"a meta snapshot record").unwrap();
+    for entry in fs::read_dir(meta_journal(root)).unwrap() {
+        let path = entry.unwrap().path();
+        if path != record {
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Recovering);
+}
+
 /// A meta journal is prior state, as a core journal is: a root that holds
 /// one, its metadata file alone, but no topology refuses to infer the
 /// topology from the configuration.
