@@ -709,7 +709,9 @@ async fn data_group_zero_never_touches_the_meta_record() {
     );
     let snapshot_store: ursula_runtime::SharedSnapshotStore = Arc::new(bucket.store(1));
     let data_engine = |wal: &RaftWal| {
-        let store = wal.open(placement, metrics()).unwrap();
+        let store = wal
+            .open(placement, ursula_control::Admission::Create, metrics())
+            .unwrap();
         let record = store.snapshot_record();
         assert_ne!(record.path(), meta_record.path());
         crate::RaftGroupEngine::new_single_node(

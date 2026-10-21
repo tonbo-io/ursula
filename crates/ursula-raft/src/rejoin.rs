@@ -113,6 +113,7 @@ use ursula_shard::RaftTarget;
 
 use crate::log_store::CoreJournalError;
 use crate::log_store::GroupLogState;
+use crate::log_store::HeldLogState;
 use crate::log_store::PlanCut;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RecoveryRecord;
@@ -1122,11 +1123,11 @@ impl GroupRejoin {
                 return Err(GateOpenError::CutRecord { group, source });
             }
         }
-        let gate = match (store.recovery_record(), store.log_state()) {
+        let gate = match (store.recovery_record(), store.held_log_state()) {
             // M1 (#581 review): a member that may have lost entries keeps a
             // restricted vote: a plan's leader closes its gate, a member
             // stays planned, and its satisfied plan closes the gate too.
-            (Some(record), GroupLogState::Recovering) => {
+            (Some(record), HeldLogState::Recovering) => {
                 tracing::warn!(
                     node_id,
                     plane = group.plane().as_str_name(),
@@ -1176,8 +1177,8 @@ impl GroupRejoin {
                 VoteGate::planned(&record, node_id)
             }
             (None, _) if cut_refused.is_some() => VoteGate::closed(GroupEvidence::Initialized),
-            (None, GroupLogState::Initialized) => VoteGate::Open,
-            (None, GroupLogState::Recovering) => {
+            (None, HeldLogState::Initialized) => VoteGate::Open,
+            (None, HeldLogState::Recovering) => {
                 tracing::warn!(
                     node_id,
                     plane = group.plane().as_str_name(),
@@ -1192,20 +1193,7 @@ impl GroupRejoin {
                     .map_err(|source| GateOpenError::StartAsFollower { group, source })?;
                 VoteGate::closed(GroupEvidence::Initialized)
             }
-            // Unreachable while nothing retires a log: a retired log holds
-            // no vote and no entries, and never takes a first election.
-            // S2's `NotHeld` (#768) removes this arm.
-            (None, GroupLogState::Retired) => {
-                tracing::warn!(
-                    node_id,
-                    plane = group.plane().as_str_name(),
-                    raft_group_id = group.wire_group_id(),
-                    "recovery gate: this replica's log of the group is retired; it stays out of \
-                     elections"
-                );
-                VoteGate::closed(GroupEvidence::Initialized)
-            }
-            (None, GroupLogState::Empty) => {
+            (None, HeldLogState::Empty) => {
                 tracing::debug!(
                     node_id,
                     plane = group.plane().as_str_name(),
@@ -2965,8 +2953,12 @@ mod tests {
         };
         let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
         let open = |wal: &RaftWal| -> std::sync::Arc<RaftGroupFileLogStore> {
-            wal.open(placement, metrics.clone())
-                .expect("open the store")
+            wal.open(
+                placement,
+                ursula_control::Admission::Create,
+                metrics.clone(),
+            )
+            .expect("open the store")
         };
         let entry = |index| {
             openraft::alias::EntryOf::<UrsulaRaftTypeConfig>::new(

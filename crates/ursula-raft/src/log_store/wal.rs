@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use ursula_config::WalFsync;
+use ursula_control::Admission;
+use ursula_control::LocalLog;
 use ursula_headers::ClusterId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ProcessIncarnation;
@@ -47,9 +49,58 @@ type CoreWriterSlot = Arc<Mutex<CoreWriterState>>;
 #[derive(Debug, Default)]
 struct CoreWriterState {
     writer: Weak<CoreFileLogWriter>,
+    /// Whether the run keeps the writer.
+    held: HeldCore,
     exited: Option<WriterExited>,
     /// Closes once the writer is gone and the journal's lock is free.
     released: Option<WriterExited>,
+}
+
+/// Whether a run keeps a core's writer (7.2 of #768).
+#[derive(Debug, Default)]
+enum HeldCore {
+    /// The core held nothing when [`RaftWal::open_held_cores`] ran, or it
+    /// has not run: a store's open opens the writer, which lives as long as
+    /// a store holds it.
+    #[default]
+    Lazy,
+    /// The core held state when [`RaftWal::open_held_cores`] ran, and the
+    /// run keeps its writer.
+    Held(Arc<CoreFileLogWriter>),
+    /// The core held state when [`RaftWal::open_held_cores`] ran, but its
+    /// writer did not open. Its groups are `Unknown` until an open of one
+    /// of them opens the writer, which the run then keeps.
+    Unopened,
+}
+
+/// Whether [`RaftWal::core_writer`] makes the run keep the writer it
+/// returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// As the core's slot says: kept once [`RaftWal::open_held_cores`]
+    /// found the core holding state.
+    AsSlot,
+    /// Kept for the run ([`RaftWal::open_held_cores`]).
+    Keep,
+}
+
+/// What the node's journals hold of each data group
+/// ([`RaftWal::local_groups`]). A group they do not name is absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalGroups {
+    groups: BTreeMap<RaftGroupId, LocalLog>,
+}
+
+impl LocalGroups {
+    /// What the journals hold of `group`, if they name it.
+    pub fn get(&self, group: RaftGroupId) -> Option<LocalLog> {
+        self.groups.get(&group).copied()
+    }
+
+    /// Every group the journals name, in group order.
+    pub fn iter(&self) -> impl Iterator<Item = (RaftGroupId, LocalLog)> + '_ {
+        self.groups.iter().map(|(group, log)| (*group, *log))
+    }
 }
 
 /// The core writers of a running WAL, by core.
@@ -119,6 +170,8 @@ pub enum MetaOpenError {
 pub struct RaftWal {
     node: Arc<NodeWal>,
     tuning: JournalTuning,
+    /// The core and group counts the root was started with.
+    topology: ursula_shard::StaticShardMap,
     lagging: Arc<LaggingGroups>,
     /// One slot per core. Opening a journal holds only its core's slot, so
     /// cores recover their journals in parallel.
@@ -191,6 +244,7 @@ impl RaftWal {
                 fence,
             )?),
             tuning,
+            topology: topology.clone(),
             lagging: Arc::new(LaggingGroups::default()),
             core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
             engine_work: crate::openraft_work::EngineWorkLedger::default(),
@@ -301,10 +355,13 @@ impl RaftWal {
             .join(super::file::snapshot_record_file(placement.raft_group_id.0))
     }
 
+    /// The writer of `placement`'s core, opened if no writer is open. With
+    /// [`Hold::Keep`] the run keeps it ([`Self::open_held_cores`]).
     fn core_writer(
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
+        hold: Hold,
     ) -> Result<Arc<CoreFileLogWriter>, RaftWalError> {
         let slot = match &mut *self
             .core_writers
@@ -324,22 +381,28 @@ impl RaftWal {
             .lock()
             .map_err(|_poisoned| RaftWalError::LockPoisoned)?;
         if let Some(writer) = slot.writer.upgrade() {
+            if hold == Hold::Keep {
+                slot.held = HeldCore::Held(writer.clone());
+            }
             return Ok(writer);
         }
         // A writer whose last handle is being dropped still holds the
         // journal's lock until it is gone, so a new writer would find it
         // locked.
-        if let Some(released) = &slot.released
+        if let Some(released) = slot.released.clone()
             && released.has_changed().is_ok()
         {
+            if hold == Hold::Keep {
+                slot.held = HeldCore::Unopened;
+            }
             return Err(RaftWalError::CoreWriterStopping {
                 core: placement.core_id,
-                released: released.clone(),
+                released,
             });
         }
 
         let opening = self.node.opening();
-        let writer =
+        let opened =
             CoreFileLogWriter::open(self.core_dir(placement.core_id), CoreJournalOptions {
                 previous_run: opening.previous_run,
                 core: placement.core_id,
@@ -349,34 +412,163 @@ impl RaftWal {
                 node_recovery: opening.recovery,
                 lagging: self.lagging.clone(),
                 metrics: Some((placement, metrics)),
-            })
-            .map_err(|source| RaftWalError::OpenCore {
-                core: placement.core_id,
-                source,
-            })?;
+            });
+        let writer = match opened {
+            Ok(writer) => writer,
+            Err(source) => {
+                if hold == Hold::Keep && !matches!(slot.held, HeldCore::Held(_)) {
+                    slot.held = HeldCore::Unopened;
+                }
+                return Err(RaftWalError::OpenCore {
+                    core: placement.core_id,
+                    source,
+                });
+            }
+        };
+        let held = match (std::mem::take(&mut slot.held), hold) {
+            (HeldCore::Unopened, _) | (_, Hold::Keep) => HeldCore::Held(writer.clone()),
+            (held, Hold::AsSlot) => held,
+        };
         *slot = CoreWriterState {
             writer: Arc::downgrade(&writer),
+            held,
             exited: Some(writer.exited()),
             released: Some(writer.released()),
         };
         Ok(writer)
     }
 
-    /// Opens `placement`'s log store. A group whose previous engine's
-    /// OpenRaft work still runs is refused at once
-    /// ([`RaftWalError::PreviousEngineRunning`]): that work may still change
-    /// the group's state (#709).
+    /// Opens `placement`'s log store as `admission` allows (4.2 of #768).
+    /// Either admission opens a log the core's repaired metadata names,
+    /// unless it is retired: replay names every group whose journal holds
+    /// an entry or a purge, and every empty group whose snapshot record is
+    /// of its generation, which opens recovering. [`Admission::Create`]
+    /// also opens a group the metadata does not name, with a fresh log.
+    /// Every other open is refused before anything is written
+    /// ([`RaftWalError::NotHeld`]), a retired log's included until its
+    /// reopen lands.
+    ///
+    /// A group whose previous engine's OpenRaft work still runs is refused
+    /// at once ([`RaftWalError::PreviousEngineRunning`]): that work may
+    /// still change the group's state (#709).
     pub fn open(
         &self,
         placement: ShardPlacement,
+        admission: Admission,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
         self.engine_work
             .admit(placement.raft_group_id)
             .map_err(|_running| RaftWalError::PreviousEngineRunning { placement })?;
-        let core_writer = self.core_writer(placement, metrics.clone())?;
-        RaftGroupFileLogStore::open(placement, metrics, core_writer)
-            .map_err(|source| RaftWalError::OpenGroup { placement, source })
+        let core_writer = self.core_writer(placement, metrics.clone(), Hold::AsSlot)?;
+        RaftGroupFileLogStore::open(placement, metrics, core_writer, admission).map_err(|source| {
+            match source {
+                CoreJournalError::NotHeld { admission, .. } => RaftWalError::NotHeld {
+                    placement,
+                    admission,
+                },
+                source => RaftWalError::OpenGroup { placement, source },
+            }
+        })
+    }
+
+    /// Opens the writer of every core whose directory holds metadata, a
+    /// segment record or a snapshot record, and keeps each for the run
+    /// (4.3 and 7.2 of #768), then reads what the journals hold
+    /// ([`Self::local_groups`]). A core whose writer does not open stops
+    /// nothing: its groups read [`LocalLog::Unknown`] until an open of one
+    /// of them opens the writer. Only a WAL that shut down, or whose state
+    /// lock is poisoned, fails the call.
+    pub fn open_held_cores(
+        &self,
+        metrics: GroupEngineMetrics,
+    ) -> Result<LocalGroups, RaftWalError> {
+        for core in 0..self.topology.core_count() {
+            // The core's first group names the core for its metrics. A core
+            // without a group holds nothing.
+            let Some(placement) = self.topology.placement(RaftGroupId(u32::from(core))) else {
+                continue;
+            };
+            if !super::core_holds_state(&self.core_dir(placement.core_id)) {
+                continue;
+            }
+            match self.core_writer(placement, metrics.clone(), Hold::Keep) {
+                Ok(_writer) => {}
+                Err(error @ (RaftWalError::ShutDown { .. } | RaftWalError::LockPoisoned)) => {
+                    return Err(error);
+                }
+                Err(error) => tracing::error!(
+                    core = core,
+                    %error,
+                    "the core journal did not open; its groups stay unknown until one opens"
+                ),
+            }
+        }
+        self.local_groups()
+    }
+
+    /// What the journals hold of each data group, as of now: the groups of
+    /// every open core writer as its journal names them, and every group
+    /// of a core whose writer [`Self::open_held_cores`] could not open, or
+    /// that is opening right now, as [`LocalLog::Unknown`]. A core no
+    /// writer holds open contributes nothing.
+    pub fn local_groups(&self) -> Result<LocalGroups, RaftWalError> {
+        let slots = match &*self
+            .core_writers
+            .lock()
+            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+        {
+            CoreWriterSlots::Running(slots) => slots.clone(),
+            CoreWriterSlots::ShutDown => {
+                return Err(RaftWalError::ShutDown {
+                    root: self.root().to_owned(),
+                });
+            }
+        };
+        let mut groups = BTreeMap::new();
+        for (core, slot) in slots {
+            // Opening a journal holds its slot through the replay: its
+            // groups are not known yet.
+            let writer = match slot.try_lock() {
+                Ok(slot) => match &slot.held {
+                    HeldCore::Held(writer) => Some(writer.clone()),
+                    HeldCore::Lazy => match slot.writer.upgrade() {
+                        Some(writer) => Some(writer),
+                        None => continue,
+                    },
+                    HeldCore::Unopened => None,
+                },
+                Err(std::sync::TryLockError::WouldBlock) => None,
+                Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+                    return Err(RaftWalError::LockPoisoned);
+                }
+            };
+            match writer {
+                Some(writer) => groups.extend(
+                    writer
+                        .local_logs()
+                        .map_err(|_poisoned| RaftWalError::LockPoisoned)?,
+                ),
+                None => {
+                    groups.extend(
+                        self.core_groups(core)
+                            .map(|group| (group, LocalLog::Unknown)),
+                    );
+                }
+            }
+        }
+        Ok(LocalGroups { groups })
+    }
+
+    /// The groups the shard map places on `core`.
+    fn core_groups(&self, core: u16) -> impl Iterator<Item = RaftGroupId> + '_ {
+        (0..self.topology.raft_group_count())
+            .map(RaftGroupId)
+            .filter(move |group| {
+                self.topology
+                    .placement(*group)
+                    .is_some_and(|placement| placement.core_id == CoreId(core))
+            })
     }
 
     /// Opens `placement`'s log store as [`Self::open`] does, after waiting
@@ -387,10 +579,11 @@ impl RaftWal {
     pub async fn open_waiting(
         &self,
         placement: ShardPlacement,
+        admission: Admission,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
         loop {
-            match self.open(placement, metrics.clone()) {
+            match self.open(placement, admission, metrics.clone()) {
                 Err(RaftWalError::CoreWriterStopping { mut released, .. }) => {
                     while released.changed().await.is_ok() {}
                 }
@@ -447,7 +640,9 @@ impl RaftWal {
                 }
             }
         };
-        RaftGroupFileLogStore::open(META_PLACEMENT, metrics, writer)
+        // The meta group's journal decides its own creation
+        // ([`NodeWal::create_meta_journal`]).
+        RaftGroupFileLogStore::open(META_PLACEMENT, metrics, writer, Admission::Create)
             .map_err(MetaOpenError::OpenGroup)
     }
 
@@ -829,12 +1024,13 @@ mod tests {
             };
             *slots.entry(0).or_default().lock().expect("core 0") = CoreWriterState {
                 writer: Weak::new(),
+                held: HeldCore::Lazy,
                 exited: None,
                 released: Some(released),
             };
         }
         assert!(matches!(
-            wal.open(placement(1), metrics()),
+            wal.open(placement(1), ursula_control::Admission::Create, metrics()),
             Err(RaftWalError::CoreWriterStopping {
                 core: CoreId(0),
                 ..
@@ -842,7 +1038,10 @@ mod tests {
         ));
         let opening = tokio::spawn({
             let wal = wal.clone();
-            async move { wal.open_waiting(placement(1), metrics()).await }
+            async move {
+                wal.open_waiting(placement(1), ursula_control::Admission::Create, metrics())
+                    .await
+            }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!opening.is_finished(), "the open waits for the writer");
@@ -875,6 +1074,7 @@ mod tests {
                     shard_id: ShardId(0),
                     raft_group_id: RaftGroupId(0),
                 },
+                ursula_control::Admission::Create,
                 ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
             )
             .expect("open a store");
@@ -974,7 +1174,7 @@ mod tests {
         // Core 0's slot stays held on this thread, so this open would never
         // return if it waited for core 0.
         let store = factory
-            .open(placement(1, 1), metrics)
+            .open(placement(1, 1), ursula_control::Admission::Create, metrics)
             .expect("core 1 opens while core 0 recovers");
         drop(store);
         drop(held);
@@ -992,8 +1192,20 @@ mod tests {
             raft_group_id: RaftGroupId(0),
         };
         let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
-        let store = wal.open(placement, metrics.clone()).unwrap();
-        let duplicate = wal.open(placement, metrics.clone()).unwrap_err();
+        let store = wal
+            .open(
+                placement,
+                ursula_control::Admission::Create,
+                metrics.clone(),
+            )
+            .unwrap();
+        let duplicate = wal
+            .open(
+                placement,
+                ursula_control::Admission::Create,
+                metrics.clone(),
+            )
+            .unwrap_err();
         assert!(matches!(&duplicate, RaftWalError::OpenGroup {
             placement: actual,
             source: crate::log_store::CoreJournalError::GroupAlreadyOpen { raft_group_id, .. },
@@ -1006,7 +1218,7 @@ mod tests {
         );
         wal.shutdown().await.unwrap();
         assert!(matches!(
-            wal.open(placement, metrics),
+            wal.open(placement, ursula_control::Admission::Create, metrics),
             Err(RaftWalError::ShutDown { .. })
         ));
         drop(store);
@@ -1028,7 +1240,13 @@ mod tests {
             raft_group_id: RaftGroupId(0),
         };
         let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
-        let store = wal.open(placement, metrics.clone()).unwrap();
+        let store = wal
+            .open(
+                placement,
+                ursula_control::Admission::Create,
+                metrics.clone(),
+            )
+            .unwrap();
         let maintenance = wal.maintenance();
         let mut pass =
             std::pin::pin!(maintenance.maintain(Instant::now(), Duration::from_secs(60)));
@@ -1047,7 +1265,9 @@ mod tests {
             writer_gone,
             "the pass kept the writer after its last store went ({polled:?})"
         );
-        let reopened = wal.open(placement, metrics).expect("the group opens again");
+        let reopened = wal
+            .open(placement, ursula_control::Admission::Create, metrics)
+            .expect("the group opens again");
         if polled.is_pending() {
             let ran = pass.await;
             assert!(
@@ -1079,7 +1299,9 @@ mod tests {
         };
         std::fs::write(wal.core_dir(CoreId(0)), b"not a directory").unwrap();
         let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
-        let error = wal.open(placement, metrics).unwrap_err();
+        let error = wal
+            .open(placement, ursula_control::Admission::Create, metrics)
+            .unwrap_err();
         assert!(matches!(&error, RaftWalError::OpenCore {
             core: CoreId(0), source: crate::log_store::CoreJournalError::Io { source, .. },
         } if source.kind() == std::io::ErrorKind::AlreadyExists));

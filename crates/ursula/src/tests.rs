@@ -6387,6 +6387,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
             shard_id: ursula_shard::ShardId(0),
             raft_group_id: RaftGroupId(0),
         },
+        ursula_control::Admission::Create,
         ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
     )
     .expect("open the log store");
@@ -6474,6 +6475,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         .expect("start the Raft WAL")
         .open(
             placement,
+            ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("open the log store");

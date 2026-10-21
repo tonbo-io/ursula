@@ -45,6 +45,7 @@ impl StoreBuilder<UrsulaRaftTypeConfig, Arc<RaftGroupFileLogStore>, RaftGroupSta
         let store = wal
             .open(
                 placement(),
+                ursula_control::Admission::Create,
                 RuntimeMetrics::new(1, 1).group_engine_metrics(),
             )
             .map_err(|err| StorageError::write(UrsulaRaftTypeConfig::err_from_error(&err)))?;

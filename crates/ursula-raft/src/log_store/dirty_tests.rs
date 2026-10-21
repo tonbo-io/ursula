@@ -170,6 +170,7 @@ impl Journal {
             placement(group),
             self.metrics.group_engine_metrics(),
             writer.clone(),
+            ursula_control::Admission::Create,
         )
         .expect("open a group store")
     }

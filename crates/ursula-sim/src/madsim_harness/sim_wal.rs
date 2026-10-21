@@ -25,6 +25,7 @@ use std::sync::Weak;
 use std::time::Duration;
 
 use ursula_config::WalFsync;
+use ursula_control::Admission;
 use ursula_raft::JournalTuning;
 use ursula_raft::MetaOpenError;
 use ursula_raft::RaftGroupEngineOptions;
@@ -148,13 +149,14 @@ impl SimNodeWal {
             .expect("open a simulated node's raft log store")
     }
 
-    /// [`SimNodeWal::open`], reporting a journal that does not open.
+    /// [`SimNodeWal::open`], reporting a journal that does not open. Every
+    /// simulated open may create its group, as the engine factories' do.
     pub(super) async fn try_open(
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
-        let store = self.run()?.open(placement, metrics)?;
+        let store = self.run()?.open(placement, Admission::Create, metrics)?;
         self.stores
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

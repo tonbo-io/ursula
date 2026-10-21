@@ -100,6 +100,7 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         RaftWalError::ShutDown { .. } | RaftWalError::Fenced { .. } => WalOpenFailureKind::Stopped,
         RaftWalError::LockPoisoned => WalOpenFailureKind::Poisoned,
         RaftWalError::PreviousEngineRunning { .. } => WalOpenFailureKind::DuplicateGroup,
+        RaftWalError::NotHeld { .. } => WalOpenFailureKind::NotHeld,
     }
 }
 
@@ -110,6 +111,7 @@ fn core_failure(error: &CoreJournalError) -> WalOpenFailureKind {
         CoreJournalError::Metadata(source) => state_failure(source),
         CoreJournalError::Locked { .. } => WalOpenFailureKind::Locked,
         CoreJournalError::GroupAlreadyOpen { .. } => WalOpenFailureKind::DuplicateGroup,
+        CoreJournalError::NotHeld { .. } => WalOpenFailureKind::NotHeld,
         #[cfg(not(madsim))]
         CoreJournalError::SpawnWriter { .. } => WalOpenFailureKind::Io,
         CoreJournalError::RecordTooLarge(_) | CoreJournalError::InvalidRecord { .. } => {

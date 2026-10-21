@@ -783,6 +783,20 @@ pub enum RaftWalError {
     /// down ([`FenceStatus::Closed`], for good).
     #[error("the Raft WAL root '{}' is fenced ({status:?}): this run writes nothing more to it", .root.display())]
     Fenced { root: PathBuf, status: FenceStatus },
+    /// The journal holds no log of the group that `admission` may open: an
+    /// `Open` of a group the core's metadata does not name, or any open of
+    /// a retired log ([`super::CoreJournalError::NotHeld`]). Nothing was
+    /// written.
+    #[error(
+        "raft group {:?} on core {:?} holds no log here that may open as {:?}",
+        .placement.raft_group_id,
+        .placement.core_id,
+        .admission
+    )]
+    NotHeld {
+        placement: ursula_shard::ShardPlacement,
+        admission: ursula_control::Admission,
+    },
     /// The OpenRaft work of the group's previous engine still runs (#709).
     #[error(
         "raft group {:?} on core {:?} does not open: OpenRaft work of its previous engine still runs",
@@ -1450,6 +1464,25 @@ impl JournalRead {
     }
 }
 
+/// Whether the core journal in `dir` holds metadata, a segment record or a
+/// snapshot record, so a start opens it ([`super::RaftWal::open_held_cores`]).
+/// A directory that does not read counts as holding state: its open then
+/// reports the failure.
+pub(crate) fn core_holds_state(dir: &Path) -> bool {
+    match read_journal(dir) {
+        Ok(read) => read.records || read.metadata || read.snapshot_records,
+        Err(error) => {
+            let error = RaftWalError::from(error);
+            tracing::warn!(
+                path = %dir.display(),
+                %error,
+                "could not read what the core journal holds; opening it"
+            );
+            true
+        }
+    }
+}
+
 /// Reads the journal in `dir`. A missing directory holds nothing.
 fn read_journal(dir: &Path) -> Result<JournalRead, HistoryReadError> {
     let records = segment::holds_records(dir).map_err(|source| HistoryReadError::Journal {
@@ -1466,7 +1499,7 @@ fn read_journal(dir: &Path) -> Result<JournalRead, HistoryReadError> {
                 source: JournalError::io(dir, super::journal::JournalOp::Open, source),
             })?
             .iter()
-            .any(|path| super::file::is_snapshot_record_file(path));
+            .any(|path| super::file::snapshot_record_group(path).is_some());
     Ok(JournalRead {
         records,
         metadata: !missing,

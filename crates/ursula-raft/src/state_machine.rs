@@ -1940,20 +1940,11 @@ pub(crate) fn read_snapshot_record(
     if !Disk::exists(path) {
         return Ok(None);
     }
-    let read = |source| SnapshotRecordError::Read {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut file = Disk::open_read(path).map_err(read)?;
-    let length = usize::try_from(file.file_len().map_err(read)?)
-        .map_err(|source| read(io::Error::new(io::ErrorKind::InvalidData, source)))?;
-    let mut bytes = vec![0; length];
-    file.read_exact(&mut bytes).map_err(read)?;
+    let persisted = read_persisted_snapshot(path)?;
     let decode = |source| SnapshotRecordError::Decode {
         path: path.to_path_buf(),
         source,
     };
-    let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(decode)?;
     if persisted.generation != generation {
         tracing::info!(
             raft_group_id = raft_group_id.0,
@@ -1972,6 +1963,34 @@ pub(crate) fn read_snapshot_record(
         pointer,
         path: path.to_path_buf(),
     }))
+}
+
+/// Reads and decodes the snapshot record at `path`, its pointer left
+/// encoded.
+fn read_persisted_snapshot(path: &Path) -> Result<PersistedSnapshot, SnapshotRecordError> {
+    let read = |source| SnapshotRecordError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = Disk::open_read(path).map_err(read)?;
+    let length = usize::try_from(file.file_len().map_err(read)?)
+        .map_err(|source| read(io::Error::new(io::ErrorKind::InvalidData, source)))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes).map_err(read)?;
+    decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(|source| {
+        SnapshotRecordError::Decode {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+/// The generation of the group's log that the snapshot record at `path`
+/// names, read as a restore reads the record.
+pub(crate) fn snapshot_record_generation(
+    path: &Path,
+) -> Result<LogGeneration, SnapshotRecordError> {
+    read_persisted_snapshot(path).map(|persisted| persisted.generation)
 }
 
 /// A snapshot record of three distinct fields, for the persisted-envelopes
@@ -3319,7 +3338,9 @@ mod tests {
             &topology,
         )
         .unwrap();
-        let store = wal.open(placement, metrics()).unwrap();
+        let store = wal
+            .open(placement, ursula_control::Admission::Create, metrics())
+            .unwrap();
         let record = store.snapshot_record();
         assert_eq!(record.generation(), LogGeneration::new(1));
         let path = record.path().to_path_buf();

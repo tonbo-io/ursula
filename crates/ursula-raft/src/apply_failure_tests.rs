@@ -73,7 +73,11 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     )
     .unwrap();
     let mut poisoned_log = wal
-        .open(placement(0), metrics.group_engine_metrics())
+        .open(
+            placement(0),
+            ursula_control::Admission::Create,
+            metrics.group_engine_metrics(),
+        )
         .unwrap();
     let poisoned = RaftGroupEngine::new_single_node(
         placement(0),
@@ -91,8 +95,12 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         placement(1),
         1,
         config.clone(),
-        wal.open(placement(1), metrics.group_engine_metrics())
-            .unwrap(),
+        wal.open(
+            placement(1),
+            ursula_control::Admission::Create,
+            metrics.group_engine_metrics(),
+        )
+        .unwrap(),
         RaftGroupEngineOptions::default(),
     )
     .await
@@ -253,8 +261,12 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         1,
         config.clone(),
         crate::registry::SingleNodeRaftNetworkFactory,
-        wal.open(placement(0), metrics.group_engine_metrics())
-            .unwrap(),
+        wal.open(
+            placement(0),
+            ursula_control::Admission::Create,
+            metrics.group_engine_metrics(),
+        )
+        .unwrap(),
         RaftGroupEngineOptions {
             apply_fault: Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
                 index: poison_index,
@@ -270,7 +282,11 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         ))
     ));
     let retained_again = wal
-        .open(placement(0), metrics.group_engine_metrics())
+        .open(
+            placement(0),
+            ursula_control::Admission::Create,
+            metrics.group_engine_metrics(),
+        )
         .unwrap()
         .try_get_log_entries(poison_index..=poison_index)
         .await
@@ -429,8 +445,12 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         placement(0),
         1,
         config,
-        wal.open(placement(0), metrics.group_engine_metrics())
-            .unwrap(),
+        wal.open(
+            placement(0),
+            ursula_control::Admission::Create,
+            metrics.group_engine_metrics(),
+        )
+        .unwrap(),
         RaftGroupEngineOptions::default(),
     )
     .await
@@ -714,7 +734,11 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
             )
             .unwrap();
             let log = wal
-                .open(placement(0), metrics.group_engine_metrics())
+                .open(
+                    placement(0),
+                    ursula_control::Admission::Create,
+                    metrics.group_engine_metrics(),
+                )
                 .unwrap();
             let engine = RaftGroupEngine::new_node(
                 placement(0),
