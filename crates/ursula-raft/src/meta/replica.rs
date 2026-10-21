@@ -417,10 +417,11 @@ impl ActiveMeta {
     ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, GroupEngineError> {
         self.core.apply_health.check(RaftTarget::Meta)?;
         let history = Arc::clone(&self.core.history);
+        let fence = self.core.owner().fence().clone();
         self.core
             .owner()
             .call(move |raft| async move {
-                crate::forward::write_commands_on_raft(raft, &history, commands).await
+                crate::forward::write_commands_on_raft(raft, &fence, &history, commands).await
             })
             .await
             .map_err(crate::owner::owner_stopped)?
@@ -571,7 +572,10 @@ impl MetaReplica {
         let ledger = wal.engine_work_ledger();
         ledger.record_meta(openraft_work.ended());
         let core = ReplicaCore {
-            barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
+            barrier: Arc::new(ReadIndexBarrier::new(
+                raft.clone(),
+                registry.peer_cluster().fence(),
+            )),
             recovery: Some(Arc::clone(&gate)),
             history: Arc::clone(&history),
             apply_health,

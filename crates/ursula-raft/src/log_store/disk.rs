@@ -65,6 +65,9 @@ pub trait JournalDisk {
     fn rename(from: &Path, to: &Path) -> io::Result<()>;
     /// Removes the file at `path`.
     fn remove_file(path: &Path) -> io::Result<()>;
+    /// Opens `path` for [`JournalFile::overwrite_start`], creating it when
+    /// missing. The disk lease's probe keeps one such file open.
+    fn open_overwrite(path: &Path) -> io::Result<Self::File>;
     /// `fsync`s the directory at `path`, making its entries durable.
     fn sync_dir(path: &Path) -> io::Result<()>;
     /// When the file at `path` was last written, on [`JournalDisk::wall_clock`].
@@ -97,6 +100,10 @@ pub trait JournalFile: Debug + Send {
     fn append(&mut self, buf: &[u8]) -> io::Result<()>;
     /// `fsync`s the file data and the length needed to read it back.
     fn sync_data(&mut self) -> io::Result<()>;
+    /// Writes `buf` at the start of a file opened with
+    /// [`JournalDisk::open_overwrite`] in place and `fsync`s it, so it needs
+    /// no free block.
+    fn overwrite_start(&mut self, buf: &[u8]) -> io::Result<()>;
 }
 
 /// The outcome of [`JournalDisk::try_lock`].
@@ -201,6 +208,14 @@ impl JournalDisk for OsDisk {
         fs::remove_file(path)
     }
 
+    fn open_overwrite(path: &Path) -> io::Result<File> {
+        OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+    }
+
     fn sync_dir(path: &Path) -> io::Result<()> {
         File::open(path)?.sync_all()
     }
@@ -290,6 +305,12 @@ impl JournalFile for File {
     }
 
     fn sync_data(&mut self) -> io::Result<()> {
+        File::sync_data(self)
+    }
+
+    fn overwrite_start(&mut self, buf: &[u8]) -> io::Result<()> {
+        self.seek(io::SeekFrom::Start(0))?;
+        self.write_all(buf)?;
         File::sync_data(self)
     }
 }

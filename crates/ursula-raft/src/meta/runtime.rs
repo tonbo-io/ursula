@@ -195,6 +195,21 @@ where
             pauses: pauses.clone(),
             tasks: Vec::new(),
         };
+        // Before the meta replica opens, and whether it opens or not: a
+        // root that held state ends its wait without meta.
+        runtime.tasks.push(crate::rt::spawn(
+            crate::predecessor_wait::run_predecessor_wait(
+                wal.clone(),
+                registry.clone(),
+                runtime.status.registration.clone(),
+            ),
+        ));
+        runtime
+            .tasks
+            .push(crate::rt::spawn(crate::predecessor_wait::run_fence_gate(
+                registry.clone(),
+                wal.fence(),
+            )));
         let store = match journal.opened {
             Ok(store) => store,
             Err(error) => {

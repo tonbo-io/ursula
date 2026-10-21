@@ -45,6 +45,7 @@ it reports the first of:
 
 | `reason` | Meaning |
 | -------- | ------- |
+| `disk_lease_lost` | No probe of the WAL disk synced within `raft.wal.lease`. The node takes part in no Raft traffic and answers clients `503` until a probe succeeds |
 | `format_epoch_mismatch` | The node exchanged a Raft RPC with a peer of another format epoch. It stays unready until it restarts |
 | `wal_disk_pressure` | The WAL filesystem is below `raft.wal.min_available_size`, or its free-space check failed |
 | `recovery_stalled` | A group's recovery gate on this node is stalled. The groups are listed under `recovery_stalled_groups` |

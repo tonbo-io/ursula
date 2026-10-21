@@ -335,12 +335,14 @@ async fn an_upload_command_without_a_fence_is_refused() {
         .expect_err("an upload of no leadership is refused");
     assert!(refused_before_proposal(&unreplicated), "{unreplicated:?}");
 
-    let batch =
-        crate::forward::write_commands_on_raft(engine.raft_handle(), &engine.history, vec![
-            RaftCommand::Stream(command),
-        ])
-        .await
-        .expect_err("a batch carries no fence, so it refuses an upload");
+    let batch = crate::forward::write_commands_on_raft(
+        engine.raft_handle(),
+        engine.fence(),
+        &engine.history,
+        vec![RaftCommand::Stream(command)],
+    )
+    .await
+    .expect_err("a batch carries no fence, so it refuses an upload");
     assert!(refused_before_proposal(&batch), "{batch:?}");
 
     assert_eq!(last_log_index(&engine), appended, "nothing was proposed");

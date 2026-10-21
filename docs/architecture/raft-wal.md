@@ -35,6 +35,7 @@ pointer and a host restart the old one. Recovery accepts either.
 | `raft.wal.cache_size` | 256 MiB | Recent entries kept in memory per node, split evenly between its groups. |
 | `raft.wal.min_available_size` | 512 MiB | Free space below which the node refuses writes. Zero disables the guard. |
 | `raft.wal.resume_available_size` | 1 GiB | Free space at which the guard clears. Must exceed the minimum. |
+| `raft.wal.lease` | 5 s | The disk lease: with no synced probe of the root for this long, the node stops all Raft traffic. From 2 s to 10 s. |
 
 There is no interval `fsync` mode: after a host crash under `never` a replica
 keeps only its verified prefix and rejoins through the recovery gate, so a
@@ -56,6 +57,7 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | `run-state.bin` | Boot id, root device and status of the last run, and the `fsync` policy and recovery epoch of each journal class. |
 | `topology.bin` | Core count, group count, cluster id, node id and root id the root was created with. |
 | `identity.bin` | The run counter of the root, and whether a run read a predecessor that may still run. |
+| `lease.probe` | 8 bytes the disk lease's probe rewrites in place and syncs every second. |
 | `core-N/journal-<seq>.seg` | Journal segments, 20-digit consecutive sequences starting at 1. |
 | `core-N/journal.meta` | Every group's vote, log state and log generation, and the core's verified recovery epoch. |
 | `core-N/journal.lock` | Advisory lock held by the core's writer. |
@@ -294,7 +296,69 @@ run, its predecessor, and reports it as `predecessor` in `wal_recovery` of
 | Remounted, host crash, no run state | `may_live` |
 
 A start that reads `may_live` records it in `identity.bin` before it records
-itself, and the record stays across restarts, a clean one included.
+itself, and the record stays across restarts, a clean one included. Only a
+finished predecessor wait clears it, synced (see Disk lease and predecessor
+wait).
+
+## Disk lease and predecessor wait
+
+A process that loses its disk stops speaking within its lease, and a successor
+whose predecessor may still run stays silent longer than any lease.
+
+**Disk lease.** Every second a probe rewrites the 8 bytes of `lease.probe` in
+place and syncs them, on a thread of its own (a simulated task under madsim),
+so it never waits behind the hot path. It reads the monotonic clock before it
+writes. The lease holds while no probe failed since the last success and the
+clock is below that success's start plus `raft.wal.lease`. The synced
+`identity.bin` write at the start is the first success. Measured from the
+start, a late success never extends the lease, and a hung probe does not hold
+it: checks read the clock, never the probe. An error ends it at once.
+
+While the lease does not hold, the node fence refuses:
+
+- every Raft request and answer, in every group and meta: the sender refuses to
+  send and drops an answer that arrives (`UNAVAILABLE`, no metadata), and the
+  receiver refuses a request at its arrival and an answer before it leaves
+  (`FAILED_PRECONDITION` with `ursula-fence: fenced` and its node id), on unary
+  calls, on each `AppendStream` frame (the stream ends with the refusal in its
+  trailers) and in the in-process transport. A sender reads either as an
+  unreachable peer, never as a misdelivery or another format epoch.
+- leadership: the one leader predicate (`GroupLeadership::of`) answers no
+  leader, so cold flush, compaction, GC, the index repair, the orphan sweep and
+  every other leader-gated job skip. After the lease holds again, a replica
+  leads only once a quorum acknowledged an RPC it sent after the lift, or at
+  once as its own quorum.
+- every PUT and DELETE to the cold and snapshot stores, checked right before
+  each is sent, after the listing it rests on returned. A refused one fails as
+  a store call does and its job runs again later.
+- clients: the front door answers `503` with `Retry-After` and `NO_LEADER`,
+  local reads included, and so do mutating admin routes. Readiness reports
+  `disk_lease_lost`. The process never exits.
+
+A probe that started after the lease ended and succeeds lifts the fence with no
+restart. Journal write and sync errors still poison the writer: the lease says
+nothing about what a page cache lost during a hang. A shutdown closes the fence
+for good before it records `clean`, and the root's lock stays held until the
+process exits, so no successor reads `clean` beside a process that still
+answers.
+
+**Predecessor wait.** A run that reads `may_live` waits 12 s before it grants a
+vote (the bootstrap probe vote is still answered), campaigns, takes a
+transfer, starts a recovery gate's drivers or writes a snapshot object: 1.1
+times the longest lease allowed, for clock rates that differ by up to 10%,
+plus 1 s between a lease check and its write. A root that held state waits
+from its open. An empty root owes the wait only once the meta group's first
+answer to its registration binds it in a bootstrapped cluster, and an answer
+before Bootstrap settles it at once, since no data group holds data before
+Bootstrap and a forming meta group must elect. Acknowledging appends is not held: under
+`always` they are synced first, and a lossy run under `never` is gated anyway.
+At the end the run clears the wait in `identity.bin`, synced. While a wait is
+owed or the lease does not hold, the node sheds leadership for the `fence`
+reason.
+
+The lease rests on storage that revokes the old attachment of a moved volume,
+and on monotonic clock rates that differ by a bounded amount, as any leader
+lease does.
 
 ## Fail-stop
 
@@ -590,7 +654,10 @@ network is compiled only under `cfg(test)` or `cfg(madsim)`.
 Every journal file operation goes through `log_store::disk`, implemented by the
 OS and, under `cfg(madsim)`, by a simulated disk that keeps synced bytes, drops
 or reorders unsynced pages on a host crash, keeps every byte on a process crash
-and injects I/O errors. Simulation therefore runs the production journal.
+and injects I/O errors. It also detaches a volume from the process running on
+it: what that process did not sync is lost, its lock goes, and every later
+change through a file it opened fails, while the next attachment reads a new
+device. Simulation therefore runs the production journal.
 
 - OpenRaft's log-store conformance suite runs against `RaftGroupFileLogStore`
   on the real and simulated disk.

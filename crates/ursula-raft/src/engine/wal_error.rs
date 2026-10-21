@@ -88,7 +88,8 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         RaftWalError::CreateDir { .. }
         | RaftWalError::Lock { .. }
         | RaftWalError::ListCores { .. }
-        | RaftWalError::Device { .. } => WalOpenFailureKind::Io,
+        | RaftWalError::Device { .. }
+        | RaftWalError::LeaseProbe { .. } => WalOpenFailureKind::Io,
         RaftWalError::Locked { .. } | RaftWalError::CoreWriterStopping { .. } => {
             WalOpenFailureKind::Locked
         }

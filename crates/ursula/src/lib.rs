@@ -549,9 +549,12 @@ impl HttpState {
                 };
                 let seen = raft.leadership();
                 let mut metrics = raft.metrics();
+                let fence = raft.fence().clone();
                 changes.push(Box::pin(async move {
                     while metrics.changed().await.is_ok() {
-                        if ursula_raft::GroupLeadership::of(&metrics.borrow_watched()) != seen {
+                        if ursula_raft::GroupLeadership::of(&metrics.borrow_watched(), &fence)
+                            != seen
+                        {
                             return;
                         }
                     }
@@ -1372,11 +1375,49 @@ async fn require_admin_incarnation(
         if let Err(response) = removed_surface::reject_removed_admin_headers(request.headers()) {
             return *response;
         }
+        // A fenced node changes nothing: it leads no group and sends no
+        // Raft request.
+        if let Some(response) = fenced_answer(&state) {
+            return response;
+        }
         if let Some(response) = reject_admin_incarnation(&state, request.headers()) {
             return response;
         }
     }
     next.run(request).await
+}
+
+/// The answer to a request at a node whose fence does not admit (its disk
+/// lease lapsed, or it shuts down): `503` with `Retry-After` and
+/// `NO_LEADER`, as for a group without a known leader, since the node
+/// proposes nothing for it. `None` while the fence admits.
+fn fenced_answer(state: &HttpState) -> Option<Response> {
+    if state.raft_wal.as_ref()?.fence().admits_now() {
+        return None;
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        axum::http::header::RETRY_AFTER,
+        HeaderValue::from_static("1"),
+    );
+    Some(render::fixed_error_answer(
+        StatusCode::SERVICE_UNAVAILABLE,
+        ErrorCode::NoLeader,
+        headers,
+    ))
+}
+
+/// The front door's fence: every client request at a fenced node, local
+/// reads included, gets [`fenced_answer`].
+async fn refuse_while_fenced(
+    State(state): State<HttpState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    match fenced_answer(&state) {
+        Some(answer) => answer,
+        None => next.run(request).await,
+    }
 }
 
 /// Cluster-plane routes: inter-node gRPC carrying Raft RPCs, snapshot
@@ -1472,6 +1513,7 @@ async fn cluster_probe(_body: Bytes) -> StatusCode {
 /// What readiness decides on, besides the reports it carries.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ReadinessFacts {
+    pub(crate) disk_lease_lost: bool,
     pub(crate) format_epoch_mismatch: bool,
     pub(crate) wal_disk_pressure: bool,
     pub(crate) recovery_stalled: bool,
@@ -1485,7 +1527,9 @@ pub(crate) fn readiness_reason(
     facts: ReadinessFacts,
 ) -> Option<ursula_proto::admin::ServingReadinessReason> {
     use ursula_proto::admin::ServingReadinessReason as Reason;
-    if facts.format_epoch_mismatch {
+    if facts.disk_lease_lost {
+        Some(Reason::DiskLeaseLost)
+    } else if facts.format_epoch_mismatch {
         Some(Reason::FormatEpochMismatch)
     } else if facts.wal_disk_pressure {
         Some(Reason::WalDiskPressure)
@@ -1517,7 +1561,16 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         (Some(_), Some(report)) => report.serving_ready(),
         (Some(registry), None) => state.client_write_router.is_none() && registry.is_empty(),
     };
-    let ready = !disk.pressure && !format_epoch_mismatch && recovery_ready && raft_ready;
+    // A node whose disk lease lapsed takes part in no Raft traffic.
+    let disk_lease_lost = state.raft_wal.as_ref().is_some_and(|wal| {
+        wal.fence().status(ursula_runtime::node_fence::fence_now())
+            == ursula_runtime::node_fence::FenceStatus::DiskLeaseLost
+    });
+    let ready = !disk_lease_lost
+        && !disk.pressure
+        && !format_epoch_mismatch
+        && recovery_ready
+        && raft_ready;
     // Groups whose gated replica here got no leader barrier and applied
     // nothing for a while: a majority of their voters may be gated, and they
     // refuse writes until an operator accepts the loss of the unsynced tail.
@@ -1535,6 +1588,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         axum::Json(ursula_proto::admin::ServingReadiness {
             ready,
             reason: readiness_reason(ReadinessFacts {
+                disk_lease_lost,
                 format_epoch_mismatch,
                 wal_disk_pressure: disk.pressure,
                 recovery_stalled: !stalled_groups.is_empty(),
@@ -1683,6 +1737,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
                 .layer(ResponseMetadataLayer::client(IdentityHeaders::new(
                     state.cluster_id(),
                 )))
+                .layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    refuse_while_fenced,
+                ))
                 .layer(admission)
                 .layer(DefaultBodyLimit::max(MAX_HTTP_BODY_BYTES)),
         )

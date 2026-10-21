@@ -566,6 +566,7 @@ mod tests {
             &topology,
             NodeId::new(1),
             Some(&generated),
+            ursula_runtime::NodeFence::unleased(),
         )
         .unwrap();
         wal.shutdown().await.unwrap();
@@ -575,17 +576,29 @@ mod tests {
         // touching the root.
         let dir = tempfile::tempdir().unwrap();
         let prod = ClusterId::new("prod-eu-1").unwrap();
-        let wal =
-            RaftWal::start_in_cluster(dir.path(), tuning, &topology, NodeId::new(1), Some(&prod))
-                .unwrap();
+        let wal = RaftWal::start_in_cluster(
+            dir.path(),
+            tuning,
+            &topology,
+            NodeId::new(1),
+            Some(&prod),
+            ursula_runtime::NodeFence::unleased(),
+        )
+        .unwrap();
         assert_eq!(wal.cluster_id(), &prod);
         wal.shutdown().await.unwrap();
         drop(wal);
         let run_before = std::fs::read(dir.path().join(RUN_STATE_FILE)).unwrap();
         let other = ClusterId::new("prod-us-1").unwrap();
-        let error =
-            RaftWal::start_in_cluster(dir.path(), tuning, &topology, NodeId::new(1), Some(&other))
-                .unwrap_err();
+        let error = RaftWal::start_in_cluster(
+            dir.path(),
+            tuning,
+            &topology,
+            NodeId::new(1),
+            Some(&other),
+            ursula_runtime::NodeFence::unleased(),
+        )
+        .unwrap_err();
         assert!(matches!(
             &error,
             RaftWalError::ClusterIdMismatch { stored, configured, .. }
@@ -628,6 +641,7 @@ mod tests {
                 &topology,
                 NodeId::new(1),
                 configured,
+                ursula_runtime::NodeFence::unleased(),
             )
             .unwrap_err();
             assert!(

@@ -30,6 +30,8 @@
 //! - [`ops`]: declarative manifest of the uniform runtime operations; expands
 //!   into the per-operation actor and client plumbing.
 //! - [`metrics`]: runtime metrics shared across cores; lock-free counters.
+//! - [`node_fence`]: the node fence, whose disk lease and predecessor wait
+//!   decide whether this process takes part in Raft and writes objects.
 //! - [`read_index`]: the per-group ReadIndex barrier that linearizes reads
 //!   before they are queued to the group actor (D10).
 //! - [`tidy_worker`]: leader-side tidy driver (bounded-state F0): the
@@ -65,6 +67,7 @@ pub mod format_marker;
 mod group_actor;
 pub mod key_holds;
 mod metrics;
+pub mod node_fence;
 mod ops;
 mod read_index;
 mod request;
@@ -244,6 +247,7 @@ pub use metrics::RuntimeMailboxSnapshot;
 pub use metrics::RuntimeMetrics;
 pub use metrics::RuntimeMetricsSnapshot;
 pub use metrics::SnapshotGcSample;
+pub use node_fence::NodeFence;
 pub use read_index::LinearizableReadBarrier;
 pub use read_index::ReadIndexFuture;
 pub use request::AckColdGcResponse;
@@ -318,6 +322,7 @@ pub use runtime::ShardRuntime;
 pub use runtime::SweptPart;
 pub use runtime::SweptPartsObserver;
 pub use runtime::unix_time_ms;
+pub use snapshot_store::FencedSnapshotStore;
 pub use snapshot_store::InlineSnapshotStore;
 pub use snapshot_store::NotOwned;
 pub use snapshot_store::OwnListing;

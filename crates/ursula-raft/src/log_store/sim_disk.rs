@@ -32,6 +32,13 @@
 //! the device a path is mounted from too ([`JournalDisk::device`]): each
 //! attachment of a volume under a prefix ([`SimDisk::reattach`]) is a new
 //! device for every path below it.
+//!
+//! [`SimDisk::detach`] takes a volume from the process running on it, as
+//! storage that revokes an attachment does: what that process did not sync
+//! is lost, its lock goes with the attachment, and every later change under
+//! the prefix fails until the next attachment. A file opened before the
+//! next attachment keeps failing after it, so the old process never writes
+//! to the volume again.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -114,6 +121,8 @@ pub enum SimDiskError {
         .lock.display()
     )]
     NodeRunning { prefix: PathBuf, lock: PathBuf },
+    #[error("simulated path '{}' is on a detached attachment", .path.display())]
+    Detached { path: PathBuf },
 }
 
 impl SimDiskError {
@@ -123,7 +132,7 @@ impl SimDiskError {
             Self::NotFound { .. } => io::ErrorKind::NotFound,
             Self::ShortRead { .. } => io::ErrorKind::UnexpectedEof,
             Self::IsDirectory { .. } | Self::NotDirectory { .. } => io::ErrorKind::InvalidInput,
-            Self::Injected { .. } => io::ErrorKind::Other,
+            Self::Injected { .. } | Self::Detached { .. } => io::ErrorKind::Other,
             Self::NodeRunning { .. } => io::ErrorKind::ResourceBusy,
         };
         io::Error::new(kind, self)
@@ -136,12 +145,17 @@ pub struct SimFile {
     path: PathBuf,
     inode: u64,
     read_pos: usize,
+    /// The device of the attachment it was opened on.
+    attachment: u64,
 }
 
 /// A held simulated journal lock, released on drop.
 #[derive(Debug)]
 pub struct SimJournalLock {
     path: PathBuf,
+    /// Tells this lock apart from a later one at the same path, taken
+    /// after a detach dropped this one.
+    token: u64,
 }
 
 impl Drop for SimJournalLock {
@@ -153,7 +167,11 @@ impl Drop for SimJournalLock {
             let disk = slot
                 .as_mut()
                 .filter(|disk| Weak::ptr_eq(&disk.runtime, &current))?;
-            Some(disk.state.locks.remove(&self.path))
+            let held = disk.state.locks.get(&self.path) == Some(&self.token);
+            if held {
+                disk.state.locks.remove(&self.path);
+            }
+            Some(held)
         });
         if released != Some(true) {
             tracing::trace!(path = %self.path.display(), "simulated journal lock outlived its runtime");
@@ -180,7 +198,11 @@ struct DiskState {
     durable: BTreeMap<PathBuf, Entry>,
     inodes: BTreeMap<u64, Inode>,
     next_inode: u64,
-    locks: BTreeSet<PathBuf>,
+    /// Each held lock, with its token.
+    locks: BTreeMap<PathBuf, u64>,
+    next_lock: u64,
+    /// The prefixes detached and not attached again.
+    detached: BTreeSet<PathBuf>,
     faults: BTreeSet<(PathBuf, SimDiskFault)>,
     next_root: u64,
     /// The prefix of every power loss so far, in order.
@@ -385,6 +407,18 @@ impl DiskState {
         self.inodes.entry(inode).or_default()
     }
 
+    /// Refuses a change to `path` on a detached attachment, or through a
+    /// file opened on an earlier attachment (`opened_on`).
+    fn attached(&self, path: &Path, opened_on: Option<u64>) -> Result<(), SimDiskError> {
+        let detached = self.detached.iter().any(|prefix| path.starts_with(prefix));
+        if detached || opened_on.is_some_and(|device| device != self.device(path)) {
+            return Err(SimDiskError::Detached {
+                path: path.to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     fn take_fault(&mut self, path: &Path, fault: SimDiskFault) -> Result<(), SimDiskError> {
         if self.faults.remove(&(path.to_owned(), fault)) {
             return Err(SimDiskError::Injected {
@@ -419,6 +453,7 @@ impl DiskState {
             Ok(inode) => inode,
             Err(SimDiskError::NotFound { .. }) if create => {
                 self.require_parent_dir(path)?;
+                self.attached(path, None)?;
                 let inode = self.next_inode;
                 self.next_inode = self.next_inode.saturating_add(1);
                 self.inodes.insert(inode, Inode::default());
@@ -431,6 +466,7 @@ impl DiskState {
             path: path.to_owned(),
             inode,
             read_pos: 0,
+            attachment: self.device(path),
         })
     }
 
@@ -440,6 +476,7 @@ impl DiskState {
                 path: dir.to_owned(),
             });
         }
+        self.attached(dir, None)?;
         self.take_fault(dir, SimDiskFault::Sync)?;
         let is_child = |path: &Path| path.parent() == Some(dir);
         self.durable.retain(|path, _| !is_child(path));
@@ -451,17 +488,35 @@ impl DiskState {
         Ok(())
     }
 
+    /// Refuses `prefix` while a running node holds a lock under it.
+    fn stopped(&self, prefix: &Path) -> Result<(), SimDiskError> {
+        match self.locks.keys().find(|lock| lock.starts_with(prefix)) {
+            Some(lock) => Err(SimDiskError::NodeRunning {
+                prefix: prefix.to_owned(),
+                lock: lock.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
     fn power_loss(
         &mut self,
         prefix: &Path,
         reaches_disk: &mut impl FnMut() -> bool,
     ) -> Result<SimPowerLoss, SimDiskError> {
-        if let Some(lock) = self.locks.iter().find(|lock| lock.starts_with(prefix)) {
-            return Err(SimDiskError::NodeRunning {
-                prefix: prefix.to_owned(),
-                lock: lock.clone(),
-            });
-        }
+        self.stopped(prefix)?;
+        let report = self.lose_unsynced(prefix, reaches_disk);
+        self.power_losses.push(prefix.to_owned());
+        Ok(report)
+    }
+
+    /// Keeps or drops what was not synced under `prefix`, as `reaches_disk`
+    /// decides, and reverts its directory entries to their synced state.
+    fn lose_unsynced(
+        &mut self,
+        prefix: &Path,
+        reaches_disk: &mut impl FnMut() -> bool,
+    ) -> SimPowerLoss {
         let mut report = SimPowerLoss::default();
         let under_prefix = |path: &Path| path.starts_with(prefix);
         let inodes = self
@@ -516,8 +571,7 @@ impl DiskState {
             self.durable.retain(|path, _| !path.starts_with(&orphan));
         }
         self.faults.retain(|(path, _)| !under_prefix(path));
-        self.power_losses.push(prefix.to_owned());
-        Ok(report)
+        report
     }
 
     /// Makes every page of the files under `prefix` durable.
@@ -563,15 +617,22 @@ impl SimDisk {
     /// Simulates a crash of the process that owns `prefix`: the page cache
     /// survives, so nothing is lost. The node must already be stopped.
     pub fn process_crash(prefix: &Path) -> io::Result<()> {
-        io_with_disk(
-            |state| match state.locks.iter().find(|lock| lock.starts_with(prefix)) {
-                Some(lock) => Err(SimDiskError::NodeRunning {
-                    prefix: prefix.to_owned(),
-                    lock: lock.clone(),
-                }),
-                None => Ok(()),
-            },
-        )
+        io_with_disk(|state| state.stopped(prefix))
+    }
+
+    /// Detaches the volume under `prefix` from the process running on it,
+    /// as storage that revokes an attachment does: everything that process
+    /// did not sync is lost, its lock goes with the attachment, and every
+    /// later change under `prefix` fails until the next attachment
+    /// ([`SimDisk::reattach`]). A file opened before that keeps failing
+    /// after it. The boot stays.
+    pub fn detach(prefix: &Path) -> io::Result<SimPowerLoss> {
+        io_with_disk(|state| {
+            state.locks.retain(|lock, _| !lock.starts_with(prefix));
+            let report = state.lose_unsynced(prefix, &mut || false);
+            state.detached.insert(prefix.to_owned());
+            Ok(report)
+        })
     }
 
     /// Detaches the volume under `prefix` and attaches it again, as a volume
@@ -579,18 +640,14 @@ impl SimDisk {
     /// another device, the boot stays, and the page cache keeps what it
     /// held. The node must already be stopped.
     pub fn reattach(prefix: &Path) -> io::Result<()> {
-        io_with_disk(
-            |state| match state.locks.iter().find(|lock| lock.starts_with(prefix)) {
-                Some(lock) => Err(SimDiskError::NodeRunning {
-                    prefix: prefix.to_owned(),
-                    lock: lock.clone(),
-                }),
-                None => {
-                    state.attachments.push(prefix.to_owned());
-                    Ok(())
-                }
-            },
-        )
+        io_with_disk(|state| {
+            state.stopped(prefix)?;
+            state
+                .detached
+                .retain(|detached| !detached.starts_with(prefix));
+            state.attachments.push(prefix.to_owned());
+            Ok(())
+        })
     }
 
     /// Simulates a power loss of the disk under `prefix`; the node must
@@ -676,6 +733,10 @@ impl JournalDisk for SimDisk {
         io_with_disk(|state| state.open(path, false))
     }
 
+    fn open_overwrite(path: &Path) -> io::Result<SimFile> {
+        io_with_disk(|state| state.open(path, true))
+    }
+
     fn exists(path: &Path) -> bool {
         with_disk(|state| state.resolve(path).is_some()).unwrap_or(false)
     }
@@ -700,6 +761,7 @@ impl JournalDisk for SimDisk {
     fn truncate(path: &Path, len: u64) -> io::Result<()> {
         io_with_disk(|state| {
             let inode = state.resolve_file(path)?;
+            state.attached(path, None)?;
             state.take_fault(path, SimDiskFault::Sync)?;
             let inode = state.inode_mut(inode);
             inode.set_len(usize::try_from(len).unwrap_or(usize::MAX));
@@ -710,6 +772,7 @@ impl JournalDisk for SimDisk {
 
     fn rename(from: &Path, to: &Path) -> io::Result<()> {
         io_with_disk(|state| {
+            state.attached(to, None)?;
             state.take_fault(to, SimDiskFault::Rename)?;
             let inode = state.resolve_file(from)?;
             state.require_parent_dir(to)?;
@@ -727,6 +790,7 @@ impl JournalDisk for SimDisk {
     fn remove_file(path: &Path) -> io::Result<()> {
         io_with_disk(|state| {
             state.resolve_file(path)?;
+            state.attached(path, None)?;
             state.take_fault(path, SimDiskFault::Remove)?;
             state.visible.remove(path);
             Ok(())
@@ -753,13 +817,18 @@ impl JournalDisk for SimDisk {
     fn try_lock(path: &Path) -> io::Result<LockAttempt<SimJournalLock>> {
         io_with_disk(|state| {
             state.require_parent_dir(path)?;
-            if !state.locks.insert(path.to_owned()) {
+            state.attached(path, None)?;
+            if state.locks.contains_key(path) {
                 return Ok(LockAttempt::Held {
                     owner: Some("simulated node".to_owned()),
                 });
             }
+            let token = state.next_lock;
+            state.next_lock = state.next_lock.saturating_add(1);
+            state.locks.insert(path.to_owned(), token);
             Ok(LockAttempt::Acquired(SimJournalLock {
                 path: path.to_owned(),
+                token,
             }))
         })
     }
@@ -803,6 +872,7 @@ impl JournalFile for SimFile {
 
     fn append(&mut self, buf: &[u8]) -> io::Result<()> {
         io_with_disk(|state| {
+            state.attached(&self.path, Some(self.attachment))?;
             state.take_fault(&self.path, SimDiskFault::Write)?;
             if let Err(error) = state.take_fault(&self.path, SimDiskFault::PartialWrite) {
                 let prefix = buf.get(..buf.len() / 2).unwrap_or_default();
@@ -816,8 +886,30 @@ impl JournalFile for SimFile {
 
     fn sync_data(&mut self) -> io::Result<()> {
         io_with_disk(|state| {
+            state.attached(&self.path, Some(self.attachment))?;
             if let Err(err) = state.take_fault(&self.path, SimDiskFault::Sync) {
                 // Linux reports the error once and marks the pages clean.
+                state.inode_mut(self.inode).dirty.clear();
+                return Err(err);
+            }
+            state.inode_mut(self.inode).sync();
+            Ok(())
+        })
+    }
+
+    fn overwrite_start(&mut self, buf: &[u8]) -> io::Result<()> {
+        io_with_disk(|state| {
+            state.attached(&self.path, Some(self.attachment))?;
+            state.take_fault(&self.path, SimDiskFault::Write)?;
+            let inode = state.inode_mut(self.inode);
+            if inode.data.len() < buf.len() {
+                inode.data.resize(buf.len(), 0);
+            }
+            if let Some(start) = inode.data.get_mut(..buf.len()) {
+                start.copy_from_slice(buf);
+            }
+            inode.mark_dirty(0, buf.len());
+            if let Err(err) = state.take_fault(&self.path, SimDiskFault::Sync) {
                 state.inode_mut(self.inode).dirty.clear();
                 return Err(err);
             }

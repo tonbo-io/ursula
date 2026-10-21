@@ -356,9 +356,14 @@ impl StaticGrpcRaftGroupEngineFactory {
     }
 
     /// The store every engine of the node writes its snapshot objects to:
-    /// the registry's ([`RaftGroupHandleRegistry::set_snapshot_store`]).
+    /// the registry's ([`RaftGroupHandleRegistry::set_snapshot_store`]),
+    /// behind the node fence of the WAL, so no object PUT or DELETE leaves
+    /// a fenced node or one that owes its predecessor wait.
     pub fn with_snapshot_store(self, snapshot_store: Option<SharedSnapshotStore>) -> Self {
-        self.registry.set_snapshot_store(snapshot_store);
+        let fence = self.log_stores.fence();
+        self.registry.set_snapshot_store(
+            snapshot_store.map(|store| ursula_runtime::FencedSnapshotStore::wrap(store, fence)),
+        );
         self
     }
 

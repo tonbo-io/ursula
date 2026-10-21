@@ -52,13 +52,16 @@ use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex;
 
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_config::WalFsync;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ProcessIncarnation;
+use ursula_runtime::NodeFence;
+use ursula_runtime::node_fence::FenceInstant;
+use ursula_runtime::node_fence::ProbeOutcome;
+use ursula_runtime::node_fence::fence_now;
 
 use super::core_meta::CoreMetadata;
 use super::core_meta::GroupLogState;
@@ -676,6 +679,12 @@ pub enum RaftWalError {
         #[source]
         source: std::io::Error,
     },
+    #[error("start the disk lease's probe of the Raft WAL root '{}': {source}", .root.display())]
+    LeaseProbe {
+        root: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("read the Raft WAL topology: {0}")]
     ReadTopology(#[source] StateFileError),
     #[error("record the Raft WAL topology: {0}")]
@@ -834,10 +843,29 @@ pub(crate) struct NodeWal {
     /// Whether the root held no journal record, vote or snapshot record at
     /// start.
     empty: bool,
+    /// The wait this run owes its predecessor, if it owes one.
+    wait: Option<WaitFrom>,
+    /// This process's fence, whose lease the probe keeps.
+    fence: NodeFence,
+    /// The probe of a leased fence.
+    _probe: Option<super::lease::LeaseProbe>,
     /// Keeps a second process off the root, so two runs never interleave
-    /// their run-state writes. Released by a clean shutdown, or when the
-    /// node's WAL is dropped.
-    lock: Mutex<Option<DiskLock>>,
+    /// their run-state writes, and no successor reads this run's clean end
+    /// while this process still answers. Released only when the node's WAL
+    /// is dropped, a clean shutdown included.
+    _lock: DiskLock,
+}
+
+/// Where the predecessor wait of a run is measured from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitFrom {
+    /// The open of the run, for a root that held state.
+    Open(FenceInstant),
+    /// The first answer of the meta group that binds the root, for an
+    /// empty root: a fresh root of a node id whose old process may still
+    /// run. The wait is owed from that answer on, and an answer before
+    /// Bootstrap settles it at once.
+    Binding,
 }
 
 impl NodeWal {
@@ -852,6 +880,7 @@ impl NodeWal {
         topology: &ursula_shard::StaticShardMap,
         cluster_id: Option<&ursula_headers::ClusterId>,
         node: NodeId,
+        fence: NodeFence,
     ) -> Result<Self, RaftWalError> {
         create_dir_all_durable(&root).map_err(|source| RaftWalError::CreateDir {
             path: root.clone(),
@@ -958,7 +987,22 @@ impl NodeWal {
         // reads the next start's predecessor as gone without the wait this
         // one owes: the identity file keeps it.
         let predecessor = Predecessor::of(opening.previous_run, identity.predecessor_wait(), empty);
+        let opened = fence_now();
         let (_, incarnation) = super::identity::advance(&root, bound.root, identity, predecessor)?;
+        // The synced identity write is the lease's first success.
+        fence.record_probe(opened, ProbeOutcome::Synced, fence_now());
+        let wait = (predecessor == Predecessor::MayLive && fence.lease_length().is_some())
+            .then_some(if empty {
+                WaitFrom::Binding
+            } else {
+                WaitFrom::Open(opened)
+            });
+        // An empty root owes its wait only once a bootstrapped cluster binds
+        // it (`WaitFrom::Binding`), so a forming cluster's meta group still
+        // elects.
+        if let Some(WaitFrom::Open(_)) = wait {
+            fence.begin_wait();
+        }
         tracing::info!(
             root = %root.display(),
             %incarnation,
@@ -982,6 +1026,14 @@ impl NodeWal {
         run_state
             .record(RunStatus::Running, "running")
             .map_err(RaftWalError::RecordRunState)?;
+        let probe = fence
+            .lease_length()
+            .map(|_| super::lease::spawn(&root, fence.clone()))
+            .transpose()
+            .map_err(|source| RaftWalError::LeaseProbe {
+                root: root.clone(),
+                source,
+            })?;
         Ok(Self {
             root,
             cluster_id: bound.cluster_id,
@@ -993,8 +1045,29 @@ impl NodeWal {
             incarnation,
             predecessor,
             empty,
-            lock: Mutex::new(Some(lock)),
+            wait,
+            fence,
+            _probe: probe,
+            _lock: lock,
         })
+    }
+
+    /// This process's fence.
+    pub(crate) fn fence(&self) -> &NodeFence {
+        &self.fence
+    }
+
+    /// The wait this run owes its predecessor, if it owes one.
+    pub(crate) fn wait(&self) -> Option<WaitFrom> {
+        self.wait
+    }
+
+    /// Records the predecessor wait finished, `fsync`ed, so no later run
+    /// owes it again, then lets the fence admit snapshot objects and votes.
+    pub(crate) fn finish_wait(&self) -> Result<(), RaftWalError> {
+        super::identity::finish_wait(&self.root, self.incarnation.run)?;
+        self.fence.end_wait();
+        Ok(())
     }
 
     /// This process's incarnation: its root, the run this start counted
@@ -1108,19 +1181,16 @@ impl NodeWal {
         &self.run_state
     }
 
-    /// Records a clean end of this run, once every journal is `fsync`ed,
-    /// and lets the next run take the root.
+    /// Records a clean end of this run, once every journal is `fsync`ed.
+    /// The fence closes for good first, so no successor reads this end
+    /// beside a process that still answers, and the root's lock stays held
+    /// until the WAL is dropped.
     pub(crate) fn record_clean(&self) -> Result<(), RaftWalError> {
+        self.fence.close();
         self.run_state
             .record(RunStatus::Clean, "clean")
-            .map_err(RaftWalError::RecordRunState)?;
-        drop(
-            self.lock
-                .lock()
-                .map_err(|_poisoned| RaftWalError::LockPoisoned)?
-                .take(),
-        );
-        Ok(())
+            .map(|_bytes| ())
+            .map_err(RaftWalError::RecordRunState)
     }
 }
 

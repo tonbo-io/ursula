@@ -1410,7 +1410,8 @@ async fn a_handoff_settles_within_the_transfer_deadline_and_one_minimum_election
     )
     .await
     .expect("create single-node raft group");
-    let owner = crate::owner::OwnerRaftHandle::new(raft.clone());
+    let owner =
+        crate::owner::OwnerRaftHandle::new(raft.clone(), ursula_runtime::NodeFence::unleased());
     // 2 x 700 ms + 300 ms.
     assert_eq!(owner.handoff_settle_time(), Duration::from_millis(1_700));
     raft.shutdown().await.expect("shutdown raft group");
@@ -2005,13 +2006,17 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     assert!(refused_before_proposal(&written), "{written:?}");
     assert!(names_the_leader(&written), "{written:?}");
 
-    let batch =
-        crate::forward::write_commands_on_raft(follower.raft_handle(), &follower.history, vec![
+    let batch = crate::forward::write_commands_on_raft(
+        follower.raft_handle(),
+        follower.fence(),
+        &follower.history,
+        vec![
             append_command(stream_id.clone(), b"a"),
             append_command(stream_id, b"b"),
-        ])
-        .await
-        .expect("the batch is answered entry by entry");
+        ],
+    )
+    .await
+    .expect("the batch is answered entry by entry");
     assert_eq!(batch.len(), 2);
     for entry in batch {
         let error = entry.expect_err("the engine's check refuses each batch entry on a follower");

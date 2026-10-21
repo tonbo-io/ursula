@@ -810,6 +810,10 @@ pub enum SnapshotStoreError {
     /// (`found: None`, Ursula 0.5.x and earlier).
     #[error("{}", group_snapshot_epoch_refusal(*.found))]
     UnsupportedVersion { found: Option<u32> },
+    /// The node fence refused the PUT or DELETE before it was sent
+    /// ([`FencedSnapshotStore`]).
+    #[error(transparent)]
+    Fenced(#[from] crate::node_fence::FencedWrite),
     #[error("snapshot io")]
     Io(#[from] io::Error),
 }
@@ -936,6 +940,98 @@ pub trait SnapshotStore: Send + Sync + Debug {
 }
 
 pub type SharedSnapshotStore = Arc<dyn SnapshotStore>;
+
+/// A snapshot store whose object PUTs and DELETEs are sent only while the
+/// node fence admits them and no predecessor wait is owed. The check runs
+/// right before each is sent, after the LIST or state read it rests on
+/// returned, so a garbage pass that began inside the lease deletes nothing
+/// once it ended.
+#[derive(Debug)]
+pub struct FencedSnapshotStore {
+    inner: SharedSnapshotStore,
+    fence: crate::NodeFence,
+}
+
+impl FencedSnapshotStore {
+    pub fn wrap(inner: SharedSnapshotStore, fence: crate::NodeFence) -> SharedSnapshotStore {
+        Arc::new(Self { inner, fence })
+    }
+
+    fn check(&self, operation: &'static str, path: &str) -> Result<(), SnapshotStoreError> {
+        Ok(self
+            .fence
+            .check_write(crate::node_fence::FencedObject::Snapshot, operation, path)?)
+    }
+}
+
+impl SnapshotStore for FencedSnapshotStore {
+    fn namespace(&self, raft_group_id: RaftGroupId) -> OwnedNamespace {
+        self.inner.namespace(raft_group_id)
+    }
+
+    fn stage<'a>(
+        &'a self,
+        raft_group_id: RaftGroupId,
+        index: u64,
+        chunks: SnapshotBytesIterator,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        self.inner.stage(raft_group_id, index, chunks)
+    }
+
+    fn stage_stored<'a>(
+        &'a self,
+        raft_group_id: RaftGroupId,
+        index: u64,
+        stored: StoredSnapshot,
+    ) -> SnapshotStoreFuture<'a, StagedSnapshot> {
+        self.inner.stage_stored(raft_group_id, index, stored)
+    }
+
+    fn write_staged<'a>(
+        &'a self,
+        staged: StagedSnapshot,
+    ) -> SnapshotStoreFuture<'a, OwnedLocation> {
+        Box::pin(async move {
+            if let StagedSnapshot::Object(object) = &staged {
+                self.check("PUT", &object.path())?;
+            }
+            self.inner.write_staged(staged).await
+        })
+    }
+
+    fn list_own<'a>(&'a self, raft_group_id: RaftGroupId) -> SnapshotStoreFuture<'a, OwnListing> {
+        self.inner.list_own(raft_group_id)
+    }
+
+    fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.check("DELETE", object.path())?;
+            self.inner.delete_own(object).await
+        })
+    }
+
+    fn read_stored<'a>(
+        &'a self,
+        location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, StoredSnapshot> {
+        self.inner.read_stored(location)
+    }
+
+    fn download<'a>(&'a self, location: &'a SnapshotLocation) -> SnapshotStoreFuture<'a, Vec<u8>> {
+        self.inner.download(location)
+    }
+
+    fn health_check(&self) -> SnapshotStoreFuture<'_, ()> {
+        self.inner.health_check()
+    }
+
+    fn verify_uploaded<'a>(
+        &'a self,
+        location: &'a SnapshotLocation,
+    ) -> SnapshotStoreFuture<'a, ()> {
+        self.inner.verify_uploaded(location)
+    }
+}
 
 /// Default backend used when none is wired: bytes ride inline in the pointer.
 pub fn default_snapshot_store() -> SharedSnapshotStore {

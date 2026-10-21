@@ -14,6 +14,7 @@ use ursula_headers::ClusterId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ProcessIncarnation;
 use ursula_runtime::GroupEngineMetrics;
+use ursula_runtime::NodeFence;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardId;
@@ -32,6 +33,7 @@ use crate::log_store::Predecessor;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
 use crate::log_store::RecoveryState;
+use crate::log_store::WaitFrom;
 use crate::log_store::WalOpening;
 use crate::log_store::WriterExited;
 use crate::log_store::core_dir;
@@ -148,7 +150,14 @@ impl RaftWal {
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
     ) -> Result<Self, RaftWalError> {
-        Self::start_in_cluster(root, tuning, topology, NodeId::new(1), None)
+        Self::start_in_cluster(
+            root,
+            tuning,
+            topology,
+            NodeId::new(1),
+            None,
+            NodeFence::unleased(),
+        )
     }
 
     /// Starts a run of node `node`'s Raft WAL under `root` with `tuning` for
@@ -158,12 +167,18 @@ impl RaftWal {
     /// ([`RaftWalError::OtherNode`]) and cluster id
     /// ([`RaftWalError::ClusterIdMismatch`]). The start counts its run in
     /// the root's identity file before it returns ([`Self::incarnation`]).
+    ///
+    /// A leased `fence` takes that synced write as its lease's first
+    /// success, and a probe keeps the lease for as long as the WAL lives. It
+    /// owes the predecessor wait when a process of an earlier run of the
+    /// root may still run ([`Self::predecessor_wait`]).
     pub fn start_in_cluster(
         root: impl Into<PathBuf>,
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
         node: NodeId,
         cluster_id: Option<&ClusterId>,
+        fence: NodeFence,
     ) -> Result<Self, RaftWalError> {
         Ok(Self {
             node: Arc::new(NodeWal::start(
@@ -172,6 +187,7 @@ impl RaftWal {
                 topology,
                 cluster_id,
                 node,
+                fence,
             )?),
             tuning,
             lagging: Arc::new(LaggingGroups::default()),
@@ -208,6 +224,23 @@ impl RaftWal {
     /// as this start read it.
     pub fn predecessor(&self) -> Predecessor {
         self.node.predecessor()
+    }
+
+    /// This process's fence.
+    pub fn fence(&self) -> NodeFence {
+        self.node.fence().clone()
+    }
+
+    /// The wait this run owes a predecessor that may still run, if it owes
+    /// one.
+    pub fn predecessor_wait(&self) -> Option<WaitFrom> {
+        self.node.wait()
+    }
+
+    /// Records the predecessor wait finished, `fsync`ed, then ends it on the
+    /// fence.
+    pub fn finish_predecessor_wait(&self) -> Result<(), RaftWalError> {
+        self.node.finish_wait()
     }
 
     /// Whether the root held no journal record, no vote and no snapshot

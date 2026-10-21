@@ -84,6 +84,7 @@ impl GroupStorage {
         topology: &ursula_shard::StaticShardMap,
         node: u64,
         cluster_id: Option<&ursula_headers::ClusterId>,
+        fence: &ursula_runtime::NodeFence,
     ) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
@@ -93,6 +94,7 @@ impl GroupStorage {
                 topology,
                 ursula_proto::placement::NodeId::new(node),
                 cluster_id,
+                fence.clone(),
             )?),
         })
     }
@@ -147,12 +149,23 @@ pub fn spawn_runtime(
             config.raft.install_snapshot_timeout.as_duration(),
         );
 
+    // The node fence: a disk lease over the WAL root for a node that runs
+    // Raft, which its WAL keeps, its transports and leader predicate read,
+    // and its object stores check before each PUT and DELETE.
+    let fence = match &persistence {
+        Persistence::Raft { .. } => {
+            ursula_runtime::NodeFence::leased(config.raft.wal.lease.as_duration())
+        }
+        Persistence::InMemory => ursula_runtime::NodeFence::unleased(),
+    };
     let cold_store = if config.storage.cold.backend != ColdBackend::None {
-        Some(Arc::new(ColdStore::try_new(&config.storage.cold).map_err(
-            |err| RuntimeError::ColdStoreConfig {
-                message: err.to_string(),
-            },
-        )?))
+        Some(Arc::new(
+            ColdStore::try_new(&config.storage.cold)
+                .map_err(|err| RuntimeError::ColdStoreConfig {
+                    message: err.to_string(),
+                })?
+                .with_fence(fence.clone()),
+        ))
     } else {
         None
     };
@@ -192,6 +205,7 @@ pub fn spawn_runtime(
         &shard_map,
         config.raft.node_id,
         config.server.cluster_id.as_ref(),
+        &fence,
     )?;
     // Before the runtime starts, so `raft-log/meta/` exists before any data
     // group of the run opens and the peer identity is bound before any
