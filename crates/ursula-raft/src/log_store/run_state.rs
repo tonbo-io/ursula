@@ -872,8 +872,8 @@ impl NodeWal {
     /// Puts the meta journal's metadata file in place before its writer
     /// first opens in this run, when the start found no meta journal
     /// ([`MetaAtStart::Absent`]). When a data journal held records at start,
-    /// the file records the meta journal's group `raft_group_id`
-    /// recovering.
+    /// or the meta group's snapshot record is still there, the file records
+    /// the meta journal's group `raft_group_id` recovering.
     ///
     /// A node with data history never opens a new, empty meta log: its gate
     /// then opens closed, and the replica rejoins its meta group as a wiped
@@ -885,6 +885,11 @@ impl NodeWal {
     /// the genesis vote floor included, lives only in a core's metadata
     /// file, so a node whose data journals hold votes but no record opens
     /// its lost meta journal empty, as a node without data history does.
+    ///
+    /// A meta snapshot record is written only once the journal exists, so
+    /// one without its journal is meta history whose vote was lost with
+    /// the journal: the replica restores the record, and its closed gate
+    /// keeps it from voting until it rejoins, as for data history.
     ///
     /// The file appears, mark included, in one atomic replace, before the
     /// journal holds anything. A crash or a failed write before then leaves
@@ -911,7 +916,9 @@ impl NodeWal {
                     source: Arc::new(source),
                 }
             })?;
-        let lost = matches!(self.data_history, JournalHistory::Records { .. });
+        let snapshot_record = dir.join(super::file::snapshot_record_file(raft_group_id.0));
+        let lost = matches!(self.data_history, JournalHistory::Records { .. })
+            || Disk::exists(&snapshot_record);
         let marked = lost && metadata.initialize(raft_group_id.0, GroupLogState::Recovering);
         if missing || marked {
             metadata

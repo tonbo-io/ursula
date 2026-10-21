@@ -1682,7 +1682,7 @@ pub(crate) struct CurrentSnapshot {
 }
 
 impl CurrentSnapshot {
-    fn new(
+    pub(crate) fn new(
         meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
         pointer_bytes: Vec<u8>,
         location: &SnapshotLocation,
@@ -1696,6 +1696,23 @@ impl CurrentSnapshot {
             pointer_bytes,
             object,
         }
+    }
+
+    /// The current snapshot of an inline pointer, which names no object.
+    pub(crate) fn inline(
+        meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+        pointer_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            meta,
+            pointer_bytes,
+            object: None,
+        }
+    }
+
+    /// The encoded pointer OpenRaft sends.
+    pub(crate) fn pointer_bytes(&self) -> &[u8] {
+        &self.pointer_bytes
     }
 }
 
@@ -1815,7 +1832,7 @@ pub(crate) enum RecordSite {
 impl RecordSite {
     /// The record's file, and the generation it is written in and restored
     /// from.
-    fn file(&self) -> Option<(&Path, LogGeneration)> {
+    pub(crate) fn file(&self) -> Option<(&Path, LogGeneration)> {
         match self {
             Self::NoRecord => None,
             Self::Store(record) => Some((record.path(), record.generation())),
@@ -1836,10 +1853,121 @@ impl RecordSite {
 
     /// The record's file and generation, owned, for a publication that
     /// runs off the state machine.
-    fn owned_file(&self) -> Option<(PathBuf, LogGeneration)> {
+    pub(crate) fn owned_file(&self) -> Option<(PathBuf, LogGeneration)> {
         self.file()
             .map(|(path, generation)| (path.to_path_buf(), generation))
     }
+}
+
+/// A snapshot record as a restore reads it: its snapshot's meta, its
+/// pointer's bytes and the pointer they decode to.
+#[derive(Debug)]
+pub(crate) struct PersistedRecord {
+    pub(crate) meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+    pub(crate) pointer_bytes: Vec<u8>,
+    pub(crate) pointer: SnapshotPointer,
+    path: PathBuf,
+}
+
+impl PersistedRecord {
+    /// Makes the record's name durable: a preceding process may have exited
+    /// after its rename but before its directory fsync. Run before the
+    /// record's snapshot becomes the current one.
+    pub(crate) fn sync_dir(&self) -> Result<(), SnapshotRecordError> {
+        let Some(parent) = self.path.parent() else {
+            return Ok(());
+        };
+        Disk::sync_dir(parent).map_err(|source| SnapshotRecordError::Read {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+/// Why a group's snapshot record did not read, for either plane.
+#[derive(Debug, thiserror::Error)]
+pub enum SnapshotRecordError {
+    /// The record's file did not read or become durable.
+    #[error("read the snapshot record '{}'", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    /// The record, or the pointer it holds, does not decode.
+    #[error("decode the snapshot record '{}'", path.display())]
+    Decode {
+        path: PathBuf,
+        #[source]
+        source: SnapshotStoreError,
+    },
+}
+
+impl SnapshotRecordError {
+    /// The data plane's restore error for `raft_group_id`.
+    fn restore_error(self, raft_group_id: RaftGroupId) -> SnapshotRestoreError {
+        match self {
+            Self::Read { source, .. } => SnapshotRestoreError::Metadata {
+                raft_group_id,
+                source,
+            },
+            Self::Decode { source, .. } => SnapshotRestoreError::Pointer {
+                raft_group_id,
+                source,
+            },
+        }
+    }
+}
+
+/// Reads the snapshot record of `site`, the one reader of both planes: its
+/// file, its envelope and its pointer. `None` when the group keeps no
+/// record, holds none, or holds one of another generation of its log, which
+/// belongs to an earlier life of the group on this replica, whose objects
+/// may be gone: it restores nothing, before it is checked against the log
+/// or names anything to read. Each caller checks the record against its
+/// log ([`crate::SnapshotRecord::check_restored`]) and its pointer itself.
+pub(crate) fn read_snapshot_record(
+    site: &RecordSite,
+    raft_group_id: RaftGroupId,
+) -> Result<Option<PersistedRecord>, SnapshotRecordError> {
+    let Some((path, generation)) = site.file() else {
+        return Ok(None);
+    };
+    if !Disk::exists(path) {
+        return Ok(None);
+    }
+    let read = |source| SnapshotRecordError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = Disk::open_read(path).map_err(read)?;
+    let length = usize::try_from(file.file_len().map_err(read)?)
+        .map_err(|source| read(io::Error::new(io::ErrorKind::InvalidData, source)))?;
+    let mut bytes = vec![0; length];
+    file.read_exact(&mut bytes).map_err(read)?;
+    let decode = |source| SnapshotRecordError::Decode {
+        path: path.to_path_buf(),
+        source,
+    };
+    let persisted = decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(decode)?;
+    if persisted.generation != generation {
+        tracing::info!(
+            raft_group_id = raft_group_id.0,
+            record_generation = persisted.generation.get(),
+            log_generation = generation.get(),
+            path = %path.display(),
+            "the group's snapshot record is of another generation of its log; it restores \
+             nothing"
+        );
+        return Ok(None);
+    }
+    let pointer = SnapshotPointer::decode(&persisted.pointer_bytes).map_err(decode)?;
+    Ok(Some(PersistedRecord {
+        meta: persisted.meta,
+        pointer_bytes: persisted.pointer_bytes,
+        pointer,
+        path: path.to_path_buf(),
+    }))
 }
 
 /// A snapshot record of three distinct fields, for the persisted-envelopes
@@ -2045,45 +2173,11 @@ impl RaftGroupStateMachine {
 
     async fn restore_snapshot_record(&mut self) -> Result<(), SnapshotRestoreError> {
         let raft_group_id = self.placement.raft_group_id;
-        let Some((path, generation)) = self.snapshot_record.file() else {
+        let Some(persisted) = read_snapshot_record(&self.snapshot_record, raft_group_id)
+            .map_err(|error| error.restore_error(raft_group_id))?
+        else {
             return Ok(());
         };
-        if !Disk::exists(path) {
-            return Ok(());
-        }
-
-        let metadata = |source| SnapshotRestoreError::Metadata {
-            raft_group_id,
-            source,
-        };
-        let mut file = Disk::open_read(path).map_err(metadata)?;
-        let length = usize::try_from(file.file_len().map_err(metadata)?)
-            .map_err(|source| metadata(io::Error::new(io::ErrorKind::InvalidData, source)))?;
-        let mut bytes = vec![0; length];
-        file.read_exact(&mut bytes).map_err(metadata)?;
-        let pointer_unreadable = |source| SnapshotRestoreError::Pointer {
-            raft_group_id,
-            source,
-        };
-        let persisted =
-            decode_snapshot_envelope::<PersistedSnapshot>(&bytes).map_err(pointer_unreadable)?;
-        // A record of another generation belongs to an earlier life of the
-        // group on this replica, whose objects may be gone: it restores
-        // nothing, before it is checked against the log or names anything
-        // to download.
-        if persisted.generation != generation {
-            tracing::info!(
-                raft_group_id = raft_group_id.0,
-                record_generation = persisted.generation.get(),
-                log_generation = generation.get(),
-                path = %path.display(),
-                "the group's snapshot record is of another generation of its log; it restores \
-                 nothing"
-            );
-            return Ok(());
-        }
-        let pointer =
-            SnapshotPointer::decode(&persisted.pointer_bytes).map_err(pointer_unreadable)?;
         // Before anything is downloaded: a log the record contradicts
         // keeps the group closed (R1).
         if let Some(record) = self.snapshot_record.store()
@@ -2097,12 +2191,15 @@ impl RaftGroupStateMachine {
                 }
             })?;
         }
-        // A preceding process may have exited after rename but before its
-        // directory fsync. Establish this visible pointer's durability before
-        // it becomes the current one.
-        if let Some(parent) = path.parent() {
-            Disk::sync_dir(parent).map_err(metadata)?;
-        }
+        persisted
+            .sync_dir()
+            .map_err(|error| error.restore_error(raft_group_id))?;
+        let PersistedRecord {
+            meta: persisted_meta,
+            pointer_bytes: persisted_pointer_bytes,
+            pointer,
+            ..
+        } = persisted;
         // Only an object of this node's own directory restores: a node
         // started with another node's data directory, or with another
         // snapshot prefix, is refused before it reads anything (#687).
@@ -2141,21 +2238,20 @@ impl RaftGroupStateMachine {
             .install_snapshot(group_snapshot)
             .await
             .map_err(SnapshotRestoreError::Engine)?;
-        self.last_applied_log_id = persisted.meta.last_log_id;
-        self.last_membership = persisted.meta.last_membership.clone();
+        self.last_applied_log_id = persisted_meta.last_log_id;
+        self.last_membership = persisted_meta.last_membership.clone();
         self.log_gauge.record_membership(&self.last_membership);
         self.log_gauge.record_restored_snapshot(
             self.log_gauge.mark(),
             pointer.location().size_hint(),
-            persisted
-                .meta
+            persisted_meta
                 .last_log_id
                 .map_or(0, |log_id| log_id.index()),
         );
         publish_current(
             &self.current_snapshot,
             &self.holds,
-            CurrentSnapshot::new(persisted.meta, persisted.pointer_bytes, pointer.location()),
+            CurrentSnapshot::new(persisted_meta, persisted_pointer_bytes, pointer.location()),
             &pointer,
         );
         Ok(())
@@ -2975,7 +3071,7 @@ fn persist_snapshot_candidate(
     })
 }
 
-fn persist_snapshot_metadata(
+pub(crate) fn persist_snapshot_metadata(
     path: &Path,
     generation: LogGeneration,
     meta: &SnapshotMetaOf<UrsulaRaftTypeConfig>,

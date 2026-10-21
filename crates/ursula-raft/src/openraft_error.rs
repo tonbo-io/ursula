@@ -24,7 +24,6 @@ use openraft::metrics::WaitError;
 use openraft::raft::WriteResult;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
-use ursula_runtime::GroupWriteResponse;
 use ursula_runtime::LeadershipReason;
 use ursula_runtime::MembershipInitRefusal;
 use ursula_runtime::Proposal;
@@ -34,7 +33,6 @@ use ursula_shard::RaftGroupId;
 use crate::GroupLeadership;
 use crate::forward::leadership_refusal;
 use crate::forward::unknown_leader;
-use crate::forward::write_result_from_raft_response;
 use crate::owner::owner_stopped;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -193,13 +191,13 @@ pub(crate) fn group_engine_linearizable_read_error(
 /// One answer of a batch write ([`crate::forward::write_commands_on_raft`]):
 /// the state machine's outcome of a command whose response is of the kind
 /// `expected`, or OpenRaft's refusal of it as `leadership` sees it.
-pub(crate) fn batch_write_result(
+pub(crate) fn batch_write_result<SM: crate::replica::ReplicaStateMachine>(
     result: WriteResult<C>,
     expected: ResponseKind,
     leadership: impl FnOnce() -> GroupLeadership,
-) -> Result<GroupWriteResponse, GroupEngineError> {
+) -> Result<SM::Answer, GroupEngineError> {
     match result {
-        Ok(response) => write_result_from_raft_response(response.response, expected)?,
+        Ok(response) => SM::answer(response.response, expected)?,
         Err(refusal) => Err(client_write_refusal(&refusal, &leadership())),
     }
 }

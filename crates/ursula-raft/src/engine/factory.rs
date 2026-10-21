@@ -32,6 +32,39 @@ use crate::rejoin::REJOIN_HEAL_INTERVAL;
 /// Minimum election timeout of every data-group Raft, in milliseconds.
 const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
 
+/// The OpenRaft config of a Raft group of a cluster, of either plane: the
+/// static data groups and the meta group run with the same timeouts,
+/// snapshot install timeout and log retention, and OpenRaft never takes a
+/// snapshot by itself.
+pub(crate) fn cluster_raft_config(
+    cluster_name: String,
+    engine: &RaftEngineConfig,
+    enable_elect: bool,
+) -> Config {
+    Config {
+        cluster_name,
+        // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
+        // The chaos test injects netem_delay 250ms±75ms; under that load,
+        // the previous 100/300/600 produced 100s+ of spurious elections
+        // (term 200-600 in 30 min). Heartbeat must stay well below
+        // election_timeout_min, and election_timeout_min must stay above
+        // worst-case fault-induced inter-heartbeat arrival.
+        heartbeat_interval: 250,
+        election_timeout_min: GROUP_ELECTION_TIMEOUT_MIN_MS,
+        election_timeout_max: 3000,
+        install_snapshot_timeout: engine.install_snapshot_timeout_ms,
+        max_in_snapshot_log_to_keep: engine.max_in_snapshot_log_to_keep,
+        enable_elect,
+        // The snapshot drivers alone take snapshots (F12e), a data group's
+        // gated on S3 health. OpenRaft must not trigger its own: a
+        // build_snapshot failure during an S3 outage is fatal to the group
+        // (it kills the raft core, so leadership can no longer be yielded and
+        // only a process restart recovers it).
+        snapshot_policy: SnapshotPolicy::Never,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 fn parse_positive_millis(raw: Option<&str>, default_ms: u64) -> u64 {
     raw.and_then(|raw| raw.parse::<u64>().ok())
@@ -457,28 +490,11 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                     .await
                     .map_err(|source| super::wal_error::gate_open_error(placement, source))?,
             );
-            let mut raft_config = Config {
-                cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-                // Timeouts tuned for a multi-AZ EC2 cluster carrying chaos faults.
-                // The chaos test injects netem_delay 250ms±75ms; under that load,
-                // the previous 100/300/600 produced 100s+ of spurious elections
-                // (term 200-600 in 30 min). Heartbeat must stay well below
-                // election_timeout_min, and election_timeout_min must stay above
-                // worst-case fault-induced inter-heartbeat arrival.
-                heartbeat_interval: 250,
-                election_timeout_min: GROUP_ELECTION_TIMEOUT_MIN_MS,
-                election_timeout_max: 3000,
-                install_snapshot_timeout: self.engine_config.install_snapshot_timeout_ms,
-                max_in_snapshot_log_to_keep: self.engine_config.max_in_snapshot_log_to_keep,
-                enable_elect: self.registry.election_policy().may_campaign(Some(&rejoin)),
-                ..Default::default()
-            };
-            // The snapshot driver alone takes snapshots (F12e), gated on S3
-            // health. OpenRaft must not trigger its own: a build_snapshot
-            // failure during an S3 outage is fatal to the group (it kills the
-            // raft core, so leadership can no longer be yielded and only a
-            // process restart recovers it).
-            raft_config.snapshot_policy = SnapshotPolicy::Never;
+            let raft_config = cluster_raft_config(
+                format!("ursula-group-{}", placement.raft_group_id.0),
+                &self.engine_config,
+                self.registry.election_policy().may_campaign(Some(&rejoin)),
+            );
             let config = Arc::new(crate::openraft_error::validated_config(raft_config)?);
             let transport = self
                 .transports

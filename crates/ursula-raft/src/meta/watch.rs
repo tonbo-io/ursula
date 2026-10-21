@@ -1,0 +1,57 @@
+//! Placement views as this node's meta replica publishes them.
+//!
+//! The registry owns one [`PlacementPublisher`] for the life of the node,
+//! so a reader's [`PlacementWatch`] outlives every restart of the meta
+//! replica. The replica publishes a view per applied batch, per snapshot
+//! install and per startup restore. A view is never current by itself: a
+//! reader takes it as current only with a confirmation
+//! (`ursula_control::ConfirmedView`). The channel is the runtime shim's
+//! `watch`, so a simulation wakes its receivers in a replayable order.
+
+use std::sync::Arc;
+
+use ursula_control::PlacementView;
+
+use crate::rt::sync::watch;
+
+/// The sending side of this node's placement views.
+#[derive(Debug, Clone)]
+pub struct PlacementPublisher(Arc<watch::Sender<Arc<PlacementView>>>);
+
+impl Default for PlacementPublisher {
+    /// A publisher holding the empty view, as a node holds before its meta
+    /// replica restored or applied anything.
+    fn default() -> Self {
+        let (sender, _receiver) = watch::channel(Arc::new(PlacementView::empty()));
+        Self(Arc::new(sender))
+    }
+}
+
+impl PlacementPublisher {
+    /// Publishes `view` as the meta replica's latest.
+    pub(crate) fn publish(&self, view: PlacementView) {
+        self.0.send_replace(Arc::new(view));
+    }
+
+    /// A watch of the views published from now on, starting at the latest.
+    pub fn subscribe(&self) -> PlacementWatch {
+        PlacementWatch(self.0.subscribe())
+    }
+}
+
+/// A reader of this node's placement views.
+#[derive(Debug, Clone)]
+pub struct PlacementWatch(watch::Receiver<Arc<PlacementView>>);
+
+impl PlacementWatch {
+    /// The latest view published.
+    pub fn current(&self) -> Arc<PlacementView> {
+        Arc::clone(&self.0.borrow())
+    }
+
+    /// Waits until a view is published after the one this watch last saw.
+    /// `false` once the publisher is gone.
+    pub async fn changed(&mut self) -> bool {
+        self.0.changed().await.is_ok()
+    }
+}

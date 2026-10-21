@@ -447,10 +447,6 @@ impl EngineWorkLedger {
     }
 
     /// Records the work of the meta group's new engine.
-    #[cfg_attr(
-        not(all(test, not(madsim))),
-        expect(dead_code, reason = "the meta replica records its engine's work")
-    )]
     pub(crate) fn record_meta(&self, ended: WorkEnded) {
         self.slots().meta = Some(LedgerEntry {
             ended,
@@ -460,13 +456,6 @@ impl EngineWorkLedger {
 
     /// Keeps the task that stops the meta group's latest engine, which was
     /// dropped before its shutdown.
-    #[cfg_attr(
-        not(all(test, not(madsim))),
-        expect(
-            dead_code,
-            reason = "the meta replica keeps the task that stops a dropped engine"
-        )
-    )]
     pub(crate) fn keep_stopping_meta(&self, stopping: crate::rt::task::JoinHandle<()>) {
         if let Some(entry) = self.slots().meta.as_mut() {
             entry.stopping = Some(stopping);

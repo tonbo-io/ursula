@@ -1113,7 +1113,9 @@ pub(crate) fn install_error_backs_off(error: &SnapshotInstallError) -> bool {
         | SnapshotInstallError::CopyWrite { .. }
         | SnapshotInstallError::CopyVerify { .. }
         | SnapshotInstallError::NameCollision { .. }
-        | SnapshotInstallError::PointerEncode { .. } => error.peer_backs_off(),
+        | SnapshotInstallError::PointerEncode { .. }
+        | SnapshotInstallError::MetaPointer { .. }
+        | SnapshotInstallError::MetaState { .. } => error.peer_backs_off(),
     }
 }
 

@@ -47,7 +47,6 @@ use crate::peer_channel::peer_endpoint;
 use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::refusing_cluster;
 use crate::raft_internal_proto;
-use crate::state_machine::RaftGroupStateMachine;
 use crate::target::RaftTarget;
 use crate::types::RaftCommand;
 use crate::types::RaftGroupResponse;
@@ -724,15 +723,15 @@ pub(crate) fn proposal_leader(
 /// before anything of it is proposed. `history` is the group's history on
 /// this replica: a leader whose history is pending admits none of them
 /// (#581 section 4.5).
-pub(crate) async fn write_commands_on_raft(
-    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachine>(
+    raft: Raft<UrsulaRaftTypeConfig, SM>,
     history: &crate::history::GroupHistory,
     commands: Vec<RaftCommand>,
-) -> Result<Vec<Result<GroupWriteResponse, GroupEngineError>>, GroupEngineError> {
+) -> Result<Vec<Result<SM::Answer, GroupEngineError>>, GroupEngineError> {
     if commands.is_empty() {
         return Ok(Vec::new());
     }
-    let target = crate::RaftTarget::Data(history.raft_group_id());
+    let target = SM::target(history.raft_group_id());
     for command in &commands {
         if !target.admits(command) {
             return Err(invalid_raft_command(
@@ -747,7 +746,9 @@ pub(crate) async fn write_commands_on_raft(
     // A replica that lost the leadership during the admits refuses every
     // command here, before proposing any, as `write` does.
     if let Err(refused) = refuse_unless_leader(&raft) {
-        return Ok(vec![Err(refused); expected_responses]);
+        return Ok((0..expected_responses)
+            .map(|_| Err(refused.clone()))
+            .collect());
     }
     // A batch carries no fence, so an upload command in it refuses the
     // batch before anything of it is proposed.
@@ -765,7 +766,7 @@ pub(crate) async fn write_commands_on_raft(
             .zip(futures_util::stream::iter(expected_kinds))
             .map(|(result, expected)| {
                 result.map(|result| {
-                    crate::openraft_error::batch_write_result(result, expected, || {
+                    crate::openraft_error::batch_write_result::<SM>(result, expected, || {
                         GroupLeadership::of(&raft.metrics().borrow_watched())
                     })
                 })
@@ -781,8 +782,10 @@ pub(crate) async fn write_commands_on_raft(
 /// watches the metrics, so a leader that steps down meanwhile goes on at
 /// once. A leader that no quorum acknowledges in time, or a replica that does
 /// not lead, goes on to be refused before proposal.
-pub(crate) async fn await_first_quorum_ack(
-    raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+pub(crate) async fn await_first_quorum_ack<
+    SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig>,
+>(
+    raft: &Raft<UrsulaRaftTypeConfig, SM>,
 ) {
     let budget = Duration::from_millis(raft.config().election_timeout_min);
     await_quorum_ack_on(raft.metrics(), budget).await;
@@ -825,8 +828,10 @@ pub(crate) async fn await_quorum_ack_on(
 ///
 /// [`RaftGroupEngine::write`]: crate::engine::RaftGroupEngine::write
 /// [`client_write_refusal`]: crate::openraft_error::client_write_refusal
-pub(crate) fn refuse_unless_leader(
-    raft: &Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+pub(crate) fn refuse_unless_leader<
+    SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig>,
+>(
+    raft: &Raft<UrsulaRaftTypeConfig, SM>,
 ) -> Result<(), GroupEngineError> {
     let receiver = raft.metrics();
     let metrics = receiver.borrow_watched();
@@ -885,8 +890,29 @@ pub(crate) fn write_result_from_raft_response(
     response: RaftGroupResponse,
     expected: ResponseKind,
 ) -> Result<Result<GroupWriteResponse, GroupEngineError>, GroupEngineError> {
+    match response {
+        RaftGroupResponse::Write(result) => Ok(result),
+        other => Err(unexpected_response(expected, &other)),
+    }
+}
+
+/// Unwraps the meta group's applied response into the control answer it
+/// carries, as [`write_result_from_raft_response`] does a data write's.
+pub(crate) fn control_answer_from_raft_response(
+    response: RaftGroupResponse,
+    expected: ResponseKind,
+) -> Result<Result<ursula_control::ControlResponse, GroupEngineError>, GroupEngineError> {
+    match response {
+        RaftGroupResponse::Meta(MetaResponse::Control(answer)) => Ok(Ok(answer)),
+        other => Err(unexpected_response(expected, &other)),
+    }
+}
+
+/// The refusal of a response of another kind than `expected`.
+fn unexpected_response(expected: ResponseKind, response: &RaftGroupResponse) -> GroupEngineError {
     let actual = match response {
-        RaftGroupResponse::Write(result) => return Ok(result),
+        RaftGroupResponse::Write(Ok(response)) => response.kind(),
+        RaftGroupResponse::Write(Err(_)) => ResponseKind::StreamError,
         RaftGroupResponse::Blank => ResponseKind::RaftBlank,
         RaftGroupResponse::Membership => ResponseKind::RaftMembership,
         RaftGroupResponse::Meta(MetaResponse::History | MetaResponse::HistoryMismatch { .. }) => {
@@ -894,9 +920,7 @@ pub(crate) fn write_result_from_raft_response(
         }
         RaftGroupResponse::Meta(MetaResponse::Control(_)) => ResponseKind::Control,
     };
-    Err(GroupEngineError::Infra(
-        GroupInfraError::UnexpectedResponse { expected, actual },
-    ))
+    GroupEngineError::Infra(GroupInfraError::UnexpectedResponse { expected, actual })
 }
 
 /// A leadership refusal that names no leader: the answer is leader-unknown
