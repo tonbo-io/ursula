@@ -30,6 +30,8 @@ use ursula_stream::ObjectPayloadRef;
 
 use crate::ColdConfig;
 use crate::ColdIndexPageKey;
+use crate::NodeFence;
+use crate::node_fence::FencedObject;
 
 pub(crate) const DEFAULT_CONTENT_TYPE: &str = "application/octet-stream";
 
@@ -49,6 +51,7 @@ pub struct ColdObjectWriter {
     path: String,
     writer: opendal::Writer,
     written: u64,
+    fence: NodeFence,
 }
 
 impl ColdObjectWriter {
@@ -60,6 +63,7 @@ impl ColdObjectWriter {
         self.written = self
             .written
             .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        check_fence(&self.fence, "PUT", &self.path)?;
         self.writer
             .write(bytes)
             .await
@@ -68,6 +72,7 @@ impl ColdObjectWriter {
 
     /// Completes the upload and returns the object size.
     pub async fn close(mut self) -> io::Result<u64> {
+        check_fence(&self.fence, "PUT", &self.path)?;
         self.writer
             .close()
             .await
@@ -259,6 +264,9 @@ pub struct ColdStore {
     delay_fn: Arc<Mutex<ColdStoreDelayFn>>,
     /// LIST requests issued (F14d: compaction discovery issues none).
     list_requests: Arc<std::sync::atomic::AtomicU64>,
+    /// Checked before each PUT and DELETE store call. The store's own
+    /// retries of one call are not checked again.
+    fence: NodeFence,
 }
 
 pub type ColdStoreHandle = Arc<ColdStore>;
@@ -595,7 +603,14 @@ impl ColdStore {
             fault_policy: Arc::new(Mutex::new(None)),
             delay_fn: Arc::new(Mutex::new(default_cold_store_delay_fn())),
             list_requests: Arc::default(),
+            fence: NodeFence::unleased(),
         }
+    }
+
+    /// Sends a PUT or DELETE only while `fence` admits it.
+    pub fn with_fence(mut self, fence: NodeFence) -> Self {
+        self.fence = fence;
+        self
     }
 
     /// LIST requests this store has issued.
@@ -685,6 +700,7 @@ impl ColdStore {
                 cached: None,
             })
             .await?;
+        check_fence(&self.fence, "PUT", path)?;
         self.operator
             .write(path, payload.to_vec())
             .await
@@ -732,6 +748,7 @@ impl ColdStore {
             path: path.to_owned(),
             writer,
             written: 0,
+            fence: self.fence.clone(),
         })
     }
 
@@ -768,6 +785,7 @@ impl ColdStore {
                 "cold index page path must not be empty",
             ));
         }
+        check_fence(&self.fence, "PUT", path)?;
         self.operator
             .write(path, payload.to_vec())
             .await
@@ -826,7 +844,7 @@ impl ColdStore {
                 cached: None,
             })
             .await?;
-        Ok(())
+        check_fence(&self.fence, "DELETE", path)
     }
 
     /// What follows a deleted object: its cached blocks go, and
@@ -857,6 +875,7 @@ impl ColdStore {
                 cached: None,
             })
             .await?;
+        check_fence(&self.fence, "DELETE", path)?;
         self.operator
             .remove_all(path)
             .await
@@ -1031,6 +1050,7 @@ impl ColdStore {
             }
         }
         if !admitted.is_empty() {
+            check_fence(&self.fence, "DELETE", "batch delete")?;
             self.operator
                 .delete_iter(admitted.clone())
                 .await
@@ -1784,6 +1804,14 @@ impl ColdReadCache {
             inner.current_bytes = inner.current_bytes.saturating_sub(entry.bytes.len());
         }
     }
+}
+
+/// The fence's check right before a PUT or DELETE is sent: a refused one
+/// fails as a store call does, and its job runs again later.
+fn check_fence(fence: &NodeFence, operation: &'static str, path: &str) -> io::Result<()> {
+    fence
+        .check_write(FencedObject::Cold, operation, path)
+        .map_err(io::Error::other)
 }
 
 fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {

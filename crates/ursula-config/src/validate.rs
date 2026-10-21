@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -49,6 +50,12 @@ pub enum ValidationError {
     MissingGroup(u32, usize),
     #[error("raft.wal.segment_size ({segment_size} bytes) must be at least {minimum} bytes")]
     WalSegmentTooSmall { segment_size: u64, minimum: u64 },
+    #[error("raft.wal.lease ({lease:?}) must be from {minimum:?} to {maximum:?}")]
+    WalLeaseOutOfRange {
+        lease: Duration,
+        minimum: Duration,
+        maximum: Duration,
+    },
     #[error("storage.cold.s3.{setting} must be non-zero")]
     ZeroS3HealthSetting { setting: S3HealthSetting },
     /// A zero deadline fails every request for a peer's leadership-shed
@@ -171,6 +178,14 @@ impl UrsulaConfig {
             return Err(ValidationError::WalSegmentTooSmall {
                 segment_size,
                 minimum: WalConfig::MIN_SEGMENT_SIZE,
+            });
+        }
+        let lease = self.raft.wal.lease.as_duration();
+        if !(WalConfig::MIN_LEASE..=WalConfig::MAX_LEASE).contains(&lease) {
+            return Err(ValidationError::WalLeaseOutOfRange {
+                lease,
+                minimum: WalConfig::MIN_LEASE,
+                maximum: WalConfig::MAX_LEASE,
             });
         }
         if self.storage.cold.backend == ColdBackend::S3 {

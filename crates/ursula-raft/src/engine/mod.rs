@@ -188,6 +188,11 @@ pub struct RaftGroupEngineOptions {
     /// the reads and purges it forwards to a leader, and where a leader's
     /// refusal is recorded. `None` for a replica without a gRPC transport.
     pub peer_cluster: Option<crate::PeerCluster>,
+    /// The node fence the replica's one leader predicate reads
+    /// ([`crate::GroupLeadership::of`]): its WAL's ([`crate::RaftWal::fence`]),
+    /// which every engine factory passes, single-node or not. `None`, for an
+    /// engine a test builds by hand, is an unleased fence.
+    pub fence: Option<ursula_runtime::NodeFence>,
     /// How long the engine's shutdown waits for OpenRaft's work, for tests;
     /// [`crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT`] otherwise.
     #[cfg(test)]
@@ -209,6 +214,7 @@ impl RaftGroupEngineOptions {
     pub fn recording_work_in(self, wal: &crate::RaftWal) -> Self {
         Self {
             engine_work: Some(wal.engine_work_ledger()),
+            fence: Some(wal.fence()),
             ..self
         }
     }
@@ -473,6 +479,22 @@ pub(crate) fn config_for_recovery(config: Arc<Config>, gated: bool) -> Arc<Confi
 }
 
 impl RaftGroupEngine {
+    /// The node fence this replica's leadership reads.
+    pub(crate) fn fence(&self) -> &ursula_runtime::NodeFence {
+        self.read_barrier.owner().fence()
+    }
+
+    /// This replica's view of its group's leadership, by the one leader
+    /// predicate, which reads the node fence.
+    fn leadership(&self) -> GroupLeadership {
+        self.read_barrier.owner().leadership()
+    }
+
+    /// Whether this replica leads, by the one leader predicate. Every
+    /// leader-gated job of the engine stops here while the node is fenced.
+    fn leads(&self) -> bool {
+        self.leadership().leads()
+    }
     /// A single-node group over `log_store`, with the timeouts of a
     /// single-node runtime.
     #[cfg(any(test, madsim))]
@@ -779,6 +801,7 @@ impl RaftGroupEngine {
             snapshot_record,
             recovery,
             peer_cluster,
+            fence,
             #[cfg(test)]
             work_stop_timeout,
             engine_work,
@@ -899,7 +922,10 @@ impl RaftGroupEngine {
             recovery_tasks,
             snapshot_installs,
             metadata_serial,
-            read_barrier: Arc::new(ReadIndexBarrier::new(raft.clone())),
+            read_barrier: Arc::new(ReadIndexBarrier::new(
+                raft.clone(),
+                fence.unwrap_or_else(ursula_runtime::NodeFence::unleased),
+            )),
             raft,
             placement,
             cold_store,
@@ -1173,7 +1199,7 @@ impl RaftGroupEngine {
         let command = RaftCommand::Stream(command);
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
-        crate::forward::refuse_unless_leader(&self.raft)?;
+        crate::forward::refuse_unless_leader(&self.raft, self.fence())?;
         let expected_leader = crate::forward::proposal_leader(&command, fence)?;
         let expected = crate::forward::answer_kind(&command);
         let (responder, complete) = ProgressResponder::<UrsulaRaftTypeConfig, _>::complete_only();
@@ -1197,7 +1223,7 @@ impl RaftGroupEngine {
             Ok(response) => write_result_from_raft_response(response.data, expected)?,
             Err(refusal) => Err(openraft_error::client_write_refusal(
                 &refusal,
-                &GroupLeadership::of(&self.raft.metrics().borrow_watched()),
+                &self.leadership(),
             )),
         }
     }
@@ -1206,7 +1232,7 @@ impl RaftGroupEngine {
         &self,
         _command: StreamCommand,
     ) -> Result<Option<GroupWriteResponse>, GroupEngineError> {
-        crate::forward::refuse_unless_leader(&self.raft)?;
+        crate::forward::refuse_unless_leader(&self.raft, self.fence())?;
         Ok(None)
     }
 
@@ -1375,7 +1401,7 @@ impl RaftGroupEngine {
         &self,
         operation: &str,
     ) -> Result<(), GroupEngineError> {
-        if self.raft.is_leader() {
+        if self.leads() {
             return Ok(());
         }
         Err(self.not_leader_for_read(operation).await)
@@ -1383,7 +1409,7 @@ impl RaftGroupEngine {
 
     async fn not_leader_for_read(&self, operation: &str) -> GroupEngineError {
         tracing::debug!(operation, "OpenRaft read has to run on the leader");
-        let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
+        let leadership = self.leadership();
         leadership_refusal(
             LeadershipReason::Follower,
             Proposal::NotProposed,
@@ -1489,11 +1515,11 @@ fn leader_read(
 
 impl GroupEngine for RaftGroupEngine {
     fn accepts_local_writes(&self) -> bool {
-        self.raft.is_leader()
+        self.leads()
     }
 
     fn upload_fence(&self) -> Option<UploadFence> {
-        GroupLeadership::of(&self.raft.metrics().borrow_watched()).upload_fence()
+        self.leadership().upload_fence()
     }
 
     fn history_watch(&self) -> Option<ursula_runtime::HistoryWatch> {
@@ -1571,7 +1597,7 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupRouteWriteFuture<'a> {
         Box::pin(async move {
             // The one leadership policy the front door routes by too.
-            let route = GroupLeadership::of(&self.raft.metrics().borrow_watched()).write_route();
+            let route = self.leadership().write_route();
             let WriteRoute::Leader { fence, .. } = route else {
                 return Ok(route);
             };
@@ -1602,7 +1628,7 @@ impl GroupEngine for RaftGroupEngine {
             // #613: a replica holding an unsatisfied plan serves no client read.
             self.history
                 .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
-            if !self.raft.is_leader()
+            if !self.leads()
                 && let Some(route) = self.leader_route().await
             {
                 return Ok(GroupReadRoute::Leader(Box::pin(
@@ -1700,7 +1726,7 @@ impl GroupEngine for RaftGroupEngine {
             if request.leader_only {
                 // A follower forwards with `leader_only` set, so the leader
                 // linearizes the read too (field 6 of `ReadStreamReadV1`).
-                if !self.raft.is_leader()
+                if !self.leads()
                     && let Some(route) = self.leader_route().await
                 {
                     return Ok(leader_read(route, placement, request));
@@ -1711,10 +1737,10 @@ impl GroupEngine for RaftGroupEngine {
                 )
                 .await?;
             }
-            if owner_pinned && !self.raft.is_leader() {
+            if owner_pinned && !self.leads() {
                 return Err(self.not_leader_for_read("live read_stream").await);
             }
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 match self
                     .access_requires_write(request.stream_id.clone(), request.now_ms, true)
                     .await
@@ -1736,7 +1762,7 @@ impl GroupEngine for RaftGroupEngine {
                 && !ursula_stream::sim_controls::off(
                     ursula_stream::sim_controls::Defence::ImmutableLeaderBarrier,
                 );
-            if self.raft.is_leader() {
+            if self.leads() {
                 match self
                     .ensure_stream_access(request.stream_id.clone(), request.now_ms, true)
                     .await
@@ -1760,7 +1786,7 @@ impl GroupEngine for RaftGroupEngine {
             // 410 could be for the stream before a recreate, and its chunk
             // short of one another replica marked. A markable answer holds
             // committed bytes and needs no round.
-            if self.raft.is_leader()
+            if self.leads()
                 && linearize
                 && match &plan {
                     Ok(plan) => {
@@ -1787,7 +1813,7 @@ impl GroupEngine for RaftGroupEngine {
                 // instead of exposing a false permanent boundary error.
                 Err(error)
                     if !owner_pinned
-                        && !self.raft.is_leader()
+                        && !self.leads()
                         && may_hold_only_for_a_lagging_state(&error) =>
                 {
                     if let Some(route) = self.leader_route().await {
@@ -1809,10 +1835,10 @@ impl GroupEngine for RaftGroupEngine {
                 self.cold_store.clone(),
                 self.cold_index_cache.clone(),
             );
-            if owner_pinned && !self.raft.is_leader() {
+            if owner_pinned && !self.leads() {
                 return Err(self.not_leader_for_read("live read_stream").await);
             }
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 match original_request.follower {
                     FollowerRead::Prefix => {
                         if parts.end() == ReadEnd::OpenTail {
@@ -2041,7 +2067,7 @@ impl GroupEngine for RaftGroupEngine {
     ) -> GroupTidyStreamsFuture<'a> {
         Box::pin(async move {
             // Leader-side driver: followers propose nothing.
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 return TidyStreamsPass::empty();
             }
             // The sweep's report survives a failure of the `TidyStream`
@@ -2223,10 +2249,10 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupPurgeBucketFuture<'a> {
         Box::pin(async move {
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 let leader_id = self.raft.current_leader().await;
                 let route = self.leader_route().await;
-                let leadership = GroupLeadership::of(&self.raft.metrics().borrow_watched());
+                let leadership = self.leadership();
                 let Some(route) = route else {
                     return Err(leadership_refusal(
                         LeadershipReason::Follower,
@@ -2288,7 +2314,7 @@ impl GroupEngine for RaftGroupEngine {
         _placement: ShardPlacement,
     ) -> GroupPlanSharedRefCompactionFuture<'a> {
         Box::pin(async move {
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 return Ok(Vec::new());
             }
             self.with_state_machine(move |state_machine| {
@@ -2308,7 +2334,7 @@ impl GroupEngine for RaftGroupEngine {
         placement: ShardPlacement,
     ) -> GroupPlanColdOrphanSweepFuture<'a> {
         Box::pin(async move {
-            if self.cold_store.is_none() || !self.raft.is_leader() {
+            if self.cold_store.is_none() || !self.leads() {
                 return Ok(ColdOrphanSweepPlan::default());
             }
             let raft_group_id = placement.raft_group_id.0;
@@ -2332,7 +2358,7 @@ impl GroupEngine for RaftGroupEngine {
             let Some(cold_store) = self.cold_store.clone() else {
                 return Ok(RepairColdIndexResponse::default());
             };
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 return Ok(RepairColdIndexResponse::default());
             }
             let step = request.clone();
@@ -2389,7 +2415,7 @@ impl GroupEngine for RaftGroupEngine {
         admission: ColdWriteAdmission,
     ) -> ursula_runtime::GroupAppendBatchFuture<'a> {
         Box::pin(async move {
-            if !self.raft.is_leader() {
+            if !self.leads() {
                 let mut results = Vec::with_capacity(requests.len());
                 for request in requests {
                     results.push(self.append(request, placement, admission).await);
@@ -2439,9 +2465,13 @@ impl GroupEngine for RaftGroupEngine {
                 Ok(checked) => checked,
                 Err(error) => return vec![Err(error); count],
             };
-            let responses =
-                crate::forward::write_commands_on_raft(self.raft.clone(), &self.history, commands)
-                    .await;
+            let responses = crate::forward::write_commands_on_raft(
+                self.raft.clone(),
+                self.fence(),
+                &self.history,
+                commands,
+            )
+            .await;
             let mut responses = match responses {
                 Ok(responses) => responses.into_iter(),
                 Err(error) => {

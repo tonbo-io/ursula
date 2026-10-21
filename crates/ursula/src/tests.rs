@@ -550,9 +550,11 @@ fn registered_durable_factory(
 /// core writer fails the writer's next journal write, which stops the
 /// process.
 async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
-    assert_eq!(
-        crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
-        crate::server::WalShutdown::Clean,
+    assert!(
+        matches!(
+            crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
+            crate::server::WalShutdown::Clean(_)
+        ),
         "the Raft WAL shuts down cleanly"
     );
 }
@@ -641,6 +643,7 @@ async fn spawn_static_grpc_test_node(
                 &ursula_shard::StaticShardMap::new(1, raft_group_count).expect("valid topology"),
                 ursula_proto::placement::NodeId::new(node_id),
                 Some(&static_test_cluster_id()),
+                ursula_runtime::NodeFence::unleased(),
             )
             .expect("start the Raft WAL"),
             None,
@@ -655,6 +658,7 @@ async fn spawn_static_grpc_test_node(
                         .expect("valid topology"),
                     ursula_proto::placement::NodeId::new(node_id),
                     Some(&static_test_cluster_id()),
+                    ursula_runtime::NodeFence::unleased(),
                 )
                 .expect("start the Raft WAL"),
                 Some(wal_root),
@@ -13610,6 +13614,7 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
     };
     assert_eq!(readiness_reason(healthy), None);
     let mut facts = ReadinessFacts {
+        disk_lease_lost: true,
         format_epoch_mismatch: true,
         wal_disk_pressure: true,
         recovery_stalled: true,
@@ -13620,6 +13625,7 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
     while let Some(reason) = readiness_reason(facts) {
         order.push(reason.clone());
         match reason {
+            Reason::DiskLeaseLost => facts.disk_lease_lost = false,
             Reason::FormatEpochMismatch => facts.format_epoch_mismatch = false,
             Reason::WalDiskPressure => facts.wal_disk_pressure = false,
             Reason::RecoveryStalled => facts.recovery_stalled = false,
@@ -13629,6 +13635,7 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
         }
     }
     assert_eq!(order, vec![
+        Reason::DiskLeaseLost,
         Reason::FormatEpochMismatch,
         Reason::WalDiskPressure,
         Reason::RecoveryStalled,

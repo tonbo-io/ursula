@@ -238,6 +238,10 @@ impl RecoveryGate {
     /// which records the floor once every other candidate answers `probe`
     /// empty, and, for an initializer, the bootstrap driver, which
     /// initializes `members` once every other candidate does.
+    ///
+    /// Each driver starts once the node owes no predecessor wait, so a
+    /// barrier round, a vote floor and an initialization all come after the
+    /// predecessor stopped.
     pub(crate) fn spawn_gate_drivers<SM, T>(
         &self,
         raft: openraft::Raft<crate::UrsulaRaftTypeConfig, SM>,
@@ -255,7 +259,8 @@ impl RecoveryGate {
     {
         rejoin.set_stall_after(config.stall_after);
         let target = rejoin.group;
-        self.push(crate::rt::spawn(run_rejoin_vote_barrier(
+        let fence = owner.fence().clone();
+        let barrier = run_rejoin_vote_barrier(
             owner,
             rejoin.clone(),
             election,
@@ -267,12 +272,19 @@ impl RecoveryGate {
             config.barrier_timeout,
             config.interval,
             config.stall_after,
-        )));
+        );
+        let waited = fence.clone();
+        self.push(crate::rt::spawn(async move {
+            waited.waited().await;
+            barrier.await;
+        }));
         if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
             let rejoin = rejoin.clone();
             let candidates = candidates.clone();
             let probe = probe.clone();
+            let fence = fence.clone();
             self.push(crate::rt::spawn(async move {
+                fence.waited().await;
                 while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
                     let mut all_empty = true;
                     for peer in &candidates {
@@ -301,6 +313,7 @@ impl RecoveryGate {
         }
         if config.initialize && !rejoin.holds_group_history() {
             self.push(crate::rt::spawn(async move {
+                fence.waited().await;
                 run_group_bootstrap(
                     rejoin.node_id,
                     raft,

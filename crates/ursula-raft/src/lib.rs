@@ -50,6 +50,8 @@
 //! - [`peer_cluster`]: the cluster-id check between peers: the identity
 //!   every Raft gRPC request carries, the server interceptor that refuses a
 //!   peer of another cluster, and the record readiness and metrics read.
+//! - [`predecessor_wait`]: the wait a run owes a predecessor that may
+//!   still run, and the leadership shed of the node fence.
 //! - [`peer_directory`]: where each configured peer listens (`raft.peers`),
 //!   the one source every reader of a peer address takes it from.
 //! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
@@ -108,6 +110,7 @@ mod openraft_work;
 mod peer_channel;
 mod peer_cluster;
 mod peer_directory;
+pub mod predecessor_wait;
 mod read_index;
 mod recovery_transport;
 mod registry;
@@ -188,11 +191,14 @@ pub use in_process::InProcessRaftRegistry;
 pub use in_process::InProcessRaftRpcKind;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRegistry;
+pub use log_store::CleanExit;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;
 pub use log_store::MetaOpenError;
 pub use log_store::MetaOpening;
+pub use log_store::PROBE_INTERVAL;
 pub use log_store::PlanCut;
+pub use log_store::PredecessorWait;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftWal;
 pub use log_store::RaftWalError;
@@ -200,6 +206,7 @@ pub use log_store::RecoveryRecord;
 pub use log_store::RecoveryState;
 pub use log_store::SnapshotOrderError;
 pub use log_store::SnapshotRecord;
+pub use log_store::WaitFrom;
 pub use log_store::WalMaintenance;
 pub use log_store::WalOpening;
 pub use log_store::generate_cluster_id;

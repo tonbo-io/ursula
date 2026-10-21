@@ -30,16 +30,20 @@ pub enum LeadershipShedReason {
     /// never reconcile. It may campaign, so a group whose every voter lacks
     /// meta still elects, but it takes no transfer.
     PlacementUnavailable = 0b10_0000,
+    /// The node fence does not admit Raft traffic, or this run owes its
+    /// predecessor wait: the node neither campaigns nor takes a transfer.
+    Fence = 0b100_0000,
 }
 
 impl LeadershipShedReason {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::SnapshotDriverS3,
         Self::ClusterEgress,
         Self::ColdHealth,
         Self::MaintenanceDrain,
         Self::WalDiskPressure,
         Self::PlacementUnavailable,
+        Self::Fence,
     ];
 
     pub(crate) const fn bit(self) -> u8 {
@@ -54,6 +58,7 @@ impl LeadershipShedReason {
             Self::MaintenanceDrain => "maintenance-drain",
             Self::WalDiskPressure => "wal-disk-pressure",
             Self::PlacementUnavailable => "placement-unavailable",
+            Self::Fence => "fence",
         }
     }
 }
@@ -73,6 +78,7 @@ bitflags::bitflags! {
         const MAINTENANCE_DRAIN = LeadershipShedReason::MaintenanceDrain.bit();
         const WAL_DISK_PRESSURE = LeadershipShedReason::WalDiskPressure.bit();
         const PLACEMENT_UNAVAILABLE = LeadershipShedReason::PlacementUnavailable.bit();
+        const FENCE = LeadershipShedReason::Fence.bit();
     }
 }
 
@@ -109,7 +115,8 @@ impl LeadershipShedState {
             Self::CLUSTER_EGRESS
                 | Self::SNAPSHOT_DRIVER_S3
                 | Self::MAINTENANCE_DRAIN
-                | Self::WAL_DISK_PRESSURE,
+                | Self::WAL_DISK_PRESSURE
+                | Self::FENCE,
         )
     }
 
@@ -130,6 +137,8 @@ impl LeadershipShedState {
             Some(LeadershipShedReason::SnapshotDriverS3)
         } else if self.contains(Self::PLACEMENT_UNAVAILABLE) {
             Some(LeadershipShedReason::PlacementUnavailable)
+        } else if self.contains(Self::FENCE) {
+            Some(LeadershipShedReason::Fence)
         } else {
             None
         }

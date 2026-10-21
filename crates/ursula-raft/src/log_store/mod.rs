@@ -20,6 +20,7 @@
 //!   root id of the WAL root.
 //! - `identity`: the root's run counter (`identity.bin`), which names each
 //!   process of the root.
+//! - `lease`: the disk lease's probe, which keeps the node fence's lease.
 //! - `run_state`: the node's run-state file and how the journals open after
 //!   the previous run (the replay-mode decision and the recovery state).
 //! - `state_file`: the atomically replaced, checksummed state-file format.
@@ -39,6 +40,7 @@ mod identity;
 mod journal;
 #[cfg(all(test, not(madsim)))]
 mod journal_tests;
+mod lease;
 mod reclaim;
 mod run_state;
 mod segment;
@@ -82,11 +84,13 @@ pub use journal::JournalError;
 pub use journal::JournalOp;
 pub use journal::JournalReplayMode;
 pub use journal::RecordTooLarge;
+pub use lease::PROBE_INTERVAL;
 use openraft::RaftTypeConfig;
 use openraft::alias::EntryOf;
 use openraft::alias::LogIdOf;
 use openraft::entry::RaftEntry;
 pub use run_state::BootId;
+pub use run_state::CleanExit;
 pub use run_state::JournalClass;
 pub use run_state::JournalHistory;
 pub use run_state::JournalRun;
@@ -103,6 +107,7 @@ pub use run_state::RecoveryReason;
 pub use run_state::RecoveryState;
 pub use run_state::RunState;
 pub use run_state::RunStatus;
+pub use run_state::WaitFrom;
 pub use run_state::WalOpening;
 pub(crate) use run_state::core_dir;
 pub use segment::journal_segment_path;
@@ -129,6 +134,7 @@ pub use state_file::StateFileKind;
 pub(crate) use state_file::replace_file;
 pub use topology::generate_cluster_id;
 pub use wal::MetaOpenError;
+pub use wal::PredecessorWait;
 pub use wal::RaftWal;
 pub use wal::WalMaintenance;
 pub(crate) use writer::CoreFileLogWriter;

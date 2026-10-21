@@ -385,6 +385,10 @@ pub struct WalConfig {
     /// Clear disk-pressure admission only after free space reaches this value.
     /// Must exceed `min_available_size` when the guard is enabled.
     pub resume_available_size: HumanSize,
+    /// The disk lease: with no synced probe of the WAL disk for this long,
+    /// the node stops all Raft traffic and object writes until a probe
+    /// succeeds again. From [`Self::MIN_LEASE`] to [`Self::MAX_LEASE`].
+    pub lease: HumanDuration,
 }
 
 impl WalConfig {
@@ -392,6 +396,11 @@ impl WalConfig {
     pub const LOG_SUBDIR: &str = "raft-log";
     /// The smallest `segment_size`.
     pub const MIN_SEGMENT_SIZE: u64 = 4 * 1024;
+    /// The shortest `lease`: a probe every second must have room to miss.
+    pub const MIN_LEASE: Duration = Duration::from_secs(2);
+    /// The longest `lease`, which every successor's predecessor wait
+    /// covers.
+    pub const MAX_LEASE: Duration = Duration::from_secs(10);
 
     /// The entry cache of each group when the node hosts `groups` groups.
     pub fn group_cache_bytes(&self, groups: usize) -> u64 {
@@ -415,6 +424,7 @@ impl Default for WalConfig {
             cache_size: HumanSize::mib(256),
             min_available_size: HumanSize::mib(512),
             resume_available_size: HumanSize::gib(1),
+            lease: HumanDuration::sec(5),
         }
     }
 }

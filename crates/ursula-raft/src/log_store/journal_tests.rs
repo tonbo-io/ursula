@@ -1127,6 +1127,7 @@ async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
             &topology,
             None,
             NodeId::new(1),
+            ursula_runtime::NodeFence::unleased(),
         )
         .unwrap(),
     );
@@ -1171,6 +1172,7 @@ async fn durable_corruption_stays_unchanged_across_node_startup_retries() {
             &topology,
             None,
             NodeId::new(1),
+            ursula_runtime::NodeFence::unleased(),
         )
         .unwrap();
         let opening = node.opening();
@@ -1240,6 +1242,7 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
                 &topology,
                 None,
                 NodeId::new(1),
+                ursula_runtime::NodeFence::unleased(),
             )
             .unwrap(),
         );
@@ -1280,6 +1283,7 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
                 &topology,
                 None,
                 NodeId::new(1),
+                ursula_runtime::NodeFence::unleased(),
             )
             .unwrap(),
         );
@@ -1296,6 +1300,7 @@ async fn newest_invalid_tail_is_gated_before_repair_and_across_lazy_startup_retr
                 &topology,
                 None,
                 NodeId::new(1),
+                ursula_runtime::NodeFence::unleased(),
             )
             .unwrap();
             let opening = node.opening();

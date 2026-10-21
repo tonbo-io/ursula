@@ -49,6 +49,7 @@ use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
 use tonic::service::Interceptor;
 use ursula_headers::ClusterId;
+use ursula_runtime::NodeFence;
 
 use crate::format_epoch::PROTOCOL_MISMATCH_TEXT;
 use crate::peer_directory::PeerDirectory;
@@ -82,22 +83,37 @@ struct IdentityValues {
     cluster_id: ClusterId,
     cluster_value: AsciiMetadataValue,
     node_value: AsciiMetadataValue,
+    fence: NodeFence,
 }
 
 /// Who this node is to its peers: the cluster id its WAL root holds and its
-/// Raft node id. As a client interceptor it stamps both on every request.
-/// Cloning it is cheap: every Raft client holds one.
+/// Raft node id. As a client interceptor it stamps both on every request,
+/// and sends none while its node fence does not admit it. Cloning it is
+/// cheap: every Raft client holds one.
 #[derive(Debug, Clone)]
 pub struct PeerIdentity(Arc<IdentityValues>);
 
 impl PeerIdentity {
+    /// The identity of a node without a disk lease
+    /// ([`NodeFence::unleased`]).
     pub fn new(node_id: u64, cluster_id: ClusterId) -> Self {
+        Self::fenced_by(node_id, cluster_id, NodeFence::unleased())
+    }
+
+    /// The identity of a node whose Raft traffic `fence` gates.
+    pub fn fenced_by(node_id: u64, cluster_id: ClusterId, fence: NodeFence) -> Self {
         Self(Arc::new(IdentityValues {
             node_id,
             cluster_value: cluster_id_value(&cluster_id),
             node_value: AsciiMetadataValue::from(node_id),
             cluster_id,
+            fence,
         }))
+    }
+
+    /// The fence every Raft input and output of this node passes.
+    pub fn fence(&self) -> &NodeFence {
+        &self.0.fence
     }
 
     pub fn node_id(&self) -> u64 {
@@ -122,10 +138,38 @@ impl Interceptor for PeerIdentity {
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
+        check_sender_fence(&self.0.fence)?;
         let metadata = request.metadata_mut();
         metadata.insert(CLUSTER_ID_METADATA, self.0.cluster_value.clone());
         metadata.insert(NODE_ID_METADATA, self.0.node_value.clone());
         Ok(request)
+    }
+}
+
+/// This node's fence refused a Raft request before it left, or an answer
+/// at its arrival. Answered `UNAVAILABLE` with no metadata, so the caller
+/// reads it as an unreachable peer and backs off, and it never reads as a
+/// refusal by the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "this node is fenced (its disk lease does not hold, or it shuts down): no Raft request \
+     leaves it and no answer reaches it"
+)]
+pub(crate) struct SenderFenced;
+
+impl From<SenderFenced> for tonic::Status {
+    fn from(fenced: SenderFenced) -> Self {
+        Self::unavailable(fenced.to_string())
+    }
+}
+
+/// The sender's fence check before a Raft request leaves this node, and
+/// at an answer's arrival.
+pub(crate) fn check_sender_fence(fence: &NodeFence) -> Result<(), SenderFenced> {
+    if fence.admits_now() {
+        Ok(())
+    } else {
+        Err(SenderFenced)
     }
 }
 
@@ -155,6 +199,12 @@ pub enum PeerClusterError {
     MissingClusterId,
     #[error("the sender's {header} request metadata is malformed")]
     MalformedMetadata { header: &'static str },
+    /// This node's fence does not admit Raft traffic: its disk lease does
+    /// not hold, or it shuts down. Refused `FAILED_PRECONDITION` with
+    /// [`crate::target::FenceRefusal::Fenced`] and this node's id, which the
+    /// sender reads with [`crate::target::fence_refusal`].
+    #[error("node {node_id} is fenced and takes no Raft request")]
+    Fenced { node_id: u64 },
     /// The peer belongs to another cluster.
     #[error(
         "peer cluster mismatch: node {peer_node_id} is in cluster {peer_cluster_id}, this node is \
@@ -174,6 +224,15 @@ impl From<PeerClusterError> for tonic::Status {
             PeerClusterError::NoLocalCluster => Self::unavailable(message),
             PeerClusterError::MissingClusterId => Self::failed_precondition(message),
             PeerClusterError::MalformedMetadata { .. } => Self::invalid_argument(message),
+            PeerClusterError::Fenced { node_id } => {
+                let mut metadata = MetadataMap::new();
+                metadata.insert(NODE_ID_METADATA, AsciiMetadataValue::from(node_id));
+                metadata.insert(
+                    crate::target::FENCE_METADATA,
+                    AsciiMetadataValue::from_static(crate::target::FenceRefusal::Fenced.as_str()),
+                );
+                Self::with_metadata(tonic::Code::FailedPrecondition, message, metadata)
+            }
             PeerClusterError::Mismatch {
                 local_cluster_id, ..
             } => {
@@ -337,6 +396,28 @@ impl PeerCluster {
             );
         }
         url
+    }
+
+    /// The fence of the identity last bound, or an unleased one when none
+    /// is bound.
+    pub fn fence(&self) -> NodeFence {
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .map_or_else(NodeFence::unleased, |bound| bound.identity.fence().clone())
+    }
+
+    /// The receiver's fence check of an inbound request or of the answer it
+    /// is about to send.
+    pub(crate) fn check_receiver_fence(&self) -> Result<(), PeerClusterError> {
+        let bound = self.0.bound.load();
+        match bound.as_deref() {
+            Some(bound) if !bound.identity.fence().admits_now() => Err(PeerClusterError::Fenced {
+                node_id: bound.identity.node_id(),
+            }),
+            Some(_) | None => Ok(()),
+        }
     }
 
     pub fn identity(&self) -> Option<PeerIdentity> {
@@ -686,6 +767,9 @@ impl Interceptor for ClusterCheck {
         let admitted = self
             .0
             .admit(request.metadata(), request.remote_addr(), Instant::now())?;
+        // The receiver's first fence check, for every request and every
+        // `AppendStream` it opens.
+        self.0.check_receiver_fence()?;
         request.extensions_mut().insert(admitted);
         Ok(request)
     }

@@ -116,6 +116,25 @@ pub(super) fn advance(
     }))
 }
 
+/// Records that run `run` of `root` finished its predecessor wait,
+/// `fsync`ed, so the next run owes it only when it reads a predecessor that
+/// may live itself. Called under the root's lock, by the run that counted
+/// `run`.
+pub(super) fn finish_wait(root: &Path, run: u32) -> Result<(), RaftWalError> {
+    let path = root.join(IDENTITY_FILE);
+    state_file::write(
+        StateFileKind::Identity,
+        &path,
+        &path.with_extension("tmp"),
+        &IdentityFile {
+            run,
+            predecessor_wait: false,
+        },
+    )
+    .map(|_bytes| ())
+    .map_err(RaftWalError::RecordIdentity)
+}
+
 /// An identity file with distinct values in its fields, for the
 /// persisted-envelopes fixture. It decodes to the file it was encoded from
 /// and re-encodes to the same bytes.

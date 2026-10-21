@@ -30,6 +30,7 @@ use openraft::storage::RaftStateMachine;
 use openraft::type_config::alias::WatchReceiverOf;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
+use ursula_runtime::NodeFence;
 
 use crate::leadership::GroupLeadership;
 use crate::rt::sync::mpsc;
@@ -69,6 +70,8 @@ pub struct OwnerRaftHandle<
     server_metrics: WatchReceiverOf<C, RaftServerMetrics<C>>,
     handoff_ack_window: Duration,
     transfer_deadline: Duration,
+    /// The node fence the one leader predicate reads.
+    fence: NodeFence,
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHandle<SM> {
@@ -80,6 +83,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHa
             server_metrics: self.server_metrics.clone(),
             handoff_ack_window: self.handoff_ack_window,
             transfer_deadline: self.transfer_deadline,
+            fence: self.fence.clone(),
         }
     }
 }
@@ -96,7 +100,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> std::fmt::Debug for O
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
-    pub(crate) fn new(raft: Raft<C, SM>) -> Self {
+    pub(crate) fn new(raft: Raft<C, SM>, fence: NodeFence) -> Self {
         let metrics = raft.metrics();
         let data_metrics = raft.data_metrics();
         let server_metrics = raft.server_metrics();
@@ -128,7 +132,13 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
             server_metrics,
             handoff_ack_window,
             transfer_deadline,
+            fence,
         }
+    }
+
+    /// The node fence this replica's leadership reads.
+    pub fn fence(&self) -> &NodeFence {
+        &self.fence
     }
 
     /// How recently a handoff target must have acknowledged this leader:
@@ -275,7 +285,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     /// This replica's view of the group's leadership, from one borrow of
     /// its Raft metrics, without a trip through the group's core.
     pub fn leadership(&self) -> GroupLeadership {
-        GroupLeadership::of(&self.metrics.borrow_watched())
+        GroupLeadership::of(&self.metrics.borrow_watched(), &self.fence)
     }
 
     /// OpenRaft's data metrics, which carry the full last log id. Its
@@ -297,9 +307,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         }
     }
 
+    /// Whether this replica leads, by the one leader predicate
+    /// ([`GroupLeadership::of`]), which reads the node fence.
     pub fn is_leader(&self) -> bool {
-        let metrics = self.metrics.borrow_watched();
-        metrics.state == openraft::ServerState::Leader
+        self.leadership().leads()
     }
 
     pub async fn current_leader(&self) -> Option<u64> {

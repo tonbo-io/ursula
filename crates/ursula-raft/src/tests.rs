@@ -1410,7 +1410,8 @@ async fn a_handoff_settles_within_the_transfer_deadline_and_one_minimum_election
     )
     .await
     .expect("create single-node raft group");
-    let owner = crate::owner::OwnerRaftHandle::new(raft.clone());
+    let owner =
+        crate::owner::OwnerRaftHandle::new(raft.clone(), ursula_runtime::NodeFence::unleased());
     // 2 x 700 ms + 300 ms.
     assert_eq!(owner.handoff_settle_time(), Duration::from_millis(1_700));
     raft.shutdown().await.expect("shutdown raft group");
@@ -2005,13 +2006,17 @@ async fn only_the_engines_own_leadership_check_is_before_proposal() {
     assert!(refused_before_proposal(&written), "{written:?}");
     assert!(names_the_leader(&written), "{written:?}");
 
-    let batch =
-        crate::forward::write_commands_on_raft(follower.raft_handle(), &follower.history, vec![
+    let batch = crate::forward::write_commands_on_raft(
+        follower.raft_handle(),
+        follower.fence(),
+        &follower.history,
+        vec![
             append_command(stream_id.clone(), b"a"),
             append_command(stream_id, b"b"),
-        ])
-        .await
-        .expect("the batch is answered entry by entry");
+        ],
+    )
+    .await
+    .expect("the batch is answered entry by entry");
     assert_eq!(batch.len(), 2);
     for entry in batch {
         let error = entry.expect_err("the engine's check refuses each batch entry on a follower");
@@ -3569,6 +3574,45 @@ async fn shard_runtime_restarts_one_group_engine_from_its_log_store() {
         .await
         .expect("read after the second restart");
     assert_eq!(read.payload, b"kept+more");
+}
+
+/// The single-node factory hands its engines the WAL's fence, so the one
+/// leader predicate stops a fenced single node's leader-gated jobs as it
+/// does a cluster node's. Catches an engine whose leadership reads an
+/// unleased fence because its factory gave it no peer cluster.
+#[cfg(not(madsim))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_single_node_engine_leads_nothing_once_its_wal_fence_closes() {
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let registry = RaftGroupHandleRegistry::default();
+    let wal = RaftWal::start_in_cluster(
+        wal_root.path(),
+        crate::JournalTuning::new(WalFsync::Never),
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+        ursula_proto::placement::NodeId::new(1),
+        None,
+        ursula_runtime::NodeFence::leased(Duration::from_secs(5)),
+    )
+    .expect("start the Raft WAL");
+    let factory = DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone());
+    let runtime = ShardRuntime::spawn_with_engine_factory(hosted_config(1, 1), factory)
+        .expect("spawn runtime with raft group engine factory");
+    let stream_id = bsid("fenced-single-node");
+    runtime
+        .create_stream(create_req(stream_id.clone()))
+        .await
+        .expect("create");
+    let raft_group_id = runtime.locate(&stream_id).raft_group_id;
+    let owner = registry
+        .entry(raft_group_id)
+        .expect("the group's engine is registered")
+        .raft()
+        .clone();
+    assert!(owner.is_leader(), "the single node leads its group");
+    assert!(owner.leadership().upload_fence().is_some());
+    wal.fence().close();
+    assert!(!owner.is_leader(), "a fenced single node leads nothing");
+    assert_eq!(owner.leadership().upload_fence(), None);
 }
 
 /// A restart whose old engine's OpenRaft work does not end keeps the group

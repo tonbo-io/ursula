@@ -71,9 +71,12 @@ impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>> Re
         &self.raft
     }
 
-    pub(crate) fn new(raft: Raft<UrsulaRaftTypeConfig, SM>) -> Self {
+    pub(crate) fn new(
+        raft: Raft<UrsulaRaftTypeConfig, SM>,
+        fence: ursula_runtime::NodeFence,
+    ) -> Self {
         Self {
-            raft: crate::owner::OwnerRaftHandle::new(raft),
+            raft: crate::owner::OwnerRaftHandle::new(raft, fence),
             rounds: Arc::default(),
         }
     }
@@ -107,7 +110,8 @@ impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>> Re
             if let Some(state) = state.upgrade() {
                 state.lock().unwrap_or_else(PoisonError::into_inner).open = false;
             }
-            raft.call(|raft| async move { confirm(&raft).await })
+            let fence = raft.fence().clone();
+            raft.call(move |raft| async move { confirm(&raft, &fence).await })
                 .await
                 .map_err(crate::owner::owner_stopped)?
         }
@@ -150,8 +154,9 @@ impl<SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>>
 /// hangs on a stalled state machine.
 async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     raft: &Raft<UrsulaRaftTypeConfig, SM>,
+    fence: &ursula_runtime::NodeFence,
 ) -> Outcome {
-    if !raft.is_leader() {
+    if !GroupLeadership::of(&raft.metrics().borrow_watched(), fence).leads() {
         return Ok(None);
     }
     let budget = Duration::from_millis(raft.config().election_timeout_min);
@@ -163,7 +168,7 @@ async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
             group_engine_linearizable_read_error(
                 err,
                 OPERATION,
-                &GroupLeadership::of(&raft.metrics().borrow_watched()),
+                &GroupLeadership::of(&raft.metrics().borrow_watched(), fence),
             )
         })?;
     let read_log_id = *linearizer.read_log_id().log_id();

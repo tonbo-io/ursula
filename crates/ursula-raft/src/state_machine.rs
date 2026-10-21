@@ -1623,12 +1623,15 @@ fn object_refusal(
             }
         }
         // An I/O failure inside the store, as of the task that runs its
-        // codec, may pass on a retry.
-        SnapshotStoreError::Io(_) => GroupSnapshotError::StoreUnavailable {
-            raft_group_id,
-            key,
-            operation: SnapshotStoreOperation::Get,
-        },
+        // codec, may pass on a retry, and so may a write the node fence
+        // refused.
+        SnapshotStoreError::Io(_) | SnapshotStoreError::Fenced(_) => {
+            GroupSnapshotError::StoreUnavailable {
+                raft_group_id,
+                key,
+                operation: SnapshotStoreOperation::Get,
+            }
+        }
         // The pointer names an object its store does not hold, as after a
         // change of the snapshot backend.
         SnapshotStoreError::UnsupportedLocation { .. } => GroupSnapshotError::ForeignKey {

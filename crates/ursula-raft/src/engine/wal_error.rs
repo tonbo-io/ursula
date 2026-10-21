@@ -88,7 +88,8 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         RaftWalError::CreateDir { .. }
         | RaftWalError::Lock { .. }
         | RaftWalError::ListCores { .. }
-        | RaftWalError::Device { .. } => WalOpenFailureKind::Io,
+        | RaftWalError::Device { .. }
+        | RaftWalError::LeaseProbe { .. } => WalOpenFailureKind::Io,
         RaftWalError::Locked { .. } | RaftWalError::CoreWriterStopping { .. } => {
             WalOpenFailureKind::Locked
         }
@@ -96,7 +97,7 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
             MarkRecoveringError::Read(source) => state_failure(source),
             MarkRecoveringError::Write(source) => journal_failure(source),
         },
-        RaftWalError::ShutDown { .. } => WalOpenFailureKind::Stopped,
+        RaftWalError::ShutDown { .. } | RaftWalError::Fenced { .. } => WalOpenFailureKind::Stopped,
         RaftWalError::LockPoisoned => WalOpenFailureKind::Poisoned,
         RaftWalError::PreviousEngineRunning { .. } => WalOpenFailureKind::DuplicateGroup,
     }

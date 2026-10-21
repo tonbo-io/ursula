@@ -1123,6 +1123,9 @@ mod metrics_contract_tests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServingReadinessReason {
+    /// No probe of the WAL disk synced within `raft.wal.lease`: the node
+    /// takes part in no Raft traffic until one does.
+    DiskLeaseLost,
     FormatEpochMismatch,
     WalDiskPressure,
     RecoveryStalled,
@@ -1178,6 +1181,7 @@ mod serving_readiness_tests {
                 "format_epoch_mismatch",
             ),
             (ServingReadinessReason::WalDiskPressure, "wal_disk_pressure"),
+            (ServingReadinessReason::DiskLeaseLost, "disk_lease_lost"),
             (ServingReadinessReason::RecoveryStalled, "recovery_stalled"),
             (
                 ServingReadinessReason::RecoveryGateClosed,

@@ -91,7 +91,13 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
     state.register_otel_metrics();
     let wal_shutdown = serve(state, &config).await?;
     if let Some(wal_dir) = wal_dir {
-        wal_dir.close(wal_shutdown);
+        wal_dir.close(&wal_shutdown);
+    }
+    // A clean run's root lock stays held until the process exits, so no
+    // successor reads the clean end beside a task of this run that is still
+    // running.
+    if let WalShutdown::Clean(exit) = wal_shutdown {
+        exit.hold_until_exit();
     }
     Ok(())
 }
@@ -143,11 +149,11 @@ impl RaftWalDir {
     /// After the server stopped: removes a temporary WAL directory once its
     /// WAL shut down cleanly. Only then has every core writer closed, so
     /// nothing writes to the directory any more.
-    fn close(self, shutdown: WalShutdown) {
+    fn close(self, shutdown: &WalShutdown) {
         let Self::Temporary(path) = self else {
             return;
         };
-        if shutdown != WalShutdown::Clean {
+        if !matches!(shutdown, WalShutdown::Clean(_)) {
             tracing::warn!(
                 path = %path.display(),
                 ?shutdown,
@@ -413,13 +419,15 @@ async fn serve(
 }
 
 /// How [`shutdown_raft_wal`] ended the node's Raft WAL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) enum WalShutdown {
     /// The node runs no Raft WAL.
     NoWal,
-    /// Every core writer closed and `fsync`ed its journal, and the run is
-    /// recorded as clean. Nothing writes to the WAL any more.
-    Clean,
+    /// Every core writer closed and `fsync`ed its journal, the node fence
+    /// closed for good, and the run is recorded as clean. Nothing writes to
+    /// the WAL any more. The process holds the root's lock until it exits;
+    /// a test that drops it stands for that exit.
+    Clean(ursula_raft::CleanExit),
     /// A writer did not close, or the clean run was not recorded. A writer
     /// may still be open.
     Unclean,
@@ -458,9 +466,9 @@ pub(crate) async fn shutdown_raft_wal(
         tracing::warn!(%err, "failed to stop the meta replica before closing the WAL");
     }
     match raft_wal.shutdown().await {
-        Ok(()) => {
+        Ok(exit) => {
             tracing::info!("Raft WAL synced and recorded as cleanly shut down");
-            WalShutdown::Clean
+            WalShutdown::Clean(exit)
         }
         Err(err) => {
             tracing::warn!(
@@ -702,10 +710,10 @@ mod tests {
                 "predecessor": "may_live",
             })
         );
-        assert_eq!(
+        assert!(matches!(
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
-            super::WalShutdown::Clean
-        );
+            super::WalShutdown::Clean(_)
+        ));
         assert!(
             matches!(
                 raft_wal.shutdown().await,
@@ -840,10 +848,10 @@ mod tests {
             .await
             .expect("the create applies");
         assert_eq!(ready(client).await, StatusCode::OK);
-        assert_eq!(
+        assert!(matches!(
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
-            super::WalShutdown::Clean
-        );
+            super::WalShutdown::Clean(_)
+        ));
     }
 
     /// The admin recovery route takes `meta` as its target and hands the
@@ -955,10 +963,10 @@ mod tests {
         // floor check, which comes before the replica lookup, answers here.
         let answer = refused(post(data_url, mismatched(data, PlanFloor::Meta)).await);
         assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
-        assert_eq!(
+        assert!(matches!(
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
-            super::WalShutdown::Clean
-        );
+            super::WalShutdown::Clean(_)
+        ));
     }
 
     /// Creates a stream through the client router, a write in group 0.
@@ -1006,11 +1014,11 @@ mod tests {
         };
         let stop = |state: crate::HttpState| async move {
             let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
-            assert_eq!(
+            assert!(matches!(
                 super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal))
                     .await,
-                super::WalShutdown::Clean
-            );
+                super::WalShutdown::Clean(_)
+            ));
         };
         // The first run creates the meta journal.
         let state = start().await;
@@ -1052,6 +1060,18 @@ mod tests {
             }
         ));
         assert_eq!(placement.applied, None);
+        // The first run started on an empty root and may stop before the
+        // meta group answers its registration, which leaves its predecessor
+        // wait owed: this run then waits it out from its open, without
+        // meta, and campaigns only after it. The wait's end clears the
+        // fence's shed in the same step.
+        let fence = state.raft_wal().expect("a disk WAL starts").fence();
+        tokio::time::timeout(
+            ursula_raft::predecessor_wait::PREDECESSOR_WAIT.saturating_mul(2),
+            fence.waited(),
+        )
+        .await
+        .expect("the predecessor wait ends without meta");
         let registry = state.raft_registry().cloned().expect("a Raft node");
         let shed = registry.leadership_shed_state();
         assert!(shed.contains(ursula_raft::LeadershipShedState::PLACEMENT_UNAVAILABLE));
@@ -1125,9 +1145,9 @@ mod tests {
         assert_eq!(raft_wal.root(), log_dir.as_path());
         let shutdown =
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await;
-        assert_eq!(shutdown, super::WalShutdown::Clean);
+        assert!(matches!(shutdown, super::WalShutdown::Clean(_)));
         assert!(root.exists());
-        wal_dir.close(shutdown);
+        wal_dir.close(&shutdown);
         assert!(!root.exists(), "a clean shutdown removes the temporary WAL");
     }
 
@@ -1145,7 +1165,7 @@ mod tests {
             (wal_dir, root)
         };
         let (wal_dir, unclean) = resolve();
-        wal_dir.close(super::WalShutdown::Unclean);
+        wal_dir.close(&super::WalShutdown::Unclean);
         assert!(unclean.exists(), "an unclean shutdown keeps the directory");
         let (wal_dir, dropped) = resolve();
         drop(wal_dir);

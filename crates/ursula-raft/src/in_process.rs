@@ -78,6 +78,9 @@ pub trait InProcessEndpoint:
         snapshot: UrsulaSnapshot,
     ) -> impl Future<Output = Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError>> + Send;
 
+    /// The node fence of the node that registered `endpoint`.
+    fn fence(endpoint: &Self::Endpoint) -> ursula_runtime::NodeFence;
+
     /// The target's own check of a leadership transfer to `target`, before
     /// OpenRaft sees it.
     fn validate_incoming_transfer(
@@ -123,6 +126,10 @@ impl InProcessEndpoint for RaftGroupStateMachine {
     ) -> impl Future<Output = Result<SnapshotResponse<UrsulaRaftTypeConfig>, SnapshotInstallError>> + Send
     {
         registry.install_full_snapshot(*group, vote, snapshot)
+    }
+
+    fn fence((_, registry): &Self::Endpoint) -> ursula_runtime::NodeFence {
+        registry.peer_cluster().fence()
     }
 
     fn validate_incoming_transfer(
@@ -949,6 +956,32 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
     }
 }
 
+impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
+    /// The fences of an RPC, as the gRPC plane checks them: the sender's
+    /// before it sends and at the answer's arrival, the target's at the
+    /// request's arrival and before its answer leaves. A fenced end loses
+    /// the RPC, as an unreachable peer does.
+    fn check_fences(
+        &self,
+        target: Option<&SM::Endpoint>,
+    ) -> Result<(), Unreachable<UrsulaRaftTypeConfig>> {
+        let sender = self
+            .source
+            .and_then(|source| self.registry.endpoint(source))
+            .map(|endpoint| SM::fence(&endpoint));
+        let target = target.map(SM::fence);
+        for (end, fence) in [("sender", sender), ("target", target)] {
+            if fence.is_some_and(|fence| !fence.admits_now()) {
+                return Err(Unreachable::from_string(format!(
+                    "in-process raft: the {end} of an RPC to node {} is fenced",
+                    self.target
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNetwork<SM> {
     type SnapshotData = SnapshotData;
 
@@ -979,6 +1012,8 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
             target: self.target,
             kind: InProcessRaftRpcKind::AppendEntries,
         });
+        self.check_fences(Some(&target))
+            .map_err(RPCError::Unreachable)?;
         let matched = self.matched_by_sender(&rpc.vote);
         let conflict_index = rpc.prev_log_id.map(|log_id| log_id.index);
         let target_gate = SM::gate(&target);
@@ -990,6 +1025,8 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                 RPCError::Network(NetworkError::from_string(message))
             }
         })?;
+        self.check_fences(Some(&target))
+            .map_err(RPCError::Unreachable)?;
         if matches!(response, AppendEntriesResponse::Conflict) {
             if let (Some(conflict_index), Some(matched_index)) = (conflict_index, matched)
                 && conflict_index <= matched_index
@@ -1035,10 +1072,14 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
             target: self.target,
             kind: InProcessRaftRpcKind::Vote,
         });
+        self.check_fences(Some(&target))
+            .map_err(RPCError::Unreachable)?;
         let target_gate = SM::gate(&target);
         let response = SM::vote(&target, rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!("remote vote: {err}")))
         })?;
+        self.check_fences(Some(&target))
+            .map_err(RPCError::Unreachable)?;
         self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
             source: self.source,
             target: self.target,
@@ -1098,6 +1139,8 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
             meta,
             snapshot: crate::types::SnapshotData::new(pointer_bytes),
         };
+        self.check_fences(Some(&target))
+            .map_err(StreamingError::Unreachable)?;
         // RaftCore cancels a send it no longer wants, and every send once it
         // stops, as the gRPC network honours it (#709).
         let install = std::pin::pin!(SM::install_full_snapshot(&target, vote, snapshot));
@@ -1107,6 +1150,8 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                 return Err(StreamingError::Closed(closed));
             }
         };
+        self.check_fences(Some(&target))
+            .map_err(StreamingError::Unreachable)?;
         installed.map_err(|err| {
             let message = format!(
                 "remote full snapshot on node {}: {}",
@@ -1146,17 +1191,23 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
             target: self.target,
             kind: InProcessRaftRpcKind::TransferLeader,
         });
-        if let Some(endpoint) = self.registry.endpoint(self.target)
-            && let Err(refusal) = SM::validate_incoming_transfer(&endpoint, self.target, &req)
+        let endpoint = self.registry.endpoint(self.target);
+        self.check_fences(endpoint.as_ref())
+            .map_err(RPCError::Unreachable)?;
+        if let Some(endpoint) = &endpoint
+            && let Err(refusal) = SM::validate_incoming_transfer(endpoint, self.target, &req)
         {
             return Err(RPCError::Network(NetworkError::new(&refusal)));
         }
-        target.handle_transfer_leader(req).await.map_err(|err| {
+        let response = target.handle_transfer_leader(req).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!(
                 "remote TransferLeader on node {}: {err}",
                 self.target
             )))
-        })
+        })?;
+        self.check_fences(endpoint.as_ref())
+            .map_err(RPCError::Unreachable)?;
+        Ok(response)
     }
 }
 
