@@ -31,6 +31,15 @@ use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex as AsyncMutex;
 use openraft::Raft;
 use openraft::ServerState;
+use ursula_ctl::recovery::LoopState;
+use ursula_ctl::recovery::PlanMember;
+use ursula_ctl::recovery::PlanTransport;
+use ursula_ctl::recovery::RecoverOutcome;
+use ursula_ctl::recovery::SendError;
+use ursula_proto::admin::PlanFloor;
+use ursula_proto::admin::RecoveryPlanRefused;
+use ursula_proto::admin::RecoveryPlanReport;
+use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_proto::placement::GenesisClaim;
 use ursula_raft::GroupHost;
 use ursula_raft::GroupRejoin;
@@ -63,6 +72,8 @@ use super::meta_checks::BOUND;
 use super::meta_checks::STEP;
 use super::meta_checks::fail;
 use super::meta_cluster::MetaCluster;
+use super::meta_cluster::MetaRecoverFailed;
+use super::meta_cluster::recover_round;
 use super::recovery_wiring;
 
 pub(super) const I1: &str = "acknowledged_writes_read_back";
@@ -71,6 +82,7 @@ pub(super) const I3: &str = "memberships_are_the_seed_voters";
 pub(super) const I7: &str = "a_node_restarted_without_meta_serves";
 pub(super) const I15: &str = "every_seeded_group_forms";
 pub(super) const HOSTED: &str = "a_node_runs_only_its_placed_groups";
+pub(super) const DATA_PLAN: &str = "data_plans_recover_after_meta";
 
 /// Mixed into the OpenRaft seed of each placed replica's start.
 const HOST_SEED: u64 = 0x686f_7374_6564_0000;
@@ -250,6 +262,38 @@ impl SimHost {
             .shutdown()
             .await
             .map_err(|source| SimHostError::Engine { group, source })
+    }
+
+    /// Restarts the replica of `group` for a recovery plan's cut, as the
+    /// node's runtime restarts one group's engine: it stops, and opens
+    /// again from its store. The hosting driver may open it first, as it
+    /// opens every admitted group the node does not run, and that replica
+    /// is the restarted one.
+    async fn restart(&self, group: u32) -> Option<Arc<GroupRejoin>> {
+        if let Err(error) = self.stop(group).await {
+            panic!(
+                "node {}: stop group {group} for its plan: {error}",
+                self.parts.node_id
+            );
+        }
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            if let Some(rejoin) = self
+                .lock()
+                .get(&group)
+                .map(|hosted| Arc::clone(&hosted.rejoin))
+            {
+                return Some(rejoin);
+            }
+            match self.start(group).await {
+                Ok(()) => {}
+                Err(error) if madsim::time::Instant::now() >= deadline => panic!(
+                    "node {}: restart group {group} for its plan: {error}",
+                    self.parts.node_id
+                ),
+                Err(_opening) => madsim::time::sleep(STEP).await,
+            }
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, Hosted>> {
@@ -631,6 +675,137 @@ impl MetaCluster {
                     fail(trace, I7, after_event, lag);
                 }
                 madsim::time::sleep(STEP).await;
+            }
+        }
+    }
+}
+
+/// Restarts one placed replica for a recovery plan's cut.
+struct HostRestart {
+    host: Arc<SimHost>,
+}
+
+impl ursula_raft::ReplicaRestart for HostRestart {
+    fn restart_replica(
+        &mut self,
+        raft_group_id: RaftGroupId,
+    ) -> BoxFuture<'_, Result<Option<Arc<GroupRejoin>>, ursula_runtime::RuntimeError>> {
+        Box::pin(async move { Ok(self.host.restart(raft_group_id.0).await) })
+    }
+}
+
+/// [`PlanTransport`] over each node's production data plan entry point
+/// ([`ursula_raft::RaftGroupHandleRegistry::accept_recovery_plan`]), its
+/// refusal typed as the node's route types it.
+struct DataPlanTransport<'a> {
+    cluster: &'a MetaCluster,
+    group: u32,
+}
+
+impl DataPlanTransport<'_> {
+    async fn accept(
+        &self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> Result<RecoveryPlanReport, SendError> {
+        let host = self
+            .cluster
+            .placed()
+            .hosts
+            .get(&node_id)
+            .map(|node| Arc::clone(&node.host))
+            .ok_or(SendError::NotInManifest { node_id })?;
+        let registry = host.parts.registry.clone();
+        registry
+            .accept_recovery_plan(RaftGroupId(self.group), request, &mut HostRestart { host })
+            .await
+            .map_err(|error| match error.refusal() {
+                Some(refusal) => SendError::Refused {
+                    node_id,
+                    refused: RecoveryPlanRefused {
+                        raft_group_id: u64::from(self.group),
+                        node_id,
+                        refusal,
+                        message: error.to_string(),
+                    },
+                },
+                None => SendError::Failed {
+                    node_id,
+                    source: Box::new(error),
+                },
+            })
+    }
+}
+
+impl PlanTransport for DataPlanTransport<'_> {
+    fn send(
+        &mut self,
+        node_id: u64,
+        request: &RecoveryPlanRequest,
+    ) -> impl std::future::Future<Output = Result<RecoveryPlanReport, SendError>> {
+        self.accept(node_id, request)
+    }
+}
+
+impl MetaCluster {
+    /// The replicas of `group` on `nodes` as the recovery tool reads them
+    /// from each node's metrics, skipping nodes that publish none.
+    fn data_members(&self, group: u32, nodes: &[u64]) -> Vec<PlanMember> {
+        nodes
+            .iter()
+            .filter_map(|node_id| {
+                self.registry(*node_id)
+                    .metrics_snapshot()
+                    .into_iter()
+                    .find(|snapshot| snapshot.raft_group_id == group)
+            })
+            .map(|snapshot| PlanMember::from_metrics(&snapshot.to_admin()))
+            .collect()
+    }
+
+    /// `ursulactl recover-group --accept-loss` for each data group after a
+    /// meta plan, as the operations order has it (meta first): over the
+    /// group's running seed voters, the tool's rounds until its plan is
+    /// satisfied, or until it finds the group healthy.
+    pub(super) async fn recover_data(&mut self, trace: &mut SimTrace, after_event: &str) {
+        for group in JOURNAL_GROUPS {
+            let nodes: Vec<u64> = self
+                .seeds(group)
+                .into_iter()
+                .filter(|node_id| self.runtimes.contains_key(node_id))
+                .collect();
+            let mut state = LoopState::default();
+            let within = super::recovery_wiring::RECOVERY_STALL_AFTER + BOUND;
+            let deadline = madsim::time::Instant::now() + within;
+            loop {
+                let members = self.data_members(group, &nodes);
+                let mut transport = DataPlanTransport {
+                    cluster: self,
+                    group,
+                };
+                match recover_round(&mut state, &members, &mut transport, PlanFloor::Seeded).await {
+                    Ok(Some(_))
+                    | Err(MetaRecoverFailed::NoPlan {
+                        outcome: RecoverOutcome::Healthy,
+                    }) => break,
+                    Ok(None) if madsim::time::Instant::now() < deadline => {
+                        madsim::time::sleep(STEP).await;
+                    }
+                    Ok(None) => fail(
+                        trace,
+                        DATA_PLAN,
+                        after_event,
+                        format!(
+                            "no plan of group {group} was satisfied within {within:?}: {state:?}"
+                        ),
+                    ),
+                    Err(error) => fail(
+                        trace,
+                        DATA_PLAN,
+                        after_event,
+                        format!("the recovery of group {group} stopped: {error}; {state:?}"),
+                    ),
+                }
             }
         }
     }

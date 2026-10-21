@@ -76,18 +76,18 @@ use super::recovery_wiring::RecoveryProbeError;
 /// A node's meta runtime in the simulation.
 pub(super) type SimMetaRuntime = MetaRuntime<InProcessMetaNetworkFactory>;
 
-/// How many plans one meta recovery may send, as `ursulactl
-/// recover-group --max-plans` bounds it.
+/// How many plans one recovery may send, as `ursulactl recover-group
+/// --max-plans` bounds it.
 const MAX_META_PLANS: usize = 3;
 
-/// Why a meta recovery round ended without a satisfied plan.
+/// Why a recovery round ended without a satisfied plan.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum MetaRecoverFailed {
     /// The recovery tool stopped.
     #[error(transparent)]
     Recover(#[from] RecoverError),
     /// The tool found nothing to plan.
-    #[error("the meta group needed no plan: {outcome:?}")]
+    #[error("the group needed no plan: {outcome:?}")]
     NoPlan { outcome: RecoverOutcome },
 }
 
@@ -386,34 +386,35 @@ impl MetaCluster {
         nodes: &[u64],
     ) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
         let members = self.plan_members(nodes);
-        match next_step(state, &members, MAX_META_PLANS)? {
-            Step::Done(RecoverOutcome::Satisfied { plan, .. }) => Ok(Some(plan)),
-            Step::Done(outcome) => Err(MetaRecoverFailed::NoPlan { outcome }),
-            Step::Wait => Ok(None),
-            Step::Plan(plan) => {
-                state.plans_sent = state.plans_sent.saturating_add(1);
-                let sent = send_plan(
-                    &mut MetaPlanTransport { cluster: self },
-                    plan,
-                    PlanFloor::Meta,
-                    &members,
-                )
-                .await;
-                plan_sent(state, plan, sent, &electorate(&plan, &members))?;
-                Ok(None)
-            }
-            Step::Resume { plan, leader_term } => {
-                let sent = send_follows(
-                    &mut MetaPlanTransport { cluster: self },
-                    plan,
-                    PlanFloor::Meta,
-                    leader_term,
-                    &members,
-                )
-                .await;
-                plan_sent(state, plan, Ok(sent), &electorate(&plan, &members))?;
-                Ok(None)
-            }
+        let mut transport = MetaPlanTransport { cluster: self };
+        recover_round(state, &members, &mut transport, PlanFloor::Meta).await
+    }
+}
+
+/// One round of `ursulactl recover-group --accept-loss` over `members`:
+/// the shipped planning step (`next_step`), planner and sender over
+/// `transport`, as the tool's loop drives them. Answers the plan once it is
+/// satisfied, and `None` while the tool would observe again.
+pub(super) async fn recover_round<T: PlanTransport>(
+    state: &mut LoopState,
+    members: &[PlanMember],
+    transport: &mut T,
+    floor: PlanFloor,
+) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
+    match next_step(state, members, MAX_META_PLANS)? {
+        Step::Done(RecoverOutcome::Satisfied { plan, .. }) => Ok(Some(plan)),
+        Step::Done(outcome) => Err(MetaRecoverFailed::NoPlan { outcome }),
+        Step::Wait => Ok(None),
+        Step::Plan(plan) => {
+            state.plans_sent = state.plans_sent.saturating_add(1);
+            let sent = send_plan(transport, plan, floor, members).await;
+            plan_sent(state, plan, sent, &electorate(&plan, members))?;
+            Ok(None)
+        }
+        Step::Resume { plan, leader_term } => {
+            let sent = send_follows(transport, plan, floor, leader_term, members).await;
+            plan_sent(state, plan, Ok(sent), &electorate(&plan, members))?;
+            Ok(None)
         }
     }
 }

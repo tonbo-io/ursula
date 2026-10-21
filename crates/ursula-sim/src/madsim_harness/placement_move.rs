@@ -30,11 +30,12 @@
 //!   replica (I10);
 //! - discards the meta journal of one meta voter, which opens `Recovering`
 //!   over its data history (D9) and rejoins through the meta leader (I11),
-//!   then the meta journals of the meta leader and one more meta voter,
+//!   then loses the run state of the meta leader and one more meta voter,
 //!   whose meta gates open `Recovering` and stall, and recovers meta by a
 //!   plan through `ursulactl recover-group --target meta --accept-loss`'s
 //!   loop, planner and sender (the meta plan check), after which every node
-//!   learns the view again (I11);
+//!   learns the view again (I11), and then every data group those two
+//!   stalled by a data plan through the same tool;
 //! - reads every acknowledged append back from every seed voter (I1).
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
@@ -427,12 +428,12 @@ impl Run {
 
     /// One meta voter's meta journal discarded: it opens `Recovering` over
     /// its data history (D9) and rejoins through the meta leader (I11).
-    /// Then the meta leader and one more meta voter lose their meta
-    /// journals, so a majority of meta's gates open `Recovering`, where a
-    /// replica neither votes nor campaigns, and stall. A meta plan recovers
-    /// meta. Their data journals stay: a lost run state would also gate the
-    /// data groups whose seed voters they are most of, which only a data
-    /// plan recovers.
+    /// Then the meta leader and one more meta voter lose their run state, so
+    /// a majority of meta's gates open `Recovering`, where a replica neither
+    /// votes nor campaigns, and stall. A meta plan recovers meta. Their data
+    /// journals open `Recovering` too, so a data group whose seed voters
+    /// they are most of stalls, and a data plan after the meta plan
+    /// recovers it, as the operations order has it.
     async fn plan(&mut self) {
         let [discarded, _] = self.two_voters();
         self.cluster.discard_meta(discarded).await;
@@ -447,18 +448,22 @@ impl Run {
         let before = meta_checks::history_of(&self.cluster, survivor)
             .expect("the surviving meta voter applied a history");
         for victim in victims {
-            self.cluster.discard_meta(victim).await;
+            self.cluster.lose_run_state(victim).await;
         }
         for victim in victims {
             self.cluster.start_node(victim).await;
         }
-        self.step("meta_journals_lost");
+        self.step("run_state_lost");
         let nodes = self.nodes();
         self.recover_meta(&nodes).await;
         self.step("meta_plan");
         self.checks
             .plan_applied(&self.cluster, &mut self.trace, "meta_plan", &nodes, before)
             .await;
+        self.cluster
+            .recover_data(&mut self.trace, "data_plans")
+            .await;
+        self.step("data_plans");
         // I11 after the plan. Whether the plan restarted a replica, and
         // whether its drivers and shell then still act (D11), is not
         // checked here.
