@@ -2,7 +2,7 @@
 //! [`crate::RaftCommand::Meta`], the state its state machine holds and
 //! snapshots, and the answers it gives.
 //!
-//! Every type here is format (format epoch 6): persisted in the meta log and
+//! Every type here but those of [`confirm`] is format (format epoch 6): persisted in the meta log and
 //! its snapshot record, replicated, or sent between nodes, so its field
 //! order and variant names are the encoding (`ursula_stream::msgpack`). No
 //! type here uses `default`, `skip_serializing_if`, `flatten` or an untagged
@@ -21,11 +21,14 @@
 //!
 //! Module map:
 //!
+//! - [`confirm`]: why a meta read barrier confirmed no placement view
+//!   ([`confirm::MetaBarrierError`]), never encoded.
 //! - [`genesis`]: the genesis probe a node sends before the meta group
 //!   forms, and its answer.
 //! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, and
 //!   the bound on its size.
 
+pub mod confirm;
 pub mod genesis;
 pub mod snapshot;
 
