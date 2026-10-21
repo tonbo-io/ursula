@@ -254,8 +254,7 @@ authority, and missing stores do not initialize themselves.
 
 The policy covers sticky, one-source planned Pod replacement, current-token fresh
 prefix admission and all-retired completion after the original Pod UID is gone.
-Its inputs are operational evidence, not authentication. The chart's
-`maintenance-rollout.sh` Job drives planned Pod replacement through it. No
-component drives host recovery or calls a provider to terminate an instance, and
-this offline interface alone grants no disruption authority. The full protocol is
+Its inputs are operational evidence, not authentication. No component drives
+planned Pod replacement or host recovery through it, none calls a provider to
+terminate an instance, and this offline interface alone grants no disruption authority. The full protocol is
 documented in `docs/architecture/cluster-membership.md`.

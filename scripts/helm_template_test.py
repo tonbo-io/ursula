@@ -105,30 +105,6 @@ def hook_annotations(rendered: str) -> dict[tuple[str, str], dict[str, str]]:
 
 
 class HelmTemplateConfigTest(unittest.TestCase):
-    def test_rollout_target_starts_maintenance_drained(self) -> None:
-        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
-
-        self.assertIn(
-            'if [ -r "${rollout_state_dir}/phase" ] && [ -r "${rollout_state_dir}/node-id" ]; then',
-            rendered,
-        )
-        self.assertIn("        restarting)\n", rendered)
-        self.assertNotIn("upgrading-restart-quiesce", rendered)
-        self.assertIn('if [ "${rollout_node_id}" = "${node_id}" ]; then', rendered)
-        self.assertIn(
-            'export URSULA_START_MAINTENANCE_DRAINED="${start_maintenance_drained}"',
-            rendered,
-        )
-        self.assertNotIn("start_maintenance_drained =", render_config(*NAMED, "--set", "s3.bucket=bkt"))
-        self.assertIn(
-            "- name: rollout-state\n              mountPath: /var/run/ursula-rollout-state\n              readOnly: true",
-            rendered,
-        )
-        self.assertIn(
-            "- name: rollout-state\n          configMap:\n            name: test-ursula-rollout-state\n            optional: true",
-            rendered,
-        )
-
     def test_matching_deployment_contract_renders(self) -> None:
         render_chart(*NAMED, *deployment_contract_values())
 
@@ -167,193 +143,80 @@ class HelmTemplateConfigTest(unittest.TestCase):
             result.stderr,
         )
 
-    def test_server_update_strategy_defaults_to_rolling_update(self) -> None:
-        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt")
-
-        self.assertIn(
-            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: RollingUpdate",
-            rendered,
-        )
-        self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
-
-    def test_server_update_strategy_stages_on_delete_with_migration_hook(self) -> None:
-        rendered = render_chart(*NAMED, 
-            "--set",
-            "s3.bucket=bkt",
-            "--set",
-            "server.updateStrategy=OnDelete",
-        )
-
-        self.assertIn(
-            "podManagementPolicy: Parallel\n  updateStrategy:\n    type: OnDelete\n  selector:",
-            rendered,
-        )
-        self.assertIn("kind: Job\nmetadata:\n  name: test-ursula-ondelete-migration", rendered)
-
-        # Per resource, not once across the whole render: the hook only cleans
-        # up after itself if every object it creates carries the policy, and a
-        # missing Role or ServiceAccount leaves the Job unable to run at all.
-        migration = {
-            (kind, name): annotations
-            for (kind, name), annotations in hook_annotations(rendered).items()
-            if name == "test-ursula-ondelete-migration"
-        }
-        self.assertEqual(
-            {kind for kind, _ in migration},
-            {"ServiceAccount", "Role", "RoleBinding", "Job"},
-        )
-        for (kind, name), annotations in sorted(migration.items()):
-            with self.subTest(kind=kind, name=name):
-                self.assertEqual(annotations["helm.sh/hook"], "pre-upgrade")
-                self.assertEqual(
-                    annotations["helm.sh/hook-delete-policy"],
-                    "before-hook-creation,hook-succeeded,hook-failed",
+    def test_statefulset_rolls_with_rolling_update_under_parallel_management(self) -> None:
+        # The policy is pinned: a listener move recreates every pod at once,
+        # and OrderedReady would recreate one at a time, each waiting for a
+        # readiness that needs the others. RollingUpdate is all that rolls a
+        # voter, and readiness is all that paces it.
+        for name, values in {
+            "one voter": ("--set", "server.replicaCount=1"),
+            "three voters": (),
+            "five voters": ("--set", "server.replicaCount=5"),
+        }.items():
+            with self.subTest(name=name):
+                rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", *values)
+                statefulset = documents(rendered, "StatefulSet")["test-ursula"]
+                self.assertIn(
+                    "  podManagementPolicy: Parallel\n"
+                    "  # RollingUpdate replaces one pod at a time, each waiting for readiness.\n"
+                    "  updateStrategy:\n    type: RollingUpdate\n  selector:",
+                    statefulset,
                 )
-        self.assertIn(
-            '- --patch={"spec":{"updateStrategy":{"rollingUpdate":null}}}',
-            rendered,
-        )
-        self.assertIn("resourceNames:\n      - test-ursula", rendered)
-        job_pod = re.search(
-            r"kind: Job\n.*?template:\n    metadata:\n      labels:\n"
-            r"(?P<labels>.*?)    spec:",
-            rendered,
-            re.S,
-        )
-        self.assertIsNotNone(job_pod)
-        pod_labels = job_pod.group("labels")
-        self.assertIn("app.kubernetes.io/component: ondelete-migration", pod_labels)
-        self.assertNotIn("app.kubernetes.io/name:", pod_labels)
-        self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
-
-    def test_gitops_can_disable_the_duplicate_on_delete_migration(self) -> None:
-        rendered = render_chart(*NAMED, 
-            "--set",
-            "s3.bucket=bkt",
-            "--set",
-            "server.updateStrategy=OnDelete",
-            "--set",
-            "server.onDeleteMigration.enabled=false",
-        )
-
-        self.assertIn("updateStrategy:\n    type: OnDelete", rendered)
-        self.assertNotIn("app.kubernetes.io/component: ondelete-migration", rendered)
-
-    def test_graceful_rollout_hook_does_not_match_the_server_pdb(self) -> None:
-        rendered = render_chart(*NAMED, 
-            "--set",
-            "s3.bucket=bkt",
-            "--set",
-            "server.updateStrategy=OnDelete",
-            "--set",
-            "server.gracefulRollout.enabled=true",
-        )
-
-        rollout = {
-            (kind, name): annotations
-            for (kind, name), annotations in hook_annotations(rendered).items()
-            if name == "test-ursula-graceful-rollout"
-        }
-        self.assertEqual(
-            {kind for kind, _ in rollout},
-            {"ServiceAccount", "Role", "RoleBinding", "ConfigMap", "Job"},
-        )
-        for (kind, name), annotations in sorted(rollout.items()):
-            with self.subTest(kind=kind, name=name):
-                expected_delete_policy = (
-                    "before-hook-creation,hook-succeeded"
-                    if kind == "Job"
-                    else "before-hook-creation,hook-succeeded,hook-failed"
-                )
-                self.assertEqual(
-                    annotations["helm.sh/hook-delete-policy"],
-                    expected_delete_policy,
+                self.assertIn(
+                    "readinessProbe:\n            httpGet:\n              path: /__ursula/ready\n"
+                    "              port: client\n            periodSeconds: 5\n            timeoutSeconds: 2\n",
+                    statefulset,
                 )
 
-        job = re.search(
-            r"kind: Job\nmetadata:\n  name: test-ursula-graceful-rollout\n"
-            r".*?template:\n    metadata:\n      labels:\n"
-            r"(?P<labels>.*?)    spec:",
-            rendered,
-            re.S,
-        )
-        self.assertIsNotNone(job)
-        self.assertIn(
-            '"argocd.argoproj.io/hook-delete-policy": BeforeHookCreation,HookSucceeded',
-            job.group(0),
-        )
-        pod_labels = job.group("labels")
-        self.assertIn("app.kubernetes.io/component: graceful-rollout", pod_labels)
-        self.assertNotIn("app.kubernetes.io/name:", pod_labels)
-        self.assertNotIn("app.kubernetes.io/instance:", pod_labels)
+    def test_chart_renders_no_startup_ownership_or_rollout_machinery(self) -> None:
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "gateway.enabled=true",
+                                "--set", "server.networkPolicy.enabled=true")
+        # No hook, Job, RBAC or ConfigMap besides the entrypoint's.
+        self.assertEqual(hook_annotations(rendered).keys(), {("Pod", "test-ursula-wait-ready")})
+        for kind in ("Job", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"):
+            with self.subTest(kind=kind):
+                self.assertEqual(documents(rendered, kind), {})
+        self.assertEqual(list(documents(rendered, "ConfigMap")), ["test-ursula"])
+        for removed in (
+            "rollout-state",
+            "URSULA_START_MAINTENANCE_DRAINED",
+            "URSULA_STARTUP_",
+            "physical-instance",
+            "board_asset_tag",
+            "startup-api",
+            "serviceAccountToken",
+            "-maintenance",
+            "OnDelete",
+        ):
+            with self.subTest(removed=removed):
+                self.assertNotIn(removed, rendered)
 
-    def test_rollout_rbac_has_no_schema_one_controller_revision_permission(self) -> None:
-        for reserved in ("true", "false"):
-            with self.subTest(maintenance_reservation=reserved):
-                rendered = render_chart(*NAMED, 
-                    "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
-                    "--set", "server.gracefulRollout.enabled=true", "--set",
-                    f"server.gracefulRollout.maintenanceReservation={reserved}",
+    def test_removed_rollout_values_are_refused(self) -> None:
+        # The schema refuses every removed value, so an old values file fails
+        # at render instead of silently losing its strategy or its hooks.
+        for removed, key in (
+            ("server.updateStrategy=OnDelete", "updateStrategy"),
+            ("server.updateStrategy=RollingUpdate", "updateStrategy"),
+            ("server.podManagementPolicy=OrderedReady", "podManagementPolicy"),
+            ("server.podManagementPolicy=Parallel", "podManagementPolicy"),
+            ("server.probes.readiness.enabled=false", "enabled"),
+            ("server.onDeleteMigration.enabled=false", "onDeleteMigration"),
+            ("server.onDeleteMigration.image.tag=v1.33.3", "onDeleteMigration"),
+            ("server.startupOwnership.enabled=true", "startupOwnership"),
+            ("server.gracefulRollout.enabled=true", "gracefulRollout"),
+            ("server.gracefulRollout.maintenanceReservation=true", "gracefulRollout"),
+            ("server.gracefulRollout.kubectlImage.tag=1.33.3", "gracefulRollout"),
+        ):
+            with self.subTest(removed=removed):
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+                     "--set", removed],
+                    check=False,
+                    capture_output=True,
+                    text=True,
                 )
-                self.assertNotIn("controllerrevisions", rendered)
-                self.assertIn('resources: ["statefulsets"]', rendered)
-
-    def test_shared_maintenance_job_rbac_and_inventory(self) -> None:
-        values = (
-            "--namespace", "test", "--set", "s3.bucket=bkt", "--set",
-            "server.updateStrategy=OnDelete", "--set", "server.gracefulRollout.enabled=true",
-            "--set", "server.gracefulRollout.maintenanceReservation=true",
-            "--set", "server.coreCount=2", "--set", "raft.groupCount=256",
-        )
-        rendered = render_chart(*NAMED, *values)
-        self.assertIn("exec /bin/sh /opt/rollout/maintenance-rollout.sh", rendered)
-        self.assertIn('name: CORE_COUNT\n              value: "2"', rendered)
-        self.assertIn('name: EXPECTED_GROUPS\n              value: "256"', rendered)
-        self.assertIn('resourceNames: ["test-ursula-maintenance"]\n    verbs: ["get", "update"]', rendered)
-        cluster_role = re.search(r"kind: ClusterRole\n.*?(?=\n---)", rendered, re.S).group(0)
-        self.assertIn('resources: ["nodes"]\n    verbs: ["get"]', cluster_role)
-        self.assertIn('resourceNames: ["test"]', cluster_role)
-        self.assertNotIn('"delete"', cluster_role)
-        # Only the script ConfigMap is rendered: persistent state is deliberately
-        # not a disposable hook or an ordinary Helm resource that resets data.
-        names = re.findall(r"kind: ConfigMap\nmetadata:\n  name: ([^\n]+)", rendered)
-        self.assertNotIn("test-ursula-maintenance", names)
-        other = render_chart(*NAMED, *values, "--namespace", "other")
-        other_role = re.search(r"kind: ClusterRole\nmetadata:\n  name: ([^\n]+)", other).group(1)
-        this_role = re.search(r"kind: ClusterRole\nmetadata:\n  name: ([^\n]+)", rendered).group(1)
-        self.assertNotEqual(this_role, other_role)
-        for invalid in ("server.replicaCount=2", "server.gracefulRollout.expectedGroups=1"):
-            with self.subTest(invalid=invalid):
-                run = subprocess.run(["helm", "template", "test", "charts/ursula", *NAMED,
-                                      *values, "--set", invalid], text=True, capture_output=True)
-                self.assertNotEqual(run.returncode, 0)
-
-    def test_startup_ownership_is_explicit_and_has_only_exact_store_mutation(self) -> None:
-        values = ("--namespace", "test", "--set", "s3.bucket=bkt", "--set",
-                  "server.updateStrategy=OnDelete", "--set", "server.gracefulRollout.enabled=true",
-                  "--set", "server.gracefulRollout.maintenanceReservation=true",
-                  "--set", "server.startupOwnership.enabled=true")
-        rendered = render_chart(*NAMED, *values)
-        self.assertIn('name: URSULA_STARTUP_RESERVATION\n              value: "true"', rendered)
-        self.assertIn('fieldPath: metadata.uid', rendered)
-        self.assertIn('mountPath: /var/run/ursula-startup\n              readOnly: true', rendered)
-        self.assertIn('expirationSeconds: 600', rendered)
-        self.assertIn('name: kube-root-ca.crt', rendered)
-        self.assertIn('path: /sys/devices/virtual/dmi/id/board_asset_tag\n            type: File', rendered)
-        self.assertIn('mountPath: /var/run/ursula-physical-instance\n              readOnly: true', rendered)
-        startup_role = re.search(r'kind: Role\nmetadata:\n  name: test-ursula-startup\n(?P<body>.*?)(?=\n---)', rendered, re.S).group('body')
-        self.assertIn('resourceNames: ["test-ursula-maintenance"]\n    verbs: ["get", "update"]', startup_role)
-        self.assertNotIn('"delete"', startup_role)
-        self.assertNotIn('"create"', startup_role)
-        self.assertNotIn('"patch"', startup_role)
-        self.assertNotIn('URSULA_STARTUP_RESERVATION', render_chart(*NAMED, "--set", "s3.bucket=bkt"))
-        for invalid in ("server.replicaCount=2", "server.updateStrategy=RollingUpdate",
-                        "server.gracefulRollout.maintenanceReservation=false",
-                        "serviceAccount.create=false,serviceAccount.name=default",
-                        "server.extraEnv[0].name=URSULA_STARTUP_RESERVATION,server.extraEnv[0].value=false"):
-            with self.subTest(invalid=invalid):
-                result = subprocess.run(["helm", "template", "test", "charts/ursula", *NAMED, *values, "--set", invalid], text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
+                self.assertIn(key, result.stderr)
 
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(*NAMED, 
@@ -535,24 +398,13 @@ class HelmTemplateConfigTest(unittest.TestCase):
         render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.clusterListen=false",
                      "--set", "server.ports.cluster=4437")
 
-    def test_graceful_rollout_names_the_cluster_port(self) -> None:
-        for cluster_listen, port in (("true", "4439"), ("false", "4437")):
-            with self.subTest(cluster_listen=cluster_listen):
-                rendered = render_chart(
-                    *NAMED, "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
-                    "--set", "server.gracefulRollout.enabled=true",
-                    "--set", f"server.clusterListen={cluster_listen}",
-                )
-                self.assertIn(f"- name: CLUSTER_PORT\n              value: \"{port}\"", rendered)
-
-    def test_peers_manifest_and_rollout_agree_on_the_peer_host(self) -> None:
+    def test_peers_and_manifest_agree_on_the_peer_host(self) -> None:
         # A long fullname makes the headless Service name truncate, and a
-        # custom domain replaces cluster.local. The rollout manifest's
+        # custom domain replaces cluster.local. The Helm test manifest's
         # http_url names each node as its peers' [[raft.peers]] urls do.
         fullname = "u" * 58
         values = (
-            *NAMED, "--set", "s3.bucket=bkt", "--set", "server.updateStrategy=OnDelete",
-            "--set", "server.gracefulRollout.enabled=true", "--set", "global.clusterDomain=corp.example",
+            *NAMED, "--set", "s3.bucket=bkt", "--set", "global.clusterDomain=corp.example",
             "--set", f"fullnameOverride={fullname}",
         )
         rendered = render_chart(*values)
@@ -560,22 +412,6 @@ class HelmTemplateConfigTest(unittest.TestCase):
         manifest = re.search(r"cluster-manifest\.json: \|\n(?P<json>(?: {4}.*\n)+)", rendered)
         self.assertEqual([node["http_url"] for node in json.loads(manifest.group("json"))["nodes"]], peers)
         self.assertTrue(all(".svc.corp.example:" in url for url in peers))
-
-        job = documents(rendered, "Job")[f"{fullname}-graceful-rollout"[:63].rstrip("-")]
-        env = dict(re.findall(r"- name: ([A-Z_]+)\n {14}value: \"([^\"]*)\"", job))
-        script = subprocess.run(
-            ["sh", "-c", '. charts/ursula/files/graceful-rollout.sh && MANIFEST=$(mktemp) && write_manifest '
-             '&& cat "${MANIFEST}" && rm -f "${MANIFEST}"'],
-            env={
-                "PATH": "/usr/bin:/bin", "NAMESPACE": "default", "ROLLOUT_SOURCE_ONLY": "1",
-                **{key: env[key] for key in (
-                    "STATEFULSET", "REPLICAS", "EXPECTED_GROUPS", "TARGET_IMAGE", "CLUSTER_PORT",
-                    "CLUSTER_DOMAIN", "HEADLESS_SERVICE",
-                )},
-            },
-            capture_output=True, text=True, check=True,
-        )
-        self.assertEqual([node["http_url"] for node in json.loads(script.stdout)["nodes"]], peers)
 
     def test_network_policy_is_off_by_default(self) -> None:
         self.assertNotIn("test-ursula", documents(render_chart(*NAMED, "--set", "s3.bucket=bkt"), "NetworkPolicy"))
@@ -788,23 +624,10 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("walFsync", result.stderr)
 
     def test_every_server_pod_keeps_its_wal_on_the_raft_data_pvc(self) -> None:
-        ownership = (
-            "--namespace",
-            "test",
-            "--set",
-            "server.updateStrategy=OnDelete",
-            "--set",
-            "server.gracefulRollout.enabled=true",
-            "--set",
-            "server.gracefulRollout.maintenanceReservation=true",
-            "--set",
-            "server.startupOwnership.enabled=true",
-        )
         cases = {
             "one voter": ("--set", "server.replicaCount=1"),
             "three voters": ("--set", "server.replicaCount=3"),
             "five voters": ("--set", "server.replicaCount=5"),
-            "shared maintenance and startup ownership": ownership,
         }
         for name, values in cases.items():
             with self.subTest(name=name):

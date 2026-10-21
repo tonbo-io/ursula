@@ -227,43 +227,18 @@ refuses to take over a host recovery.
 
 ## 6. Kubernetes integration
 
-`server.updateStrategy = OnDelete` stages a new pod template without replacing
-any pod. `server.gracefulRollout.enabled` adds a post-upgrade Job that replaces
-voters one at a time from the highest ordinal down. Both are off by default.
+The chart's StatefulSet always updates by `RollingUpdate` under the `Parallel`
+pod management policy. The controller replaces one pod at a time, from the
+highest ordinal down, and moves on only once the replaced pod passes its
+readiness probe (`GET /__ursula/ready`), which the chart always renders. A
+replaced voter runs the graceful shutdown on `SIGTERM`: it hands off its
+leaderships, then records a clean shutdown, so its restart reads its journals
+strictly. The controller does not look at the other pods, so an upgrade starts
+only once `ursulactl verify-cluster` passes, and the default
+PodDisruptionBudget limits evictions to one voter at a time.
 
-With `gracefulRollout.maintenanceReservation = false`, the Job runs
-`files/graceful-rollout.sh`. For each stale voter it runs `verify-cluster`,
-`drain`, records the phase in the `<StatefulSet>-rollout-state` ConfigMap,
-deletes the Pod with a UID precondition, waits for the node to return as a
-caught-up voter with `ursulactl wait`, then runs `undrain` and verifies the
-cluster again. The entrypoint starts the replacement drained when the state
-names it `restarting`. The Job refuses to run once a
-`<StatefulSet>-maintenance` store exists. Its Role can delete Pods, forward
-ports, read StatefulSets and write ConfigMaps.
-
-With `maintenanceReservation = true`, the Job runs
-`files/maintenance-rollout.sh`, which requires three voters, an
-`expectedGroups` equal to `raft.groupCount` and a bootstrapped store. It drives
-the planned Pod transitions of section 5. A failed or cancelled Job keeps the
-reservation, and the next Job takes it over. Its Role is limited to get and
-update on the exact store, and a ClusterRole grants read access to Nodes and
-the namespace.
-
-`server.startupOwnership.enabled` makes every server launch, including
-container restarts, run `startup-admit` (section 4). It requires the
-reservation rollout, three voters, OnDelete and a dedicated non-default service
-account. The chart disables automatic token mounting, projects a short-lived
-token and the cluster CA, and grants get and update on the store, get on the
-three named Pods and the StatefulSet, and read access to Nodes and the
-namespace. The only provider is `aws-nitro`. The chart mounts
-`/sys/devices/virtual/dmi/id/board_asset_tag` read-only, and the helper
-requires its instance ID to match the scheduled Node's `providerID` and zone
-label. An idle launch must match the catalogued Pod and host. During an
-operation an unbound replacement binds its fresh boot through the same CAS
-before it opens any listener, and a later restart of a bound boot is refused.
-
-An interrupted bound host replacement has no automatic recovery. A replacement
-voter that dies, before or after its group leaders reached it, stays a voter of
-every group, so `verify-survivors` proves its loss and the operator restages
-the host. Nothing drives host recovery automatically, and `startupOwnership`
-stays off by default.
+`Parallel` matters for a listener move (`server.clusterListen`,
+`server.ports.cluster`). Every server pod is deleted at once after the
+`helm upgrade`, and the controller recreates them together. Under
+`OrderedReady` it would recreate one at a time, each waiting for a readiness
+that needs the others.
