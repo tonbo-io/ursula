@@ -125,8 +125,16 @@ one: a `307 Temporary Redirect` to the leader, with `x-ursula-raft-leader-id`,
 hosts no replica of the stream's group to one that does, which names the group
 alone in `x-ursula-raft-group`:
 
-- It sends the request to the upstream that the redirect's `Location` names,
-  unless the request already went to that upstream.
+- After a leader redirect, it sends the request to the upstream that the
+  redirect's `Location` names, unless the request already went to that
+  upstream. When that upstream cannot be connected to, the request ends with
+  `503` and `Retry-After`.
+- The host that a non-hosting node's redirect names is a hint, often the
+  node its group moves away from. The gateway sends the request there only
+  when the request has not tried that upstream and it is not ejected. A hop
+  to it that cannot connect sent nothing, so the gateway searches on as it
+  does after a search hop that cannot connect. A blackholed host costs one
+  connect, after which it is ejected and later hints to it are passed over.
 - Otherwise, and when the `Location` names no upstream because `--upstream`
   names the nodes otherwise than their client URLs, it searches: it sends the
   request to the next upstream it has not tried yet, starting after the one

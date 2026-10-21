@@ -9,8 +9,12 @@
 //! never gets one: up to three hops after the first, none starting later than
 //! 5 s after the first redirect. A redirect to an address that is not one of
 //! the upstreams, or to an upstream the request already went to, sends the
-//! request to an upstream it has not tried yet instead. When no upstream
-//! answers without redirecting within those limits, the client gets a
+//! request to an upstream it has not tried yet instead. The host a
+//! non-hosting node's redirect names is a hint: the request goes there only
+//! while that upstream is not ejected, and when it cannot connect there the
+//! search goes on, as it does from a hop to an upstream no redirect named. A
+//! leader redirect's target that cannot connect ends the request. When no
+//! upstream answers without redirecting within those limits, the client gets a
 //! retryable `503`. This keeps internal node addresses from clients, and SSE
 //! live reads from looping when the first upstream is a follower. Other
 //! redirects stay visible to clients, with the upstream's address stripped
@@ -90,6 +94,7 @@ use tracing::debug;
 use tracing::error;
 use ursula_headers::ErrorBody;
 use ursula_headers::ErrorCode;
+use ursula_headers::RoutingAnswer;
 use ursula_headers::SizeLimit;
 use ursula_headers::immutable;
 use ursula_headers::lowered_request_limit;
@@ -917,13 +922,20 @@ impl Gateway {
     /// Forwards a request to `upstream` and follows the Raft leader redirects
     /// of its answers (see [`Chain`]), so that a client never gets one.
     ///
-    /// - A redirect sends the request to the upstream its `Location` names,
-    ///   unless the request already went to that upstream in this chain.
+    /// - A leader redirect (`NotLeader`) sends the request to the upstream its
+    ///   `Location` names, unless the request already went to that upstream in
+    ///   this chain.
+    /// - A redirect from a node that hosts no replica of the group
+    ///   (`NotHosted`) names a host only as a hint, often the dead node the
+    ///   group moves away from. The request goes there only when the upstream
+    ///   is not ejected ([`Ejections::claim`]).
     /// - Otherwise, and when the `Location` names no upstream (`--upstream`
     ///   names the nodes otherwise than their client URLs), the request goes to
     ///   an upstream it has not tried yet, the next after the one that
-    ///   redirected in the configured order. Such a search hop that cannot
-    ///   connect sent nothing, so the search goes on to the next one.
+    ///   redirected in the configured order.
+    /// - A search hop or a hinted hop that cannot connect sent nothing, so the
+    ///   search goes on to the next upstream. A leader hop that cannot connect
+    ///   ends the request.
     /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
     ///   starts later than [`LEADER_REDIRECT_DEADLINE`] after the first
     ///   redirect. When no upstream answers without redirecting within those
@@ -959,17 +971,18 @@ impl Gateway {
                 Ok(response) => response,
                 Err(error) => {
                     self.upstream_failed(pin_key.as_deref(), &target, &error);
-                    // A search hop that could not connect sent nothing: look
-                    // on among the upstreams the request has not tried.
-                    if chain.searching
+                    // A search or hinted hop that could not connect sent
+                    // nothing: look on among the upstreams the request has not
+                    // tried.
+                    if chain.lead.searches_on_connect_failure()
                         && matches!(error, GatewayError::LeaderUnreachable { .. })
                         && let Some(next) = chain
                             .may_follow(Instant::now())
                             .then(|| self.untried_upstream(&chain))
                             .flatten()
                     {
-                        self.followed(&target, &next, true);
-                        chain.follow(next, true);
+                        self.followed(&target, &next, Lead::Search);
+                        chain.follow(next, Lead::Search);
                         continue;
                     }
                     self.chain_ended(&chain, started);
@@ -988,6 +1001,7 @@ impl Gateway {
                 self.forget_leader_if_matches(key, &target);
             }
             chain.redirected(Instant::now());
+            let hinted = is_not_hosted(&response);
             let named = self
                 .resolve_leader_upstream(response.headers())
                 .map(str::to_owned);
@@ -995,9 +1009,15 @@ impl Gateway {
             drop(response);
             let next = chain
                 .may_follow(Instant::now())
-                .then(|| self.next_hop(&chain, named))
+                .then(|| {
+                    if hinted {
+                        self.next_hinted_hop(&chain, named)
+                    } else {
+                        self.next_hop(&chain, named)
+                    }
+                })
                 .flatten();
-            let Some((next, searching)) = next else {
+            let Some((next, lead)) = next else {
                 self.metrics
                     .leader_not_found
                     .fetch_add(1, Ordering::Relaxed);
@@ -1006,8 +1026,8 @@ impl Gateway {
                     followed: chain.redirects,
                 });
             };
-            self.followed(&target, &next, searching);
-            chain.follow(next, searching);
+            self.followed(&target, &next, lead);
+            chain.follow(next, lead);
         }
     }
 
@@ -1016,23 +1036,42 @@ impl Gateway {
     /// `Location` names. It goes there unless the request already went to it,
     /// else to an upstream it has not tried ([`Gateway::untried_upstream`]),
     /// else back to `named`. `None` when there is nowhere to go.
-    fn next_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, bool)> {
+    fn next_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
         match named {
-            Some(leader) if !chain.tried.contains(&leader) => Some((leader, false)),
+            Some(leader) if !chain.tried.contains(&leader) => Some((leader, Lead::Leader)),
             named => self
                 .untried_upstream(chain)
-                .map(|upstream| (upstream, true))
-                .or_else(|| named.map(|leader| (leader, false))),
+                .map(|upstream| (upstream, Lead::Search))
+                .or_else(|| named.map(|leader| (leader, Lead::Leader))),
         }
     }
 
+    /// Where a request goes after a `NotHosted` redirect, whose `Location`
+    /// names `named`, a host as the redirecting node's view has it. It goes
+    /// there only when the request has not tried it and [`Ejections::claim`]
+    /// admits it, else to an upstream it has not tried
+    /// ([`Gateway::untried_upstream`]), else to `named` all the same, as
+    /// selection falls back to an ejected upstream rather than none. `None`
+    /// when there is nowhere to go.
+    fn next_hinted_hop(&self, chain: &Chain, named: Option<String>) -> Option<(String, Lead)> {
+        if let Some(host) = &named
+            && !chain.tried.contains(host)
+            && self.ejections.claim(host, Instant::now())
+        {
+            return named.map(|host| (host, Lead::Hint));
+        }
+        self.untried_upstream(chain)
+            .map(|upstream| (upstream, Lead::Search))
+            .or_else(|| named.map(|host| (host, Lead::Hint)))
+    }
+
     /// Counts a hop that follows a redirect, a search hop among them.
-    fn followed(&self, from: &str, to: &str, searching: bool) {
-        debug!(from, to, searching, "following a leader redirect");
+    fn followed(&self, from: &str, to: &str, lead: Lead) {
+        debug!(from, to, ?lead, "following a leader redirect");
         self.metrics
             .leader_redirects
             .fetch_add(1, Ordering::Relaxed);
-        if searching {
+        if lead == Lead::Search {
             self.metrics.leader_searches.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1475,6 +1514,32 @@ enum Hop {
     Followed,
 }
 
+/// What sent a forwarded request to the upstream of the hop under way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lead {
+    /// Selection picked it for the first hop.
+    Picked,
+    /// A leader redirect (`NotLeader`) named it.
+    Leader,
+    /// A redirect from a node that hosts no replica of the group
+    /// (`NotHosted`) named it, a hint that may name a node that is down.
+    Hint,
+    /// No redirect named it: an upstream the request had not tried.
+    Search,
+}
+
+impl Lead {
+    /// Whether a hop that cannot connect, and so sent nothing, goes on to an
+    /// upstream the request has not tried instead of ending the request. A
+    /// leader hop ends it: the leader is the only node that can serve it.
+    fn searches_on_connect_failure(self) -> bool {
+        match self {
+            Self::Hint | Self::Search => true,
+            Self::Picked | Self::Leader => false,
+        }
+    }
+}
+
 /// The hops of one forwarded request ([`Gateway::forward`]).
 struct Chain {
     /// The upstream of the hop under way.
@@ -1483,8 +1548,8 @@ struct Chain {
     tried: Vec<String>,
     /// Hops that followed a redirect so far, search hops included.
     redirects: usize,
-    /// Whether the hop under way goes to an upstream that no redirect named.
-    searching: bool,
+    /// What sent the request to `target`.
+    lead: Lead,
     /// When the first redirect arrived: [`LEADER_REDIRECT_DEADLINE`] counts
     /// from it.
     first_redirect: Option<Instant>,
@@ -1496,7 +1561,7 @@ impl Chain {
             target: first.to_owned(),
             tried: vec![first.to_owned()],
             redirects: 0,
-            searching: false,
+            lead: Lead::Picked,
             first_redirect: None,
         }
     }
@@ -1524,10 +1589,10 @@ impl Chain {
                 .is_none_or(|first| now.saturating_duration_since(first) < LEADER_REDIRECT_DEADLINE)
     }
 
-    /// Sends the next hop to `next`, a search hop when no redirect named it.
-    fn follow(&mut self, next: String, searching: bool) {
+    /// Sends the next hop to `next`, which `lead` chose.
+    fn follow(&mut self, next: String, lead: Lead) {
         self.redirects = self.redirects.saturating_add(1);
-        self.searching = searching;
+        self.lead = lead;
         self.tried.push(next.clone());
         self.target = next;
     }
@@ -1543,6 +1608,22 @@ fn is_raft_redirect(response: &reqwest::Response) -> bool {
         && [names::X_URSULA_RAFT_LEADER_ID, names::X_URSULA_RAFT_GROUP]
             .iter()
             .any(|name| response.headers().contains_key(*name))
+}
+
+/// Whether a Raft redirect is [`RoutingAnswer::NotHosted`], whose target is
+/// a hint, rather than a leader redirect. A redirect whose routing headers do
+/// not parse counts as a leader redirect, as before the hint rule.
+fn is_not_hosted(response: &reqwest::Response) -> bool {
+    matches!(
+        RoutingAnswer::parse(
+            response.status().as_u16(),
+            response
+                .headers()
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        ),
+        Ok(Some(RoutingAnswer::NotHosted { .. }))
+    )
 }
 
 /// Per-request context available once access control has classified and
