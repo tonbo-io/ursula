@@ -558,7 +558,8 @@ mod tests {
             log_dir: wal.path().join("raft-log"),
         };
         let state = super::init_state(&config, persistence).await.unwrap();
-        let response = crate::admin_router(state)
+        let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let response = crate::admin_router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/__ursula/metrics")
@@ -573,6 +574,13 @@ mod tests {
                 .unwrap();
         assert_eq!(metrics["process_node_id"], 7);
         assert_eq!(metrics["process_incarnation"].as_str().unwrap().len(), 32);
+        // The WAL shuts down before its directory goes: a journal that
+        // first syncs after the directory was removed cannot sync it,
+        // poisons and aborts the test process.
+        assert!(matches!(
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
+            super::WalShutdown::Clean(_)
+        ));
     }
 
     /// A node without a WAL (in-memory mode) names the configured cluster

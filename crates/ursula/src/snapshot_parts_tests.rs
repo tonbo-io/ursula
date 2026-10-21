@@ -1830,6 +1830,7 @@ async fn a_new_raft_term_lists_the_stream_again() {
     // No meta runs here, so the test settles the fresh root's binding.
     spawned.bind_without_meta();
     let runtime = spawned.runtime;
+    let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm");
     let raft = registry.get(RaftGroupId(0)).expect("group 0");
@@ -1838,7 +1839,7 @@ async fn a_new_raft_term_lists_the_stream_again() {
         .await
         .expect("leader");
     let cold_store = runtime.cold_store().expect("a memory cold store");
-    let mut state = HttpState::with_raft_registry(runtime, registry.clone());
+    let mut state = HttpState::with_raft_registry(runtime.clone(), registry.clone());
     state.set_staged_parts(crate::staged_parts::StagedParts::for_test(3, 1_000));
     let app = router_with_http_state(state.clone());
     create(&app, "/parts/s").await;
@@ -1915,5 +1916,6 @@ async fn a_new_raft_term_lists_the_stream_again() {
         ursula_headers::StagedPartsLimit::Parts(3),
         "the new term counted the part staged elsewhere"
     );
+    crate::tests::shutdown_test_wal(&runtime, &raft_wal).await;
     crate::tests::remove_test_path(&raft_root);
 }

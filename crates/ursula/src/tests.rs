@@ -521,7 +521,7 @@ fn registered_durable_factory(
 /// so the test may then remove the WAL directory. Removing it under a live
 /// core writer fails the writer's next journal write, which stops the
 /// process.
-async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
+pub(crate) async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
     assert!(
         matches!(
             crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
@@ -1788,19 +1788,18 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     ));
     remove_test_path(&raft_root);
 
-    let app = router(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::Raft {
-                log_dir: raft_root.clone(),
-            },
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
-    );
+    let spawned = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::Raft {
+            log_dir: raft_root.clone(),
+        },
+        Topology::SingleNode {
+            raft_group_count: 1,
+        },
+    )
+    .expect("runtime");
+    let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
+    let app = router(spawned.runtime.clone());
     let response = http_put(
         &app,
         "/benchcmp/raft-http",
@@ -1872,6 +1871,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
         "expected raft journal records, got {journal_len} bytes"
     );
 
+    shutdown_test_wal(&spawned.runtime, &raft_wal).await;
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
 }
 
@@ -1903,6 +1903,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     // No meta runs here, so the test settles the fresh root's binding.
     spawned.bind_without_meta();
     let runtime = spawned.runtime;
+    let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
@@ -1913,7 +1914,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .await
         .expect("wait for leader");
     let app = router_with_static_raft_cluster(
-        runtime,
+        runtime.clone(),
         registry,
         crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
     );
@@ -1959,6 +1960,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         "core journal should contain records"
     );
 
+    shutdown_test_wal(&runtime, &raft_wal).await;
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
 }
 
@@ -2055,7 +2057,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("restarted runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
-        let opening = spawned.raft_wal.expect("restarted WAL").opening();
+        let raft_wal = spawned.raft_wal.expect("restarted WAL");
+        let opening = raft_wal.opening();
         assert_eq!(
             opening.previous_run,
             ursula_raft::wal::diagnostics::PreviousRun::Clean
@@ -2081,7 +2084,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "restarted durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for restarted leader");
-        let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
         let shutdown_runtime = runtime.clone();
         let app = router_with_static_raft_cluster(runtime, registry, peers);
 
@@ -2094,10 +2096,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         let body = body_bytes(response).await;
         assert_eq!(&body[..], b"restart-payload");
         drop(app);
-        shutdown_runtime
-            .shutdown_group_engine(placement)
-            .await
-            .expect("shut down restarted durable group");
+        shutdown_test_wal(&shutdown_runtime, &raft_wal).await;
     }
 
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
@@ -8493,6 +8492,11 @@ mod snapshot_driver {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{stream_id}");
         }
         drop(app);
+        let raft_wal = spawned
+            .raft_wal
+            .as_ref()
+            .expect("a single node runs its WAL");
+        super::shutdown_test_wal(&runtime, raft_wal).await;
         drop(spawned);
         drop(root);
     }
@@ -8571,6 +8575,11 @@ mod snapshot_driver {
         .await;
         assert_eq!(appended.status(), StatusCode::NO_CONTENT);
         drop(app);
+        let raft_wal = spawned
+            .raft_wal
+            .as_ref()
+            .expect("a single node runs its WAL");
+        super::shutdown_test_wal(&runtime, raft_wal).await;
         drop(spawned);
         drop(root);
     }
