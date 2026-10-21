@@ -4110,6 +4110,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "ursula-config",
+ "ursula-control",
  "ursula-ctl",
  "ursula-gateway",
  "ursula-headers",

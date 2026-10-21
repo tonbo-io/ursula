@@ -545,7 +545,7 @@ fn registered_durable_factory(
 /// process.
 async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
     assert_eq!(
-        crate::server::shutdown_raft_wal(runtime, Some(raft_wal)).await,
+        crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
         crate::server::WalShutdown::Clean,
         "the Raft WAL shuts down cleanly"
     );

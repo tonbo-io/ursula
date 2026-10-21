@@ -1,0 +1,140 @@
+//! The meta group on a server node: the spawn path binds the node's peer
+//! identity and opens the meta journal ([`open_meta`]), before the runtime
+//! starts and so before any data group of the run opens. `init_state`
+//! then starts the meta runtime on that journal ([`SpawnedMeta::start`])
+//! and keeps it in a [`MetaSlot`] until shutdown.
+
+use std::num::NonZeroU32;
+use std::sync::Arc;
+use std::sync::Mutex;
+use std::sync::PoisonError;
+
+use ursula_control::MaintenanceAuthority;
+use ursula_control::default_meta_voters;
+use ursula_control::effective_replication_factor;
+use ursula_proto::placement::GenesisClaim;
+use ursula_proto::placement::GroupCount;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::NodeSet;
+use ursula_raft::PeerDirectory;
+use ursula_raft::PeerIdentity;
+use ursula_raft::RaftEngineConfig;
+use ursula_raft::RaftGroupHandleRegistry;
+use ursula_raft::RaftWal;
+use ursula_raft::meta::formation::FormationParams;
+use ursula_raft::meta::replica::MetaSnapshotTrigger;
+use ursula_raft::meta::runtime::GrpcMetaRuntime;
+use ursula_raft::meta::runtime::MetaJournal;
+use ursula_raft::meta::runtime::MetaRuntimeConfig;
+use ursula_shard::ShardMapError;
+
+/// What the spawn path prepared for the meta runtime: the opened meta
+/// journal, the node's peer identity, WAL and registry, and the meta
+/// runtime's config.
+#[derive(Debug)]
+pub struct SpawnedMeta {
+    journal: MetaJournal,
+    identity: PeerIdentity,
+    wal: RaftWal,
+    registry: RaftGroupHandleRegistry,
+    config: MetaRuntimeConfig,
+}
+
+impl SpawnedMeta {
+    /// Starts the meta runtime over gRPC on the prepared journal.
+    pub(crate) async fn start(self) -> MetaSlot {
+        let runtime = GrpcMetaRuntime::start_over_grpc(
+            self.config,
+            self.journal,
+            self.wal,
+            self.registry,
+            self.identity,
+        )
+        .await;
+        MetaSlot(Arc::new(Mutex::new(Some(runtime))))
+    }
+}
+
+/// Where the server keeps its meta runtime until shutdown takes it.
+#[derive(Debug, Clone, Default)]
+pub struct MetaSlot(Arc<Mutex<Option<GrpcMetaRuntime>>>);
+
+impl MetaSlot {
+    /// The meta runtime, once: shutdown stops it.
+    pub(crate) fn take(&self) -> Option<GrpcMetaRuntime> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).take()
+    }
+
+    /// Reads the meta runtime, if it still runs.
+    #[cfg(test)]
+    pub(crate) fn with<T>(&self, read: impl FnOnce(&GrpcMetaRuntime) -> T) -> Option<T> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(read)
+    }
+}
+
+/// Binds this node's peer identity, its Raft node id and the cluster id
+/// of its WAL root, with its address book
+/// ([`ursula_config::RaftConfig::address_book`]), then opens the meta
+/// journal under `raft-log/meta/`. A journal that does not open is handed
+/// on as such: the meta runtime then runs `Damaged` and the node serves.
+pub(crate) fn open_meta(
+    config: &ursula_config::UrsulaConfig,
+    wal: &RaftWal,
+    registry: &RaftGroupHandleRegistry,
+    shard_map: &ursula_shard::StaticShardMap,
+    engine: RaftEngineConfig,
+    snapshots: MetaSnapshotTrigger,
+) -> Result<SpawnedMeta, ShardMapError> {
+    let raft = &config.raft;
+    let identity = PeerIdentity::new(raft.node_id, wal.cluster_id().clone());
+    let book = raft.address_book(&self_url(&config.server));
+    registry
+        .peer_cluster()
+        .bind(identity.clone(), PeerDirectory::from_config(&book));
+
+    let me = NodeId::new(raft.node_id);
+    let peers = NodeSet::from_first(me, book.iter().map(|peer| NodeId::new(peer.node_id)));
+    let group_count = NonZeroU32::new(shard_map.raft_group_count())
+        .map(GroupCount::new)
+        .ok_or(ShardMapError::ZeroRaftGroups)?;
+    let claim = GenesisClaim {
+        meta_voters: raft
+            .meta_voters
+            .clone()
+            .unwrap_or_else(|| default_meta_voters(&peers)),
+        replication_factor: effective_replication_factor(raft.placement.replication_factor, &peers),
+        peers,
+        group_count,
+    };
+    let metrics = ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+    Ok(SpawnedMeta {
+        journal: MetaJournal {
+            opened: wal.open_meta(metrics.clone()),
+            metrics,
+        },
+        identity,
+        wal: wal.clone(),
+        registry: registry.clone(),
+        config: MetaRuntimeConfig {
+            node: raft.node_id,
+            claim,
+            formation: FormationParams {
+                max_concurrent_moves: raft.placement.max_concurrent_moves,
+                maintenance: MaintenanceAuthority::Placement,
+            },
+            engine,
+            snapshots: Some(snapshots),
+        },
+    })
+}
+
+/// The cluster URL of a node whose `raft.peers` is empty, for its own
+/// address book entry: its cluster listener, else its client listener.
+fn self_url(server: &ursula_config::ServerConfig) -> String {
+    let listen = server.cluster_listen.as_deref().unwrap_or(&server.listen);
+    format!("http://{listen}")
+}
