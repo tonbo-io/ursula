@@ -45,70 +45,9 @@ server:
   # Supported fresh-install values are 1, 3, and 5. Changing this value on an
   # initialized cluster does not perform safe Raft voter reconfiguration.
   replicaCount: 3
-  # StatefulSet pod management policy. Parallel avoids readiness-gated bootstrap serialization.
-  podManagementPolicy: Parallel
   # Allow the voter's overall 20-second shutdown budget, which includes up to
   # 5 seconds of leadership handoff, plus Kubernetes termination overhead.
   terminationGracePeriodSeconds: 30
-  # RollingUpdate lets Kubernetes replace pods automatically. OnDelete stages
-  # new templates without restarting voters so an external graceful-rollout
-  # controller can drain and replace exactly one pod at a time.
-  updateStrategy: RollingUpdate
-  # Helm pre-upgrade migration used only when updateStrategy=OnDelete. It
-  # removes a live StatefulSet's defaulted/stale rollingUpdate fields before
-  # Helm changes the strategy type.
-  onDeleteMigration:
-    # Disable only when a GitOps PreSync hook performs the same patch.
-    enabled: true
-    image:
-      repository: registry.k8s.io/kubectl
-      tag: v1.33.3
-      pullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: 20m
-        memory: 32Mi
-      limits:
-        memory: 64Mi
-  # Post-upgrade job that finishes what OnDelete deliberately leaves undone.
-  # OnDelete stages a new pod template and replaces nothing, because Kubernetes
-  # cannot know which voter is safe to lose; this drains one node, replaces it,
-  # waits for it to rejoin and catch up, verifies the cluster, and only then
-  # moves on. Without it an OnDelete upgrade never reaches the new image.
-  # Enable only after a settled pre-fault host catalog exists in the shared store.
-  # Every server launch claims its fresh boot before opening Raft transport.
-  startupOwnership:
-    enabled: false
-    # Read-only Nitro kernel instance identity must match the scheduled Node.
-    provider: aws-nitro
-  gracefulRollout:
-    # Off by default: it is only meaningful with updateStrategy=OnDelete, and
-    # it needs RBAC to delete pods and forward ports.
-    enabled: false
-    # Shared CAS/process fencing requires all voters to support maintenance
-    # tokens and an explicitly bootstrapped persistent <StatefulSet>-maintenance
-    # ConfigMap. A missing store fails closed; this hook never initializes it.
-    # false uses the rollout controller without a shared maintenance store.
-    # Enable this after bootstrapping the store for coordinated maintenance.
-    maintenanceReservation: false
-    # Groups `ursulactl verify-cluster` should find. Defaults to raft.groupCount.
-    expectedGroups: null
-    # Ceiling for the whole rollout, not one node. Draining and catching up a
-    # lagging voter can take a long time, and cutting it short mid-rollout
-    # leaves the cluster on mixed versions.
-    activeDeadlineSeconds: 7200
-    # The rollout runs from the Ursula image for `ursulactl`, and copies a
-    # kubectl in from here rather than adding one to the server image.
-    kubectlImage:
-      repository: alpine/k8s
-      tag: 1.33.3
-      pullPolicy: IfNotPresent
-    resources:
-      requests:
-        cpu: 100m
-        memory: 128Mi
-      limits:
-        memory: 256Mi
   ports:
     # Ursula public client-plane HTTP port (stream reads/writes).
     client: 4437
@@ -120,8 +59,8 @@ server:
   # Service never exposes the cluster plane. false serves both planes on
   # ports.client, so anyone who reaches the client Service reaches Raft.
   # A change moves every voter's cluster listener and needs every voter
-  # restarted together: upgrade with OnDelete and gracefulRollout.enabled
-  # false, then delete every voter pod at once.
+  # restarted together: run helm upgrade without --wait or --atomic, then
+  # delete every server pod at once.
   clusterListen: true
   # The mutating admin plane stays on pod loopback by default. A trusted
   # in-cluster operator or chaos controller may opt in to a pod-reachable bind
@@ -194,8 +133,8 @@ server:
       failureThreshold: 180
       periodSeconds: 5
       timeoutSeconds: 2
+    # Always rendered: readiness is what paces a RollingUpdate.
     readiness:
-      enabled: true
       periodSeconds: 5
       timeoutSeconds: 2
     liveness:

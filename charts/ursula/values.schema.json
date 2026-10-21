@@ -210,71 +210,10 @@
           ],
           "description": "Fresh-cluster Ursula voter pod count. Supported values are 1, 3, and 5."
         },
-        "podManagementPolicy": {
-          "type": "string",
-          "enum": [
-            "OrderedReady",
-            "Parallel"
-          ],
-          "description": "StatefulSet pod management policy."
-        },
         "terminationGracePeriodSeconds": {
           "type": "integer",
           "minimum": 21,
           "description": "Voter termination grace period; must exceed the server's overall 20-second shutdown budget, including leadership handoff."
-        },
-        "updateStrategy": {
-          "type": "string",
-          "enum": [
-            "RollingUpdate",
-            "OnDelete"
-          ],
-          "description": "StatefulSet update strategy. OnDelete stages templates for an external graceful-rollout controller."
-        },
-        "onDeleteMigration": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "Helm pre-upgrade migration that clears live rollingUpdate state before switching to OnDelete.",
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "image": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "repository": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "tag": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "pullPolicy": {
-                  "type": "string",
-                  "enum": [
-                    "Always",
-                    "IfNotPresent",
-                    "Never"
-                  ]
-                }
-              },
-              "required": [
-                "repository",
-                "tag",
-                "pullPolicy"
-              ]
-            },
-            "resources": {
-              "type": "object"
-            }
-          },
-          "required": [
-            "enabled",
-            "image",
-            "resources"
-          ]
         },
         "ports": {
           "type": "object",
@@ -467,9 +406,6 @@
               "type": "object",
               "additionalProperties": false,
               "properties": {
-                "enabled": {
-                  "type": "boolean"
-                },
                 "periodSeconds": {
                   "type": "integer",
                   "minimum": 1
@@ -480,7 +416,6 @@
                 }
               },
               "required": [
-                "enabled",
                 "periodSeconds",
                 "timeoutSeconds"
               ]
@@ -563,95 +498,10 @@
             "affinity",
             "topologySpreadConstraints"
           ]
-        },
-        "gracefulRollout": {
-          "type": "object",
-          "additionalProperties": false,
-          "description": "Post-upgrade job that drains, replaces and verifies one voter at a time. Only meaningful with updateStrategy=OnDelete, which stages a new template without replacing any pod.",
-          "properties": {
-            "enabled": {
-              "type": "boolean"
-            },
-            "expectedGroups": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "minimum": 1,
-              "description": "Groups verify-cluster should find. Null defaults to raft.groupCount."
-            },
-            "activeDeadlineSeconds": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "kubectlImage": {
-              "type": "object",
-              "additionalProperties": false,
-              "properties": {
-                "repository": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "tag": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "pullPolicy": {
-                  "type": "string",
-                  "enum": [
-                    "Always",
-                    "IfNotPresent",
-                    "Never"
-                  ]
-                }
-              },
-              "required": [
-                "repository",
-                "tag",
-                "pullPolicy"
-              ]
-            },
-            "resources": {
-              "type": "object"
-            },
-            "maintenanceReservation": {
-              "type": "boolean",
-              "description": "Use shared persistent reservation CAS and process fencing for planned Pod rollouts. Requires explicit new-cell store bootstrap and token-capable voters; missing stores fail closed. False uses the rollout controller for clusters without a shared maintenance store."
-            }
-          },
-          "required": [
-            "enabled",
-            "activeDeadlineSeconds",
-            "kubectlImage",
-            "resources"
-          ]
-        },
-        "startupOwnership": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "enabled": {
-              "type": "boolean",
-              "description": "Require a settled host catalog and pre-transport boot admission through the shared maintenance CAS."
-            },
-            "provider": {
-              "type": "string",
-              "enum": [
-                "aws-nitro"
-              ]
-            }
-          },
-          "required": [
-            "enabled",
-            "provider"
-          ]
         }
       },
       "required": [
         "replicaCount",
-        "podManagementPolicy",
-        "updateStrategy",
-        "onDeleteMigration",
         "ports",
         "adminListen",
         "service",

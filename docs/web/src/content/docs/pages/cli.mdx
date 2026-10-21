@@ -53,7 +53,7 @@ ursulactl pin-incarnations --config cluster.json > pinned-cluster.json
 ursulactl drain --config pinned-cluster.json --node 3
 ```
 
-The saved nodes carry `expected_process_incarnation`. After an admitted Pod replacement, `pin-incarnations --replace-node 3` can bind that one replacement. Every survivor must still match its saved identity. The Helm rollout persists these pins and the admitted source/replacement Pod UIDs in state schema 3. Resuming the same replacement validates its saved process instead of refreshing it after a container restart. It stops on a missing saved plan, changed survivor, or another unadmitted replacement.
+The saved nodes carry `expected_process_incarnation`. After an admitted Pod replacement, `pin-incarnations --replace-node 3` can bind that one replacement. Every survivor must still match its saved identity. Resuming the same replacement validates its saved process instead of refreshing it after a container restart. It stops on a missing saved plan, changed survivor, or another unadmitted replacement.
 
 `pin-incarnations` requires a process incarnation from every node, including an explicitly selected replacement. Nodes that do not report one are refused. `verify-quorum` records the identity of every observed process, and reservation steps compare that map with the saved plan. Instance identity does not serialize concurrent executors or prove a failed host is physically fenced.
 
@@ -79,7 +79,7 @@ New processes start `unclaimed`, explicitly uncertified until admission. An expl
 
 Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/leader-transfer, maintenance drain, cold-flush trigger, bucket purge) plus metrics and usage are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics and usage.
 
-Metrics and readiness use an explicit `metrics_url` when configured, then `client_url`, then `admin_url`. The client and admin planes serve them. The Raft `http_url` is never used for them, since a cluster listener serves neither. The chart's rollout hook sets `metrics_url` to its Pod-bound admin tunnel so it can inspect a replacement before cluster DNS becomes reachable. Mutating verbs always use `admin_url`.
+Metrics and readiness use an explicit `metrics_url` when configured, then `client_url`, then `admin_url`. The client and admin planes serve them. The Raft `http_url` is never used for them, since a cluster listener serves neither. Set `metrics_url` to reach a node's metrics through a separate forward, for example to inspect a replacement before its cluster DNS name resolves. Mutating verbs always use `admin_url`.
 
 ursulactl is a plain HTTP client and opens no tunnels itself. When the admin plane is not directly reachable, bring your own forward and point the manifest's `admin_url` at it. On Kubernetes, `kubectl port-forward` reaches the loopback-bound plane inside each pod:
 
@@ -254,8 +254,7 @@ authority, and missing stores do not initialize themselves.
 
 The policy covers sticky, one-source planned Pod replacement, current-token fresh
 prefix admission and all-retired completion after the original Pod UID is gone.
-Its inputs are operational evidence, not authentication. The chart's
-`maintenance-rollout.sh` Job drives planned Pod replacement through it. No
-component drives host recovery or calls a provider to terminate an instance, and
-this offline interface alone grants no disruption authority. The full protocol is
+Its inputs are operational evidence, not authentication. No component drives
+planned Pod replacement or host recovery through it, none calls a provider to
+terminate an instance, and this offline interface alone grants no disruption authority. The full protocol is
 documented in `docs/architecture/cluster-membership.md`.

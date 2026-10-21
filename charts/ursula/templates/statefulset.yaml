@@ -15,9 +15,13 @@ metadata:
 spec:
   serviceName: {{ include "ursula.headlessServiceName" . }}
   replicas: {{ $replicaCount }}
-  podManagementPolicy: {{ .Values.server.podManagementPolicy }}
+  # Parallel: a listener move recreates every pod at once, and OrderedReady
+  # would recreate one at a time, each waiting for a readiness that needs the
+  # others.
+  podManagementPolicy: Parallel
+  # RollingUpdate replaces one pod at a time, each waiting for readiness.
   updateStrategy:
-    type: {{ .Values.server.updateStrategy }}
+    type: RollingUpdate
   selector:
     matchLabels:
       {{- include "ursula.selectorLabels" . | nindent 6 }}
@@ -35,7 +39,7 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "ursula.serviceAccountName" . }}
-      automountServiceAccountToken: {{ if .Values.server.startupOwnership.enabled }}false{{ else }}{{ .Values.serviceAccount.automountServiceAccountToken }}{{ end }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
       enableServiceLinks: false
       terminationGracePeriodSeconds: {{ .Values.server.terminationGracePeriodSeconds }}
       {{- with .Values.global.imagePullSecrets }}
@@ -67,26 +71,6 @@ spec:
               protocol: TCP
             {{- end }}
           env:
-            {{- if .Values.server.startupOwnership.enabled }}
-            - name: URSULA_STARTUP_PROVIDER
-              value: {{ .Values.server.startupOwnership.provider | quote }}
-            - name: URSULA_STARTUP_RESERVATION
-              value: "true"
-            - name: URSULA_STARTUP_STATEFULSET
-              value: {{ include "ursula.fullname" . | quote }}
-            - name: URSULA_STARTUP_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-            - name: URSULA_STARTUP_POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: URSULA_STARTUP_POD_UID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.uid
-            {{- end }}
             - name: RUST_LOG
               value: {{ .Values.server.rustLog | quote }}
             {{- if $hasS3Credentials }}
@@ -131,14 +115,12 @@ spec:
             periodSeconds: {{ .Values.server.probes.startup.periodSeconds }}
             timeoutSeconds: {{ .Values.server.probes.startup.timeoutSeconds }}
           {{- end }}
-          {{- if .Values.server.probes.readiness.enabled }}
           readinessProbe:
             httpGet:
               path: /__ursula/ready
               port: client
             periodSeconds: {{ .Values.server.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.server.probes.readiness.timeoutSeconds }}
-          {{- end }}
           {{- if .Values.server.probes.liveness.enabled }}
           livenessProbe:
             tcpSocket:
@@ -147,55 +129,22 @@ spec:
             timeoutSeconds: {{ .Values.server.probes.liveness.timeoutSeconds }}
           {{- end }}
           volumeMounts:
-            {{- if .Values.server.startupOwnership.enabled }}
-            - name: physical-instance
-              mountPath: /var/run/ursula-physical-instance
-              readOnly: true
-            - name: startup-api
-              mountPath: /var/run/ursula-startup
-              readOnly: true
-            {{- end }}
             - name: entrypoint
               mountPath: /opt/ursula/entrypoint
               readOnly: true
             - name: generated-config
               mountPath: /etc/ursula/generated
-            - name: rollout-state
-              mountPath: /var/run/ursula-rollout-state
-              readOnly: true
             - name: tmp
               mountPath: /tmp
             - name: raft-data
               mountPath: {{ .Values.raft.logDir }}
       volumes:
-        {{- if .Values.server.startupOwnership.enabled }}
-        - name: physical-instance
-          hostPath:
-            path: /sys/devices/virtual/dmi/id/board_asset_tag
-            type: File
-        - name: startup-api
-          projected:
-            defaultMode: 0440
-            sources:
-              - serviceAccountToken:
-                  path: token
-                  expirationSeconds: 600
-              - configMap:
-                  name: kube-root-ca.crt
-                  items:
-                    - key: ca.crt
-                      path: ca.crt
-        {{- end }}
         - name: entrypoint
           configMap:
             name: {{ include "ursula.fullname" . }}
             defaultMode: 0555
         - name: generated-config
           emptyDir: {}
-        - name: rollout-state
-          configMap:
-            name: {{ printf "%s-rollout-state" (include "ursula.fullname" .) }}
-            optional: true
         - name: tmp
           emptyDir: {}
       {{- with .Values.server.scheduling.nodeSelector }}

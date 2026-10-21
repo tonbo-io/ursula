@@ -2,7 +2,7 @@
 
 This chart installs Ursula as a static-membership Raft cluster on Kubernetes. The default install starts three voter pods, 64 Raft groups, durable per-pod Raft log PVCs, a headless peer Service, an internal client/admin ClusterIP Service, a quorum-protecting PodDisruptionBudget, default multi-pod spread hints, an optional stateless gateway Deployment, and a Helm test that verifies cluster readiness with `ursulactl wait-ready`.
 
-The chart uses a fixed configured voter set. Its optional graceful-rollout hook hands off leadership and verifies one replacement at a time. A replica that lost Raft log entries is gated, stays a voter, and is caught up by its group leaders without an operator. Online changes to the configured voter count still require a future Ursula operator workflow.
+The chart uses a fixed configured voter set. The StatefulSet updates by `RollingUpdate`, one pod at a time, each waiting for serving readiness, and every voter hands off its leaderships on `SIGTERM`. A replica that lost Raft log entries is gated, stays a voter, and is caught up by its group leaders without an operator. Online changes to the configured voter count still require a future Ursula operator workflow.
 
 ## Recommended Production Topology
 
@@ -11,7 +11,7 @@ The chart uses a fixed configured voter set. Its optional graceful-rollout hook 
 - Run at least two stateless gateway replicas behind an authenticated TLS ingress or load balancer. Keep the server and peer Services private.
 - Give Ursula a workload identity with least-privilege access to its S3 prefix. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for S3 errors, storage growth, and pod restarts.
 
-This topology removes single-pod compute failures from the normal request path, but it does not make chart upgrades an automated Raft operation. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place and server rollouts must be performed deliberately with health checks between pods. `server.updateStrategy=OnDelete` stages new pod templates without letting Kubernetes restart voters automatically, and `server.gracefulRollout.enabled=true` supplies the sequence it leaves undone: a post-upgrade job that drains one voter, replaces it, waits for it to rejoin and catch up, verifies the cluster, and only then moves to the next. Enable both together, or the upgrade stages a template that nothing ever applies. A Helm pre-upgrade hook removes stale `rollingUpdate` state before switching an existing StatefulSet to `OnDelete`; GitOps users that already provide an equivalent PreSync migration can disable it with `server.onDeleteMigration.enabled=false`.
+This topology removes single-pod compute failures from the normal request path. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place. `helm upgrade` rolls the voters with `RollingUpdate`: the controller replaces the highest ordinal first and moves to the next pod only once the replaced one passes its readiness probe, which waits until the pod's voter replicas caught up. Each replaced voter hands off its leaderships on `SIGTERM` before it stops. The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
 
 [`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, and an IRSA workload identity. It needs the AWS resources listed under [Prerequisites](#prerequisites).
 
@@ -92,7 +92,6 @@ ursulactl wait-ready \
 `wait-ready` succeeds only when every configured node reports the expected Raft
 group count and leaders, its metrics certify the complete configured voter set
 and an unambiguous maintenance fence, and `GET /__ursula/ready` returns 200.
-The rollout hook uses this same command before allowing another disruption.
 
 ## Access Locally
 
@@ -175,11 +174,21 @@ leader redirects name. The admin plane stays on pod loopback
 Set `server.clusterListen=false` to serve the client and cluster planes on the
 client port, as charts before 0.8 did. Anyone who reaches the client Service can
 then send Raft traffic. Changing it, or `server.ports.cluster`, later moves
-every voter's cluster listener, which needs every voter restarted together: run
-that `helm upgrade` with `server.updateStrategy=OnDelete` and
-`server.gracefulRollout.enabled=false`, since the graceful-rollout job restarts
-voters one at a time. Then delete every voter pod at once, and turn the
-graceful rollout back on with the next upgrade. See
+every voter's cluster listener, which needs every voter restarted together.
+Run that `helm upgrade` without `--wait` or `--atomic`, then delete every server
+pod at once with the release's server selector labels:
+
+```bash
+kubectl delete pod -l app.kubernetes.io/instance=<release>,app.kubernetes.io/name=<chart name or nameOverride>
+```
+
+The gateway's `-gateway` name does not match that selector. The upgrade starts
+the rollout itself. The controller replaces the highest ordinal, which comes up
+alone on the new port and stays unready, so the rollout cannot finish on its
+own. `--wait` would hang until its timeout, `--atomic` would roll the change
+back, and a GitOps sync shows Progressing until the delete. Expect one voter
+isolated in between. The recreated pods take the new revision, all together
+under the `Parallel` pod management policy. See
 [Changing a peer address](https://ursula.tonbo.io/docs/operations#changing-a-peer-address).
 
 A Service does not stop a pod from dialing another pod's IP. To restrict that,
@@ -215,9 +224,7 @@ node, which most CNIs admit whatever the policy says.
 
 If a majority of a group's voters lose their tail at once, the group has no leader and refuses writes, and the gated replicas report it stalled (readiness reason `recovery_stalled`). It resumes only after an operator accepts the loss of writes acknowledged after the last `fsync` with a recovery plan, sent with `ursulactl recover-group --accept-loss` or through `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` to the plan's leader first and then to the other voters. Set `raft.walFsync=always` to acknowledge every batch after `fsync` instead. See the [operations guide](https://ursula.tonbo.io/docs/operations#recovering-after-a-host-crash).
 
-These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Serving readiness (`/__ursula/ready`) checks the configured group inventory, running local voter replicas, recovery gates, applied membership and bounded local lag. While a voter that lost entries catches up, healthy surviving voters remain Service endpoints, while the catching-up voter stays NotReady. With three pods and the default PDB, that unavailable voter consumes the one allowed disruption. `ursulactl wait-ready` combines the existing serving probe with strict metrics evidence for complete uniform voter sets and an unambiguous maintenance fence. Rollout hooks therefore continue to block a second maintenance. Serving readiness does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes. This observation still requires an exclusive maintenance reservation and physical fencing before it can authorize a disruption.
-
-Reservation stores have one schema, version 1, for Pod replacement, host recovery and candidate restaging. Host inventory is optional data, and publishing it keeps the version. `ursulactl` refuses a store with any other version.
+These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Serving readiness (`/__ursula/ready`) checks the configured group inventory, running local voter replicas, recovery gates, applied membership and bounded local lag. While a voter that lost entries catches up, healthy surviving voters remain Service endpoints, while the catching-up voter stays NotReady. With three pods and the default PDB, that unavailable voter consumes the one allowed disruption, and a `RollingUpdate` does not move past it. `ursulactl wait-ready` combines the existing serving probe with strict metrics evidence for complete uniform voter sets. Serving readiness does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes.
 
 ## Static Membership And `server.replicaCount`
 
@@ -373,9 +380,11 @@ finds the 0.8 data on its volume and exits at startup. Recover with
 migration. Move the data through your applications, and give the new release
 its own `server.clusterId`. See the operations guide's "Upgrading to 0.9".
 
-Until the operator exists, Kubernetes StatefulSet rolling updates do not
-transfer leaders, coordinate applied-index catch-up, or mutate Raft membership.
-For a manual restart of one voter on an initialized cluster, run `ursulactl drain`,
+The StatefulSet updates by `RollingUpdate` and never changes Raft membership.
+Each replaced voter hands off its leaderships on `SIGTERM`, and the controller
+moves on only once the new pod passes its readiness probe, which waits for its
+voter replicas to catch up. Start an upgrade only when `ursulactl verify-cluster`
+passes. For a manual restart of one voter outside a rollout, run `ursulactl drain`,
 restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next voter.
 
 ## Values Reference
@@ -388,7 +397,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `global.image.tag` | `""` | Image tag. Empty uses the chart `appVersion`. |
 | `global.image.pullPolicy` | `IfNotPresent` | Kubernetes image pull policy for server, gateway, and test pods. |
 | `global.imagePullSecrets` | `[]` | Optional image pull secret references rendered into server, gateway, and test pods. |
-| `global.clusterDomain` | `cluster.local` | Kubernetes cluster DNS domain used for generated peer FQDNs, the Helm test's cluster manifest, the graceful-rollout manifest and gateway upstreams. A change rolls like any restart while the old domain still resolves. |
+| `global.clusterDomain` | `cluster.local` | Kubernetes cluster DNS domain used for generated peer FQDNs, the Helm test's cluster manifest and gateway upstreams. A change rolls like any restart while the old domain still resolves. |
 
 ### Cluster And Naming
 
@@ -411,15 +420,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | Value | Default | Description |
 | --- | --- | --- |
 | `server.replicaCount` | `3` | Fresh-cluster static voter pod count. Supported values are `1`, `3`, and `5`. Changing this on an initialized cluster is unsafe without the future operator workflow. |
-| `server.podManagementPolicy` | `Parallel` | StatefulSet pod management policy. `Parallel` starts all static voters without serializing on per-pod readiness. |
 | `server.terminationGracePeriodSeconds` | `30` | Must exceed the server's overall 20-second shutdown budget, including up to 5 seconds for leadership handoff before Raft transport closes. |
-| `server.updateStrategy` | `RollingUpdate` | StatefulSet update strategy. Use `OnDelete` only with an external controller that drains, restarts, catches up, undrains, and verifies one voter at a time. Helm clears stale `rollingUpdate` state with a pre-upgrade migration hook. |
-| `server.onDeleteMigration.enabled` | `true` | Run the Helm pre-upgrade migration when using `OnDelete`. Disable when a GitOps PreSync hook performs the equivalent patch. |
-| `server.gracefulRollout.enabled` | `false` | Run the post-upgrade job that drains, replaces and verifies one voter at a time. Only meaningful with `OnDelete`, which otherwise stages a template nothing applies. |
-| `server.gracefulRollout.expectedGroups` | `null` | Groups `ursulactl verify-cluster` must find between nodes. Defaults to `raft.groupCount`. |
-| `server.gracefulRollout.activeDeadlineSeconds` | `7200` | Ceiling for the whole rollout, not one node. Cutting it short leaves the cluster on mixed versions. |
-| `server.gracefulRollout.kubectlImage` | `alpine/k8s:1.33.3` | Kubectl copied in beside `ursulactl`, so the server image every node runs does not have to carry one. |
-| `server.onDeleteMigration.image` | `registry.k8s.io/kubectl:v1.33.3` | Kubectl image used by the Helm pre-upgrade migration when switching an existing StatefulSet to `OnDelete`. |
 | `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, the headless peer Service, the gateway upstreams and leader redirects (each peer's `client_url`) target this port. With `server.clusterListen=false` the generated Raft peer URLs target it too. |
 | `server.ports.cluster` | `4439` | Cluster-plane (Raft gRPC) process port, used when `server.clusterListen=true`. The generated Raft peer URLs and the headless peer Service target it. The client Service never exposes it. Must differ from `server.ports.client` and the `server.adminListen` port. |
 | `server.clusterListen` | `true` | Serve the cluster plane on `server.ports.cluster` (`server.cluster_listen`) instead of sharing the client port. With `false`, anyone who reaches the client Service reaches Raft. A change moves every voter's cluster listener and needs every voter restarted together. |
@@ -443,7 +444,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.podSecurityContext` | `{fsGroup: 10001, fsGroupChangePolicy: OnRootMismatch}` | Pod-level securityContext for Ursula server pods. |
 | `server.securityContext` | `{runAsUser: 10001, runAsGroup: 10001, runAsNonRoot: true, readOnlyRootFilesystem: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}` | Container-level securityContext for the Ursula server container. |
 | `server.probes.startup` | `{enabled: true, failureThreshold: 180, periodSeconds: 5, timeoutSeconds: 2}` | TCP startup probe. The 15-minute budget allows S3 snapshot restore before Kubernetes enables liveness checks. |
-| `server.probes.readiness` | `{enabled: true, periodSeconds: 5, timeoutSeconds: 2}` | HTTP `GET /__ursula/ready` probe. It removes the pod from service while the WAL free-space guard is active, or after a Raft protocol (format-epoch) mismatch with a peer until the pod restarts (`format_epoch_mismatch`). |
+| `server.probes.readiness` | `{periodSeconds: 5, timeoutSeconds: 2}` | HTTP `GET /__ursula/ready` probe, always rendered since it paces `RollingUpdate`. It removes the pod from service while the WAL free-space guard is active, or after a Raft protocol (format-epoch) mismatch with a peer until the pod restarts (`format_epoch_mismatch`). |
 | `server.probes.liveness` | `{enabled: true, periodSeconds: 10, timeoutSeconds: 2}` | TCP liveness probe enabled after startup succeeds. |
 | `server.podDisruptionBudget.enabled` | `true` | Render a PDB for multi-node clusters. The chart omits the PDB when `server.replicaCount=1`. |
 | `server.podDisruptionBudget.maxUnavailable` | `1` | Maximum voluntary disruptions. The template fails if this value would allow loss of Raft quorum. |
