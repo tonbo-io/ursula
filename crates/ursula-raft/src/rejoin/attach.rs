@@ -18,6 +18,7 @@ use super::run_rejoin_vote_barrier;
 use crate::BarrierAnswer;
 use crate::RaftTarget;
 use crate::meta::MetaForwardError;
+use crate::meta::confirm::BarrierFailure;
 use crate::meta::genesis::GenesisProbe;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::replica::ReplicaStateMachine;
@@ -146,7 +147,8 @@ pub(super) async fn wait_change<T: Send + Sync>(
 /// the one seam through which a replica's gate, the meta runtime and its
 /// drivers ask other nodes, over gRPC or in process.
 pub trait RecoveryTransport: Clone + Send + Sync + 'static {
-    type Error: fmt::Debug + Send;
+    /// Why a barrier failed, which a meta read barrier classifies.
+    type Error: fmt::Debug + Send + Into<BarrierFailure>;
     /// Asks `peer` with the bootstrap probe vote, about the transport's own
     /// data group.
     fn probe(&self, peer: u64) -> impl Future<Output = Option<PeerGroupLog>> + Send;

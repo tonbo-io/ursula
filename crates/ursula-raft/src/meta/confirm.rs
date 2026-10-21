@@ -38,6 +38,8 @@ pub enum MetaBarrierError {
 }
 
 /// How a meta leader's barrier failed, as the transport classifies it.
+/// Every recovery transport's error converts into it
+/// ([`crate::RecoveryTransport::Error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum BarrierFailure {
     /// The leader could not be reached.
@@ -55,4 +57,26 @@ pub enum BarrierFailure {
     /// The leader refused the barrier.
     #[error("it refused the barrier ({code:?})")]
     Refused { code: tonic::Code },
+}
+
+impl BarrierFailure {
+    /// The failure a barrier call answered with `status` reads as: the
+    /// leader unreachable when the call failed at the transport or the
+    /// leader could not serve it, else the leader's refusal.
+    pub(crate) fn of_status(status: &tonic::Status) -> Self {
+        if crate::forward::is_transport_failure(status) {
+            return Self::Unreachable;
+        }
+        Self::Refused {
+            code: status.code(),
+        }
+    }
+}
+
+/// A barrier the leader refused in this process, classified as the same
+/// refusal over gRPC is (its one status conversion).
+impl From<crate::QuorumProofError> for BarrierFailure {
+    fn from(error: crate::QuorumProofError) -> Self {
+        Self::of_status(&tonic::Status::from(error))
+    }
 }

@@ -46,7 +46,15 @@
 //!   `AppendStream` item (`RaftAppendStreamError.refusing_node`);
 //! - barrier answers that echo the plane and the group they answer for and
 //!   carry the leader's memberships;
-//! - the genesis probe RPC;
+//! - the genesis probe RPC, which a node that runs no meta replica refuses
+//!   (`NOT_FOUND`) and a node that runs one answers with its own genesis
+//!   claim when the prober's differs, else with its meta replica's answer to
+//!   the probe vote;
+//! - the meta plane's forwarded write: a `GroupWrite` of the meta plane with
+//!   core and shard 0, answered per command with a control answer or a group
+//!   engine error, and refused (`INVALID_ARGUMENT`, before anything is
+//!   proposed) when it names no admitted sender or registers another node
+//!   than the sender the cluster check admitted;
 //! - the group engine error without its static-membership variant, with a
 //!   not-held WAL open, a control answer kind and a command of the other
 //!   plane, and with the closed `ApplyStopKind` in `ApplyStopped`, which no

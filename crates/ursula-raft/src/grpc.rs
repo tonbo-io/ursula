@@ -66,6 +66,7 @@ use crate::peer_cluster::PeerIdentity;
 use crate::raft_internal_proto;
 use crate::target::RaftTarget;
 use crate::target::TargetedRequest;
+use crate::types::RaftCommand;
 use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
 use crate::types::UrsulaAppendEntriesResponse;
@@ -291,6 +292,26 @@ pub(crate) enum RecoveryProbeError {
     /// The answer's memberships are not a live leader's.
     #[error("recovery answer: {0}")]
     Memberships(#[from] crate::memberships::MalformedMembership),
+}
+
+/// How a barrier the gRPC recovery transport asked for failed: a peer not
+/// listed, or a call that failed at the transport, is unreachable; an
+/// answer that does not decode, names another target or carries malformed
+/// memberships is malformed.
+impl From<RecoveryProbeError> for crate::meta::confirm::BarrierFailure {
+    fn from(error: RecoveryProbeError) -> Self {
+        match error {
+            RecoveryProbeError::Channel(_) => Self::Unreachable,
+            RecoveryProbeError::Rpc(status) => Self::of_status(&status),
+            RecoveryProbeError::Payload(_)
+            | RecoveryProbeError::OtherTarget { .. }
+            | RecoveryProbeError::Memberships(_) => Self::Malformed,
+            RecoveryProbeError::NotLeader => Self::NotLeader,
+            RecoveryProbeError::OtherNode { node } => Self::OtherNode {
+                node: ursula_proto::placement::NodeId::new(node),
+            },
+        }
+    }
 }
 
 /// Confirm a group's current quorum without issuing an application write.
@@ -1178,11 +1199,15 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
             let request = request.into_inner();
             validate_grpc_metadata(request.protocol_version)?;
             let target = RaftTarget::parse(&request, local_node(&self.registry)?)?;
-            let commands = request
-                .command_payloads
-                .iter()
-                .map(|payload| decode_rpc_payload(payload, "group command"))
-                .collect::<Result<Vec<_>, _>>()?;
+            // The commands decode once the replica is found, so a request
+            // for a group this node does not run is `NOT_FOUND` either way.
+            let commands = |request: &raft_internal_proto::GroupWriteRequestV1| {
+                request
+                    .command_payloads
+                    .iter()
+                    .map(|payload| decode_rpc_payload(payload, "group command"))
+                    .collect::<Result<Vec<RaftCommand>, _>>()
+            };
             let results = match target {
                 RaftTarget::Data(group) => {
                     let placement = placement_from_parts(
@@ -1197,6 +1222,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .map_err(group_rpc_status)?;
                     let raft = entry.raft().clone();
                     let history = entry.core.history.clone();
+                    let commands = commands(&request)?;
                     let count = commands.len();
                     // A refusal of the whole batch answers each command with
                     // it, so the sender keeps the leader's typed answer (a
@@ -1222,7 +1248,7 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                         .ok_or_else(|| no_meta_replica("GroupWrite"))?;
                     write_results(
                         meta.write_forwarded(
-                            commands,
+                            commands(&request)?,
                             ursula_proto::placement::NodeId::new(sender),
                         )
                         .await?,

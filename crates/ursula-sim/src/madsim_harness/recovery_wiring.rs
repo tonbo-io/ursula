@@ -21,6 +21,7 @@ use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftTarget;
 use ursula_raft::RecoveryGateStatus;
 use ursula_raft::meta::MetaForwardError;
+use ursula_raft::meta::confirm::BarrierFailure;
 use ursula_raft::meta::genesis::GenesisProbe;
 use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
 use ursula_shard::ShardPlacement;
@@ -45,6 +46,15 @@ pub(super) enum RecoveryProbeError {
     Partitioned,
     Proof(ursula_raft::QuorumProofError),
 }
+impl From<RecoveryProbeError> for BarrierFailure {
+    fn from(error: RecoveryProbeError) -> Self {
+        match error {
+            RecoveryProbeError::Partitioned => Self::Unreachable,
+            RecoveryProbeError::Proof(error) => error.into(),
+        }
+    }
+}
+
 impl std::fmt::Display for RecoveryProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {

@@ -502,7 +502,7 @@ impl ForwardError {
 /// `Unavailable` (connect), `Cancelled` (deadline), `Unknown` (a broken
 /// connection or a keepalive timeout); a leader answers `Unavailable` while
 /// its group owner is stopped.
-fn is_transport_failure(status: &tonic::Status) -> bool {
+pub(crate) fn is_transport_failure(status: &tonic::Status) -> bool {
     matches!(
         status.code(),
         tonic::Code::Unavailable
