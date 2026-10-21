@@ -1089,6 +1089,16 @@ fn answer_fence(
     registry.peer_cluster().check_receiver_fence()
 }
 
+/// The refusal of a `GroupWrite` answer this node's fence stopped after the
+/// write ran: `UNAVAILABLE` without `ursula-fence`, which a forwarder reads
+/// as a leader that could not serve a write it may have committed
+/// ([`crate::forward::ForwardError::Transport`], an unknown outcome).
+pub(crate) fn fenced_after_write(fenced: crate::peer_cluster::PeerClusterError) -> tonic::Status {
+    tonic::Status::unavailable(format!(
+        "{fenced}, after the write ran: its outcome is unknown"
+    ))
+}
+
 /// One item of an `AppendStream` frame, checked against the stream's
 /// open-time identities (`admitted`). A fence refusal is `Err`: it ends the
 /// stream with that status, in its trailers, as an item cannot carry it.
@@ -1401,7 +1411,10 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     )
                 }
             };
-            answer_fence(&self.registry)?;
+            // The handler ran: a refusal now must not read as one before it.
+            if let Err(fenced) = self.registry.peer_cluster().check_receiver_fence() {
+                return Err(fenced_after_write(fenced));
+            }
             Ok(tonic::Response::new(
                 raft_internal_proto::GroupWriteResponseV1 { results },
             ))
@@ -2712,7 +2725,7 @@ async fn run_append_session(
         client.append_stream(request),
     )
     .await;
-    let mut responses = match response {
+    let (mut responses, opened) = match response {
         Ok(Ok(response)) => {
             // The stream binds one process at each end at its open: the one
             // this node named, or, if it named none, one the table accepts.
@@ -2725,7 +2738,7 @@ async fn run_append_session(
                 return;
             }
             GRPC_APPEND_STREAM_SESSIONS_OPENED.fetch_add(1, Ordering::Relaxed);
-            response.into_inner()
+            (response.into_inner(), stamp.incarnation)
         }
         Ok(Err(status)) => {
             GRPC_APPEND_STREAM_SESSION_FAILURES.fetch_add(1, Ordering::Relaxed);
@@ -2743,8 +2756,14 @@ async fn run_append_session(
         }
     };
 
-    // The process the stream is bound to, as the table holds it.
-    let bound = peer_cluster.target_incarnation(target);
+    // The process the stream is bound to: the one its open accepted, never
+    // a later read of the table, which another session may have raised to
+    // a newer process meanwhile. A node without an incarnation of its own
+    // holds no entry (`target_incarnation` is `None`), and binds none.
+    let bound = peer_cluster
+        .identity()
+        .and_then(|identity| identity.incarnation())
+        .and(opened);
     let mut wire_sender = Some(wire_sender);
     let mut pending = PendingAppends::default();
     let mut next_request_id = 1_u64;
@@ -3144,10 +3163,11 @@ mod reconnect_tests {
     /// Each fence refusal of the transport classifies as a lost RPC,
     /// never as a misdelivery, a peer of another cluster or another format
     /// epoch: a fenced receiver's refusal, read by the sender as
-    /// `FenceRefusal::Fenced` of the target itself, and the sender's own,
-    /// before a send and at an answer's arrival, `UNAVAILABLE` with no
-    /// metadata, so it never reads as a refusal by the peer. Both are
-    /// unreachable peers to OpenRaft, which backs off.
+    /// `FenceRefusal::Fenced` of the target itself, which retires the
+    /// channel, and the sender's own, before a send and at an answer's
+    /// arrival, `UNAVAILABLE` with no metadata, so it never reads as a
+    /// refusal by the peer. Both are unreachable peers to OpenRaft, which
+    /// backs off.
     #[tokio::test]
     async fn fence_refusals_classify_as_lost_rpcs_at_both_ends() {
         use crate::peer_cluster::PeerClusterError;
@@ -3167,7 +3187,14 @@ mod reconnect_tests {
         assert!(!crate::format_epoch::is_protocol_mismatch(&receiver));
         let (error, refusal) = net.map_tonic_status("Append", receiver);
         assert!(matches!(error, RPCError::Unreachable(_)), "{error:?}");
-        assert_eq!(refusal, None);
+        // A fenced target asks the sender to retire the channel and dial
+        // again.
+        assert_eq!(
+            refusal,
+            Some(PeerRefusal::Fence {
+                effect: crate::incarnation::Effect::Retire
+            })
+        );
 
         // A leased fence whose lease never began admits nothing.
         let fence = ursula_runtime::NodeFence::leased(Duration::from_secs(5));
@@ -4655,11 +4682,17 @@ mod barrier_asker_tests {
             "http://{}",
             listener.local_addr().expect("barrier peer address")
         );
+        // A misdelivery comes from the node the address serves now, whose
+        // answers carry its own node id.
+        let serving = match script {
+            Script::Misdelivered(node) => node,
+            _ => LEADER,
+        };
         let server = tokio::spawn(
             tonic::transport::Server::builder()
                 .add_service(super::raft_grpc_server(
                     ScriptedBarrier { script },
-                    &crate::peer_cluster::test_peer_cluster(LEADER),
+                    &crate::peer_cluster::test_peer_cluster(serving),
                 ))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );

@@ -558,25 +558,26 @@ impl PeerCluster {
     /// before it is decoded: this node's fence at the answer's arrival,
     /// then the stamp's node and incarnation, which raises the table when
     /// accepted. A node without an incarnation of its own checks only its
-    /// fence.
+    /// fence. Every discarded answer is counted, one that reached this node
+    /// fenced included.
     pub(crate) fn accept_responder(&self, target: u64, stamp: Stamp) -> Result<(), Discarded> {
         let bound = self.0.bound.load();
         let Some(bound) = bound.as_deref() else {
             return Ok(());
         };
-        if !bound.identity.fence().admits_now() {
-            return Err(Discarded::Fenced);
-        }
-        if bound.identity.incarnation().is_none() {
+        let judged = if !bound.identity.fence().admits_now() {
+            Err(Discarded::Fenced)
+        } else if bound.identity.incarnation().is_none() {
             return Ok(());
-        }
-        let judged = match (stamp.node, stamp.incarnation) {
-            (Some(node), _) if node != target => Err(Discarded::OtherNode { node }),
-            (_, None) => Err(Discarded::Unstamped),
-            (_, Some(seen)) => match bound.book.observe(target, seen) {
-                Judgement::Accept => Ok(()),
-                judgement => Err(Discarded::Stale { judgement }),
-            },
+        } else {
+            match (stamp.node, stamp.incarnation) {
+                (Some(node), _) if node != target => Err(Discarded::OtherNode { node }),
+                (_, None) => Err(Discarded::Unstamped),
+                (_, Some(seen)) => match bound.book.observe(target, seen) {
+                    Judgement::Accept => Ok(()),
+                    judgement => Err(Discarded::Stale { judgement }),
+                },
+            }
         };
         match judged {
             Ok(()) => bound.book.counts().accepted(),
