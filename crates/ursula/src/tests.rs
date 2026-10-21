@@ -5982,7 +5982,7 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
         .registry
         .get(RaftGroupId(0))
         .expect("drained follower group");
-    // Do not let the separate recovery gate hide a broken maintenance fence.
+    // Do not let the separate recovery gate hide a broken drain mark.
     // Every replica must finish recovery while the leader still ticks.
     tokio::time::timeout(Duration::from_secs(10), async {
         while nodes
@@ -5993,7 +5993,7 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
         }
     })
     .await
-    .expect("all recovery barriers must open before testing the maintenance fence");
+    .expect("all recovery barriers must open before testing the drain mark");
     // Stop both other Raft engines so only the drained follower can campaign.
     // Disabling a peer's election flag can be overwritten by recovery policy;
     // disabling its ticker alone does not stop all outbound replication.

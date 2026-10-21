@@ -315,8 +315,8 @@ impl From<RecoveryProbeError> for crate::meta::confirm::BarrierFailure {
 }
 
 /// Confirm a group's current quorum without issuing an application write.
-/// This is a point-in-time observation, not a maintenance reservation or a
-/// promise that another participant cannot disrupt a voter immediately after.
+/// This is a point-in-time observation, not a promise that another
+/// participant cannot disrupt a voter immediately after.
 #[cfg(all(test, not(madsim)))]
 pub(crate) async fn confirm_quorum_prefix(
     transport: Arc<CoreRaftTransport>,

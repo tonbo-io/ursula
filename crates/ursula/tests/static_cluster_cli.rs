@@ -3396,7 +3396,7 @@ async fn cli_voter_replaced_with_an_empty_wal_heals_itself() {
     let stale_clear = ctl
         .set_maintenance_drain(&nodes[2], false)
         .await
-        .expect_err("old process must not clear replacement drain");
+        .expect_err("the old process incarnation is refused");
     assert!(stale_clear.to_string().contains("412"), "{stale_clear}");
     assert!(
         ctl.fetch_node(&nodes[2]).await.is_err(),
