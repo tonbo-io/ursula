@@ -16,7 +16,6 @@ use super::plan_decommission;
 use crate::placement::ControlApplied;
 use crate::placement::ControlCommand;
 use crate::placement::LifecycleChange;
-use crate::placement::MaintenanceAuthority;
 use crate::placement::MoveLimit;
 use crate::placement::samples::Driver;
 use crate::placement::samples::node;
@@ -176,10 +175,7 @@ fn a_retired_replica_cordoned_node_or_moving_group_takes_no_move() {
 
 #[test]
 fn a_seeded_group_is_blocked_until_it_reports() {
-    let mut driver = Driver::bootstrapped(
-        &[1, 2, 3, 4],
-        params(&[1, 2, 3, 4], 2, 3, 4, MaintenanceAuthority::Placement),
-    );
+    let mut driver = Driver::bootstrapped(&[1, 2, 3, 4], params(&[1, 2, 3, 4], 2, 3, 4));
     driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
     let plan = plan_decommission(driver.cluster(), &eligible(&[1, 2, 3, 4]));
     assert_eq!(plan, DecommissionPlan {

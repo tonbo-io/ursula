@@ -68,7 +68,6 @@ use crate::placement::HostingStep;
 use crate::placement::LifecycleChange;
 use crate::placement::LocalLog;
 use crate::placement::LocalReplica;
-use crate::placement::MaintenanceAuthority;
 use crate::placement::MembershipConfig;
 use crate::placement::MembershipStep;
 use crate::placement::MembershipTarget;
@@ -642,7 +641,6 @@ impl World {
             replication_factor,
             meta_voters: default_meta_voters(&nodes),
             max_concurrent_moves: MoveLimit::new(DEFAULT_MOVE_LIMIT),
-            maintenance: MaintenanceAuthority::Placement,
         };
         meta.apply(ControlCommand::Bootstrap {
             params,

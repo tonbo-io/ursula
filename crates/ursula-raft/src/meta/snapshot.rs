@@ -190,7 +190,6 @@ pub(crate) async fn run_meta_snapshot_trigger(
 mod tests {
     use ursula_control::ControlCommand;
     use ursula_control::ControlPlaneState;
-    use ursula_control::MaintenanceAuthority;
     use ursula_control::samples;
     use ursula_runtime::SnapshotCompression;
     use ursula_runtime::SnapshotLocation;
@@ -294,13 +293,7 @@ mod tests {
         }
         control
             .apply(at(), ControlCommand::Bootstrap {
-                params: samples::params(
-                    &nodes,
-                    ursula_proto::placement::MAX_GROUP_COUNT,
-                    3,
-                    4,
-                    MaintenanceAuthority::Placement,
-                ),
+                params: samples::params(&nodes, ursula_proto::placement::MAX_GROUP_COUNT, 3, 4),
                 nodes: samples::node_set(&nodes),
                 now_ms: 2,
             })

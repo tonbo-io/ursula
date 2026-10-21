@@ -38,7 +38,6 @@ use super::GroupPlacement;
 use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
-use super::MaintenanceAuthority;
 use super::Move;
 use super::MoveLimit;
 use super::Placements;
@@ -103,13 +102,7 @@ pub fn membership(term: u64, index: u64) -> MembershipLogId {
 
 /// Bootstrap parameters over `nodes`, with their default meta voters.
 /// `groups` and `rf` must not be zero.
-pub fn params(
-    nodes: &[u64],
-    groups: u32,
-    rf: u8,
-    limit: u32,
-    maintenance: MaintenanceAuthority,
-) -> ClusterParams {
+pub fn params(nodes: &[u64], groups: u32, rf: u8, limit: u32) -> ClusterParams {
     let nodes = node_set(nodes);
     ClusterParams {
         group_count: GroupCount::new(NonZeroU32::new(groups).expect("a sample has groups")),
@@ -118,7 +111,6 @@ pub fn params(
         ),
         meta_voters: super::default_meta_voters(&nodes),
         max_concurrent_moves: MoveLimit::new(limit),
-        maintenance,
     }
 }
 
@@ -144,10 +136,7 @@ impl Driver {
     /// A cluster of `nodes`, every group seeded and reported, with move
     /// limit 4.
     pub(crate) fn live(nodes: &[u64], groups: u32, rf: u8) -> Self {
-        let mut driver = Self::bootstrapped(
-            nodes,
-            params(nodes, groups, rf, 4, MaintenanceAuthority::Placement),
-        );
+        let mut driver = Self::bootstrapped(nodes, params(nodes, groups, rf, 4));
         for group in 0..groups {
             let group = RaftGroupId(group);
             let placement = driver.placement(group).clone();
@@ -307,7 +296,6 @@ pub fn sample_state() -> ControlPlaneState {
             replication_factor: ReplicationFactor::new(NonZeroU8::new(2).expect("non-zero")),
             meta_voters: voters(&[1, 2]),
             max_concurrent_moves: MoveLimit::new(5),
-            maintenance: MaintenanceAuthority::Placement,
         },
         nodes: BTreeMap::from([
             (node(1), NodeRecord {
@@ -342,64 +330,14 @@ pub fn sample_state() -> ControlPlaneState {
     })
 }
 
-/// A bootstrapped state under the startup reservation: nodes and meta
-/// voters 1, 2 and 3 at replication factor 3, one stable group.
-pub fn sample_reservation_state() -> ControlPlaneState {
-    ControlPlaneState::Bootstrapped(Cluster {
-        params: ClusterParams {
-            group_count: GroupCount::new(NonZeroU32::new(1).expect("non-zero")),
-            replication_factor: ReplicationFactor::new(NonZeroU8::new(3).expect("non-zero")),
-            meta_voters: voters(&[1, 2, 3]),
-            max_concurrent_moves: MoveLimit::new(6),
-            maintenance: MaintenanceAuthority::Reservation,
-        },
-        nodes: BTreeMap::from([
-            (node(1), NodeRecord {
-                lifecycle: NodeLifecycle::Active,
-                since_ms: 16,
-            }),
-            (node(2), NodeRecord {
-                lifecycle: NodeLifecycle::Active,
-                since_ms: 17,
-            }),
-            (node(3), NodeRecord {
-                lifecycle: NodeLifecycle::Cordoned,
-                since_ms: 18,
-            }),
-        ]),
-        groups: Placements(BTreeMap::from([(RaftGroupId(0), GroupPlacement::Live {
-            since: PlacementEpoch::new(meta(9, 28)),
-            converged_at: membership(10, 29),
-            target: Target::Stable {
-                voters: voters(&[1, 2, 3]),
-            },
-        })])),
-        retirements: BTreeMap::new(),
-    })
-}
-
-/// One state of every variant, and a bootstrapped one under each
-/// maintenance authority.
+/// One state of every variant.
 pub fn sample_states() -> Vec<ControlPlaneState> {
     every!(ControlPlaneState {
         ControlPlaneState::Forming { .. } => ControlPlaneState::Forming {
             registered: BTreeMap::from([(node(7), Registration { since_ms: 31 })]),
         },
         ControlPlaneState::FormationCut => ControlPlaneState::FormationCut,
-        ControlPlaneState::Bootstrapped(Cluster {
-            params: ClusterParams {
-                maintenance: MaintenanceAuthority::Placement,
-                ..
-            },
-            ..
-        }) => sample_state(),
-        ControlPlaneState::Bootstrapped(Cluster {
-            params: ClusterParams {
-                maintenance: MaintenanceAuthority::Reservation,
-                ..
-            },
-            ..
-        }) => sample_reservation_state(),
+        ControlPlaneState::Bootstrapped(..) => sample_state(),
     })
 }
 
@@ -411,7 +349,7 @@ pub fn sample_commands() -> Vec<ControlCommand> {
             now_ms: 41,
         },
         ControlCommand::Bootstrap { .. } => ControlCommand::Bootstrap {
-            params: params(&[1, 2, 3], 4, 3, 2, MaintenanceAuthority::Reservation),
+            params: params(&[1, 2, 3], 4, 3, 2),
             nodes: node_set(&[1, 2, 3]),
             now_ms: 42,
         },
@@ -561,7 +499,6 @@ pub fn sample_errors() -> Vec<ControlError> {
             reported: voters(&[16, 17]),
         },
         ControlError::MetaVoter { .. } => ControlError::MetaVoter { node: node(18) },
-        ControlError::ReservationAuthority => ControlError::ReservationAuthority,
         ControlError::Decommissioning { .. } => ControlError::Decommissioning { node: node(19) },
     });
     errors.extend(
@@ -575,7 +512,6 @@ pub fn sample_errors() -> Vec<ControlError> {
             BootstrapProblem::ReplicationFactorAboveNodes => {
                 BootstrapProblem::ReplicationFactorAboveNodes
             },
-            BootstrapProblem::ReservationTopology => BootstrapProblem::ReservationTopology,
         })
         .into_iter()
         .map(|problem| ControlError::InvalidBootstrap { problem }),

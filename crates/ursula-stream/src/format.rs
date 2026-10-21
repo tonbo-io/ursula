@@ -40,6 +40,10 @@
 //!   `ursula_raft::meta::snapshot::META_SNAPSHOT_MAX_STATE_BYTES` (16 MiB),
 //!   and the bound is fixed for the epoch, since a node refuses a meta
 //!   record or install above it;
+//! - placement parameters with no maintenance authority: `ClusterParams`
+//!   hold the group count, the replication factor, the meta voters and the
+//!   move limit, and the kernel refuses no `RequestMove`, no `Decommission`
+//!   and no `Bootstrap` topology on behalf of a startup reservation;
 //! - a plane and a target node on every Raft request, the plane of an
 //!   `AppendStream` in its `ursula-raft-plane` metadata, the refusal of a
 //!   request for another node, and the refusing node of a refused

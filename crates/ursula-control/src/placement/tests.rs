@@ -25,7 +25,6 @@ use super::GroupPlacement;
 use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
-use super::MaintenanceAuthority;
 use super::MetaDamageKind;
 use super::MetaLeaderReport;
 use super::MoveLimit;
@@ -69,14 +68,9 @@ fn forming(nodes: &[u64]) -> Driver {
     driver
 }
 
-fn bootstrap(
-    driver: &mut Driver,
-    nodes: &[u64],
-    rf: u8,
-    maintenance: MaintenanceAuthority,
-) -> ControlResponse {
+fn bootstrap(driver: &mut Driver, nodes: &[u64], rf: u8) -> ControlResponse {
     driver.apply(ControlCommand::Bootstrap {
-        params: params(nodes, 2, rf, 4, maintenance),
+        params: params(nodes, 2, rf, 4),
         nodes: node_set(nodes),
         now_ms: 2,
     })
@@ -95,7 +89,7 @@ fn not_bootstrapped_refuses_every_placement_command_while_forming() {
 fn already_bootstrapped_refuses_a_second_bootstrap() {
     let mut driver = Driver::live(&[1, 2, 3], 2, 3);
     let error = driver.refused(ControlCommand::Bootstrap {
-        params: params(&[1, 2, 3], 2, 3, 4, MaintenanceAuthority::Placement),
+        params: params(&[1, 2, 3], 2, 3, 4),
         nodes: node_set(&[1, 2, 3]),
         now_ms: 3,
     });
@@ -112,7 +106,7 @@ fn formation_cut_refuses_everything_after_a_plans_history_event() {
     );
     assert_eq!(driver.state, ControlPlaneState::FormationCut);
     let error = driver.refused(ControlCommand::Bootstrap {
-        params: params(&[1, 2, 3], 2, 3, 4, MaintenanceAuthority::Placement),
+        params: params(&[1, 2, 3], 2, 3, 4),
         nodes: node_set(&[1, 2, 3]),
         now_ms: 3,
     });
@@ -131,7 +125,7 @@ fn formation_cut_refuses_everything_after_a_plans_history_event() {
 #[test]
 fn invalid_bootstrap_names_its_problem() {
     let mut driver = forming(&[1, 2, 3]);
-    let mut with_voters = params(&[1, 2, 3], 2, 3, 4, MaintenanceAuthority::Placement);
+    let mut with_voters = params(&[1, 2, 3], 2, 3, 4);
     with_voters.meta_voters = voters(&[1, 4]);
     let error = driver.refused(ControlCommand::Bootstrap {
         params: with_voters,
@@ -146,7 +140,7 @@ fn invalid_bootstrap_names_its_problem() {
     ));
 
     let above = MAX_GROUP_COUNT.checked_add(1).unwrap();
-    let over = params(&[1, 2, 3], above, 3, 4, MaintenanceAuthority::Placement);
+    let over = params(&[1, 2, 3], above, 3, 4);
     let error = driver.refused(ControlCommand::Bootstrap {
         params: over,
         nodes: node_set(&[1, 2, 3]),
@@ -159,13 +153,7 @@ fn invalid_bootstrap_names_its_problem() {
         } if count.get() == above
     ));
     let at_bound = ControlCommand::Bootstrap {
-        params: params(
-            &[1, 2, 3],
-            MAX_GROUP_COUNT,
-            3,
-            4,
-            MaintenanceAuthority::Placement,
-        ),
+        params: params(&[1, 2, 3], MAX_GROUP_COUNT, 3, 4),
         nodes: node_set(&[1, 2, 3]),
         now_ms: 3,
     };
@@ -173,22 +161,12 @@ fn invalid_bootstrap_names_its_problem() {
 
     let mut two = forming(&[1, 2]);
     let error = two.refused(ControlCommand::Bootstrap {
-        params: params(&[1, 2], 2, 3, 4, MaintenanceAuthority::Placement),
+        params: params(&[1, 2], 2, 3, 4),
         nodes: node_set(&[1, 2]),
         now_ms: 3,
     });
     assert!(matches!(error, ControlError::InvalidBootstrap {
         problem: BootstrapProblem::ReplicationFactorAboveNodes
-    }));
-
-    let mut four = forming(&[1, 2, 3, 4]);
-    let error = four.refused(ControlCommand::Bootstrap {
-        params: params(&[1, 2, 3, 4], 2, 3, 4, MaintenanceAuthority::Reservation),
-        nodes: node_set(&[1, 2, 3, 4]),
-        now_ms: 3,
-    });
-    assert!(matches!(error, ControlError::InvalidBootstrap {
-        problem: BootstrapProblem::ReservationTopology
     }));
 }
 
@@ -196,7 +174,7 @@ fn invalid_bootstrap_names_its_problem() {
 fn unknown_node_refuses_a_bootstrap_over_an_unregistered_node() {
     let mut driver = forming(&[1, 2]);
     let error = driver.refused(ControlCommand::Bootstrap {
-        params: params(&[1, 2, 3], 2, 3, 4, MaintenanceAuthority::Placement),
+        params: params(&[1, 2, 3], 2, 3, 4),
         nodes: node_set(&[1, 2, 3]),
         now_ms: 3,
     });
@@ -267,10 +245,7 @@ fn stale_placement_refuses_a_move_or_report_naming_an_older_placement() {
 
 #[test]
 fn group_not_live_refuses_moving_a_seeded_group() {
-    let mut driver = Driver::bootstrapped(
-        &[1, 2, 3, 4],
-        params(&[1, 2, 3, 4], 1, 3, 4, MaintenanceAuthority::Placement),
-    );
+    let mut driver = Driver::bootstrapped(&[1, 2, 3, 4], params(&[1, 2, 3, 4], 1, 3, 4));
     let error = driver.refused(ControlCommand::RequestMove {
         group: G0,
         expected: driver.since(G0),
@@ -454,10 +429,7 @@ fn not_target_refuses_a_report_of_other_voters() {
         matches!(error, ControlError::NotTarget { reported, .. } if reported == voters(&[1, 2, 3]))
     );
     // A seeded group reports `rf` voters.
-    let mut seeded = Driver::bootstrapped(
-        &[1, 2, 3],
-        params(&[1, 2, 3], 1, 3, 4, MaintenanceAuthority::Placement),
-    );
+    let mut seeded = Driver::bootstrapped(&[1, 2, 3], params(&[1, 2, 3], 1, 3, 4));
     let error = seeded.refused(ControlCommand::ReportConverged {
         group: G0,
         since: seeded.since(G0),
@@ -477,32 +449,6 @@ fn meta_voter_refuses_decommissioning_a_meta_voter() {
         now_ms: 5,
     });
     assert!(matches!(error, ControlError::MetaVoter { node: n } if n == node(2)));
-}
-
-#[test]
-fn reservation_authority_refuses_moves_and_decommissions() {
-    let mut driver = forming(&[1, 2, 3]);
-    bootstrap(
-        &mut driver,
-        &[1, 2, 3],
-        3,
-        MaintenanceAuthority::Reservation,
-    )
-    .unwrap();
-    driver.report(G0, &[1, 2, 3]).unwrap();
-    let error = driver.refused(ControlCommand::RequestMove {
-        group: G0,
-        expected: driver.since(G0),
-        to: voters(&[1, 2, 3]),
-        now_ms: 5,
-    });
-    assert!(matches!(error, ControlError::ReservationAuthority));
-    let error = driver.refused(ControlCommand::SetNodeLifecycle {
-        node: node(3),
-        change: LifecycleChange::Decommission,
-        now_ms: 5,
-    });
-    assert!(matches!(error, ControlError::ReservationAuthority));
 }
 
 #[test]
@@ -549,7 +495,6 @@ fn every_error_variant_has_a_unit_test_named_after_it() {
             ControlError::MoveLimit { .. } => "move_limit",
             ControlError::NotTarget { .. } => "not_target",
             ControlError::MetaVoter { .. } => "meta_voter",
-            ControlError::ReservationAuthority => "reservation_authority",
             ControlError::Decommissioning { .. } => "decommissioning",
         })
         .collect();
@@ -572,13 +517,7 @@ fn bootstrap_seeds_every_group_and_activates_every_registered_node() {
         }),
         Ok(ControlApplied::NodeRegistered(Registered::Forming))
     );
-    bootstrap(
-        &mut driver,
-        &[1, 2, 3, 4],
-        3,
-        MaintenanceAuthority::Placement,
-    )
-    .unwrap();
+    bootstrap(&mut driver, &[1, 2, 3, 4], 3).unwrap();
     let at = PlacementEpoch::new(meta(1, driver.index));
     let cluster = driver.cluster();
     assert_eq!(cluster.nodes().len(), 4);

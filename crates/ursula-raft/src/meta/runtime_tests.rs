@@ -8,7 +8,6 @@ use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ursula_control::MaintenanceAuthority;
 use ursula_control::MoveLimit;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::GroupCount;
@@ -66,7 +65,6 @@ async fn a_single_node_forms_meta_at_once() {
             claim: claim.clone(),
             formation: FormationParams {
                 max_concurrent_moves: MoveLimit::new(2),
-                maintenance: MaintenanceAuthority::Placement,
             },
             engine: crate::RaftEngineConfig::default(),
             snapshots: None,
