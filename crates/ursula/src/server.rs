@@ -937,14 +937,17 @@ mod tests {
         };
         let meta_url = "/__ursula/raft/meta/recovery/accept-unsynced-loss".to_owned();
         let meta = view(&metrics["meta"]);
-        // No data group runs yet: the plan reached the meta replica.
-        assert!(registry.get(super::RaftGroupId(0)).is_none());
+        // `step_mismatch` comes from inside a plan's job, and a data group
+        // would refuse the `meta` floor first: the plan reached the meta
+        // replica.
         let answer = refused(post(meta_url.clone(), mismatched(meta, PlanFloor::Meta)).await);
         assert_eq!(answer.refusal, RecoveryPlanRefusal::StepMismatch);
         assert_eq!((answer.raft_group_id, answer.node_id), (0, 7));
         let answer = refused(post(meta_url, mismatched(meta, PlanFloor::Seeded)).await);
         assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
 
+        // A committed write in group 0 settles its leader and term before
+        // the test reads the view it plans against.
         let created = create_a_stream(&state).await;
         assert_eq!(created, StatusCode::CREATED);
         let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
@@ -960,7 +963,7 @@ mod tests {
         );
     }
 
-    /// Creates a stream through the client router, which opens group 0.
+    /// Creates a stream through the client router, a write in group 0.
     async fn create_a_stream(state: &crate::HttpState) -> axum::http::StatusCode {
         use tower::ServiceExt;
         crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default())
