@@ -2564,6 +2564,413 @@ async fn a_data_host_crash_under_never_leaves_the_meta_epoch_unmoved() {
     });
 }
 
+/// Metrics for the store of a group 0, the meta group or a data group.
+fn group_metrics() -> ursula_runtime::GroupEngineMetrics {
+    RuntimeMetrics::new(1, 1).group_engine_metrics()
+}
+
+/// The meta journal's directory under the WAL `root`.
+fn meta_journal(root: &Path) -> PathBuf {
+    root.join("meta")
+}
+
+/// Ends the run of `wal` cleanly and lets the next one take the root.
+async fn stop_cleanly(wal: super::RaftWal) {
+    wal.shutdown().await.expect("a clean shutdown");
+    drop(wal);
+}
+
+/// Each class decides on its own journals' history: a lost run state
+/// recovers only the class whose journals hold records, and the other opens
+/// as new.
+#[tokio::test]
+async fn the_meta_class_decides_on_its_own_journal_history() {
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let data = map.placement(RaftGroupId(0)).unwrap();
+
+    // Only a data journal holds records.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let mut store = wal.open(data, group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    drop(store);
+    stop_cleanly(wal).await;
+    fs::remove_file(root.join(super::RUN_STATE_FILE)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    assert_eq!(wal.opening().previous_run, PreviousRun::Unrecorded);
+    let super::MetaOpening::Decided(meta) = wal.meta_opening() else {
+        panic!("a node without a meta journal decides the meta class");
+    };
+    assert_eq!(meta.previous_run, PreviousRun::Absent);
+    assert_eq!(meta.recovery, RecoveryState::Normal);
+    assert_eq!(meta.recovery_epoch, 0);
+    drop(wal);
+
+    // Only the meta journal holds records.
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let mut store = wal.open_meta(group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    drop(store);
+    stop_cleanly(wal).await;
+    fs::remove_file(root.join(super::RUN_STATE_FILE)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    assert_eq!(wal.opening().previous_run, PreviousRun::Absent);
+    let super::MetaOpening::Decided(meta) = wal.meta_opening() else {
+        panic!("a readable meta journal decides the meta class");
+    };
+    assert_eq!(meta.previous_run, PreviousRun::Unrecorded);
+    assert_eq!(meta.recovery, RecoveryState::Recovering {
+        reason: RecoveryReason::UnknownHistory
+    });
+    assert_eq!(meta.recovery_epoch, 1);
+    // The start moved the meta group into recovery before it recorded the
+    // run, as it moves the cores' groups.
+    let store = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert_eq!(log_ids(&store).await, [1]);
+}
+
+/// A host crash under a data policy of `never` opens the data journals
+/// recovering in a new epoch, while the meta journal, which ran `always`,
+/// opens `Normal` in its own epoch, replays strictly and keeps the entry it
+/// synced before the crash.
+#[tokio::test]
+async fn a_data_host_crash_under_never_opens_meta_strictly() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let data = map.placement(RaftGroupId(0)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Never, &map).unwrap();
+    let mut meta = wal.open_meta(group_metrics()).unwrap();
+    append(&mut meta, [blank_entry(1)]).await;
+    let mut store = wal.open(data, group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    drop((meta, store));
+    let path = root.join(super::RUN_STATE_FILE);
+    let running = super::state_file::read::<RunState>(super::StateFileKind::RunState, &path)
+        .unwrap()
+        .unwrap();
+    drop(wal);
+    // No clean end and no boot id to match: a host crash.
+    RunStateFile::new(path, RunState {
+        boot_id: None,
+        ..running
+    })
+    .record(RunStatus::Running, "host crash")
+    .unwrap();
+
+    let wal = super::RaftWal::start(root, WalFsync::Never, &map).unwrap();
+    let opening = wal.opening();
+    assert_eq!(opening.previous_run, PreviousRun::HostCrash {
+        fsync: WalFsync::Never
+    });
+    assert_eq!(opening.recovery, RecoveryState::Recovering {
+        reason: RecoveryReason::HostCrash
+    });
+    assert_eq!(opening.recovery_epoch, 1);
+    let super::MetaOpening::Decided(meta) = wal.meta_opening() else {
+        panic!("the meta journal is readable");
+    };
+    assert_eq!(meta.previous_run, PreviousRun::HostCrash {
+        fsync: WalFsync::Always
+    });
+    assert_eq!(meta.replay_mode, JournalReplayMode::Strict);
+    assert_eq!(meta.recovery, RecoveryState::Normal);
+    assert_eq!(meta.recovery_epoch, 0);
+    let store = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(wal.meta_replay_mode(), Some(JournalReplayMode::Strict));
+    assert_eq!(store.log_state(), GroupLogState::Initialized);
+    assert_eq!(log_ids(&store).await, [1]);
+    let data_store = wal.open(data, group_metrics()).unwrap();
+    assert_eq!(data_store.log_state(), GroupLogState::Recovering);
+}
+
+/// A run that cannot read the meta journal after an I/O failure still
+/// records the epoch it decided for meta. Once the damage is gone, the run
+/// after a clean stop reads the journal below that epoch, so the meta group
+/// reopens recovering instead of initialized.
+#[tokio::test]
+async fn a_damaged_meta_run_then_a_clean_stop_reopens_meta_recovering() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let mut store = wal.open_meta(group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    drop(store);
+    stop_cleanly(wal).await;
+    // An I/O failure stops the next run.
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    record_poisoned(root);
+    drop(wal);
+    // The run after it cannot read the meta journal's metadata.
+    let metadata = core_metadata_path(&meta_journal(root));
+    let intact = fs::read(&metadata).unwrap();
+    fs::write(&metadata, b"broken meta metadata").unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map)
+        .expect("a damaged meta journal never stops the start");
+    let super::MetaOpening::Damaged { opening, damage } = wal.meta_opening() else {
+        panic!("unreadable meta metadata damages the meta class");
+    };
+    assert!(
+        matches!(damage, super::MetaJournalDamage::ReadMetadata { .. }),
+        "{damage}"
+    );
+    assert_eq!(opening.previous_run, PreviousRun::Poisoned);
+    assert_eq!(opening.recovery_epoch, 1);
+    let Err(error) = wal.open_meta(group_metrics()) else {
+        panic!("a damaged meta journal does not open");
+    };
+    assert!(
+        matches!(
+            error,
+            super::MetaOpenError::Damaged(super::MetaJournalDamage::ReadMetadata { .. })
+        ),
+        "{error}"
+    );
+    stop_cleanly(wal).await;
+    let recorded = super::state_file::read::<RunState>(
+        super::StateFileKind::RunState,
+        &root.join(super::RUN_STATE_FILE),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(recorded.status, RunStatus::Clean);
+    assert_eq!(recorded.meta.recovery_epoch, 1);
+
+    fs::write(&metadata, &intact).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let super::MetaOpening::Decided(meta) = wal.meta_opening() else {
+        panic!("the meta journal is readable again");
+    };
+    assert_eq!(
+        (meta.previous_run, meta.recovery, meta.recovery_epoch),
+        (PreviousRun::Clean, RecoveryState::Normal, 1)
+    );
+    let store = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(
+        wal.meta_replay_mode(),
+        Some(JournalReplayMode::VerifiedPrefix)
+    );
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert_eq!(log_ids(&store).await, [1]);
+}
+
+/// Unreadable meta metadata, or a meta segment whose header is damaged,
+/// never stops the start: the data journals open and take writes, and only
+/// the meta journal is refused.
+#[tokio::test]
+async fn a_corrupt_meta_metadata_or_segment_header_still_starts_the_node() {
+    for corrupt_header in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let data = map.placement(RaftGroupId(0)).unwrap();
+        let tuning = JournalTuning {
+            fsync: WalFsync::Always,
+            segment_bytes: SEGMENT_BYTES,
+            group_cache_bytes: 1024,
+        };
+        let wal = super::RaftWal::start_with(root, tuning, &map).unwrap();
+        let mut meta = wal.open_meta(group_metrics()).unwrap();
+        for index in 1..=30 {
+            append(&mut meta, [payload_entry(index, 512)]).await;
+        }
+        let mut store = wal.open(data, group_metrics()).unwrap();
+        append(&mut store, [blank_entry(1)]).await;
+        drop((meta, store));
+        stop_cleanly(wal).await;
+        let meta_dir = meta_journal(root);
+        if corrupt_header {
+            let segments = list_segments(&meta_dir).unwrap();
+            assert!(segments.len() > 1, "the meta journal rotated");
+            overwrite(&segment_path(&meta_dir, segments[0]), 0, b"XXXX");
+        } else {
+            fs::write(core_metadata_path(&meta_dir), b"broken meta metadata").unwrap();
+        }
+
+        let wal = super::RaftWal::start_with(root, tuning, &map)
+            .expect("a damaged meta journal never stops the start");
+        let mut store = wal
+            .open(data, group_metrics())
+            .expect("the data journals open");
+        append(&mut store, [blank_entry(2)]).await;
+        assert_eq!(log_ids(&store).await, [1, 2]);
+        let Err(error) = wal.open_meta(group_metrics()) else {
+            panic!("a damaged meta journal does not open");
+        };
+        if corrupt_header {
+            assert!(matches!(wal.meta_opening(), super::MetaOpening::Decided(_)));
+            assert!(
+                matches!(
+                    error,
+                    super::MetaOpenError::Damaged(super::MetaJournalDamage::OpenJournal(
+                        CoreJournalError::Journal(_)
+                    ))
+                ),
+                "{error}"
+            );
+        } else {
+            assert!(matches!(wal.meta_opening(), super::MetaOpening::Damaged {
+                damage: super::MetaJournalDamage::ReadMetadata { .. },
+                ..
+            }));
+            assert!(
+                matches!(
+                    error,
+                    super::MetaOpenError::Damaged(super::MetaJournalDamage::ReadMetadata { .. })
+                ),
+                "{error}"
+            );
+        }
+        drop(store);
+        stop_cleanly(wal).await;
+    }
+}
+
+/// The meta directory gone while a data journal holds records: the meta
+/// group opens recovering, never as a new empty log, and the record is
+/// durable, so the next run opens it recovering by what it holds.
+#[tokio::test]
+async fn an_absent_meta_journal_over_data_history_opens_recovering() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let data = map.placement(RaftGroupId(0)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let mut store = wal.open(data, group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    drop(store);
+    stop_cleanly(wal).await;
+
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    assert!(!meta_journal(root).exists());
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Recovering);
+    assert_eq!(log_ids(&meta).await, Vec::<u64>::new());
+    drop(meta);
+    stop_cleanly(wal).await;
+
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Recovering);
+    // Data group 0 keeps its own state.
+    let store = wal.open(data, group_metrics()).unwrap();
+    assert_eq!(store.log_state(), GroupLogState::Initialized);
+    assert_eq!(log_ids(&store).await, [1]);
+}
+
+/// A meta journal that exists opens by what it holds: one created empty
+/// before any data journal held a record stays empty once data has history.
+#[tokio::test]
+async fn an_existing_empty_meta_journal_over_data_history_opens_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let data = map.placement(RaftGroupId(0)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    drop(wal.open_meta(group_metrics()).unwrap());
+    let mut store = wal.open(data, group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    drop(store);
+    stop_cleanly(wal).await;
+
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    assert!(meta_journal(root).exists());
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Empty);
+}
+
+/// Without data history, an absent meta journal opens as a new, empty log,
+/// even beside a data journal that holds no record.
+#[tokio::test]
+async fn an_absent_meta_journal_on_a_node_without_data_history_opens_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let data = map.placement(RaftGroupId(0)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Empty);
+    drop(meta);
+    drop(wal.open(data, group_metrics()).unwrap());
+    stop_cleanly(wal).await;
+    fs::remove_dir_all(meta_journal(root)).unwrap();
+
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(meta.log_state(), GroupLogState::Empty);
+}
+
+/// A meta journal is prior state, as a core journal is: a root that holds
+/// one but no topology refuses to infer the topology from the
+/// configuration.
+#[test]
+fn the_prior_state_test_counts_the_meta_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    fs::create_dir_all(meta_journal(root)).unwrap();
+    assert!(matches!(
+        super::RaftWal::start(root, WalFsync::Always, &map),
+        Err(super::RaftWalError::MissingTopology { .. })
+    ));
+}
+
+/// A journal read below its class's recovery epoch opens its groups
+/// recovering, although the run opens `Normal`: the start that began the
+/// epoch is the one that marks journals, and these were never read since.
+#[tokio::test]
+async fn a_journal_read_below_its_class_epoch_opens_recovering() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+    let data = map.placement(RaftGroupId(0)).unwrap();
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    let mut store = wal.open(data, group_metrics()).unwrap();
+    append(&mut store, [blank_entry(1)]).await;
+    let mut meta = wal.open_meta(group_metrics()).unwrap();
+    append(&mut meta, [blank_entry(1)]).await;
+    drop((store, meta));
+    stop_cleanly(wal).await;
+    RunStateFile::new(root.join(super::RUN_STATE_FILE), RunState {
+        boot_id: None,
+        status: RunStatus::Clean,
+        data: JournalRun {
+            fsync: WalFsync::Always,
+            recovery_epoch: 3,
+        },
+        meta: JournalRun {
+            fsync: WalFsync::Always,
+            recovery_epoch: 2,
+        },
+    })
+    .record(RunStatus::Clean, "later epochs")
+    .unwrap();
+
+    let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+    assert_eq!(wal.opening().recovery, RecoveryState::Normal);
+    assert_eq!(wal.meta_opening().opening().recovery, RecoveryState::Normal);
+    let store = wal.open(data, group_metrics()).unwrap();
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert_eq!(core_verified_epoch(&wal, 0), 3);
+    let meta = wal.open_meta(group_metrics()).unwrap();
+    assert_eq!(
+        wal.meta_replay_mode(),
+        Some(JournalReplayMode::VerifiedPrefix)
+    );
+    assert_eq!(meta.log_state(), GroupLogState::Recovering);
+    assert_eq!(
+        CoreMetadata::load(&core_metadata_path(&meta_journal(root)))
+            .unwrap()
+            .verified_epoch(),
+        2
+    );
+}
+
 /// #613: the store reports an append that would overwrite an entry at or
 /// below a commit marker, which the replica refuses before OpenRaft sees
 /// it, and nothing above the marker or matching the log. B1 of the fifth

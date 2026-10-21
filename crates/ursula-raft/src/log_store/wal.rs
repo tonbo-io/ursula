@@ -104,8 +104,11 @@ pub enum MetaOpenError {
 ///
 /// [`RaftWal::start`] begins the run: it reads the run
 /// state the previous run left, decides how the journals open
-/// ([`WalOpening`]) and records this run before any journal write.
-/// [`RaftWal::shutdown`] ends it cleanly.
+/// ([`WalOpening`], [`MetaOpening`]) and records this run before any journal
+/// write. [`RaftWal::shutdown`] ends it cleanly.
+///
+/// The meta group's log lives on a journal of its own, under `meta` beside
+/// the cores' directories ([`RaftWal::open_meta`]).
 #[derive(Debug, Clone)]
 pub struct RaftWal {
     node: Arc<NodeWal>,
@@ -778,6 +781,49 @@ mod tests {
         }
         dropping.await.expect("drop the last handle");
         crate::tests::remove_test_path(&root);
+    }
+
+    /// The meta journal's writer is held for the run: its group reopens on
+    /// it once the previous store closed, and a shutdown closes it, with the
+    /// store still held, before it records the run as clean.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn the_meta_writer_closes_before_the_clean_record() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = RaftWal::start(root.path(), WalFsync::Never, &topology).unwrap();
+        let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let store = wal.open_meta(metrics()).unwrap();
+        let exited = match &*wal.meta_writer.lock().unwrap() {
+            MetaWriterSlot::Open(writer) => writer.exited(),
+            other => panic!("an opened meta writer, not {other:?}"),
+        };
+        assert!(matches!(
+            wal.open_meta(metrics()),
+            Err(MetaOpenError::OpenGroup(
+                CoreJournalError::GroupAlreadyOpen { .. }
+            ))
+        ));
+        drop(store);
+        let store = wal
+            .open_meta(metrics())
+            .expect("the meta group reopens on the held writer");
+        wal.shutdown().await.unwrap();
+        if let Ok(changed) = exited.has_changed() {
+            panic!("the meta writer still runs after a clean shutdown (changed: {changed})");
+        }
+        let recorded = crate::log_store::state_file::read::<crate::log_store::RunState>(
+            crate::log_store::StateFileKind::RunState,
+            &root.path().join(crate::log_store::RUN_STATE_FILE),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorded.status, crate::log_store::RunStatus::Clean);
+        assert!(matches!(
+            wal.open_meta(metrics()),
+            Err(MetaOpenError::ShutDown { .. })
+        ));
+        drop(store);
     }
 
     /// A core recovering its journal does not hold up another core's.
