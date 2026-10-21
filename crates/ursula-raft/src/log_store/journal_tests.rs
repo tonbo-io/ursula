@@ -2831,9 +2831,9 @@ async fn a_corrupt_meta_metadata_or_segment_header_still_starts_the_node() {
     }
 }
 
-/// The meta directory gone while a data journal holds records: the meta
-/// group opens recovering, never as a new empty log, and the record is
-/// durable, so the next run opens it recovering by what it holds.
+/// The meta journal gone while a data journal holds records: the meta group
+/// opens recovering, never as a new empty log, and the record is durable,
+/// so the next run opens it recovering by what it holds.
 #[tokio::test]
 async fn an_absent_meta_journal_over_data_history_opens_recovering() {
     let dir = tempfile::tempdir().unwrap();
@@ -2873,15 +2873,55 @@ async fn an_existing_empty_meta_journal_over_data_history_opens_empty() {
     let data = map.placement(RaftGroupId(0)).unwrap();
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
     drop(wal.open_meta(group_metrics()).unwrap());
+    // The first open put the new journal's metadata file in place, so the
+    // journal exists although it holds no record.
+    assert!(core_metadata_path(&meta_journal(root)).exists());
     let mut store = wal.open(data, group_metrics()).unwrap();
     append(&mut store, [blank_entry(1)]).await;
     drop(store);
     stop_cleanly(wal).await;
 
     let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
-    assert!(meta_journal(root).exists());
     let meta = wal.open_meta(group_metrics()).unwrap();
     assert_eq!(meta.log_state(), GroupLogState::Empty);
+}
+
+/// A meta directory without its metadata file and without a record, which
+/// a first open that stopped before the file was in place leaves (an empty
+/// directory, or one holding only the replace's temporary file), is no meta
+/// journal. Over data history its group opens recovering, never as a new
+/// empty log. Deciding by the directory alone opened it empty.
+#[tokio::test]
+async fn a_meta_directory_without_its_metadata_over_data_history_opens_recovering() {
+    for leftover in [None, Some(b"torn metadata".as_slice())] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let data = map.placement(RaftGroupId(0)).unwrap();
+        let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+        let mut store = wal.open(data, group_metrics()).unwrap();
+        append(&mut store, [blank_entry(1)]).await;
+        drop(store);
+        stop_cleanly(wal).await;
+        let meta_dir = meta_journal(root);
+        fs::create_dir(&meta_dir).unwrap();
+        if let Some(bytes) = leftover {
+            fs::write(meta_dir.join("journal.meta.tmp"), bytes).unwrap();
+        }
+
+        let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+        let meta = wal.open_meta(group_metrics()).unwrap();
+        assert_eq!(meta.log_state(), GroupLogState::Recovering, "{leftover:?}");
+        assert_eq!(log_ids(&meta).await, Vec::<u64>::new());
+        drop(meta);
+        stop_cleanly(wal).await;
+
+        let wal = super::RaftWal::start(root, WalFsync::Always, &map).unwrap();
+        let meta = wal.open_meta(group_metrics()).unwrap();
+        assert_eq!(meta.log_state(), GroupLogState::Recovering, "{leftover:?}");
+        drop(meta);
+        stop_cleanly(wal).await;
+    }
 }
 
 /// Without data history, an absent meta journal opens as a new, empty log,
@@ -2906,14 +2946,17 @@ async fn an_absent_meta_journal_on_a_node_without_data_history_opens_empty() {
 }
 
 /// A meta journal is prior state, as a core journal is: a root that holds
-/// one but no topology refuses to infer the topology from the
-/// configuration.
+/// one, its metadata file alone, but no topology refuses to infer the
+/// topology from the configuration.
 #[test]
 fn the_prior_state_test_counts_the_meta_journal() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     let map = ursula_shard::StaticShardMap::new(1, 1).unwrap();
     fs::create_dir_all(meta_journal(root)).unwrap();
+    CoreMetadata::default()
+        .store(&core_metadata_path(&meta_journal(root)))
+        .unwrap();
     assert!(matches!(
         super::RaftWal::start(root, WalFsync::Always, &map),
         Err(super::RaftWalError::MissingTopology { .. })

@@ -345,8 +345,9 @@ impl RaftWal {
     /// The first call of a run opens the meta journal's writer, which the
     /// run then holds until [`Self::shutdown`], so a later call, after the
     /// previous store closed, reopens the group on the same writer. When the
-    /// meta directory was gone at start while a data journal held records,
-    /// the first call records the group recovering first. A meta journal the
+    /// start found no meta journal, the first call puts the journal's
+    /// metadata file in place before the writer opens, recording the group
+    /// recovering if a data journal held records at start. A meta journal the
     /// start could not read, or whose writer does not open, is refused as
     /// [`MetaOpenError::Damaged`] and never stops the node. A meta group
     /// whose previous engine's OpenRaft work still runs is refused at once.
@@ -393,7 +394,8 @@ impl RaftWal {
         opening: WalOpening,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<CoreFileLogWriter>, MetaJournalDamage> {
-        self.node.record_lost_meta(META_PLACEMENT.raft_group_id)?;
+        self.node
+            .create_meta_journal(META_PLACEMENT.raft_group_id)?;
         CoreFileLogWriter::open(self.node.meta_dir(), CoreJournalOptions {
             previous_run: opening.previous_run,
             core: META_PLACEMENT.core_id,
