@@ -417,6 +417,11 @@ impl InProcessEndpoint for crate::meta::MetaStateMachine {
         }
     }
 
+    /// The node's one fence, which its data plane shares.
+    fn fence(registry: &Self::Endpoint) -> ursula_runtime::NodeFence {
+        registry.peer_cluster().fence()
+    }
+
     fn validate_incoming_transfer(
         _registry: &Self::Endpoint,
         _target: u64,
