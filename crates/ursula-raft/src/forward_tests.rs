@@ -680,3 +680,91 @@ async fn forwards_to_a_leader_of_another_cluster_are_refused_before_they_run() {
     server.abort();
     shutdown_all(&engines).await;
 }
+
+/// How each fence outcome of a forward classifies (rules 24): refused
+/// before the leader's handler, or not sent, is not proposed; an answer
+/// discarded after the handler may have run leaves a write's outcome
+/// unknown, so a stale view never turns a commit into a duplicate retry, and
+/// so does a write answer the leader's fence stopped after the write ran. A
+/// barrier the fence refused or discarded is no answer, asked again.
+#[test]
+fn fence_outcomes_of_a_forward_say_whether_the_leader_may_have_run_it() {
+    use ursula_runtime::ForwardedRpc;
+    use ursula_runtime::WriteEffect;
+
+    use crate::incarnation::Discarded;
+    use crate::incarnation::Judgement;
+    use crate::target::FenceRefusal;
+    let address = || "http://10.0.0.2:4437".to_owned();
+    let stale = Discarded::Stale {
+        judgement: Judgement::Older,
+    };
+    for (error, effect) in [
+        (
+            ForwardError::Fenced {
+                rpc: ForwardedRpc::GroupWrite,
+            },
+            WriteEffect::NotProposed,
+        ),
+        (
+            ForwardError::OtherIncarnation {
+                rpc: ForwardedRpc::GroupWrite,
+                address: address(),
+                refusal: FenceRefusal::StaleTarget,
+            },
+            WriteEffect::NotProposed,
+        ),
+        (
+            ForwardError::Discarded {
+                rpc: ForwardedRpc::GroupWrite,
+                address: address(),
+                discarded: stale,
+            },
+            WriteEffect::Unknown,
+        ),
+        (
+            ForwardError::Discarded {
+                rpc: ForwardedRpc::GroupRead,
+                address: address(),
+                discarded: stale,
+            },
+            WriteEffect::NotProposed,
+        ),
+    ] {
+        assert_eq!(error.write_effect(), effect, "{error:?}");
+        assert_eq!(
+            error.status(),
+            ursula_runtime::ErrorStatus::Temporary,
+            "{error:?}"
+        );
+    }
+
+    // The leader fenced while it ran the write: its answer is refused after
+    // the handler, never as a fence refusal before it, on both planes.
+    let after_write = || {
+        crate::grpc::fenced_after_write(crate::peer_cluster::PeerClusterError::Fence {
+            node_id: 2,
+            refusal: FenceRefusal::Fenced,
+        })
+    };
+    assert_eq!(crate::target::fence_refusal(&after_write(), 2), None);
+    assert_eq!(crate::target::refusing_node(&after_write(), 2), None);
+    assert!(crate::peer_cluster::refusing_cluster(&after_write()).is_none());
+    assert!(crate::forward::is_transport_failure(&after_write()));
+    let fenced_after_write = || ForwardError::Transport {
+        rpc: ForwardedRpc::GroupWrite,
+        address: address(),
+        source: after_write(),
+    };
+    assert_eq!(fenced_after_write().write_effect(), WriteEffect::Unknown);
+    assert_eq!(
+        crate::meta::MetaForwardError::Transport(fenced_after_write()).write_effect(),
+        WriteEffect::Unknown
+    );
+    assert!(matches!(
+        crate::meta::confirm::BarrierFailure::from(
+            crate::grpc::RecoveryProbeError::OtherIncarnation
+        ),
+        crate::meta::confirm::BarrierFailure::Unreachable
+    ));
+}

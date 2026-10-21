@@ -163,7 +163,12 @@ pub(crate) fn open_meta(
 ) -> Result<SpawnedMeta, ShardMapError> {
     let raft = &config.raft;
     let (node_id, directory) = node_and_peers(config, topology);
-    let identity = PeerIdentity::fenced_by(node_id, wal.cluster_id().clone(), wal.fence());
+    let identity = PeerIdentity::of_process(
+        node_id,
+        wal.cluster_id().clone(),
+        wal.fence(),
+        wal.incarnation(),
+    );
     let peers = NodeSet::from_first(NodeId::new(node_id), directory.node_ids().map(NodeId::new));
     registry.peer_cluster().bind(identity.clone(), directory);
     // Before any group opens, so none campaigns while a wait is owed.

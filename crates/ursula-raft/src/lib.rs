@@ -50,6 +50,9 @@
 //! - [`peer_cluster`]: the cluster-id check between peers: the identity
 //!   every Raft gRPC request carries, the server interceptor that refuses a
 //!   peer of another cluster, and the record readiness and metrics read.
+//! - [`incarnation`]: the process fence on Raft RPCs: the table of the
+//!   peers' processes, the receiver's check and the sender's reading of an
+//!   answer's stamp.
 //! - [`predecessor_wait`]: the wait a run owes a predecessor that may
 //!   still run, and the leadership shed of the node fence.
 //! - [`peer_directory`]: where each configured peer listens (`raft.peers`),
@@ -110,6 +113,7 @@ mod history;
 pub mod hosting;
 #[cfg(any(test, madsim))]
 mod in_process;
+mod incarnation;
 mod log_store;
 mod maintenance;
 mod memberships;
@@ -211,6 +215,7 @@ pub use in_process::InProcessRaftRegistry;
 pub use in_process::InProcessRaftRpcKind;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRegistry;
+pub use incarnation::IncarnationCounts;
 pub use log_store::CleanExit;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;

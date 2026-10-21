@@ -111,8 +111,8 @@ pub async fn run_fence_gate(registry: RaftGroupHandleRegistry, fence: NodeFence)
                 }
                 FenceStatus::Closed => tracing::info!("node fence closed for the shutdown"),
                 FenceStatus::Superseded => tracing::error!(
-                    "superseded: the meta group binds this node id to another root or released \
-                     this one, so this process takes part in nothing again until it exits"
+                    "superseded: another process may answer as this node, so this process takes \
+                     part in nothing again until it exits"
                 ),
             }
             last = status;

@@ -1123,8 +1123,10 @@ mod metrics_contract_tests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServingReadinessReason {
-    /// The meta group binds this node id to another root or released this
-    /// one: the process takes part in nothing again until it exits.
+    /// Another process may answer as this node: the meta group binds this
+    /// node id to another root or released this one, or a peer saw a newer
+    /// run of this root. The process takes part in nothing again until it
+    /// exits.
     Superseded,
     /// No probe of the WAL disk synced within `raft.wal.lease`: the node
     /// takes part in no Raft traffic until one does.

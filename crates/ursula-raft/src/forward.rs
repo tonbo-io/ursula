@@ -380,6 +380,29 @@ pub enum ForwardError {
         address: String,
         timeout: Duration,
     },
+    /// This node is fenced (its disk lease lapsed, it shuts down or it is
+    /// superseded): nothing was sent.
+    #[error("{rpc} cannot be forwarded: this node is fenced")]
+    Fenced { rpc: ForwardedRpc },
+    /// The leader's process fence refused the call before its handler ran
+    /// ([`crate::incarnation`]): it names an older process of the leader
+    /// (after one retry), or the leader is fenced or a duplicate. Nothing
+    /// ran there.
+    #[error("{rpc} to the group leader at {address} was refused: {}", refusal.as_str())]
+    OtherIncarnation {
+        rpc: ForwardedRpc,
+        address: String,
+        refusal: crate::target::FenceRefusal,
+    },
+    /// The leader's answer came from another process than the one this
+    /// node holds for it, or reached this node fenced: discarded unread,
+    /// after its handler may have run.
+    #[error("{rpc} to the group leader at {address}: the answer was discarded ({discarded})")]
+    Discarded {
+        rpc: ForwardedRpc,
+        address: String,
+        discarded: crate::incarnation::Discarded,
+    },
     /// The leader refused the call (protocol mismatch, unknown group, a
     /// malformed request).
     #[error("{rpc} to the group leader at {address} was refused")]
@@ -435,7 +458,16 @@ impl ForwardError {
     /// another node now, which `raft.peers` or a moved address can fix
     /// without a restart. The next call connects afresh.
     fn drops_channel(&self) -> bool {
-        self.leader_unreachable() || matches!(self, Self::OtherNode { .. })
+        self.leader_unreachable()
+            || matches!(
+                self,
+                Self::OtherNode { .. }
+                    | Self::OtherIncarnation {
+                        refusal: crate::target::FenceRefusal::Fenced,
+                        ..
+                    }
+            )
+            || matches!(self, Self::Discarded { discarded, .. } if discarded.retires())
     }
 
     /// The engine-level answer, decided here only. A leader this node
@@ -484,7 +516,25 @@ impl ForwardError {
                     Proposal::MayHaveCommitted,
                 );
             }
-            Self::Connect { .. } | Self::Transport { .. } | Self::TimedOut { .. } => {
+            // An answer discarded after the leader's handler may have run:
+            // a stale view never turns a commit into a duplicate retry.
+            Self::Discarded {
+                rpc: ForwardedRpc::GroupWrite,
+                ..
+            } => {
+                return unknown_leader(
+                    LeadershipReason::LeaderUnreachable,
+                    Proposal::MayHaveCommitted,
+                );
+            }
+            // Nothing ran: this node sent nothing, or the leader's fence
+            // refused the call before its handler.
+            Self::Connect { .. }
+            | Self::Transport { .. }
+            | Self::TimedOut { .. }
+            | Self::Fenced { .. }
+            | Self::OtherIncarnation { .. }
+            | Self::Discarded { .. } => {
                 return unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
             }
             Self::NoIdentity { rpc } => (*rpc, ForwardFailure::NoIdentity),
@@ -515,12 +565,33 @@ pub(crate) fn is_transport_failure(status: &tonic::Status) -> bool {
 /// One forwarded leader RPC under [`FORWARD_RPC_TIMEOUT`]. A call that fails
 /// at the transport, or that the leader's address refused as meant for
 /// another node, drops its cached channel, so the next one reconnects.
-async fn call_leader<Req, Resp, Fut>(
+async fn call_leader<Req: Clone, Resp, Fut>(
     route: &LeaderRoute,
     target: RaftTarget,
     rpc: ForwardedRpc,
     request: Req,
-    send: impl FnOnce(RaftClient, tonic::Request<Req>) -> Fut,
+    send: impl Fn(RaftClient, tonic::Request<Req>) -> Fut,
+) -> Result<Resp, ForwardError>
+where
+    Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
+{
+    // A `stale_target` refusal raised the table: the retry names the
+    // leader's process that runs.
+    match call_leader_once(route, target, rpc, request.clone(), &send).await {
+        Err(ForwardError::OtherIncarnation {
+            refusal: crate::target::FenceRefusal::StaleTarget,
+            ..
+        }) => call_leader_once(route, target, rpc, request, &send).await,
+        answer => answer,
+    }
+}
+
+async fn call_leader_once<Req, Resp, Fut>(
+    route: &LeaderRoute,
+    target: RaftTarget,
+    rpc: ForwardedRpc,
+    request: Req,
+    send: &impl Fn(RaftClient, tonic::Request<Req>) -> Fut,
 ) -> Result<Resp, ForwardError>
 where
     Fut: Future<Output = Result<tonic::Response<Resp>, tonic::Status>>,
@@ -530,6 +601,10 @@ where
     let Some(identity) = peer_cluster.identity() else {
         return Err(ForwardError::NoIdentity { rpc });
     };
+    // A fenced node forwards nothing: definitely not proposed.
+    if !identity.fence().admits_now() {
+        return Err(ForwardError::Fenced { rpc });
+    }
     let started = crate::rt::time::Instant::now();
     let timed_out = || ForwardError::TimedOut {
         rpc,
@@ -558,8 +633,19 @@ where
             // forwarded call joins the originating trace. No-op when no
             // propagator is installed.
             crate::telemetry::inject_current_context(request.metadata_mut());
+            peer_cluster.stamp_target(route.leader_id, request.metadata_mut());
             let error = match crate::rt::time::timeout(remaining, send(client, request)).await {
-                Ok(Ok(response)) => return Ok(response.into_inner()),
+                Ok(Ok(response)) => {
+                    let stamp = crate::incarnation::Stamp::of(response.metadata());
+                    match peer_cluster.accept_responder(route.leader_id, stamp) {
+                        Ok(()) => return Ok(response.into_inner()),
+                        Err(discarded) => ForwardError::Discarded {
+                            rpc,
+                            address: address.to_owned(),
+                            discarded,
+                        },
+                    }
+                }
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
                     if let Some(node) = crate::target::refusing_node(&status, route.leader_id) {
@@ -580,6 +666,18 @@ where
                             rpc,
                             address: address.to_owned(),
                             cluster_id,
+                        }
+                    } else if let Some(refusal) =
+                        crate::target::fence_refusal(&status, route.leader_id)
+                    {
+                        // Refused before the leader's handler, whoever
+                        // refused. Only a refusal from the process this
+                        // node accepts raises the table or fences it.
+                        peer_cluster.observe_failure(route.leader_id, &status);
+                        ForwardError::OtherIncarnation {
+                            rpc,
+                            address: address.to_owned(),
+                            refusal,
                         }
                     } else if is_transport_failure(&status) {
                         ForwardError::Transport {
