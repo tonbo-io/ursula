@@ -4540,14 +4540,19 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
     }
 }
 
-/// f2 (#768): two meta voters lose their `raft-log/meta/` while stopped.
-/// Over their data history they open meta recovering, so node 1, which
-/// keeps the meta log, wins no meta election, and meta has no leader while
-/// the data groups serve. `ursulactl recover-group --target meta
-/// --accept-loss` plans meta with node 1 as its leader, meta answers again
-/// on every node, and the plan's history event keys every placement anew.
-/// The plan's restart of the meta replica marks no node
-/// `placement-unavailable` (r1 L12).
+/// f2 (#768): every node loses its run state while stopped, as the
+/// cutting plan test of a data group does, so each meta replica opens
+/// recovering and keeps its vote. Every meta gate stalls and meta has no
+/// leader. `ursulactl recover-group --target meta --accept-loss` plans
+/// meta, meta answers again on every node, and the plan's history event
+/// keys every placement anew. The plan's restart of the meta replica marks
+/// no node `placement-unavailable` (r1 L12). The data groups are gated
+/// too and stay so: the test claims nothing about them.
+///
+/// A replica that lost its meta journal lost its vote with it, and refuses
+/// a plan (`missing_vote_floor`) until a live leader proves its vote, so
+/// a meta group where a majority of the voters lost their journals is not
+/// recovered by a plan. This test does not claim it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -4570,30 +4575,27 @@ async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
     }
     let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
     let before = bootstrapped(&formed[0]).unwrap().clone();
-    let stream = |node: &MetaNode| format!("{}/meta-cli/plan", node.url());
-    put_until_created(&client, &stream(&nodes[0])).await;
-    post_until_no_content(&client, &stream(&nodes[0]), "before-the-loss;").await;
 
-    // 1. Every node stops, and nodes 2 and 3 lose their meta journals.
+    // 1. Every node stops and loses its run state, so how its last run
+    // ended is unknown.
     for node in &nodes {
         procs.stop(node.id).await;
     }
-    for node in &nodes[1..] {
-        remove_test_path(node.meta_dir());
+    for node in &nodes {
+        remove_test_path(node.wal.join("raft-log").join("run-state.bin"));
     }
     for node in &nodes {
         procs.start(binary, node);
     }
 
-    // 2. Their meta gates stall, no node leads meta, and data serves. The
-    // nodes were just started, so the poll tolerates a node that does not
-    // listen yet.
-    let replicas = eventually(&mut procs, "nodes 2 and 3 stall on meta", async || {
+    // 2. Every meta gate stalls and no node leads meta. The nodes were
+    // just started, so the poll tolerates a node that does not listen yet.
+    let replicas = eventually(&mut procs, "every meta gate stalls", async || {
         let mut replicas = Vec::new();
         for node in &nodes {
             let replica = try_node_metrics(&client, &node.url()).await?.meta;
             let gate = replica.as_ref().map(|replica| replica.recovery_gate);
-            if node.id != 1 && gate != Some(ursula_proto::admin::RecoveryGateStatus::Stalled) {
+            if gate != Some(ursula_proto::admin::RecoveryGateStatus::Stalled) {
                 return Err(format!("node {}: {replica:?}", node.id));
             }
             replicas.push((node.id, replica));
@@ -4607,13 +4609,6 @@ async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
             "node {id}: {replica:?}"
         );
     }
-    post_until_no_content(&client, &stream(&nodes[2]), "while-meta-waits;").await;
-    read_until_matches(
-        &client,
-        &format!("{}?offset=0&max_bytes=64", stream(&nodes[1])),
-        b"before-the-loss;while-meta-waits;",
-    )
-    .await;
 
     // 3. The meta plan, as `ursulactl recover-group --target meta
     // --accept-loss` sends it.
@@ -4636,7 +4631,7 @@ async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
     let ursula_ctl::recovery::RecoverOutcome::Satisfied { plan, stopped, .. } = outcome else {
         panic!("the meta plan was not satisfied: {outcome:?}");
     };
-    assert_eq!(plan.leader, 1, "{plan:?}");
+    assert!(META_VOTERS.contains(&plan.leader), "{plan:?}");
     assert!(stopped.is_empty(), "{stopped:?}");
 
     // 4. Meta answers on every node, each placement keyed at one new
@@ -4667,12 +4662,6 @@ async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
             node.id
         );
     }
-    read_until_matches(
-        &client,
-        &format!("{}?offset=0&max_bytes=64", stream(&nodes[0])),
-        b"before-the-loss;while-meta-waits;",
-    )
-    .await;
 }
 
 /// S1(a), D7 (#768): on nodes whose snapshot store is S3, a meta snapshot
