@@ -3927,6 +3927,27 @@ fn leads(metrics: &ursula_proto::admin::NodeMetrics, node_id: u64) -> usize {
         .count()
 }
 
+/// The metrics of the node at `base_url`, or why they did not answer,
+/// for a poll that may start before the node listens.
+async fn try_node_metrics(
+    client: &reqwest::Client,
+    base_url: &str,
+) -> Result<ursula_proto::admin::NodeMetrics, String> {
+    let url = format!("{base_url}/__ursula/metrics");
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))?;
+    if response.status() != reqwest::StatusCode::OK {
+        return Err(format!("GET {url}: {}", response.status()));
+    }
+    response
+        .json()
+        .await
+        .map_err(|err| format!("GET {url}: {err}"))
+}
+
 /// Node `node`'s participation, from its cluster listener.
 async fn leadership_shed(
     client: &reqwest::Client,
@@ -4231,8 +4252,9 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
 
 /// S1 acceptance (#768): a node whose meta journal does not read runs no
 /// meta replica, reports `Damaged { kind: journal }` and
-/// `placement-unavailable`, takes no leadership transfer, and keeps
-/// serving data. Elected leader of every group while the only other node
+/// `placement-unavailable`, advertises on `/__ursula/leadership-shed` that
+/// it accepts no leadership transfer (the stance a peer reads before a
+/// handoff), and keeps serving data. Elected leader of every group while the only other node
 /// left is drained, it hands each group away once that node takes
 /// transfers again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4274,7 +4296,7 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
         .await
         .expect("drain node 3");
     eventually(&mut procs, "node 1 leads every data group", async || {
-        let led = leads(&node_metrics(&client, &nodes[0].url()).await, 1);
+        let led = leads(&try_node_metrics(&client, &nodes[0].url()).await?, 1);
         if led == META_TEST_GROUPS {
             Ok(())
         } else {
@@ -4283,8 +4305,8 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
     })
     .await;
 
-    // 2. Node 2 starts without a meta replica: it may campaign but takes
-    // no transfer, and serves data through node 1.
+    // 2. Node 2 starts without a meta replica: it may campaign, advertises
+    // that it accepts no transfer, and serves data through node 1.
     procs.start(binary, &nodes[1]);
     let damaged = wait_placement(
         &client,
@@ -4327,7 +4349,7 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
     // and keeps them while no node takes a transfer.
     procs.kill(1);
     eventually(&mut procs, "node 2 leads every data group", async || {
-        let led = leads(&node_metrics(&client, &nodes[1].url()).await, 2);
+        let led = leads(&try_node_metrics(&client, &nodes[1].url()).await?, 2);
         if led == META_TEST_GROUPS {
             Ok(())
         } else {
@@ -4345,8 +4367,8 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
         &mut procs,
         "node 2 hands every data group to node 3",
         async || {
-            let kept = leads(&node_metrics(&client, &nodes[1].url()).await, 2);
-            let taken = leads(&node_metrics(&client, &nodes[2].url()).await, 3);
+            let kept = leads(&try_node_metrics(&client, &nodes[1].url()).await?, 2);
+            let taken = leads(&try_node_metrics(&client, &nodes[2].url()).await?, 3);
             if kept == 0 && taken == META_TEST_GROUPS {
                 Ok(())
             } else {
@@ -4563,24 +4585,26 @@ async fn cli_meta_recovers_by_a_plan_through_recover_group_target_meta() {
         procs.start(binary, node);
     }
 
-    // 2. Their meta gates stall, no node leads meta, and data serves.
-    eventually(&mut procs, "nodes 2 and 3 stall on meta", async || {
-        for node in &nodes[1..] {
-            let replica = node_metrics(&client, &node.url()).await.meta;
+    // 2. Their meta gates stall, no node leads meta, and data serves. The
+    // nodes were just started, so the poll tolerates a node that does not
+    // listen yet.
+    let replicas = eventually(&mut procs, "nodes 2 and 3 stall on meta", async || {
+        let mut replicas = Vec::new();
+        for node in &nodes {
+            let replica = try_node_metrics(&client, &node.url()).await?.meta;
             let gate = replica.as_ref().map(|replica| replica.recovery_gate);
-            if gate != Some(ursula_proto::admin::RecoveryGateStatus::Stalled) {
+            if node.id != 1 && gate != Some(ursula_proto::admin::RecoveryGateStatus::Stalled) {
                 return Err(format!("node {}: {replica:?}", node.id));
             }
+            replicas.push((node.id, replica));
         }
-        Ok(())
+        Ok(replicas)
     })
     .await;
-    for node in &nodes {
-        let replica = node_metrics(&client, &node.url()).await.meta;
+    for (id, replica) in &replicas {
         assert!(
             replica.as_ref().is_some_and(|replica| !replica.leads_live),
-            "node {}: {replica:?}",
-            node.id
+            "node {id}: {replica:?}"
         );
     }
     post_until_no_content(&client, &stream(&nodes[2]), "while-meta-waits;").await;
