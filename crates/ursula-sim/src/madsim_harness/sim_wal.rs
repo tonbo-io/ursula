@@ -31,6 +31,8 @@ use ursula_raft::MetaOpenError;
 #[cfg(test)]
 use ursula_raft::PlacedRaftGroupEngineFactory;
 #[cfg(test)]
+use ursula_raft::RaftEngineConfig;
+#[cfg(test)]
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupFileLogStore;
@@ -185,12 +187,25 @@ impl SimNodeWal {
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<RaftGroupEngine, GroupEngineError> {
+        self.single_voter_with(placement, metrics, RaftEngineConfig::default())
+            .await
+    }
+
+    /// [`SimNodeWal::single_voter`], its engine configured as `config`.
+    #[cfg(test)]
+    pub(super) async fn single_voter_with(
+        &self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+        config: RaftEngineConfig,
+    ) -> Result<RaftGroupEngine, GroupEngineError> {
         let store = self.open(placement, metrics.clone()).await;
         let factory = PlacedRaftGroupEngineFactory::single_node(
             self.raft_wal(),
             RaftGroupHandleRegistry::default(),
             SINGLE_VOTER,
-        );
+        )
+        .with_engine_config(config);
         let engine = factory.start_on(placement, store, metrics).await?;
         engine
             .wait_for_current_leader(SINGLE_VOTER, Duration::from_secs(5))
