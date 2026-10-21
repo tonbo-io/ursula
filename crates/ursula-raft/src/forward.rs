@@ -503,14 +503,25 @@ where
             error
         }
     };
-    if dropped_channel {
+    // A leader unreachable over its channel warns on each drop. An address
+    // that serves another node drops its channel at debug:
+    // `observe_misdelivery` already warned once for that change, and every
+    // later forward to the same address repeats the drop.
+    if dropped_channel && error.leader_unreachable() {
         tracing::warn!(
             plane = ?target.plane(),
             group = target.wire_group_id(),
             leader = address,
             error = %ErrorChain(&error),
-            "dropped the forwarding channel to a group leader: the leader is unreachable over \
-             it, or its address serves another node now"
+            "dropped the forwarding channel to a group leader: the leader is unreachable over it"
+        );
+    } else if dropped_channel {
+        tracing::debug!(
+            plane = ?target.plane(),
+            group = target.wire_group_id(),
+            leader = address,
+            error = %ErrorChain(&error),
+            "dropped the forwarding channel to a group leader: its address serves another node now"
         );
     } else {
         tracing::debug!(

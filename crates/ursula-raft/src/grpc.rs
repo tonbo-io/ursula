@@ -2081,6 +2081,17 @@ fn open_peer_channel(
 /// Keying the stream by each object's generation makes them replace one
 /// another on nearly every Append call. A live stream is already proof that
 /// its underlying channel works; replace it only after its sender closes.
+///
+/// One exception: a misdelivery refusal shows that the live stream reaches
+/// the wrong node, so [`retire_append_session`] drops it before its sender
+/// closes. That does not bring the thrash back. Only a refusal from the node
+/// at the address retires a session, never an ordinary Append call, so
+/// retirements are bounded by misdeliveries. And the session remembers the
+/// generation it was opened on, so a group that saw the refusal on an older
+/// channel leaves alone a session another group already opened on a newer
+/// one: groups that see the same refusal retire the session once per
+/// channel generation, not once each.
+///
 /// A transport's sessions serve the plane of the groups it carries: the
 /// stream names it in its `ursula-raft-plane` metadata, and the receiver
 /// refuses an item of another plane. Sessions are keyed by endpoint alone,
