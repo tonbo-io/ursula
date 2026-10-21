@@ -61,7 +61,9 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         RaftWalError::OpenCore { source, .. }
         | RaftWalError::OpenGroup { source, .. }
         | RaftWalError::CloseJournal { source, .. }
-        | RaftWalError::MaintainJournal { source, .. } => core_failure(source),
+        | RaftWalError::MaintainJournal { source, .. }
+        | RaftWalError::CloseMetaJournal { source }
+        | RaftWalError::MaintainMetaJournal { source } => core_failure(source),
         RaftWalError::TopologyMismatch { .. }
         | RaftWalError::MissingTopology { .. }
         | RaftWalError::ClusterIdMismatch { .. } => WalOpenFailureKind::InvalidConfiguration,

@@ -183,6 +183,7 @@ pub use in_process::InProcessRaftRpcKind;
 pub use in_process::InProcessRegistry;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;
+pub use log_store::MetaOpenError;
 pub use log_store::MetaOpening;
 pub use log_store::PlanCut;
 pub use log_store::RaftGroupFileLogStore;

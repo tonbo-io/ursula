@@ -53,6 +53,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_config::WalFsync;
 
+use super::core_meta::CoreMetadata;
+use super::core_meta::GroupLogState;
 use super::core_meta::MarkRecoveringError;
 use super::core_meta::core_metadata_path;
 use super::core_meta::mark_core_recovering;
@@ -75,7 +77,7 @@ const WAL_LOCK_FILE: &str = "wal.lock";
 /// The directory of core `N` under the WAL root is `core-N`.
 const CORE_DIR_PREFIX: &str = "core-";
 /// The meta journal's policy, whatever the data journals run.
-const META_FSYNC: WalFsync = WalFsync::Always;
+pub(crate) const META_FSYNC: WalFsync = WalFsync::Always;
 /// The meta journal's directory under the WAL root. It does not start with
 /// [`CORE_DIR_PREFIX`], so no data reader of the root lists it as a core.
 const META_DIR: &str = "meta";
@@ -575,6 +577,18 @@ pub enum RaftWalError {
         #[source]
         source: super::CoreJournalError,
     },
+    #[error("stop the meta journal: {source}")]
+    CloseMetaJournal {
+        #[source]
+        source: super::CoreJournalError,
+    },
+    /// A maintenance pass of the meta journal could not be asked for: its
+    /// writer stopped or is poisoned.
+    #[error("maintain the meta journal: {source}")]
+    MaintainMetaJournal {
+        #[source]
+        source: super::CoreJournalError,
+    },
     #[error("Raft WAL state mutex poisoned")]
     LockPoisoned,
     /// The OpenRaft work of the group's previous engine still runs (#709).
@@ -631,6 +645,8 @@ pub(crate) struct NodeWal {
     cluster_id: ursula_headers::ClusterId,
     /// How the data journals open.
     opening: WalOpening,
+    /// What the data journals held at start.
+    data_history: JournalHistory,
     /// How the meta journal opens.
     meta_opening: MetaOpening,
     /// Whether the meta journal's directory existed at start.
@@ -774,6 +790,7 @@ impl NodeWal {
             root,
             cluster_id,
             opening,
+            data_history: journals,
             meta_opening,
             meta_at_start,
             run_state: Arc::new(run_state),
@@ -802,6 +819,52 @@ impl NodeWal {
     /// How the meta journal opens.
     pub(crate) fn meta_opening(&self) -> MetaOpening {
         self.meta_opening.clone()
+    }
+
+    /// The meta journal's directory.
+    pub(crate) fn meta_dir(&self) -> PathBuf {
+        meta_dir(&self.root)
+    }
+
+    /// Records the meta journal's group `raft_group_id` recovering before
+    /// its journal first opens in this run, when the meta journal's
+    /// directory was gone at start while a data journal held records.
+    ///
+    /// A node with data history never opens a new, empty meta log: its gate
+    /// then opens closed, and the replica rejoins its meta group as a wiped
+    /// voter does, instead of answering as empty and forming a meta group
+    /// again beside the one it belonged to. Every node that holds data
+    /// creates the meta directory first, so only a discarded or lost
+    /// directory gives this. A meta journal that exists opens by what it
+    /// holds, so an empty one stays empty. A data vote floor alone counts as
+    /// data history, which is safe for an absent directory.
+    pub(crate) fn record_lost_meta(
+        &self,
+        raft_group_id: ursula_shard::RaftGroupId,
+    ) -> Result<(), MetaJournalDamage> {
+        let lost = self.meta_at_start == MetaAtStart::Absent
+            && matches!(self.data_history, JournalHistory::Records { .. });
+        if !lost {
+            return Ok(());
+        }
+        let dir = self.meta_dir();
+        create_dir_all_durable(&dir).map_err(|source| MetaJournalDamage::CreateDir {
+            path: dir.clone(),
+            source: Arc::new(source),
+        })?;
+        let path = core_metadata_path(&dir);
+        let marked = |source: MarkRecoveringError| MetaJournalDamage::MarkRecovering {
+            path: path.clone(),
+            source: Arc::new(source),
+        };
+        let mut metadata = CoreMetadata::load(&path)
+            .map_err(|source| marked(MarkRecoveringError::Read(source)))?;
+        if metadata.initialize(raft_group_id.0, GroupLogState::Recovering) {
+            metadata
+                .store(&path)
+                .map_err(|source| marked(MarkRecoveringError::Write(source)))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn run_state(&self) -> &Arc<RunStateFile> {
@@ -957,7 +1020,7 @@ fn journal_history(dirs: &[PathBuf]) -> Result<JournalHistory, HistoryReadError>
             source,
         })?;
         let path = core_metadata_path(dir);
-        let metadata = super::core_meta::CoreMetadata::load(&path)
+        let metadata = CoreMetadata::load(&path)
             .map_err(|source| HistoryReadError::Metadata { path, source })?;
         verified_epoch = verified_epoch.max(metadata.verified_epoch());
     }
