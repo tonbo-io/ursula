@@ -7,6 +7,8 @@
 //! (`ursula_control::ControlError::requeue`). `NodeRemoved` makes the node
 //! treat itself as removed until it restarts.
 
+use std::sync::Arc;
+use std::sync::Weak;
 use std::time::Duration;
 
 use openraft::rt::WatchReceiver;
@@ -19,6 +21,7 @@ use ursula_proto::placement::Registered;
 
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
+use super::replica::ActiveMeta;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
 use crate::rt::sync::watch;
@@ -97,13 +100,29 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
 }
 
 /// Waits until this node's meta replica has gone `window` without a
-/// leader. A node without a meta replica waits `window`.
+/// leader. A node without a meta replica waits `window`, and so does one
+/// whose replica stopped while it is still published, whose metrics close
+/// at once: the wait then always awaits something that pends.
 async fn wait_without_leader(registry: &RaftGroupHandleRegistry, window: Duration) {
+    // The replica whose metrics closed, held weakly so the wait keeps no
+    // replica alive and its address cannot name another.
+    let mut stopped: Option<Weak<ActiveMeta>> = None;
     loop {
         let Some(active) = registry.meta() else {
             crate::rt::time::sleep(window).await;
             return;
         };
+        let current = Arc::downgrade(&active);
+        if stopped
+            .as_ref()
+            .is_some_and(|stopped| Weak::ptr_eq(stopped, &current))
+        {
+            // The replica whose metrics closed is still the published one.
+            // It names no leader, so the node goes `window` without one.
+            drop(active);
+            crate::rt::time::sleep(window).await;
+            return;
+        }
         let mut metrics = active.core.owner().metrics();
         drop(active);
         let mut leaderless_since = None;
@@ -122,10 +141,11 @@ async fn wait_without_leader(registry: &RaftGroupHandleRegistry, window: Duratio
             }
             match crate::rt::time::timeout(remaining, metrics.changed()).await {
                 Err(_elapsed) => return,
-                // The replica stopped: watch the one that replaced it.
                 Ok(Err(_closed)) => break,
                 Ok(Ok(())) => {}
             }
         }
+        // The replica stopped: watch the one that replaced it, if one did.
+        stopped = Some(current);
     }
 }

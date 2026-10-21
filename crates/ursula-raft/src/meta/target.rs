@@ -154,11 +154,17 @@ mod tests {
         assert_eq!(read.target.stage, TargetStage::Settled);
 
         // The sample cluster: 1 active, 2 cordoned, 3 decommissioning, 4
-        // removed and 5 active, with meta voters {1,2}. The committed voters
-        // stay the target's, and the removed node is no learner.
+        // removed and 5 active, with meta voters {1,2} in its params. The
+        // committed voters {1,5} differ from those, and stay the target's:
+        // read from the view, the target would be voters {1,2} with
+        // learners {3,5}. The removed node is no learner.
+        let committed = MembershipConfig::Uniform {
+            voters: samples::voters(&[1, 5]),
+            learners: samples::ids(&[2]),
+        };
         let bootstrapped = applied(samples::sample_state());
         let read = meta_target(&bootstrapped, &committed).unwrap();
-        assert_eq!(read.target.voters, samples::voters(&[1, 2]));
-        assert_eq!(read.target.learners, samples::ids(&[3, 5]));
+        assert_eq!(read.target.voters, samples::voters(&[1, 5]));
+        assert_eq!(read.target.learners, samples::ids(&[2, 3]));
     }
 }

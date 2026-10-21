@@ -29,6 +29,7 @@ use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
 use ursula_control::ControlError;
 use ursula_control::PlacementView;
+use ursula_control::UnconfirmedView;
 use ursula_control::leader_candidates;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::MetaLogId;
@@ -285,14 +286,18 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         drop(active);
         let bound = barrier_bound(&answer);
         let mut watch = self.registry.placement_watch();
-        let view = crate::rt::time::timeout(CONFIRM_WAIT, async {
+        crate::rt::time::timeout(CONFIRM_WAIT, async {
             loop {
-                let view = watch.current();
-                if reaches(&view, bound) {
-                    return Some(view);
+                match confirm(watch.current(), bound) {
+                    // Not applied up to the bound yet: wait for the next view.
+                    Err(UnconfirmedView::Empty | UnconfirmedView::Behind { .. }) => {}
+                    confirmed => {
+                        return confirmed
+                            .map_err(|source| MetaBarrierError::Unconfirmed { source });
+                    }
                 }
                 if !watch.changed().await {
-                    return None;
+                    return Err(MetaBarrierError::Stopped);
                 }
             }
         })
@@ -300,8 +305,6 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         .map_err(|_elapsed| MetaBarrierError::TimedOut {
             waited: CONFIRM_WAIT,
         })?
-        .ok_or(MetaBarrierError::Stopped)?;
-        confirm(view, bound)
     }
 }
 
@@ -315,82 +318,16 @@ pub(crate) fn barrier_bound(answer: &BarrierAnswer) -> MetaLogId {
     })
 }
 
-/// Whether `view` applied an entry at least `bound`, compared term first.
-pub(crate) fn reaches(view: &PlacementView, bound: MetaLogId) -> bool {
-    view.applied().is_some_and(|applied| applied >= bound)
-}
-
-/// `view` confirmed at `bound`, in the history it applied.
-fn confirm(view: Arc<PlacementView>, bound: MetaLogId) -> Result<ConfirmedView, MetaBarrierError> {
+/// `view` confirmed at `bound` in the history it applied, by
+/// [`ConfirmedView::new`]'s rule (term first): `Behind` until the view
+/// applied the bound.
+fn confirm(view: Arc<PlacementView>, bound: MetaLogId) -> Result<ConfirmedView, UnconfirmedView> {
     let history = match view.stage {
         ViewStage::Applied { history, .. } => history,
-        ViewStage::Empty => {
-            return Err(MetaBarrierError::Unconfirmed {
-                source: ursula_control::UnconfirmedView::Empty,
-            });
-        }
+        ViewStage::Empty => return Err(UnconfirmedView::Empty),
     };
     ConfirmedView::new(view, ConfirmedStamp {
         history,
         applied: bound,
     })
-    .map_err(|source| MetaBarrierError::Unconfirmed { source })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use ursula_control::ControlPlaneState;
-    use ursula_control::PlacementView;
-    use ursula_proto::placement::MetaLogId;
-    use ursula_proto::placement::NodeId;
-    use ursula_proto::placement::RaftLogId;
-    use ursula_proto::placement::ViewStage;
-
-    use super::barrier_bound;
-    use super::reaches;
-    use crate::BarrierAnswer;
-    use crate::LeaderMemberships;
-    use crate::types::UrsulaVote;
-
-    fn id(term: u64, leader: u64, index: u64) -> MetaLogId {
-        MetaLogId::new(RaftLogId {
-            term,
-            leader: NodeId::new(leader),
-            index,
-        })
-    }
-
-    fn view(applied: MetaLogId) -> PlacementView {
-        PlacementView {
-            stage: ViewStage::Applied {
-                applied,
-                history: id(1, 1, 1),
-            },
-            state: Arc::new(ControlPlaneState::default()),
-        }
-    }
-
-    /// A follower confirms only once it applied the barrier's bound term
-    /// first: a learner that missed a meta plan holds a higher index of an
-    /// older term, which an index comparison would take as caught up.
-    #[test]
-    fn a_view_reaches_a_barrier_bound_term_first() {
-        let answer = BarrierAnswer {
-            vote: UrsulaVote::new_committed(3, 2),
-            index: 10,
-            memberships: LeaderMemberships {
-                committed: Default::default(),
-                effective: Default::default(),
-            },
-        };
-        let bound = barrier_bound(&answer);
-        assert_eq!(bound, id(3, 2, 10));
-        assert!(!reaches(&view(id(2, 1, 50)), bound), "an older term");
-        assert!(!reaches(&view(id(3, 2, 9)), bound), "below the index");
-        assert!(reaches(&view(id(3, 2, 10)), bound));
-        assert!(reaches(&view(id(4, 1, 1)), bound), "a newer leadership");
-        assert!(!reaches(&PlacementView::empty(), bound));
-    }
 }

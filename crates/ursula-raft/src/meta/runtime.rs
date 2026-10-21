@@ -13,10 +13,13 @@
 //!
 //! No meta failure stops the node. A journal that did not open, or a
 //! replica that did not, leaves the runtime [`MetaRuntimeState::Damaged`]
-//! from the start, and a for-good refusal of the commit screen
-//! ([`super::damage`]) makes it so later: the supervisor stops the replica
-//! with its tasks, which clears the registry's slot, publishes the empty
-//! view and keeps the meta directory, whose discard is the operator's step.
+//! from the start. A recovery plan's restart that does not reopen the
+//! replica, or a for-good refusal of the commit screen ([`super::damage`]),
+//! makes it so later: the supervisor stops the replica with its tasks,
+//! which clears the registry's slot. Every way into `Damaged` publishes the
+//! empty view (design 3.2), since a replica that restored or replayed its
+//! state before failing may have published a view no replica backs. The
+//! meta directory stays, and its discard is the operator's step.
 //!
 //! Generic over the network and the recovery transport, so a simulation
 //! runs it in process.
@@ -112,6 +115,7 @@ pub struct MetaRuntimeStatus {
 /// This node's meta runtime (see the module docs).
 pub struct MetaRuntime<N> {
     status: MetaRuntimeStatus,
+    state: watch::Sender<MetaRuntimeState>,
     replica: Arc<Mutex<Option<MetaReplicaRestart<N>>>>,
     registry: RaftGroupHandleRegistry,
     tasks: Vec<JoinHandle<()>>,
@@ -156,6 +160,7 @@ where
                 bootstrap_refusal: refusal_rx,
                 reconcile: reconcile_rx,
             },
+            state,
             replica: Arc::new(Mutex::new(None)),
             registry: registry.clone(),
             tasks: Vec::new(),
@@ -164,7 +169,7 @@ where
             Ok(store) => store,
             Err(error) => {
                 tracing::error!(%error, "meta runtime: the meta journal did not open; this node runs no meta replica");
-                state.send_replace(MetaRuntimeState::Damaged(MetaDamageKind::Journal));
+                mark_damaged(&runtime.state, &registry, MetaDamageKind::Journal);
                 return runtime;
             }
         };
@@ -200,9 +205,9 @@ where
         {
             Ok(restart) => restart,
             Err(error) => {
-                let kind = error.damage_kind().unwrap_or(MetaDamageKind::Start);
+                let kind = opening_damage(&error);
                 tracing::error!(%error, ?kind, "meta runtime: the meta replica did not open; this node runs no meta replica");
-                state.send_replace(MetaRuntimeState::Damaged(kind));
+                mark_damaged(&runtime.state, &registry, kind);
                 return runtime;
             }
         };
@@ -231,7 +236,7 @@ where
             damage_rx,
             Arc::clone(&runtime.replica),
             registry,
-            state,
+            runtime.state.clone(),
         )));
         runtime
     }
@@ -248,7 +253,9 @@ where
 
     /// A recovery plan on this node's meta replica
     /// ([`RaftGroupHandleRegistry::accept_meta_recovery_plan`]), which
-    /// restarts the replica with its tasks when the plan cuts its log.
+    /// restarts the replica with its tasks when the plan cuts its log. A
+    /// restart that does not reopen the replica leaves the runtime
+    /// `Damaged`.
     pub async fn accept_recovery_plan(
         &self,
         plan: &RecoveryPlanRequest,
@@ -257,7 +264,16 @@ where
         let restart = replica.as_mut().ok_or(RecoveryGateError::NotRegistered {
             raft_group_id: super::state_machine::META_GROUP,
         })?;
-        self.registry.accept_meta_recovery_plan(plan, restart).await
+        let accepted = self.registry.accept_meta_recovery_plan(plan, restart).await;
+        if let Err(RecoveryGateError::MetaRestart { source }) = &accepted {
+            // The restart stopped the old replica, which unpublished it, and
+            // no new one opened: the replica held here runs nothing.
+            let kind = opening_damage(source);
+            tracing::error!(%source, ?kind, "meta runtime: the meta replica did not reopen after a recovery plan; this node runs no meta replica");
+            *replica = None;
+            mark_damaged(&self.state, &self.registry, kind);
+        }
+        accepted
     }
 
     /// Stops the node tasks, then the meta replica with its own tasks.
@@ -293,9 +309,28 @@ fn recovery_config(engine: &RaftEngineConfig) -> RecoveryConfig {
     }
 }
 
+/// How a replica that did not open, or did not reopen, is damaged: as its
+/// error names it, and `Start` for a stop, which names none.
+fn opening_damage(error: &super::replica::MetaReplicaError) -> MetaDamageKind {
+    error.damage_kind().unwrap_or(MetaDamageKind::Start)
+}
+
+/// Marks the runtime damaged for `kind` and publishes the empty view, the
+/// one way into `Damaged` (see the module docs). Callers stop or drop the
+/// replica first, so no replica publishes after the empty view.
+fn mark_damaged(
+    state: &watch::Sender<MetaRuntimeState>,
+    registry: &RaftGroupHandleRegistry,
+    kind: MetaDamageKind,
+) {
+    state.send_replace(MetaRuntimeState::Damaged(kind));
+    registry
+        .placement_publisher()
+        .publish(PlacementView::empty());
+}
+
 /// Waits for a for-good refusal of the commit screen, then stops the
-/// replica with its tasks, publishes the empty view and marks the runtime
-/// damaged.
+/// replica with its tasks and marks the runtime damaged.
 async fn supervise_damage<N>(
     mut damage: watch::Receiver<Option<CommitScreenDamage>>,
     replica: Arc<Mutex<Option<MetaReplicaRestart<N>>>>,
@@ -313,16 +348,15 @@ async fn supervise_damage<N>(
             return;
         }
     }
-    state.send_replace(MetaRuntimeState::Damaged(MetaDamageKind::CommitScreen));
-    let stopped = replica.lock().await.take();
-    if let Some(stopped) = stopped
-        && let Err(error) = stopped.shutdown().await
-    {
+    // No replica here: a failed plan restart already made the runtime
+    // damaged.
+    let Some(stopped) = replica.lock().await.take() else {
+        return;
+    };
+    if let Err(error) = stopped.shutdown().await {
         tracing::error!(%error, "meta runtime: the damaged meta replica did not stop cleanly");
     }
-    registry
-        .placement_publisher()
-        .publish(PlacementView::empty());
+    mark_damaged(&state, &registry, MetaDamageKind::CommitScreen);
 }
 
 /// The gate drivers and the reconcile shell of every meta replica the
