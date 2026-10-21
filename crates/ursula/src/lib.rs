@@ -22,6 +22,8 @@
 //!   parts, counted by the leader.
 //! - [`response_metadata`]: `Ursula-Protocol` and `Ursula-Cluster-Id` on
 //!   every HEAD answer, and the request limit on a `413` that names none.
+//! - [`placement_status`]: `GET /__ursula/placement`, this node's placement
+//!   status, and the one answer of every placement refusal.
 //! - [`render`]: response builders, header helpers, SSE/multipart rendering.
 //! - [`bootstrap`]: typed-config `spawn_*_runtime` constructors and cold-flush worker.
 //! - [`server`]: command arguments and the long-running server service entrypoint.
@@ -34,6 +36,7 @@ mod immutable_reads;
 pub mod json_text;
 mod limits;
 mod otel_metrics;
+mod placement_status;
 pub mod server;
 mod http_time {
     #[cfg(madsim)]
@@ -457,6 +460,7 @@ impl HttpState {
         }
         if let Some(registry) = &self.raft_registry {
             otel_metrics::register_recovery_gates(registry.clone());
+            otel_metrics::register_meta(registry.clone(), self.meta.wal_metrics());
         }
         otel_metrics::register_staged_snapshot_parts(self.clone());
     }
@@ -1259,6 +1263,10 @@ pub fn admin_router(state: HttpState) -> Router {
     admin_ops_router(state.clone()).merge(
         Router::new()
             .route("/__ursula/metrics", get(metrics))
+            .route(
+                placement_status::PLACEMENT_PATH,
+                get(placement_status::admin_placement_status),
+            )
             .route(READINESS_PATH, get(readiness))
             .route("/__ursula/usage", get(bucket_usage))
             .with_state(state),
@@ -1623,6 +1631,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route("/__ursula/metrics", get(metrics))
         .route(READINESS_PATH, get(readiness))
         .route("/__ursula/usage", get(bucket_usage))
+        .route(
+            placement_status::PLACEMENT_PATH,
+            get(placement_status::placement_status),
+        )
         .route("/{bucket}", put(create_bucket))
         // The bare path (the removed latest-snapshot redirect and the removed
         // record-addressed publish) answers 405 to every method, not a 404
@@ -2063,13 +2075,34 @@ struct WalRecoveryReport {
     fsync: ursula_config::WalFsync,
     #[serde(flatten)]
     opening: ursula_raft::WalOpening,
+    /// How the meta journal opened, by its own run-state class.
+    meta: MetaWalRecoveryReport,
+}
+
+/// How the meta journal opened, and why it could not be read, if it could
+/// not.
+#[derive(Debug, serde::Serialize)]
+struct MetaWalRecoveryReport {
+    #[serde(flatten)]
+    opening: ursula_raft::WalOpening,
+    damage: Option<String>,
 }
 
 impl WalRecoveryReport {
     fn new(raft_wal: &ursula_raft::RaftWal) -> Self {
+        let meta = raft_wal.meta_opening();
         Self {
             fsync: raft_wal.fsync(),
             opening: raft_wal.opening(),
+            meta: MetaWalRecoveryReport {
+                opening: meta.opening(),
+                damage: match &meta {
+                    ursula_raft::MetaOpening::Decided(_) => None,
+                    ursula_raft::MetaOpening::Damaged { damage, .. } => {
+                        Some(ursula_runtime::ErrorChain(damage).to_string())
+                    }
+                },
+            },
         }
     }
 }
@@ -2088,6 +2121,11 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
                 .node_id()
                 .or_else(|| raft_groups.first().map(|group| group.node_id)),
             groups: raft_groups.iter().map(render::raft_group_metrics).collect(),
+            meta: state
+                .raft_registry()
+                .and_then(RaftGroupHandleRegistry::meta_metrics_snapshot)
+                .as_ref()
+                .map(render::raft_group_metrics),
             raft_maintenance: state.raft_maintenance_report(),
         },
         runtime: render_metrics(

@@ -793,6 +793,10 @@ pub struct NodeMetrics {
     pub process_node_id: Option<u64>,
     #[serde(rename = "raft_groups")]
     pub groups: Vec<RaftGroupMetrics>,
+    /// This node's meta replica, `null` when it runs none. Apart from
+    /// `raft_groups`, where its group 0 would meet data group 0.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub meta: Option<RaftGroupMetrics>,
     #[serde(deserialize_with = "Option::deserialize")]
     pub raft_maintenance: Option<RaftMaintenanceReport>,
 }
@@ -906,6 +910,7 @@ mod metrics_contract_tests {
             cluster_id: ursula_headers::ClusterId::new("prod-eu-1").unwrap(),
             process_incarnation: ProcessIncarnation::from_bits(1),
             process_node_id: Some(1),
+            meta: None,
             raft_maintenance: Some(RaftMaintenanceReport {
                 version: SchemaVersion,
                 node_id: 1,

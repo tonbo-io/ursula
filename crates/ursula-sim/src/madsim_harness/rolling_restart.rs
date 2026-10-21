@@ -255,6 +255,7 @@ impl RollingRestartValidator {
                                 }),
                         }
                     }],
+                    meta: None,
                     raft_maintenance: Some(ursula_proto::admin::RaftMaintenanceReport {
                         version: ursula_proto::admin::SchemaVersion,
                         node_id,

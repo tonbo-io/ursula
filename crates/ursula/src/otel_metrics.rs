@@ -14,6 +14,8 @@
 //! Raft group count, so series cardinality stays fixed. `stream_id`/`bucket_id`
 //! are never used as labels (unbounded) — they live on spans only.
 
+use std::collections::BTreeMap;
+
 use opentelemetry::KeyValue;
 use opentelemetry::global;
 use opentelemetry::metrics::Meter;
@@ -136,6 +138,92 @@ pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegi
             }
         })
         .build();
+}
+
+/// Register the meta group's instruments: `ursula.meta.leader` (1 while
+/// this node leads meta), `ursula.meta.applied_index` (the last meta entry
+/// this node's view includes), `ursula.placement.moving_groups` and
+/// `ursula.placement.retirements_pending` (from that view), and the meta
+/// journal's own WAL counters, `ursula.meta.wal.batches` and
+/// `ursula.meta.wal.records`, from `wal`.
+pub(crate) fn register_meta(
+    registry: ursula_raft::RaftGroupHandleRegistry,
+    wal: Option<RuntimeMetrics>,
+) {
+    let meter = global::meter("ursula-raft");
+    let leader = registry.clone();
+    let _ = meter
+        .u64_observable_gauge("ursula.meta.leader")
+        .with_description(
+            "1 while this node leads the meta group, 0 while it runs a meta replica that does not",
+        )
+        .with_callback(move |observer| {
+            if let Some(meta) = leader.meta_metrics_snapshot() {
+                observer.observe(u64::from(meta.current_leader == Some(meta.node_id)), &[]);
+            }
+        })
+        .build();
+    let applied = registry.clone();
+    let _ = meter
+        .u64_observable_gauge("ursula.meta.applied_index")
+        .with_description(
+            "The index of the last meta log entry this node's placement view includes",
+        )
+        .with_callback(move |observer| {
+            if let Some(applied) = applied.placement_watch().current().applied() {
+                observer.observe(applied.get().index, &[]);
+            }
+        })
+        .build();
+    let moving = registry.clone();
+    let _ = meter
+        .u64_observable_gauge("ursula.placement.moving_groups")
+        .with_description("Raft groups with a move in progress, in this node's placement view")
+        .with_callback(move |observer| {
+            if let Some(cluster) = moving.placement_watch().current().cluster() {
+                observer.observe(u64::from(cluster.moving()), &[]);
+            }
+        })
+        .build();
+    let _ = meter
+        .u64_observable_gauge("ursula.placement.retirements_pending")
+        .with_description(
+            "Replicas a converged move still owes a retirement, in this node's placement view",
+        )
+        .with_callback(move |observer| {
+            if let Some(cluster) = registry.placement_watch().current().cluster() {
+                let pending = cluster
+                    .retirements()
+                    .values()
+                    .map(BTreeMap::len)
+                    .sum::<usize>();
+                observer.observe(u64::try_from(pending).unwrap_or(u64::MAX), &[]);
+            }
+        })
+        .build();
+    let Some(wal) = wal else {
+        return;
+    };
+    for (name, description, field) in [
+        (
+            "ursula.meta.wal.batches",
+            "Meta journal WAL batches written",
+            (|s: &RuntimeMetricsSnapshot| s.per_group_wal_batches.iter().sum::<u64>())
+                as fn(&RuntimeMetricsSnapshot) -> u64,
+        ),
+        (
+            "ursula.meta.wal.records",
+            "Meta journal WAL records written",
+            |s: &RuntimeMetricsSnapshot| s.per_group_wal_records.iter().sum::<u64>(),
+        ),
+    ] {
+        let wal = wal.clone();
+        let _ = meter
+            .u64_observable_counter(name)
+            .with_description(description)
+            .with_callback(move |observer| observer.observe(field(&wal.snapshot()), &[]))
+            .build();
+    }
 }
 
 /// Register `ursula.snapshot_parts.staged_bytes`: the bytes of staged,

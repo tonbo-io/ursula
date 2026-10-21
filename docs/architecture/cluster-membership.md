@@ -29,10 +29,19 @@ entries, snapshot records and installed snapshots name each member by node ID
 only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 
 There is no runtime membership authority for data groups. Every node that
-runs Raft runs a replica of the meta Raft group, which forms over the nodes of
-`raft.peers` and records the cluster's bootstrap, but no data group reads its
-placements, and the server never moves a group to another node or changes its
-voter count. The
+runs Raft runs a replica of the meta Raft group, unless its meta journal or
+replica is damaged, which forms over the nodes of `raft.peers` and records the
+cluster's bootstrap, but no data group reads its placements, and the server
+never moves a group to another node or changes its voter count.
+`GET /__ursula/placement`, on the client and the admin listener, reports what
+the node's meta replica applied, its role and leader, and its registration
+(`crates/ursula-raft/src/meta/status.rs`). With `?confirmed=true`, on the
+admin listener only, a meta read barrier confirms the view first. A node that
+runs no meta replica marks the `placement-unavailable` leadership shed. It
+still campaigns, so a group whose every voter lacks meta still elects, but it
+takes no leadership transfer and hands the leaderships it holds to its peers,
+again every 30 seconds (`crates/ursula/src/bootstrap/meta_shed.rs`). A node
+that sheds for any reason hands its meta leadership away too. The
 configured voter set is the target that the heal driver restores
 (section 2). The admin routes (section 3) can change a group's OpenRaft
 membership directly, and the heal driver adds a configured voter that is
@@ -107,8 +116,11 @@ sends it with every mutation of the same command.
 
 The maintenance-drain mark makes a node shed its leaderships, stop
 campaigning and refuse leadership transfers. `ursulactl drain` sets it and
-waits until the node leads nothing, and `undrain` clears it. The mark lives in
-the process, so a restarted server starts without it.
+waits until the node leads nothing, the meta group included, and `undrain`
+clears it. The node hands its meta leadership away itself, and `ursulactl`
+reads it from the `meta` field of the node's metrics, apart from
+`raft_groups`. The mark lives in the process, so a restarted server starts
+without it.
 
 Readiness and maintenance eligibility are two answers from one report
 (`check_raft_maintenance` in `crates/ursula-raft/src/maintenance.rs`). The

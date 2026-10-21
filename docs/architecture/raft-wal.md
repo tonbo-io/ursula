@@ -524,7 +524,7 @@ The data-group engine owns its recovery tasks and exposes the runtime's
 | --- | --- |
 | `RaftWal` | Node run state, per-core writer lifetime, group log stores and shutdown. Exported from `ursula_raft::wal`, with format inspection types under `wal::diagnostics`. |
 | `RecoveryGate::attach` | Binds the gate, publishes the group's resources, starts the bootstrap, heal and barrier drivers and keeps their handles. Engine shutdown aborts and joins them. gRPC and simulation inject a `RecoveryTransport`. |
-| `ElectionPolicy` | Combines node leadership shedding with per-group recovery eligibility, drives OpenRaft's election switch and validates handoff targets and incoming transfers. Cold-health pressure alone leaves a node electable. |
+| `ElectionPolicy` | Combines node leadership shedding with per-group recovery eligibility, drives OpenRaft's election switch and validates handoff targets and incoming transfers. Cold-health pressure alone leaves a node electable, and a node without a meta replica stays electable but takes no transfer. |
 | `GroupEntry` | Registry entry per group. `Active` holds the Raft handle, read barrier, recovery gate, apply health and cold-index cache. `ApplyStopped` holds the apply failure and last applied log id and refuses requests. Each RPC keeps one entry through dispatch, and a gate cannot be removed by republication. |
 | `ursula-proto` | Shared admin requests, responses and recovery status. WAL metric samples live in `ursula-runtime`. |
 
