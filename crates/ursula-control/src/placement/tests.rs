@@ -27,12 +27,16 @@ use super::HistoryCause;
 use super::LifecycleChange;
 use super::MetaDamageKind;
 use super::MetaLeaderReport;
+use super::MetaReplicaStatus;
+use super::MetaRole;
 use super::MoveLimit;
 use super::MoveLimitRequest;
 use super::MoveRequest;
 use super::NodeEligibility;
 use super::PlacementApiError;
 use super::PlacementApiReason;
+use super::PlacementStatus;
+use super::RegistrationStatus;
 use super::Retirement;
 use super::Target;
 use super::samples::Driver;
@@ -876,6 +880,9 @@ fn every_root_round_trips_through_messagepack_and_json() {
         last_bootstrap_refusal: None,
         oldest_move_age_ms: None,
     });
+    for status in sample_placement_statuses() {
+        round_trip(&status);
+    }
     for kind in [
         MetaDamageKind::Journal,
         MetaDamageKind::Pointer,
@@ -897,6 +904,7 @@ fn every_root_round_trips_through_messagepack_and_json() {
         PlacementApiReason::ForwardFailed { leader: node(2) },
         PlacementApiReason::LeaderRefused { leader: node(3) },
         PlacementApiReason::Stopped,
+        PlacementApiReason::Unconfirmed,
     ] {
         round_trip(&PlacementApiError {
             reason,
@@ -904,6 +912,150 @@ fn every_root_round_trips_through_messagepack_and_json() {
             current: None,
             message: String::new(),
         });
+    }
+}
+
+/// Every variant of the placement status's enums, sampled through
+/// exhaustive matches, so a new variant fails to compile until it is.
+fn sample_placement_statuses() -> Vec<PlacementStatus> {
+    let ControlPlaneState::Bootstrapped(cluster) = sample_state() else {
+        panic!("the sample state is bootstrapped");
+    };
+    let record = NodeRecord {
+        lifecycle: NodeLifecycle::Cordoned,
+        since_ms: 81,
+    };
+    let metas = [
+        MetaReplicaStatus::Running {
+            role: MetaRole::Voter,
+            leader: Some(node(2)),
+        },
+        MetaReplicaStatus::Running {
+            role: MetaRole::Learner,
+            leader: None,
+        },
+        MetaReplicaStatus::Running {
+            role: MetaRole::NotMember,
+            leader: Some(node(4)),
+        },
+        MetaReplicaStatus::Damaged {
+            kind: MetaDamageKind::CommitScreen,
+            message: "refused for good".to_owned(),
+        },
+        MetaReplicaStatus::Absent,
+    ];
+    let registrations = [
+        RegistrationStatus::Pending,
+        RegistrationStatus::Answered(Registered::Forming),
+        RegistrationStatus::Answered(Registered::Referenced(record)),
+        RegistrationStatus::Answered(Registered::Unreferenced(record)),
+        RegistrationStatus::Refused(ControlError::FormationCut),
+        RegistrationStatus::Removed,
+    ];
+    let views = [
+        ClusterView::MetaGenesis {
+            unanswered: ids(&[5]),
+            genesis_mismatch: BTreeMap::from([(node(6), sample_genesis_claim())]),
+        },
+        ClusterView::MetaCatchingUp,
+        ClusterView::Registering {
+            registered: ids(&[1]),
+            waiting_for: ids(&[3]),
+        },
+        ClusterView::FormationCut,
+        ClusterView::Bootstrapped(cluster),
+    ];
+    let mut statuses = Vec::new();
+    let mut paired_metas = metas.iter().cycle();
+    let mut paired_registrations = registrations.iter().cycle();
+    let mut applied = true;
+    for view in views {
+        match &view {
+            ClusterView::MetaGenesis { .. }
+            | ClusterView::MetaCatchingUp
+            | ClusterView::Registering { .. }
+            | ClusterView::FormationCut
+            | ClusterView::Bootstrapped(_) => {}
+        }
+        let replica = paired_metas.next().unwrap().clone();
+        match &replica {
+            MetaReplicaStatus::Running {
+                role: MetaRole::Voter | MetaRole::Learner | MetaRole::NotMember,
+                ..
+            }
+            | MetaReplicaStatus::Damaged { .. }
+            | MetaReplicaStatus::Absent => {}
+        }
+        let registration = paired_registrations.next().unwrap().clone();
+        match &registration {
+            RegistrationStatus::Pending
+            | RegistrationStatus::Answered(
+                Registered::Forming | Registered::Referenced(_) | Registered::Unreferenced(_),
+            )
+            | RegistrationStatus::Refused(_)
+            | RegistrationStatus::Removed => {}
+        }
+        statuses.push(PlacementStatus {
+            node: node(7),
+            view,
+            applied: applied.then(|| meta(3, 9)),
+            meta: replica,
+            registration,
+            last_bootstrap_refusal: (!applied).then_some(ControlError::AlreadyBootstrapped),
+        });
+        applied = !applied;
+    }
+    // The variants the views did not pair with.
+    for replica in metas {
+        statuses.push(PlacementStatus {
+            node: node(8),
+            view: ClusterView::MetaCatchingUp,
+            applied: None,
+            meta: replica,
+            registration: RegistrationStatus::Pending,
+            last_bootstrap_refusal: None,
+        });
+    }
+    for registration in registrations {
+        statuses.push(PlacementStatus {
+            node: node(9),
+            view: ClusterView::FormationCut,
+            applied: Some(meta(4, 10)),
+            meta: MetaReplicaStatus::Absent,
+            registration,
+            last_bootstrap_refusal: None,
+        });
+    }
+    statuses
+}
+
+#[test]
+fn a_placement_status_refuses_a_missing_option() {
+    let status = PlacementStatus {
+        node: node(1),
+        view: ClusterView::MetaCatchingUp,
+        applied: None,
+        meta: MetaReplicaStatus::Running {
+            role: MetaRole::Voter,
+            leader: None,
+        },
+        registration: RegistrationStatus::Pending,
+        last_bootstrap_refusal: None,
+    };
+    let json = serde_json::to_value(&status).unwrap();
+    // An `Option` field is required, also when `null`.
+    for path in [&["applied"][..], &["last_bootstrap_refusal"], &[
+        "meta", "running", "leader",
+    ]] {
+        let mut missing = json.clone();
+        let (last, parents) = path.split_last().unwrap();
+        let mut object = &mut missing;
+        for key in parents {
+            object = object.get_mut(*key).unwrap();
+        }
+        assert!(object.as_object_mut().unwrap().remove(*last).is_some());
+        serde_json::from_value::<PlacementStatus>(missing)
+            .expect_err(&format!("a missing `{}` does not decode", path.join(".")));
     }
 }
 

@@ -16,8 +16,10 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_proto::admin::required_option;
 use ursula_proto::placement::GenesisClaim;
+use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
+use ursula_proto::placement::Registered;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WriteEffect;
 use ursula_shard::RaftGroupId;
@@ -99,6 +101,71 @@ pub enum MetaDamageKind {
     CommitScreen,
 }
 
+/// `GET /__ursula/placement`: what this node knows of the placement and
+/// how its meta replica runs. With `?confirmed=true` (admin listener only)
+/// the view is one a meta read barrier confirmed current.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementStatus {
+    pub node: NodeId,
+    pub view: ClusterView,
+    /// The last meta entry the view includes, `null` for an empty view.
+    #[serde(deserialize_with = "required_option")]
+    pub applied: Option<MetaLogId>,
+    pub meta: MetaReplicaStatus,
+    pub registration: RegistrationStatus,
+    /// Why the last `Bootstrap` this node submitted was refused, if it was.
+    #[serde(deserialize_with = "required_option")]
+    pub last_bootstrap_refusal: Option<ControlError>,
+}
+
+/// How this node's meta replica runs. Closed, like [`MetaDamageKind`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaReplicaStatus {
+    /// The replica runs, with this node's role in meta's effective
+    /// membership and the meta leader it knows.
+    Running {
+        role: MetaRole,
+        #[serde(deserialize_with = "required_option")]
+        leader: Option<NodeId>,
+    },
+    /// No meta replica runs in this run, for `kind`. `message` is the
+    /// rendered error.
+    Damaged {
+        kind: MetaDamageKind,
+        message: String,
+    },
+    /// No replica is published at the moment: a recovery plan restarts it,
+    /// or the node stops.
+    Absent,
+}
+
+/// A node's role in meta's effective membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaRole {
+    Voter,
+    Learner,
+    NotMember,
+}
+
+/// Where this node's registration with the meta group stands in this run.
+/// Closed, like [`MetaDamageKind`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistrationStatus {
+    /// No answer yet.
+    Pending,
+    /// The meta group's last answer.
+    Answered(Registered),
+    /// The meta group refused the node for good: it registers again only
+    /// after a restart.
+    Refused(ControlError),
+    /// The meta group refused the node as removed: it treats itself as
+    /// removed until it restarts.
+    Removed,
+}
+
 /// `POST /__ursula/placement/groups/{group}/move`: move the group to `to`
 /// when its placement is still at `expected`. A cancel names the move's
 /// source.
@@ -128,6 +195,9 @@ pub enum PlacementApiReason {
     LeaderRefused { leader: NodeId },
     /// The local meta replica stopped.
     Stopped,
+    /// A meta read barrier completed, and the local replica did not apply
+    /// up to it in time, or its view is in another meta history.
+    Unconfirmed,
 }
 
 /// Every refusal of a placement route, with whether the write may have
