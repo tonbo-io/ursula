@@ -4150,6 +4150,7 @@ dependencies = [
  "tempfile",
  "thiserror 1.0.69",
  "toml",
+ "ursula-control",
  "ursula-headers",
  "ursula-proto",
 ]

@@ -3,7 +3,10 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_control::MoveLimit;
 use ursula_headers::ClusterId;
+use ursula_proto::placement::ReplicationFactor;
+use ursula_proto::placement::VoterSet;
 
 use crate::human::HumanDuration;
 use crate::human::HumanSize;
@@ -191,6 +194,14 @@ pub struct RaftConfig {
     /// each entry's voters must be a non-empty subset of `peers`.
     #[serde(default)]
     pub groups: Vec<RaftGroupConfig>,
+    /// The meta group's voters at its genesis: ids of `raft.peers`, or this
+    /// node's id when `raft.peers` is empty. Unset, the smallest
+    /// `min(3, N)` ids of the address book ([`RaftConfig::address_book`]).
+    /// Read at genesis only: the meta group's committed voters rule after
+    /// it. A repeated id counts once, and an empty list is refused.
+    pub meta_voters: Option<VoterSet>,
+    /// How the meta group places the data groups.
+    pub placement: PlacementConfig,
     /// How often a group's initializer that holds nothing of the group logs
     /// that it still waits for every voter to report an empty group before
     /// it initializes the group. It keeps probing indefinitely.
@@ -277,6 +288,21 @@ impl RaftConfig {
     pub const DEFAULT_DELETED_DATA_MAX_AGE: std::time::Duration =
         std::time::Duration::from_secs(60 * 60);
 
+    /// This node's address book: `raft.peers`, or, when it is empty, this
+    /// node alone at `self_url`, so every Raft node can run the meta group.
+    /// The data topology does not read it. Removed in S2 (#768), where
+    /// every node with `raft.wal.path` lists itself in `raft.peers`.
+    pub fn address_book(&self, self_url: &str) -> Vec<RaftPeerConfig> {
+        if !self.peers.is_empty() {
+            return self.peers.clone();
+        }
+        vec![RaftPeerConfig {
+            node_id: self.node_id,
+            url: self_url.to_owned(),
+            client_url: None,
+        }]
+    }
+
     /// The shortest `deleted_data_max_age` this config allows.
     pub fn min_deleted_data_max_age(&self) -> std::time::Duration {
         self.install_snapshot_timeout
@@ -314,6 +340,8 @@ impl Default for RaftConfig {
             wal: WalConfig::default(),
             peers: Vec::new(),
             groups: Vec::new(),
+            meta_voters: None,
+            placement: PlacementConfig::default(),
             bootstrap_peer_probe: HumanDuration::sec(60),
             bootstrap_peer_probe_interval: HumanDuration::milli(250),
             bootstrap_peer_connect: HumanDuration::milli(500),
@@ -411,6 +439,36 @@ impl RaftPeerConfig {
     /// The base URL of the peer's client plane: `client_url`, else `url`.
     pub fn client_base_url(&self) -> &str {
         self.client_url.as_deref().unwrap_or(&self.url)
+    }
+}
+
+/// `[raft.placement]`: what the meta group places the data groups with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// Voters of each data group, at least 1. The cluster runs with
+    /// `min(value, N)` over its N nodes, and the genesis claim carries that
+    /// effective value.
+    pub replication_factor: ReplicationFactor,
+    /// How many groups may move at once, recorded at `Bootstrap` only.
+    /// Zero stops every move.
+    pub max_concurrent_moves: MoveLimit,
+}
+
+impl PlacementConfig {
+    pub const DEFAULT_REPLICATION_FACTOR: u8 = 3;
+    pub const DEFAULT_MAX_CONCURRENT_MOVES: u32 = 4;
+}
+
+impl Default for PlacementConfig {
+    fn default() -> Self {
+        Self {
+            replication_factor: ReplicationFactor::new(
+                std::num::NonZeroU8::new(Self::DEFAULT_REPLICATION_FACTOR)
+                    .unwrap_or(std::num::NonZeroU8::MIN),
+            ),
+            max_concurrent_moves: MoveLimit::new(Self::DEFAULT_MAX_CONCURRENT_MOVES),
+        }
     }
 }
 

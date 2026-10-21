@@ -18,6 +18,8 @@ ursula-headers = { workspace = true, features = ["serde"] }
 # `MAX_GROUP_COUNT`, the bound `raft.group_count` shares with the meta
 # group's `Bootstrap`.
 ursula-proto = { workspace = true }
+# `MoveLimit`, the type `raft.placement.max_concurrent_moves` parses into.
+ursula-control = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
