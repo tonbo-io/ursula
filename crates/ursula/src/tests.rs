@@ -1820,6 +1820,8 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
         },
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let app = router(spawned.runtime.clone());
     let response = http_put(
@@ -8332,6 +8334,8 @@ mod snapshot_driver {
             },
         )
         .expect("spawn a single node");
+        // No meta runs here, so the test settles the fresh root's binding.
+        spawned.bind_without_meta();
         (spawned, root, config.raft.effective_deleted_data_max_age())
     }
 
@@ -8545,6 +8549,8 @@ mod snapshot_driver {
             },
         )
         .expect("spawn a single node");
+        // No meta runs here, so the test settles the fresh root's binding.
+        spawned.bind_without_meta();
         let runtime = spawned.runtime.clone();
         let registry = spawned.raft_registry.clone().expect("a Raft registry");
         tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
