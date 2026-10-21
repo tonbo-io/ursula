@@ -1,6 +1,7 @@
 //! OpenRaft log stores.
 //!
-//! - `wal`: node lifecycle and per-core journal ownership.
+//! - `wal`: node lifecycle, per-core journal ownership, and the meta
+//!   group's journal under `meta`, apart from the cores'.
 //! - `file`: the durable per-group store over the shared per-core journal.
 //! - `writer`: the single writer of each core's journal: batches, the fsync
 //!   policy, rotation and reclaim.
