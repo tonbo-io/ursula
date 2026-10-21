@@ -216,7 +216,7 @@ impl<H: GroupHost> HostingDriver<H> {
     async fn run(self) {
         let mut views = self.registry.placement_watch();
         let mut groups = self.registry.subscribe_group_changes();
-        let mut answers = self.meta.registration();
+        let mut answers = self.meta.registration_answers();
         let (mut views_open, mut groups_open, mut answers_open) = (true, true, true);
         let mut actions = Actions::new();
         let mut confirms = Confirms::default();
@@ -266,10 +266,11 @@ impl<H: GroupHost> HostingDriver<H> {
                 })
             })
             .collect();
-        let standing = match *self.meta.registration().borrow() {
+        let standing = match *self.meta.registration_answers().borrow() {
             RegistrationStatus::Removed => Standing::Removed,
             RegistrationStatus::Pending
             | RegistrationStatus::Answered(_)
+            | RegistrationStatus::RootRefused { .. }
             | RegistrationStatus::Refused(_) => Standing::Member,
         };
         let input = |view| HostingInput {

@@ -109,14 +109,16 @@ impl MetaStatusReader {
     }
 
     /// The meta group's answers to this node's registration.
-    pub(crate) fn registration(&self) -> crate::rt::sync::watch::Receiver<RegistrationStatus> {
+    pub(crate) fn registration_answers(
+        &self,
+    ) -> crate::rt::sync::watch::Receiver<RegistrationStatus> {
         self.status.registration.clone()
     }
 
     /// This node's view, confirmed by a meta read barrier
     /// ([`MetaHandle::confirm_view`]).
     pub(crate) fn confirm_view(&self) -> Confirmation<'_> {
-        self.confirm.confirm_view()
+        self.meta.confirm_view()
     }
 
     /// This node's placement status, from its current view.
