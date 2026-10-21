@@ -19,6 +19,7 @@ use crate::log_store::CoreFileLogWriter;
 use crate::log_store::CoreJournalOptions;
 use crate::log_store::JournalTuning;
 use crate::log_store::LaggingGroups;
+use crate::log_store::MetaOpening;
 use crate::log_store::NodeWal;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
@@ -148,9 +149,8 @@ impl RaftWal {
     }
 
     /// How this run opens the meta journal, by the meta class's own record
-    /// in the run state. No meta journal is written yet, so nothing opens
-    /// by it.
-    pub fn meta_opening(&self) -> WalOpening {
+    /// in the run state and the meta journal's own history.
+    pub fn meta_opening(&self) -> MetaOpening {
         self.node.meta_opening()
     }
 

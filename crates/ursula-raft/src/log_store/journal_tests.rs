@@ -2541,7 +2541,9 @@ async fn a_data_host_crash_under_never_leaves_the_meta_epoch_unmoved() {
     });
     assert_eq!(data.replay_mode, JournalReplayMode::VerifiedPrefix);
     assert_eq!(data.recovery_epoch, 5);
-    let meta = wal.meta_opening();
+    let super::MetaOpening::Decided(meta) = wal.meta_opening() else {
+        panic!("a node without a meta journal decides the meta class");
+    };
     assert_eq!(meta.previous_run, PreviousRun::HostCrash {
         fsync: WalFsync::Always
     });

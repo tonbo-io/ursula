@@ -87,6 +87,8 @@ pub use run_state::JournalClass;
 pub use run_state::JournalHistory;
 pub use run_state::JournalRun;
 pub use run_state::JournalSync;
+pub use run_state::MetaJournalDamage;
+pub use run_state::MetaOpening;
 pub(crate) use run_state::NodeWal;
 pub use run_state::PreviousRun;
 pub use run_state::RUN_STATE_FILE;
