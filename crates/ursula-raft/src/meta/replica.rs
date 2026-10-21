@@ -117,6 +117,8 @@ pub struct MetaReplicaTasks {
     pub(crate) drivers: Option<Arc<dyn MetaDrivers>>,
     /// Where the replica reports a for-good refusal of its commit screen.
     pub(crate) damage: Option<watch::Sender<Option<CommitScreenDamage>>>,
+    /// The meta runtime's pause points, which a restart passes.
+    pub(crate) pauses: super::pause::MetaPauses,
 }
 
 /// Spawns a meta replica's gate drivers and reconcile shell onto its
@@ -757,6 +759,10 @@ where
     /// registry slot. A replica that does not reopen leaves the slot empty.
     pub async fn restart(&mut self) -> Result<&MetaReplica, MetaReplicaError> {
         self.replica.shutdown().await?;
+        let pauses = self.tasks.pauses.clone();
+        pauses
+            .at(super::pause::MetaPausePoint::RestartStopped)
+            .await;
         self.replica = MetaReplica::open(
             &self.config,
             &self.wal,
@@ -766,6 +772,9 @@ where
             &self.tasks,
         )
         .await?;
+        pauses
+            .at(super::pause::MetaPausePoint::RestartReopened)
+            .await;
         Ok(&self.replica)
     }
 
