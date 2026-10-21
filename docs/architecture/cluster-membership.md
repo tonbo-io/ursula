@@ -15,10 +15,9 @@ the peers, and then it must cover every group in `0..group_count`
 
 The supported production topology is three voters, node IDs `{1, 2, 3}`, on
 every group. Startup ownership refuses any other topology
-(`validate_startup_topology` in `crates/ursula/src/server.rs`), the shared
+(`validate_startup_topology` in `crates/ursula/src/server.rs`), and the shared
 reservation accepts only that voter set (`Reservation::validate` in
-`crates/ursula-ctl/src/reservation.rs`), and the chart requires
-`server.replicaCount = 3` for both.
+`crates/ursula-ctl/src/reservation.rs`).
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
 electorate. Every reader of a peer address takes it from one `PeerDirectory`
