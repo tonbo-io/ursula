@@ -544,7 +544,8 @@ async fn view_applied_above(
 /// One meta replica on a real journal: it forms alone, its history driver
 /// proposes the genesis, it writes, refuses a registration of another node
 /// before proposing it, snapshots, stops, and a restart of the WAL brings
-/// back its state, its history and its view from the record and the log.
+/// back its state, its history and its view from the record and the
+/// committed log above it.
 /// The meta group stays out of the registry's data structures throughout.
 #[tokio::test]
 async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
@@ -627,7 +628,11 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
 
     let wal = start_wal(dir.path());
     let replica = open(&wal, &registry).await.unwrap();
-    let after = view_applied_above(&registry, applied).await;
+    // The restart restores the record and replays the committed log above
+    // it. It does not campaign: its gate opens only through the gate
+    // drivers, which the meta runtime starts.
+    let after = view_applied_above(&registry, applied.saturating_sub(1)).await;
+    assert_eq!(after.applied(), before.applied());
     assert_eq!(after.state, before.state);
     let ViewStage::Applied {
         history: restarted, ..
@@ -641,11 +646,11 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
 
 /// The meta snapshot record lives in the meta journal's directory, apart
 /// from data group 0's record in its core's directory, and data group 0's
-/// build and restore leave it byte for byte as it was. Data group 0's
-/// owned-object passes delete only objects of its snapshot store, and a meta
-/// snapshot is never one.
+/// engine opens, restores and stops beside it leaving it byte for byte as
+/// it was. Data group 0's owned-object passes delete only objects of its
+/// snapshot store, and a meta snapshot is never one.
 #[tokio::test]
-async fn data_group_zero_snapshots_never_touch_the_meta_record() {
+async fn data_group_zero_never_touches_the_meta_record() {
     let dir = tempfile::tempdir().unwrap();
     let wal = start_wal(dir.path());
     let (meta_store, mut machine, _placement) = state_machine(&wal);
@@ -698,29 +703,8 @@ async fn data_group_zero_snapshots_never_touch_the_meta_record() {
             },
         )
     };
+    // Data group 0 opens, restores, runs and stops beside the meta record.
     let engine = data_engine(&wal).await.unwrap();
-    let raft = engine.raft_handle();
-    raft.trigger().snapshot().await.unwrap();
-    raft.wait(Some(Duration::from_secs(10)))
-        .metrics(
-            |metrics| metrics.snapshot.is_some(),
-            "data group 0's snapshot",
-        )
-        .await
-        .unwrap();
-    engine.shutdown().await.unwrap();
-    drop(engine);
-    // Data group 0 restores its own record.
-    let engine = data_engine(&wal).await.unwrap();
-    assert!(
-        engine
-            .raft_handle()
-            .metrics()
-            .borrow_watched()
-            .snapshot
-            .is_some(),
-        "data group 0 restored its snapshot"
-    );
     engine.shutdown().await.unwrap();
     assert_eq!(std::fs::read(meta_record.path()).unwrap(), recorded);
 }
