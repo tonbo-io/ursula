@@ -220,8 +220,6 @@ pub enum ControlError {
     },
     #[error("node {node} is a meta voter, which is replaced under its id, never decommissioned")]
     MetaVoter { node: NodeId },
-    #[error("the startup reservation changes placement in this cluster")]
-    ReservationAuthority,
     #[error("node {node} is decommissioning: uncordon it first")]
     Decommissioning { node: NodeId },
 }
@@ -261,7 +259,6 @@ impl ControlError {
             | Self::ReplicationFactorChange { .. }
             | Self::NotTarget { .. }
             | Self::MetaVoter { .. }
-            | Self::ReservationAuthority
             | Self::Decommissioning { .. } => Requeue::Permanent,
         }
     }
@@ -277,8 +274,4 @@ pub enum BootstrapProblem {
     MetaVoterNotANode { node: NodeId },
     #[error("the replication factor exceeds the node count")]
     ReplicationFactorAboveNodes,
-    #[error(
-        "the startup reservation needs nodes and meta voters 1, 2 and 3 and replication factor 3"
-    )]
-    ReservationTopology,
 }

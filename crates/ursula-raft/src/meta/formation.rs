@@ -4,11 +4,10 @@
 //! history and shows the cluster `Forming`, and every `raft.peers` id
 //! registered, it submits `Bootstrap` with meta's committed voters, the
 //! claimed group count, the effective replication factor over the nodes,
-//! and the node's move limit and maintenance authority. It keeps the last
-//! refusal for status reports, retries by the refusal's class (confirming
-//! its view first when the refusal says the view is stale), and stops at a
-//! permanent refusal, once bootstrapped, or once a meta plan cut the
-//! formation.
+//! and the node's move limit. It keeps the last refusal for status reports,
+//! retries by the refusal's class (confirming its view first when the
+//! refusal says the view is stale), and stops at a permanent refusal, once
+//! bootstrapped, or once a meta plan cut the formation.
 
 use std::time::Duration;
 
@@ -17,7 +16,6 @@ use ursula_control::ClusterParams;
 use ursula_control::ControlCommand;
 use ursula_control::ControlError;
 use ursula_control::ControlPlaneState;
-use ursula_control::MaintenanceAuthority;
 use ursula_control::MembershipConfig;
 use ursula_control::MoveLimit;
 use ursula_control::Requeue;
@@ -44,9 +42,6 @@ const FORMATION_RECHECK: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormationParams {
     pub max_concurrent_moves: MoveLimit,
-    /// A server always passes `Placement`: the startup reservation does
-    /// not reach the meta group.
-    pub maintenance: MaintenanceAuthority,
 }
 
 /// Bootstraps the cluster from node `me`'s meta leadership (see the module
@@ -95,7 +90,6 @@ pub(crate) async fn run_formation<T: RecoveryTransport>(
                 ),
                 meta_voters,
                 max_concurrent_moves: params.max_concurrent_moves,
-                maintenance: params.maintenance,
             },
             nodes: claim.peers.clone(),
             now_ms: ursula_runtime::unix_time_ms(),

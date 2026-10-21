@@ -33,7 +33,6 @@ use super::seed_role;
 use crate::placement::ConfirmedStamp;
 use crate::placement::ConfirmedView;
 use crate::placement::LifecycleChange;
-use crate::placement::MaintenanceAuthority;
 use crate::placement::PlacementView;
 use crate::placement::reconcile::MembershipConfig;
 use crate::placement::samples::Driver;
@@ -279,10 +278,7 @@ fn a_view_showing_the_node_removed_plans_as_removed() {
 
 #[test]
 fn only_a_seeded_groups_recorded_initializer_initializes() {
-    let mut driver = Driver::bootstrapped(
-        &[1, 2, 3, 4],
-        params(&[1, 2, 3, 4], 4, 3, 4, MaintenanceAuthority::Placement),
-    );
+    let mut driver = Driver::bootstrapped(&[1, 2, 3, 4], params(&[1, 2, 3, 4], 4, 3, 4));
     let view = confirmed(&driver);
     assert_eq!(seed_role(&view, node(2), G1), Some(SeedRoleOf::Initializer));
     assert_eq!(seed_role(&view, node(3), G1), Some(SeedRoleOf::Voter));

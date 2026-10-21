@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
-use ursula_control::MaintenanceAuthority;
 use ursula_control::default_meta_voters;
 use ursula_control::effective_replication_factor;
 use ursula_proto::placement::GenesisClaim;
@@ -124,7 +123,6 @@ pub(crate) fn open_meta(
             claim,
             formation: FormationParams {
                 max_concurrent_moves: raft.placement.max_concurrent_moves,
-                maintenance: MaintenanceAuthority::Placement,
             },
             engine,
             snapshots: Some(snapshots),

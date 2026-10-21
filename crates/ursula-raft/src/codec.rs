@@ -518,11 +518,9 @@ mod tests {
     }
 
     /// The meta group's state, one per sample state of the kernel. The
-    /// bootstrapped state under the placement authority carries a history
-    /// event.
+    /// bootstrapped state carries a history event.
     fn meta_states() -> Vec<(&'static str, crate::meta::MetaState)> {
         use ursula_control::ControlPlaneState;
-        use ursula_control::MaintenanceAuthority;
 
         let history = ursula_stream::HistoryEvent {
             id: std::num::NonZeroU64::new(0x0abc_def0_1234_5678).expect("non-zero"),
@@ -541,12 +539,7 @@ mod tests {
                 let (name, history) = match &control {
                     ControlPlaneState::Forming { .. } => ("meta_state_forming", None),
                     ControlPlaneState::FormationCut => ("meta_state_formation_cut", None),
-                    ControlPlaneState::Bootstrapped(cluster) => {
-                        match cluster.params().maintenance {
-                            MaintenanceAuthority::Placement => ("meta_state", Some(history)),
-                            MaintenanceAuthority::Reservation => ("meta_state_reservation", None),
-                        }
-                    }
+                    ControlPlaneState::Bootstrapped(_) => ("meta_state", Some(history)),
                 };
                 (name, crate::meta::MetaState { history, control })
             })

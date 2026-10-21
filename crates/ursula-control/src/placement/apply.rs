@@ -40,7 +40,6 @@ use super::state::Cluster;
 use super::state::ClusterParams;
 use super::state::ControlPlaneState;
 use super::state::GroupPlacement;
-use super::state::MaintenanceAuthority;
 use super::state::Move;
 use super::state::MoveLimit;
 use super::state::Placements;
@@ -48,11 +47,6 @@ use super::state::Registration;
 use super::state::Retirement;
 use super::state::Target;
 use super::state::group_ids;
-
-/// The node ids, meta voters and replication factor a cluster under the
-/// startup reservation must have.
-const RESERVATION_NODES: [u64; 3] = [1, 2, 3];
-const RESERVATION_REPLICATION_FACTOR: u8 = 3;
 
 impl ControlPlaneState {
     /// Applies `command` as the meta entry `at`: checks it, then mutates.
@@ -270,15 +264,6 @@ fn check_bootstrap(
     if usize::from(params.replication_factor.get()) > nodes.len() {
         return invalid(BootstrapProblem::ReplicationFactorAboveNodes);
     }
-    if params.maintenance == MaintenanceAuthority::Reservation {
-        let reserved: BTreeSet<NodeId> = RESERVATION_NODES.map(NodeId::new).into();
-        if nodes.to_set() != reserved
-            || params.meta_voters.to_set() != reserved
-            || params.replication_factor.get() != RESERVATION_REPLICATION_FACTOR
-        {
-            return invalid(BootstrapProblem::ReservationTopology);
-        }
-    }
     Ok(())
 }
 
@@ -346,9 +331,6 @@ impl Cluster {
         to: VoterSet,
         now_ms: u64,
     ) -> Result<Change, ControlError> {
-        if self.params.maintenance == MaintenanceAuthority::Reservation {
-            return Err(ControlError::ReservationAuthority);
-        }
         let placement = self.existing(group)?;
         let GroupPlacement::Live {
             since,
@@ -510,11 +492,6 @@ impl Cluster {
         let record = *self.node(node).ok_or(ControlError::UnknownNode { node })?;
         let lifecycle = match (record.lifecycle, change) {
             (NodeLifecycle::Removed, _) => return Err(ControlError::NodeRemoved { node }),
-            (_, LifecycleChange::Decommission)
-                if self.params.maintenance == MaintenanceAuthority::Reservation =>
-            {
-                return Err(ControlError::ReservationAuthority);
-            }
             (_, LifecycleChange::Decommission) if self.params.meta_voters.contains(node) => {
                 return Err(ControlError::MetaVoter { node });
             }

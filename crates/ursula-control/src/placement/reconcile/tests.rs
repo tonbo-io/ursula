@@ -523,13 +523,7 @@ fn the_membership_answer_classifies_by_both_memberships() {
 fn a_placement_gives_its_groups_target() {
     let mut driver = Driver::bootstrapped(
         &[1, 2, 3, 4],
-        crate::placement::samples::params(
-            &[1, 2, 3, 4],
-            2,
-            3,
-            4,
-            crate::placement::MaintenanceAuthority::Placement,
-        ),
+        crate::placement::samples::params(&[1, 2, 3, 4], 2, 3, 4),
     );
     let group = RaftGroupId(0);
     let seeded = MembershipTarget::of_placement(driver.placement(group));

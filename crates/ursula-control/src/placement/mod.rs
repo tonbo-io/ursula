@@ -96,7 +96,6 @@ pub use state::Cluster;
 pub use state::ClusterParams;
 pub use state::ControlPlaneState;
 pub use state::GroupPlacement;
-pub use state::MaintenanceAuthority;
 pub use state::Move;
 pub use state::MoveLimit;
 pub use state::Placements;

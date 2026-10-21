@@ -51,7 +51,6 @@ pub use placement::Leadership;
 pub use placement::LifecycleChange;
 pub use placement::LocalLog;
 pub use placement::LocalReplica;
-pub use placement::MaintenanceAuthority;
 pub use placement::MembershipConfig;
 pub use placement::MembershipStep;
 pub use placement::MembershipTarget;

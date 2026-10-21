@@ -28,7 +28,6 @@ use ursula_config::WalFsync;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::HistoryCause;
-use ursula_control::MaintenanceAuthority;
 use ursula_control::samples;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ViewStage;
@@ -163,7 +162,7 @@ async fn control_commands_apply_through_the_kernel_at_their_entry_log_id() {
     let nodes = [1, 2, 3];
     let mut commands = nodes.map(register).to_vec();
     commands.push(ControlCommand::Bootstrap {
-        params: samples::params(&nodes, 4, 3, 2, MaintenanceAuthority::Placement),
+        params: samples::params(&nodes, 4, 3, 2),
         nodes: samples::node_set(&nodes),
         now_ms: 40,
     });

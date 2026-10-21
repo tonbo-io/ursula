@@ -91,9 +91,7 @@ pub fn free_slots(limit: u32, moving: u32) -> u32 {
 }
 
 /// The moves that empty decommissioning nodes now, and the groups that
-/// cannot move. A cluster under the startup reservation has no
-/// decommissioning node (the kernel refuses `Decommission` there), so it
-/// plans nothing.
+/// cannot move.
 pub fn plan_decommission(
     cluster: &Cluster,
     eligibility: &BTreeMap<NodeId, NodeEligibility>,

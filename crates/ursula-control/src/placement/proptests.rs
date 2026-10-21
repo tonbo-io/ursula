@@ -1,6 +1,7 @@
 //! Kernel property tests: random valid and invalid commands and history
 //! events over 1 to 6 nodes, 1 to 4 groups and replication factors 1 to 3,
-//! checked after every step against K1 to K16 of the design (issue #768):
+//! checked after every step against K1 to K12 and K14 to K16 of the design
+//! (issue #768):
 //! refusals change nothing, placement keys move exactly on accepted moves,
 //! converges and history events and never backwards, retirements never sit
 //! beside a role, removal is terminal, and the rest. An accepted command
@@ -30,7 +31,6 @@ use super::GroupPlacement;
 use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
-use super::MaintenanceAuthority;
 use super::Move;
 use super::MoveLimit;
 use super::Retirement;
@@ -163,20 +163,10 @@ impl Run {
             1 => {
                 let nodes = self.voters_from_mask(y);
                 let ids: Vec<u64> = nodes.iter().map(NodeId::get).collect();
-                let maintenance = if one_in(z, 8) {
-                    MaintenanceAuthority::Reservation
-                } else {
-                    MaintenanceAuthority::Placement
-                };
                 let groups = u32::try_from(index(x, 4)).unwrap().checked_add(1).unwrap();
                 let rf = u8::try_from(index(z, 3)).unwrap().checked_add(1).unwrap();
-                let mut bootstrap = params(
-                    &ids,
-                    groups,
-                    rf,
-                    u32::from(x.checked_shr(2).unwrap()) & 3,
-                    maintenance,
-                );
+                let mut bootstrap =
+                    params(&ids, groups, rf, u32::from(x.checked_shr(2).unwrap()) & 3);
                 if one_in(y, 7) {
                     bootstrap.meta_voters = VoterSet::single(self.pick_node(z));
                 }
@@ -328,10 +318,7 @@ pub(super) fn reachable(
     let driver = if live {
         Driver::live(&ids, group_count, rf)
     } else {
-        Driver::bootstrapped(
-            &ids,
-            params(&ids, group_count, rf, 4, MaintenanceAuthority::Placement),
-        )
+        Driver::bootstrapped(&ids, params(&ids, group_count, rf, 4))
     };
     let mut run = Run {
         driver,
@@ -542,20 +529,6 @@ fn check_accepted(
         format!("2.3: {command:?} left {new:?}, the table says {expected:?}")
     })?;
     check_answer(old, new, at, command, applied)?;
-    // K13: the reservation refuses moves and decommissions.
-    if old.params().maintenance == MaintenanceAuthority::Reservation {
-        ensure(
-            !matches!(
-                command,
-                ControlCommand::RequestMove { .. }
-                    | ControlCommand::SetNodeLifecycle {
-                        change: LifecycleChange::Decommission,
-                        ..
-                    }
-            ),
-            || format!("K13: the reservation accepted {command:?}"),
-        )?;
-    }
     for (group, placement) in new.groups().iter() {
         let Some(previous) = old.group(group) else {
             return Err(format!("K9: {group:?} appeared"));
@@ -592,7 +565,6 @@ fn check_accepted(
         // K4: every move can be cancelled.
         if let Some(moving) = placement.moving()
             && moving.from != moving.to
-            && new.params().maintenance == MaintenanceAuthority::Placement
         {
             let cancel = ControlCommand::RequestMove {
                 group,
@@ -1106,23 +1078,14 @@ proptest::proptest! {
         group_count in 1_u32..=4,
         rf in 1_u8..=3,
         limit in 0_u32..=3,
-        reservation in proptest::bool::weighted(0.1),
         bootstrap_first in proptest::bool::weighted(0.9),
         steps in steps_strategy(1..200),
     ) {
-        // A drawn reservation gets the only topology it accepts, so its
-        // cases run under it rather than refusing their Bootstrap.
-        let (node_count, rf) = if reservation { (3, 3) } else { (node_count, rf) };
         let mut run = Run::new(node_count);
         let bootstrap = bootstrap_first.then(|| {
             let rf = rf.min(u8::try_from(node_count).unwrap());
-            let maintenance = if reservation {
-                MaintenanceAuthority::Reservation
-            } else {
-                MaintenanceAuthority::Placement
-            };
             let ids: Vec<u64> = (1..=node_count).collect();
-            params(&ids, group_count, rf, limit, maintenance)
+            params(&ids, group_count, rf, limit)
         });
         if let Err(violation) = drive(&mut run, bootstrap, &steps) {
             proptest::prop_assert!(false, "{violation}");
@@ -1135,54 +1098,5 @@ proptest::proptest! {
         let json = serde_json::to_string(state).unwrap();
         let decoded: ControlPlaneState = serde_json::from_str(&json).unwrap();
         proptest::prop_assert_eq!(&decoded, state);
-    }
-
-    /// K13 under a valid reservation in every case: nodes and meta voters
-    /// 1, 2 and 3 at replication factor 3. After random steps, which the
-    /// properties check as above, every move of every group and the
-    /// decommission of every registered node are refused with
-    /// `ReservationAuthority`.
-    #[test]
-    fn the_reservation_refuses_every_move_and_decommission(
-        group_count in 1_u32..=4,
-        limit in 0_u32..=3,
-        steps in steps_strategy(0..100),
-    ) {
-        let mut run = Run::new(3);
-        let bootstrap = params(&[1, 2, 3], group_count, 3, limit, MaintenanceAuthority::Reservation);
-        if let Err(violation) = drive(&mut run, Some(bootstrap), &steps) {
-            proptest::prop_assert!(false, "{violation}");
-        }
-        let cluster = run.cluster().unwrap();
-        proptest::prop_assert_eq!(cluster.params().maintenance, MaintenanceAuthority::Reservation);
-        for (group, placement) in cluster.groups().iter() {
-            let targets = [
-                run.swap_one(placement.target_voters(), 0, 0),
-                placement.current_voters().clone(),
-            ];
-            for to in targets {
-                let command = ControlCommand::RequestMove {
-                    group,
-                    expected: placement.since(),
-                    to,
-                    now_ms: 3,
-                };
-                proptest::prop_assert_eq!(
-                    run.driver.state.check(&command),
-                    Err(super::ControlError::ReservationAuthority)
-                );
-            }
-        }
-        for id in cluster.nodes().keys() {
-            let command = ControlCommand::SetNodeLifecycle {
-                node: *id,
-                change: LifecycleChange::Decommission,
-                now_ms: 3,
-            };
-            proptest::prop_assert_eq!(
-                run.driver.state.check(&command),
-                Err(super::ControlError::ReservationAuthority)
-            );
-        }
     }
 }

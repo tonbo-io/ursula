@@ -163,7 +163,6 @@ pub struct ClusterParams {
     /// The meta group's committed voters at Bootstrap.
     pub meta_voters: VoterSet,
     pub max_concurrent_moves: MoveLimit,
-    pub maintenance: MaintenanceAuthority,
 }
 
 /// Every group id of a cluster of `count` groups, ascending.
@@ -185,15 +184,6 @@ impl MoveLimit {
     pub const fn get(self) -> u32 {
         self.0
     }
-}
-
-/// Who changes placement: the meta group, or the startup reservation, under
-/// which the state machine refuses moves and decommissions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MaintenanceAuthority {
-    Placement,
-    Reservation,
 }
 
 /// Where a group should live.
