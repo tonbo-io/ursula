@@ -28,13 +28,18 @@ leadership-shed polls and leader redirects. Membership and recovery code deal in
 node IDs only. A node that a group's membership names but `raft.peers` does not
 list is never dialed: its network client answers unreachable without dialing,
 followers neither forward to it nor redirect to it, and each node logs it once
-(`PeerCluster::cluster_url` in `crates/ursula-raft/src/peer_cluster.rs`). To
-move a node, change `raft.peers` on every node and restart them. Membership
+(`PeerCluster::cluster_url` in `crates/ursula-raft/src/peer_cluster.rs`). The
+server binds the directory with the node's identity before its runtime starts
+(`crates/ursula/src/bootstrap/meta.rs`). A node whose `raft.peers` is empty
+binds itself alone, at its cluster listener. To move a node, change `raft.peers` on every node and restart them. Membership
 entries, snapshot records and installed snapshots name each member by node ID
 only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 
-There is no runtime membership authority. No meta Raft group runs, and the
-server never moves a group to another node or changes its voter count. The
+There is no runtime membership authority for data groups. Every node that
+runs Raft runs a replica of the meta Raft group, which forms over the nodes of
+`raft.peers` and records the cluster's bootstrap, but no data group reads its
+placements, and the server never moves a group to another node or changes its
+voter count. The
 configured voter set is the target that the heal driver restores
 (section 2). The admin routes (section 3) can change a group's OpenRaft
 membership directly, and the heal driver adds a configured voter that is
