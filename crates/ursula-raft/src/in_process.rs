@@ -178,26 +178,6 @@ impl<SM: InProcessEndpoint> Debug for InProcessRegistry<SM> {
     }
 }
 
-impl InProcessRegistry<RaftGroupStateMachine> {
-    pub fn register(&self, node_id: u64, engine: &crate::RaftGroupEngine) {
-        let raft = engine.raft_handle();
-        self.barriers
-            .lock()
-            .expect("in-process barrier mutex")
-            .insert(node_id, engine.read_barrier.clone());
-        let endpoint = crate::RaftGroupHandleRegistry::default();
-        endpoint.register_engine(engine);
-        self.endpoints
-            .lock()
-            .expect("endpoint registry")
-            .insert(node_id, (engine.placement.raft_group_id, endpoint));
-        self.nodes
-            .lock()
-            .expect("in-process raft registry mutex")
-            .insert(node_id, raft);
-    }
-}
-
 impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
     pub fn unregister(&self, node_id: u64) -> Option<Raft<UrsulaRaftTypeConfig, SM>> {
         self.barriers
@@ -250,6 +230,24 @@ impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
 }
 
 impl InProcessRegistry<RaftGroupStateMachine> {
+    pub fn register(&self, node_id: u64, engine: &crate::RaftGroupEngine) {
+        let raft = engine.raft_handle();
+        self.barriers
+            .lock()
+            .expect("in-process barrier mutex")
+            .insert(node_id, engine.read_barrier.clone());
+        let endpoint = crate::RaftGroupHandleRegistry::default();
+        endpoint.register_engine(engine);
+        self.endpoints
+            .lock()
+            .expect("endpoint registry")
+            .insert(node_id, (engine.placement.raft_group_id, endpoint));
+        self.nodes
+            .lock()
+            .expect("in-process raft registry mutex")
+            .insert(node_id, raft);
+    }
+
     /// The barrier RPC's server side on `node_id`, through the node's
     /// production registry: a leader whose history is pending confirms none.
     pub async fn confirm_recovery_barrier(

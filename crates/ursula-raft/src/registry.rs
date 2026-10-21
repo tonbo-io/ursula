@@ -769,7 +769,7 @@ impl RaftGroupHandleRegistry {
         let applied = entry.log_gauge.applied_membership();
         drop(entry);
         core.accept_plan(&self.election, raft_group_id, plan, applied, move || {
-            Box::pin(async move {
+            futures_util::FutureExt::boxed(async move {
                 let Some(restarted) =
                     restart
                         .restart_replica(raft_group_id)
@@ -783,15 +783,16 @@ impl RaftGroupHandleRegistry {
                 };
                 // The replica this registry holds after the restart, with
                 // the recovery gate the restart returned.
-                Ok(self
-                    .groups
-                    .load()
-                    .get(&raft_group_id.0)
-                    .and_then(|entry| entry.active().cloned())
-                    .map(|entry| ReplicaCore {
-                        recovery: Some(restarted),
-                        ..entry.core.clone()
-                    }))
+                Ok::<_, RecoveryGateError>(
+                    self.groups
+                        .load()
+                        .get(&raft_group_id.0)
+                        .and_then(|entry| entry.active().cloned())
+                        .map(|entry| ReplicaCore {
+                            recovery: Some(restarted),
+                            ..entry.core.clone()
+                        }),
+                )
             })
         })
         .await
