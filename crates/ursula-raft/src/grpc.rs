@@ -1237,15 +1237,18 @@ impl raft_internal_proto::raft_internal_server::RaftInternal for RaftGrpcService
                     write_results(results)
                 }
                 RaftTarget::Meta => {
+                    // Target, replica, then payload, as every RPC checks
+                    // them: a node without a meta replica answers
+                    // `NOT_FOUND` whoever sent the write.
+                    let meta = self
+                        .registry
+                        .meta()
+                        .ok_or_else(|| no_meta_replica("GroupWrite"))?;
                     let AdmittedPeer(sender) = admitted.ok_or_else(|| {
                         GrpcRpcError::invalid_argument(
                             "GroupWrite to the meta plane names no admitted sender",
                         )
                     })?;
-                    let meta = self
-                        .registry
-                        .meta()
-                        .ok_or_else(|| no_meta_replica("GroupWrite"))?;
                     write_results(
                         meta.write_forwarded(
                             commands(&request)?,
