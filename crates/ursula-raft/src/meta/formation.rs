@@ -4,11 +4,10 @@
 //! history and shows the cluster `Forming`, and every `raft.peers` id
 //! registered, it submits `Bootstrap` with meta's committed voters, the
 //! claimed group count, the effective replication factor over the nodes,
-//! and the node's move limit. It keeps the last
-//! refusal for status reports, retries by the refusal's class (confirming
-//! its view first when the refusal says the view is stale), and stops at a
-//! permanent refusal, once bootstrapped, or once a meta plan cut the
-//! formation.
+//! and the node's move limit. It keeps the last refusal for status reports,
+//! retries by the refusal's class (confirming its view first when the
+//! refusal says the view is stale), and stops at a permanent refusal, once
+//! bootstrapped, or once a meta plan cut the formation.
 
 use std::time::Duration;
 

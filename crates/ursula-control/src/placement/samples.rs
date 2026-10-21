@@ -248,10 +248,9 @@ impl Driver {
     }
 }
 
-/// A bootstrapped state under the placement authority that sets every
-/// field: a seeded group, a stable group, a moving group with an abandoned
-/// target and a retirement, over nodes of every lifecycle. It holds every
-/// invariant of the kernel.
+/// A bootstrapped state that sets every field: a seeded group, a stable
+/// group, a moving group with an abandoned target and a retirement, over
+/// nodes of every lifecycle. It holds every invariant of the kernel.
 ///
 /// The groups are one per [`GroupPlacement`] and [`Target`] variant, in
 /// group order, built behind an exhaustive match ([`every`]): a new variant
