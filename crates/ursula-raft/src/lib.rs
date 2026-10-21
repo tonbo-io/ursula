@@ -22,7 +22,8 @@
 //!   implementation is the simulated disk (`SimDisk`), keeps votes and each
 //!   group's log state ([`wal::diagnostics::GroupLogState`]) in per-core metadata files, and
 //!   records each run of the node in a run-state file that decides how the
-//!   journals reopen ([`WalOpening`]).
+//!   journals reopen ([`WalOpening`], and [`MetaOpening`] for the meta
+//!   group's own journal).
 //! - [`wal`]: node WAL facade and separately named format diagnostics.
 //! - [`election`]: shared campaign and leadership transfer policy.
 //! - [`recovery_transport`]: native transport adapter for recovery probes.
@@ -185,6 +186,8 @@ pub use in_process::InProcessRaftRpcKind;
 pub use in_process::InProcessRegistry;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;
+pub use log_store::MetaOpenError;
+pub use log_store::MetaOpening;
 pub use log_store::PlanCut;
 pub use log_store::RaftGroupFileLogStore;
 pub use log_store::RaftWal;

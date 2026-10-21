@@ -4,6 +4,9 @@
 
 pub use crate::log_store::JournalTuning;
 pub use crate::log_store::LaggingGroups;
+pub use crate::log_store::MetaJournalDamage;
+pub use crate::log_store::MetaOpenError;
+pub use crate::log_store::MetaOpening;
 pub use crate::log_store::RaftGroupFileLogStore;
 pub use crate::log_store::RaftWal;
 pub use crate::log_store::RaftWalError;

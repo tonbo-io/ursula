@@ -33,13 +33,22 @@
 //!
 //! The rule is kept per journal class, since the classes run different
 //! policies: the data journals (`core-*`) run the configured one, and the
-//! meta journal always runs `always`. Each class opens by its own record,
-//! through the same decision table, over the node-wide status and boot id:
-//! a host crash under a data policy of `never` gives the data journals a
-//! verified prefix and a new epoch, and leaves the meta journal strict with
-//! its epoch unmoved. No meta journal is written yet: the meta class is
-//! decided and recorded on every start, and it has no journal to open.
+//! meta journal (`meta`) always runs `always`. Each class opens by its own
+//! record and its own journals' history, through the same decision table,
+//! over the node-wide status and boot id: a host crash under a data policy
+//! of `never` gives the data journals a verified prefix and a new epoch, and
+//! leaves the meta journal strict with its epoch unmoved.
+//!
+//! No failure to read or mark the meta journal stops a start: it opens the
+//! meta class [`MetaOpening::Damaged`] for the run, which still records the
+//! epoch it decided for meta, and the data journals open as they would.
+//!
+//! The meta journal exists once its metadata file does, or a segment of it
+//! holds a record. Its first open puts the metadata file in place, in one
+//! atomic replace, before the journal holds anything, so a directory without
+//! either is a creation that stopped and holds no journal.
 
+use std::io;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -49,6 +58,8 @@ use serde::Deserialize;
 use serde::Serialize;
 use ursula_config::WalFsync;
 
+use super::core_meta::CoreMetadata;
+use super::core_meta::GroupLogState;
 use super::core_meta::MarkRecoveringError;
 use super::core_meta::core_metadata_path;
 use super::core_meta::mark_core_recovering;
@@ -71,11 +82,19 @@ const WAL_LOCK_FILE: &str = "wal.lock";
 /// The directory of core `N` under the WAL root is `core-N`.
 const CORE_DIR_PREFIX: &str = "core-";
 /// The meta journal's policy, whatever the data journals run.
-const META_FSYNC: WalFsync = WalFsync::Always;
+pub(crate) const META_FSYNC: WalFsync = WalFsync::Always;
+/// The meta journal's directory under the WAL root. It does not start with
+/// [`CORE_DIR_PREFIX`], so no data reader of the root lists it as a core.
+const META_DIR: &str = "meta";
 
 /// The journal directory of core `core` under the WAL `root`.
 pub(crate) fn core_dir(root: &Path, core: u16) -> PathBuf {
     root.join(format!("{CORE_DIR_PREFIX}{core}"))
+}
+
+/// The meta journal's directory under the WAL `root`.
+pub(crate) fn meta_dir(root: &Path) -> PathBuf {
+    root.join(META_DIR)
 }
 
 /// The id the host's kernel gives its current boot.
@@ -113,9 +132,8 @@ pub enum JournalClass {
     /// The core journals (`core-*`), which hold the data groups' logs and
     /// run the configured fsync policy.
     Data,
-    /// The meta group's journal, which always runs `fsync = always`. No
-    /// meta journal is written yet: the class is decided and recorded, and
-    /// has no journal to open.
+    /// The meta group's journal (`meta`), which always runs `fsync =
+    /// always`.
     Meta,
 }
 
@@ -164,16 +182,27 @@ impl RunState {
     }
 }
 
-/// Whether the core journals under a WAL root hold records.
+/// Whether the journals of one class under a WAL root hold records.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JournalHistory {
-    /// No core journal holds a record; metadata may retain a verified epoch.
+    /// No journal of the class holds a record; metadata may retain a
+    /// verified epoch.
     Empty { verified_epoch: u64 },
-    /// Some core journal holds records.
+    /// Some journal of the class holds records.
     Records { verified_epoch: u64 },
 }
 
 impl JournalHistory {
+    /// The history of journals that hold a record or not (`records`), with
+    /// the greatest surviving `verified_epoch`.
+    fn of(records: bool, verified_epoch: u64) -> Self {
+        if records {
+            Self::Records { verified_epoch }
+        } else {
+            Self::Empty { verified_epoch }
+        }
+    }
+
     fn verified_epoch(self) -> u64 {
         match self {
             Self::Empty { verified_epoch } | Self::Records { verified_epoch } => verified_epoch,
@@ -256,6 +285,115 @@ pub struct WalOpening {
     /// This run's recovery epoch (see the module documentation).
     pub recovery_epoch: u64,
     pub journal_sync: JournalSync,
+}
+
+/// How this run opens the meta journal.
+#[derive(Debug, Clone)]
+pub enum MetaOpening {
+    /// The meta journal opens by the meta class's record and its own
+    /// history, as the data journals open by theirs.
+    Decided(WalOpening),
+    /// The start could not read or mark the meta journal. The run records
+    /// `opening`, decided as if the journal held records, and opens no meta
+    /// journal. Its groups are not marked, so a later run that reads the
+    /// journal below the epoch recorded here opens them recovering.
+    Damaged {
+        opening: WalOpening,
+        damage: MetaJournalDamage,
+    },
+}
+
+impl MetaOpening {
+    /// The decision this run records for the meta class, whether or not the
+    /// meta journal could be read.
+    pub fn opening(&self) -> WalOpening {
+        match self {
+            Self::Decided(opening) | Self::Damaged { opening, .. } => *opening,
+        }
+    }
+}
+
+/// Why the meta journal does not open in this run. None of them stops the
+/// node: the data journals open as they would.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum MetaJournalDamage {
+    #[error("read the meta journal '{}': {source}", .path.display())]
+    ReadJournal {
+        path: PathBuf,
+        #[source]
+        source: Arc<JournalError>,
+    },
+    #[error("read the meta journal's metadata '{}': {source}", .path.display())]
+    ReadMetadata {
+        path: PathBuf,
+        #[source]
+        source: Arc<StateFileError>,
+    },
+    #[error("record the meta journal's group recovering in '{}': {source}", .path.display())]
+    MarkRecovering {
+        path: PathBuf,
+        #[source]
+        source: Arc<MarkRecoveringError>,
+    },
+    #[error("put the new meta journal's metadata '{}' in place: {source}", .path.display())]
+    WriteMetadata {
+        path: PathBuf,
+        #[source]
+        source: Arc<JournalError>,
+    },
+    #[error("create the meta journal directory '{}': {source}", .path.display())]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: Arc<io::Error>,
+    },
+    /// The meta journal's writer did not open: a sealed segment, a segment
+    /// header, a frozen archive or the replayed log is damaged.
+    #[error("open the meta journal: {0}")]
+    OpenJournal(#[source] super::CoreJournalError),
+}
+
+/// Whether the meta journal existed when the run started, before anything
+/// of the run touched the WAL root: its metadata file, or a segment holding
+/// a record. A directory with neither, which a first open that stopped
+/// before its metadata file was in place leaves, is no journal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MetaAtStart {
+    Absent,
+    Present,
+}
+
+/// What the start read of the meta journal.
+#[derive(Debug)]
+enum MetaRead {
+    /// No meta journal ([`MetaAtStart::Absent`]).
+    Absent,
+    /// The meta journal and what it holds.
+    Read(JournalHistory),
+    /// The meta journal could not be read.
+    Unread(MetaJournalDamage),
+}
+
+impl MetaRead {
+    /// Reads the meta journal in `dir`, if there is one.
+    fn of(dir: &Path) -> Self {
+        match read_journal(dir) {
+            Ok(JournalRead {
+                records: false,
+                metadata: false,
+                ..
+            }) => Self::Absent,
+            Ok(read) => Self::Read(JournalHistory::of(read.records, read.verified_epoch)),
+            Err(unread) => Self::Unread(unread.into()),
+        }
+    }
+
+    fn at_start(&self) -> MetaAtStart {
+        match self {
+            Self::Absent => MetaAtStart::Absent,
+            Self::Read(_) | Self::Unread(_) => MetaAtStart::Present,
+        }
+    }
 }
 
 impl PreviousRun {
@@ -495,6 +633,18 @@ pub enum RaftWalError {
         #[source]
         source: super::CoreJournalError,
     },
+    #[error("stop the meta journal: {source}")]
+    CloseMetaJournal {
+        #[source]
+        source: super::CoreJournalError,
+    },
+    /// A maintenance pass of the meta journal could not be asked for: its
+    /// writer stopped or is poisoned.
+    #[error("maintain the meta journal: {source}")]
+    MaintainMetaJournal {
+        #[source]
+        source: super::CoreJournalError,
+    },
     #[error("Raft WAL state mutex poisoned")]
     LockPoisoned,
     /// The OpenRaft work of the group's previous engine still runs (#709).
@@ -551,8 +701,12 @@ pub(crate) struct NodeWal {
     cluster_id: ursula_headers::ClusterId,
     /// How the data journals open.
     opening: WalOpening,
+    /// What the data journals held at start.
+    data_history: JournalHistory,
     /// How the meta journal opens.
-    meta_opening: WalOpening,
+    meta_opening: MetaOpening,
+    /// Whether the meta journal existed at start.
+    meta_at_start: MetaAtStart,
     run_state: Arc<RunStateFile>,
     /// Keeps a second process off the root, so two runs never interleave
     /// their run-state writes. Released by a clean shutdown, or when the
@@ -592,12 +746,16 @@ impl NodeWal {
         let previous = state_file::read::<RunState>(StateFileKind::RunState, &path)
             .map_err(RaftWalError::ReadRunState)?;
         let cores = core_dirs(&root)?;
-        // Even metadata-only cores are prior state: votes must not be forgotten.
+        let meta = meta_dir(&root);
+        let meta_read = MetaRead::of(&meta);
+        let meta_at_start = meta_read.at_start();
+        // Even metadata-only cores are prior state: votes must not be
+        // forgotten. So is a meta journal.
         let cluster_id = super::topology::check_or_create(
             &root,
             topology,
             cluster_id,
-            previous.is_some() || !cores.is_empty(),
+            previous.is_some() || !cores.is_empty() || meta_at_start == MetaAtStart::Present,
         )?;
         let journals = journal_history(&cores)?;
         let boot_id = Disk::boot_id(&root).map(BootId);
@@ -608,16 +766,7 @@ impl NodeWal {
             boot_id.as_ref(),
             fsync,
         )?;
-        // No meta journal is written yet, so the meta class holds no history
-        // and has nothing to mark or sync. Its policy never rises, so it
-        // never syncs first.
-        let meta_opening = WalOpening::decide(
-            previous.as_ref(),
-            JournalClass::Meta,
-            JournalHistory::Empty { verified_epoch: 0 },
-            boot_id.as_ref(),
-            META_FSYNC,
-        )?;
+        let meta_opening = open_meta_class(&meta, meta_read, previous.as_ref(), boot_id.as_ref())?;
         log_opening(
             &root,
             previous.as_ref(),
@@ -626,9 +775,26 @@ impl NodeWal {
             fsync,
             &opening,
         );
-        // The meta class's opening is not logged while no meta journal
-        // exists: its recovery warning would describe a log this node does
-        // not have. S1(d), which opens the meta journal, logs it again.
+        // Without a meta journal, the meta class's recovery warning would
+        // describe a log this node does not have.
+        if meta_at_start == MetaAtStart::Present {
+            log_opening(
+                &root,
+                previous.as_ref(),
+                boot_id.as_ref(),
+                JournalClass::Meta,
+                META_FSYNC,
+                &meta_opening.opening(),
+            );
+            if let MetaOpening::Damaged { damage, .. } = &meta_opening {
+                tracing::error!(
+                    root = %root.display(),
+                    error = %damage,
+                    "the meta journal could not be read at start; this run opens no meta journal \
+                     and the data journals open as they would"
+                );
+            }
+        }
         // Before this run records itself, so a crash in between marks the
         // cores again on the next start.
         if let RecoveryState::Recovering { .. } = opening.recovery {
@@ -657,7 +823,7 @@ impl NodeWal {
             },
             meta: JournalRun {
                 fsync: META_FSYNC,
-                recovery_epoch: meta_opening.recovery_epoch,
+                recovery_epoch: meta_opening.opening().recovery_epoch,
             },
         });
         run_state
@@ -667,7 +833,9 @@ impl NodeWal {
             root,
             cluster_id,
             opening,
+            data_history: journals,
             meta_opening,
+            meta_at_start,
             run_state: Arc::new(run_state),
             lock: Mutex::new(Some(lock)),
         })
@@ -692,8 +860,68 @@ impl NodeWal {
     }
 
     /// How the meta journal opens.
-    pub(crate) fn meta_opening(&self) -> WalOpening {
-        self.meta_opening
+    pub(crate) fn meta_opening(&self) -> MetaOpening {
+        self.meta_opening.clone()
+    }
+
+    /// The meta journal's directory.
+    pub(crate) fn meta_dir(&self) -> PathBuf {
+        meta_dir(&self.root)
+    }
+
+    /// Puts the meta journal's metadata file in place before its writer
+    /// first opens in this run, when the start found no meta journal
+    /// ([`MetaAtStart::Absent`]). When a data journal held records at start,
+    /// the file records the meta journal's group `raft_group_id`
+    /// recovering.
+    ///
+    /// A node with data history never opens a new, empty meta log: its gate
+    /// then opens closed, and the replica rejoins its meta group as a wiped
+    /// voter does, instead of answering as empty and forming a meta group
+    /// again beside the one it belonged to. Every node that holds data
+    /// creates the meta journal first, so only a discarded or lost journal
+    /// gives this. A meta journal that exists opens by what it holds, so an
+    /// empty one stays empty. Data history means a segment record. A vote,
+    /// the genesis vote floor included, lives only in a core's metadata
+    /// file, so a node whose data journals hold votes but no record opens
+    /// its lost meta journal empty, as a node without data history does.
+    ///
+    /// The file appears, mark included, in one atomic replace, before the
+    /// journal holds anything. A crash or a failed write before then leaves
+    /// no meta journal, and the next start, or the next open of this run,
+    /// does this again.
+    pub(crate) fn create_meta_journal(
+        &self,
+        raft_group_id: ursula_shard::RaftGroupId,
+    ) -> Result<(), MetaJournalDamage> {
+        if self.meta_at_start == MetaAtStart::Present {
+            return Ok(());
+        }
+        let dir = self.meta_dir();
+        create_dir_all_durable(&dir).map_err(|source| MetaJournalDamage::CreateDir {
+            path: dir.clone(),
+            source: Arc::new(source),
+        })?;
+        let path = core_metadata_path(&dir);
+        // An earlier open of this run may have put the file in place.
+        let (mut metadata, missing) =
+            CoreMetadata::load_with_presence(&path).map_err(|source| {
+                MetaJournalDamage::ReadMetadata {
+                    path: path.clone(),
+                    source: Arc::new(source),
+                }
+            })?;
+        let lost = matches!(self.data_history, JournalHistory::Records { .. });
+        let marked = lost && metadata.initialize(raft_group_id.0, GroupLogState::Recovering);
+        if missing || marked {
+            metadata
+                .store(&path)
+                .map_err(|source| MetaJournalDamage::WriteMetadata {
+                    path,
+                    source: Arc::new(source),
+                })?;
+        }
+        Ok(())
     }
 
     pub(crate) fn run_state(&self) -> &Arc<RunStateFile> {
@@ -759,24 +987,129 @@ fn core_dirs(root: &Path) -> Result<Vec<PathBuf>, RaftWalError> {
         .collect())
 }
 
-/// Gather journal records and the greatest surviving verification epoch.
-/// This performs I/O only; `WalOpening::decide` owns the recovery policy.
-fn journal_history(cores: &[PathBuf]) -> Result<JournalHistory, RaftWalError> {
+/// The meta class's opening, by what the start `read` of the meta journal
+/// in `dir`: decided on the meta journal's own history, with its groups
+/// moved into recovery when the class opens recovering, as the cores' are.
+/// Without a meta journal there is nothing to mark. A journal that cannot be
+/// read or marked opens the class [`MetaOpening::Damaged`] instead of
+/// failing the start, and the run then records the epoch decided as if the
+/// journal held records.
+fn open_meta_class(
+    dir: &Path,
+    read: MetaRead,
+    previous: Option<&RunState>,
+    boot_id: Option<&BootId>,
+) -> Result<MetaOpening, RaftWalError> {
+    let decide = |history: JournalHistory| {
+        WalOpening::decide(previous, JournalClass::Meta, history, boot_id, META_FSYNC)
+    };
+    let history = match read {
+        MetaRead::Absent => {
+            return Ok(MetaOpening::Decided(decide(JournalHistory::Empty {
+                verified_epoch: 0,
+            })?));
+        }
+        MetaRead::Unread(damage) => {
+            return Ok(MetaOpening::Damaged {
+                opening: decide(JournalHistory::Records { verified_epoch: 0 })?,
+                damage,
+            });
+        }
+        MetaRead::Read(history) => history,
+    };
+    let opening = decide(history)?;
+    // Before this run records itself, as for the cores. The policy of meta
+    // never rises, so nothing is synced first.
+    if let RecoveryState::Recovering { .. } = opening.recovery {
+        let path = core_metadata_path(dir);
+        if let Err(source) = mark_core_recovering(&path) {
+            return Ok(MetaOpening::Damaged {
+                opening,
+                damage: MetaJournalDamage::MarkRecovering {
+                    path,
+                    source: Arc::new(source),
+                },
+            });
+        }
+    }
+    Ok(MetaOpening::Decided(opening))
+}
+
+/// A journal directory [`journal_history`] could not read.
+#[derive(Debug)]
+enum HistoryReadError {
+    Journal {
+        path: PathBuf,
+        source: JournalError,
+    },
+    Metadata {
+        path: PathBuf,
+        source: StateFileError,
+    },
+}
+
+impl From<HistoryReadError> for RaftWalError {
+    fn from(error: HistoryReadError) -> Self {
+        match error {
+            HistoryReadError::Journal { path, source } => Self::ReadJournal { path, source },
+            HistoryReadError::Metadata { source, .. } => Self::ReadCoreMetadata(source),
+        }
+    }
+}
+
+impl From<HistoryReadError> for MetaJournalDamage {
+    fn from(error: HistoryReadError) -> Self {
+        match error {
+            HistoryReadError::Journal { path, source } => Self::ReadJournal {
+                path,
+                source: Arc::new(source),
+            },
+            HistoryReadError::Metadata { path, source } => Self::ReadMetadata {
+                path,
+                source: Arc::new(source),
+            },
+        }
+    }
+}
+
+/// Gather journal records and the greatest surviving verification epoch of
+/// the journals in `dirs`. This performs I/O only; `WalOpening::decide` owns
+/// the recovery policy.
+fn journal_history(dirs: &[PathBuf]) -> Result<JournalHistory, HistoryReadError> {
     let mut records = false;
     let mut verified_epoch = 0;
-    for core in cores {
-        records |= segment::holds_records(core).map_err(|source| RaftWalError::ReadJournal {
-            path: core.clone(),
-            source,
-        })?;
-        let metadata = super::core_meta::CoreMetadata::load(&core_metadata_path(core))
-            .map_err(RaftWalError::ReadCoreMetadata)?;
-        verified_epoch = verified_epoch.max(metadata.verified_epoch());
+    for dir in dirs {
+        let read = read_journal(dir)?;
+        records |= read.records;
+        verified_epoch = verified_epoch.max(read.verified_epoch);
     }
-    Ok(if records {
-        JournalHistory::Records { verified_epoch }
-    } else {
-        JournalHistory::Empty { verified_epoch }
+    Ok(JournalHistory::of(records, verified_epoch))
+}
+
+/// What one journal directory holds, as a start reads it.
+#[derive(Debug)]
+struct JournalRead {
+    /// Whether a segment holds a record.
+    records: bool,
+    /// Whether the metadata file exists.
+    metadata: bool,
+    /// The epoch the metadata file records, 0 without one.
+    verified_epoch: u64,
+}
+
+/// Reads the journal in `dir`. A missing directory holds nothing.
+fn read_journal(dir: &Path) -> Result<JournalRead, HistoryReadError> {
+    let records = segment::holds_records(dir).map_err(|source| HistoryReadError::Journal {
+        path: dir.to_owned(),
+        source,
+    })?;
+    let path = core_metadata_path(dir);
+    let (metadata, missing) = CoreMetadata::load_with_presence(&path)
+        .map_err(|source| HistoryReadError::Metadata { path, source })?;
+    Ok(JournalRead {
+        records,
+        metadata: !missing,
+        verified_epoch: metadata.verified_epoch(),
     })
 }
 

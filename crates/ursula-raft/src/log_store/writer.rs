@@ -729,7 +729,12 @@ impl CoreFileLogWriter {
             metadata_changed |= metadata.adopt_generation(group_id, generation);
         }
         // Without metadata, surviving records do not prove the lost vote.
-        let damaged = metadata_missing || invalid_tail;
+        // A journal read below its class's epoch opens recovering too: the
+        // start that began the epoch marks the journals it found, and this
+        // covers one whose mark never ran, such as a meta journal the start
+        // could not read.
+        let damaged =
+            metadata_missing || invalid_tail || replay_mode == JournalReplayMode::VerifiedPrefix;
         let repaired = match (options.node_recovery, damaged) {
             (RecoveryState::Normal, false) => GroupLogState::Initialized,
             _ => GroupLogState::Recovering,

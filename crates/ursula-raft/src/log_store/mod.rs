@@ -1,6 +1,7 @@
 //! OpenRaft log stores.
 //!
-//! - `wal`: node lifecycle and per-core journal ownership.
+//! - `wal`: node lifecycle, per-core journal ownership, and the meta
+//!   group's journal under `meta`, apart from the cores'.
 //! - `file`: the durable per-group store over the shared per-core journal.
 //! - `writer`: the single writer of each core's journal: batches, the fsync
 //!   policy, rotation and reclaim.
@@ -87,6 +88,9 @@ pub use run_state::JournalClass;
 pub use run_state::JournalHistory;
 pub use run_state::JournalRun;
 pub use run_state::JournalSync;
+pub(crate) use run_state::META_FSYNC;
+pub use run_state::MetaJournalDamage;
+pub use run_state::MetaOpening;
 pub(crate) use run_state::NodeWal;
 pub use run_state::PreviousRun;
 pub use run_state::RUN_STATE_FILE;
@@ -120,6 +124,7 @@ pub use state_file::StateFileError;
 pub use state_file::StateFileKind;
 pub(crate) use state_file::replace_file;
 pub use topology::generate_cluster_id;
+pub use wal::MetaOpenError;
 pub use wal::RaftWal;
 pub use wal::WalMaintenance;
 pub(crate) use writer::CoreFileLogWriter;

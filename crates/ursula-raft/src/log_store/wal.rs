@@ -1,4 +1,4 @@
-//! Node WAL lifecycle and per-core journal ownership.
+//! Node WAL lifecycle and per-core journal ownership, and the meta journal's.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -13,12 +13,18 @@ use ursula_config::WalFsync;
 use ursula_headers::ClusterId;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_shard::CoreId;
+use ursula_shard::RaftGroupId;
+use ursula_shard::ShardId;
 use ursula_shard::ShardPlacement;
 
 use crate::log_store::CoreFileLogWriter;
+use crate::log_store::CoreJournalError;
 use crate::log_store::CoreJournalOptions;
 use crate::log_store::JournalTuning;
 use crate::log_store::LaggingGroups;
+use crate::log_store::META_FSYNC;
+use crate::log_store::MetaJournalDamage;
+use crate::log_store::MetaOpening;
 use crate::log_store::NodeWal;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
@@ -49,13 +55,60 @@ enum CoreWriterSlots {
     ShutDown,
 }
 
+/// The meta journal's writer in a run. Unlike a core's, it is held for the
+/// whole run once open, so a restart of the meta replica reopens its group
+/// on the same writer.
+#[derive(Debug, Default)]
+enum MetaWriterSlot {
+    /// No meta store opened yet in this run.
+    #[default]
+    Unopened,
+    Open(Arc<CoreFileLogWriter>),
+    /// [`RaftWal::shutdown`] closed it; it opens no more in this run.
+    ShutDown,
+}
+
+/// Where the meta group's log lives on its own journal: core 0, shard 0 and
+/// group 0 of the meta journal's namespace, which no data group shares.
+pub(crate) const META_PLACEMENT: ShardPlacement = ShardPlacement {
+    core_id: CoreId(0),
+    shard_id: ShardId(0),
+    raft_group_id: RaftGroupId(0),
+};
+
+/// The meta group's cache of recent entries: the default per-group cache,
+/// whatever the data journals' tuning sets.
+const META_CACHE_BYTES: u64 = JournalTuning::DEFAULT_GROUP_CACHE_BYTES;
+
+/// Failure to open the meta group's log store ([`RaftWal::open_meta`]).
+#[derive(Debug, thiserror::Error)]
+pub enum MetaOpenError {
+    /// The meta journal does not open in this run: the start could not read
+    /// or mark it, or its writer did not open. The node runs on without it.
+    #[error("the meta journal is damaged: {0}")]
+    Damaged(#[source] MetaJournalDamage),
+    /// The OpenRaft work of the meta group's previous engine still runs.
+    #[error("OpenRaft work of the previous engine of the meta group still runs")]
+    PreviousEngineRunning,
+    /// The meta group's store did not open on the open meta journal.
+    #[error("open the meta group's store: {0}")]
+    OpenGroup(#[source] CoreJournalError),
+    #[error("the Raft WAL under '{}' has shut down", .root.display())]
+    ShutDown { root: PathBuf },
+    #[error("Raft WAL state mutex poisoned")]
+    LockPoisoned,
+}
+
 /// Opens each group's durable log store over its core's shared journal, for
 /// one run of the node's Raft WAL.
 ///
 /// [`RaftWal::start`] begins the run: it reads the run
 /// state the previous run left, decides how the journals open
-/// ([`WalOpening`]) and records this run before any journal write.
-/// [`RaftWal::shutdown`] ends it cleanly.
+/// ([`WalOpening`], [`MetaOpening`]) and records this run before any journal
+/// write. [`RaftWal::shutdown`] ends it cleanly.
+///
+/// The meta group's log lives on a journal of its own, under `meta` beside
+/// the cores' directories ([`RaftWal::open_meta`]).
 #[derive(Debug, Clone)]
 pub struct RaftWal {
     node: Arc<NodeWal>,
@@ -67,6 +120,10 @@ pub struct RaftWal {
     /// The OpenRaft work of each group's latest engine in this run: a group
     /// opens again only once its previous engine's work ended (#709).
     engine_work: crate::openraft_work::EngineWorkLedger,
+    /// The meta journal's writer.
+    meta_writer: Arc<Mutex<MetaWriterSlot>>,
+    /// The meta journal's lagging groups, apart from the data cores'.
+    meta_lagging: Arc<LaggingGroups>,
 }
 
 impl RaftWal {
@@ -111,6 +168,8 @@ impl RaftWal {
             lagging: Arc::new(LaggingGroups::default()),
             core_writers: Arc::new(Mutex::new(CoreWriterSlots::Running(BTreeMap::new()))),
             engine_work: crate::openraft_work::EngineWorkLedger::default(),
+            meta_writer: Arc::new(Mutex::new(MetaWriterSlot::Unopened)),
+            meta_lagging: Arc::new(LaggingGroups::default()),
         })
     }
 
@@ -148,9 +207,8 @@ impl RaftWal {
     }
 
     /// How this run opens the meta journal, by the meta class's own record
-    /// in the run state. No meta journal is written yet, so nothing opens
-    /// by it.
-    pub fn meta_opening(&self) -> WalOpening {
+    /// in the run state and the meta journal's own history.
+    pub fn meta_opening(&self) -> MetaOpening {
         self.node.meta_opening()
     }
 
@@ -280,6 +338,107 @@ impl RaftWal {
         }
     }
 
+    /// Opens the meta group's log store on the meta journal under
+    /// `raft-log/meta/`, which always runs `fsync = always`, with its WAL
+    /// metrics in `metrics`, the meta group's own.
+    ///
+    /// The first call of a run opens the meta journal's writer, which the
+    /// run then holds until [`Self::shutdown`], so a later call, after the
+    /// previous store closed, reopens the group on the same writer. When the
+    /// start found no meta journal, the first call puts the journal's
+    /// metadata file in place before the writer opens, recording the group
+    /// recovering if a data journal held records at start. A meta journal the
+    /// start could not read, or whose writer does not open, is refused as
+    /// [`MetaOpenError::Damaged`] and never stops the node. A meta group
+    /// whose previous engine's OpenRaft work still runs is refused at once.
+    pub fn open_meta(
+        &self,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<RaftGroupFileLogStore>, MetaOpenError> {
+        let opening = match self.node.meta_opening() {
+            MetaOpening::Decided(opening) => opening,
+            MetaOpening::Damaged { damage, .. } => return Err(MetaOpenError::Damaged(damage)),
+        };
+        self.engine_work
+            .admit_meta()
+            .map_err(|_running| MetaOpenError::PreviousEngineRunning)?;
+        let writer = {
+            // Opening the journal holds the slot through its replay, as a
+            // core's open holds its slot.
+            let mut slot = self
+                .meta_writer
+                .lock()
+                .map_err(|_poisoned| MetaOpenError::LockPoisoned)?;
+            match &*slot {
+                MetaWriterSlot::Open(writer) => writer.clone(),
+                MetaWriterSlot::ShutDown => {
+                    return Err(MetaOpenError::ShutDown {
+                        root: self.root().to_owned(),
+                    });
+                }
+                MetaWriterSlot::Unopened => {
+                    let writer = self
+                        .open_meta_writer(opening, metrics.clone())
+                        .map_err(MetaOpenError::Damaged)?;
+                    *slot = MetaWriterSlot::Open(writer.clone());
+                    writer
+                }
+            }
+        };
+        RaftGroupFileLogStore::open(META_PLACEMENT, metrics, writer)
+            .map_err(MetaOpenError::OpenGroup)
+    }
+
+    fn open_meta_writer(
+        &self,
+        opening: WalOpening,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<CoreFileLogWriter>, MetaJournalDamage> {
+        self.node
+            .create_meta_journal(META_PLACEMENT.raft_group_id)?;
+        CoreFileLogWriter::open(self.node.meta_dir(), CoreJournalOptions {
+            previous_run: opening.previous_run,
+            core: META_PLACEMENT.core_id,
+            tuning: JournalTuning {
+                fsync: META_FSYNC,
+                segment_bytes: self.tuning.segment_bytes,
+                group_cache_bytes: META_CACHE_BYTES,
+            },
+            recovery_epoch: opening.recovery_epoch,
+            run_state: self.node.run_state().clone(),
+            node_recovery: opening.recovery,
+            lagging: self.meta_lagging.clone(),
+            metrics: Some((META_PLACEMENT, metrics)),
+        })
+        .map_err(MetaJournalDamage::OpenJournal)
+    }
+
+    /// How the meta journal was read when it opened in this run, if it has.
+    #[cfg(all(test, not(madsim)))]
+    pub(crate) fn meta_replay_mode(&self) -> Option<super::JournalReplayMode> {
+        match &*self.meta_writer.lock().expect("the meta writer slot") {
+            MetaWriterSlot::Open(writer) => Some(writer.replay_mode()),
+            MetaWriterSlot::Unopened | MetaWriterSlot::ShutDown => None,
+        }
+    }
+
+    /// The meta journal's lagging groups, for the meta group's snapshot
+    /// trigger.
+    pub fn meta_lagging_groups(&self) -> Arc<LaggingGroups> {
+        self.meta_lagging.clone()
+    }
+
+    /// What the meta group's snapshot trigger needs of this WAL: the meta
+    /// journal's lagging groups and its maintenance passes. Like
+    /// [`Self::maintenance`], it holds neither the root's lock nor the
+    /// journal.
+    pub fn meta_maintenance(&self) -> WalMaintenance {
+        WalMaintenance {
+            lagging: self.meta_lagging.clone(),
+            journals: MaintainedJournals::Meta(Arc::downgrade(&self.meta_writer)),
+        }
+    }
+
     /// The ledger engines of this WAL's groups record their OpenRaft work in
     /// as soon as their Raft starts (#709).
     pub(crate) fn engine_work_ledger(&self) -> crate::openraft_work::EngineWorkLedger {
@@ -300,14 +459,15 @@ impl RaftWal {
     pub fn maintenance(&self) -> WalMaintenance {
         WalMaintenance {
             lagging: self.lagging.clone(),
-            core_writers: Arc::downgrade(&self.core_writers),
+            journals: MaintainedJournals::Cores(Arc::downgrade(&self.core_writers)),
         }
     }
 
-    /// Ends this run cleanly: closes every core writer, each of which
-    /// `fsync`s its journal, and only then records a clean shutdown. Stop the
-    /// Raft groups first; a write after this fails and no journal opens
-    /// again. When a writer cannot close, the run is not recorded as clean.
+    /// Ends this run cleanly: closes every core writer and the meta
+    /// journal's, each of which `fsync`s its journal, and only then records a
+    /// clean shutdown. Stop the Raft groups first; a write after this fails
+    /// and no journal opens again. When a writer cannot close, the run is not
+    /// recorded as clean.
     pub async fn shutdown(&self) -> Result<(), RaftWalError> {
         let slots = {
             let mut core_writers = self
@@ -343,6 +503,24 @@ impl RaftWal {
         }))
         .await;
         closed.into_iter().collect::<Result<Vec<()>, _>>()?;
+        let meta = std::mem::replace(
+            &mut *self
+                .meta_writer
+                .lock()
+                .map_err(|_poisoned| RaftWalError::LockPoisoned)?,
+            MetaWriterSlot::ShutDown,
+        );
+        let meta_closed = match meta {
+            MetaWriterSlot::Open(writer) => {
+                exits.push(writer.exited());
+                writer
+                    .close()
+                    .await
+                    .map_err(|source| RaftWalError::CloseMetaJournal { source })?;
+                true
+            }
+            MetaWriterSlot::Unopened | MetaWriterSlot::ShutDown => false,
+        };
         // A writer whose last handle is being dropped still drains its queued
         // batch. Only once every worker stopped can no journal change.
         for mut exited in exits {
@@ -352,17 +530,29 @@ impl RaftWal {
         tracing::info!(
             root = %self.root().display(),
             cores = writers.len(),
+            meta = meta_closed,
             "shut down the Raft WAL cleanly"
         );
         Ok(())
     }
 }
 
-/// The snapshot driver's handle on a node's Raft WAL ([`RaftWal::maintenance`]).
+/// The snapshot driver's handle on a node's Raft WAL ([`RaftWal::maintenance`]),
+/// or the meta group's snapshot trigger's on the meta journal
+/// ([`RaftWal::meta_maintenance`]).
 #[derive(Debug, Clone)]
 pub struct WalMaintenance {
     lagging: Arc<LaggingGroups>,
-    core_writers: Weak<Mutex<CoreWriterSlots>>,
+    journals: MaintainedJournals,
+}
+
+/// The journals a [`WalMaintenance`] maintains.
+#[derive(Debug, Clone)]
+enum MaintainedJournals {
+    /// Every open core journal.
+    Cores(Weak<Mutex<CoreWriterSlots>>),
+    /// The meta journal, once open.
+    Meta(Weak<Mutex<MetaWriterSlot>>),
 }
 
 impl WalMaintenance {
@@ -371,8 +561,8 @@ impl WalMaintenance {
         self.lagging.clone()
     }
 
-    /// Runs one maintenance pass of every open core journal, as of `now` on
-    /// the snapshot driver's clock (#669): each writer stamps the dead
+    /// Runs one maintenance pass of every open core journal, or of the meta
+    /// journal, as of `now` on the snapshot driver's clock (#669): each writer stamps the dead
     /// frames it learned of since its last pass with `now`, seals its active
     /// segment once that segment has held dead frames for `max_dirty_age`,
     /// and frees the oldest kept segment while a kept segment has, copying
@@ -386,50 +576,95 @@ impl WalMaintenance {
         now: Instant,
         max_dirty_age: Duration,
     ) -> Result<(), RaftWalError> {
-        let Some(core_writers) = self.core_writers.upgrade() else {
-            return Ok(());
-        };
-        let slots = match &*core_writers
-            .lock()
-            .map_err(|_poisoned| RaftWalError::LockPoisoned)?
-        {
-            CoreWriterSlots::Running(slots) => slots.clone(),
-            CoreWriterSlots::ShutDown => return Ok(()),
-        };
-        drop(core_writers);
-        // Each pass is asked for while the writer's handle is held, and
-        // the handle goes before the wait: holding the last one there would
-        // make its drop wait for the writer and keep the journal locked
-        // against a group that reopens meanwhile.
-        let mut answers = Vec::with_capacity(slots.len());
-        for (core, slot) in slots {
-            // Opening a journal holds its slot through the replay, so a busy
-            // slot is skipped rather than waited on.
-            let slot = match slot.try_lock() {
-                Ok(slot) => slot,
-                Err(std::sync::TryLockError::WouldBlock) => continue,
-                Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
-                    return Err(RaftWalError::LockPoisoned);
-                }
-            };
-            let Some(writer) = slot.writer.upgrade() else {
-                continue;
-            };
-            drop(slot);
-            let answer = writer.send_maintenance(now, max_dirty_age);
-            drop(writer);
-            answers.push((CoreId(core), answer));
-        }
-        let passes = join_all(answers.into_iter().map(|(core, answer)| async move {
-            match answer {
-                Ok(answer) => answer.ran().await,
-                Err(source) => Err(source),
+        match &self.journals {
+            MaintainedJournals::Cores(core_writers) => {
+                maintain_cores(core_writers, now, max_dirty_age).await
             }
-            .map_err(|source| RaftWalError::MaintainJournal { core, source })
-        }))
-        .await;
-        passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
+            MaintainedJournals::Meta(meta_writer) => {
+                maintain_meta(meta_writer, now, max_dirty_age).await
+            }
+        }
     }
+}
+
+async fn maintain_cores(
+    core_writers: &Weak<Mutex<CoreWriterSlots>>,
+    now: Instant,
+    max_dirty_age: Duration,
+) -> Result<(), RaftWalError> {
+    let Some(core_writers) = core_writers.upgrade() else {
+        return Ok(());
+    };
+    let slots = match &*core_writers
+        .lock()
+        .map_err(|_poisoned| RaftWalError::LockPoisoned)?
+    {
+        CoreWriterSlots::Running(slots) => slots.clone(),
+        CoreWriterSlots::ShutDown => return Ok(()),
+    };
+    drop(core_writers);
+    // Each pass is asked for while the writer's handle is held, and
+    // the handle goes before the wait: holding the last one there would
+    // make its drop wait for the writer and keep the journal locked
+    // against a group that reopens meanwhile.
+    let mut answers = Vec::with_capacity(slots.len());
+    for (core, slot) in slots {
+        // Opening a journal holds its slot through the replay, so a busy
+        // slot is skipped rather than waited on.
+        let slot = match slot.try_lock() {
+            Ok(slot) => slot,
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+            Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+                return Err(RaftWalError::LockPoisoned);
+            }
+        };
+        let Some(writer) = slot.writer.upgrade() else {
+            continue;
+        };
+        drop(slot);
+        let answer = writer.send_maintenance(now, max_dirty_age);
+        drop(writer);
+        answers.push((CoreId(core), answer));
+    }
+    let passes = join_all(answers.into_iter().map(|(core, answer)| async move {
+        match answer {
+            Ok(answer) => answer.ran().await,
+            Err(source) => Err(source),
+        }
+        .map_err(|source| RaftWalError::MaintainJournal { core, source })
+    }))
+    .await;
+    passes.into_iter().collect::<Result<Vec<()>, _>>().map(drop)
+}
+
+async fn maintain_meta(
+    meta_writer: &Weak<Mutex<MetaWriterSlot>>,
+    now: Instant,
+    max_dirty_age: Duration,
+) -> Result<(), RaftWalError> {
+    let Some(meta_writer) = meta_writer.upgrade() else {
+        return Ok(());
+    };
+    // Opening the journal holds the slot through its replay, so a busy slot
+    // is skipped rather than waited on.
+    let writer = match meta_writer.try_lock() {
+        Ok(slot) => match &*slot {
+            MetaWriterSlot::Open(writer) => writer.clone(),
+            MetaWriterSlot::Unopened | MetaWriterSlot::ShutDown => return Ok(()),
+        },
+        Err(std::sync::TryLockError::WouldBlock) => return Ok(()),
+        Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+            return Err(RaftWalError::LockPoisoned);
+        }
+    };
+    drop(meta_writer);
+    let answer = writer.send_maintenance(now, max_dirty_age);
+    drop(writer);
+    match answer {
+        Ok(answer) => answer.ran().await,
+        Err(source) => Err(source),
+    }
+    .map_err(|source| RaftWalError::MaintainMetaJournal { source })
 }
 
 #[cfg(all(test, not(madsim)))]
@@ -548,6 +783,49 @@ mod tests {
         }
         dropping.await.expect("drop the last handle");
         crate::tests::remove_test_path(&root);
+    }
+
+    /// The meta journal's writer is held for the run: its group reopens on
+    /// it once the previous store closed, and a shutdown closes it, with the
+    /// store still held, before it records the run as clean.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn the_meta_writer_closes_before_the_clean_record() {
+        let root = tempfile::tempdir().unwrap();
+        let topology = ursula_shard::StaticShardMap::new(1, 1).unwrap();
+        let wal = RaftWal::start(root.path(), WalFsync::Never, &topology).unwrap();
+        let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
+        let store = wal.open_meta(metrics()).unwrap();
+        let exited = match &*wal.meta_writer.lock().unwrap() {
+            MetaWriterSlot::Open(writer) => writer.exited(),
+            other => panic!("an opened meta writer, not {other:?}"),
+        };
+        assert!(matches!(
+            wal.open_meta(metrics()),
+            Err(MetaOpenError::OpenGroup(
+                CoreJournalError::GroupAlreadyOpen { .. }
+            ))
+        ));
+        drop(store);
+        let store = wal
+            .open_meta(metrics())
+            .expect("the meta group reopens on the held writer");
+        wal.shutdown().await.unwrap();
+        if let Ok(changed) = exited.has_changed() {
+            panic!("the meta writer still runs after a clean shutdown (changed: {changed})");
+        }
+        let recorded = crate::log_store::state_file::read::<crate::log_store::RunState>(
+            crate::log_store::StateFileKind::RunState,
+            &root.path().join(crate::log_store::RUN_STATE_FILE),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(recorded.status, crate::log_store::RunStatus::Clean);
+        assert!(matches!(
+            wal.open_meta(metrics()),
+            Err(MetaOpenError::ShutDown { .. })
+        ));
+        drop(store);
     }
 
     /// A core recovering its journal does not hold up another core's.
