@@ -811,16 +811,25 @@ pub(super) fn sim_cold_store() -> ColdStore {
     cold_store
 }
 
+/// A single node's groups over a simulated WAL, each opened in a madsim
+/// scope of its own.
 #[derive(Clone)]
 struct MadsimScopedRaftGroupEngineFactory {
     seed: u64,
     wal: SimNodeWal,
+    /// The single node's placed engine factory over the WAL's run.
+    groups: ursula_raft::PlacedRaftGroupEngineFactory,
 }
 
 impl MadsimScopedRaftGroupEngineFactory {
     fn new(seed: u64) -> Self {
         let wal = SimNodeWal::provision("runtime-raft-engine-node");
-        Self { seed, wal }
+        let groups = ursula_raft::PlacedRaftGroupEngineFactory::single_node(
+            wal.raft_wal(),
+            ursula_raft::RaftGroupHandleRegistry::default(),
+            sim_wal::SINGLE_VOTER,
+        );
+        Self { seed, wal, groups }
     }
 }
 
@@ -832,14 +841,10 @@ impl GroupEngineFactory for MadsimScopedRaftGroupEngineFactory {
     ) -> GroupEngineCreateFuture<'a> {
         let seed = self.seed ^ u64::from(placement.raft_group_id.0);
         let wal = self.wal.clone();
+        let groups = self.groups.clone();
         Box::pin(MadsimOpenRaftRuntime::scope(seed, async move {
             let log_store = wal.open(placement, metrics.clone()).await;
-            let inner = RaftGroupEngine::new_single_node_on_log_store_with_options(
-                placement,
-                log_store,
-                wal.recording_work(sim_wal::engine_options(Some(metrics), None)),
-            )
-            .await?;
+            let inner = groups.start_on(placement, log_store, metrics).await?;
             let engine: Box<dyn GroupEngine> = Box::new(MadsimScopedGroupEngine {
                 seed,
                 inner: Box::new(inner),

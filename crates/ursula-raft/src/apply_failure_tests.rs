@@ -17,6 +17,9 @@ use crate::RaftCommand;
 use crate::RaftGroupEngine;
 use crate::RaftGroupEngineOptions;
 use crate::RaftGroupHandleRegistry;
+use crate::engine::test_support::open_single_voter;
+use crate::engine::test_support::single_node_factory;
+use crate::engine::test_support::start_single_voter_on;
 
 fn placement(group: u32) -> ShardPlacement {
     ShardPlacement {
@@ -79,35 +82,12 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
             metrics.group_engine_metrics(),
         )
         .unwrap();
-    let poisoned = RaftGroupEngine::new_single_node(
-        placement(0),
-        1,
-        config.clone(),
-        poisoned_log.clone(),
-        RaftGroupEngineOptions {
-            apply_stop_signal: Some(poisoned_log.apply_stop_signal()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-    let healthy = RaftGroupEngine::new_single_node(
-        placement(1),
-        1,
-        config.clone(),
-        wal.open(
-            placement(1),
-            ursula_control::Admission::Create,
-            metrics.group_engine_metrics(),
-        )
-        .unwrap(),
-        RaftGroupEngineOptions::default(),
-    )
-    .await
-    .unwrap();
+    // Both groups register their engines in `registry`.
     let registry = RaftGroupHandleRegistry::default();
-    registry.register_engine(&poisoned);
-    registry.register_engine(&healthy);
+    let factory =
+        crate::PlacedRaftGroupEngineFactory::single_node(wal.clone(), registry.clone(), 1);
+    let poisoned = start_single_voter_on(&factory, placement(0), poisoned_log.clone()).await;
+    let healthy = open_single_voter(&factory, placement(1)).await;
     poisoned
         .raft
         .client_write(create_stream("before-poison"))
@@ -244,6 +224,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     healthy.raft.shutdown().await.unwrap();
     wal.shutdown().await.unwrap();
     drop(registry);
+    drop(factory);
     drop(poisoned);
     drop(healthy);
     drop(poisoned_log);
@@ -297,10 +278,17 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     // start the other group on that same owner, and never retry the poison
     // merely because another request or warmup arrives.
     let restarted_registry = RaftGroupHandleRegistry::default();
-    crate::peer_cluster::bind_single_node(&restarted_registry, &wal);
-    let mut factory = crate::DurableRaftGroupEngineFactory::new(wal.clone())
-        .with_registry(restarted_registry.clone());
-    factory.fail_apply_at = Some((RaftGroupId(0), poison_index));
+    let factory = crate::PlacedRaftGroupEngineFactory::single_node(
+        wal.clone(),
+        restarted_registry.clone(),
+        1,
+    )
+    .with_apply_fault(
+        RaftGroupId(0),
+        crate::apply_failure::ApplyFault::PanicAfterMutation {
+            index: poison_index,
+        },
+    );
     let runtime = ursula_runtime::ShardRuntime::spawn_with_engine_factory(
         ursula_runtime::RuntimeConfig::new(1, 2),
         factory,
@@ -441,20 +429,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         &topology,
     )
     .unwrap();
-    let recovered = RaftGroupEngine::new_single_node(
-        placement(0),
-        1,
-        config,
-        wal.open(
-            placement(0),
-            ursula_control::Admission::Create,
-            metrics.group_engine_metrics(),
-        )
-        .unwrap(),
-        RaftGroupEngineOptions::default(),
-    )
-    .await
-    .unwrap();
+    let recovered = open_single_voter(&single_node_factory(&wal), placement(0)).await;
     recovered
         .raft
         .client_write(create_stream("after-recovery"))
@@ -945,7 +920,7 @@ async fn startup_snapshot_corruption_is_not_an_isolated_apply_failure() {
     let registry = RaftGroupHandleRegistry::default();
     let runtime = ursula_runtime::ShardRuntime::spawn_with_engine_factory(
         ursula_runtime::RuntimeConfig::new(1, 1),
-        crate::DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone()),
+        crate::PlacedRaftGroupEngineFactory::single_node(wal.clone(), registry.clone(), 1),
     )
     .unwrap();
     assert!(matches!(

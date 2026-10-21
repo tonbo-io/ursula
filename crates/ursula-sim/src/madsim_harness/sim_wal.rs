@@ -28,18 +28,29 @@ use ursula_config::WalFsync;
 use ursula_control::Admission;
 use ursula_raft::JournalTuning;
 use ursula_raft::MetaOpenError;
+#[cfg(test)]
+use ursula_raft::PlacedRaftGroupEngineFactory;
+#[cfg(test)]
+use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupFileLogStore;
+#[cfg(test)]
+use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
 use ursula_raft::RaftWalError;
 #[cfg(test)]
 use ursula_raft::WalOpening;
 use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_raft::wal::diagnostics::SimPowerLoss;
+#[cfg(test)]
+use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::RuntimeMetrics;
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
+
+/// The Raft node id of a simulated single node.
+pub(super) const SINGLE_VOTER: u64 = 1;
 
 /// Scheduler turns a stopped engine gets to drop its store before the wait
 /// falls back to advancing simulated time.
@@ -162,6 +173,29 @@ impl SimNodeWal {
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(placement.raft_group_id, Arc::downgrade(&store));
         Ok(store)
+    }
+
+    /// Node 1's replica of `placement`'s group, the group's only voter, as
+    /// a single node opens it: through the placed engine factory over the
+    /// node's current run, on a store the node hands out. It waits until
+    /// the replica leads.
+    #[cfg(test)]
+    pub(super) async fn single_voter(
+        &self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<RaftGroupEngine, GroupEngineError> {
+        let store = self.open(placement, metrics.clone()).await;
+        let factory = PlacedRaftGroupEngineFactory::single_node(
+            self.raft_wal(),
+            RaftGroupHandleRegistry::default(),
+            SINGLE_VOTER,
+        );
+        let engine = factory.start_on(placement, store, metrics).await?;
+        engine
+            .wait_for_current_leader(SINGLE_VOTER, Duration::from_secs(5))
+            .await?;
+        Ok(engine)
     }
 
     /// Opens the meta group's log store from the node's meta journal, kept

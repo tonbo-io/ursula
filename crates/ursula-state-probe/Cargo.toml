@@ -29,7 +29,8 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time
 ursula-config = { workspace = true }
 ursula-control = { workspace = true }
 ursula-proto = { workspace = true }
-ursula-raft = { workspace = true }
+# `PlacedRaftGroupEngineFactory::single_node`, the L2 probe's Raft engine.
+ursula-raft = { workspace = true, features = ["test-support"] }
 ursula-runtime = { workspace = true }
 ursula-shard = { workspace = true }
 ursula-stream = { workspace = true }

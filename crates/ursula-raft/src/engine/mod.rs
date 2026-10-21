@@ -10,7 +10,7 @@ mod factory;
 #[cfg(all(test, not(madsim)))]
 mod history_pending_cold_tests;
 #[cfg(all(test, not(madsim)))]
-mod test_support;
+pub(crate) mod test_support;
 mod wal_error;
 
 use std::collections::BTreeSet;
@@ -18,7 +18,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::PlacedRaftGroupEngineFactory;
 pub use factory::RaftEngineConfig;
 pub(crate) use factory::cluster_raft_config;
@@ -149,7 +148,6 @@ use crate::forward::leadership_refusal;
 use crate::forward::write_result_from_raft_response;
 use crate::openraft_error;
 use crate::read_index::ReadIndexBarrier;
-use crate::registry::SingleNodeRaftNetworkFactory;
 use crate::state_machine::RaftGroupStateMachine;
 use crate::state_machine::RecordSite;
 use crate::state_machine::SnapshotBuildCoordinator;
@@ -190,8 +188,8 @@ pub struct RaftGroupEngineOptions {
     pub peer_cluster: Option<crate::PeerCluster>,
     /// The node fence the replica's one leader predicate reads
     /// ([`crate::GroupLeadership::of`]): its WAL's ([`crate::RaftWal::fence`]),
-    /// which every engine factory passes, single-node or not. `None`, for an
-    /// engine a test builds by hand, is an unleased fence.
+    /// which every engine factory passes. `None`, for an engine a test
+    /// builds by hand, is an unleased fence.
     pub fence: Option<ursula_runtime::NodeFence>,
     /// How long the engine's shutdown waits for OpenRaft's work, for tests;
     /// [`crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT`] otherwise.
@@ -201,9 +199,6 @@ pub struct RaftGroupEngineOptions {
     /// records its OpenRaft work as soon as its Raft starts, so a start that
     /// fails after that still keeps the group closed until the work ended.
     pub(crate) engine_work: Option<crate::openraft_work::EngineWorkLedger>,
-    /// A failure injected once the Raft started, for tests.
-    #[cfg(test)]
-    pub(crate) startup_fault: Option<StartupFault>,
 }
 
 impl RaftGroupEngineOptions {
@@ -220,9 +215,8 @@ impl RaftGroupEngineOptions {
     }
 }
 
-/// A start of a single-node engine that fails once its Raft started, for
-/// tests: its state-machine worker runs an external function that waits
-/// for `release` first, so the failed engine's work outlives its start.
+/// A start of an engine that fails once its Raft started, for tests
+/// ([`RaftGroupEngine::fail_start`]).
 #[cfg(test)]
 #[derive(Debug, Clone)]
 pub(crate) struct StartupFault {
@@ -495,193 +489,26 @@ impl RaftGroupEngine {
     fn leads(&self) -> bool {
         self.leadership().leads()
     }
-    /// A single-node group over `log_store`, with the timeouts of a
-    /// single-node runtime.
-    #[cfg(any(test, madsim))]
-    pub async fn new_single_node_on_log_store<LS>(
-        placement: ShardPlacement,
-        log_store: LS,
-        metrics: Option<GroupEngineMetrics>,
-    ) -> Result<Self, GroupEngineError>
-    where
-        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
-    {
-        Self::new_single_node_on_log_store_with_options(
-            placement,
-            log_store,
-            RaftGroupEngineOptions {
-                metrics,
-                ..Default::default()
-            },
-        )
-        .await
-    }
 
-    /// [`Self::new_single_node_on_log_store`] with `options`.
-    #[cfg(any(test, madsim))]
-    pub async fn new_single_node_on_log_store_with_options<LS>(
-        placement: ShardPlacement,
-        log_store: LS,
-        options: RaftGroupEngineOptions,
-    ) -> Result<Self, GroupEngineError>
-    where
-        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
-    {
-        let config = Arc::new(openraft_error::validated_config(Config {
-            cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        })?);
-        Self::new_single_node(placement, 1, config, log_store, options).await
-    }
-
-    #[cfg(any(test, madsim))]
-    pub async fn new_single_node_with_log_store<LS>(
-        placement: ShardPlacement,
-        node_id: u64,
-        config: Arc<Config>,
-        log_store: LS,
-    ) -> Result<Self, GroupEngineError>
-    where
-        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
-    {
-        Self::new_single_node_with_log_store_and_metrics(
-            placement, node_id, config, log_store, None, None,
-        )
-        .await
-    }
-
-    #[cfg(any(test, madsim))]
-    pub(crate) async fn new_single_node_with_log_store_and_metrics<LS>(
-        placement: ShardPlacement,
-        node_id: u64,
-        config: Arc<Config>,
-        log_store: LS,
-        metrics: Option<GroupEngineMetrics>,
-        cold_store: Option<ColdStoreHandle>,
-    ) -> Result<Self, GroupEngineError>
-    where
-        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
-    {
-        Self::new_single_node(
-            placement,
-            node_id,
-            config,
-            log_store,
-            RaftGroupEngineOptions {
-                metrics,
-                cold_store,
-                ..Default::default()
-            },
-        )
-        .await
-    }
-
-    pub async fn new_single_node<LS>(
-        placement: ShardPlacement,
-        node_id: u64,
-        config: Arc<Config>,
-        log_store: LS,
-        options: RaftGroupEngineOptions,
-    ) -> Result<Self, GroupEngineError>
-    where
-        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
-    {
-        Self::new_single_node_observed(
-            placement,
-            node_id,
-            config,
-            log_store,
-            options,
-            Default::default(),
-        )
-        .await
-    }
-
-    pub(crate) async fn new_single_node_observed<LS>(
-        placement: ShardPlacement,
-        node_id: u64,
-        config: Arc<Config>,
-        log_store: LS,
-        options: RaftGroupEngineOptions,
-        apply_health: crate::apply_failure::ApplyHealth,
-    ) -> Result<Self, GroupEngineError>
-    where
-        LS: RaftLogStorage<UrsulaRaftTypeConfig>,
-    {
-        #[cfg(test)]
-        let mut options = options;
-        #[cfg(test)]
-        let startup_fault = options.startup_fault.take();
-        let engine = Self::new_node_observed(
-            placement,
-            node_id,
-            config,
-            SingleNodeRaftNetworkFactory,
-            log_store,
-            options,
-            apply_health,
-        )
-        .await?;
-        #[cfg(test)]
-        let started = engine.start_single_node(node_id, startup_fault).await;
-        #[cfg(not(test))]
-        let started = engine.start_single_node(node_id).await;
-        match started {
-            Ok(()) => Ok(engine),
-            Err(error) => {
-                // The Raft runs: dropping the engine stops it as any engine
-                // stops, in a task the WAL's ledger keeps, and the group
-                // stays closed until the engine's work ended (#709).
-                drop(engine);
-                Err(error)
-            }
-        }
-    }
-
-    /// Initializes a single-node group and waits until it leads.
-    async fn start_single_node(
-        &self,
-        node_id: u64,
-        #[cfg(test)] startup_fault: Option<StartupFault>,
-    ) -> Result<(), GroupEngineError> {
-        #[cfg(test)]
-        if let Some(fault) = startup_fault {
-            let release = fault.release;
-            self.raft
-                .external_state_machine_request(move |_state_machine| {
-                    Box::pin(async move { release.notified().await })
-                })
-                .await
-                .map_err(crate::owner::owner_stopped)?;
-            return Err(GroupEngineError::Infra(
-                ursula_runtime::GroupInfraError::LeaderWaitTimedOut {
-                    group: RaftTarget::Data(self.placement.raft_group_id),
-                    timeout_ms: 0,
-                },
-            ));
-        }
-        let raft_group_id = self.placement.raft_group_id;
-        let initialized = self
+    /// Fails a start once its Raft runs, for tests: the state-machine
+    /// worker runs an external function that waits for `fault.release`
+    /// first, so the failed engine's work outlives its start.
+    #[cfg(test)]
+    pub(crate) async fn fail_start(&self, fault: &StartupFault) -> GroupEngineError {
+        let release = Arc::clone(&fault.release);
+        if let Err(error) = self
             .raft
-            .is_initialized()
+            .external_state_machine_request(move |_state_machine| {
+                Box::pin(async move { release.notified().await })
+            })
             .await
-            .map_err(crate::owner::owner_stopped)?;
-        if !initialized {
-            self.raft
-                .initialize(BTreeSet::from([node_id]))
-                .await
-                .map_err(|err| openraft_error::initialize_error(raft_group_id, err))?;
+        {
+            return crate::owner::owner_stopped(error);
         }
-        let timeout = Duration::from_secs(2);
-        self.raft
-            .wait(Some(timeout))
-            .current_leader(node_id, "single-node OpenRaft group should elect itself")
-            .await
-            .map_err(|err| openraft_error::leader_wait_error(raft_group_id, timeout, err))?;
-        Ok(())
+        GroupEngineError::Infra(ursula_runtime::GroupInfraError::LeaderWaitTimedOut {
+            group: RaftTarget::Data(self.placement.raft_group_id),
+            timeout_ms: 0,
+        })
     }
 
     #[cfg(any(test, madsim))]
@@ -805,8 +632,6 @@ impl RaftGroupEngine {
             #[cfg(test)]
             work_stop_timeout,
             engine_work,
-            #[cfg(test)]
-                startup_fault: _,
         } = options;
         #[cfg(test)]
         let work_stop_timeout =

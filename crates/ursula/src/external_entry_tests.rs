@@ -113,11 +113,12 @@ fn durable_runtime_with_cold_store(
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         config,
-        ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
+        ursula_raft::PlacedRaftGroupEngineFactory::single_node(
             raft_wal.clone(),
-            Some(cold_store.clone()),
+            registry.clone(),
+            1,
         )
-        .with_registry(registry.clone()),
+        .with_cold_store(Some(cold_store.clone())),
         Some(cold_store),
     )
     .expect("runtime");

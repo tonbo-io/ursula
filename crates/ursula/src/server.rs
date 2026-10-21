@@ -650,7 +650,7 @@ mod tests {
         config.raft.group_count = 1;
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
-        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
         let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
         assert!(matches!(wal_dir, super::RaftWalDir::Configured(_)));
@@ -725,7 +725,7 @@ mod tests {
         config.raft.group_count = 1;
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
-        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
         let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
         let persistence = crate::Persistence::Raft {
@@ -863,7 +863,7 @@ mod tests {
         config.raft.group_count = 1;
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
-        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
         let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
         let state = super::init_state(&config, crate::Persistence::Raft {
@@ -988,7 +988,7 @@ mod tests {
         config.raft.group_count = 1;
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
-        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
         let log_dir = super::RaftWalDir::resolve(&config.raft.wal)
             .unwrap()

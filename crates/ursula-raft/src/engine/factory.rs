@@ -121,177 +121,10 @@ impl From<&ursula_config::RaftConfig> for RaftEngineConfig {
     }
 }
 
-/// The Raft node id of every single-node group.
-const SINGLE_NODE_ID: u64 = 1;
-
-/// Single-node groups over the per-core journals of `log_stores`.
-#[derive(Debug, Clone)]
-pub struct DurableRaftGroupEngineFactory {
-    #[cfg(test)]
-    pub(crate) fail_apply_at: Option<(ursula_shard::RaftGroupId, u64)>,
-    log_stores: RaftWal,
-    cold_store: Option<ColdStoreHandle>,
-    registry: Option<RaftGroupHandleRegistry>,
-    /// The node's snapshot settings, which a server sets
-    /// ([`Self::with_engine_config`]). Without them each group keeps
-    /// OpenRaft's default config, as the tests, benchmarks and probes that
-    /// build this factory without a snapshot driver expect.
-    engine_config: Option<RaftEngineConfig>,
-    /// How long an engine's shutdown waits for OpenRaft's work, for tests.
-    #[cfg(test)]
-    pub(crate) work_stop_timeout: Option<Duration>,
-}
-
-impl DurableRaftGroupEngineFactory {
-    pub fn new(log_stores: RaftWal) -> Self {
-        Self::with_cold_store(log_stores, None)
-    }
-
-    pub fn with_cold_store(log_stores: RaftWal, cold_store: Option<ColdStoreHandle>) -> Self {
-        Self {
-            #[cfg(test)]
-            fail_apply_at: None,
-            log_stores,
-            cold_store,
-            registry: None,
-            engine_config: None,
-            #[cfg(test)]
-            work_stop_timeout: None,
-        }
-    }
-
-    /// Publishes each live group's barrier, Raft handle and cold cache, or its
-    /// terminal replay-failure diagnostics when committed application stops.
-    ///
-    /// It binds no peer identity: the server binds the node's
-    /// ([`crate::PeerCluster::bind`]) before the runtime starts, and a bind
-    /// here would replace it.
-    pub fn with_registry(mut self, registry: RaftGroupHandleRegistry) -> Self {
-        if let Some(config) = &self.engine_config {
-            registry.set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
-        }
-        self.registry = Some(registry);
-        self
-    }
-
-    pub fn registry(&self) -> Option<&RaftGroupHandleRegistry> {
-        self.registry.as_ref()
-    }
-
-    /// Runs every group with the node's snapshot settings, as a static
-    /// cluster's groups run (#669): `config.max_in_snapshot_log_to_keep`
-    /// entries below a snapshot, and no snapshot policy of OpenRaft's own
-    /// (`SnapshotPolicy::Never`), since the snapshot driver alone takes
-    /// every snapshot (F12e). With a registry
-    /// ([`Self::with_registry`], before or after this) every group shares
-    /// its build and install coordinators, whose gauges the driver, the
-    /// metrics and admission read, and the build coordinator gets
-    /// `config.snapshot_build_max_concurrency` permits.
-    pub fn with_engine_config(mut self, config: RaftEngineConfig) -> Self {
-        if let Some(registry) = &self.registry {
-            registry.set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
-        }
-        self.engine_config = Some(config);
-        self
-    }
-
-    /// The OpenRaft config of one group: the single node's timeouts, with
-    /// the node's snapshot settings when it has them.
-    fn raft_config(&self, placement: ShardPlacement) -> Config {
-        let mut config = Config {
-            cluster_name: format!("ursula-group-{}", placement.raft_group_id.0),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        };
-        if let Some(engine) = &self.engine_config {
-            config.max_in_snapshot_log_to_keep = engine.max_in_snapshot_log_to_keep;
-            config.snapshot_policy = SnapshotPolicy::Never;
-        }
-        config
-    }
-}
-
-impl GroupEngineFactory for DurableRaftGroupEngineFactory {
-    fn create<'a>(
-        &'a self,
-        placement: ShardPlacement,
-        metrics: GroupEngineMetrics,
-    ) -> GroupEngineCreateFuture<'a> {
-        Box::pin(async move {
-            let config = Arc::new(crate::openraft_error::validated_config(
-                self.raft_config(placement),
-            )?);
-            let log_store = self
-                .log_stores
-                .open_waiting(placement, Admission::Create, metrics.clone())
-                .await
-                .map_err(|source| super::wal_error::group_open_error(placement, source))?;
-            let apply_stop_signal = log_store.apply_stop_signal();
-            let snapshot_record = log_store.snapshot_record();
-            let health = crate::apply_failure::ApplyHealth::default();
-            let engine =
-                RaftGroupEngine::new_single_node_observed(
-                    placement,
-                    SINGLE_NODE_ID,
-                    config,
-                    log_store,
-                    RaftGroupEngineOptions {
-                        apply_stop_signal: Some(apply_stop_signal),
-                        #[cfg(test)]
-                        apply_fault: self
-                            .fail_apply_at
-                            .filter(|(group, _)| *group == placement.raft_group_id)
-                            .map(|(_, index)| {
-                                crate::apply_failure::ApplyFault::PanicAfterMutation { index }
-                            }),
-                        metrics: Some(metrics),
-                        cold_store: self.cold_store.clone(),
-                        snapshot_record: Some(snapshot_record),
-                        fence: Some(self.log_stores.fence()),
-                        snapshot_build: self
-                            .registry
-                            .as_ref()
-                            .filter(|_| self.engine_config.is_some())
-                            .map(RaftGroupHandleRegistry::snapshot_build_coordinator),
-                        snapshot_install: self
-                            .registry
-                            .as_ref()
-                            .filter(|_| self.engine_config.is_some())
-                            .map(RaftGroupHandleRegistry::snapshot_install_coordinator),
-                        #[cfg(test)]
-                        work_stop_timeout: self.work_stop_timeout,
-                        engine_work: Some(self.log_stores.engine_work_ledger()),
-                        ..Default::default()
-                    },
-                    health.clone(),
-                )
-                .await
-                .inspect_err(|_error| {
-                    if let Some(stopped) = health.stopped()
-                        && let Some(registry) = &self.registry
-                    {
-                        registry.register_apply_stopped(
-                            placement.raft_group_id,
-                            SINGLE_NODE_ID,
-                            stopped,
-                        );
-                    }
-                })?;
-            if let Some(registry) = &self.registry {
-                registry.register_engine(&engine);
-            }
-            let engine: Box<dyn GroupEngine> = Box::new(engine);
-            Ok(engine)
-        })
-    }
-}
-
-/// The data groups of a cluster node: their Raft logs live in the per-core
-/// journals of a [`RaftWal`], they talk gRPC, every replica opens behind its
-/// recovery gate, and every input placement decides comes from one
-/// [`PlacementInputs`].
+/// The data groups of a node, a single node included: their Raft logs live
+/// in the per-core journals of a [`RaftWal`], they talk gRPC, every replica
+/// opens behind its recovery gate, and every input placement decides comes
+/// from one [`PlacementInputs`].
 #[derive(Clone)]
 pub struct PlacedRaftGroupEngineFactory {
     transports: Arc<Mutex<BTreeMap<u16, Arc<crate::grpc::CoreRaftTransport>>>>,
@@ -303,6 +136,12 @@ pub struct PlacedRaftGroupEngineFactory {
     /// Faulty code that every replica of one group runs, for tests.
     #[cfg(any(test, madsim, feature = "fault-injection"))]
     apply_fault: Option<(RaftGroupId, crate::apply_failure::ApplyFault)>,
+    /// How long an engine's shutdown waits for OpenRaft's work, for tests.
+    #[cfg(test)]
+    pub(crate) work_stop_timeout: Option<Duration>,
+    /// A failure injected into every start once its Raft runs, for tests.
+    #[cfg(test)]
+    pub(crate) startup_fault: Option<super::StartupFault>,
 }
 
 impl std::fmt::Debug for PlacedRaftGroupEngineFactory {
@@ -337,7 +176,38 @@ impl PlacedRaftGroupEngineFactory {
             engine_config: RaftEngineConfig::default(),
             #[cfg(any(test, madsim, feature = "fault-injection"))]
             apply_fault: None,
+            #[cfg(test)]
+            work_stop_timeout: None,
+            #[cfg(test)]
+            startup_fault: None,
         }
+    }
+
+    /// The groups of a single node `node` over `log_stores`, each with `node`
+    /// as its only voter and initializer ([`FixedPlacement::single`]). It
+    /// binds `registry`'s peer cluster first, as a server binds its node
+    /// before its runtime starts: `node` of the WAL's cluster, behind the
+    /// WAL's fence, with an address book of itself.
+    ///
+    /// [`FixedPlacement::single`]: crate::FixedPlacement::single
+    #[cfg(any(test, madsim, feature = "test-support"))]
+    pub fn single_node(log_stores: RaftWal, registry: RaftGroupHandleRegistry, node: u64) -> Self {
+        registry.peer_cluster().bind(
+            crate::PeerIdentity::fenced_by(
+                node,
+                log_stores.cluster_id().clone(),
+                log_stores.fence(),
+            ),
+            crate::PeerDirectory::new([(
+                node,
+                crate::PeerEndpoints::shared(format!("http://node-{node}")),
+            )]),
+        );
+        Self::new(
+            log_stores,
+            registry,
+            Arc::new(crate::FixedPlacement::single(node)),
+        )
     }
 
     /// Run faulty code for `group`, as a deployment of a buggy binary does.
@@ -401,151 +271,216 @@ impl GroupEngineFactory for PlacedRaftGroupEngineFactory {
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
-            let group = placement.raft_group_id;
-            let identity = self
-                .registry
-                .peer_cluster()
-                .identity()
-                .ok_or_else(|| invalid_configuration(placement))?;
-            let node_id = identity.node_id();
-            let peers = self.registry.peer_cluster().directory();
-            // A group the node does not host, or whose voters it cannot
-            // dial, never opens, and a replica is created only with
-            // voters. A held replica opens without placed voters: it then
-            // asks only the members of its own membership.
-            let admission = self
-                .inputs
-                .admission(group)
-                .ok_or_else(|| invalid_configuration(placement))?;
-            let voters = self.inputs.nodes(group).voters();
-            if !peers.contains(node_id)
-                || (admission == Admission::Create && voters.is_empty())
-                || !voters.iter().all(|voter| peers.contains(*voter))
-            {
-                return Err(invalid_configuration(placement));
-            }
-            // The log store and the recovery gate go first: a gated replica's
-            // Raft core starts with elections disabled.
-            let store = self
-                .log_stores
-                .open_waiting(placement, admission, metrics.clone())
-                .await
-                .map_err(|source| super::wal_error::group_open_error(placement, source))?;
-            let rejoin = Arc::new(
-                GroupRejoin::durable(
-                    node_id,
-                    ursula_shard::RaftTarget::Data(placement.raft_group_id),
-                    &store,
-                )
-                .await
-                .map_err(|source| super::wal_error::gate_open_error(placement, source))?,
-            );
-            let raft_config = cluster_raft_config(
-                format!("ursula-group-{}", placement.raft_group_id.0),
-                &self.engine_config,
-                self.registry.election_policy().may_campaign(Some(&rejoin)),
-            );
-            let config = Arc::new(crate::openraft_error::validated_config(raft_config)?);
-            let transport = self
-                .transports
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .entry(placement.core_id.0)
-                .or_insert_with(|| {
-                    Arc::new(crate::grpc::CoreRaftTransport::with_budget(
-                        self.registry.append_send_budget.clone(),
-                        identity,
-                        self.registry.peer_cluster().clone(),
-                    ))
-                })
-                .clone();
-            let network = GrpcRaftNetworkFactory::new(
-                transport.clone(),
-                crate::RaftTarget::Data(placement.raft_group_id),
-            )
-            .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures);
-            let apply_stop_signal = store.apply_stop_signal();
-            let snapshot_record = store.snapshot_record();
-            let health = crate::apply_failure::ApplyHealth::default();
-            let engine = RaftGroupEngine::new_node_observed(
-                placement,
-                node_id,
-                config,
-                network,
-                store,
-                RaftGroupEngineOptions {
-                    apply_stop_signal: Some(apply_stop_signal),
-                    metrics: Some(metrics),
-                    cold_store: self.cold_store.clone(),
-                    snapshot_store: Some(self.registry.snapshot_store()),
-                    snapshot_build: Some(self.registry.snapshot_build_coordinator()),
-                    snapshot_install: Some(self.registry.snapshot_install_coordinator()),
-                    #[cfg(any(test, madsim, feature = "fault-injection"))]
-                    apply_fault: self
-                        .apply_fault
-                        .filter(|(group, _)| *group == placement.raft_group_id)
-                        .map(|(_, fault)| fault),
-                    snapshot_record: Some(snapshot_record),
-                    recovery: Some(rejoin.clone()),
-                    peer_cluster: Some(self.registry.peer_cluster().clone()),
-                    fence: Some(self.log_stores.fence()),
-                    #[cfg(test)]
-                    work_stop_timeout: None,
-                    engine_work: Some(self.log_stores.engine_work_ledger()),
-                    #[cfg(test)]
-                    startup_fault: None,
-                },
-                health.clone(),
-            )
-            .await
-            .inspect_err(|_error| {
-                if let Some(stopped) = health.stopped() {
-                    self.registry
-                        .register_apply_stopped(placement.raft_group_id, node_id, stopped);
-                }
-            })?;
-            let attached = engine.recovery_tasks.attach(
-                &engine,
-                rejoin,
-                &self.registry,
-                &*self.inputs,
-                crate::recovery_transport::GrpcRecoveryTransport {
-                    transport,
-                    target: crate::RaftTarget::Data(placement.raft_group_id),
-                    timeout: self.engine_config.bootstrap_peer_connect,
-                },
-                crate::rejoin::RecoveryConfig {
-                    interval: REJOIN_HEAL_INTERVAL,
-                    barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
-                    stall_after: RECOVERY_STALL_AFTER,
-                    bootstrap_interval: self.engine_config.bootstrap_peer_probe_interval,
-                    bootstrap_warn_after: self.engine_config.bootstrap_peer_probe,
-                },
-            );
-            if let Err(err) = attached {
-                // The engine never serves. Dropping it stops it as any engine
-                // stops, so its snapshot publication closes before the group
-                // can reopen (#489), in a task the WAL's ledger keeps: the
-                // core loop does not wait, and the group stays closed until
-                // the engine's work ended (#709).
-                drop(engine);
-                return Err(err);
-            }
-            let engine: Box<dyn GroupEngine> = Box::new(engine);
+            let engine: Box<dyn GroupEngine> = Box::new(self.open(placement, metrics).await?);
             Ok(engine)
         })
     }
 }
 
+impl PlacedRaftGroupEngineFactory {
+    /// Opens this node's replica of `placement`'s group: its log store with
+    /// the placement's admission, then the replica on it ([`Self::start`]).
+    pub async fn open(
+        &self,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<RaftGroupEngine, GroupEngineError> {
+        let (identity, admission) = self.placed(placement)?;
+        let store = self
+            .log_stores
+            .open_waiting(placement, admission, metrics.clone())
+            .await
+            .map_err(|source| super::wal_error::group_open_error(placement, source))?;
+        self.start(placement, identity, store, metrics).await
+    }
+
+    /// Starts this node's replica of `placement`'s group on `store`, a log
+    /// store the caller opened from this factory's WAL, as [`Self::open`]
+    /// starts one on the store it opens. For a simulation that keeps the
+    /// stores it hands out.
+    #[cfg(any(test, madsim, feature = "test-support"))]
+    pub async fn start_on(
+        &self,
+        placement: ShardPlacement,
+        store: Arc<crate::RaftGroupFileLogStore>,
+        metrics: GroupEngineMetrics,
+    ) -> Result<RaftGroupEngine, GroupEngineError> {
+        let (identity, _admission) = self.placed(placement)?;
+        self.start(placement, identity, store, metrics).await
+    }
+
+    /// The identity this node runs `placement`'s group as and how its store
+    /// may open. A group the node does not host, or whose voters it cannot
+    /// dial, never opens.
+    fn placed(
+        &self,
+        placement: ShardPlacement,
+    ) -> Result<(crate::PeerIdentity, Admission), GroupEngineError> {
+        let group = placement.raft_group_id;
+        let identity = self
+            .registry
+            .peer_cluster()
+            .identity()
+            .ok_or_else(|| invalid_configuration(placement))?;
+        let node_id = identity.node_id();
+        let peers = self.registry.peer_cluster().directory();
+        // A group the node does not host, or whose voters it cannot dial,
+        // never opens, and a replica is created only with voters. A held
+        // replica opens without placed voters: it then asks only the members
+        // of its own membership.
+        let admission = self
+            .inputs
+            .admission(group)
+            .ok_or_else(|| invalid_configuration(placement))?;
+        let voters = self.inputs.nodes(group).voters();
+        if !peers.contains(node_id)
+            || (admission == Admission::Create && voters.is_empty())
+            || !voters.iter().all(|voter| peers.contains(*voter))
+        {
+            return Err(invalid_configuration(placement));
+        }
+        Ok((identity, admission))
+    }
+
+    /// Starts the replica on `store`: its recovery gate, its Raft and its
+    /// recovery drivers, and, for a group's only voter, its first
+    /// leadership.
+    async fn start(
+        &self,
+        placement: ShardPlacement,
+        identity: crate::PeerIdentity,
+        store: Arc<crate::RaftGroupFileLogStore>,
+        metrics: GroupEngineMetrics,
+    ) -> Result<RaftGroupEngine, GroupEngineError> {
+        let group = placement.raft_group_id;
+        let node_id = identity.node_id();
+        // The recovery gate goes first: a gated replica's Raft core starts
+        // with elections disabled.
+        let rejoin = Arc::new(
+            GroupRejoin::durable(node_id, ursula_shard::RaftTarget::Data(group), &store)
+                .await
+                .map_err(|source| super::wal_error::gate_open_error(placement, source))?,
+        );
+        let raft_config = cluster_raft_config(
+            format!("ursula-group-{}", group.0),
+            &self.engine_config,
+            self.registry.election_policy().may_campaign(Some(&rejoin)),
+        );
+        let config = Arc::new(crate::openraft_error::validated_config(raft_config)?);
+        let sole_voter_wait = Duration::from_millis(config.election_timeout_min);
+        let transport = self
+            .transports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(placement.core_id.0)
+            .or_insert_with(|| {
+                Arc::new(crate::grpc::CoreRaftTransport::with_budget(
+                    self.registry.append_send_budget.clone(),
+                    identity,
+                    self.registry.peer_cluster().clone(),
+                ))
+            })
+            .clone();
+        let network =
+            GrpcRaftNetworkFactory::new(transport.clone(), crate::RaftTarget::Data(group))
+                .with_reconnect_threshold(self.engine_config.grpc_reconnect_after_failures);
+        let apply_stop_signal = store.apply_stop_signal();
+        let snapshot_record = store.snapshot_record();
+        let health = crate::apply_failure::ApplyHealth::default();
+        let engine = RaftGroupEngine::new_node_observed(
+            placement,
+            node_id,
+            config,
+            network,
+            store,
+            RaftGroupEngineOptions {
+                apply_stop_signal: Some(apply_stop_signal),
+                metrics: Some(metrics),
+                cold_store: self.cold_store.clone(),
+                snapshot_store: Some(self.registry.snapshot_store()),
+                snapshot_build: Some(self.registry.snapshot_build_coordinator()),
+                snapshot_install: Some(self.registry.snapshot_install_coordinator()),
+                #[cfg(any(test, madsim, feature = "fault-injection"))]
+                apply_fault: self
+                    .apply_fault
+                    .filter(|(faulty, _)| *faulty == group)
+                    .map(|(_, fault)| fault),
+                snapshot_record: Some(snapshot_record),
+                recovery: Some(rejoin.clone()),
+                peer_cluster: Some(self.registry.peer_cluster().clone()),
+                fence: Some(self.log_stores.fence()),
+                #[cfg(test)]
+                work_stop_timeout: self.work_stop_timeout,
+                engine_work: Some(self.log_stores.engine_work_ledger()),
+            },
+            health.clone(),
+        )
+        .await
+        .inspect_err(|_error| {
+            if let Some(stopped) = health.stopped() {
+                self.registry
+                    .register_apply_stopped(group, node_id, stopped);
+            }
+        })?;
+        #[cfg(test)]
+        if let Some(fault) = &self.startup_fault {
+            // The engine never serves. Dropping it stops it as any engine
+            // stops (#709), as below.
+            let error = engine.fail_start(fault).await;
+            drop(engine);
+            return Err(error);
+        }
+        let attached = engine.recovery_tasks.attach(
+            &engine,
+            rejoin,
+            &self.registry,
+            &*self.inputs,
+            crate::recovery_transport::GrpcRecoveryTransport {
+                transport,
+                target: crate::RaftTarget::Data(group),
+                timeout: self.engine_config.bootstrap_peer_connect,
+            },
+            crate::rejoin::RecoveryConfig {
+                interval: REJOIN_HEAL_INTERVAL,
+                barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
+                stall_after: RECOVERY_STALL_AFTER,
+                bootstrap_interval: self.engine_config.bootstrap_peer_probe_interval,
+                bootstrap_warn_after: self.engine_config.bootstrap_peer_probe,
+            },
+        );
+        if let Err(err) = attached {
+            // The engine never serves. Dropping it stops it as any engine
+            // stops, so its snapshot publication closes before the group
+            // can reopen (#489), in a task the WAL's ledger keeps: the
+            // core loop does not wait, and the group stays closed until
+            // the engine's work ended (#709).
+            drop(engine);
+            return Err(err);
+        }
+        // A replica its placement makes the group's only voter needs no
+        // other node to lead: it leads as soon as its gate lets it campaign,
+        // a fresh group once its bootstrap driver initialized it. Its open
+        // waits for that, so a group opened by a request does not refuse
+        // that request for want of a leader. A gate that waits for a
+        // recovery plan keeps it from leading, and the open returns at the
+        // bound with the replica waiting.
+        if self.inputs.nodes(group).voters() == std::collections::BTreeSet::from([node_id])
+            && engine
+                .wait_for_current_leader(node_id, sole_voter_wait)
+                .await
+                .is_err()
+        {
+            tracing::info!(
+                raft_group_id = group.0,
+                "the group's only voter opened without leading it; its recovery gate decides when it leads"
+            );
+        }
+        Ok(engine)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    #[cfg(not(madsim))]
-    use ursula_config::WalFsync;
-    #[cfg(not(madsim))]
-    use ursula_shard::CoreId;
-    #[cfg(not(madsim))]
-    use ursula_shard::ShardId;
-
     use super::*;
 
     #[test]
@@ -590,56 +525,5 @@ mod tests {
             RaftEngineConfig::default().snapshot_build_max_concurrency,
             1
         );
-    }
-
-    /// #669: a single node's groups take the node's snapshot settings once
-    /// a server sets them: no snapshot policy of OpenRaft's own, the
-    /// configured entries kept below a snapshot, and the registry's build
-    /// coordinator with the configured permits. Without them they keep
-    /// OpenRaft's default config, as the tests, benchmarks and probes that
-    /// build this factory expect.
-    #[cfg(not(madsim))]
-    #[test]
-    fn a_single_node_factory_takes_the_node_snapshot_settings() {
-        let wal_root = tempfile::tempdir().expect("WAL root");
-        let wal = RaftWal::start(
-            wal_root.path(),
-            WalFsync::Never,
-            &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
-        )
-        .expect("start the WAL");
-        let placement = ShardPlacement {
-            core_id: CoreId(0),
-            shard_id: ShardId(0),
-            raft_group_id: RaftGroupId(0),
-        };
-        let openraft = Config::default();
-        let plain = DurableRaftGroupEngineFactory::new(wal.clone()).raft_config(placement);
-        assert_eq!(
-            plain.max_in_snapshot_log_to_keep,
-            openraft.max_in_snapshot_log_to_keep
-        );
-        assert_eq!(plain.snapshot_policy, openraft.snapshot_policy);
-
-        let registry = RaftGroupHandleRegistry::default();
-        let driven = DurableRaftGroupEngineFactory::new(wal.clone())
-            .with_registry(registry.clone())
-            .with_engine_config(RaftEngineConfig {
-                snapshot_build_max_concurrency: 3,
-                ..RaftEngineConfig::default()
-            });
-        let config = driven.raft_config(placement);
-        assert_eq!(config.max_in_snapshot_log_to_keep, 64);
-        assert_eq!(config.snapshot_policy, SnapshotPolicy::Never);
-        assert_eq!(registry.snapshot_build_coordinator().max_concurrency(), 3);
-        // The order of the two calls does not matter.
-        let registry = RaftGroupHandleRegistry::default();
-        let _config_first = DurableRaftGroupEngineFactory::new(wal)
-            .with_engine_config(RaftEngineConfig {
-                snapshot_build_max_concurrency: 4,
-                ..RaftEngineConfig::default()
-            })
-            .with_registry(registry.clone());
-        assert_eq!(registry.snapshot_build_coordinator().max_concurrency(), 4);
     }
 }

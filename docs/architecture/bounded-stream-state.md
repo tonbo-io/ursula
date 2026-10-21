@@ -229,7 +229,7 @@ Each defect class is pinned by tests that drive the production entry points.
 `crates/ursula-state-probe` (`publish = false`) measures bounded state with a counting global allocator (requested bytes, live blocks, and every live allocation of 64 KiB or more) and sizes group snapshots with the production codec (`ursula_raft::group_snapshot_frames`).
 
 - **L1** drivers run the real `StreamStateMachine` with the commands the runtime issues.
-- **L2** drivers run the real `ShardRuntime` on the in-memory and the single-node OpenRaft engines, plus a shared `CompactCold` probe (`l2_compact`).
+- **L2** drivers run the real `ShardRuntime` on the in-memory engine and a single node's OpenRaft groups, plus a shared `CompactCold` probe (`l2_compact`).
 - **W1**: one JSON stream of 200 B inline appends with cold flushes (`w1` with a forced flush before each checkpoint, `w1_hot` without).
 - **W2**: slow streams sharing packed flushes, including the reduced starvation reproduction (`w2_starve`) and the F2 driver (`w2_driver`).
 - **W3**: external-only streams with 1 or 5,000 records per append.

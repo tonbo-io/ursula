@@ -100,6 +100,14 @@ use ursula_stream::StreamCommand;
 
 use super::*;
 use crate::codec::*;
+#[cfg(not(madsim))]
+use crate::engine::test_support::open_single_voter;
+#[cfg(not(madsim))]
+use crate::engine::test_support::single_node_factory;
+#[cfg(not(madsim))]
+use crate::engine::test_support::single_voter;
+#[cfg(not(madsim))]
+use crate::engine::test_support::start_single_voter_on;
 use crate::engine::*;
 use crate::forward::write_result_from_raft_response;
 use crate::log_store::*;
@@ -195,9 +203,35 @@ fn fresh_journal_store() -> (tempfile::TempDir, Arc<RaftGroupFileLogStore>) {
     (root, store)
 }
 
+/// A fresh WAL in a new temporary directory, which the caller keeps while
+/// the WAL is in use.
+#[cfg(not(madsim))]
+fn fresh_wal() -> (tempfile::TempDir, RaftWal) {
+    let root = tempfile::tempdir().expect("WAL root");
+    let wal = RaftWal::start(
+        root.path(),
+        WalFsync::Never,
+        &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+    )
+    .expect("start the Raft WAL");
+    (root, wal)
+}
+
 /// `placement()`'s log store on a fresh WAL on the simulated disk.
 #[cfg(madsim)]
 fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
+    sim_wal(name)
+        .open(
+            placement(),
+            ursula_control::Admission::Create,
+            ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
+        )
+        .expect("open the log store")
+}
+
+/// A fresh WAL on the simulated disk.
+#[cfg(madsim)]
+fn sim_wal(name: &str) -> RaftWal {
     let root = SimDisk::provision_dir(name).expect("provision a simulated WAL");
     RaftWal::start(
         root,
@@ -205,12 +239,6 @@ fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
     .expect("start the Raft WAL")
-    .open(
-        placement(),
-        ursula_control::Admission::Create,
-        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-    )
-    .expect("open the log store")
 }
 
 /// The frames of core 0's journal under the WAL `root`, all segments.
@@ -355,10 +383,9 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
     let wal = start_wal(wal_root.path(), 1, 1);
-    crate::peer_cluster::bind_single_node(&registry, &wal);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(wal, registry.clone(), 1),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
@@ -443,10 +470,9 @@ async fn group_rpcs_check_their_target_before_the_group() {
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
     let wal = start_wal(wal_root.path(), 1, 1);
-    crate::peer_cluster::bind_single_node(&registry, &wal);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(wal, registry.clone(), 1),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
@@ -558,10 +584,9 @@ async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() 
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
     let wal = start_wal(wal_root.path(), 1, 1);
-    crate::peer_cluster::bind_single_node(&registry, &wal);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(wal, registry.clone(), 1),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
@@ -3137,10 +3162,8 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
-    let (_wal_root, log_store) = fresh_journal_store();
-    let mut engine = RaftGroupEngine::new_single_node_on_log_store(placement(), log_store, None)
-        .await
-        .expect("create raft group engine");
+    let (_wal_root, wal) = fresh_wal();
+    let mut engine = single_voter(&wal, placement()).await;
     let stream_id = bsid("raft-group-engine");
 
     let created = engine
@@ -3194,10 +3217,8 @@ async fn raft_group_engine_implements_runtime_group_engine_over_openraft() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn raft_group_engine_preserves_stream_error_next_offset() {
-    let (_wal_root, log_store) = fresh_journal_store();
-    let mut engine = RaftGroupEngine::new_single_node_on_log_store(placement(), log_store, None)
-        .await
-        .expect("create raft group engine");
+    let (_wal_root, wal) = fresh_wal();
+    let mut engine = single_voter(&wal, placement()).await;
     let stream_id = bsid("raft-stream-error-offset");
 
     engine
@@ -3248,17 +3269,9 @@ async fn raft_group_engine_preserves_stream_error_next_offset() {
 async fn raft_group_engine_recovers_client_writes_from_file_log() {
     let root = tempfile::tempdir().expect("journal root");
     let stream_id = bsid("raft-engine-recover");
-    let single_node_config = || raft_config("ursula-group-0", 30, 60);
 
     {
-        let mut engine = RaftGroupEngine::new_single_node_with_log_store(
-            placement(),
-            1,
-            single_node_config(),
-            open_core_journal_store(root.path()).expect("open durable log store"),
-        )
-        .await
-        .expect("create durable raft group engine");
+        let mut engine = single_voter(&start_wal(root.path(), 1, 1), placement()).await;
         engine
             .create_stream(
                 CreateStreamRequest::new(stream_id.clone(), "application/octet-stream"),
@@ -3278,14 +3291,7 @@ async fn raft_group_engine_recovers_client_writes_from_file_log() {
         engine.shutdown().await.expect("shutdown first engine");
     }
 
-    let mut recovered = RaftGroupEngine::new_single_node_with_log_store(
-        placement(),
-        1,
-        single_node_config(),
-        open_core_journal_store(root.path()).expect("reopen durable log store"),
-    )
-    .await
-    .expect("reopen durable raft group engine");
+    let mut recovered = single_voter(&start_wal(root.path(), 1, 1), placement()).await;
     let read = recovered
         .read_stream(read_req(stream_id, 16), placement())
         .await
@@ -3319,17 +3325,9 @@ async fn wait_history(engine: &RaftGroupEngine) -> ursula_runtime::HistoryEvent 
 #[tokio::test]
 async fn a_new_group_starts_with_one_genesis_history_event() {
     let root = tempfile::tempdir().expect("journal root");
-    let single_node_config = || raft_config("ursula-group-0", 30, 60);
     let stream_id = bsid("genesis");
     let genesis = {
-        let mut engine = RaftGroupEngine::new_single_node_with_log_store(
-            placement(),
-            1,
-            single_node_config(),
-            open_core_journal_store(root.path()).expect("open durable log store"),
-        )
-        .await
-        .expect("create durable raft group engine");
+        let mut engine = single_voter(&start_wal(root.path(), 1, 1), placement()).await;
         // A create racing the genesis waits for it: its token is never
         // derived from a group without a history.
         engine
@@ -3365,14 +3363,7 @@ async fn a_new_group_starts_with_one_genesis_history_event() {
         engine.shutdown().await.expect("shutdown first engine");
         genesis
     };
-    let recovered = RaftGroupEngine::new_single_node_with_log_store(
-        placement(),
-        1,
-        single_node_config(),
-        open_core_journal_store(root.path()).expect("reopen durable log store"),
-    )
-    .await
-    .expect("reopen durable raft group engine");
+    let recovered = single_voter(&start_wal(root.path(), 1, 1), placement()).await;
     // The leader applied its blank: an earlier genesis is in its state, so
     // it proposes none.
     recovered
@@ -3403,10 +3394,8 @@ async fn a_new_group_starts_with_one_genesis_history_event() {
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn a_leader_with_an_unsatisfied_plan_serves_nothing() {
-    let (_root, log_store) = fresh_journal_store();
-    let mut engine = RaftGroupEngine::new_single_node_on_log_store(placement(), log_store, None)
-        .await
-        .expect("single-node engine");
+    let (_root, wal) = fresh_wal();
+    let mut engine = single_voter(&wal, placement()).await;
     wait_history(&engine).await;
     let stream_id = bsid("fenced");
     engine
@@ -3504,7 +3493,7 @@ async fn shard_runtime_restarts_one_group_engine_from_its_log_store() {
     let wal_root = tempfile::tempdir().expect("WAL root");
     let runtime = ShardRuntime::spawn_with_engine_factory(
         hosted_config(1, 1),
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1)),
+        single_node_factory(&start_wal(wal_root.path(), 1, 1)),
     )
     .expect("spawn runtime with raft group engine factory");
     let stream_id = bsid("restarted-group");
@@ -3569,7 +3558,7 @@ async fn a_single_node_engine_leads_nothing_once_its_wal_fence_closes() {
     // registration. No meta runs here, so settle it as a forming
     // cluster's answer does.
     wal.fence().bind(false);
-    let factory = DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone());
+    let factory = PlacedRaftGroupEngineFactory::single_node(wal.clone(), registry.clone(), 1);
     let runtime = ShardRuntime::spawn_with_engine_factory(hosted_config(1, 1), factory)
         .expect("spawn runtime with raft group engine factory");
     let stream_id = bsid("fenced-single-node");
@@ -3601,8 +3590,7 @@ async fn a_restart_keeps_the_group_closed_while_its_old_work_runs() {
     let wal_root = tempfile::tempdir().expect("WAL root");
     let registry = RaftGroupHandleRegistry::default();
     let wal = start_wal(wal_root.path(), 1, 1);
-    let mut factory =
-        DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone());
+    let mut factory = PlacedRaftGroupEngineFactory::single_node(wal.clone(), registry.clone(), 1);
     factory.work_stop_timeout = Some(Duration::from_millis(200));
     let runtime = ShardRuntime::spawn_with_engine_factory(hosted_config(1, 1), factory)
         .expect("spawn runtime with raft group engine factory");
@@ -3675,8 +3663,8 @@ async fn a_restart_keeps_the_group_closed_while_its_old_work_runs() {
     assert_eq!(read.payload, b"kept");
 }
 
-/// A single-node engine whose start fails once its Raft runs keeps its
-/// group closed until its work ended (#709): the WAL refuses to open the
+/// An engine whose start fails once its Raft runs keeps its group closed
+/// until its work ended (#709): the WAL refuses to open the
 /// group while the failed engine's worker still runs, and opens it once the
 /// stopping task the WAL keeps finished.
 #[cfg(not(madsim))]
@@ -3686,25 +3674,11 @@ async fn a_start_that_fails_after_its_raft_runs_keeps_the_group_closed() {
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
     let release = Arc::new(crate::rt::sync::Notify::new());
-    let store = wal
-        .open(placement(), ursula_control::Admission::Create, metrics())
-        .unwrap();
-    let record = store.snapshot_record();
-    let started = RaftGroupEngine::new_single_node(
-        placement(),
-        1,
-        raft_config("failed-start", 30, 60),
-        store,
-        RaftGroupEngineOptions {
-            snapshot_record: Some(record),
-            engine_work: Some(wal.engine_work_ledger()),
-            startup_fault: Some(StartupFault {
-                release: Arc::clone(&release),
-            }),
-            ..Default::default()
-        },
-    )
-    .await;
+    let mut factory = single_node_factory(&wal);
+    factory.startup_fault = Some(StartupFault {
+        release: Arc::clone(&release),
+    });
+    let started = factory.open(placement(), metrics()).await;
     assert!(matches!(
         started,
         Err(GroupEngineError::Infra(
@@ -3737,23 +3711,7 @@ async fn an_engine_dropped_before_its_shutdown_stops_in_the_background() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let metrics = || ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics();
-    let store = wal
-        .open(placement(), ursula_control::Admission::Create, metrics())
-        .unwrap();
-    let record = store.snapshot_record();
-    let engine = RaftGroupEngine::new_single_node(
-        placement(),
-        1,
-        raft_config("dropped-engine", 30, 60),
-        store,
-        RaftGroupEngineOptions {
-            snapshot_record: Some(record),
-            engine_work: Some(wal.engine_work_ledger()),
-            ..Default::default()
-        },
-    )
-    .await
-    .expect("start the engine");
+    let engine = single_voter(&wal, placement()).await;
     // What the registry keeps of a registered engine.
     let kept = engine.raft_handle();
     let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -3803,7 +3761,7 @@ async fn shard_runtime_uses_raft_group_engine_factory_for_owned_group() {
     let config = hosted_config(1, 1);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1)),
+        single_node_factory(&start_wal(wal_root.path(), 1, 1)),
     )
     .expect("spawn runtime with raft group engine factory");
     let stream_id = bsid("runtime-raft-engine");
@@ -3834,8 +3792,11 @@ async fn warm_group_registers_runtime_owned_raft_handle() {
     let config = hosted_config(2, 4);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 2, 4))
-            .with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(
+            start_wal(wal_root.path(), 2, 4),
+            registry.clone(),
+            1,
+        ),
     )
     .expect("spawn runtime with registered raft group engine factory");
 
@@ -3868,8 +3829,11 @@ async fn a_history_event_ends_a_live_read_pinned_to_the_old_token() {
     let registry = RaftGroupHandleRegistry::default();
     let runtime = ShardRuntime::spawn_with_engine_factory(
         hosted_config(1, 1),
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
-            .with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(
+            start_wal(wal_root.path(), 1, 1),
+            registry.clone(),
+            1,
+        ),
     )
     .expect("spawn runtime");
     let stream_id = bsid("pinned-live-read");
@@ -3941,7 +3905,7 @@ async fn durable_raft_group_engine_records_file_log_metrics() {
     let config = hosted_config(1, 1);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(start_wal(&root, 1, 1)),
+        single_node_factory(&start_wal(&root, 1, 1)),
     )
     .expect("spawn runtime with durable raft group engine factory");
     let placement = placement();
@@ -3995,11 +3959,9 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
     {
         let config = hosted_config(1, 1);
         let log_stores = start_wal(&root, 1, 1);
-        let runtime = ShardRuntime::spawn_with_engine_factory(
-            config,
-            DurableRaftGroupEngineFactory::new(log_stores.clone()),
-        )
-        .expect("spawn durable runtime");
+        let runtime =
+            ShardRuntime::spawn_with_engine_factory(config, single_node_factory(&log_stores))
+                .expect("spawn durable runtime");
         runtime
             .create_stream(create_req(stream_id.clone()))
             .await
@@ -4035,11 +3997,9 @@ async fn durable_raft_group_engine_recovers_from_core_journal() {
         let config = hosted_config(1, 1);
         let log_stores = start_wal(&root, 1, 1);
         assert_eq!(log_stores.opening().previous_run, PreviousRun::Clean);
-        let recovered = ShardRuntime::spawn_with_engine_factory(
-            config,
-            DurableRaftGroupEngineFactory::new(log_stores),
-        )
-        .expect("spawn recovered durable runtime");
+        let recovered =
+            ShardRuntime::spawn_with_engine_factory(config, single_node_factory(&log_stores))
+                .expect("spawn recovered durable runtime");
         let read = recovered
             .read_stream(read_req(stream_id, 32))
             .await
@@ -4817,22 +4777,8 @@ async fn recovery_proof_rejects_a_vote_change_after_read_index() {
             })
         }
     }
-    let (_root, store) = fresh_journal_store();
-    let engine = RaftGroupEngine::new_single_node(
-        placement(),
-        1,
-        raft_config("changed-proof", 30, 60),
-        store,
-        Default::default(),
-    )
-    .await
-    .unwrap();
-    engine
-        .raft
-        .wait(Some(Duration::from_secs(2)))
-        .current_leader(1, "leader elected")
-        .await
-        .unwrap();
+    let (_root, wal) = fresh_wal();
+    let engine = single_voter(&wal, placement()).await;
     let barrier = VoteChangingBarrier {
         raft: engine.raft.clone(),
         barrier: engine.read_barrier.clone(),
@@ -4860,7 +4806,7 @@ async fn the_engine_factory_wires_the_snapshot_record_to_the_log_store() {
     let registry = RaftGroupHandleRegistry::default();
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(wal, registry.clone(), 1),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
@@ -4891,8 +4837,11 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
             config.cpu_affinity = Some(true);
             config
         },
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 2))
-            .with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(
+            start_wal(wal_root.path(), 1, 2),
+            registry.clone(),
+            1,
+        ),
     )
     .unwrap();
     for group in [RaftGroupId(0), RaftGroupId(1)] {
@@ -4967,7 +4916,7 @@ async fn registry_commands_execute_on_the_owner_and_waiters_do_not_block_rpc() {
 async fn replicated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
     let dir = tempfile::tempdir().unwrap();
     let placement = placement();
-    let factory = DurableRaftGroupEngineFactory::new(start_wal(dir.path(), 1, 1));
+    let factory = single_node_factory(&start_wal(dir.path(), 1, 1));
     let metrics = ursula_runtime::RuntimeMetrics::new(1, 1);
     let mut engine = factory
         .create(placement, metrics.group_engine_metrics())
@@ -5119,11 +5068,10 @@ fn expiring_create(stream_id: ursula_shard::BucketStreamId, expires_at_ms: u64) 
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn a_leader_sweeps_expired_streams_with_expire_streams_entries() {
-    let (_wal_root, log_store) = fresh_journal_store();
+    let (_wal_root, wal) = fresh_wal();
+    let log_store = reopen_journal_store(&wal);
     let mut engine =
-        RaftGroupEngine::new_single_node_on_log_store(placement(), log_store.clone(), None)
-            .await
-            .expect("create raft group engine");
+        start_single_voter_on(&single_node_factory(&wal), placement(), log_store.clone()).await;
     wait_history(&engine).await;
     for index in 0..300 {
         engine
@@ -5297,7 +5245,7 @@ async fn a_snapshot_build_running_at_shutdown_publishes_nothing_and_is_awaited()
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let metadata_path = wal.snapshot_metadata_path(placement());
-    let engine = reopen_journal_engine(&wal, "build-at-shutdown").await;
+    let engine = reopen_journal_engine(&wal).await;
     // Stand in for the build OpenRaft detached: its builder, taken while the
     // group runs, builds only once the engine's shutdown began.
     let mut builder = engine
@@ -5332,35 +5280,19 @@ async fn a_snapshot_build_running_at_shutdown_publishes_nothing_and_is_awaited()
     fs::remove_dir_all(root.path()).expect("nothing writes the closed WAL directory");
 }
 
-/// A single-node engine of `placement()` over `wal` whose snapshot metadata
-/// lives at the WAL's own path, as the factory builds it. The group's log
-/// store opens at once: a previous engine of the group released it before
-/// its shutdown returned (#709).
+/// A single node's replica of `placement()` over `wal`, which the factory
+/// opens with its snapshot metadata at the WAL's own path, once it leads.
+/// The group's log store opens at once: a previous engine of the group
+/// released it before its shutdown returned (#709).
 #[cfg(not(madsim))]
-async fn reopen_journal_engine(wal: &RaftWal, cluster_name: &str) -> RaftGroupEngine {
-    reopen_journal_engine_with(wal, cluster_name, RaftGroupEngineOptions::default()).await
+async fn reopen_journal_engine(wal: &RaftWal) -> RaftGroupEngine {
+    reopen_journal_engine_on(&single_node_factory(wal)).await
 }
 
+/// [`reopen_journal_engine`] through `factory`, a single node's factory.
 #[cfg(not(madsim))]
-async fn reopen_journal_engine_with(
-    wal: &RaftWal,
-    cluster_name: &str,
-    options: RaftGroupEngineOptions,
-) -> RaftGroupEngine {
-    let store = reopen_journal_store(wal);
-    let snapshot_record = store.snapshot_record();
-    RaftGroupEngine::new_single_node(
-        placement(),
-        1,
-        raft_config(cluster_name, 30, 60),
-        store,
-        RaftGroupEngineOptions {
-            snapshot_record: Some(snapshot_record),
-            ..options
-        },
-    )
-    .await
-    .unwrap()
+async fn reopen_journal_engine_on(factory: &PlacedRaftGroupEngineFactory) -> RaftGroupEngine {
+    open_single_voter(factory, placement()).await
 }
 
 /// `placement()`'s log store over `wal`. It opens at once: a previous
@@ -5632,7 +5564,7 @@ async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
     let wal = start_wal(root.path(), 1, 1);
     let metadata_path = wal.snapshot_metadata_path(placement());
 
-    let mut engine_a = reopen_journal_engine(&wal, "restart-overlap-a").await;
+    let mut engine_a = reopen_journal_engine(&wal).await;
     let mut stale = snapshot_builder_after_write(&mut engine_a, "written-by-a").await;
     let work = stale.work.clone();
     let shutdown = tokio::spawn(async move { engine_a.shutdown().await });
@@ -5653,7 +5585,7 @@ async fn a_build_of_a_stopped_engine_leaves_its_restarted_replica_alone() {
         "a build of the stopped engine published"
     );
 
-    let mut engine_b = reopen_journal_engine(&wal, "restart-overlap-b").await;
+    let mut engine_b = reopen_journal_engine(&wal).await;
     let mut first = snapshot_builder_after_write(&mut engine_b, "written-by-b").await;
     let first_built = first.build_snapshot().await.expect("B publishes");
     drop(first);
@@ -5733,6 +5665,8 @@ fn group_work_trace(
 /// snapshot install of a later leader queue behind it.
 #[cfg(not(madsim))]
 struct QueuedWork {
+    /// The single node's factory the engine opened through.
+    factory: PlacedRaftGroupEngineFactory,
     engine: RaftGroupEngine,
     raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
     release: tokio::sync::oneshot::Sender<()>,
@@ -5754,13 +5688,10 @@ async fn queue_state_machine_work(
     cluster_name: &str,
     work_stop_timeout: Option<Duration>,
 ) -> QueuedWork {
-    let builds = crate::state_machine::SnapshotBuildCoordinator::default();
-    let mut engine = reopen_journal_engine_with(wal, cluster_name, RaftGroupEngineOptions {
-        snapshot_build: Some(builds.clone()),
-        work_stop_timeout,
-        ..Default::default()
-    })
-    .await;
+    let mut factory = single_node_factory(wal);
+    factory.work_stop_timeout = work_stop_timeout;
+    let builds = factory.registry().snapshot_build_coordinator();
+    let mut engine = reopen_journal_engine_on(&factory).await;
     let stream = bsid(cluster_name);
     engine
         .create_stream(
@@ -5848,6 +5779,7 @@ async fn queue_state_machine_work(
         .unwrap();
     let builds_changed = builds.subscribe_builds();
     QueuedWork {
+        factory,
         engine,
         raft,
         release,
@@ -5907,7 +5839,6 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         )
         .expect("the stopped engine released the group's log store");
-    let reopened_record = reopened.snapshot_record();
 
     // The queued work ran before the shutdown returned: the applies
     // answered, a build started, and the refused install left the gauge
@@ -5936,19 +5867,15 @@ async fn engine_shutdown_returns_after_the_state_machine_work_it_queued() {
         "work of the stopped engine ran after its shutdown returned"
     );
 
-    let engine = RaftGroupEngine::new_single_node(
-        placement(),
-        1,
-        raft_config("queued-work-reopened", 30, 60),
-        reopened,
-        RaftGroupEngineOptions {
-            snapshot_build: Some(queued.builds.clone()),
-            snapshot_record: Some(reopened_record),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let engine = queued
+        .factory
+        .start_on(
+            placement(),
+            reopened,
+            crate::engine::test_support::engine_metrics(placement()),
+        )
+        .await
+        .unwrap();
     engine.shutdown().await.unwrap();
     wal.shutdown().await.unwrap();
 }
@@ -6011,11 +5938,9 @@ async fn a_shutdown_that_does_not_wait_leaves_the_queued_work_running() {
 async fn engine_shutdown_names_openraft_work_that_does_not_end() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
-    let engine = reopen_journal_engine_with(&wal, "stuck-work", RaftGroupEngineOptions {
-        work_stop_timeout: Some(Duration::from_millis(200)),
-        ..Default::default()
-    })
-    .await;
+    let mut factory = single_node_factory(&wal);
+    factory.work_stop_timeout = Some(Duration::from_millis(200));
+    let engine = reopen_journal_engine_on(&factory).await;
     let (release, released) = tokio::sync::oneshot::channel();
     let held = hold_state_machine_worker(engine.raft_handle(), released).await;
 
@@ -6098,11 +6023,8 @@ async fn a_kill_after_the_object_write_before_the_pointer_record_leaves_the_obje
     let gates = SnapshotStoreGates::new();
     let store: ursula_runtime::SharedSnapshotStore =
         Arc::new(GatedSnapshotStore::new(1, inner, gates.clone()));
-    let options = || RaftGroupEngineOptions {
-        snapshot_store: Some(store.clone()),
-        ..RaftGroupEngineOptions::default()
-    };
-    let engine = reopen_journal_engine_with(&wal, "kill-before-record", options()).await;
+    let factory = || single_node_factory(&wal).with_snapshot_store(Some(store.clone()));
+    let engine = reopen_journal_engine_on(&factory()).await;
     let checked = Gate::after(1, StoreOp::Head);
     gates.hold(checked);
     let mut builder = engine
@@ -6124,7 +6046,7 @@ async fn a_kill_after_the_object_write_before_the_pointer_record_leaves_the_obje
     assert!(!metadata_path.exists(), "no pointer record was written");
     assert_eq!(bucket.keys().len(), 1, "the object stays until a pass");
 
-    let reopened = reopen_journal_engine_with(&wal, "kill-before-record", options()).await;
+    let reopened = reopen_journal_engine_on(&factory()).await;
     let holds = reopened.snapshots.holds.clone();
     assert_eq!(holds.current(), None);
     assert!(holds.gc_due(crate::rt::time::Instant::now()));
@@ -6150,11 +6072,8 @@ async fn a_shut_down_engine_changes_no_hold() {
     let root = tempfile::tempdir().unwrap();
     let wal = start_wal(root.path(), 1, 1);
     let (bucket, store) = memory_snapshot_store(1);
-    let options = || RaftGroupEngineOptions {
-        snapshot_store: Some(store.clone()),
-        ..RaftGroupEngineOptions::default()
-    };
-    let engine = reopen_journal_engine_with(&wal, "holds-per-incarnation", options()).await;
+    let factory = || single_node_factory(&wal).with_snapshot_store(Some(store.clone()));
+    let engine = reopen_journal_engine_on(&factory()).await;
     engine
         .with_state_machine(|state_machine| {
             Box::pin(async move {
@@ -6189,7 +6108,7 @@ async fn a_shut_down_engine_changes_no_hold() {
     drop(work);
     shutdown.await.unwrap().unwrap();
 
-    let reopened = reopen_journal_engine_with(&wal, "holds-per-incarnation", options()).await;
+    let reopened = reopen_journal_engine_on(&factory()).await;
     let holds = reopened.snapshots.holds.clone();
     assert!(!Arc::ptr_eq(&holds, &old_holds), "a fresh incarnation");
     assert_eq!(holds.current(), Some(current.clone()));
@@ -6461,18 +6380,15 @@ async fn a_pass_on_a_stopped_incarnations_holds_deletes_nothing() {
         let root = tempfile::tempdir().unwrap();
         let wal = start_wal(root.path(), 1, 1);
         let (bucket, store) = memory_snapshot_store(1);
-        let options = || RaftGroupEngineOptions {
-            snapshot_store: Some(store.clone()),
-            ..RaftGroupEngineOptions::default()
-        };
-        let old = reopen_journal_engine_with(&wal, "fenced-pass", options()).await;
+        let factory = || single_node_factory(&wal).with_snapshot_store(Some(store.clone()));
+        let old = reopen_journal_engine_on(&factory()).await;
         build(&old).await;
         // What a driver tick copied before the group restarted.
         let snapshots = old.snapshots.clone();
         let admission = old.snapshot_installs.clone();
         old.shutdown().await.unwrap();
 
-        let new = reopen_journal_engine_with(&wal, "fenced-pass", options()).await;
+        let new = reopen_journal_engine_on(&factory()).await;
         build(&new).await;
         let current = new.snapshots.holds.current().expect("the new current");
         snapshots.holds.owe_pass(crate::rt::time::Instant::now());
@@ -6536,12 +6452,9 @@ async fn a_gc_round_held_across_a_restart_never_deletes_the_new_incarnations_obj
     let gates = SnapshotStoreGates::new();
     let store: ursula_runtime::SharedSnapshotStore =
         Arc::new(GatedSnapshotStore::new(1, inner, gates.clone()));
-    let options = || RaftGroupEngineOptions {
-        snapshot_store: Some(store.clone()),
-        ..RaftGroupEngineOptions::default()
-    };
+    let factory = || single_node_factory(&wal).with_snapshot_store(Some(store.clone()));
     let registry = RaftGroupHandleRegistry::default();
-    let old = reopen_journal_engine_with(&wal, "gc-round-restart", options()).await;
+    let old = reopen_journal_engine_on(&factory()).await;
     registry.register_engine(&old);
     build(&old).await;
 
@@ -6570,7 +6483,7 @@ async fn a_gc_round_held_across_a_restart_never_deletes_the_new_incarnations_obj
     let round = round.await.unwrap();
     assert_eq!(round.groups, 0, "the stopped engine's pass did not run");
 
-    let new = reopen_journal_engine_with(&wal, "gc-round-restart", options()).await;
+    let new = reopen_journal_engine_on(&factory()).await;
     registry.register_engine(&new);
     gates.open(before_list);
     build(&new).await;

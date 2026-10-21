@@ -82,6 +82,12 @@ harness = false
 [[bench]]
 name = "owner_burst"
 harness = false
+required-features = ["test-support"]
+
+[[bin]]
+name = "ursula-raft-runtime-stress"
+path = "src/bin/ursula-raft-runtime-stress.rs"
+required-features = ["test-support"]
 
 [features]
 # Lets other crates' tests run deterministic apply bugs. Never enable it in a

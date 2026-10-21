@@ -508,13 +508,10 @@ impl ReclaimGroup {
         let wal = SimNodeWal::provision(name);
         let placement = group_placement(0);
         let metrics = RuntimeMetrics::new(1, 1);
-        let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-            placement,
-            wal.open(placement, metrics.group_engine_metrics()).await,
-            None,
-        )
-        .await
-        .expect("start a single-node group");
+        let mut engine = wal
+            .single_voter(placement, metrics.group_engine_metrics())
+            .await
+            .expect("start a single-node group");
         engine
             .create_stream(
                 CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
@@ -748,13 +745,10 @@ async fn reopen_after_a_reordered_unsynced_tail(
     });
     let placement = group_placement(0);
     let metrics = standalone_wal_metrics(placement);
-    let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-        placement,
-        wal.open(placement, metrics.clone()).await,
-        None,
-    )
-    .await
-    .expect("start a single-node group");
+    let mut engine = wal
+        .single_voter(placement, metrics.clone())
+        .await
+        .expect("start a single-node group");
     engine
         .create_stream(
             CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
@@ -1271,13 +1265,10 @@ fn votes_survive_power_loss_under_never_and_the_metadata_is_old_or_new() {
             let wal = SimNodeWal::provision_with_fsync("never-votes", WalFsync::Never);
             let placement = group_placement(0);
             let metrics = standalone_wal_metrics(placement);
-            let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-                placement,
-                wal.open(placement, metrics.clone()).await,
-                None,
-            )
-            .await
-            .expect("start a single-node group");
+            let mut engine = wal
+                .single_voter(placement, metrics.clone())
+                .await
+                .expect("start a single-node group");
             engine
                 .create_stream(
                     CreateStreamRequest::new(group_stream(0), "application/octet-stream"),

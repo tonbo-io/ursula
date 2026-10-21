@@ -1047,10 +1047,11 @@
         "walFsync": {
           "type": "string",
           "enum": [
+            "",
             "always",
             "never"
           ],
-          "description": "When Raft WAL appends reach stable storage (default never): never acknowledges from the page cache, so a host crash can cost this replica its unsynced tail and it rejoins through the recovery gate; always acknowledges after fsync."
+          "description": "When Raft WAL appends reach stable storage. Empty (the default) leaves raft.wal.fsync unset, which the server resolves to always when the groups have one or two voters and to never otherwise. never acknowledges from the page cache, so a host crash can cost this replica its unsynced tail and it rejoins through the recovery gate. always acknowledges after fsync."
         },
         "walSegmentBytes": {
           "type": "integer",

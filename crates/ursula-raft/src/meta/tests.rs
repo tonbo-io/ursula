@@ -708,33 +708,15 @@ async fn data_group_zero_never_touches_the_meta_record() {
         ursula_runtime::snapshot_harness::SnapshotStoreFaults::none(),
     );
     let snapshot_store: ursula_runtime::SharedSnapshotStore = Arc::new(bucket.store(1));
-    let data_engine = |wal: &RaftWal| {
-        let store = wal
-            .open(placement, ursula_control::Admission::Create, metrics())
-            .unwrap();
-        let record = store.snapshot_record();
-        assert_ne!(record.path(), meta_record.path());
-        crate::RaftGroupEngine::new_single_node(
-            placement,
-            1,
-            Arc::new(
-                openraft::Config {
-                    cluster_name: "data-0".to_owned(),
-                    ..Default::default()
-                }
-                .validate()
-                .unwrap(),
-            ),
-            store,
-            crate::RaftGroupEngineOptions {
-                snapshot_record: Some(record),
-                snapshot_store: Some(snapshot_store.clone()),
-                ..Default::default()
-            },
-        )
-    };
+    let store = wal
+        .open(placement, ursula_control::Admission::Create, metrics())
+        .unwrap();
+    assert_ne!(store.snapshot_record().path(), meta_record.path());
     // Data group 0 opens and stops beside the meta record.
-    let engine = data_engine(&wal).await.unwrap();
+    let factory = crate::engine::test_support::single_node_factory(&wal)
+        .with_snapshot_store(Some(snapshot_store.clone()));
+    let engine =
+        crate::engine::test_support::start_single_voter_on(&factory, placement, store).await;
     engine.shutdown().await.unwrap();
     assert_eq!(std::fs::read(meta_record.path()).unwrap(), recorded);
 }
