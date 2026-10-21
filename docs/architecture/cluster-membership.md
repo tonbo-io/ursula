@@ -126,7 +126,9 @@ the predecessor wait (`crates/ursula-raft/src/predecessor_wait.rs`): they
 grant no vote, run no gate driver, write no vote floor and no snapshot
 object, so their gates stay closed and they take no replication. Its meta
 replica is not held before an answer, so a forming cluster's meta group
-elects. A refusal for another root makes the run owe the predecessor wait:
+elects. A fresh cluster's data groups therefore form only once meta
+answered its nodes' registrations, and genesis values that disagree, which
+keep meta from forming, keep the data groups from forming too. A refusal for another root makes the run owe the predecessor wait:
 from then on its meta replica grants no vote and writes no floor, and the
 node sheds every leadership. Its registration status is `root_refused` with
 the slot, readiness reports `root_refused`, and it registers again at most

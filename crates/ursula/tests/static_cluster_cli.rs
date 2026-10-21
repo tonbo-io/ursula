@@ -3950,6 +3950,31 @@ async fn try_node_metrics(
         .map_err(|err| format!("GET {url}: {err}"))
 }
 
+/// Asserts that every data replica node `node` reports took part in
+/// nothing: no vote floor (term 0, where a barrier would adopt its
+/// leader's), no entry and a closed recovery gate.
+fn assert_data_held(metrics: &ursula_proto::admin::NodeMetrics, node: u64) {
+    assert!(
+        !metrics.groups.is_empty(),
+        "node {node} runs its data replicas"
+    );
+    for group in &metrics.groups {
+        assert_eq!(
+            group.current_term, 0,
+            "node {node}, no vote floor: {group:?}"
+        );
+        assert_eq!(
+            group.last_log_index, None,
+            "node {node}, no entry: {group:?}"
+        );
+        assert_ne!(
+            group.recovery_gate,
+            ursula_proto::admin::RecoveryGateStatus::Open,
+            "node {node}, a closed gate: {group:?}"
+        );
+    }
+}
+
 /// Node `node`'s participation, from its cluster listener.
 async fn leadership_shed(
     client: &reqwest::Client,
@@ -4408,13 +4433,15 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
 }
 
 /// S1, r1 H1 (#768): while node 3 claims another replication factor, the
-/// genesis node names node 3 and its claim, meta does not form, and the
-/// data groups form and serve. Node 3 restarts with the fixed claim while
-/// node 1's `raft.peers` names node 2's address for node 3: node 2 refuses
-/// the misdelivered genesis probes as meant for another node, which leave
-/// node 3 unanswered and are never read as a claim or a format mismatch,
-/// so meta still does not form. Node 1 restarts with the right address,
-/// and meta forms and bootstraps.
+/// genesis node names node 3 and its claim and meta does not form. Every
+/// root is fresh and meta binds none of them, so no data replica takes
+/// part either: no data group forms while meta waits. Node 3 restarts with
+/// the fixed claim while node 1's `raft.peers` names node 2's address for
+/// node 3: node 2 refuses the misdelivered genesis probes as meant for
+/// another node, which leave node 3 unanswered and are never read as a
+/// claim or a format mismatch, so meta still does not form. Node 1
+/// restarts with the right address, meta forms and bootstraps, and the
+/// data groups form and serve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -4447,7 +4474,7 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
         matches!(status.view, ClusterView::MetaGenesis { .. }) && status.applied.is_none()
     };
 
-    // 1. The genesis node names node 3's claim, and the data groups serve.
+    // 1. The genesis node names node 3's claim, and no data group forms.
     let held = wait_placement(
         &client,
         &mut procs,
@@ -4474,20 +4501,23 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
         node_ids(claim.meta_voters.iter()),
         BTreeSet::from([1, 2, 3])
     );
-    let stream = |node: &MetaNode| format!("{}/meta-cli/claims", node.url());
-    put_until_created(&client, &stream(&nodes[1])).await;
-    post_until_no_content(&client, &stream(&nodes[1]), "while-meta-waits;").await;
-    read_until_matches(
-        &client,
-        &format!("{}?offset=0&max_bytes=64", stream(&nodes[2])),
-        b"while-meta-waits;",
-    )
-    .await;
+    // The data groups would have formed within these 5 s if a fresh root's
+    // data replicas took part before meta bound it.
     for node in &nodes {
-        let status = placement_status(&client, node)
-            .await
-            .expect("placement status");
-        assert!(no_meta(&status), "{status:?}");
+        wait_placement(&client, &mut procs, node, "listens without meta", no_meta).await;
+    }
+    for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for node in &nodes {
+            let status = placement_status(&client, node)
+                .await
+                .expect("placement status");
+            assert!(no_meta(&status), "{status:?}");
+            let metrics = try_node_metrics(&client, &node.url())
+                .await
+                .expect("node metrics");
+            assert_data_held(&metrics, node.id);
+        }
     }
 
     // 2. Node 3 claims the same values again, but node 1's genesis probes
@@ -4559,6 +4589,31 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
     for status in &formed {
         assert_eq!(bootstrapped(status), Some(cluster), "{status:?}");
     }
+
+    // Meta bound every root, so the data groups form and serve.
+    let stream = |node: &MetaNode| format!("{}/meta-cli/claims", node.url());
+    let create = stream(&nodes[1]);
+    eventually(&mut procs, "the data groups serve", async || {
+        let response = client
+            .put(&create)
+            .header("content-type", "text/plain")
+            .send()
+            .await
+            .map_err(|err| format!("PUT {create}: {err}"))?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("PUT {create}: {}", response.status()))
+        }
+    })
+    .await;
+    post_until_no_content(&client, &stream(&nodes[1]), "once-meta-formed;").await;
+    read_until_matches(
+        &client,
+        &format!("{}?offset=0&max_bytes=64", stream(&nodes[2])),
+        b"once-meta-formed;",
+    )
+    .await;
 }
 
 /// f2 (#768): every node loses its run state while stopped, as the
@@ -4966,16 +5021,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     let held = try_node_metrics(&client, &nodes[2].url())
         .await
         .expect("node 3 reports its replicas");
-    assert!(!held.groups.is_empty(), "node 3 runs its data replicas");
-    for group in &held.groups {
-        assert_eq!(group.current_term, 0, "no vote floor: {group:?}");
-        assert_eq!(group.last_log_index, None, "no entry: {group:?}");
-        assert_ne!(
-            group.recovery_gate,
-            ursula_proto::admin::RecoveryGateStatus::Open,
-            "a closed gate: {group:?}"
-        );
-    }
+    assert_data_held(&held, 3);
 
     // 2. The guard refuses a node that still runs on the root it names.
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");

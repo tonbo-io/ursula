@@ -1900,6 +1900,8 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         ),
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm group");
@@ -1987,6 +1989,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             ),
         )
         .expect("runtime");
+        // No meta runs here, so the test settles the fresh root's binding.
+        spawned.bind_without_meta();
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
         let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
@@ -13299,6 +13303,8 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         ),
     )
     .unwrap();
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.unwrap();
     runtime.warm_all_groups().await.unwrap();
@@ -13368,6 +13374,8 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         ),
     )
     .unwrap();
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.unwrap();
     runtime.warm_all_groups().await.unwrap();

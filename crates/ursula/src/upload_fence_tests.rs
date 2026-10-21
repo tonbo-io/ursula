@@ -77,6 +77,8 @@ async fn an_external_append_whose_leadership_ended_during_its_put_answers_503_an
         ),
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm");

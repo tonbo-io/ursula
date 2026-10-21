@@ -1827,6 +1827,8 @@ async fn a_new_raft_term_lists_the_stream_again() {
         ),
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm");
