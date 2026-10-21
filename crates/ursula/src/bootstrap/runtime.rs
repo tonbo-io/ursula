@@ -283,7 +283,7 @@ pub fn spawn_runtime(
         );
     }
 
-    if let (Topology::StaticCluster { peers, seeds, .. }, Some(participation)) =
+    if let (Topology::StaticCluster { peers, .. }, Some(participation)) =
         (&topology, &participation)
     {
         let registry = spawned
@@ -318,7 +318,6 @@ pub fn spawn_runtime(
             &registry,
             participation,
             peers,
-            seeds.voter_table(),
             &config.governance.cluster_probe,
         );
         commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);

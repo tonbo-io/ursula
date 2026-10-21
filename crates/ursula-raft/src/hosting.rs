@@ -37,8 +37,9 @@
 //!
 //! The teardown executor comes later (S4). The driver logs a plan's
 //! teardown and report steps and starts neither, so such a replica stays
-//! admitted, which is the safe direction. Every held replica counts as a
-//! voter until the shell's voter predicate lands.
+//! admitted, which is the safe direction. Each held replica counts as a
+//! voter by the one voter predicate
+//! ([`RaftGroupHandleRegistry::counts_as_voter`]).
 //!
 //! A [`GroupHost`] runs the replicas: the server's over its shard runtime,
 //! the simulation's over its cluster.
@@ -53,7 +54,6 @@ use futures_util::future::BoxFuture;
 use ursula_control::Admission;
 use ursula_control::ConfirmedStamp;
 use ursula_control::ConfirmedView;
-use ursula_control::Counts;
 use ursula_control::HostingInput;
 use ursula_control::HostingPlan;
 use ursula_control::HostingStep;
@@ -261,7 +261,7 @@ impl<H: GroupHost> HostingDriver<H> {
             .map(|(group, log)| {
                 (group, LocalReplica {
                     log,
-                    counts: Counts::Voter,
+                    counts: self.registry.counts_as_voter(group),
                     teardown: None,
                 })
             })

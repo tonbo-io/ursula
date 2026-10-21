@@ -15,8 +15,11 @@ initializer come from the seed rule over the `raft.peers` ids
 from index `g mod N`, and the first of them initializes it. With `N` at most the
 replication factor, every node votes in every group. `ConfigSeeds`
 (`crates/ursula-raft/src/placement_wiring.rs`) computes this table, and the
-server reads it for what a node hosts, where it routes a group it does not host,
-its maintenance inventory and its egress probe. The engine factory takes every
+server reads it for what a node hosts, where it routes a group it does not host
+and its maintenance inventory. The egress probe judges each voter config of the
+effective membership of every replica that counts as a voter
+([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
+The engine factory takes every
 input placement decides through one seam, `PlacementInputs`: which groups the
 node hosts and how each may open, the replica's seed role, and the voters its
 recovery drivers ask, initialize and heal toward, read at each use. The meta group's `Bootstrap` seeds the same rule

@@ -145,7 +145,7 @@ impl ursula_raft::RecoveryTransport for MetaTransport {
             return Err(RecoveryProbeError::Partitioned);
         }
         self.registry
-            .confirm_recovery_barrier(leader)
+            .barrier(leader)
             .await
             .map_err(RecoveryProbeError::Proof)
     }

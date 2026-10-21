@@ -198,10 +198,11 @@ pub(crate) type GateProbe = Arc<
 >;
 
 impl RecoveryGate {
-    /// Publishes a data replica's recovery gate, then spawns its heal driver
-    /// and its gate drivers (`spawn_gate_drivers`) with the
-    /// transport's bootstrap probe vote, over the seed role and the node
-    /// sets `inputs` gives the replica's group.
+    /// Binds a data replica's voter predicate to the seed role `inputs`
+    /// gives its group and to the node's left marks, publishes its recovery
+    /// gate, then spawns its heal driver and its gate drivers
+    /// (`spawn_gate_drivers`) with the transport's bootstrap probe vote,
+    /// over that seed role and the node sets `inputs` gives the group.
     pub fn attach<T: RecoveryTransport>(
         &self,
         engine: &crate::RaftGroupEngine,
@@ -213,6 +214,8 @@ impl RecoveryGate {
     ) -> Result<(), ursula_runtime::GroupEngineError> {
         let group = engine.placement.raft_group_id;
         let nodes = inputs.nodes(group);
+        let seed = inputs.seed_role(group);
+        rejoin.bind_placement(seed.clone(), registry.left_marks());
         engine.publish_recovery(rejoin.clone(), registry)?;
         self.push(crate::rt::spawn(run_rejoin_heal(
             engine.raft_handle(),
@@ -232,7 +235,7 @@ impl RecoveryGate {
             rejoin,
             registry.election_policy(),
             nodes,
-            inputs.seed_role(group),
+            seed,
             probe,
             transport,
             config,

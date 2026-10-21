@@ -319,6 +319,9 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         if let Some(root) = &self.root {
             root.check_view(confirmed.view(), true);
         }
+        self.registry
+            .placement_publisher()
+            .record_confirmation(confirmed.stamp());
         Ok(confirmed)
     }
 }

@@ -23,7 +23,9 @@ use crate::types::UrsulaRaftTypeConfig;
 /// of its effective membership, by node id. The supplied probe must confirm a new
 /// post-call ReadIndex with a quorum and return that leader's committed vote
 /// and required local applied index ([`crate::BarrierAnswer`]). The driver
-/// does not read the answer's memberships. A replica that for `stall_after` gets no barrier and applies
+/// reads the answer's memberships only for the replica's left mark
+/// (`crate::voter`): classified for this node, an answer that shows it a
+/// learner or no member may set it. A replica that for `stall_after` gets no barrier and applies
 /// nothing reports its group stalled. Once the gate is open, here or through
 /// an operator, the group's election policy is refreshed and the driver
 /// returns. Transport-independent so simulation exercises the production
@@ -94,7 +96,11 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
                 if !rejoin.needs_vote_floor() && metrics.current_leader != Some(leader_id) {
                     continue;
                 }
+                let asked = rejoin.ask_membership();
                 let outcome = crate::rt::time::timeout(probe_timeout, probe(leader_id)).await;
+                if let Ok(Ok(answer)) = &outcome {
+                    rejoin.observe_membership_answer(asked, answer);
+                }
                 match outcome {
                     Ok(Ok(crate::BarrierAnswer {
                         vote: leader,

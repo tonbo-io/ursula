@@ -5,7 +5,6 @@ use std::time::Duration;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::PeerDirectory;
 use ursula_raft::RaftGroupHandleRegistry;
-use ursula_raft::RaftGroupMetricsSnapshot;
 use ursula_shard::RaftGroupId;
 
 use crate::bootstrap::health_gate::HealthHysteresis;
@@ -33,20 +32,21 @@ const DEFAULT_CLUSTER_PROBE_TIMEOUT_MS: usize = 200;
 /// what prevents the flap that a commit-stall step-down suffers.
 ///
 /// The egress probe of one tick: every peer of this node's groups, probed
-/// once whatever the group count, and each group judged by how many of its
-/// other voters answered.
+/// once whatever the group count, and each voter config of each group
+/// judged by how many of its other voters answered.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClusterEgressProbePlan {
     /// The cluster URL of every peer to probe, by node id.
     pub peer_urls: BTreeMap<u64, String>,
-    /// This node's groups, each with the peers it needs answers from.
+    /// One entry per voter config of each of this node's groups, each with
+    /// the peers it needs answers from.
     pub groups: Vec<ClusterEgressProbeGroup>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ClusterEgressProbeGroup {
     pub raft_group_id: RaftGroupId,
-    /// The group's voters other than this node that `raft.peers` lists.
+    /// The config's voters other than this node that `raft.peers` lists.
     pub peers: BTreeSet<u64>,
     pub needed_peers: usize,
 }
@@ -56,8 +56,8 @@ impl ClusterEgressProbePlan {
         self.groups.is_empty()
     }
 
-    /// The first group that fewer of its peers answered than its quorum
-    /// needs, with how many did.
+    /// The first group config that fewer of its peers answered than its
+    /// quorum needs, with how many did.
     pub(crate) fn degraded(
         &self,
         answered: &BTreeSet<u64>,
@@ -69,30 +69,27 @@ impl ClusterEgressProbePlan {
     }
 }
 
-fn remote_peers_needed_for_quorum(total_voters: usize) -> usize {
-    // A quorum is `total_voters / 2 + 1` voters and this node is one of them.
-    total_voters / 2
+/// The other voters a quorum of `voters` needs besides `node_id`: a
+/// majority, less this node when it is one of them.
+fn remote_peers_needed_for_quorum(node_id: u64, voters: &BTreeSet<u64>) -> usize {
+    let quorum = (voters.len() / 2).saturating_add(1);
+    quorum.saturating_sub(usize::from(voters.contains(&node_id)))
 }
 
-/// The probe plan of `node_id` over `voter_table`: the groups it votes in,
-/// of those it registered once any is registered.
+/// The probe plan of `node_id` over `groups`, the voter configs of the
+/// effective membership of each replica that counts as a voter
+/// ([`RaftGroupHandleRegistry::counting_voter_configs`]).
+/// A config none of whose other voters `raft.peers` lists is not probed.
 pub(crate) fn cluster_egress_probe_plan(
     node_id: u64,
     peers: &PeerDirectory,
-    voter_table: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
-    snapshots: &[RaftGroupMetricsSnapshot],
+    groups: &BTreeMap<RaftGroupId, Vec<BTreeSet<u64>>>,
 ) -> ClusterEgressProbePlan {
-    let registered_groups: BTreeSet<RaftGroupId> = snapshots
-        .iter()
-        .map(|snapshot| RaftGroupId(snapshot.raft_group_id))
-        .collect();
-
     let mut peer_urls = BTreeMap::new();
-    let groups = voter_table
+    let groups = groups
         .iter()
-        .filter(|(raft_group_id, voters)| {
-            voters.contains(&node_id)
-                && (registered_groups.is_empty() || registered_groups.contains(raft_group_id))
+        .flat_map(|(raft_group_id, configs)| {
+            configs.iter().map(move |voters| (*raft_group_id, voters))
         })
         .filter_map(|(raft_group_id, voters)| {
             let group_peers: BTreeSet<u64> = voters
@@ -111,17 +108,18 @@ pub(crate) fn cluster_egress_probe_plan(
                 return None;
             }
             Some(ClusterEgressProbeGroup {
-                raft_group_id: *raft_group_id,
+                raft_group_id,
                 peers: group_peers,
-                needed_peers: remote_peers_needed_for_quorum(voters.len()),
+                needed_peers: remote_peers_needed_for_quorum(node_id, voters),
             })
         })
         .collect();
     ClusterEgressProbePlan { peer_urls, groups }
 }
 
-/// Config-driven cluster egress gate. It probes `probe_peers` and, while it
-/// sheds, hands every leadership it held when it shed to its peers at once,
+/// Cluster egress gate. Each tick it probes the peers of `probe_peers` that
+/// are voters of the groups whose replica on this node counts as a voter
+/// ([`cluster_egress_probe_plan`]) and, while it sheds, hands every leadership it held when it shed to its peers at once,
 /// and plans again on every tick for the ones still pending. The peers'
 /// answers to `participation` travel the path the gate judges impaired, so
 /// a leadership's first handoff may also go to a peer that did not answer,
@@ -132,7 +130,6 @@ pub fn spawn_egress_gate(
     registry: &RaftGroupHandleRegistry,
     participation: &PeerParticipation,
     probe_peers: &PeerDirectory,
-    voter_table: BTreeMap<RaftGroupId, BTreeSet<u64>>,
     cp_cfg: &ursula_config::ClusterProbeConfig,
 ) {
     let node_id = participation.node_id();
@@ -140,7 +137,8 @@ pub fn spawn_egress_gate(
     if interval_ms == 0 {
         return;
     }
-    if cluster_egress_probe_plan(node_id, probe_peers, &voter_table, &[]).is_empty() {
+    // A node with no peer has no egress to judge.
+    if probe_peers.node_ids().all(|peer| peer == node_id) {
         return;
     }
     let probe_bytes = cp_cfg.probe_size.as_bytes() as usize;
@@ -181,8 +179,8 @@ pub fn spawn_egress_gate(
         );
         loop {
             tokio::time::sleep(interval).await;
-            let snaps = registry.metrics_snapshot();
-            let plan = cluster_egress_probe_plan(node_id, &peers, &voter_table, &snaps);
+            let plan =
+                cluster_egress_probe_plan(node_id, &peers, &registry.counting_voter_configs());
             if plan.is_empty() {
                 continue;
             }

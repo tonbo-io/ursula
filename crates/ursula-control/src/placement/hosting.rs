@@ -1,5 +1,6 @@
 //! Placement-driven hosting: what a node runs, what it tears down, who may
-//! initialize a seeded group, and whom a node asks about a group.
+//! initialize a seeded group, whom a node asks about a group, and whether
+//! a replica counts as a voter ([`counts_as_voter`], with [`LeftMark`]).
 //!
 //! [`plan_hosting`] is the one decision of what a node runs. A node runs
 //! what its journal holds and what its placement gives it, and starts
@@ -79,12 +80,166 @@ impl LocalLog {
     }
 }
 
-/// Whether a replica counts as a voter (the shell's one voter predicate). A
-/// replica closed by a restart counts until its group answers.
+/// Whether a replica counts as a voter, by the one voter predicate
+/// ([`counts_as_voter`]). A replica closed by a restart counts until its
+/// group answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Counts {
     Voter,
     NotVoter,
+}
+
+/// What the voter predicate reads of a replica's membership.
+#[derive(Debug, Clone, Copy)]
+pub enum ReplicaMembership<'a> {
+    /// The replica is not open, so its membership is not read: it counts
+    /// until its group answers.
+    Closed,
+    /// The open replica of node `me`, with its effective membership, `None`
+    /// while it holds none, as on an empty log.
+    Open {
+        me: NodeId,
+        effective: Option<&'a MembershipConfig>,
+    },
+}
+
+/// The one voter predicate (S10 of the design): a replica counts as a voter
+/// when a confirmed view gives its node the role `Voter`, or when its node
+/// is a voter of a config of its effective membership, and its group has
+/// not marked it left ([`LeftMark`]). A closed replica counts unless it is
+/// marked left.
+///
+/// `confirmed_role` is the node's role in a confirmed view, `None` without
+/// a confirmation or without a role. An unconfirmed role counts for
+/// nothing, and neither does an `Incoming` one: an incoming learner counts
+/// once its membership makes it a voter.
+pub fn counts_as_voter(
+    confirmed_role: Option<ReplicaRole>,
+    membership: ReplicaMembership<'_>,
+    left: bool,
+) -> Counts {
+    let placed = confirmed_role == Some(ReplicaRole::Voter);
+    let member = match membership {
+        ReplicaMembership::Closed => true,
+        ReplicaMembership::Open { me, effective } => {
+            effective.is_some_and(|membership| membership.is_voter(me))
+        }
+    };
+    if (placed || member) && !left {
+        Counts::Voter
+    } else {
+        Counts::NotVoter
+    }
+}
+
+/// Whether a replica's group answered that its node left, and what the
+/// mark compares against (S10 of the design). A voter a membership step
+/// dropped keeps a membership that lists it, since the leader stops
+/// replicating to it, so only its group can tell it.
+///
+/// - A live leader's answer that classifies the node [`MembershipAnswer::Learner`]
+///   or [`MembershipAnswer::NotMember`], with the leader's vote `v`, sets the
+///   mark, unless an append with a vote of at least `v` arrived after the
+///   request ([`LeftMark::ask`]).
+/// - Only an append with a vote of at least the mark's clears it. A deposed
+///   leader heartbeats with a lower vote and clears nothing.
+/// - A `Voter` answer changes nothing: the leader's next append clears the
+///   mark.
+///
+/// `V` is the group's vote, compared only by `PartialOrd`: a vote that does
+/// not compare is never "at least" another, so it neither clears the mark
+/// nor keeps an answer from setting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftMark<V> {
+    /// The vote of the answer that set the mark.
+    left: Option<V>,
+    /// How many appends arrived.
+    appends: u64,
+    /// The highest vote of an append, and the count of appends when an
+    /// append last reached it.
+    highest: Option<(V, u64)>,
+}
+
+impl<V> Default for LeftMark<V> {
+    fn default() -> Self {
+        Self {
+            left: None,
+            appends: 0,
+            highest: None,
+        }
+    }
+}
+
+/// When a membership question was asked, in appends ([`LeftMark::ask`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Asked(u64);
+
+/// Whether `vote` is at least `floor`, by `PartialOrd` only.
+fn at_least<V: PartialOrd>(vote: &V, floor: &V) -> bool {
+    matches!(
+        vote.partial_cmp(floor),
+        Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+    )
+}
+
+impl<V: PartialOrd> LeftMark<V> {
+    /// Whether the group marked the node left.
+    pub fn is_left(&self) -> bool {
+        self.left.is_some()
+    }
+
+    /// Records that a question goes out now, to compare its answer with
+    /// the appends that arrive after it.
+    pub fn ask(&self) -> Asked {
+        Asked(self.appends)
+    }
+
+    /// Records an append with the leader's vote `vote`: it clears the mark
+    /// when `vote` is at least the mark's.
+    pub fn appended(&mut self, vote: V) {
+        self.appends = self.appends.saturating_add(1);
+        if self.left.as_ref().is_some_and(|left| at_least(&vote, left)) {
+            self.left = None;
+        }
+        // Replaced unless it is strictly higher, so a vote that does not
+        // compare never pins it.
+        let raised = !self.highest.as_ref().is_some_and(|(highest, _)| {
+            matches!(
+                highest.partial_cmp(&vote),
+                Some(std::cmp::Ordering::Greater)
+            )
+        });
+        if raised {
+            self.highest = Some((vote, self.appends));
+        }
+    }
+
+    /// Records a live leader's answer, with its vote, to the question
+    /// asked at `asked`.
+    pub fn answered(&mut self, asked: Asked, answer: MembershipAnswer, vote: V) {
+        match answer {
+            MembershipAnswer::Voter => return,
+            MembershipAnswer::Learner | MembershipAnswer::NotMember => {}
+        }
+        // An append at least as new as the answer arrived after the
+        // question: the answer is older than what the node already knows.
+        // The highest append vote is the one to compare, as a follower
+        // takes appends only at or above the vote it saved, which grows.
+        let overtaken = self
+            .highest
+            .as_ref()
+            .is_some_and(|(highest, at)| *at > asked.0 && at_least(highest, &vote));
+        if overtaken {
+            return;
+        }
+        let newer = match &self.left {
+            None => true,
+            Some(left) => at_least(&vote, left),
+        };
+        if newer {
+            self.left = Some(vote);
+        }
+    }
 }
 
 /// A group the node's journal names.

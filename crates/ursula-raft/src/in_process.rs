@@ -147,6 +147,27 @@ impl InProcessEndpoint for RaftGroupStateMachine {
     }
 }
 
+/// Why a barrier ask on the in-process seam got no answer.
+#[derive(Debug, thiserror::Error)]
+pub enum InProcessBarrierError {
+    /// The node asked confirmed no barrier.
+    #[error(transparent)]
+    Refused(#[from] crate::QuorumProofError),
+    /// Its answer failed the check every seam runs.
+    #[error(transparent)]
+    Answer(#[from] crate::BarrierAnswerRefusal),
+}
+
+/// Classified as the same failure over gRPC is.
+impl From<InProcessBarrierError> for crate::meta::confirm::BarrierFailure {
+    fn from(error: InProcessBarrierError) -> Self {
+        match error {
+            InProcessBarrierError::Refused(error) => error.into(),
+            InProcessBarrierError::Answer(refusal) => refusal.failure(),
+        }
+    }
+}
+
 /// The in-process registry of one plane's replicas, by node id.
 pub struct InProcessRegistry<SM: InProcessEndpoint> {
     endpoints: Arc<Mutex<BTreeMap<u64, SM::Endpoint>>>,
@@ -279,6 +300,19 @@ impl InProcessRegistry<RaftGroupStateMachine> {
                 None => Err(crate::QuorumProofError::NotRegistered { group }),
             },
         }
+    }
+
+    /// The barrier `leader` answers about `target` on the in-process seam:
+    /// the RPC's server side ([`Self::confirm_recovery_barrier`]), which
+    /// answers about the target it served, then the check every seam runs
+    /// ([`crate::BarrierAnswer::accept`]).
+    pub async fn barrier(
+        &self,
+        leader: u64,
+        target: crate::RaftTarget,
+    ) -> Result<crate::BarrierAnswer, InProcessBarrierError> {
+        let answer = self.confirm_recovery_barrier(leader, target).await?;
+        Ok(answer.accept(leader, target, target.into())?)
     }
 
     /// The genesis probe RPC on `node_id`, through the node's production
@@ -489,6 +523,17 @@ impl InProcessRegistry<crate::meta::MetaStateMachine> {
             .and_then(|registry| registry.meta())
             .ok_or(not_registered)?;
         meta.confirm_recovery_barrier().await
+    }
+
+    /// The meta barrier `leader` answers on the in-process seam, checked as
+    /// a data barrier is ([`InProcessRaftRegistry::barrier`]).
+    pub async fn barrier(
+        &self,
+        leader: u64,
+    ) -> Result<crate::BarrierAnswer, InProcessBarrierError> {
+        let answer = self.confirm_recovery_barrier(leader).await?;
+        let target = crate::RaftTarget::Meta;
+        Ok(answer.accept(leader, target, target.into())?)
     }
 
     /// A control command `sender` forwards to the meta leader `node_id`

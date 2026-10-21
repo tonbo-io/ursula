@@ -25,7 +25,6 @@ use openraft::error::Unreachable;
 use openraft::network::RPCOption;
 use openraft::raft::SnapshotResponse;
 use openraft::raft::TransferLeaderRequest;
-use openraft::vote::RaftLeaderId;
 use prost::Message;
 use serde::de::DeserializeOwned;
 use tokio::sync::OwnedSemaphorePermit;
@@ -331,18 +330,14 @@ pub(crate) enum RecoveryProbeError {
     Rpc(#[from] tonic::Status),
     #[error("recovery payload: {}", ErrorChain(.0))]
     Payload(#[from] crate::codec::WireDecodeError),
-    #[error("recovery peer does not report itself as committed leader")]
-    NotLeader,
     /// The address dialed serves another node now, which refused the
     /// barrier as meant for another node: no answer.
     #[error("the recovery peer's address serves node {node} now")]
     OtherNode { node: u64 },
-    /// The answer is about another group than the one asked about.
-    #[error("the recovery peer answered about plane {plane} group {raft_group_id}")]
-    OtherTarget { plane: i32, raft_group_id: u32 },
-    /// The answer's memberships are not a live leader's.
+    /// The answer failed the check every seam runs
+    /// ([`crate::BarrierAnswer::accept`]).
     #[error("recovery answer: {0}")]
-    Memberships(#[from] crate::memberships::MalformedMembership),
+    Answer(#[from] crate::BarrierAnswerRefusal),
     /// The peer's process fence refused the ask, or this node discarded its
     /// answer as from another process than the one it holds for the peer:
     /// no answer, asked again.
@@ -361,10 +356,8 @@ impl From<RecoveryProbeError> for crate::meta::confirm::BarrierFailure {
                 Self::Unreachable
             }
             RecoveryProbeError::Rpc(status) => Self::of_status(&status),
-            RecoveryProbeError::Payload(_)
-            | RecoveryProbeError::OtherTarget { .. }
-            | RecoveryProbeError::Memberships(_) => Self::Malformed,
-            RecoveryProbeError::NotLeader => Self::NotLeader,
+            RecoveryProbeError::Payload(_) => Self::Malformed,
+            RecoveryProbeError::Answer(refusal) => refusal.failure(),
             RecoveryProbeError::OtherNode { node } => Self::OtherNode {
                 node: ursula_proto::placement::NodeId::new(node),
             },
@@ -392,7 +385,7 @@ pub(crate) async fn confirm_quorum_prefix(
     Ok(QuorumPrefix {
         raft_group_id: placement.raft_group_id.0,
         leader_id,
-        leader_term: answer.vote.leader_id().term(),
+        leader_term: answer.vote.leader_id.term,
         required_applied_index: answer.index,
     })
 }
@@ -451,30 +444,21 @@ pub(crate) async fn probe_rejoin_vote_barrier(
             return Err(status.into());
         }
     };
-    // The answer must echo the target, and its memberships are required:
-    // empty bytes do not decode, and a membership without voters is refused,
-    // never read as an answer that a node is no member.
-    let target = network.raft_target();
-    if response.plane != i32::from(target.plane())
-        || response.raft_group_id != target.wire_group_id()
-    {
-        return Err(RecoveryProbeError::OtherTarget {
-            plane: response.plane,
-            raft_group_id: response.raft_group_id,
-        });
-    }
+    // The memberships are required: empty bytes do not decode. The answer
+    // then passes the check every seam runs (`BarrierAnswer::accept`).
     let vote: UrsulaVote = decode_wire(&response.vote, "rejoin barrier vote")?;
-    if !vote.is_committed() || *vote.leader_id().node_id() != leader_id {
-        return Err(RecoveryProbeError::NotLeader);
-    }
     let memberships: LeaderMemberships =
         decode_wire(&response.memberships, "rejoin barrier memberships")?;
-    memberships.check()?;
-    Ok(BarrierAnswer {
+    let answer = BarrierAnswer {
         vote,
         index: response.index,
         memberships,
-    })
+    };
+    let echoed = crate::EchoedTarget {
+        plane: response.plane,
+        raft_group_id: response.raft_group_id,
+    };
+    Ok(answer.accept(leader_id, network.raft_target(), echoed)?)
 }
 
 /// Asks `peer` with this node's genesis probe, at the cluster URL
@@ -4534,6 +4518,7 @@ mod barrier_asker_tests {
     use super::probe_rejoin_vote_barrier;
     use crate::codec::encode_wire;
     use crate::memberships::BarrierAnswer;
+    use crate::memberships::BarrierAnswerRefusal;
     use crate::memberships::LeaderMemberships;
     use crate::memberships::MalformedMembership;
     use crate::memberships::MembershipKind;
@@ -4758,9 +4743,11 @@ mod barrier_asker_tests {
         assert!(
             matches!(
                 error,
-                RecoveryProbeError::Memberships(MalformedMembership::EmptyVoterConfig {
-                    membership: MembershipKind::Committed,
-                })
+                RecoveryProbeError::Answer(BarrierAnswerRefusal::Memberships(
+                    MalformedMembership::EmptyVoterConfig {
+                        membership: MembershipKind::Committed,
+                    }
+                ))
             ),
             "{error:?}"
         );
@@ -4780,8 +4767,10 @@ mod barrier_asker_tests {
         assert!(
             matches!(
                 error,
-                RecoveryProbeError::OtherTarget { plane, raft_group_id }
-                    if plane == meta && raft_group_id == GROUP.0
+                RecoveryProbeError::Answer(BarrierAnswerRefusal::OtherTarget {
+                    plane,
+                    raft_group_id
+                }) if plane == meta && raft_group_id == GROUP.0
             ),
             "{error:?}"
         );
@@ -4794,13 +4783,36 @@ mod barrier_asker_tests {
         assert!(
             matches!(
                 error,
-                RecoveryProbeError::OtherTarget {
+                RecoveryProbeError::Answer(BarrierAnswerRefusal::OtherTarget {
                     plane,
                     raft_group_id: 4,
-                } if plane == i32::from(pb::RaftPlaneV1::Data)
+                }) if plane == i32::from(pb::RaftPlaneV1::Data)
             ),
             "{error:?}"
         );
+    }
+
+    /// An answer whose vote is not the asked leader's committed vote is
+    /// refused: a vote of another node, and one not committed.
+    #[tokio::test]
+    async fn an_answer_without_the_asked_leaders_committed_vote_is_refused() {
+        let other: UrsulaVote = openraft::Vote::new_committed(5, 3);
+        let uncommitted: UrsulaVote = openraft::Vote::new(5, LEADER);
+        for vote in [other, uncommitted] {
+            let error = ask(Script::Answer(pb::RejoinBarrierResponseV1 {
+                vote: encode_wire(&vote),
+                ..live_answer()
+            }))
+            .await
+            .expect_err("not the asked leader's committed vote");
+            assert!(
+                matches!(
+                    error,
+                    RecoveryProbeError::Answer(BarrierAnswerRefusal::NotLeader { leader: LEADER })
+                ),
+                "{vote:?}: {error:?}"
+            );
+        }
     }
 
     /// A misdelivery refusal names the node the address serves now, and is

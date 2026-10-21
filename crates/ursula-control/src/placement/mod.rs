@@ -12,7 +12,8 @@
 //! - `reconcile`: the group leader's membership planner, one voter per step
 //!   toward the placement's target.
 //! - `hosting`: what a node runs, creates and tears down, the teardown
-//!   steps, the seed role, and whom a node asks about a group.
+//!   steps, the seed role, whom a node asks about a group, and the one
+//!   voter predicate with its left mark.
 //! - `decommission`: the meta leader's moves off decommissioning nodes.
 //! - `admin`: the admin JSON types of the placement routes.
 //! - `samples` (tests and `test-support` only): one sample of every root.
@@ -62,14 +63,17 @@ pub use decommission::NodeEligibility;
 pub use decommission::free_slots;
 pub use decommission::plan_decommission;
 pub use hosting::Admission;
+pub use hosting::Asked;
 pub use hosting::CandidatesOf;
 pub use hosting::Counts;
 pub use hosting::HostingInput;
 pub use hosting::HostingPlan;
 pub use hosting::HostingStep;
 pub use hosting::LeaderCandidates;
+pub use hosting::LeftMark;
 pub use hosting::LocalLog;
 pub use hosting::LocalReplica;
+pub use hosting::ReplicaMembership;
 pub use hosting::SeedRoleOf;
 pub use hosting::Standing;
 pub use hosting::Teardown;
@@ -78,6 +82,7 @@ pub use hosting::TeardownEvent;
 pub use hosting::TeardownOutcome;
 pub use hosting::TeardownStep;
 pub use hosting::ViewInput;
+pub use hosting::counts_as_voter;
 pub use hosting::leader_candidates;
 pub use hosting::plan_hosting;
 pub use hosting::seed_role;
