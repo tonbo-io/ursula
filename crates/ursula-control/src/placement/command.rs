@@ -226,6 +226,47 @@ pub enum ControlError {
     Decommissioning { node: NodeId },
 }
 
+/// What a caller does after the state machine refused its command. Never
+/// encoded: a process classifies a refusal it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Requeue {
+    /// The same command may apply later, unchanged: retry it after a pause.
+    Retry,
+    /// The command was planned from a view the state has moved past:
+    /// confirm a view and plan again from it.
+    ConfirmView,
+    /// The command never applies as it is: stop asking.
+    Permanent,
+}
+
+impl ControlError {
+    /// What a caller does after this refusal (see [`Requeue`]). One
+    /// exhaustive match, so a new refusal names its class.
+    pub fn requeue(&self) -> Requeue {
+        match self {
+            Self::NotBootstrapped | Self::RetirementPending { .. } | Self::MoveLimit { .. } => {
+                Requeue::Retry
+            }
+            Self::StalePlacement { .. }
+            | Self::UnknownNode { .. }
+            | Self::GroupNotLive { .. }
+            | Self::NotMoving { .. }
+            | Self::IneligibleTarget { .. } => Requeue::ConfirmView,
+            Self::AlreadyBootstrapped
+            | Self::FormationCut
+            | Self::InvalidBootstrap { .. }
+            | Self::UnknownGroup { .. }
+            | Self::NodeRemoved { .. }
+            | Self::NoChange { .. }
+            | Self::ReplicationFactorChange { .. }
+            | Self::NotTarget { .. }
+            | Self::MetaVoter { .. }
+            | Self::ReservationAuthority
+            | Self::Decommissioning { .. } => Requeue::Permanent,
+        }
+    }
+}
+
 /// Why a `Bootstrap` is invalid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]

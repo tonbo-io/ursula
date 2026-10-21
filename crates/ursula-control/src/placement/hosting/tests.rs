@@ -12,6 +12,7 @@ use ursula_proto::placement::ViewStage;
 use ursula_shard::RaftGroupId;
 
 use super::Admission;
+use super::CandidatesOf;
 use super::Counts;
 use super::HostingInput;
 use super::HostingPlan;
@@ -299,7 +300,7 @@ fn leader_candidates_walk_the_placement_then_the_membership_then_the_peers() {
     driver.request_move(G1, &[1, 2, 3]).unwrap();
     let view = view_of(&driver);
     let peers = ids(&[1, 2, 3, 4, 5, 6]);
-    let outsider = leader_candidates(node(5), G1, &view, None, &peers);
+    let outsider = leader_candidates(node(5), CandidatesOf::Group(G1), &view, None, &peers);
     assert_eq!(outsider.tiers(), [
         ids(&[2, 3]),
         ids(&[4]),
@@ -315,7 +316,13 @@ fn leader_candidates_walk_the_placement_then_the_membership_then_the_peers() {
         voters: voters(&[2, 3, 4]),
         learners: ids(&[1, 7]),
     };
-    let member = leader_candidates(node(2), G1, &view, Some(&membership), &peers);
+    let member = leader_candidates(
+        node(2),
+        CandidatesOf::Group(G1),
+        &view,
+        Some(&membership),
+        &peers,
+    );
     assert_eq!(member.tiers(), [
         ids(&[3]),
         ids(&[4]),
@@ -323,10 +330,40 @@ fn leader_candidates_walk_the_placement_then_the_membership_then_the_peers() {
         ids(&[7]),
         ids(&[5, 6])
     ]);
-    let stable = leader_candidates(node(5), G0, &view, None, &peers);
+    let stable = leader_candidates(node(5), CandidatesOf::Group(G0), &view, None, &peers);
     assert_eq!(stable.first_tier(), Some(&ids(&[1, 2, 3])));
-    let blind = leader_candidates(node(5), G0, &PlacementView::empty(), None, &peers);
+    let blind = leader_candidates(
+        node(5),
+        CandidatesOf::Group(G0),
+        &PlacementView::empty(),
+        None,
+        &peers,
+    );
     assert_eq!(blind.tiers(), [ids(&[1, 2, 3, 4, 6])]);
+}
+
+/// The meta form asks meta's voters first, from the best source this node
+/// has: its local meta membership, else the bootstrapped view's meta
+/// voters, else its own claim. A form that skipped a source, or put the
+/// peers before the voters, orders the walk differently.
+#[test]
+fn meta_leader_candidates_ask_the_meta_voters_from_the_best_source_first() {
+    let claimed = voters(&[4, 5, 6]);
+    let peers = ids(&[1, 2, 3, 4, 5, 6, 7]);
+    let meta = CandidatesOf::Meta { claimed: &claimed };
+    let forming = leader_candidates(node(7), meta, &PlacementView::empty(), None, &peers);
+    assert_eq!(forming.tiers(), [ids(&[4, 5, 6]), ids(&[1, 2, 3])]);
+    // Bootstrapped with meta voters {1,2,3}: the view outranks the claim.
+    let view = view_of(&Driver::live(&[1, 2, 3, 4], 4, 3));
+    let bootstrapped = leader_candidates(node(7), meta, &view, None, &peers);
+    assert_eq!(bootstrapped.tiers(), [ids(&[1, 2, 3]), ids(&[4, 5, 6])]);
+    // The local membership outranks both, its learners come next.
+    let membership = MembershipConfig::Uniform {
+        voters: voters(&[2, 5]),
+        learners: ids(&[7, 3]),
+    };
+    let member = leader_candidates(node(7), meta, &view, Some(&membership), &peers);
+    assert_eq!(member.tiers(), [ids(&[2, 5]), ids(&[3]), ids(&[1, 4, 6])]);
 }
 
 #[test]

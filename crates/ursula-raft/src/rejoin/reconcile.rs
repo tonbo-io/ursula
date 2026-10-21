@@ -141,6 +141,13 @@ impl PeerGates for NoPeerGates {
 pub(crate) enum PendingStep {
     None,
     /// A step's future has not answered.
+    #[cfg_attr(
+        not(all(test, not(madsim))),
+        expect(
+            dead_code,
+            reason = "the shell plans nothing while a step is pending, so only its tests plan under one"
+        )
+    )]
     Step,
     /// The shell's own leadership transfer to `to` has not settled.
     Transfer {

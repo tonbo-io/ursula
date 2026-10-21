@@ -80,6 +80,25 @@ pub struct MetaLeaderReport {
     pub oldest_move_age_ms: Option<u64>,
 }
 
+/// Why this node runs no meta replica in this run, while it keeps its meta
+/// directory for the operator (design 12.2). Closed: a reader of the same
+/// minor knows every variant, and a new one comes only with a new minor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaDamageKind {
+    /// The meta journal could not be read or opened at start.
+    Journal,
+    /// The meta snapshot record's pointer is not the meta group's own.
+    Pointer,
+    /// The meta snapshot record did not restore against the meta log.
+    Restore,
+    /// The meta Raft or its recovery gate did not start.
+    Start,
+    /// The commit screen refused, for good, what the current meta leader
+    /// sent: this replica holds committed entries the group no longer has.
+    CommitScreen,
+}
+
 /// `POST /__ursula/placement/groups/{group}/move`: move the group to `to`
 /// when its placement is still at `expected`. A cancel names the move's
 /// source.

@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
+use ursula_control::GroupPlacement;
 use ursula_control::PlacementView;
+use ursula_shard::RaftGroupId;
 
 use crate::rt::sync::watch;
 
@@ -53,5 +55,43 @@ impl PlacementWatch {
     /// `false` once the publisher is gone.
     pub async fn changed(&mut self) -> bool {
         self.0.changed().await.is_ok()
+    }
+}
+
+/// A reader of one data group's placement in this node's views.
+#[derive(Debug, Clone)]
+pub struct GroupPlacementWatch {
+    watch: PlacementWatch,
+    group: RaftGroupId,
+}
+
+impl GroupPlacementWatch {
+    pub fn new(watch: PlacementWatch, group: RaftGroupId) -> Self {
+        Self { watch, group }
+    }
+
+    pub fn group(&self) -> RaftGroupId {
+        self.group
+    }
+
+    /// The latest view published, which a reader takes as current only
+    /// with a confirmation.
+    pub fn view(&self) -> Arc<PlacementView> {
+        self.watch.current()
+    }
+
+    /// The group's placement in the latest view, `None` before Bootstrap.
+    pub fn current(&self) -> Option<GroupPlacement> {
+        self.watch
+            .current()
+            .cluster()
+            .and_then(|cluster| cluster.group(self.group))
+            .cloned()
+    }
+
+    /// Waits until a view is published after the one this watch last saw.
+    /// `false` once the publisher is gone.
+    pub async fn changed(&mut self) -> bool {
+        self.watch.changed().await
     }
 }

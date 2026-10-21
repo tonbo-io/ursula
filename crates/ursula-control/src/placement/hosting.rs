@@ -20,6 +20,7 @@ use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::TeardownStage;
+use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
 use super::reconcile::MembershipConfig;
@@ -388,29 +389,52 @@ impl LeaderCandidates {
     }
 }
 
-/// Who `me` asks about `group`, from its placement view (confirmed or
-/// not), the membership of its open replica if any, and the ids of
+/// Whose leader a node looks for: a data group's, or the meta group's with
+/// the meta voters this node claims at genesis.
+#[derive(Debug, Clone, Copy)]
+pub enum CandidatesOf<'a> {
+    Group(RaftGroupId),
+    Meta { claimed: &'a VoterSet },
+}
+
+/// Who `me` asks about a group's leader, from its placement view (confirmed
+/// or not), the membership of its open replica if any, and the ids of
 /// `raft.peers`.
+///
+/// For a data group the first tiers come from its placement. For the meta
+/// group the first tier is meta's voters: the voters of the local meta
+/// membership, else the view's `meta_voters` once bootstrapped, else the
+/// claimed ones. Then come the other members of the local membership, then
+/// every other peer.
 pub fn leader_candidates(
     me: NodeId,
-    group: RaftGroupId,
+    of: CandidatesOf<'_>,
     view: &PlacementView,
     membership: Option<&MembershipConfig>,
     peers: &BTreeSet<NodeId>,
 ) -> LeaderCandidates {
     let mut candidates = LeaderCandidates::default();
-    if let Some(placement) = view.cluster().and_then(|cluster| cluster.group(group)) {
-        match placement.moving() {
-            Some(moving) => {
-                candidates.push(
-                    me,
-                    moving.from.iter().filter(|node| moving.to.contains(*node)),
-                );
-                candidates.push(me, moving.from.iter());
-                candidates.push(me, moving.to.iter());
+    match of {
+        CandidatesOf::Group(group) => {
+            if let Some(placement) = view.cluster().and_then(|cluster| cluster.group(group)) {
+                match placement.moving() {
+                    Some(moving) => {
+                        candidates.push(
+                            me,
+                            moving.from.iter().filter(|node| moving.to.contains(*node)),
+                        );
+                        candidates.push(me, moving.from.iter());
+                        candidates.push(me, moving.to.iter());
+                    }
+                    None => candidates.push(me, placement.current_voters().iter()),
+                }
             }
-            None => candidates.push(me, placement.current_voters().iter()),
         }
+        CandidatesOf::Meta { claimed } => match (membership, view.cluster()) {
+            (Some(membership), _) => candidates.push(me, membership.voters()),
+            (None, Some(cluster)) => candidates.push(me, cluster.params().meta_voters.iter()),
+            (None, None) => candidates.push(me, claimed.iter()),
+        },
     }
     if let Some(membership) = membership {
         candidates.push(me, membership.members());
