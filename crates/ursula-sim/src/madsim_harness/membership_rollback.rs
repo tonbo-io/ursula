@@ -786,8 +786,13 @@ async fn recover(
                 state.plans_sent = state.plans_sent.saturating_add(1);
                 first.get_or_insert(plan);
                 cluster.plan_leaders.insert(plan.leader);
-                let mut sent =
-                    send_plan(&mut SimPlanTransport { cluster, group }, plan, &members).await;
+                let mut sent = send_plan(
+                    &mut SimPlanTransport { cluster, group },
+                    plan,
+                    ursula_proto::admin::PlanFloor::Seeded,
+                    &members,
+                )
+                .await;
                 if let Ok(sent) = &mut sent {
                     for error in &sent.refused {
                         tracing::info!(%error, group, "a member refused the plan");
@@ -816,6 +821,7 @@ async fn recover(
                 let sent = send_follows(
                     &mut SimPlanTransport { cluster, group },
                     plan,
+                    ursula_proto::admin::PlanFloor::Seeded,
                     leader_term,
                     &members,
                 )

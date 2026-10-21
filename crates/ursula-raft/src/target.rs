@@ -76,6 +76,12 @@ pub(crate) trait WireTarget: Sized {
     /// OpenRaft sees it.
     fn admits(self, command: &RaftCommand) -> bool;
 
+    /// Whether a recovery plan of this target may carry `floor`: a data
+    /// group's plan takes `seeded`, the meta group's `meta`. The only plane
+    /// predicate of a plan floor: a plan of the other plane is refused
+    /// before its job runs ([`crate::RecoveryGateError::FloorOtherPlane`]).
+    fn takes_floor(self, floor: ursula_proto::admin::PlanFloor) -> bool;
+
     /// Writes this target and `target_node` into `request`: the one encoder
     /// of the plane, group and target node of every Raft request.
     fn stamp<R: TargetedRequest>(self, target_node: u64, request: &mut R);
@@ -113,6 +119,14 @@ impl WireTarget for RaftTarget {
         match (self, command) {
             (Self::Data(_), RaftCommand::Stream(_)) | (Self::Meta, RaftCommand::Meta(_)) => true,
             (Self::Data(_), RaftCommand::Meta(_)) | (Self::Meta, RaftCommand::Stream(_)) => false,
+        }
+    }
+
+    fn takes_floor(self, floor: ursula_proto::admin::PlanFloor) -> bool {
+        use ursula_proto::admin::PlanFloor;
+        match (self, floor) {
+            (Self::Data(_), PlanFloor::Seeded) | (Self::Meta, PlanFloor::Meta) => true,
+            (Self::Data(_), PlanFloor::Meta) | (Self::Meta, PlanFloor::Seeded) => false,
         }
     }
 

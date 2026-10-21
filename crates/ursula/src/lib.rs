@@ -1300,31 +1300,25 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(check_backup_group_cold_objects),
         )
         .route(
-            "/__ursula/raft/{raft_group_id}/snapshot",
+            "/__ursula/raft/{target}/snapshot",
             post(trigger_raft_snapshot),
         )
+        .route("/__ursula/raft/{target}/purge", post(trigger_raft_purge))
         .route(
-            "/__ursula/raft/{raft_group_id}/purge",
-            post(trigger_raft_purge),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/membership",
+            "/__ursula/raft/{target}/membership",
             post(change_raft_membership),
         )
         .route(
-            "/__ursula/raft/{raft_group_id}/leader/transfer/{node_id}",
+            "/__ursula/raft/{target}/leader/transfer/{node_id}",
             post(transfer_raft_leader),
         )
+        .route("/__ursula/raft/{target}/quorum", get(confirm_raft_quorum))
         .route(
-            "/__ursula/raft/{raft_group_id}/quorum",
-            get(confirm_raft_quorum),
-        )
-        .route(
-            "/__ursula/raft/{raft_group_id}/self-election",
+            "/__ursula/raft/{target}/self-election",
             post(request_raft_self_election),
         )
         .route(
-            "/__ursula/raft/{raft_group_id}/recovery/accept-unsynced-loss",
+            "/__ursula/raft/{target}/recovery/accept-unsynced-loss",
             post(accept_unsynced_loss),
         )
         .route(
@@ -2629,10 +2623,18 @@ const ADMIN_SNAPSHOT_PUBLISH_WAIT: Duration = Duration::from_secs(10);
 
 pub(crate) async fn trigger_raft_snapshot(
     State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
+    Path(target): Path<String>,
 ) -> Response {
+    let target = match parse_raft_target(&target) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
     let Some(registry) = state.raft_registry() else {
         return *no_raft_registry();
+    };
+    let raft_group_id = match target {
+        ursula_raft::RaftTarget::Meta => return trigger_meta_snapshot(registry).await,
+        ursula_raft::RaftTarget::Data(group) => group,
     };
     let (raft_group_id, raft) = match resolve_registered_raft_group(registry, raft_group_id) {
         Ok(resolved) => resolved,
@@ -2725,11 +2727,61 @@ pub(crate) async fn trigger_raft_snapshot(
         .into_response()
 }
 
+/// An operator's snapshot of the meta group: its inline snapshot, which
+/// takes no build permit of the data groups, covering what meta had
+/// applied when the request arrived.
+async fn trigger_meta_snapshot(registry: &RaftGroupHandleRegistry) -> Response {
+    let Some(raft) = registry.meta_raft() else {
+        return *no_meta_replica();
+    };
+    let snapshot_log_id = raft.metrics().borrow_watched().last_applied;
+    if let Err(err) = raft.trigger().snapshot().await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("trigger meta snapshot: {err}"),
+        )
+            .into_response();
+    }
+    if let Some(wanted) = snapshot_log_id
+        && let Err(err) = raft
+            .wait(Some(ADMIN_SNAPSHOT_PUBLISH_WAIT))
+            .metrics(
+                |metrics| {
+                    metrics
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| snapshot >= &wanted)
+                },
+                format!("admin meta snapshot .snapshot >= {wanted}"),
+            )
+            .await
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("wait for meta snapshot: {err}"),
+        )
+            .into_response();
+    }
+    let metrics = raft.metrics().borrow_watched().clone();
+    (
+        StatusCode::OK,
+        axum::Json(ursula_proto::admin::SnapshotResponse {
+            raft_group_id: ursula_raft::meta::state_machine::META_GROUP.0,
+            snapshot_index: metrics.snapshot.map(|log_id| log_id.index),
+        }),
+    )
+        .into_response()
+}
+
 pub(crate) async fn trigger_raft_purge(
     State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
+    Path(target): Path<String>,
     axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::PurgeQuery>,
 ) -> Response {
+    let raft_group_id = match data_group_target(&target, "purge") {
+        Ok(group) => group,
+        Err(response) => return *response,
+    };
     let upto = query.upto;
     let Some(registry) = state.raft_registry() else {
         return *no_raft_registry();
@@ -2819,9 +2871,13 @@ fn membership_no_leader_response(operation: &str) -> Response {
 
 pub(crate) async fn change_raft_membership(
     State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
+    Path(target): Path<String>,
     axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::MembershipQuery>,
 ) -> Response {
+    let raft_group_id = match data_group_target(&target, "membership") {
+        Ok(group) => group,
+        Err(response) => return *response,
+    };
     let voters = match parse_voter_ids(&query.voters) {
         Ok(voters) => voters,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
@@ -2907,19 +2963,38 @@ pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
 
 pub(crate) async fn transfer_raft_leader(
     State(state): State<HttpState>,
-    Path((raft_group_id, node_id)): Path<(u64, u64)>,
+    Path((target, node_id)): Path<(String, u64)>,
 ) -> Response {
     use ursula_proto::admin::TransferLeaderResponse;
 
-    let (group, raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
+    let target = match parse_raft_target(&target) {
+        Ok(target) => target,
         Err(response) => return *response,
     };
     let Some(registry) = state.raft_registry() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return *no_raft_registry();
     };
-    let metrics = raft.metrics().borrow_watched().clone();
-    match registry.transfer_leader(group, node_id).await {
+    let (raft_group_id, metrics) = match target {
+        ursula_raft::RaftTarget::Meta => match registry.meta_raft() {
+            Some(raft) => (
+                ursula_raft::meta::state_machine::META_GROUP,
+                raft.metrics().borrow_watched().clone(),
+            ),
+            None => return *no_meta_replica(),
+        },
+        ursula_raft::RaftTarget::Data(group) => {
+            match resolve_registered_raft_group(registry, group) {
+                Ok((group, raft)) => (group, raft.metrics().borrow_watched().clone()),
+                Err(response) => return *response,
+            }
+        }
+    };
+    let transferred = match target {
+        ursula_raft::RaftTarget::Meta => registry.transfer_meta_leader(node_id).await,
+        ursula_raft::RaftTarget::Data(group) => registry.transfer_leader(group, node_id).await,
+    };
+    let raft_group_id = u64::from(raft_group_id.0);
+    match transferred {
         Ok(()) => axum::Json(TransferLeaderResponse {
             raft_group_id,
             from: Some(metrics.id),
@@ -2986,25 +3061,31 @@ fn transfer_raft_error_response(
 
 async fn confirm_raft_quorum(
     State(state): State<HttpState>,
-    Path(group): Path<u64>,
+    Path(target): Path<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
     if let Some(response) = reject_admin_incarnation(&state, &headers) {
         return response;
     }
-    let (group, _) = match resolve_raft_group(&state, group) {
-        Ok(resolved) => resolved,
+    let target = match parse_raft_target(&target) {
+        Ok(target) => target,
         Err(response) => return *response,
     };
     let Some(registry) = state.raft_registry() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return *no_raft_registry();
     };
-    match http_time::timeout(
-        Duration::from_secs(10),
-        registry.confirm_quorum_prefix(group),
-    )
-    .await
-    {
+    let confirmed = match target {
+        ursula_raft::RaftTarget::Meta => {
+            futures_util::FutureExt::boxed(registry.confirm_meta_quorum_prefix())
+        }
+        ursula_raft::RaftTarget::Data(group) => {
+            if let Err(response) = resolve_registered_raft_group(registry, group) {
+                return *response;
+            }
+            futures_util::FutureExt::boxed(registry.confirm_quorum_prefix(group))
+        }
+    };
+    match http_time::timeout(Duration::from_secs(10), confirmed).await {
         Ok(Ok(proof)) => axum::Json(proof).into_response(),
         Ok(Err(error)) => {
             let status = match &error {
@@ -3031,20 +3112,32 @@ use ursula_proto::admin::SelfElectionRequest;
 /// startup, answers `404 Not Found`.
 async fn request_raft_self_election(
     State(state): State<HttpState>,
-    Path(group_id): Path<u64>,
+    Path(target): Path<String>,
     axum::Json(request): axum::Json<SelfElectionRequest>,
 ) -> Response {
-    let (group_id, _raft) = match resolve_raft_group(&state, group_id) {
-        Ok(resolved) => resolved,
+    let target = match parse_raft_target(&target) {
+        Ok(target) => target,
         Err(response) => return *response,
     };
     let Some(registry) = state.raft_registry() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return *no_raft_registry();
     };
-    let Err(error) = registry
-        .request_self_election(group_id, request.current_term)
-        .await
-    else {
+    let elected = match target {
+        ursula_raft::RaftTarget::Meta => {
+            registry
+                .request_meta_self_election(request.current_term)
+                .await
+        }
+        ursula_raft::RaftTarget::Data(group) => {
+            if let Err(response) = resolve_registered_raft_group(registry, group) {
+                return *response;
+            }
+            registry
+                .request_self_election(group, request.current_term)
+                .await
+        }
+    };
+    let Err(error) = elected else {
         return StatusCode::NO_CONTENT.into_response();
     };
     let status = match &error {
@@ -3075,9 +3168,11 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
 
 /// Operator recovery when a majority of a group's voters are gated after a
 /// crash may have cost them their unsynced tail: this replica takes a
-/// recovery plan (#581 section 4.5). The plan names its leader, the point
-/// the leader's log reaches, whether every member cuts its log to what it
-/// knew was committed, and this replica's log as the tool read it. A
+/// recovery plan (#581 section 4.5), of a data group or of the meta group
+/// (`/__ursula/raft/meta/...`), whose `floor` must be of the target's
+/// plane. The plan names its leader, the point the leader's log reaches,
+/// whether every member cuts its log to what it knew was committed, and
+/// this replica's log as the tool read it. A
 /// replica that follows a live leader, holds another log, or committed above
 /// the point refuses with `409 Conflict` and changes nothing; a 0.7 body is
 /// refused with `422`. A plan that cuts the logs restarts the group's
@@ -3087,42 +3182,69 @@ pub(crate) fn parse_raft_group_id(raw: u64) -> Result<RaftGroupId, std::num::Try
 /// host crash").
 pub(crate) async fn accept_unsynced_loss(
     State(state): State<HttpState>,
-    Path(raft_group_id): Path<u64>,
+    Path(target): Path<String>,
     axum::Json(plan): axum::Json<ursula_proto::admin::RecoveryPlanRequest>,
 ) -> Response {
-    let (raft_group_id, _raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
+    let target = match parse_raft_target(&target) {
+        Ok(target) => target,
         Err(response) => return *response,
     };
     let Some(registry) = state.raft_registry() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "raft registry is not configured for this server",
-        )
-            .into_response();
+        return *no_raft_registry();
+    };
+    let raft_group_id = match target {
+        ursula_raft::RaftTarget::Meta => ursula_raft::meta::state_machine::META_GROUP,
+        ursula_raft::RaftTarget::Data(group) => {
+            if let Err(response) = resolve_registered_raft_group(registry, group) {
+                return *response;
+            }
+            group
+        }
     };
     // The node's own id: the one its config names, or its replica's.
-    let Some(node_id) = state.configured_node_id.or_else(|| {
-        registry
-            .rejoin(raft_group_id)
-            .map(|rejoin| rejoin.node_id())
+    let Some(node_id) = state.configured_node_id.or_else(|| match target {
+        ursula_raft::RaftTarget::Meta => registry
+            .meta_raft()
+            .map(|raft| raft.metrics().borrow_watched().id),
+        ursula_raft::RaftTarget::Data(group) => {
+            registry.rejoin(group).map(|rejoin| rejoin.node_id())
+        }
     }) else {
-        let err = ursula_raft::RecoveryGateError::NotRegistered {
-            group: ursula_shard::RaftTarget::Data(raft_group_id),
-        };
+        let err = ursula_raft::RecoveryGateError::NotRegistered { group: target };
         return (StatusCode::NOT_FOUND, err.to_string()).into_response();
     };
-    // The admin fence runs this handler in a task of its own, so a client
-    // that goes away cancels neither the plan nor the group's restart, and
-    // the registry runs the plan's job in its own task too (m1, #581
-    // review).
-    let mut restart = RuntimeReplicaRestart {
-        runtime: state.runtime.clone(),
-        registry: registry.clone(),
+    let plans = match target {
+        ursula_raft::RaftTarget::Meta => match state.meta().plans() {
+            Some(plans) => Some(plans),
+            None => return *no_meta_replica(),
+        },
+        ursula_raft::RaftTarget::Data(_) => None,
     };
-    let accepted = registry
-        .accept_recovery_plan(raft_group_id, &plan, &mut restart)
-        .await;
+    // The plan runs in a task of its own, so a client that goes away
+    // cancels neither the plan nor the restart of its cut, and the registry
+    // runs the plan's job in its own task too (m1, #581 review).
+    let job = {
+        let runtime = state.runtime.clone();
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            match plans {
+                Some(plans) => plans.accept_recovery_plan(&plan).await,
+                None => {
+                    let mut restart = RuntimeReplicaRestart {
+                        runtime,
+                        registry: registry.clone(),
+                    };
+                    registry
+                        .accept_recovery_plan(raft_group_id, &plan, &mut restart)
+                        .await
+                }
+            }
+        })
+    };
+    let accepted = job
+        .await
+        .map_err(|_aborted| ursula_raft::RecoveryGateError::JobAborted { group: target })
+        .and_then(|accepted| accepted);
     let err = match accepted {
         Ok(report) => return (StatusCode::OK, axum::Json(report)).into_response(),
         Err(err) => err,
@@ -3197,18 +3319,57 @@ fn snapshot_not_started(err: &SnapshotStartError<Fatal<UrsulaRaftTypeConfig>>) -
     }
 }
 
-/// Resolves the raft registry, parses the group id, and looks up the live group
-/// handle — the preamble shared by every raft admin endpoint. Returns the
-/// appropriate error response (`400`/`404`) when any step fails, so handlers can
-/// `?`-style early-return and focus on their actual operation.
+/// The `{target}` of a `/__ursula/raft/{target}/...` route: `meta`, the
+/// meta group, or a data group's id. `400` for anything else.
+fn parse_raft_target(raw: &str) -> Result<ursula_raft::RaftTarget, Box<Response>> {
+    if raw == "meta" {
+        return Ok(ursula_raft::RaftTarget::Meta);
+    }
+    raw.parse::<u32>()
+        .map(|group| ursula_raft::RaftTarget::Data(RaftGroupId(group)))
+        .map_err(|_invalid| {
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    "invalid raft target: `meta` or a raft group id",
+                )
+                    .into_response(),
+            )
+        })
+}
+
+/// The data group of a route that serves data groups only: `400` for
+/// `meta`, as for any invalid target.
+fn data_group_target(raw: &str, route: &str) -> Result<RaftGroupId, Box<Response>> {
+    match parse_raft_target(raw)? {
+        ursula_raft::RaftTarget::Data(group) => Ok(group),
+        ursula_raft::RaftTarget::Meta => Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("the {route} route serves data groups only, not `meta`"),
+            )
+                .into_response(),
+        )),
+    }
+}
+
+/// Resolves the raft registry and looks up the live group handle, the
+/// preamble of the data-group raft admin routes: `400` without a registry
+/// and `404` for a group the node does not run.
 fn resolve_raft_group(
     state: &HttpState,
-    raft_group_id: u64,
+    raft_group_id: RaftGroupId,
 ) -> Result<(RaftGroupId, OwnerRaftHandle), Box<Response>> {
     let Some(registry) = state.raft_registry() else {
         return Err(no_raft_registry());
     };
     resolve_registered_raft_group(registry, raft_group_id)
+}
+
+/// The answer of a meta route on a node that runs no meta replica: the
+/// zero-config in-memory node, a damaged one, or one that shuts down.
+fn no_meta_replica() -> Box<Response> {
+    Box::new((StatusCode::NOT_FOUND, "this node runs no meta replica").into_response())
 }
 
 fn no_raft_registry() -> Box<Response> {
@@ -3221,17 +3382,12 @@ fn no_raft_registry() -> Box<Response> {
     )
 }
 
-/// The group `raft_group_id` of `registry`: `400` for an id out of range,
-/// and `404` for a group the node does not run.
+/// The group `raft_group_id` of `registry`: `404` for a group the node
+/// does not run.
 fn resolve_registered_raft_group(
     registry: &RaftGroupHandleRegistry,
-    raft_group_id: u64,
+    raft_group_id: RaftGroupId,
 ) -> Result<(RaftGroupId, OwnerRaftHandle), Box<Response>> {
-    let Ok(raft_group_id) = parse_raft_group_id(raft_group_id) else {
-        return Err(Box::new(
-            (StatusCode::BAD_REQUEST, "invalid raft group id").into_response(),
-        ));
-    };
     let Some(raft) = registry.get(raft_group_id) else {
         return Err(Box::new(
             (StatusCode::NOT_FOUND, "raft group is not registered").into_response(),

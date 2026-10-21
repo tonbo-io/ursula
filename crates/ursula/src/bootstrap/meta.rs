@@ -23,6 +23,7 @@ use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
 use ursula_raft::meta::formation::FormationParams;
 use ursula_raft::meta::replica::MetaSnapshotTrigger;
+use ursula_raft::meta::runtime::GrpcMetaPlans;
 use ursula_raft::meta::runtime::GrpcMetaRuntime;
 use ursula_raft::meta::runtime::MetaJournal;
 use ursula_raft::meta::runtime::MetaRuntimeConfig;
@@ -122,6 +123,16 @@ impl MetaSlot {
             .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|meta| meta.runtime.status_reader().clone())
+    }
+
+    /// Where the meta replica's recovery plans go, while the meta runtime
+    /// runs.
+    pub(crate) fn plans(&self) -> Option<GrpcMetaPlans> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|meta| meta.runtime.plans())
     }
 
     /// Reads the meta runtime, if it still runs.

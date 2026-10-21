@@ -759,6 +759,14 @@ pub enum RecoveryGateError {
         leader_term: u64,
         current_term: u64,
     },
+    #[error(
+        "{group}'s recovery plan carries the floor {floor:?} of the other plane: a data \
+         group takes `seeded`, the meta group `meta`"
+    )]
+    FloorOtherPlane {
+        group: RaftTarget,
+        floor: ursula_proto::admin::PlanFloor,
+    },
     #[error("restart {group}'s replica to run its recovery cut: {source}")]
     Restart {
         group: RaftTarget,
@@ -849,6 +857,7 @@ impl RecoveryGateError {
             Self::PlanInFlight { .. } => RecoveryPlanRefusal::PlanInFlight,
             Self::SingleVoterCut { .. } => RecoveryPlanRefusal::SingleVoterCut,
             Self::PlanTermBelowVote { .. } => RecoveryPlanRefusal::PlanTermBelowVote,
+            Self::FloorOtherPlane { .. } => RecoveryPlanRefusal::FloorOtherPlane,
             Self::NotRegistered { .. } => return PlanAnswer::NotRegistered,
             // A restart that failed for a reason that passes is retryable,
             // as one refused while the group's previous engine still stops
@@ -2989,6 +2998,7 @@ mod tests {
         let plan =
             |leader, point, cut, last_log_index, last_log_term, current_term| RecoveryPlanRequest {
                 point_entry: None,
+                floor: ursula_proto::admin::PlanFloor::Seeded,
                 leader,
                 point,
                 cut,

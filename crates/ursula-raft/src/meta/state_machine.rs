@@ -74,7 +74,7 @@ use crate::types::UrsulaSnapshot;
 
 /// The meta group's id, in its own namespace: the wire, the journal and
 /// the snapshot record name it group 0.
-pub(crate) const META_GROUP: RaftGroupId = RaftGroupId(0);
+pub const META_GROUP: RaftGroupId = RaftGroupId(0);
 
 /// The meta log id of the entry at `log_id`: its term, its leader and its
 /// index.

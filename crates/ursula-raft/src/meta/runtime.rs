@@ -26,8 +26,9 @@
 //! operator's step.
 //!
 //! [`MetaRuntime::status_reader`] reads the node's placement status
-//! ([`super::status`]), and [`MetaRuntime::pauses`] holds the pause points
-//! tests stop the runtime at ([`super::pause`]).
+//! ([`super::status`]), [`MetaRuntime::plans`] takes the meta replica's
+//! recovery plans ([`MetaPlans`]), and [`MetaRuntime::pauses`] holds the
+//! pause points tests stop the runtime at ([`super::pause`]).
 //!
 //! Generic over the network and the recovery transport, so a simulation
 //! runs it in process.
@@ -291,29 +292,15 @@ where
         &self.pauses
     }
 
-    /// A recovery plan on this node's meta replica
-    /// ([`RaftGroupHandleRegistry::accept_meta_recovery_plan`]), which
-    /// restarts the replica with its tasks when the plan cuts its log. A
-    /// restart that does not reopen the replica leaves the runtime
-    /// `Damaged`.
-    pub async fn accept_recovery_plan(
-        &self,
-        plan: &RecoveryPlanRequest,
-    ) -> Result<RecoveryPlanReport, RecoveryGateError> {
-        let mut replica = self.replica.lock().await;
-        let restart = replica.as_mut().ok_or(RecoveryGateError::NotRegistered {
-            group: RaftTarget::Meta,
-        })?;
-        let accepted = self.registry.accept_meta_recovery_plan(plan, restart).await;
-        if let Err(RecoveryGateError::MetaRestart { source }) = &accepted {
-            // The restart stopped the old replica, which unpublished it, and
-            // no new one opened: the replica held here runs nothing.
-            let kind = opening_damage(source);
-            tracing::error!(%source, ?kind, "meta runtime: the meta replica did not reopen after a recovery plan; this node runs no meta replica");
-            *replica = None;
-            mark_damaged(&self.state, &self.registry, kind, source);
+    /// Where recovery plans of this node's meta replica go, apart from the
+    /// runtime, so the admin route takes plans while shutdown owns the
+    /// runtime. A plan after shutdown finds no replica.
+    pub fn plans(&self) -> MetaPlans<N> {
+        MetaPlans {
+            replica: Arc::clone(&self.replica),
+            registry: self.registry.clone(),
+            state: self.state.clone(),
         }
-        accepted
     }
 
     /// Stops the node tasks, then the meta replica with its own tasks.
@@ -338,6 +325,64 @@ where
 
 /// A server node's meta runtime, over gRPC.
 pub type GrpcMetaRuntime = MetaRuntime<crate::GrpcRaftNetworkFactory>;
+
+/// Takes recovery plans on this node's meta replica
+/// ([`MetaRuntime::plans`]).
+pub struct MetaPlans<N> {
+    replica: Arc<Mutex<Option<MetaReplicaRestart<N>>>>,
+    registry: RaftGroupHandleRegistry,
+    state: watch::Sender<MetaRuntimeState>,
+}
+
+impl<N> Clone for MetaPlans<N> {
+    fn clone(&self) -> Self {
+        Self {
+            replica: Arc::clone(&self.replica),
+            registry: self.registry.clone(),
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl<N> std::fmt::Debug for MetaPlans<N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetaPlans").finish_non_exhaustive()
+    }
+}
+
+impl<N> MetaPlans<N>
+where
+    N: RaftNetworkFactory<C> + Clone + Send + Sync + 'static,
+    N::Network: openraft::RaftNetworkV2<C, SnapshotData = SnapshotData>,
+{
+    /// A recovery plan on this node's meta replica
+    /// ([`RaftGroupHandleRegistry::accept_meta_recovery_plan`]), which
+    /// restarts the replica with its tasks when the plan cuts its log. A
+    /// restart that does not reopen the replica leaves the runtime
+    /// `Damaged`.
+    pub async fn accept_recovery_plan(
+        &self,
+        plan: &RecoveryPlanRequest,
+    ) -> Result<RecoveryPlanReport, RecoveryGateError> {
+        let mut replica = self.replica.lock().await;
+        let restart = replica.as_mut().ok_or(RecoveryGateError::NotRegistered {
+            group: RaftTarget::Meta,
+        })?;
+        let accepted = self.registry.accept_meta_recovery_plan(plan, restart).await;
+        if let Err(RecoveryGateError::MetaRestart { source }) = &accepted {
+            // The restart stopped the old replica, which unpublished it, and
+            // no new one opened: the replica held here runs nothing.
+            let kind = opening_damage(source);
+            tracing::error!(%source, ?kind, "meta runtime: the meta replica did not reopen after a recovery plan; this node runs no meta replica");
+            *replica = None;
+            mark_damaged(&self.state, &self.registry, kind, source);
+        }
+        accepted
+    }
+}
+
+/// [`MetaPlans`] of a server node, over gRPC.
+pub type GrpcMetaPlans = MetaPlans<crate::GrpcRaftNetworkFactory>;
 
 impl GrpcMetaRuntime {
     /// Starts a server node's meta runtime over gRPC: meta's own transport

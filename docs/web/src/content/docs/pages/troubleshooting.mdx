@@ -229,7 +229,8 @@ If the stalled replicas retain their voting history, an operator can accept
 the loss of writes acknowledged after the last `fsync` with a recovery plan,
 sent through `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` to
 the plan's leader first and then to every other replica that answers, with the
-leader's plan term (`ursulactl recover-group --accept-loss` does both). The plan starts a new history of
+leader's plan term (`ursulactl recover-group --accept-loss` does both). Recover the meta group first
+(`--target meta`): a data group's plan needs a confirmed meta view. The plan starts a new history of
 the group, so every stream of the group gets a new `Stream-Incarnation`. A
 voter of the group that was never gated does not report `recovery_stalled`. It
 answers `raft_replica_unready` with `leader_unknown` for the group. See

@@ -62,10 +62,11 @@ enum Command {
     /// Restore a verified backup into a fresh, empty cluster with the same
     /// raft group count.
     Restore(BackupCreateArgs),
-    /// Accept the unsynced loss of one stalled group: plan it from every
-    /// reachable replica, send the plan to its leader first and then to the
-    /// other members, and wait until its history event applied. A plan that
-    /// wedges is planned again.
+    /// Accept the unsynced loss of one stalled group, the meta group or a
+    /// data group: plan it from every reachable replica, send the plan to
+    /// its leader first and then to the other members, and wait until its
+    /// history event applied. A plan that wedges is planned again. Recover
+    /// meta first: a data group's plan needs a confirmed meta view.
     RecoverGroup(RecoverGroupArgs),
 }
 
@@ -74,9 +75,9 @@ struct RecoverGroupArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// The stalled raft group.
+    /// The stalled group: `meta`, or a data group's id.
     #[arg(long)]
-    group: u64,
+    target: ursula_ctl::recovery::RecoverTarget,
     /// Plans to send at most, the first included.
     #[arg(long, default_value_t = 3)]
     max_plans: usize,
@@ -490,15 +491,13 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
         accept_timeout: Duration::from_secs(args.accept_timeout_secs),
         accept_loss: args.accept_loss,
     };
-    match ursula_ctl::recovery::recover_group(&client, &nodes, args.group, &options).await? {
+    let target = args.target;
+    match ursula_ctl::recovery::recover_group(&client, &nodes, target, &options).await? {
         ursula_ctl::recovery::RecoverOutcome::Healthy => {
-            println!(
-                "group {}: it has a leader and no replica holds a plan",
-                args.group
-            );
+            println!("{target}: it has a leader and no replica holds a plan");
         }
         ursula_ctl::recovery::RecoverOutcome::DryRun(explained) => {
-            print_plan_explanation(args.group, &explained);
+            print_plan_explanation(target, &explained);
         }
         ursula_ctl::recovery::RecoverOutcome::Satisfied {
             plan,
@@ -507,22 +506,20 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
             stopped,
         } => {
             println!(
-                "group {}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
-                args.group, plan.leader, plan.point, plan.cut
+                "{target}: recovered with leader {} at point {} (cut: {}, plans sent: {plans_sent})",
+                plan.leader, plan.point, plan.cut
             );
             if !outside.is_empty() {
                 println!(
-                    "group {}: nodes {outside:?} are outside the leader's membership: they answer reads \
+                    "{target}: nodes {outside:?} are outside the leader's membership: they answer reads \
                      of the group with 503 while they hold the plan; a configured voter is added \
                      back as a learner, and one whose log is ahead of the plan's point must rejoin \
-                     as a wiped node (operations guide, Rejoining a wiped node)",
-                    args.group
+                     as a wiped node (operations guide, Rejoining a wiped node)"
                 );
             }
             if !stopped.is_empty() {
                 println!(
-                    "group {}: nodes {stopped:?} report the group stopped and were not waited for",
-                    args.group
+                    "{target}: nodes {stopped:?} report the group stopped and were not waited for"
                 );
             }
         }
@@ -531,10 +528,13 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
 }
 
 /// What `recover-group` would send, before `--accept-loss`.
-fn print_plan_explanation(group: u64, explained: &ursula_ctl::recovery::PlanExplanation) {
+fn print_plan_explanation(
+    target: ursula_ctl::recovery::RecoverTarget,
+    explained: &ursula_ctl::recovery::PlanExplanation,
+) {
     let plan = explained.plan;
     println!(
-        "group {group}: would plan leader {} at point {} (cut: {}); nothing was sent",
+        "{target}: would plan leader {} at point {} (cut: {}); nothing was sent",
         plan.leader, plan.point, plan.cut
     );
     let longest = explained
@@ -647,7 +647,7 @@ mod cli_tests {
                 "recover-group",
                 "--config",
                 "cluster.toml",
-                "--group",
+                "--target",
                 "4",
             ];
             args.extend_from_slice(extra);
@@ -658,12 +658,16 @@ mod cli_tests {
         };
         assert!(!parse(&[]).accept_loss);
         assert!(parse(&["--accept-loss"]).accept_loss);
+        assert_eq!(
+            parse(&[]).target,
+            ursula_ctl::recovery::RecoverTarget::Group(4)
+        );
         let removed = super::Cli::try_parse_from([
             "ursulactl",
             "recover-group",
             "--config",
             "cluster.toml",
-            "--group",
+            "--target",
             "4",
             "--dry-run",
         ])

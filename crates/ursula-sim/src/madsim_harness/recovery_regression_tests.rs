@@ -227,6 +227,7 @@ fn an_accepted_ex_leader_restarts_as_a_follower_and_the_log_never_forks() {
                 seen.last_log_index = Some(seen.last_log_index.map_or(0, |index| index + 1));
                 let other_log = RecoveryPlanRequest {
                     point_entry: None,
+                    floor: ursula_proto::admin::PlanFloor::Seeded,
                     leader: ex_leader,
                     point: seen.last_log_index.unwrap_or(0),
                     cut: false,
@@ -546,6 +547,7 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                         RaftGroupId(group),
                         &RecoveryPlanRequest {
                             point_entry: None,
+                            floor: ursula_proto::admin::PlanFloor::Seeded,
                             leader: wiped,
                             point: seen.last_log_index.unwrap_or(0),
                             cut: false,
