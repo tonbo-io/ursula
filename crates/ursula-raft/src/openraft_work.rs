@@ -356,8 +356,22 @@ impl Debug for WorkAdmission {
 /// dropped before its own runs in the background. The check takes no time and holds no lock across a
 /// wait: a group whose previous work still runs is refused at once, and
 /// opens on a later request.
+///
+/// The meta group has a slot of its own beside the data groups'. Its group
+/// id is 0 in a namespace of its own, so keyed with the data groups it
+/// would share data group 0's entry, and one engine's work would hold the
+/// other closed.
 #[derive(Clone, Default)]
-pub(crate) struct EngineWorkLedger(Arc<std::sync::Mutex<HashMap<RaftGroupId, LedgerEntry>>>);
+pub(crate) struct EngineWorkLedger(Arc<std::sync::Mutex<LedgerSlots>>);
+
+/// The entries of an [`EngineWorkLedger`].
+#[derive(Default)]
+struct LedgerSlots {
+    /// The data groups' latest engines, by group.
+    data: HashMap<RaftGroupId, LedgerEntry>,
+    /// The meta group's latest engine.
+    meta: Option<LedgerEntry>,
+}
 
 /// The work of one group's latest engine, and the task that stops it when
 /// it was dropped before its shutdown.
@@ -367,12 +381,15 @@ struct LedgerEntry {
 }
 
 impl EngineWorkLedger {
+    fn slots(&self) -> std::sync::MutexGuard<'_, LedgerSlots> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Whether `raft_group_id` may open: its previous engine's work ended.
     pub(crate) fn admit(&self, raft_group_id: RaftGroupId) -> Result<(), PreviousEngineRunning> {
         let running = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .slots()
+            .data
             .get(&raft_group_id)
             .is_some_and(|entry| entry.ended.is_running());
         if running {
@@ -384,13 +401,10 @@ impl EngineWorkLedger {
 
     /// Records the work of `raft_group_id`'s new engine.
     pub(crate) fn record(&self, raft_group_id: RaftGroupId, ended: WorkEnded) {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(raft_group_id, LedgerEntry {
-                ended,
-                stopping: None,
-            });
+        self.slots().data.insert(raft_group_id, LedgerEntry {
+            ended,
+            stopping: None,
+        });
     }
 
     /// Keeps the task that stops `raft_group_id`'s latest engine, which was
@@ -400,12 +414,7 @@ impl EngineWorkLedger {
         raft_group_id: RaftGroupId,
         stopping: crate::rt::task::JoinHandle<()>,
     ) {
-        if let Some(entry) = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(&raft_group_id)
-        {
+        if let Some(entry) = self.slots().data.get_mut(&raft_group_id) {
             entry.stopping = Some(stopping);
         }
     }
@@ -414,11 +423,60 @@ impl EngineWorkLedger {
     #[cfg(test)]
     pub(crate) async fn ended(&self, raft_group_id: RaftGroupId) {
         let latest = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+            .slots()
+            .data
             .get(&raft_group_id)
             .map(|entry| entry.ended.clone());
+        if let Some(latest) = latest {
+            latest.ended().await;
+        }
+    }
+
+    /// Whether the meta group may open: its previous engine's work ended.
+    pub(crate) fn admit_meta(&self) -> Result<(), PreviousMetaEngineRunning> {
+        let running = self
+            .slots()
+            .meta
+            .as_ref()
+            .is_some_and(|entry| entry.ended.is_running());
+        if running {
+            Err(PreviousMetaEngineRunning)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Records the work of the meta group's new engine.
+    #[cfg_attr(
+        not(all(test, not(madsim))),
+        expect(dead_code, reason = "the meta replica records its engine's work")
+    )]
+    pub(crate) fn record_meta(&self, ended: WorkEnded) {
+        self.slots().meta = Some(LedgerEntry {
+            ended,
+            stopping: None,
+        });
+    }
+
+    /// Keeps the task that stops the meta group's latest engine, which was
+    /// dropped before its shutdown.
+    #[cfg_attr(
+        not(all(test, not(madsim))),
+        expect(
+            dead_code,
+            reason = "the meta replica keeps the task that stops a dropped engine"
+        )
+    )]
+    pub(crate) fn keep_stopping_meta(&self, stopping: crate::rt::task::JoinHandle<()>) {
+        if let Some(entry) = self.slots().meta.as_mut() {
+            entry.stopping = Some(stopping);
+        }
+    }
+
+    /// Waits until the work of the meta group's latest engine ended.
+    #[cfg(all(test, not(madsim)))]
+    pub(crate) async fn meta_ended(&self) {
+        let latest = self.slots().meta.as_ref().map(|entry| entry.ended.clone());
         if let Some(latest) = latest {
             latest.ended().await;
         }
@@ -433,17 +491,21 @@ pub(crate) struct PreviousEngineRunning {
     pub(crate) raft_group_id: RaftGroupId,
 }
 
+/// The meta group does not open because its previous engine's OpenRaft
+/// work still runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("OpenRaft work of the previous engine of the meta group still runs")]
+pub(crate) struct PreviousMetaEngineRunning;
+
 impl Debug for EngineWorkLedger {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let groups = self
-            .0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
+        let slots = self.slots();
+        let groups = slots.data.keys().copied().collect::<Vec<_>>();
+        let meta = slots.meta.is_some();
+        drop(slots);
         f.debug_struct("EngineWorkLedger")
             .field("groups", &groups)
+            .field("meta", &meta)
             .finish()
     }
 }
@@ -828,6 +890,62 @@ mod tests {
             .admit(RaftGroupId(4))
             .expect("the group opens once the work ended");
         drop(work);
+    }
+
+    /// The meta group's slot is its own: a running meta engine never keeps
+    /// data group 0 closed, and a running data group 0 never keeps meta
+    /// closed, although both are group 0.
+    #[tokio::test]
+    async fn the_work_ledger_keeps_meta_apart_from_data_group_zero() {
+        let ledger = EngineWorkLedger::default();
+        ledger
+            .admit_meta()
+            .expect("a meta group with no previous engine opens");
+        let (meta, meta_token) = OpenRaftWork::start();
+        ledger.record_meta(meta.ended());
+        assert!(matches!(
+            ledger.admit_meta(),
+            Err(super::PreviousMetaEngineRunning)
+        ));
+        ledger
+            .admit(RaftGroupId(0))
+            .expect("data group 0 opens while a meta engine's work runs");
+        let (data, data_token) = OpenRaftWork::start();
+        ledger.record(RaftGroupId(0), data.ended());
+        assert!(matches!(
+            ledger.admit(RaftGroupId(0)),
+            Err(super::PreviousEngineRunning {
+                raft_group_id: RaftGroupId(0),
+            })
+        ));
+        drop(meta_token);
+        ledger.meta_ended().await;
+        ledger
+            .admit_meta()
+            .expect("meta opens while data group 0's work runs");
+        assert!(matches!(
+            ledger.admit(RaftGroupId(0)),
+            Err(super::PreviousEngineRunning { .. })
+        ));
+        drop(data_token);
+        ledger.ended(RaftGroupId(0)).await;
+        ledger
+            .admit(RaftGroupId(0))
+            .expect("data group 0 opens once its work ended");
+        // A stopping task kept for meta stays with meta's entry.
+        let (meta, meta_token) = OpenRaftWork::start();
+        ledger.record_meta(meta.ended());
+        ledger.keep_stopping_meta(tokio::spawn(async {}));
+        assert!(matches!(
+            ledger.admit_meta(),
+            Err(super::PreviousMetaEngineRunning)
+        ));
+        ledger
+            .admit(RaftGroupId(0))
+            .expect("data group 0 still opens");
+        drop((meta_token, meta, data));
+        ledger.meta_ended().await;
+        ledger.admit_meta().expect("meta opens again");
     }
 
     #[tokio::test]
