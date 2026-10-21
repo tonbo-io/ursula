@@ -570,11 +570,12 @@ async fn recovery_publication_keeps_one_gate_bound_to_one_engine() {
         ))
     ));
     registry.register_engine(&other);
-    assert!(Arc::ptr_eq(original.recovery.as_ref().unwrap(), &gate));
+    assert!(Arc::ptr_eq(original.core.recovery.as_ref().unwrap(), &gate));
     assert!(Arc::ptr_eq(
         registry
             .entry(placement().raft_group_id)
             .unwrap()
+            .core
             .recovery
             .as_ref()
             .unwrap(),

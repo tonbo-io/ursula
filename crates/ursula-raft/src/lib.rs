@@ -59,6 +59,9 @@
 //!   history event (genesis, recovery plans).
 //! - [`rejoin`]: the recovery gate of a replica that may be missing entries
 //!   it acknowledged, the leader-side heal driver, and the bootstrap probe.
+//! - [`replica`]: one replica of either plane: the gate screens of every
+//!   inbound RPC, the recovery barrier with its history fence, and the
+//!   recovery plan's orchestration, generic over the state machine.
 //! - [`snapshot_codec`]: the group-snapshot frame codec; [`group_snapshot_frames`]
 //!   and [`decode_group_snapshot`] are re-exported for measurement tools.
 
@@ -102,6 +105,7 @@ mod read_index;
 mod recovery_transport;
 mod registry;
 mod rejoin;
+mod replica;
 mod rt;
 #[cfg(madsim)]
 mod sim_runtime;
