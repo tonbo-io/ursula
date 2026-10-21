@@ -11,6 +11,10 @@
 //! returns (#709). Before it cuts power or simulates a process crash, it
 //! waits until the node's stores are released, as a new process starts only
 //! after the old one has exited.
+//!
+//! The meta group's store is kept apart from the data groups' stores: it is
+//! group 0 of the meta journal's own namespace, which keyed with them would
+//! stand in for data group 0's.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -22,6 +26,7 @@ use std::time::Duration;
 
 use ursula_config::WalFsync;
 use ursula_raft::JournalTuning;
+use ursula_raft::MetaOpenError;
 use ursula_raft::RaftGroupEngineOptions;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
@@ -48,7 +53,10 @@ pub(crate) struct SimNodeWal {
     topology: ursula_shard::StaticShardMap,
     /// The node's current run of the WAL; `None` while the node is down.
     run: Arc<Mutex<Option<RaftWal>>>,
+    /// The data groups' stores the node handed out.
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
+    /// The meta group's store the node handed out last.
+    meta: Arc<Mutex<Weak<RaftGroupFileLogStore>>>,
 }
 
 impl SimNodeWal {
@@ -73,6 +81,7 @@ impl SimNodeWal {
             topology: ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
             run: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
+            meta: Arc::new(Mutex::new(Weak::new())),
         }
     }
 
@@ -92,6 +101,7 @@ impl SimNodeWal {
             topology: self.topology.clone(),
             run: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
+            meta: Arc::new(Mutex::new(Weak::new())),
         }
     }
 
@@ -149,6 +159,25 @@ impl SimNodeWal {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .insert(placement.raft_group_id, Arc::downgrade(&store));
+        Ok(store)
+    }
+
+    /// Opens the meta group's log store from the node's meta journal, kept
+    /// apart from data group 0's store. A meta journal that does not open is
+    /// reported, as the production WAL reports it.
+    #[expect(dead_code, reason = "the meta harness opens the meta group's store")]
+    pub(super) fn open_meta(
+        &self,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<RaftGroupFileLogStore>, MetaOpenError> {
+        let store = self
+            .run()
+            .expect("start a simulated node's Raft WAL")
+            .open_meta(metrics)?;
+        *self
+            .meta
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Arc::downgrade(&store);
         Ok(store)
     }
 
@@ -210,10 +239,8 @@ impl SimNodeWal {
     /// stores are held while the engines stop, and the writers close here.
     pub(super) async fn clean_shutdown(&self, stop_engines: impl Future<Output = ()>) {
         let held = self
-            .stores
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .values()
+            .handed_out_stores()
+            .iter()
             .filter_map(Weak::upgrade)
             .collect::<Vec<_>>();
         stop_engines.await;
@@ -244,16 +271,27 @@ impl SimNodeWal {
     }
 
     async fn wait_stopped(&self) {
-        let stores = self
+        for store in &self.handed_out_stores() {
+            wait_released(store).await;
+        }
+    }
+
+    /// Every store the node handed out, the meta group's included.
+    fn handed_out_stores(&self) -> Vec<Weak<RaftGroupFileLogStore>> {
+        let mut stores = self
             .stores
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for store in &stores {
-            wait_released(store).await;
-        }
+        stores.push(
+            self.meta
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .clone(),
+        );
+        stores
     }
 
     fn handed_out(&self, raft_group_id: RaftGroupId) -> Option<Weak<RaftGroupFileLogStore>> {
