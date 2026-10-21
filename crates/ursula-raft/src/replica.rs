@@ -9,6 +9,10 @@
 //! with its history fence run here, generic over the state machine, so a
 //! second plane reuses them instead of copying them. The data plane's
 //! registry entry wraps one core with its data-only resources.
+//!
+//! [`ReplicaStateMachine`] is what a plane's state machine tells the shared
+//! drivers: the history event its history driver proposes, and how it reads
+//! that event's refusal.
 
 use std::sync::Arc;
 
@@ -36,9 +40,75 @@ use crate::read_index::ReadIndexBarrier;
 use crate::registry::QuorumProofError;
 use crate::rejoin::GroupRejoin;
 use crate::state_machine::RaftGroupStateMachine;
+use crate::types::RaftCommand;
+use crate::types::RaftGroupResponse;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig as C;
 use crate::types::UrsulaVote;
+
+/// The history event a leader's history driver proposes
+/// ([`crate::history::run_history_driver`]), before its plane encodes it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HistoryProposal {
+    /// The new history's id, drawn by the proposer.
+    pub(crate) history: std::num::NonZeroU64,
+    pub(crate) now_ms: u64,
+    /// The id of the history this one replaces, 0 at the genesis.
+    pub(crate) previous: u64,
+    /// The last log index the new history keeps from the one it replaces.
+    pub(crate) kept: u64,
+    pub(crate) leader: ursula_stream::HistoryLeader,
+    #[expect(
+        dead_code,
+        reason = "the data plane's event does not record its cause; the meta plane's reads it"
+    )]
+    pub(crate) cause: HistoryCause,
+}
+
+/// Why a leader proposes a history event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HistoryCause {
+    /// The group's genesis.
+    Genesis,
+    /// The recovery plan at `point`.
+    Plan { point: u64 },
+}
+
+/// A plane's state machine, as the drivers every replica runs see it.
+pub(crate) trait ReplicaStateMachine:
+    RaftStateMachine<C, SnapshotData = SnapshotData> + Send + Sync + 'static
+{
+    /// The command that proposes `proposal` on this plane.
+    fn history_command(proposal: HistoryProposal) -> RaftCommand;
+    /// Whether the applied answer to a history command refused it: the
+    /// event named another predecessor than the group's history and applied
+    /// nothing, so the driver proposes again.
+    fn history_refused(response: &RaftGroupResponse) -> bool;
+}
+
+impl ReplicaStateMachine for RaftGroupStateMachine {
+    fn history_command(proposal: HistoryProposal) -> RaftCommand {
+        let HistoryProposal {
+            history,
+            now_ms,
+            previous,
+            kept,
+            leader,
+            cause: _,
+        } = proposal;
+        RaftCommand::Stream(ursula_stream::StreamCommand::NewHistory {
+            history,
+            now_ms,
+            previous,
+            kept,
+            leader,
+        })
+    }
+
+    fn history_refused(response: &RaftGroupResponse) -> bool {
+        matches!(response, RaftGroupResponse::Write(Err(_)))
+    }
+}
 
 /// One replica's gate screens and recovery barrier, of either plane.
 pub(crate) struct ReplicaCore<

@@ -36,19 +36,22 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::ServerState;
 use openraft::rt::WatchReceiver;
+use openraft::storage::RaftStateMachine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::HistoryEvent;
 use ursula_runtime::HistoryWatch;
 use ursula_shard::RaftGroupId;
-use ursula_stream::StreamCommand;
 
 use crate::log_store::RecoveryRecord;
-use crate::registry::RaftGroupHandle;
 use crate::rejoin::GroupRejoin;
+use crate::replica::HistoryCause;
+use crate::replica::HistoryProposal;
+use crate::replica::ReplicaStateMachine;
 use crate::rt::sync::Notify;
 use crate::types::RaftCommand;
 use crate::types::UrsulaRaftTypeConfig;
@@ -236,7 +239,10 @@ impl GroupHistory {
     /// The fence of a leader whose history is pending: waits up to
     /// [`HISTORY_PENDING_WAIT`] for the history event or a lost leadership,
     /// then refuses. Never fences a follower.
-    pub(crate) async fn admit(&self, raft: &RaftGroupHandle) -> Result<(), GroupEngineError> {
+    pub(crate) async fn admit<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
+        &self,
+        raft: &Raft<UrsulaRaftTypeConfig, SM>,
+    ) -> Result<(), GroupEngineError> {
         self.admit_on(raft.metrics()).await
     }
 
@@ -267,9 +273,9 @@ impl GroupHistory {
     /// Admits `command` on `raft`: refused when the proposal path may not
     /// carry it (a history event included, which only the driver proposes),
     /// then through [`Self::admit`].
-    pub(crate) async fn admit_proposal(
+    pub(crate) async fn admit_proposal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
         &self,
-        raft: &RaftGroupHandle,
+        raft: &Raft<UrsulaRaftTypeConfig, SM>,
         command: &RaftCommand,
     ) -> Result<(), GroupEngineError> {
         crate::forward::validate_proposal(command)?;
@@ -298,7 +304,12 @@ fn leader_applied_own_term(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> Optio
 /// history event a pending leader owes, once per term and debt, again after
 /// a proposal that did not answer, and retires a satisfied recovery record,
 /// removing it from disk before the fence lifts. Runs until the group stops.
-pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<GroupHistory>) {
+/// The plane's state machine encodes the event and reads its refusal
+/// ([`ReplicaStateMachine`]).
+pub(crate) async fn run_history_driver<SM: ReplicaStateMachine>(
+    raft: Raft<UrsulaRaftTypeConfig, SM>,
+    history: Arc<GroupHistory>,
+) {
     let mut metrics = raft.metrics();
     let mut applied = history.applied.clone();
     let mut plan = history.plan_version.load(Ordering::SeqCst);
@@ -351,7 +362,7 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
             // The driver looks only once the leader applied its whole log,
             // so its applied history is the one this event replaces, and at
             // the genesis every entry it applied stays.
-            let command = RaftCommand::Stream(StreamCommand::NewHistory {
+            let command = SM::history_command(HistoryProposal {
                 history: ursula_runtime::draw_history_id(),
                 now_ms: ursula_runtime::unix_time_ms(),
                 previous: history.applied().map_or(0, |event| event.id.get()),
@@ -366,13 +377,17 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
                     term,
                     node_id: metrics.borrow_watched().id,
                 },
+                cause: match debt {
+                    Owed::Plan { point, .. } => HistoryCause::Plan { point },
+                    Owed::Genesis => HistoryCause::Genesis,
+                },
             });
             let answer = raft
                 .client_write(command)
                 .await
                 .map(|response| response.data);
             match answer {
-                Ok(crate::types::RaftGroupResponse::Write(Err(refusal))) => {
+                Ok(refused) if SM::history_refused(&refused) => {
                     // N1 of the fifth #613 review: the event named another
                     // predecessor than the group's history and applied
                     // nothing. Propose again from the applied history.
@@ -380,7 +395,7 @@ pub(crate) async fn run_history_driver(raft: RaftGroupHandle, history: Arc<Group
                         raft_group_id = history.raft_group_id.0,
                         term,
                         ?debt,
-                        %refusal,
+                        response = ?refused,
                         "the history event this leader proposed was refused; it proposes again"
                     );
                     proposed = None;
