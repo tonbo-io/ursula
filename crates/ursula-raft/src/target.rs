@@ -5,9 +5,11 @@
 //! (`RaftPlaneV1`, where `UNSPECIFIED` is refused) and the node it is for
 //! (`node_id` on the envelope, snapshot and leader-transfer requests,
 //! `target_node` on `GroupWrite`, `GroupRead` and `RejoinBarrier`).
-//! [`RaftTarget::stamp`] is the one encoder of those fields, for every
+//! [`RaftTarget`] itself is `ursula_shard`'s, which errors and recovery
+//! reports share; this module adds its wire form as [`WireTarget`]:
+//! [`WireTarget::stamp`] is the one encoder of those fields, for every
 //! request builder and the format-epoch probe's envelope, and
-//! [`RaftTarget::parse`] their one parser. A receiver checks the protocol
+//! [`WireTarget::parse`] their one parser. A receiver checks the protocol
 //! version first, then the target, then looks the group up.
 //!
 //! A request for another node is refused with `FAILED_PRECONDITION` and the
@@ -25,6 +27,7 @@
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use crate::grpc::GrpcRpcError;
 use crate::peer_cluster::NODE_ID_METADATA;
@@ -35,14 +38,6 @@ use crate::types::RaftCommand;
 /// it carries: `data` or `meta`. A receiver refuses an item of another
 /// plane, so no item bypasses its plane's receive budget.
 pub const RAFT_PLANE_METADATA: &str = "ursula-raft-plane";
-
-/// The Raft group a request names: a data group, or the meta group.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RaftTarget {
-    Data(RaftGroupId),
-    /// The meta group, whose wire group id, core and shard are 0.
-    Meta,
-}
 
 /// The target fields of a Raft request, as the wire carries them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,41 +59,26 @@ pub(crate) trait TargetedRequest {
     fn set_target_fields(&mut self, plane: pb::RaftPlaneV1, raft_group_id: u32, target_node: u64);
 }
 
-impl RaftTarget {
+/// The wire form of a [`RaftTarget`]: the plane and group a Raft request
+/// names, and the plane predicate of a command.
+pub(crate) trait WireTarget: Sized {
     /// The plane the target is on.
-    pub(crate) fn plane(self) -> pb::RaftPlaneV1 {
-        match self {
-            Self::Data(_) => pb::RaftPlaneV1::Data,
-            Self::Meta => pb::RaftPlaneV1::Meta,
-        }
-    }
+    fn plane(self) -> pb::RaftPlaneV1;
 
     /// The `raft_group_id` the wire carries: the data group's id, 0 for the
     /// meta group.
-    pub(crate) fn wire_group_id(self) -> u32 {
-        match self {
-            Self::Data(group) => group.0,
-            Self::Meta => 0,
-        }
-    }
+    fn wire_group_id(self) -> u32;
 
     /// Whether a request of this target may carry `command`: a data group
     /// takes only stream commands, the meta group only meta commands. The
     /// only plane predicate of a command: a `GroupWrite` of the other plane
     /// is refused before anything is proposed, and an inbound append before
     /// OpenRaft sees it.
-    pub fn admits(self, command: &RaftCommand) -> bool {
-        match (self, command) {
-            (Self::Data(_), RaftCommand::Stream(_)) | (Self::Meta, RaftCommand::Meta(_)) => true,
-            (Self::Data(_), RaftCommand::Meta(_)) | (Self::Meta, RaftCommand::Stream(_)) => false,
-        }
-    }
+    fn admits(self, command: &RaftCommand) -> bool;
 
     /// Writes this target and `target_node` into `request`: the one encoder
     /// of the plane, group and target node of every Raft request.
-    pub(crate) fn stamp<R: TargetedRequest>(self, target_node: u64, request: &mut R) {
-        request.set_target_fields(self.plane(), self.wire_group_id(), target_node);
-    }
+    fn stamp<R: TargetedRequest>(self, target_node: u64, request: &mut R);
 
     /// The target `request` names, for a receiver whose node id is `local`.
     ///
@@ -108,7 +88,39 @@ impl RaftTarget {
     /// ([`GrpcRpcError::misdelivered`]). Any data group id parses: the group
     /// lookup after it answers `NOT_FOUND` for a group this node does not
     /// run, which the format-epoch probe's group `u32::MAX` relies on.
-    pub(crate) fn parse<R: TargetedRequest>(request: &R, local: u64) -> Result<Self, GrpcRpcError> {
+    fn parse<R: TargetedRequest>(request: &R, local: u64) -> Result<Self, GrpcRpcError>;
+
+    /// The value of [`RAFT_PLANE_METADATA`] for this target's plane.
+    fn plane_metadata(self) -> AsciiMetadataValue;
+}
+
+impl WireTarget for RaftTarget {
+    fn plane(self) -> pb::RaftPlaneV1 {
+        match self {
+            Self::Data(_) => pb::RaftPlaneV1::Data,
+            Self::Meta => pb::RaftPlaneV1::Meta,
+        }
+    }
+
+    fn wire_group_id(self) -> u32 {
+        match self {
+            Self::Data(group) => group.0,
+            Self::Meta => 0,
+        }
+    }
+
+    fn admits(self, command: &RaftCommand) -> bool {
+        match (self, command) {
+            (Self::Data(_), RaftCommand::Stream(_)) | (Self::Meta, RaftCommand::Meta(_)) => true,
+            (Self::Data(_), RaftCommand::Meta(_)) | (Self::Meta, RaftCommand::Stream(_)) => false,
+        }
+    }
+
+    fn stamp<R: TargetedRequest>(self, target_node: u64, request: &mut R) {
+        request.set_target_fields(self.plane(), self.wire_group_id(), target_node);
+    }
+
+    fn parse<R: TargetedRequest>(request: &R, local: u64) -> Result<Self, GrpcRpcError> {
         let fields = request.target_fields();
         let target = match pb::RaftPlaneV1::try_from(fields.plane) {
             Ok(pb::RaftPlaneV1::Data) => Self::Data(RaftGroupId(fields.raft_group_id)),
@@ -149,8 +161,7 @@ impl RaftTarget {
         Ok(target)
     }
 
-    /// The value of [`RAFT_PLANE_METADATA`] for this target's plane.
-    pub(crate) fn plane_metadata(self) -> AsciiMetadataValue {
+    fn plane_metadata(self) -> AsciiMetadataValue {
         AsciiMetadataValue::from_static(match self {
             Self::Data(_) => "data",
             Self::Meta => "meta",
@@ -273,6 +284,7 @@ mod tests {
 
     use super::RaftTarget;
     use super::TargetedRequest;
+    use super::WireTarget;
     use super::refusing_node;
     use crate::raft_internal_proto as pb;
 

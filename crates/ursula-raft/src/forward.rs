@@ -35,6 +35,7 @@ use ursula_runtime::ReadStreamResponse;
 use ursula_runtime::ResponseKind;
 use ursula_runtime::WriteEffect;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftTarget;
 use ursula_shard::ShardPlacement;
 
 use crate::GroupLeadership;
@@ -52,7 +53,7 @@ use crate::peer_channel::peer_endpoint;
 use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::refusing_cluster;
 use crate::raft_internal_proto;
-use crate::target::RaftTarget;
+use crate::target::WireTarget;
 use crate::types::RaftCommand;
 use crate::types::RaftGroupResponse;
 use crate::types::UrsulaRaftTypeConfig;
@@ -830,7 +831,7 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
     if commands.is_empty() {
         return Ok(Vec::new());
     }
-    let target = SM::target(history.raft_group_id());
+    let target = history.target();
     for command in &commands {
         if !target.admits(command) {
             return Err(invalid_raft_command(
@@ -1083,7 +1084,7 @@ mod forwarded_answer_tests {
     #[test]
     fn a_forwarded_refusal_keeps_the_leaders_type() {
         let pending = GroupEngineError::Infra(GroupInfraError::RecoveryPending {
-            raft_group_id: RaftGroupId(7),
+            group: ursula_shard::RaftTarget::Data(RaftGroupId(7)),
         });
         let answer = forwarded_answer::<GroupWriteResponse>(
             ForwardedRpc::GroupWrite,

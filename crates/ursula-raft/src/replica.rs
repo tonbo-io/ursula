@@ -35,6 +35,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::HistoryEvent;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use crate::apply_failure::ApplyHealth;
 use crate::election::ElectionPolicy;
@@ -86,8 +87,6 @@ pub(crate) trait ReplicaStateMachine:
     /// What a written command of this plane answers.
     type Answer: Send + 'static;
 
-    /// The target of this plane's group `group`.
-    fn target(group: RaftGroupId) -> crate::RaftTarget;
     /// The command that proposes `proposal` on this plane.
     fn history_command(proposal: HistoryProposal) -> RaftCommand;
     /// Whether the applied answer to a history command refused it: the
@@ -104,10 +103,6 @@ pub(crate) trait ReplicaStateMachine:
 
 impl ReplicaStateMachine for RaftGroupStateMachine {
     type Answer = ursula_runtime::GroupWriteResponse;
-
-    fn target(group: RaftGroupId) -> crate::RaftTarget {
-        crate::RaftTarget::Data(group)
-    }
 
     fn answer(
         response: RaftGroupResponse,
@@ -181,9 +176,19 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         self.barrier.owner()
     }
 
+    /// The recovery gate that governs this node's participation. A replica
+    /// stopped by an apply failure reports the stop instead: its gate can
+    /// no longer open, and it must not hold back the node's other replicas.
+    pub(crate) fn participating_gate(&self) -> Option<&Arc<GroupRejoin>> {
+        if self.apply_health.failure().is_some() {
+            return None;
+        }
+        self.recovery.as_ref()
+    }
+
     pub(crate) fn check_recovery_vote(
         &self,
-        group: RaftGroupId,
+        group: RaftTarget,
         vote: UrsulaVote,
     ) -> Result<Option<UrsulaVote>, GroupEngineError> {
         let Some(rejoin) = &self.recovery else {
@@ -196,9 +201,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
             return Err(GroupEngineError::Infra(refusal));
         }
         let floor = rejoin.recovery_vote().ok_or(GroupEngineError::Infra(
-            GroupInfraError::RecoveryVoteFloor {
-                raft_group_id: group,
-            },
+            GroupInfraError::RecoveryVoteFloor { group },
         ))?;
         Ok((vote < floor).then_some(floor))
     }
@@ -208,7 +211,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
     /// meanwhile and the commit screen (#613).
     pub(crate) async fn append_entries(
         &self,
-        group: RaftGroupId,
+        group: RaftTarget,
         request: AppendEntriesRequest<C>,
     ) -> Result<AppendEntriesResponse<C>, GroupEngineError> {
         if let Some(floor) = self.check_recovery_vote(group, request.vote)? {
@@ -506,7 +509,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
     pub(crate) async fn accept_plan<'r, R>(
         self,
         election: &ElectionPolicy,
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         plan: &RecoveryPlanRequest,
         applied: StoredMembershipOf<C>,
         restart: R,
@@ -517,7 +520,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         let rejoin = self
             .recovery
             .clone()
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+            .ok_or(RecoveryGateError::NotRegistered { group })?;
         let owner = self.owner().clone();
         let plan = *plan;
         let job = rejoin.clone();
@@ -529,22 +532,16 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         let job = crate::rt::spawn(async move {
             owner
                 .call(move |raft| async move {
-                    let core = RaftPlanCore {
-                        raft: &raft,
-                        raft_group_id,
-                    };
+                    let core = RaftPlanCore { raft: &raft, group };
                     job.accept_recovery_plan(&plan, &core, &history, applied)
                         .await
                 })
                 .await
-                .map_err(|source| RecoveryGateError::OwnerStopped {
-                    raft_group_id,
-                    source,
-                })?
+                .map_err(|source| RecoveryGateError::OwnerStopped { group, source })?
         });
         let taken = job
             .await
-            .map_err(|_aborted| RecoveryGateError::JobAborted { raft_group_id })
+            .map_err(|_aborted| RecoveryGateError::JobAborted { group })
             .and_then(|taken| taken);
         // m6 (#581 review): the job stopped the core campaigning; the
         // node's election policy decides again, taken or refused.
@@ -565,14 +562,14 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         drop(self);
         let restarted = restart()
             .await?
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+            .ok_or(RecoveryGateError::NotRegistered { group })?;
         let restarted_gate = restarted
             .recovery
             .as_ref()
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+            .ok_or(RecoveryGateError::NotRegistered { group })?;
         if let Some((committed, held)) = restarted_gate.cut_refused() {
             return Err(RecoveryGateError::CutRefused {
-                raft_group_id,
+                group,
                 committed,
                 held,
             });
@@ -607,8 +604,8 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                 {
                     None
                 }
-                Ok(_left_without_vote) => Some(RecoveryGateError::CutLeftNoVote { raft_group_id }),
-                Err(_timed_out) => Some(RecoveryGateError::CutMembershipUnknown { raft_group_id }),
+                Ok(_left_without_vote) => Some(RecoveryGateError::CutLeftNoVote { group }),
+                Err(_timed_out) => Some(RecoveryGateError::CutMembershipUnknown { group }),
             };
             if let Some(refusal) = refusal {
                 restarted_gate

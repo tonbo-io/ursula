@@ -45,7 +45,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::HistoryEvent;
 use ursula_runtime::HistoryWatch;
-use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use crate::log_store::RecoveryRecord;
 use crate::rejoin::GroupRejoin;
@@ -53,6 +53,7 @@ use crate::replica::HistoryCause;
 use crate::replica::HistoryProposal;
 use crate::replica::ReplicaStateMachine;
 use crate::rt::sync::Notify;
+use crate::target::WireTarget;
 use crate::types::RaftCommand;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -110,7 +111,7 @@ const PROPOSAL_RETRY: Duration = Duration::from_millis(200);
 /// [`ursula_runtime::HistoryPublisher`]).
 #[derive(Debug)]
 pub struct GroupHistory {
-    raft_group_id: RaftGroupId,
+    target: RaftTarget,
     applied: HistoryWatch,
     plan: Mutex<Option<RecoveryRecord>>,
     /// Bumped by every change of the plan, under its lock.
@@ -122,13 +123,13 @@ pub struct GroupHistory {
 
 impl GroupHistory {
     /// The group whose history this is.
-    pub(crate) fn raft_group_id(&self) -> RaftGroupId {
-        self.raft_group_id
+    pub(crate) fn target(&self) -> RaftTarget {
+        self.target
     }
 
-    pub(crate) fn new(raft_group_id: RaftGroupId, applied: HistoryWatch) -> Arc<Self> {
+    pub(crate) fn new(target: RaftTarget, applied: HistoryWatch) -> Arc<Self> {
         Arc::new(Self {
-            raft_group_id,
+            target,
             applied,
             plan: Mutex::new(None),
             plan_version: AtomicU64::new(0),
@@ -230,7 +231,7 @@ impl GroupHistory {
     ) -> Result<(), GroupEngineError> {
         if metrics.state != ServerState::Leader && self.plan().is_some() && self.pending() {
             return Err(GroupEngineError::Infra(GroupInfraError::RecoveryPending {
-                raft_group_id: self.raft_group_id,
+                group: self.target,
             }));
         }
         Ok(())
@@ -264,7 +265,7 @@ impl GroupHistory {
             || self.fences(&metrics.borrow_watched())
         {
             return Err(GroupEngineError::Infra(GroupInfraError::RecoveryPending {
-                raft_group_id: self.raft_group_id,
+                group: self.target,
             }));
         }
         Ok(())
@@ -336,7 +337,8 @@ pub(crate) async fn run_history_driver<SM: ReplicaStateMachine>(
                 Ok(()) => history.clear_plan(record),
                 Err(error) => {
                     tracing::warn!(
-                        raft_group_id = history.raft_group_id.0,
+                        plane = history.target.plane().as_str_name(),
+                        raft_group_id = history.target.wire_group_id(),
                         %error,
                         "could not remove a satisfied recovery plan; retrying"
                     );
@@ -392,7 +394,8 @@ pub(crate) async fn run_history_driver<SM: ReplicaStateMachine>(
                     // predecessor than the group's history and applied
                     // nothing. Propose again from the applied history.
                     tracing::warn!(
-                        raft_group_id = history.raft_group_id.0,
+                        plane = history.target.plane().as_str_name(),
+                        raft_group_id = history.target.wire_group_id(),
                         term,
                         ?debt,
                         response = ?refused,
@@ -402,14 +405,16 @@ pub(crate) async fn run_history_driver<SM: ReplicaStateMachine>(
                     crate::rt::time::sleep(PROPOSAL_RETRY).await;
                 }
                 Ok(_) => tracing::info!(
-                    raft_group_id = history.raft_group_id.0,
+                    plane = history.target.plane().as_str_name(),
+                    raft_group_id = history.target.wire_group_id(),
                     term,
                     ?debt,
                     "a new history started"
                 ),
                 Err(error) => {
                     tracing::warn!(
-                        raft_group_id = history.raft_group_id.0,
+                        plane = history.target.plane().as_str_name(),
+                        raft_group_id = history.target.wire_group_id(),
                         term,
                         ?debt,
                         %error,

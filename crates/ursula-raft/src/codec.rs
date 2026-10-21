@@ -910,7 +910,7 @@ mod tests {
     fn an_apply_stop_of_an_unknown_kind_does_not_decode() {
         let known = ursula_runtime::GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::ApplyStopped {
-                raft_group_id: ursula_shard::RaftGroupId(7),
+                group: ursula_shard::RaftTarget::Data(ursula_shard::RaftGroupId(7)),
                 term: 5,
                 index: 20,
                 kind: ursula_runtime::ApplyStopKind::Panic,
@@ -984,13 +984,13 @@ mod tests {
                         limit: number,
                     })
                 }
-                GroupEngineError::Infra(GroupInfraError::LogBehindCommit {
-                    raft_group_id, ..
-                }) => GroupEngineError::Infra(GroupInfraError::LogBehindCommit {
-                    raft_group_id,
-                    committed: number,
-                    held: maybe,
-                }),
+                GroupEngineError::Infra(GroupInfraError::LogBehindCommit { group, .. }) => {
+                    GroupEngineError::Infra(GroupInfraError::LogBehindCommit {
+                        group,
+                        committed: number,
+                        held: maybe,
+                    })
+                }
                 other => other,
             }
         }

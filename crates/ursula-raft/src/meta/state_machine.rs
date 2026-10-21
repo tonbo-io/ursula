@@ -45,6 +45,7 @@ use ursula_proto::placement::ViewStage;
 use ursula_runtime::HistoryPublisher;
 use ursula_runtime::SnapshotPointer;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 use ursula_stream::HistoryEvent;
 
 use super::MetaCommand;
@@ -463,7 +464,7 @@ impl RaftSnapshotBuilder<C> for MetaSnapshotBuilder {
 
     async fn build_snapshot(&mut self) -> Result<UrsulaSnapshot, io::Error> {
         self.apply_health
-            .check(META_GROUP)
+            .check(RaftTarget::Meta)
             .map_err(crate::engine::group_engine_io_error)?;
         if self.work.is_stopping() {
             return Err(stopped());
@@ -514,10 +515,6 @@ impl RaftSnapshotBuilder<C> for MetaSnapshotBuilder {
 
 impl ReplicaStateMachine for MetaStateMachine {
     type Answer = ursula_control::ControlResponse;
-
-    fn target(_group: RaftGroupId) -> crate::RaftTarget {
-        crate::RaftTarget::Meta
-    }
 
     fn answer(
         response: RaftGroupResponse,

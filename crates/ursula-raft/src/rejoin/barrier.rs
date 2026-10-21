@@ -14,6 +14,7 @@ use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
 use crate::owner::OwnerRaftHandle;
+use crate::target::WireTarget;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -43,7 +44,7 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
     F: Future<Output = Result<crate::BarrierAnswer, E>>,
     E: fmt::Debug,
 {
-    let raft_group_id = rejoin.raft_group_id;
+    let group = rejoin.group;
     let mut last_barrier_leader = None;
     let mut last_probe = None;
     let mut last_applied = None;
@@ -55,7 +56,8 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
             Ok(true) => break,
             Ok(false) => {}
             Err(err) => tracing::warn!(
-                raft_group_id = raft_group_id.0,
+                plane = group.plane().as_str_name(),
+                raft_group_id = group.wire_group_id(),
                 "recovery gate: could not record the open gate, retrying: {err}"
             ),
         }
@@ -137,7 +139,8 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
                         break;
                     }
                     other => tracing::debug!(
-                        raft_group_id = raft_group_id.0,
+                        plane = group.plane().as_str_name(),
+                        raft_group_id = group.wire_group_id(),
                         ?other,
                         "recovery barrier probe failed"
                     ),

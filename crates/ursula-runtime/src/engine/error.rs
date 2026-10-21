@@ -38,7 +38,7 @@ pub use snapshot::SnapshotObjectCheck;
 pub use snapshot::SnapshotStoreOperation;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
-use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 use ursula_stream::StreamCommand;
 use ursula_stream::StreamErrorCode;
 use ursula_stream::StreamErrorContext;
@@ -424,56 +424,54 @@ pub enum MembershipInitRefusal {
 /// message on demand through `Display`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 pub enum GroupInfraError {
-    #[error(
-        "recovery gate node {actual} differs from engine node {expected} for {raft_group_id:?}"
-    )]
+    #[error("recovery gate node {actual} differs from engine node {expected} for {group}")]
     RecoveryNodeMismatch {
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         expected: u64,
         actual: u64,
     },
-    #[error("raft group {raft_group_id:?} is not registered on this node")]
-    RaftGroupNotRegistered { raft_group_id: RaftGroupId },
-    #[error("recovery gate for group {raft_group_id:?} is already bound")]
-    RecoveryAlreadyBound { raft_group_id: RaftGroupId },
-    #[error("recovery gate group {actual:?} differs from engine group {expected:?}")]
+    #[error("{group} is not registered on this node")]
+    RaftGroupNotRegistered { group: RaftTarget },
+    #[error("recovery gate for {group} is already bound")]
+    RecoveryAlreadyBound { group: RaftTarget },
+    #[error("recovery gate of {actual} differs from the engine's {expected}")]
     RecoveryGroupMismatch {
-        expected: RaftGroupId,
-        actual: RaftGroupId,
+        expected: RaftTarget,
+        actual: RaftTarget,
     },
     #[error(
-        "raft group {raft_group_id:?} stopped after a committed apply failure; retain WAL for corrected-code replay"
+        "{group} stopped after a committed apply failure; retain WAL for corrected-code replay"
     )]
     ApplyStopped {
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         term: u64,
         index: u64,
         kind: ApplyStopKind,
     },
     #[error("command {command:?} cannot be proposed to a data Raft group")]
     InvalidRaftCommand { command: UnproposableCommand },
-    #[error("open WAL for raft group {raft_group_id:?} on core {core_id:?}: {failure:?}")]
+    #[error("open WAL for {group} on core {core_id:?}: {failure:?}")]
     WalOpen {
         core_id: CoreId,
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         failure: WalOpenFailureKind,
     },
-    #[error("raft group {raft_group_id:?} has not established its recovery vote floor")]
-    RecoveryVoteFloor { raft_group_id: RaftGroupId },
+    #[error("{group} has not established its recovery vote floor")]
+    RecoveryVoteFloor { group: RaftTarget },
     /// This replica restarts to run a recovery plan's cut (#581 section
     /// 4.5): it takes no replication until it has. Retryable.
-    #[error("raft group {raft_group_id:?} restarts to cut its log for a recovery plan")]
-    RecoveryCutting { raft_group_id: RaftGroupId },
+    #[error("{group} restarts to cut its log for a recovery plan")]
+    RecoveryCutting { group: RaftTarget },
     /// The sender's entries differ from this replica's at or below the entry
     /// it knows is committed (#613): taking them would overwrite committed
     /// entries. Raft never sends that; a recovery plan led from a replica
     /// that knew less would. The replica takes nothing from the sender.
     #[error(
-        "raft group {raft_group_id:?}: the sender's entries differ from this replica's at index \
+        "{group}: the sender's entries differ from this replica's at index \
          {index}, at or below the committed index {committed}"
     )]
     CommittedOverwrite {
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         committed: u64,
         index: u64,
     },
@@ -483,11 +481,11 @@ pub enum GroupInfraError {
     /// compare anything until it has, so the replica takes nothing from the
     /// sender meanwhile. Retryable.
     #[error(
-        "raft group {raft_group_id:?}: committed index {committed} is above the last entry \
+        "{group}: committed index {committed} is above the last entry \
          {held:?} its log store holds; replication waits until the store catches up"
     )]
     LogBehindCommit {
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         committed: u64,
         held: Option<u64>,
     },
@@ -497,12 +495,12 @@ pub enum GroupInfraError {
     /// replica refuses to open the group, which stays closed on it until it
     /// rejoins as a wiped node.
     #[error(
-        "raft group {raft_group_id:?} on core {core_id:?}: its log holds {held:?} below its \
+        "{group} on core {core_id:?}: its log holds {held:?} below its \
          restored snapshot {snapshot:?}"
     )]
     LogBelowSnapshot {
         core_id: CoreId,
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         snapshot: LogPosition,
         held: LogPosition,
     },
@@ -512,11 +510,11 @@ pub enum GroupInfraError {
     /// kept this replica's committed entries (#613). The replica takes
     /// nothing from the sender; it rejoins as a wiped node.
     #[error(
-        "raft group {raft_group_id:?}: a snapshot of history {history:#x}, which replaced \
+        "{group}: a snapshot of history {history:#x}, which replaced \
          {replaced:#x}, does not continue this replica's committed history {local:?}"
     )]
     UnrelatedHistory {
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         history: u64,
         replaced: u64,
         local: Option<u64>,
@@ -526,21 +524,16 @@ pub enum GroupInfraError {
     /// takes no more (#581 section 4.5). Retryable for the sender, which a
     /// leader under the plan replaces.
     #[error(
-        "raft group {raft_group_id:?} holds a recovery plan with plan term {plan_term}; it takes \
+        "{group} holds a recovery plan with plan term {plan_term}; it takes \
          no replication from a leader at or below it"
     )]
-    RecoveryPlanFenced {
-        raft_group_id: RaftGroupId,
-        plan_term: u64,
-    },
+    RecoveryPlanFenced { group: RaftTarget, plan_term: u64 },
     /// This replica leads the group, and the group's history is pending: its
     /// genesis, or the history event of a recovery plan, has not applied
     /// (#581 sections 4.3 and 4.5). The leader serves and admits nothing but
     /// the event until it does. Retryable.
-    #[error(
-        "raft group {raft_group_id:?} waits for its history event; its leader serves nothing before it"
-    )]
-    RecoveryPending { raft_group_id: RaftGroupId },
+    #[error("{group} waits for its history event; its leader serves nothing before it")]
+    RecoveryPending { group: RaftTarget },
     #[error("the Raft owner has stopped")]
     OwnerStopped,
     /// A group engine's shutdown waited `waited_ms` for the work OpenRaft
@@ -548,20 +541,13 @@ pub enum GroupInfraError {
     /// the snapshot builds it spawned, its network clients and log
     /// readers), and some of it still runs (#709). The group does not open
     /// again in this process until that work ended.
-    #[error(
-        "raft group {raft_group_id:?}: OpenRaft work of the stopped engine still runs after {waited_ms} ms"
-    )]
-    EngineWorkOutlivedShutdown {
-        raft_group_id: RaftGroupId,
-        waited_ms: u64,
-    },
+    #[error("{group}: OpenRaft work of the stopped engine still runs after {waited_ms} ms")]
+    EngineWorkOutlivedShutdown { group: RaftTarget, waited_ms: u64 },
     /// The OpenRaft work of the group's previous engine on this node still
     /// runs (#709): the group does not open while that work may still change
     /// its state. Refused at once, before any engine starts. Retryable.
-    #[error(
-        "raft group {raft_group_id:?} does not open: OpenRaft work of its previous engine still runs"
-    )]
-    PreviousEngineWorkRunning { raft_group_id: RaftGroupId },
+    #[error("{group} does not open: OpenRaft work of its previous engine still runs")]
+    PreviousEngineWorkRunning { group: RaftTarget },
     #[error("write outcome is unknown; the proposal may have committed")]
     OutcomeUnknown,
     /// A read or write of the cold tier failed. The store's error is logged
@@ -633,26 +619,21 @@ pub enum GroupInfraError {
         election_timeout_max_ms: u64,
     },
     /// The group's recovery gate did not open.
-    #[error(
-        "open the recovery gate of raft group {raft_group_id:?} on core {core_id:?}: {failure:?}"
-    )]
+    #[error("open the recovery gate of {group} on core {core_id:?}: {failure:?}")]
     RecoveryGateOpen {
         core_id: CoreId,
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         failure: WalOpenFailureKind,
     },
     /// OpenRaft refused to initialize the group's membership.
-    #[error("initialize the membership of raft group {raft_group_id:?}: {refusal:?}")]
+    #[error("initialize the membership of {group}: {refusal:?}")]
     MembershipInit {
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         refusal: MembershipInitRefusal,
     },
     /// The group observed no expected leader in time.
-    #[error("raft group {raft_group_id:?} observed no expected leader within {timeout_ms} ms")]
-    LeaderWaitTimedOut {
-        raft_group_id: RaftGroupId,
-        timeout_ms: u64,
-    },
+    #[error("{group} observed no expected leader within {timeout_ms} ms")]
+    LeaderWaitTimedOut { group: RaftTarget, timeout_ms: u64 },
     #[error(transparent)]
     Snapshot(#[from] GroupSnapshotError),
 }

@@ -47,6 +47,7 @@ use ursula_runtime::HeadStreamRequest;
 use ursula_runtime::ReadStreamRequest;
 use ursula_shard::BucketStreamId;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use crate::codec::decode_wire;
 use crate::codec::encode_wire;
@@ -64,8 +65,8 @@ use crate::peer_cluster::ClusterCheck;
 use crate::peer_cluster::PeerCluster;
 use crate::peer_cluster::PeerIdentity;
 use crate::raft_internal_proto;
-use crate::target::RaftTarget;
 use crate::target::TargetedRequest;
+use crate::target::WireTarget;
 use crate::types::RaftCommand;
 use crate::types::SnapshotData;
 use crate::types::UrsulaAppendEntriesRequest;
@@ -3982,6 +3983,7 @@ mod barrier_asker_tests {
     use tonic::Response;
     use tonic::Status;
     use ursula_shard::RaftGroupId;
+    use ursula_shard::RaftTarget;
 
     use super::CoreRaftTransport;
     use super::GrpcRpcError;
@@ -3994,7 +3996,6 @@ mod barrier_asker_tests {
     use crate::memberships::MembershipKind;
     use crate::raft_internal_proto as pb;
     use crate::raft_internal_proto::raft_internal_server::RaftInternal;
-    use crate::target::RaftTarget;
     use crate::types::UrsulaRaftTypeConfig;
     use crate::types::UrsulaVote;
 
@@ -4294,7 +4295,7 @@ mod transfer_leader_codec_tests {
     async fn transfer_leader_ack_preserves_typed_rejections_and_refuses_an_empty_response() {
         let network = GrpcRaftNetwork::with_transport(
             Arc::new(CoreRaftTransport::default()),
-            crate::target::RaftTarget::Data(RaftGroupId(1)),
+            ursula_shard::RaftTarget::Data(RaftGroupId(1)),
             2,
             "http://127.0.0.1:1",
             8,
@@ -4413,7 +4414,7 @@ mod group_rpc_status_tests {
             (
                 IncomingTransferError::Group(GroupEngineError::Infra(
                     GroupInfraError::RaftGroupNotRegistered {
-                        raft_group_id: group,
+                        group: ursula_shard::RaftTarget::Data(group),
                     },
                 )),
                 Code::NotFound,

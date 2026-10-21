@@ -311,7 +311,7 @@ impl InProcessRegistry<RaftGroupStateMachine> {
         let (group, endpoint) =
             self.endpoint(node_id)
                 .ok_or(crate::RecoveryGateError::NotRegistered {
-                    raft_group_id: ursula_shard::RaftGroupId(0),
+                    group: crate::RaftTarget::Data(ursula_shard::RaftGroupId(0)),
                 })?;
         endpoint.accept_recovery_plan(group, plan, restart).await
     }

@@ -51,6 +51,7 @@ use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::HistoryPublisher;
 use ursula_runtime::SnapshotPointer;
+use ursula_shard::RaftTarget;
 
 use super::MetaCommand;
 use super::damage::CommitScreenDamage;
@@ -242,9 +243,9 @@ impl ActiveMeta {
         &self,
         request: AppendEntriesRequest<C>,
     ) -> Result<AppendEntriesResponse<C>, GroupEngineError> {
-        self.core.apply_health.check(META_GROUP)?;
+        self.core.apply_health.check(RaftTarget::Meta)?;
         let vote = request.vote;
-        let answer = self.core.append_entries(META_GROUP, request).await;
+        let answer = self.core.append_entries(RaftTarget::Meta, request).await;
         if let Err(GroupEngineError::Infra(refusal)) = &answer {
             self.screened(Screened::Append, refusal, &vote);
         }
@@ -278,7 +279,7 @@ impl ActiveMeta {
 
     /// An inbound vote, through the recovery gate's vote screen.
     pub async fn vote(&self, request: VoteRequest<C>) -> Result<VoteResponse<C>, GroupEngineError> {
-        self.core.apply_health.check(META_GROUP)?;
+        self.core.apply_health.check(RaftTarget::Meta)?;
         self.core.vote(request).await
     }
 
@@ -304,8 +305,8 @@ impl ActiveMeta {
         vote: UrsulaVote,
         snapshot: UrsulaSnapshot,
     ) -> Result<SnapshotResponse<C>, SnapshotInstallError> {
-        self.core.apply_health.check(META_GROUP)?;
-        if let Some(floor) = self.core.check_recovery_vote(META_GROUP, vote)? {
+        self.core.apply_health.check(RaftTarget::Meta)?;
+        if let Some(floor) = self.core.check_recovery_vote(RaftTarget::Meta, vote)? {
             return Ok(SnapshotResponse::new(floor));
         }
         if let Some(refusal) = self
@@ -374,7 +375,7 @@ impl ActiveMeta {
     ) -> Result<TransferLeaderResponse<C>, IncomingTransferError> {
         self.core
             .apply_health
-            .check(META_GROUP)
+            .check(RaftTarget::Meta)
             .map_err(IncomingTransferError::Group)?;
         self.core
             .deliver_transfer(&self.election, META_GROUP, request)
@@ -414,7 +415,7 @@ impl ActiveMeta {
         &self,
         commands: Vec<RaftCommand>,
     ) -> Result<Vec<Result<ControlResponse, GroupEngineError>>, GroupEngineError> {
-        self.core.apply_health.check(META_GROUP)?;
+        self.core.apply_health.check(RaftTarget::Meta)?;
         let history = Arc::clone(&self.core.history);
         self.core
             .owner()
@@ -528,7 +529,7 @@ impl MetaReplica {
         // The recovery gate goes first: a gated replica's Raft starts with
         // elections disabled, and a plan's cut runs before it reads the log.
         let gate = Arc::new(
-            GroupRejoin::durable(config.node, META_GROUP, &store)
+            GroupRejoin::durable(config.node, RaftTarget::Meta, &store)
                 .await
                 .map_err(MetaReplicaError::Gate)?,
         );
@@ -540,7 +541,7 @@ impl MetaReplica {
             store.apply_stop_signal(),
         );
         state_machine.restore()?;
-        let history = GroupHistory::new(META_GROUP, history_publisher.subscribe());
+        let history = GroupHistory::new(RaftTarget::Meta, history_publisher.subscribe());
         history.set_plan(gate.recovery_record());
         let metadata_serial = Arc::clone(&state_machine.metadata_serial);
         let apply_health = state_machine.apply_health.clone();
@@ -642,7 +643,7 @@ impl MetaReplica {
             raft: self.raft.clone(),
             metadata_serial: Arc::clone(&self.metadata_serial),
             openraft_work: self.openraft_work.clone(),
-            raft_group_id: META_GROUP,
+            group: RaftTarget::Meta,
             work_stop_timeout: crate::openraft_work::ENGINE_WORK_STOP_TIMEOUT,
         }
     }

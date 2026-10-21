@@ -64,6 +64,7 @@ use ursula_runtime::encode_binary_envelope;
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 use ursula_shard::ShardPlacement;
 
 use crate::engine::group_engine_io_error;
@@ -1501,7 +1502,7 @@ impl From<SnapshotRestoreError> for GroupEngineError {
                 };
                 return GroupEngineError::Infra(GroupInfraError::LogBelowSnapshot {
                     core_id,
-                    raft_group_id,
+                    group: RaftTarget::Data(raft_group_id),
                     snapshot: log_position(snapshot),
                     held: log_position(held),
                 });
@@ -2792,7 +2793,7 @@ impl RaftSnapshotBuilder<UrsulaRaftTypeConfig> for RaftGroupSnapshotBuilder {
 
     async fn build_snapshot(&mut self) -> Result<UrsulaSnapshot, io::Error> {
         self.apply_health
-            .check(self.placement.raft_group_id)
+            .check(RaftTarget::Data(self.placement.raft_group_id))
             .map_err(group_engine_io_error)?;
         // A build of an engine that already shut down would be refused at its
         // publication anyway. Refusing it here skips its write, and hands
@@ -4786,16 +4787,22 @@ mod tests {
             }
             assert!(
                 matches!(
-                    work.stop(placement.raft_group_id, Duration::from_millis(10))
-                        .await,
+                    work.stop(
+                        ursula_shard::RaftTarget::Data(placement.raft_group_id),
+                        Duration::from_millis(10)
+                    )
+                    .await,
                     Err(ursula_runtime::GroupInfraError::EngineWorkOutlivedShutdown { .. })
                 ),
                 "{write:?}: the builder still holds the engine's token"
             );
             drop(builder);
-            work.stop(placement.raft_group_id, Duration::from_secs(5))
-                .await
-                .expect("the engine's stop returns once the builder is gone");
+            work.stop(
+                ursula_shard::RaftTarget::Data(placement.raft_group_id),
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("the engine's stop returns once the builder is gone");
         }
     }
 

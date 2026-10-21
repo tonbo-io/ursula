@@ -133,6 +133,7 @@ use ursula_runtime::replace_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_runtime::rollback_cold_index_pages;
 use ursula_runtime::write_cold_chunk_index_pages_with_rollback_in_generation;
 use ursula_shard::BucketStreamId;
+use ursula_shard::RaftTarget;
 use ursula_shard::ShardPlacement;
 use ursula_stream::SharedRefCompactionRequest;
 use ursula_stream::StreamCommand;
@@ -288,7 +289,7 @@ pub(crate) struct EngineStopper<SM: RaftStateMachine<UrsulaRaftTypeConfig> = Raf
     pub(crate) metadata_serial:
         Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
     pub(crate) openraft_work: crate::openraft_work::OpenRaftWork,
-    pub(crate) raft_group_id: ursula_shard::RaftGroupId,
+    pub(crate) group: RaftTarget,
     pub(crate) work_stop_timeout: Duration,
 }
 
@@ -323,7 +324,7 @@ impl<SM: RaftStateMachine<UrsulaRaftTypeConfig>> EngineStopper<SM> {
             return result;
         }
         self.openraft_work
-            .stop(self.raft_group_id, self.work_stop_timeout)
+            .stop(self.group, self.work_stop_timeout)
             .await
             .map_err(GroupEngineError::Infra)?;
         result
@@ -635,7 +636,7 @@ impl RaftGroupEngine {
                 .map_err(crate::owner::owner_stopped)?;
             return Err(GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::LeaderWaitTimedOut {
-                    raft_group_id: self.placement.raft_group_id,
+                    group: RaftTarget::Data(self.placement.raft_group_id),
                     timeout_ms: 0,
                 },
             ));
@@ -828,7 +829,7 @@ impl RaftGroupEngine {
         // install) then reach reads on every replica, followers included.
         let cold_index_cache = state_machine.engine.cold_index_cache();
         let history = crate::history::GroupHistory::new(
-            placement.raft_group_id,
+            RaftTarget::Data(placement.raft_group_id),
             state_machine.engine.subscribe_history(),
         );
         if let Some(gate) = &recovery {
@@ -866,7 +867,7 @@ impl RaftGroupEngine {
         .map_err(|err| {
             tracing::error!(raft_group_id = placement.raft_group_id.0, error = %err, "Raft initialization failed");
             apply_health
-                .check(placement.raft_group_id)
+                .check(RaftTarget::Data(placement.raft_group_id))
                 .err()
                 .unwrap_or_else(|| crate::owner::owner_stopped(&err))
         })?;
@@ -996,11 +997,11 @@ impl RaftGroupEngine {
         gate: Arc<crate::GroupRejoin>,
         registry: &crate::RaftGroupHandleRegistry,
     ) -> Result<(), GroupEngineError> {
-        if gate.raft_group_id() != self.placement.raft_group_id {
+        if gate.group() != RaftTarget::Data(self.placement.raft_group_id) {
             return Err(GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::RecoveryGroupMismatch {
-                    expected: self.placement.raft_group_id,
-                    actual: gate.raft_group_id(),
+                    expected: RaftTarget::Data(self.placement.raft_group_id),
+                    actual: gate.group(),
                 },
             ));
         }
@@ -1014,7 +1015,7 @@ impl RaftGroupEngine {
         {
             return Err(GroupEngineError::Infra(
                 ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
-                    raft_group_id: self.placement.raft_group_id,
+                    group: RaftTarget::Data(self.placement.raft_group_id),
                 },
             ));
         }
@@ -1026,7 +1027,7 @@ impl RaftGroupEngine {
             if !Arc::ptr_eq(bound, &gate) {
                 return Err(GroupEngineError::Infra(
                     ursula_runtime::GroupInfraError::RecoveryAlreadyBound {
-                        raft_group_id: self.placement.raft_group_id,
+                        group: RaftTarget::Data(self.placement.raft_group_id),
                     },
                 ));
             }
@@ -1072,7 +1073,7 @@ impl RaftGroupEngine {
             raft: self.raft.clone(),
             metadata_serial: Arc::clone(&self.metadata_serial),
             openraft_work: self.openraft_work.clone(),
-            raft_group_id: self.placement.raft_group_id,
+            group: RaftTarget::Data(self.placement.raft_group_id),
             work_stop_timeout: self.work_stop_timeout,
         }
     }
@@ -1167,7 +1168,8 @@ impl RaftGroupEngine {
         fence: ProposalFence,
     ) -> Result<GroupWriteResponse, GroupEngineError> {
         // Refused before proposal: nothing was written.
-        self.apply_health.check(self.placement.raft_group_id)?;
+        self.apply_health
+            .check(RaftTarget::Data(self.placement.raft_group_id))?;
         let command = RaftCommand::Stream(command);
         self.history.admit_proposal(&self.raft, &command).await?;
         crate::forward::await_first_quorum_ack(&self.raft).await;
@@ -1217,7 +1219,8 @@ impl RaftGroupEngine {
     where
         V: OptionalSend + 'static,
     {
-        self.apply_health.check(self.placement.raft_group_id)?;
+        self.apply_health
+            .check(RaftTarget::Data(self.placement.raft_group_id))?;
         // A leader whose history is pending serves nothing (#581 section
         // 4.5); this covers every engine read and the early answers.
         self.history.admit(&self.raft).await?;
@@ -1235,7 +1238,8 @@ impl RaftGroupEngine {
     where
         V: OptionalSend + 'static,
     {
-        self.apply_health.check(self.placement.raft_group_id)?;
+        self.apply_health
+            .check(RaftTarget::Data(self.placement.raft_group_id))?;
         self.raft
             .with_state_machine(f)
             .await

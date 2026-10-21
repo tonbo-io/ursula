@@ -17,11 +17,12 @@ use openraft::alias::LogIdOf;
 use openraft::metrics::RaftServerMetrics;
 use openraft::rt::WatchReceiver;
 use openraft::type_config::alias::WatchReceiverOf;
+use ursula_shard::RaftTarget;
 
 use super::attach::Wake;
 use super::attach::wait_change;
 use super::log_index;
-use crate::target::RaftTarget;
+use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig as C;
 use crate::types::UrsulaVote;
 

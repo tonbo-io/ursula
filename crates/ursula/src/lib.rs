@@ -3107,7 +3107,9 @@ pub(crate) async fn accept_unsynced_loss(
             .rejoin(raft_group_id)
             .map(|rejoin| rejoin.node_id())
     }) else {
-        let err = ursula_raft::RecoveryGateError::NotRegistered { raft_group_id };
+        let err = ursula_raft::RecoveryGateError::NotRegistered {
+            group: ursula_shard::RaftTarget::Data(raft_group_id),
+        };
         return (StatusCode::NOT_FOUND, err.to_string()).into_response();
     };
     // The admin fence runs this handler in a task of its own, so a client

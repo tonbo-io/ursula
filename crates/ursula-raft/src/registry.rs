@@ -31,6 +31,7 @@ use openraft::storage::RaftSnapshotBuilder;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
 use tokio::sync::watch;
+use ursula_proto::admin::RaftTargetKey;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_runtime::ColdIndexPageCache;
@@ -43,6 +44,7 @@ use ursula_runtime::SnapshotLocation;
 use ursula_runtime::SnapshotPointer;
 use ursula_runtime::default_snapshot_store;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 #[cfg(test)]
 use ursula_shard::ShardPlacement;
 
@@ -192,11 +194,7 @@ impl GroupEntry {
     /// stopped by an apply failure reports the stop instead: its gate can no
     /// longer open, and it must not hold back the node's other groups.
     fn participating_gate(&self) -> Option<&Arc<GroupRejoin>> {
-        let active = self.active()?;
-        if active.core.apply_health.failure().is_some() {
-            return None;
-        }
-        active.core.recovery.as_ref()
+        self.active()?.core.participating_gate()
     }
 }
 
@@ -781,18 +779,21 @@ impl RaftGroupHandleRegistry {
             .load()
             .get(&raft_group_id.0)
             .and_then(|entry| entry.active().cloned())
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?;
+            .ok_or(RecoveryGateError::NotRegistered {
+                group: RaftTarget::Data(raft_group_id),
+            })?;
         let core = entry.core.clone();
         let applied = entry.log_gauge.applied_membership();
         drop(entry);
-        core.accept_plan(&self.election, raft_group_id, plan, applied, move || {
+        let group = RaftTarget::Data(raft_group_id);
+        core.accept_plan(&self.election, group, plan, applied, move || {
             futures_util::FutureExt::boxed(async move {
                 let Some(restarted) =
                     restart
                         .restart_replica(raft_group_id)
                         .await
                         .map_err(|source| RecoveryGateError::Restart {
-                            raft_group_id,
+                            group,
                             source: Box::new(source),
                         })?
                 else {
@@ -815,12 +816,24 @@ impl RaftGroupHandleRegistry {
         .await
     }
 
-    /// The recovery gate of every group that has one on this node.
-    pub fn recovery_gates(&self) -> BTreeMap<u32, RecoveryGateStatus> {
+    /// The recovery gate of every replica that has one on this node, by
+    /// its group: each data group's by its id, the meta replica's as
+    /// `meta`.
+    pub fn recovery_gates(&self) -> BTreeMap<RaftTargetKey, RecoveryGateStatus> {
+        let meta = self.meta();
+        let meta_gate = meta
+            .as_ref()
+            .and_then(|meta| meta.core.participating_gate())
+            .map(|gate| (RaftTargetKey::Meta, gate.status()));
         self.groups
             .load()
             .iter()
-            .filter_map(|(id, entry)| entry.participating_gate().map(|gate| (*id, gate.status())))
+            .filter_map(|(id, entry)| {
+                entry
+                    .participating_gate()
+                    .map(|gate| (RaftTargetKey::Data(*id), gate.status()))
+            })
+            .chain(meta_gate)
             .collect()
     }
 
@@ -840,15 +853,28 @@ impl RaftGroupHandleRegistry {
         self.follower_log_reversions.clone()
     }
 
-    /// Groups whose gated replica on this node got no leader barrier and
-    /// applied nothing for [`crate::RECOVERY_STALL_AFTER`]: they wait for an
-    /// operator to accept the loss of the unsynced tail.
+    /// The recovery gates of [`Self::recovery_gates`] that are not open,
+    /// and the groups among them whose gated replica on this node got no
+    /// leader barrier and applied nothing for
+    /// [`crate::RECOVERY_STALL_AFTER`]: they wait for an operator to accept
+    /// the loss of the unsynced tail.
     pub fn recovery_report(&self) -> ursula_proto::admin::RecoveryGatesReport {
         ursula_proto::admin::RecoveryGatesReport::new(self.recovery_gates())
     }
 
+    /// The data groups of [`Self::recovery_report`] that stalled, which
+    /// readiness reports. The meta replica's gate never makes the node
+    /// unready, as in [`Self::recovery_barriers_ready`]: readiness gates
+    /// the data plane's serving.
     pub fn stalled_recovery_groups(&self) -> Vec<u32> {
-        self.recovery_report().stalled
+        self.recovery_report()
+            .stalled
+            .into_iter()
+            .filter_map(|group| match group {
+                RaftTargetKey::Data(group) => Some(group),
+                RaftTargetKey::Meta => None,
+            })
+            .collect()
     }
 
     /// The group's shared cold-index page cache, if one was registered.
@@ -1107,10 +1133,10 @@ impl RaftGroupHandleRegistry {
         N: openraft::RaftNetworkFactory<UrsulaRaftTypeConfig> + Clone + Send,
         N::Network: RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
     {
-        let raft_group_id = crate::meta::state_machine::META_GROUP;
+        let group = RaftTarget::Meta;
         let core = self
             .meta()
-            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?
+            .ok_or(RecoveryGateError::NotRegistered { group })?
             .core
             .clone();
         let applied = core
@@ -1119,11 +1145,8 @@ impl RaftGroupHandleRegistry {
                 Box::pin(std::future::ready(state_machine.applied_membership()))
             })
             .await
-            .map_err(|source| RecoveryGateError::OwnerStopped {
-                raft_group_id,
-                source,
-            })?;
-        core.accept_plan(&self.election, raft_group_id, plan, applied, move || {
+            .map_err(|source| RecoveryGateError::OwnerStopped { group, source })?;
+        core.accept_plan(&self.election, group, plan, applied, move || {
             futures_util::FutureExt::boxed(async move {
                 let restarted =
                     restart
@@ -1289,15 +1312,15 @@ impl RaftGroupHandleRegistry {
         let groups = self.groups.load();
         let entry = groups.get(&group.0).ok_or(GroupEngineError::Infra(
             ursula_runtime::GroupInfraError::RaftGroupNotRegistered {
-                raft_group_id: group,
+                group: RaftTarget::Data(group),
             },
         ))?;
         match entry.as_ref() {
             GroupEntry::Active(active) => {
-                active.core.apply_health.check(group)?;
+                active.core.apply_health.check(RaftTarget::Data(group))?;
                 Ok(active.clone())
             }
-            GroupEntry::ApplyStopped { stopped, .. } => Err(stopped.error(group)),
+            GroupEntry::ApplyStopped { stopped, .. } => Err(stopped.error(RaftTarget::Data(group))),
         }
     }
 
@@ -1307,7 +1330,10 @@ impl RaftGroupHandleRegistry {
         request: AppendEntriesRequest<UrsulaRaftTypeConfig>,
     ) -> Result<AppendEntriesResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let entry = self.entry(raft_group_id)?;
-        entry.core.append_entries(raft_group_id, request).await
+        entry
+            .core
+            .append_entries(RaftTarget::Data(raft_group_id), request)
+            .await
     }
 
     pub async fn vote(
@@ -1330,7 +1356,10 @@ impl RaftGroupHandleRegistry {
         // falls below it, so Raft refuses a vote the floor overtakes while
         // this request waits.
         let entry = self.entry(raft_group_id)?;
-        if let Some(floor) = entry.core.check_recovery_vote(raft_group_id, vote)? {
+        if let Some(floor) = entry
+            .core
+            .check_recovery_vote(RaftTarget::Data(raft_group_id), vote)?
+        {
             return Ok(SnapshotResponse::new(floor));
         }
         if let Some(refusal) = entry
@@ -2103,9 +2132,13 @@ mod tests {
         )
         .unwrap();
         let gate = Arc::new(
-            crate::GroupRejoin::durable(1, RaftGroupId(7), &gate_store)
-                .await
-                .expect("open the gate"),
+            crate::GroupRejoin::durable(
+                1,
+                ursula_shard::RaftTarget::Data(RaftGroupId(7)),
+                &gate_store,
+            )
+            .await
+            .expect("open the gate"),
         );
         let (registry, engine, _root) = gated_install_engine(store, gate.clone()).await;
         engine.publish_recovery(gate.clone(), &registry).unwrap();
@@ -2119,7 +2152,7 @@ mod tests {
             matches!(
                 error,
                 GroupEngineError::Infra(ursula_runtime::GroupInfraError::RecoveryPlanFenced {
-                    raft_group_id: RaftGroupId(7),
+                    group: RaftTarget::Data(RaftGroupId(7)),
                     plan_term: 7,
                 })
             )
@@ -2970,14 +3003,14 @@ mod tests {
             SnapshotInstallError::ShuttingDown { group },
             SnapshotInstallError::Group(GroupEngineError::Infra(
                 GroupInfraError::CommittedOverwrite {
-                    raft_group_id: group,
+                    group: RaftTarget::Data(group),
                     committed: 2,
                     index: 1,
                 },
             )),
             SnapshotInstallError::Group(GroupEngineError::Infra(
                 GroupInfraError::RaftGroupNotRegistered {
-                    raft_group_id: group,
+                    group: RaftTarget::Data(group),
                 },
             )),
             SnapshotInstallError::Group(GroupEngineError::Infra(

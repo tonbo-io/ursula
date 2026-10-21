@@ -4,6 +4,7 @@
 //! recovery plans) is exercised end to end by the meta DST family and the
 //! integration tests.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -29,6 +30,8 @@ use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::HistoryCause;
 use ursula_control::samples;
+use ursula_proto::admin::RaftTargetKey;
+use ursula_proto::admin::RecoveryGateStatus;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ViewStage;
 use ursula_runtime::GroupEngineMetrics;
@@ -576,7 +579,10 @@ pub(super) async fn form_alone(wal: &RaftWal, registry: &RaftGroupHandleRegistry
 /// before proposing it, snapshots, stops, and a restart of the WAL brings
 /// back its state, its history and its view from the record and the
 /// committed log above it.
-/// The meta group stays out of the registry's data structures throughout.
+/// The meta group stays out of the registry's data groups and metrics
+/// throughout. Its open gate shows in the registry's recovery gates as
+/// `meta`, and the recovery report, which lists only gates that are not
+/// open, stays empty.
 #[tokio::test]
 async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
     let dir = tempfile::tempdir().unwrap();
@@ -638,7 +644,12 @@ async fn a_meta_replica_forms_writes_and_restarts_from_its_journal() {
     assert!(matches!(forwarded.as_slice(), [Ok(Ok(_))]), "{forwarded:?}");
     let before = registry.placement_watch().current();
     let applied = before.applied().unwrap().get().index;
-    assert!(registry.is_empty() && registry.recovery_gates().is_empty());
+    assert!(registry.is_empty());
+    assert_eq!(
+        registry.recovery_gates(),
+        BTreeMap::from([(RaftTargetKey::Meta, RecoveryGateStatus::Open)])
+    );
+    assert!(registry.recovery_report().gated.is_empty());
     assert!(registry.metrics_snapshot().is_empty());
     drop(active);
 

@@ -254,7 +254,7 @@ impl RecoveryGate {
         T: RecoveryTransport,
     {
         rejoin.set_stall_after(config.stall_after);
-        let target = SM::target(rejoin.raft_group_id);
+        let target = rejoin.group;
         self.push(crate::rt::spawn(run_rejoin_vote_barrier(
             owner,
             rejoin.clone(),

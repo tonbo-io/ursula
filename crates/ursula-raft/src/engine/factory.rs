@@ -440,7 +440,7 @@ impl StaticGrpcRaftGroupEngineFactory {
 fn invalid_configuration(placement: ShardPlacement) -> GroupEngineError {
     GroupEngineError::Infra(GroupInfraError::WalOpen {
         core_id: placement.core_id,
-        raft_group_id: placement.raft_group_id,
+        group: ursula_shard::RaftTarget::Data(placement.raft_group_id),
         failure: WalOpenFailureKind::InvalidConfiguration,
     })
 }
@@ -485,9 +485,13 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .await
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let rejoin = Arc::new(
-                GroupRejoin::durable(self.node_id, placement.raft_group_id, &store)
-                    .await
-                    .map_err(|source| super::wal_error::gate_open_error(placement, source))?,
+                GroupRejoin::durable(
+                    self.node_id,
+                    ursula_shard::RaftTarget::Data(placement.raft_group_id),
+                    &store,
+                )
+                .await
+                .map_err(|source| super::wal_error::gate_open_error(placement, source))?,
             );
             let raft_config = cluster_raft_config(
                 format!("ursula-group-{}", placement.raft_group_id.0),
@@ -659,7 +663,7 @@ mod tests {
             err,
             GroupEngineError::Infra(GroupInfraError::WalOpen {
                 core_id: CoreId(1),
-                raft_group_id: RaftGroupId(2),
+                group: ursula_shard::RaftTarget::Data(RaftGroupId(2)),
                 failure: WalOpenFailureKind::InvalidConfiguration,
             })
         );

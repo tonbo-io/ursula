@@ -67,6 +67,7 @@ use ursula_proto::placement::StepKind;
 use ursula_proto::placement::ViewStage;
 use ursula_proto::placement::WaitReason;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use super::leader_tick::FollowerLogReversions;
 use super::leader_tick::LeaderTick;
@@ -82,7 +83,7 @@ use crate::meta::confirm::MetaBarrierError;
 use crate::peer_cluster::PeerCluster;
 use crate::replica::ReplicaCore;
 use crate::rt::sync::watch;
-use crate::target::RaftTarget;
+use crate::target::WireTarget;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig as C;
 use crate::types::UrsulaVote;

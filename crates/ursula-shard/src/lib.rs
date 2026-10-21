@@ -3,8 +3,9 @@
 //! Module map:
 //!
 //! - [`content_type`]: content-type normalization, used by the node.
-//! - crate root: shard and Raft group identifiers, [`BucketStreamId`], the
-//!   reserved subresource names and the static shard map.
+//! - crate root: shard and Raft group identifiers, [`RaftTarget`],
+//!   [`BucketStreamId`], the reserved subresource names and the static shard
+//!   map.
 
 use std::fmt;
 use std::num::NonZeroU16;
@@ -26,6 +27,40 @@ pub struct ShardId(pub u32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct RaftGroupId(pub u32);
+
+/// A Raft group of either plane: a data group, or the meta group. Errors,
+/// recovery gates and their logs name a group by it, so a refusal of the
+/// meta group never reads as one of data group 0.
+///
+/// Its serde form is part of the replicated and RPC MessagePack closure
+/// (`GroupEngineError` carries it): the variant by name, `Data` with the
+/// group id. Admin JSON names it through [`ursula_proto::admin::RaftTargetKey`]
+/// instead: `"meta"` or the group id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RaftTarget {
+    Data(RaftGroupId),
+    /// The meta group, whose wire group id, core and shard are 0.
+    Meta,
+}
+
+/// `raft group 7`, or `the meta group`.
+impl fmt::Display for RaftTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Data(group) => write!(f, "raft group {}", group.0),
+            Self::Meta => f.write_str("the meta group"),
+        }
+    }
+}
+
+impl From<RaftTarget> for ursula_proto::admin::RaftTargetKey {
+    fn from(target: RaftTarget) -> Self {
+        match target {
+            RaftTarget::Data(group) => Self::Data(group.0),
+            RaftTarget::Meta => Self::Meta,
+        }
+    }
+}
 
 /// Path segments reserved for any future co-location form and stream
 /// subresource. Ursula serves `/{bucket}/{stream}` and the two-segment

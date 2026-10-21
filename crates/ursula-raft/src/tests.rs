@@ -581,7 +581,7 @@ async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() 
             payload: encode_wire(&request),
             ..Default::default()
         };
-        crate::target::RaftTarget::Data(RaftGroupId(0)).stamp(1, &mut envelope);
+        crate::target::WireTarget::stamp(crate::RaftTarget::Data(RaftGroupId(0)), 1, &mut envelope);
         tonic::Request::new(envelope)
     };
     let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
@@ -804,9 +804,13 @@ async fn build_three_node_cluster_gating(
         let (wal_root, log_store) = fresh_journal_store();
         let node_gate = if gated == Some(node_id) {
             Some(Arc::new(
-                GroupRejoin::durable(node_id, placement().raft_group_id, &log_store)
-                    .await
-                    .expect("open the gate"),
+                GroupRejoin::durable(
+                    node_id,
+                    ursula_shard::RaftTarget::Data(placement().raft_group_id),
+                    &log_store,
+                )
+                .await
+                .expect("open the gate"),
             ))
         } else {
             None
@@ -3640,7 +3644,7 @@ async fn a_restart_keeps_the_group_closed_while_its_old_work_runs() {
             &refused,
             Err(ursula_runtime::RuntimeError::GroupEngine {
                 error: GroupEngineError::Infra(GroupInfraError::PreviousEngineWorkRunning {
-                    raft_group_id: refused_group,
+                    group: RaftTarget::Data(refused_group),
                 }),
                 ..
             }) if *refused_group == raft_group_id
@@ -4310,9 +4314,13 @@ async fn only_a_gated_group_allows_follower_log_reversion() {
         let mut options = RaftGroupEngineOptions::default();
         if gated {
             options.recovery = Some(Arc::new(
-                GroupRejoin::durable(1, placement().raft_group_id, &store)
-                    .await
-                    .expect("open the gate"),
+                GroupRejoin::durable(
+                    1,
+                    ursula_shard::RaftTarget::Data(placement().raft_group_id),
+                    &store,
+                )
+                .await
+                .expect("open the gate"),
             ));
         }
         let engine = RaftGroupEngine::new_node(
@@ -4586,7 +4594,9 @@ async fn incoming_transfer_policy_refuses_only_transfers_to_this_node() {
     ));
 
     let (_root, store) = fresh_journal_store();
-    let gate = GroupRejoin::durable(node, group, &store).await.unwrap();
+    let gate = GroupRejoin::durable(node, ursula_shard::RaftTarget::Data(group), &store)
+        .await
+        .unwrap();
     assert!(!gate.vote_gate_open());
     assert!(matches!(
         policy.validate_incoming_transfer(group, node, &transfer(leader_vote, node), Some(&gate)),
@@ -5447,7 +5457,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
     match opened {
         Err(GroupEngineError::Infra(GroupInfraError::LogBelowSnapshot {
             core_id,
-            raft_group_id,
+            group: RaftTarget::Data(raft_group_id),
             snapshot,
             held,
         })) => {
@@ -5941,7 +5951,7 @@ async fn a_shutdown_that_does_not_wait_leaves_the_queued_work_running() {
         matches!(
             &stopped,
             Err(GroupEngineError::Infra(GroupInfraError::EngineWorkOutlivedShutdown {
-                raft_group_id,
+                group: RaftTarget::Data(raft_group_id),
                 waited_ms: 0,
             })) if *raft_group_id == placement().raft_group_id
         ),
@@ -5994,7 +6004,7 @@ async fn engine_shutdown_names_openraft_work_that_does_not_end() {
         matches!(
             &stopped,
             Err(GroupEngineError::Infra(GroupInfraError::EngineWorkOutlivedShutdown {
-                raft_group_id,
+                group: RaftTarget::Data(raft_group_id),
                 waited_ms: 200,
             })) if *raft_group_id == placement().raft_group_id
         ),

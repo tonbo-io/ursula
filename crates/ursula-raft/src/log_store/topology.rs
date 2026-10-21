@@ -384,10 +384,14 @@ mod tests {
         assert_eq!(store.read_vote().await.unwrap(), Some(vote));
         assert_eq!(store.try_get_log_entries(1..=1).await.unwrap().len(), 1);
         assert!(
-            GroupRejoin::durable(1, placement.raft_group_id, &store)
-                .await
-                .unwrap()
-                .vote_gate_open()
+            GroupRejoin::durable(
+                1,
+                ursula_shard::RaftTarget::Data(placement.raft_group_id),
+                &store
+            )
+            .await
+            .unwrap()
+            .vote_gate_open()
         );
         wal.shutdown().await.unwrap();
     }

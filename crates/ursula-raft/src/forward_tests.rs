@@ -365,7 +365,7 @@ impl GroupEngineFactory for PrebuiltEngine {
             // The one engine was handed out: the group runs nowhere else.
             let engine = engine.ok_or(GroupEngineError::Infra(
                 GroupInfraError::RaftGroupNotRegistered {
-                    raft_group_id: placement.raft_group_id,
+                    group: RaftTarget::Data(placement.raft_group_id),
                 },
             ))?;
             Ok(Box::new(engine) as Box<dyn GroupEngine>)

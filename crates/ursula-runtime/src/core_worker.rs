@@ -567,7 +567,7 @@ impl CoreWorker {
                 GroupEntry::Refused(RuntimeError::group_engine(
                     placement,
                     GroupEngineError::Infra(crate::engine::GroupInfraError::ApplyStopped {
-                        raft_group_id,
+                        group: ursula_shard::RaftTarget::Data(raft_group_id),
                         term: *term,
                         index: *index,
                         kind: *kind,
