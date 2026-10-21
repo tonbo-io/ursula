@@ -4369,6 +4369,7 @@ dependencies = [
  "tracing",
  "ursula",
  "ursula-config",
+ "ursula-control",
  "ursula-ctl",
  "ursula-headers",
  "ursula-observability",

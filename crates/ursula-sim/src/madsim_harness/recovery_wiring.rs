@@ -7,6 +7,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+use ursula_control::ControlCommand;
+use ursula_control::ControlResponse;
+use ursula_proto::placement::NodeId;
+use ursula_raft::BarrierAnswer;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkEvent;
 use ursula_raft::InProcessRaftNetworkPolicy;
@@ -14,8 +18,10 @@ use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::PeerGroupLog;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupHandleRegistry;
+use ursula_raft::RaftTarget;
 use ursula_raft::RecoveryGateStatus;
-use ursula_raft::UrsulaVote;
+use ursula_raft::meta::MetaForwardError;
+use ursula_raft::meta::genesis::GenesisProbe;
 use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
 use ursula_shard::ShardPlacement;
 
@@ -37,38 +43,34 @@ pub(super) fn configured_voters(node_ids: impl IntoIterator<Item = u64>) -> BTre
 #[derive(Debug)]
 pub(super) enum RecoveryProbeError {
     Partitioned,
-    MissingGate,
     Proof(ursula_raft::QuorumProofError),
 }
 impl std::fmt::Display for RecoveryProbeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Partitioned => f.write_str("partitioned from leader"),
-            Self::MissingGate => f.write_str("leader gate is absent"),
             Self::Proof(error) => std::fmt::Display::fmt(error, f),
         }
     }
 }
 
-/// A fresh outbound ReadIndex barrier from `leader_id`, confirmed the way the
-/// barrier RPC confirms one: a new ReadIndex round with a quorum, applied by
-/// the leader, while it still leads. `policy` cuts the RPC off as it cuts
-/// off the Raft RPCs between `node_id` and the leader.
+/// A fresh outbound ReadIndex barrier of `target` from `leader_id`,
+/// confirmed the way the barrier RPC confirms one: a new ReadIndex round
+/// with a quorum, applied by the leader, while it still leads. `policy`
+/// cuts the RPC off as it cuts off the Raft RPCs between `node_id` and the
+/// leader.
 pub(super) async fn in_process_barrier(
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
     node_id: u64,
     leader_id: u64,
-) -> Result<(UrsulaVote, u64), RecoveryProbeError> {
+    target: RaftTarget,
+) -> Result<BarrierAnswer, RecoveryProbeError> {
     if policy.partitioned(node_id, leader_id) {
         return Err(RecoveryProbeError::Partitioned);
     }
-    let group = registry
-        .rejoin(leader_id)
-        .ok_or(RecoveryProbeError::MissingGate)?
-        .raft_group_id();
     registry
-        .confirm_recovery_barrier(leader_id, group)
+        .confirm_recovery_barrier(leader_id, target)
         .await
         .map_err(RecoveryProbeError::Proof)
 }
@@ -139,8 +141,26 @@ impl ursula_raft::RecoveryTransport for InProcessRecoveryTransport {
     async fn probe(&self, peer: u64) -> Option<PeerGroupLog> {
         in_process_probe(&self.registry, &self.policy, self.node_id, peer).await
     }
-    async fn barrier(&self, leader: u64) -> Result<(UrsulaVote, u64), Self::Error> {
-        in_process_barrier(&self.registry, &self.policy, self.node_id, leader).await
+    async fn genesis_probe(&self, peer: u64, probe: &GenesisProbe) -> Option<PeerGroupLog> {
+        if self.policy.partitioned(self.node_id, peer) {
+            return None;
+        }
+        self.registry.genesis_probe(peer, probe.clone()).await
+    }
+    async fn barrier(&self, leader: u64, target: RaftTarget) -> Result<BarrierAnswer, Self::Error> {
+        in_process_barrier(&self.registry, &self.policy, self.node_id, leader, target).await
+    }
+    async fn forward_control(
+        &self,
+        leader: u64,
+        command: ControlCommand,
+    ) -> Result<ControlResponse, MetaForwardError> {
+        if self.policy.partitioned(self.node_id, leader) {
+            return Err(MetaForwardError::leader_unreachable());
+        }
+        self.registry
+            .write_meta(leader, command, NodeId::new(self.node_id))
+            .await
     }
 }
 

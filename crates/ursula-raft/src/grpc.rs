@@ -91,7 +91,7 @@ pub struct CoreRaftTransport {
     /// Stamped on every request this transport sends.
     identity: PeerIdentity,
     /// Where a peer's refusal for another cluster id is recorded.
-    peer_cluster: PeerCluster,
+    pub(crate) peer_cluster: PeerCluster,
     channels: Mutex<BTreeMap<String, SharedRaftChannel>>,
     sessions: Mutex<BTreeMap<String, SharedAppendSession>>,
 }
@@ -397,7 +397,6 @@ pub(crate) async fn genesis_probe(
     probe: &crate::meta::genesis::GenesisProbe,
     timeout: Duration,
 ) -> Option<crate::rejoin::PeerGroupLog> {
-    use crate::meta::genesis::GenesisAnswer;
     use crate::rejoin::PeerGroupLog;
     let mut network = GrpcRaftNetwork::new(transport, RaftTarget::Meta, peer);
     let channel = network.channel.as_ref().ok()?;
@@ -408,10 +407,7 @@ pub(crate) async fn genesis_probe(
     let status = match client.genesis_probe(request).await {
         Ok(ack) => {
             return match crate::meta::genesis::genesis_answer(&ack.into_inner()) {
-                Ok(GenesisAnswer::Vote(response)) => {
-                    Some(PeerGroupLog::from_vote_response(&response))
-                }
-                Ok(GenesisAnswer::Mismatch(claim)) => Some(PeerGroupLog::GenesisMismatch { claim }),
+                Ok(answer) => Some(PeerGroupLog::from(answer)),
                 Err(error) => {
                     tracing::debug!(
                         peer,

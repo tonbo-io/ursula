@@ -492,8 +492,9 @@ impl JournalCluster {
         leader: u64,
     ) -> Result<(ursula_raft::UrsulaVote, u64), ursula_raft::QuorumProofError> {
         self.registries[&group]
-            .confirm_recovery_barrier(leader, RaftGroupId(group))
+            .confirm_recovery_barrier(leader, ursula_raft::RaftTarget::Data(RaftGroupId(group)))
             .await
+            .map(|answer| (answer.vote, answer.index))
     }
 
     /// Every node, the spares included.

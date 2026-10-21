@@ -38,6 +38,17 @@ pub enum GenesisAnswer {
     Mismatch(GenesisClaim),
 }
 
+/// What a genesis answer says of the meta group on the node that gave it,
+/// as the bootstrap decision and the genesis vote floor read it.
+impl From<GenesisAnswer> for crate::rejoin::PeerGroupLog {
+    fn from(answer: GenesisAnswer) -> Self {
+        match answer {
+            GenesisAnswer::Vote(response) => Self::from_vote_response(&response),
+            GenesisAnswer::Mismatch(claim) => Self::GenesisMismatch { claim },
+        }
+    }
+}
+
 /// The `GenesisProbe` request for `target_node` carrying `probe`.
 pub(crate) fn genesis_probe_request(
     target_node: u64,

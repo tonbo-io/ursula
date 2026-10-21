@@ -248,20 +248,56 @@ impl InProcessRegistry<RaftGroupStateMachine> {
             .insert(node_id, raft);
     }
 
-    /// The barrier RPC's server side on `node_id`, through the node's
-    /// production registry: a leader whose history is pending confirms none.
+    /// The barrier RPC's server side on `node_id` for `target`, through the
+    /// node's production registry: a leader whose history is pending
+    /// confirms none, and a node that runs no meta replica confirms no meta
+    /// barrier.
     pub async fn confirm_recovery_barrier(
         &self,
         node_id: u64,
-        group: ursula_shard::RaftGroupId,
-    ) -> Result<(crate::UrsulaVote, u64), crate::QuorumProofError> {
+        target: crate::RaftTarget,
+    ) -> Result<crate::BarrierAnswer, crate::QuorumProofError> {
+        let group = match target {
+            crate::RaftTarget::Data(group) => group,
+            crate::RaftTarget::Meta => crate::meta::state_machine::META_GROUP,
+        };
         let (_, endpoint) = self
             .endpoint(node_id)
             .ok_or(crate::QuorumProofError::NotRegistered { group })?;
-        endpoint
-            .confirm_recovery_barrier(group)
-            .await
-            .map(|answer| (answer.vote, answer.index))
+        match target {
+            crate::RaftTarget::Data(group) => endpoint.confirm_recovery_barrier(group).await,
+            crate::RaftTarget::Meta => match endpoint.meta() {
+                Some(meta) => meta.confirm_recovery_barrier().await,
+                None => Err(crate::QuorumProofError::NotRegistered { group }),
+            },
+        }
+    }
+
+    /// The genesis probe RPC on `node_id`, through the node's production
+    /// registry ([`genesis_probe_in_process`]).
+    pub async fn genesis_probe(
+        &self,
+        node_id: u64,
+        probe: crate::meta::genesis::GenesisProbe,
+    ) -> Option<crate::PeerGroupLog> {
+        let (_, endpoint) = self.endpoint(node_id)?;
+        genesis_probe_in_process(&endpoint, probe).await
+    }
+
+    /// A control command `sender` forwards to the meta leader `node_id`,
+    /// through the node's production registry
+    /// ([`forward_control_in_process`]). A node that is not registered is a
+    /// leader that cannot be reached.
+    pub async fn write_meta(
+        &self,
+        node_id: u64,
+        command: ursula_control::ControlCommand,
+        sender: ursula_proto::placement::NodeId,
+    ) -> Result<ursula_control::ControlResponse, crate::meta::MetaForwardError> {
+        let Some((_, endpoint)) = self.endpoint(node_id) else {
+            return Err(crate::meta::MetaForwardError::leader_unreachable());
+        };
+        forward_control_in_process(&endpoint, node_id, command, sender).await
     }
 
     /// The `accept-unsynced-loss` admin route on `node_id`, through the
@@ -298,6 +334,49 @@ impl InProcessRegistry<RaftGroupStateMachine> {
         let (group, endpoint) = self.endpoint(node_id)?;
         endpoint.rejoin(group)
     }
+}
+
+/// The genesis probe as the node whose production registry is `registry`
+/// answers it, and as the gRPC sender reads the answer: no answer from a
+/// node that runs no meta replica or whose replica refuses the probe vote.
+pub(crate) async fn genesis_probe_in_process(
+    registry: &crate::RaftGroupHandleRegistry,
+    probe: crate::meta::genesis::GenesisProbe,
+) -> Option<crate::PeerGroupLog> {
+    let meta = registry.meta()?;
+    meta.answer_genesis_probe(probe)
+        .await
+        .ok()
+        .map(crate::PeerGroupLog::from)
+}
+
+/// A control command `sender` forwards to the meta leader `leader`, whose
+/// production registry is `registry`, answered through the same forwarded
+/// write as `GroupWrite` ([`crate::meta::replica::ActiveMeta`]) and
+/// classified as the gRPC sender classifies the same answer: the guard's
+/// refusal of a `RegisterNode` naming another node, and the refusal of a
+/// node that runs no meta replica, are the leader's refusals of the request
+/// ([`crate::meta::MetaForwardError::refused_in_process`]).
+pub(crate) async fn forward_control_in_process(
+    registry: &crate::RaftGroupHandleRegistry,
+    leader: u64,
+    command: ursula_control::ControlCommand,
+    sender: ursula_proto::placement::NodeId,
+) -> Result<ursula_control::ControlResponse, crate::meta::MetaForwardError> {
+    let refused = |status| crate::meta::MetaForwardError::refused_in_process(leader, status);
+    let meta = registry
+        .meta()
+        .ok_or_else(|| refused(crate::grpc::no_meta_replica("GroupWrite").into()))?;
+    let answers = meta
+        .write_forwarded(
+            vec![crate::RaftCommand::Meta(crate::meta::MetaCommand::Control(
+                command,
+            ))],
+            sender,
+        )
+        .await
+        .map_err(refused)?;
+    crate::forward::single_control_answer(answers).map_err(crate::meta::MetaForwardError::Leader)
 }
 
 /// The in-process network factory of one plane.

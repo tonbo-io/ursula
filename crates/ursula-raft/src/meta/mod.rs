@@ -57,13 +57,15 @@ pub use state_machine::MetaStateMachine;
 
 #[cfg(test)]
 #[cfg(not(madsim))]
+mod grpc_tests;
+#[cfg(test)]
+#[cfg(not(madsim))]
 mod tests;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;
 use ursula_control::HistoryCause;
 use ursula_runtime::ErrorStatus;
-use ursula_runtime::ForwardedRpc;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::WriteEffect;
 use ursula_stream::HistoryEvent;
@@ -141,13 +143,23 @@ impl MetaForwardError {
         }
     }
 
+    /// The answer when the meta leader cannot be reached, so nothing was
+    /// sent: a leader this node does not know, nothing proposed.
+    pub fn leader_unreachable() -> Self {
+        Self::Leader(crate::forward::unknown_leader(
+            ursula_runtime::LeadershipReason::LeaderUnreachable,
+            ursula_runtime::Proposal::NotProposed,
+        ))
+    }
+
     /// The refusal `status` of the meta leader `leader` answered in this
     /// process, classified as the same refusal over gRPC is: the in-process
     /// seam's answer to a write the leader refused itself, such as a
     /// `RegisterNode` naming another node than the sender.
+    #[cfg(any(test, madsim))]
     pub(crate) fn refused_in_process(leader: u64, status: tonic::Status) -> Self {
         Self::Transport(ForwardError::Refused {
-            rpc: ForwardedRpc::GroupWrite,
+            rpc: ursula_runtime::ForwardedRpc::GroupWrite,
             address: format!("in-process node {leader}"),
             source: status,
         })

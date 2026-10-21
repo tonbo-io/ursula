@@ -16,13 +16,13 @@ use super::log_index;
 use crate::owner::OwnerRaftHandle;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
-use crate::types::UrsulaVote;
 
 /// Opens a gated replica's recovery gate from fresh outbound leader proofs.
 /// It asks the group's configured voters (`nodes`) and the members of its
 /// effective membership, by node id. The supplied probe must confirm a new
 /// post-call ReadIndex with a quorum and return that leader's committed vote
-/// and required local applied index. A replica that for `stall_after` gets no barrier and applies
+/// and required local applied index ([`crate::BarrierAnswer`]). The driver
+/// does not read the answer's memberships. A replica that for `stall_after` gets no barrier and applies
 /// nothing reports its group stalled. Once the gate is open, here or through
 /// an operator, the group's election policy is refreshed and the driver
 /// returns. Transport-independent so simulation exercises the production
@@ -40,7 +40,7 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
 ) where
     SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
     P: Fn(u64) -> F,
-    F: Future<Output = Result<(UrsulaVote, u64), E>>,
+    F: Future<Output = Result<crate::BarrierAnswer, E>>,
     E: fmt::Debug,
 {
     let raft_group_id = rejoin.raft_group_id;
@@ -94,7 +94,11 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
                 }
                 let outcome = crate::rt::time::timeout(probe_timeout, probe(leader_id)).await;
                 match outcome {
-                    Ok(Ok((leader, index))) => {
+                    Ok(Ok(crate::BarrierAnswer {
+                        vote: leader,
+                        index,
+                        memberships: _,
+                    })) => {
                         if rejoin.needs_vote_floor() {
                             // This replica has refused every replication ACK. Therefore this fresh
                             // ReadIndex used a current quorum excluding it; a stale leader cannot

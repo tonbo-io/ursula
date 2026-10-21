@@ -308,13 +308,13 @@ fn single_write_answer<T>(results: Vec<T>) -> Result<T, GroupEngineError> {
 }
 
 /// [`single_write_answer`] of a meta write answered in this process, as
-/// [`forward_control_to_leader`] reads the same answer off the wire.
+/// [`forward_control_to_leader`] reads the same answer off the wire: the
+/// leader's answer, or its refusal ([`MetaForwardError::Leader`]).
+#[cfg(any(test, madsim))]
 pub(crate) fn single_control_answer(
     answers: Vec<Result<ControlResponse, GroupEngineError>>,
-) -> Result<ControlResponse, MetaForwardError> {
-    single_write_answer(answers)
-        .and_then(|answer| answer)
-        .map_err(MetaForwardError::Leader)
+) -> Result<ControlResponse, GroupEngineError> {
+    single_write_answer(answers).and_then(|answer| answer)
 }
 
 /// Deadline of one forwarded leader RPC, connect included. It ends a call
