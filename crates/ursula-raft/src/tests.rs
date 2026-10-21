@@ -5910,10 +5910,8 @@ async fn a_shutdown_that_does_not_wait_leaves_the_queued_work_running() {
             ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         ),
-        Err(crate::log_store::RaftWalError::OpenGroup {
-            source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
-            ..
-        })
+        Err(crate::log_store::RaftWalError::PreviousEngineRunning { placement: refused })
+            if refused == placement()
     ));
 
     queued.release.send(()).expect("the worker is still held");
@@ -5961,10 +5959,8 @@ async fn engine_shutdown_names_openraft_work_that_does_not_end() {
             ursula_control::Admission::Create,
             ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
         ),
-        Err(crate::log_store::RaftWalError::OpenGroup {
-            source: crate::log_store::CoreJournalError::GroupAlreadyOpen { .. },
-            ..
-        })
+        Err(crate::log_store::RaftWalError::PreviousEngineRunning { placement: refused })
+            if refused == placement()
     ));
 
     release.send(()).unwrap();

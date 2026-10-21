@@ -105,19 +105,22 @@ pub(crate) async fn route_before_body(
 ) -> HeadDecision {
     let incarnation = early_answer.as_ref().map(|query| query.incarnation);
     let raft_group_id = state.runtime.locate(stream_id).raft_group_id;
-    // The leadership view decides without a trip through the group's core.
-    // Only a leader's early answer, and a group the view does not know,
-    // need the core.
+    // The leadership view decides a leader and a follower without a trip
+    // through the group's core. A leader's early answer, a group the view
+    // does not know, and a view with no leader need the core. The view
+    // shows a replica from the moment its open publishes it, while the
+    // core still opens the group: the open of a group's only voter waits
+    // until it leads, and the core holds the write until that open ended.
     let viewed = leadership_view(state, raft_group_id);
     let routed = match viewed {
         Some(WriteRoute::Leader { fence, .. }) if early_answer.is_none() => {
             return admit(admission, fence);
         }
-        Some(route @ (WriteRoute::Follower { .. } | WriteRoute::NoLeader)) => RoutedWrite {
+        Some(route @ WriteRoute::Follower { .. }) => RoutedWrite {
             raft_group_id,
             route,
         },
-        Some(WriteRoute::Leader { .. }) | None => match state
+        Some(WriteRoute::Leader { .. } | WriteRoute::NoLeader) | None => match state
             .runtime
             .route_write(RouteWriteRequest {
                 stream_id: stream_id.clone(),
