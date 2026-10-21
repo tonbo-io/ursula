@@ -83,6 +83,10 @@ pub async fn run_fence_gate(registry: RaftGroupHandleRegistry, fence: NodeFence)
                     tracing::warn!("disk lease holds again: this node takes part in Raft again");
                 }
                 FenceStatus::Closed => tracing::info!("node fence closed for the shutdown"),
+                FenceStatus::Superseded => tracing::error!(
+                    "superseded: the meta group binds this node id to another root or released \
+                     this one, so this process takes part in nothing again until it exits"
+                ),
             }
             last = status;
         }
@@ -114,6 +118,7 @@ pub async fn run_predecessor_wait(
                 RegistrationStatus::Answered(Registered::Forming) => break None,
                 RegistrationStatus::Answered(_) => break Some(fence_now()),
                 RegistrationStatus::Pending
+                | RegistrationStatus::RootRefused { .. }
                 | RegistrationStatus::Refused(_)
                 | RegistrationStatus::Removed => {}
             }
@@ -138,11 +143,14 @@ pub async fn run_predecessor_wait(
     }
     while let Err(error) = wait.finish() {
         if let RaftWalError::Fenced {
-            status: FenceStatus::Closed,
+            status: FenceStatus::Closed | FenceStatus::Superseded,
             ..
         } = error
         {
-            tracing::info!("the run shut down before its predecessor wait was recorded finished");
+            tracing::info!(
+                "the run shut down or was superseded before its predecessor wait was recorded \
+                 finished"
+            );
             return;
         }
         tracing::error!(

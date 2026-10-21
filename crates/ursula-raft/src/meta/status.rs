@@ -4,7 +4,9 @@
 //! meta replica and placement view at once, and derives the view's
 //! [`ClusterView`] stage ([`cluster_view`]). A confirmed status
 //! ([`MetaStatusReader::confirmed_placement_status`]) derives it from a view
-//! a meta read barrier confirmed current.
+//! a meta read barrier confirmed current. The reader also carries the
+//! placement routes' writes ([`MetaStatusReader::release_root`]) to the
+//! meta group.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -13,17 +15,22 @@ use std::sync::Arc;
 use openraft::rt::WatchReceiver;
 use ursula_control::ClusterView;
 use ursula_control::ConfirmedView;
+use ursula_control::ControlApplied;
+use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::MetaRole;
 use ursula_control::PlacementStatus;
 use ursula_control::PlacementView;
+use ursula_control::RegistrationStatus;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::RootId;
 
 use super::confirm::MetaBarrierError;
 use super::genesis_driver::GenesisStatus;
 use super::handle::MetaHandle;
+use super::handle::MetaWriteError;
 use super::runtime::MetaRuntimeState;
 use super::runtime::MetaRuntimeStatus;
 use crate::RaftGroupHandleRegistry;
@@ -31,15 +38,23 @@ use crate::RecoveryTransport;
 
 type Confirmation<'a> =
     Pin<Box<dyn Future<Output = Result<ConfirmedView, MetaBarrierError>> + Send + 'a>>;
+type Submission<'a> =
+    Pin<Box<dyn Future<Output = Result<ControlApplied, MetaWriteError>> + Send + 'a>>;
 
-/// A meta read barrier on this node's view, whatever the transport.
-trait ConfirmView: Send + Sync {
+/// A meta read barrier on this node's view, and a write to the meta group,
+/// whatever the transport.
+trait MetaAccess: Send + Sync {
     fn confirm_view(&self) -> Confirmation<'_>;
+    fn submit(&self, command: ControlCommand) -> Submission<'_>;
 }
 
-impl<T: RecoveryTransport> ConfirmView for MetaHandle<T> {
+impl<T: RecoveryTransport> MetaAccess for MetaHandle<T> {
     fn confirm_view(&self) -> Confirmation<'_> {
         Box::pin(MetaHandle::confirm_view(self))
+    }
+
+    fn submit(&self, command: ControlCommand) -> Submission<'_> {
+        Box::pin(MetaHandle::submit(self, command))
     }
 }
 
@@ -51,7 +66,7 @@ pub struct MetaStatusReader {
     claim: GenesisClaim,
     status: MetaRuntimeStatus,
     registry: RaftGroupHandleRegistry,
-    confirm: Arc<dyn ConfirmView>,
+    meta: Arc<dyn MetaAccess>,
 }
 
 impl std::fmt::Debug for MetaStatusReader {
@@ -75,7 +90,7 @@ impl MetaStatusReader {
             claim,
             status,
             registry,
-            confirm: Arc::new(handle),
+            meta: Arc::new(handle),
         }
     }
 
@@ -92,8 +107,25 @@ impl MetaStatusReader {
     /// This node's placement status, from a view a meta read barrier
     /// confirmed current.
     pub async fn confirmed_placement_status(&self) -> Result<PlacementStatus, MetaBarrierError> {
-        let confirmed = self.confirm.confirm_view().await?;
+        let confirmed = self.meta.confirm_view().await?;
         Ok(self.status_of(confirmed.view()))
+    }
+
+    /// Where this node's registration stands.
+    pub fn registration(&self) -> RegistrationStatus {
+        self.status.registration.borrow().clone()
+    }
+
+    /// Releases `root`, the root node `node` is bound to, through the meta
+    /// leader (`ControlCommand::ReleaseRoot`).
+    pub async fn release_root(
+        &self,
+        node: NodeId,
+        root: RootId,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.meta
+            .submit(ControlCommand::ReleaseRoot { node, root })
+            .await
     }
 
     fn status_of(&self, view: &PlacementView) -> PlacementStatus {
@@ -155,7 +187,10 @@ pub(crate) fn cluster_view(
     if view.applied().is_some() {
         return match &*view.state {
             ControlPlaneState::Forming { registered } => ClusterView::Registering {
-                registered: registered.keys().copied().collect(),
+                registered: registered
+                    .iter()
+                    .map(|(node, registration)| (*node, registration.root))
+                    .collect(),
                 waiting_for: claim
                     .peers
                     .iter()
@@ -233,7 +268,10 @@ mod tests {
         assert_eq!(
             cluster_view(&forming, &claim(), me, &genesis, true),
             ClusterView::Registering {
-                registered: samples::ids(&[3]),
+                registered: BTreeMap::from([(
+                    samples::node(3),
+                    ursula_proto::placement::RootSlot::Bound(samples::root(3))
+                )]),
                 waiting_for: samples::ids(&[2, 4]),
             }
         );

@@ -16,7 +16,9 @@
 //! is two loads and a clock read. Every Raft input and output checks it,
 //! on every transport, and so do the leader predicate and every PUT and
 //! DELETE to the cold and snapshot stores. A shutdown closes it for good
-//! ([`NodeFence::close`]).
+//! ([`NodeFence::close`]), and so does a supersession
+//! ([`NodeFence::supersede`]): the meta group binds this node id to another
+//! root, or released this one, so another process may answer as this node.
 //!
 //! The fence also carries the predecessor wait ([`NodeFence::owes_wait`]):
 //! while a process of an earlier run of the root may still run, this one
@@ -154,6 +156,10 @@ pub enum FenceStatus {
     DiskLeaseLost,
     /// The process is shutting down.
     Closed,
+    /// Another process may answer as this node: this one takes part in
+    /// nothing again, writes nothing more to its root and never records a
+    /// clean end.
+    Superseded,
 }
 
 /// Why the fence refused a PUT or DELETE.
@@ -161,6 +167,7 @@ pub enum FenceStatus {
 pub enum WriteRefusal {
     DiskLeaseLost,
     Closed,
+    Superseded,
     /// A snapshot object, while a predecessor wait is owed.
     PredecessorWait,
 }
@@ -194,6 +201,7 @@ struct FenceState {
     /// The last lift in nanoseconds after `origin`, plus one. 0 for none.
     lifted: AtomicU64,
     closed: AtomicBool,
+    superseded: AtomicBool,
     owes_wait: AtomicBool,
     waited: crate::rt::sync::Notify,
 }
@@ -210,6 +218,7 @@ impl NodeFence {
             until: AtomicU64::new(0),
             lifted: AtomicU64::new(0),
             closed: AtomicBool::new(false),
+            superseded: AtomicBool::new(false),
             owes_wait: AtomicBool::new(false),
             waited: crate::rt::sync::Notify::new(),
         }))
@@ -282,6 +291,9 @@ impl NodeFence {
     }
 
     pub fn status(&self, now: FenceInstant) -> FenceStatus {
+        if self.0.superseded.load(Ordering::Acquire) {
+            return FenceStatus::Superseded;
+        }
         if self.0.closed.load(Ordering::Acquire) {
             return FenceStatus::Closed;
         }
@@ -312,6 +324,7 @@ impl NodeFence {
             FenceStatus::Admits => return Ok(()),
             FenceStatus::DiskLeaseLost => WriteRefusal::DiskLeaseLost,
             FenceStatus::Closed => WriteRefusal::Closed,
+            FenceStatus::Superseded => WriteRefusal::Superseded,
         };
         Err(FencedWrite {
             refusal,
@@ -326,7 +339,16 @@ impl NodeFence {
         self.0.closed.store(true, Ordering::Release);
     }
 
-    /// Whether the fence closed for good ([`Self::close`]).
+    /// Closes the fence for good because another process may answer as
+    /// this node. Unlike a shutdown's close, it keeps the run from
+    /// recording a clean end.
+    pub fn supersede(&self) {
+        self.0.superseded.store(true, Ordering::Release);
+        self.0.closed.store(true, Ordering::Release);
+    }
+
+    /// Whether the fence closed for good ([`Self::close`],
+    /// [`Self::supersede`]).
     pub fn is_closed(&self) -> bool {
         self.0.closed.load(Ordering::Acquire)
     }
@@ -485,6 +507,22 @@ mod tests {
         assert!(!unleased.owes_wait());
         unleased.close();
         assert!(!unleased.admits_now());
+        // A superseded fence never admits again, whatever a probe says, and
+        // a later shutdown's close keeps it superseded.
+        let superseded = NodeFence::leased(L);
+        superseded.record_probe(t, ProbeOutcome::Synced, t);
+        superseded.supersede();
+        superseded.record_probe(at(t, 100), ProbeOutcome::Synced, at(t, 100));
+        superseded.close();
+        assert_eq!(superseded.status(at(t, 200)), FenceStatus::Superseded);
+        assert!(superseded.is_closed());
+        assert_eq!(
+            superseded
+                .check_write(FencedObject::Cold, "PUT", "cold/x")
+                .unwrap_err()
+                .refusal,
+            WriteRefusal::Superseded
+        );
     }
 
     /// A wait owed holds back object writes, though the fence admits.

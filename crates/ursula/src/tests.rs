@@ -13636,7 +13636,10 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
     };
     assert_eq!(readiness_reason(healthy), None);
     let mut facts = ReadinessFacts {
+        superseded: true,
         disk_lease_lost: true,
+        root_refused: true,
+        predecessor_wait: true,
         format_epoch_mismatch: true,
         wal_disk_pressure: true,
         recovery_stalled: true,
@@ -13647,7 +13650,10 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
     while let Some(reason) = readiness_reason(facts) {
         order.push(reason.clone());
         match reason {
+            Reason::Superseded => facts.superseded = false,
             Reason::DiskLeaseLost => facts.disk_lease_lost = false,
+            Reason::RootRefused => facts.root_refused = false,
+            Reason::PredecessorWait => facts.predecessor_wait = false,
             Reason::FormatEpochMismatch => facts.format_epoch_mismatch = false,
             Reason::WalDiskPressure => facts.wal_disk_pressure = false,
             Reason::RecoveryStalled => facts.recovery_stalled = false,
@@ -13657,7 +13663,10 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
         }
     }
     assert_eq!(order, vec![
+        Reason::Superseded,
         Reason::DiskLeaseLost,
+        Reason::RootRefused,
+        Reason::PredecessorWait,
         Reason::FormatEpochMismatch,
         Reason::WalDiskPressure,
         Reason::RecoveryStalled,

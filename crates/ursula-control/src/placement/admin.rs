@@ -20,6 +20,8 @@ use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WriteEffect;
 use ursula_shard::RaftGroupId;
@@ -46,10 +48,11 @@ pub enum ClusterView {
     },
     /// Meta formed elsewhere and this node's replica applied nothing yet.
     MetaCatchingUp,
-    /// Meta formed and nodes register: the registered ids, and the
-    /// `raft.peers` ids that have not registered yet.
+    /// Meta formed and nodes register: the registered ids with the root
+    /// each id is bound to, and the `raft.peers` ids that have not
+    /// registered yet.
     Registering {
-        registered: BTreeSet<NodeId>,
+        registered: BTreeMap<NodeId, RootSlot>,
         waiting_for: BTreeSet<NodeId>,
     },
     /// A meta recovery plan ended the formation.
@@ -158,6 +161,11 @@ pub enum RegistrationStatus {
     Pending,
     /// The meta group's last answer.
     Answered(Registered),
+    /// The meta group binds this node id to `slot`'s root, not to the
+    /// empty root this node runs on: the node takes part in nothing and
+    /// registers again until an operator releases that root
+    /// (`ursulactl node replace-disk`).
+    RootRefused { slot: RootSlot },
     /// The meta group refused the node for good: it registers again only
     /// after a restart.
     Refused(ControlError),
@@ -173,6 +181,15 @@ pub enum RegistrationStatus {
 pub struct MoveRequest {
     pub expected: PlacementEpoch,
     pub to: VoterSet,
+}
+
+/// `POST /__ursula/placement/nodes/{node}/replace-disk`: release the root
+/// the node id is bound to when it is still `expect_root`, once that root's
+/// disk is revoked. The answer is the node's record with its released root.
+/// A root released never binds again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplaceDiskRequest {
+    pub expect_root: RootId,
 }
 
 /// `POST /__ursula/placement/move-limit`.

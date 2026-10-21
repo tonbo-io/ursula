@@ -38,6 +38,7 @@ use super::PlacementApiError;
 use super::PlacementApiReason;
 use super::PlacementStatus;
 use super::RegistrationStatus;
+use super::ReplaceDiskRequest;
 use super::Retirement;
 use super::Target;
 use super::samples::Driver;
@@ -959,9 +960,28 @@ fn every_root_round_trips_through_messagepack_and_json() {
         genesis_mismatch: BTreeMap::from([(node(3), sample_genesis_claim())]),
     });
     round_trip(&ClusterView::Registering {
-        registered: ids(&[1]),
+        registered: BTreeMap::from([
+            (node(1), RootSlot::Bound(root(1))),
+            (node(4), RootSlot::Released(root(4))),
+        ]),
         waiting_for: ids(&[2, 3]),
     });
+    // A root above 2^53 travels as its hex string.
+    let high = ursula_proto::placement::RootId::new(
+        std::num::NonZeroU64::new(0x9e37_79b9_7f4a_7c15).unwrap(),
+    );
+    round_trip(&ReplaceDiskRequest { expect_root: high });
+    assert_eq!(
+        serde_json::to_string(&ReplaceDiskRequest { expect_root: high }).unwrap(),
+        r#"{"expect_root":"9e3779b97f4a7c15"}"#
+    );
+    assert_eq!(
+        serde_json::to_string(&RegistrationStatus::RootRefused {
+            slot: RootSlot::Bound(high)
+        })
+        .unwrap(),
+        r#"{"root_refused":{"slot":{"bound":"9e3779b97f4a7c15"}}}"#
+    );
     round_trip(&ClusterView::MetaCatchingUp);
     round_trip(&ClusterView::FormationCut);
     round_trip(&MoveRequest {
@@ -1089,6 +1109,9 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
         RegistrationStatus::Answered(Registered::Forming),
         RegistrationStatus::Answered(Registered::Referenced(record)),
         RegistrationStatus::Answered(Registered::Unreferenced(record)),
+        RegistrationStatus::RootRefused {
+            slot: RootSlot::Released(root(6)),
+        },
         RegistrationStatus::Refused(ControlError::FormationCut),
         RegistrationStatus::Removed,
     ];
@@ -1099,7 +1122,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
         },
         ClusterView::MetaCatchingUp,
         ClusterView::Registering {
-            registered: ids(&[1]),
+            registered: BTreeMap::from([(node(1), RootSlot::Bound(root(1)))]),
             waiting_for: ids(&[3]),
         },
         ClusterView::FormationCut,
@@ -1132,6 +1155,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
             | RegistrationStatus::Answered(
                 Registered::Forming | Registered::Referenced(_) | Registered::Unreferenced(_),
             )
+            | RegistrationStatus::RootRefused { .. }
             | RegistrationStatus::Refused(_)
             | RegistrationStatus::Removed => {}
         }

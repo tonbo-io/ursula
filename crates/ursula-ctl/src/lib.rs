@@ -12,6 +12,7 @@
 //!
 //! - [`metrics`]: HTTP client for `/__ursula/metrics` and the admin endpoints.
 //! - [`observe`]: read-only status and cluster-wide readiness reporting.
+//! - [`placement`]: confirmed placement views and `node replace-disk`.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait).
@@ -23,6 +24,7 @@ pub mod backup;
 pub mod maintenance;
 pub mod metrics;
 pub mod observe;
+pub mod placement;
 pub mod plan;
 pub mod provider;
 pub mod quorum;

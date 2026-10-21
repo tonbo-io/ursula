@@ -72,6 +72,7 @@ pub use placement::PlacementView;
 pub use placement::Placements;
 pub use placement::Registration;
 pub use placement::RegistrationStatus;
+pub use placement::ReplaceDiskRequest;
 pub use placement::Requeue;
 pub use placement::Retirement;
 pub use placement::SeedRoleOf;

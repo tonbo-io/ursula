@@ -1326,6 +1326,10 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             "/__ursula/leadership-shed/maintenance",
             post(mark_maintenance_drain).delete(clear_maintenance_drain),
+        )
+        .route(
+            placement_status::REPLACE_DISK_ROUTE,
+            post(placement_status::replace_disk),
         );
     #[cfg(feature = "jemalloc-prof")]
     let router = router.route("/__ursula/debug/heap-profile", get(heap_profile));
@@ -1514,7 +1518,10 @@ async fn cluster_probe(_body: Bytes) -> StatusCode {
 /// What readiness decides on, besides the reports it carries.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct ReadinessFacts {
+    pub(crate) superseded: bool,
     pub(crate) disk_lease_lost: bool,
+    pub(crate) root_refused: bool,
+    pub(crate) predecessor_wait: bool,
     pub(crate) format_epoch_mismatch: bool,
     pub(crate) wal_disk_pressure: bool,
     pub(crate) recovery_stalled: bool,
@@ -1528,8 +1535,14 @@ pub(crate) fn readiness_reason(
     facts: ReadinessFacts,
 ) -> Option<ursula_proto::admin::ServingReadinessReason> {
     use ursula_proto::admin::ServingReadinessReason as Reason;
-    if facts.disk_lease_lost {
+    if facts.superseded {
+        Some(Reason::Superseded)
+    } else if facts.disk_lease_lost {
         Some(Reason::DiskLeaseLost)
+    } else if facts.root_refused {
+        Some(Reason::RootRefused)
+    } else if facts.predecessor_wait {
+        Some(Reason::PredecessorWait)
     } else if facts.format_epoch_mismatch {
         Some(Reason::FormatEpochMismatch)
     } else if facts.wal_disk_pressure {
@@ -1562,12 +1575,29 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         (Some(_), Some(report)) => report.serving_ready(),
         (Some(registry), None) => state.client_write_router.is_none() && registry.is_empty(),
     };
-    // A node whose disk lease lapsed takes part in no Raft traffic.
-    let disk_lease_lost = state.raft_wal.as_ref().is_some_and(|wal| {
-        wal.fence().status(ursula_runtime::node_fence::fence_now())
-            == ursula_runtime::node_fence::FenceStatus::DiskLeaseLost
+    // A node whose disk lease lapsed, or that was superseded, takes part in
+    // no Raft traffic, and one that owes its predecessor wait grants no vote.
+    let fence = state.raft_wal.as_ref().map(|wal| wal.fence());
+    let fence_status = fence
+        .as_ref()
+        .map(|fence| fence.status(ursula_runtime::node_fence::fence_now()));
+    let superseded = fence_status == Some(ursula_runtime::node_fence::FenceStatus::Superseded);
+    let disk_lease_lost =
+        fence_status == Some(ursula_runtime::node_fence::FenceStatus::DiskLeaseLost);
+    let predecessor_wait = fence
+        .as_ref()
+        .is_some_and(ursula_runtime::NodeFence::owes_wait);
+    // An empty root under a node id that meta binds to another root.
+    let root_refused = state.meta().status_reader().is_some_and(|reader| {
+        matches!(
+            reader.registration(),
+            ursula_control::RegistrationStatus::RootRefused { .. }
+        )
     });
-    let ready = !disk_lease_lost
+    let ready = !superseded
+        && !disk_lease_lost
+        && !root_refused
+        && !predecessor_wait
         && !disk.pressure
         && !format_epoch_mismatch
         && recovery_ready
@@ -1589,7 +1619,10 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         axum::Json(ursula_proto::admin::ServingReadiness {
             ready,
             reason: readiness_reason(ReadinessFacts {
+                superseded,
                 disk_lease_lost,
+                root_refused,
+                predecessor_wait,
                 format_epoch_mismatch,
                 wal_disk_pressure: disk.pressure,
                 recovery_stalled: !stalled_groups.is_empty(),

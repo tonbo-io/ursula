@@ -44,6 +44,7 @@ pub use admin::PlacementApiError;
 pub use admin::PlacementApiReason;
 pub use admin::PlacementStatus;
 pub use admin::RegistrationStatus;
+pub use admin::ReplaceDiskRequest;
 pub use command::BootstrapProblem;
 pub use command::ControlApplied;
 pub use command::ControlCommand;

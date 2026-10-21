@@ -68,6 +68,39 @@ enum Command {
     /// history event applied. A plan that wedges is planned again. Recover
     /// meta first: a data group's plan needs a confirmed meta view.
     RecoverGroup(RecoverGroupArgs),
+    /// Operations on one node id in the meta group.
+    #[command(subcommand)]
+    Node(NodeCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum NodeCommand {
+    /// Release the root (the WAL disk) a node id is bound to, so the empty
+    /// disk the node runs on now binds with no restart. Run it once the
+    /// old disk is revoked: the release cannot be undone. The release goes
+    /// to another node's admin plane.
+    ReplaceDisk(ReplaceDiskArgs),
+}
+
+#[derive(Args, Debug)]
+struct ReplaceDiskArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// The node id whose disk was replaced.
+    #[arg(long)]
+    node: u64,
+    /// The root the node id is bound to now, in 16 lowercase hex digits, as
+    /// the placement status, `root_refused` and the first 16 digits of a
+    /// process incarnation print it. The release applies only while the
+    /// slot still names it.
+    #[arg(long)]
+    expect_root: ursula_proto::placement::RootId,
+    /// Release even when the node still runs on the root or reports ready.
+    #[arg(long, default_value_t = false)]
+    force: bool,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -270,6 +303,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::RecoverGroup(args) => run_recover_group_subcommand(args).await,
+        Command::Node(NodeCommand::ReplaceDisk(args)) => run_replace_disk_subcommand(args).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
@@ -584,6 +618,27 @@ fn print_plan_explanation(
         "  to accept the loss of writes acknowledged after the last fsync and send it, run again \
          with --accept-loss"
     );
+}
+
+async fn run_replace_disk_subcommand(args: ReplaceDiskArgs) -> Result<()> {
+    use ursula_ctl::placement;
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let before = placement::confirmed_slot(&client, &nodes, args.node).await?;
+    println!(
+        "node {}: slot {} (confirmed by node {})",
+        args.node, before.slot, before.via.id
+    );
+    if !args.force {
+        placement::check_replaceable(&client, &nodes, args.node, args.expect_root).await?;
+    }
+    println!("{}", placement::RELEASE_RULE);
+    let record = placement::release_root(&client, &before.via, args.node, args.expect_root).await?;
+    println!(
+        "node {}: slot {}, released through node {}",
+        args.node, record.root, before.via.id
+    );
+    Ok(())
 }
 
 async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {

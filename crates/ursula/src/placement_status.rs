@@ -3,23 +3,32 @@
 //! listener. `?confirmed=true`, a meta read barrier, is served on the admin
 //! listener only.
 //!
+//! `POST /__ursula/placement/nodes/{node}/replace-disk` (admin listener,
+//! [`replace_disk`]) releases the root a node id is bound to, the
+//! `ursulactl node replace-disk` verb.
+//!
 //! Every refusal of a placement route answers through
 //! [`placement_api_error_response`], one status per reason.
 
 use axum::Json;
+use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::response::Response;
+use ursula_control::ControlApplied;
 use ursula_control::ControlError;
 use ursula_control::PlacementApiError;
 use ursula_control::PlacementApiReason;
+use ursula_control::ReplaceDiskRequest;
+use ursula_proto::placement::NodeId;
 use ursula_proto::placement::WriteEffect;
 
 use crate::HttpState;
 
 pub(crate) const PLACEMENT_PATH: &str = "/__ursula/placement";
+pub(crate) const REPLACE_DISK_ROUTE: &str = "/__ursula/placement/nodes/{node}/replace-disk";
 
 /// The query of `GET /__ursula/placement`.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -62,6 +71,38 @@ pub(crate) async fn admin_placement_status(
     }
     match reader.confirmed_placement_status().await {
         Ok(status) => Json(status).into_response(),
+        Err(error) => placement_api_error_response(error.into()),
+    }
+}
+
+/// Releases `expect_root`, the root node `node` is bound to, through the
+/// meta leader, and answers the node's record with its released root. A
+/// slot on another root answers `409` (`stale_root`), an unknown or
+/// removed node `404` or `409`.
+pub(crate) async fn replace_disk(
+    State(state): State<HttpState>,
+    Path(node): Path<u64>,
+    Json(request): Json<ReplaceDiskRequest>,
+) -> Response {
+    let Some(reader) = state.meta().status_reader() else {
+        return placement_api_error_response(no_meta_runtime());
+    };
+    match reader
+        .release_root(NodeId::new(node), request.expect_root)
+        .await
+    {
+        Ok(ControlApplied::RootReleased(record)) => Json(record).into_response(),
+        Ok(other) => {
+            tracing::error!(
+                ?other,
+                "replace-disk: the meta group answered another command"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the meta group answered another command",
+            )
+                .into_response()
+        }
         Err(error) => placement_api_error_response(error.into()),
     }
 }
