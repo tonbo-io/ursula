@@ -681,7 +681,7 @@ mod tests {
                 ..
             })
         ));
-        assert!(superseded(receiver.fence()));
+        assert!(superseded(&receiver.fence()));
         assert!(matches!(
             receiver.receive(Some(&claims(sender, None)), Rpc::Forward),
             Err(PeerClusterError::Fence {
@@ -756,7 +756,7 @@ mod tests {
         // An older process of node 2 is discarded, and supersedes nobody.
         let zombie = refused(2, at(3, 9, 1), FenceRefusal::StaleSender);
         assert_eq!(sender.observe_failure(2, &zombie), Some(Effect::Retire));
-        assert!(!superseded(sender.fence()));
+        assert!(!superseded(&sender.fence()));
         // The process that runs: a newer one raises the entry for a retry,
         // and its `stale_sender` supersedes this process.
         let newer = refused(2, at(3, 11, 1), FenceRefusal::StaleTarget);
@@ -767,7 +767,7 @@ mod tests {
             sender.observe_failure(2, &superseding),
             Some(Effect::Supersede)
         );
-        assert!(superseded(sender.fence()));
+        assert!(superseded(&sender.fence()));
         assert_eq!(sender.incarnation_counts().refusals_received, [
             0, 1, 1, 0, 0, 0
         ]);

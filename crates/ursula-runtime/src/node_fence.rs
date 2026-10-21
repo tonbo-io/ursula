@@ -17,8 +17,9 @@
 //! on every transport, and so do the leader predicate and every PUT and
 //! DELETE to the cold and snapshot stores. A shutdown closes it for good
 //! ([`NodeFence::close`]), and so does a supersession
-//! ([`NodeFence::supersede`]): the meta group binds this node id to another
-//! root, or released this one, so another process may answer as this node.
+//! ([`NodeFence::supersede`]): another process may answer as this node,
+//! because the meta group binds this node id to another root or released
+//! this one, or because a peer saw a newer run of this root.
 //!
 //! The fence also carries the predecessor wait ([`NodeFence::owes_wait`]):
 //! while a process of an earlier run of the root may still run, this one
