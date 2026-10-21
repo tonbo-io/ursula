@@ -110,8 +110,6 @@ data:
 
     [raft]
     group_count = {{ .Values.raft.groupCount }}
-    init_membership = {{ .Values.raft.initMembership }}
-    init_membership_per_group = {{ .Values.raft.initMembershipPerGroup }}
     snapshot_pressure_max_groups_per_tick = {{ .Values.raft.snapshotPressureMaxGroupsPerTick }}
 {{- if not (eq .Values.raft.snapshotBuildMaxConcurrency nil) }}
     snapshot_build_max_concurrency = {{ .Values.raft.snapshotBuildMaxConcurrency }}

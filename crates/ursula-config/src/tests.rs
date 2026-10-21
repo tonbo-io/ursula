@@ -773,6 +773,34 @@ url = "http://127.0.0.1:4438"
         }
     }
 
+    /// Static voter assignment is gone: data groups take the seed rule's
+    /// voters and initializer, so the keys that set them fail the load.
+    #[test]
+    fn removed_static_membership_keys_are_refused() {
+        for (key, contents) in [
+            ("init_membership", "[raft]\ninit_membership = true\n"),
+            (
+                "init_membership_per_group",
+                "[raft]\ninit_membership_per_group = true\n",
+            ),
+            (
+                "groups",
+                "[[raft.groups]]\nraft_group_id = 0\nvoters = [1]\n",
+            ),
+        ] {
+            let tmp = temp_config(".toml", contents);
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(err, crate::ConfigError::TomlParse(_)),
+                "{key}: {err}"
+            );
+            assert!(
+                err.to_string().contains(&format!("unknown field `{key}`")),
+                "{key}: {err}"
+            );
+        }
+    }
+
     #[test]
     fn wal_fsync_defaults_to_never_and_parses_both_policies() {
         use crate::config::WalFsync;

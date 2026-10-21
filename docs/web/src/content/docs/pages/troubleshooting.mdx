@@ -295,7 +295,7 @@ The backup references cold objects that the target's `storage.cold.root` does no
 
 `/__ursula/metrics` on each node should show a non-null `current_leader` and a stable `current_term` for every group in `raft_groups`. If groups stay leaderless:
 
-- First start must include `raft.init_membership_per_group = true` (or `raft.init_membership = true`) on every voting node.
+- Every voter of a group must be up on first start: the group's initializer waits for all of them to report the group empty.
 - Every peer URL must be reachable from every node.
 
 ### Replacing or restarting a node leaves it leaderless

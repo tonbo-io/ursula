@@ -34,7 +34,6 @@ server:
 
 raft:
   groupCount: 256
-  initMembershipPerGroup: true
 
 persistence:
   storageClassName: gp3

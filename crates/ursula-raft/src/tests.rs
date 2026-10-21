@@ -1308,22 +1308,26 @@ async fn raft_file_log_restart_rebuilds_only_through_the_committed_marker() {
 fn dynamic_group_hosting_allows_non_voter_warmup() {
     let wal_root = tempfile::tempdir().expect("WAL root");
     let registry = RaftGroupHandleRegistry::default();
+    // Over four nodes at the default replication factor, group 2 is seeded
+    // on nodes 3, 4 and 1: node 2 hosts none of it.
+    let peers = crate::PeerDirectory::new((1..=4).map(|node_id| {
+        (
+            node_id,
+            crate::PeerEndpoints::shared(format!("node{node_id}")),
+        )
+    }));
+    let seeds = crate::ConfigSeeds::new(
+        &peers,
+        3,
+        ursula_config::PlacementConfig::default().replication_factor,
+    );
     let factory = StaticGrpcRaftGroupEngineFactory::new(
-        4,
-        crate::PeerDirectory::new((1..=4).map(|node_id| {
-            (
-                node_id,
-                crate::PeerEndpoints::shared(format!("node{node_id}")),
-            )
-        })),
-        false,
+        2,
+        peers,
+        seeds,
         registry.clone(),
         start_wal(wal_root.path(), 1, 3),
-    )
-    .with_per_group_voters(BTreeMap::from([(
-        RaftGroupId(2),
-        BTreeSet::from([1, 2, 3]),
-    )]));
+    );
     let placement = ShardPlacement {
         shard_id: ShardId(0),
         core_id: CoreId(0),

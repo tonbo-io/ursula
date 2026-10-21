@@ -218,6 +218,47 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(key, result.stderr)
 
+    def test_removed_membership_values_are_refused(self) -> None:
+        # Data groups take the seed rule's voters and initializer, so the
+        # schema refuses the values that once chose who initializes.
+        for removed, key in (
+            ("raft.initMembership=true", "initMembership"),
+            ("raft.initMembershipPerGroup=true", "initMembershipPerGroup"),
+        ):
+            with self.subTest(removed=removed):
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+                     "--set", removed],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(key, result.stderr)
+        config = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))
+        self.assertNotIn("init_membership", config["raft"])
+        self.assertNotIn("init_membership_per_group", config["raft"])
+
+    def test_pod_disruption_budget_allows_at_most_one_disruption(self) -> None:
+        # Each data group has three voters at most, so two disruptions can
+        # take two of a group's voters at any replica count.
+        for replicas in ("3", "5"):
+            with self.subTest(replicas=replicas):
+                rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt",
+                                        "--set", f"server.replicaCount={replicas}")
+                pdb = documents(rendered, "PodDisruptionBudget")["test-ursula"]
+                self.assertIn("  maxUnavailable: 1\n", pdb)
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+                     "--set", f"server.replicaCount={replicas}",
+                     "--set", "server.podDisruptionBudget.maxUnavailable=2"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("maxUnavailable", result.stderr)
+
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(*NAMED, 
             "--set",

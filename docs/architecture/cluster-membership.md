@@ -8,10 +8,17 @@ Kubernetes replace a voter without losing quorum.
 
 Membership is static and comes from configuration. `raft.peers` lists every
 node and its cluster URL. `raft.group_count` fixes the number of data groups,
-and streams hash to a group by that count. By default every peer is a voter of
-every group. `raft.groups` may instead assign each group a non-empty subset of
-the peers, and then it must cover every group in `0..group_count`
-(`crates/ursula-config/src/validate.rs`).
+and streams hash to a group by that count. Each data group's voters and its
+initializer come from the seed rule over the `raft.peers` ids
+(`crates/ursula-control/src/placement/seed.rs`): group `g` runs on
+`min(raft.placement.replication_factor, N)` consecutive nodes in ascending id
+from index `g mod N`, and the first of them initializes it. With `N` at most the
+replication factor, every node votes in every group. `ConfigSeeds`
+(`crates/ursula-raft/src/types.rs`) computes this table, and the server reads it
+for what a node hosts, where it routes a group it does not host, its maintenance
+inventory and its egress probe. The meta group's `Bootstrap` seeds the same rule
+over the `raft.peers` ids at genesis, so the two agree only while `raft.peers`
+keeps those ids: do not add nodes to `raft.peers` of a running cluster.
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
 electorate. Every reader of a peer address takes it from one `PeerDirectory`
@@ -88,7 +95,7 @@ operator who accepts the loss of the unsynced tail calls
 `accept-unsynced-loss` on the gated replicas with the longest logs until a
 leader is elected.
 
-A group's initializer runs `Initialize` only when every configured voter
+A group's seed initializer runs `Initialize` only when every seed voter
 reports an empty log, no leader and a persisted genesis floor. A replica that
 ever held the group never initializes it again.
 

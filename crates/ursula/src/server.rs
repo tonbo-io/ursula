@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -190,18 +188,6 @@ async fn init_state(
     // The one source of every configured peer address.
     let raft_peers = ursula_raft::PeerDirectory::from_config(&config.raft.peers);
 
-    let per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>> = config
-        .raft
-        .groups
-        .iter()
-        .map(|g| {
-            (
-                RaftGroupId(g.raft_group_id),
-                g.voters.iter().cloned().collect(),
-            )
-        })
-        .collect();
-
     let topology = if raft_peers.is_empty() {
         Topology::SingleNode {
             raft_group_count: config.raft.group_count,
@@ -211,13 +197,13 @@ async fn init_state(
             config.raft.node_id,
             raft_peers.clone(),
             config.raft.group_count,
-            config.raft.init_membership,
-            ursula_raft::StaticGrpcRaftMembershipConfig {
-                initialize_membership_per_group: config.raft.init_membership_per_group,
-                per_group_voters: per_group_voters.clone(),
-            },
-        )?
+            config.raft.placement.replication_factor,
+        )
     };
+    // Interim, removed in S2(h): the seed table decides what this node
+    // warms, where it routes a group it does not host, and what its
+    // maintenance inventory and egress gate expect.
+    let seeds = topology.config_seeds().cloned().unwrap_or_default();
 
     // Format epoch: refuse data and peers of another epoch before anything is
     // written.
@@ -235,34 +221,27 @@ async fn init_state(
     };
 
     if !raft_peers.is_empty() {
-        if per_group_voters.is_empty() {
-            runtime.warm_all_groups().await?;
-        } else {
-            for raw_group_id in 0..config.raft.group_count {
-                let raft_group_id = u32::try_from(raw_group_id)
-                    .expect("runtime config validates raft group ids fit u32");
-                if static_grpc_node_hosts_group(
-                    config.raft.node_id,
-                    raft_group_id,
-                    &per_group_voters,
-                ) && let Err(error) = runtime.warm_group(RaftGroupId(raft_group_id)).await
-                {
-                    // A group whose replay stopped, or whose snapshot store
-                    // did not answer its restore, stays closed on its core,
-                    // which reopens the latter after a back-off.
-                    if !error.leaves_group_closed() {
-                        return Err(error.into());
-                    }
-                    if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
-                        error: ursula_runtime::GroupEngineError::Infra(
-                            ursula_runtime::GroupInfraError::ApplyStopped { .. }
-                        ),
-                        ..
-                    }) {
-                        tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
-                    } else {
-                        tracing::warn!(raft_group_id, %error, "the snapshot store did not answer the group's restore; other groups remain available");
-                    }
+        for raw_group_id in 0..config.raft.group_count {
+            let raft_group_id = u32::try_from(raw_group_id)
+                .expect("runtime config validates raft group ids fit u32");
+            if seeds.hosts(config.raft.node_id, RaftGroupId(raft_group_id))
+                && let Err(error) = runtime.warm_group(RaftGroupId(raft_group_id)).await
+            {
+                // A group whose replay stopped, or whose snapshot store
+                // did not answer its restore, stays closed on its core,
+                // which reopens the latter after a back-off.
+                if !error.leaves_group_closed() {
+                    return Err(error.into());
+                }
+                if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
+                    error: ursula_runtime::GroupEngineError::Infra(
+                        ursula_runtime::GroupInfraError::ApplyStopped { .. }
+                    ),
+                    ..
+                }) {
+                    tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
+                } else {
+                    tracing::warn!(raft_group_id, %error, "the snapshot store did not answer the group's restore; other groups remain available");
                 }
             }
         }
@@ -284,7 +263,7 @@ async fn init_state(
             registry,
             config.raft.node_id,
             raft_peers,
-            per_group_voters,
+            seeds.voter_table(),
         )
     };
     let mut state = state
@@ -308,19 +287,6 @@ async fn init_state(
         );
     }
     Ok(state)
-}
-
-fn static_grpc_node_hosts_group(
-    node_id: u64,
-    raft_group_id: u32,
-    raft_group_voters: &BTreeMap<RaftGroupId, BTreeSet<u64>>,
-) -> bool {
-    if raft_group_voters.is_empty() {
-        return true;
-    }
-    raft_group_voters
-        .get(&RaftGroupId(raft_group_id))
-        .is_some_and(|voters| voters.contains(&node_id))
 }
 
 /// Serves until a shutdown signal, then stops the Raft groups and the WAL.

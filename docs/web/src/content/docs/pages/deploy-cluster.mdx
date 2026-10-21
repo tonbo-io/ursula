@@ -99,7 +99,6 @@ cluster_id = "prod-us-east-1"
 
 [raft]
 group_count = 256
-init_membership_per_group = true
 
 [raft.wal]
 path = "/var/lib/ursula"
@@ -136,7 +135,7 @@ ursula --config /etc/ursula/ursula.toml --node-id 1   # node 2 and 3 likewise
 
 Peers dial each other's `url` on the cluster port (`4439`), and a follower redirects clients to the leader's `client_url` on the client port (`4437`). Let only the voters reach port `4439`, with a security group or a firewall. Without `server.cluster_listen`, both planes share `server.listen` and each peer's `url` names that port (see [Network planes](/docs/security#network-planes)).
 
-`server.cluster_id` is required with `raft.peers`. Use the same value on every node and a different one for every deployment a client can reach, such as the environment and the region. `init_membership_per_group = true` bootstraps each group on the first start of a fresh cluster. Keep it on every node across restarts: a replica that ever held its group never initializes it again, and an empty replica initializes a group only when every configured voter reports it empty and no leader (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). Verify the cluster with a one-file manifest:
+`server.cluster_id` is required with `raft.peers`. Use the same value on every node and a different one for every deployment a client can reach, such as the environment and the region. Each group runs on three consecutive nodes in node ID order (every node in a cluster of three), and the first of them initializes it on the first start of a fresh cluster, only when every voter of the group reports it empty and no leader. A replica that ever held its group never initializes it again (see [Rejoining a wiped node](/docs/operations#rejoining-a-wiped-node)). The node IDs in `raft.peers` decide every group's voters, so keep `raft.peers` the same for the life of the cluster. Verify the cluster with a one-file manifest:
 
 ```bash
 cat > cluster-manifest.json <<'JSON'

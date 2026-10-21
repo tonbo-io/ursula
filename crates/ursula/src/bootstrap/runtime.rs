@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use ursula_config::config::ColdBackend;
+use ursula_raft::ConfigSeeds;
 use ursula_raft::JournalTuning;
 use ursula_raft::PeerDirectory;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
-use ursula_raft::StaticGrpcRaftMembershipConfig;
 use ursula_runtime::ColdStore;
 use ursula_runtime::ColdStoreHandle;
 use ursula_runtime::InMemoryGroupEngineFactory;
@@ -273,7 +273,7 @@ pub fn spawn_runtime(
         );
     }
 
-    if let (Topology::StaticCluster { peers, .. }, Some(participation)) =
+    if let (Topology::StaticCluster { peers, seeds, .. }, Some(participation)) =
         (&topology, &participation)
     {
         let registry = spawned
@@ -304,25 +304,11 @@ pub fn spawn_runtime(
             participation,
             &config.governance.leadership_balance,
         );
-        let per_group_voters: std::collections::BTreeMap<
-            ursula_shard::RaftGroupId,
-            std::collections::BTreeSet<u64>,
-        > = config
-            .raft
-            .groups
-            .iter()
-            .map(|g| {
-                (
-                    ursula_shard::RaftGroupId(g.raft_group_id),
-                    g.voters.iter().cloned().collect(),
-                )
-            })
-            .collect();
         egress::spawn_egress_gate(
             &registry,
             participation,
             peers,
-            per_group_voters,
+            seeds.voter_table(),
             &config.governance.cluster_probe,
         );
         commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
@@ -365,18 +351,15 @@ fn spawn_runtime_core(
         Topology::StaticCluster {
             node_id,
             peers,
-            raft_group_count,
-            initialize_membership,
-            membership_config,
+            seeds,
+            ..
         } => spawn_static_cluster(
             runtime_config,
             cold_store,
             storage,
             *node_id,
             peers.clone(),
-            *raft_group_count,
-            *initialize_membership,
-            membership_config.clone(),
+            seeds.clone(),
             snapshot_store,
             raft_engine_config,
             registry.unwrap_or_default(),
@@ -428,19 +411,13 @@ fn spawn_singleton(
     })
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "static-cluster bootstrap wires every runtime dependency in one place"
-)]
 fn spawn_static_cluster(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,
     storage: GroupStorage,
     node_id: u64,
     peers: PeerDirectory,
-    _raft_group_count: usize,
-    initialize_membership: bool,
-    membership_config: StaticGrpcRaftMembershipConfig,
+    seeds: ConfigSeeds,
     snapshot_store: Option<SharedSnapshotStore>,
     raft_engine_config: RaftEngineConfig,
     registry: RaftGroupHandleRegistry,
@@ -454,12 +431,10 @@ fn spawn_static_cluster(
     let factory = ursula_raft::StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         peers,
-        initialize_membership,
+        seeds,
         registry.clone(),
         log_stores,
     )
-    .with_per_group_membership_initializers(membership_config.initialize_membership_per_group)
-    .with_per_group_voters(membership_config.per_group_voters)
     .with_cold_store(cold_store.clone())
     .with_snapshot_store(snapshot_store)
     .with_engine_config(raft_engine_config);

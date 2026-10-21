@@ -49,8 +49,7 @@ mod test_reexports {
     pub(crate) use super::cold_health::spawn_cold_health_gate;
     pub(crate) use super::commit_stall::CommitStallAction;
     pub(crate) use super::commit_stall::CommitStallTracker;
-    pub(crate) use super::egress::ClusterEgressProbeScope;
-    pub(crate) use super::egress::cluster_egress_probe_groups;
+    pub(crate) use super::egress::cluster_egress_probe_plan;
     pub(crate) use super::egress::spawn_egress_gate;
     pub(crate) use super::health_gate::LeadershipShed;
     pub(crate) use super::health_gate::ShedDrain;

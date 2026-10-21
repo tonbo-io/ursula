@@ -179,21 +179,10 @@ pub struct RaftConfig {
     /// `None` or `0` disables the admission. Catches raft replication lag before
     /// in-memory queues grow unbounded.
     pub max_uncommitted_size_per_group: Option<HumanSize>,
-    /// Bootstrap the initial Raft membership once on startup.
-    pub init_membership: bool,
-    /// Bootstrap per-group Raft membership on startup.
-    pub init_membership_per_group: bool,
     /// Raft WAL configuration.
     pub wal: WalConfig,
     /// Static gRPC Raft peers. Each entry maps a `node_id` to its gRPC URL.
     pub peers: Vec<RaftPeerConfig>,
-    /// Optional per-group voter assignments.
-    ///
-    /// When empty (the default), every Raft group uses all peers as voters.
-    /// When supplied, every group in `0..group_count` must have an entry and
-    /// each entry's voters must be a non-empty subset of `peers`.
-    #[serde(default)]
-    pub groups: Vec<RaftGroupConfig>,
     /// The meta group's voters at its genesis: ids of `raft.peers`, or this
     /// node's id when `raft.peers` is empty. Unset, the smallest
     /// `min(3, N)` ids of the address book ([`RaftConfig::address_book`]).
@@ -335,11 +324,8 @@ impl Default for RaftConfig {
                     usize::try_from(ursula_proto::placement::MAX_GROUP_COUNT).unwrap_or(usize::MAX),
                 ),
             max_uncommitted_size_per_group: None,
-            init_membership: false,
-            init_membership_per_group: false,
             wal: WalConfig::default(),
             peers: Vec::new(),
-            groups: Vec::new(),
             meta_voters: None,
             placement: PlacementConfig::default(),
             bootstrap_peer_probe: HumanDuration::sec(60),
@@ -480,18 +466,6 @@ impl Default for PlacementConfig {
             max_concurrent_moves: MoveLimit::new(Self::DEFAULT_MAX_CONCURRENT_MOVES),
         }
     }
-}
-
-/// Per-group voter assignment for heterogeneous static clusters.
-///
-/// When omitted (the default), every group uses all peers as voters.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RaftGroupConfig {
-    /// Raft group ID.
-    pub raft_group_id: u32,
-    /// Node IDs that are voters for this group.
-    pub voters: Vec<u64>,
 }
 
 /// Storage tier configuration.
