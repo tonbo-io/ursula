@@ -346,6 +346,12 @@ fn generate_snapshot_objects_stay_owned(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::SnapshotObjectsStayOwned)
 }
 
+/// The placement-move family's meta seeds: the run draws its meta faults
+/// from the seed.
+fn generate_placement_move(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::PlacementMove)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -499,6 +505,13 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 1061,
         kind: "snapshot-objects-stay-owned",
         generate: generate_snapshot_objects_stay_owned,
+    },
+    SeedFamily {
+        name: "placement-move",
+        start: 1100,
+        end: 1109,
+        kind: "placement-move",
+        generate: generate_placement_move,
     },
     SeedFamily {
         name: "deleted-data-after-expiry",

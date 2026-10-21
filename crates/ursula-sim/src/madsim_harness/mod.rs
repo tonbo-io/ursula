@@ -164,6 +164,7 @@ pub enum SimScenario {
     DeletedDataLeavesWithinBound,
     EngineRestartLeavesNoWork,
     SnapshotObjectsStayOwned,
+    PlacementMove,
 }
 
 #[derive(Clone)]
@@ -217,6 +218,7 @@ impl SimScenario {
             Self::DeletedDataLeavesWithinBound => "deleted-data-leaves-within-bound",
             Self::EngineRestartLeavesNoWork => "engine-restart-leaves-no-work",
             Self::SnapshotObjectsStayOwned => "snapshot-objects-stay-owned",
+            Self::PlacementMove => "placement-move",
         }
     }
 }
@@ -300,6 +302,9 @@ impl SimSchedule {
         if SNAPSHOT_OBJECTS_SEEDS.contains(&seed) {
             return Self::for_scenario(seed, SimScenario::SnapshotObjectsStayOwned);
         }
+        if PLACEMENT_MOVE_SEEDS.contains(&seed) {
+            return Self::for_scenario(seed, SimScenario::PlacementMove);
+        }
         let scenario = match seed % 12 {
             0 => SimScenario::NoFaultBaseline,
             1 => SimScenario::PartitionHeal,
@@ -361,6 +366,7 @@ pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_SEEDS: std::ops::RangeInclusive<u64> =
 pub const HTTP_PROTOCOL_SURFACE_RANDOMIZED_SEEDS: std::ops::RangeInclusive<u64> = 277..=296;
 pub const ROUTING_BEFORE_BODY_SEEDS: std::ops::RangeInclusive<u64> = 500..=504;
 pub const SNAPSHOT_OBJECTS_SEEDS: std::ops::RangeInclusive<u64> = 546..=549;
+pub const PLACEMENT_MOVE_SEEDS: std::ops::RangeInclusive<u64> = 1100..=1109;
 pub const RUNTIME_RAFT_NETWORK_PARTITION_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 212..=216;
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_COLD_READ_FAILURE_SEEDS: std::ops::RangeInclusive<u64> =
     322..=326;
@@ -574,6 +580,9 @@ mod immutable_reads_loss;
 mod journal_cluster;
 mod leader_reads;
 mod membership_rollback;
+mod meta_checks;
+mod meta_cluster;
+mod placement_move;
 mod recovery_wiring;
 mod routing;
 mod runtime_network;
@@ -762,9 +771,18 @@ fn catch_up_read(stream: &BucketStreamId, offset: u64, max_len: usize) -> ReadSt
 /// [`SimTrace::last_recorded`] reads this run's events afterwards, and a
 /// panic of the run resumes on the caller.
 fn run_with_madsim<T: Send>(seed: u64, workload: impl Future<Output = T> + Send) -> T {
+    run_with_madsim_for(seed, Duration::from_secs(30), workload)
+}
+
+/// [`run_with_madsim`] with a time limit of `limit` simulated time.
+fn run_with_madsim_for<T: Send>(
+    seed: u64,
+    limit: Duration,
+    workload: impl Future<Output = T> + Send,
+) -> T {
     let (result, recorded) = ursula_raft::run_isolated(
         seed,
-        Some(Duration::from_secs(30)),
+        Some(limit),
         move || MadsimOpenRaftRuntime::scope(seed, workload),
         SimTrace::last_recorded,
     );

@@ -529,7 +529,7 @@ impl<T> std::fmt::Debug for ReplicaDrivers<T> {
 
 impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
     fn spawn(&self, replica: MetaDriverContext<'_>) {
-        let peers: BTreeSet<u64> = self.claim.peers.iter().map(NodeId::get).collect();
+        let peers = super::genesis_driver::probed_peers(&self.claim);
         let voters: BTreeSet<u64> = self.claim.meta_voters.iter().map(NodeId::get).collect();
         let mut recovery = self.recovery.clone();
         recovery.initialize = self.claim.is_genesis_node(self.node);

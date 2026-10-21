@@ -166,6 +166,10 @@ pub use history::GroupHistory;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessEndpoint;
 #[cfg(any(test, madsim))]
+pub use in_process::InProcessMetaNetworkFactory;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessMetaRegistry;
+#[cfg(any(test, madsim))]
 pub use in_process::InProcessNetwork;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessNetworkFactory;

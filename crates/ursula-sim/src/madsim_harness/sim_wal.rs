@@ -165,7 +165,6 @@ impl SimNodeWal {
     /// Opens the meta group's log store from the node's meta journal, kept
     /// apart from data group 0's store. A meta journal that does not open is
     /// reported, as the production WAL reports it.
-    #[expect(dead_code, reason = "the meta harness opens the meta group's store")]
     pub(super) fn open_meta(
         &self,
         metrics: GroupEngineMetrics,
@@ -223,8 +222,7 @@ impl SimNodeWal {
     }
 
     /// Crashes the node's process after its engines have stopped: the page
-    /// cache survives.
-    #[cfg(test)]
+    /// cache survives, and the next start begins a new run.
     pub(super) async fn process_crash(&self) {
         self.stop().await;
         SimDisk::process_crash(&self.root).expect("crash a stopped simulated node");

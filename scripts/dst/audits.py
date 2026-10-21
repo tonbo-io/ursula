@@ -676,6 +676,7 @@ EXPECTED_FAMILIES = {
     "engine-restart-leaves-no-work-extended",
     "snapshot-objects-stay-owned",
     "snapshot-objects-stay-owned-extended",
+    "placement-move",
 }
 EXPECTED_RANGES = {"60..=199", "503..=504"}
 

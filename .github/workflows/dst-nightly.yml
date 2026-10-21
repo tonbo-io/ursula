@@ -180,7 +180,8 @@ jobs:
             --seed-family engine-restart-leaves-no-work \
             --seed-family engine-restart-leaves-no-work-extended \
             --seed-family snapshot-objects-stay-owned \
-            --seed-family snapshot-objects-stay-owned-extended
+            --seed-family snapshot-objects-stay-owned-extended \
+            --seed-family placement-move
 
       # Bounded-state DST default seeds (bounded-stream-state DST invariants): producer
       # state across a mid-stream snapshot install (F3, Invariant 12; fixed seed), external

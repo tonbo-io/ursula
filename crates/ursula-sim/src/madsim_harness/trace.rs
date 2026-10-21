@@ -803,6 +803,13 @@ pub enum SimEvent {
         late_puts_landed: u64,
         store_log_digest: String,
     },
+    /// The placement-move family's meta invariants held through the run,
+    /// whose meta history began at the genesis `genesis`, with the meta
+    /// runtimes of `nodes` running at its end.
+    PlacementMoveMetaHeld {
+        genesis: u64,
+        nodes: Vec<u64>,
+    },
     InvariantFailed {
         invariant: String,
         after_event: String,

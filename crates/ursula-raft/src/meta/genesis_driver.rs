@@ -67,6 +67,22 @@ impl GenesisStatus {
     }
 }
 
+/// The peers meta's gate drivers ask: every `raft.peers` node, the meta
+/// learners included, so a node that holds meta history but is no meta
+/// voter holds a genesis back. A negative control turns it off
+/// (`Defence::GenesisEveryPeer`), and the drivers then ask the claimed meta
+/// voters only.
+pub(crate) fn probed_peers(claim: &GenesisClaim) -> BTreeSet<u64> {
+    use ursula_stream::sim_controls::Defence;
+    let peers = if ursula_stream::sim_controls::off(Defence::GenesisEveryPeer) {
+        ursula_stream::sim_controls::note_fired(Defence::GenesisEveryPeer);
+        claim.meta_voters.to_set()
+    } else {
+        claim.peers.to_set()
+    };
+    peers.into_iter().map(NodeId::get).collect()
+}
+
 /// The gate drivers' probe of the meta plane: the genesis probe with
 /// `claim`, each answer recorded in `status`.
 pub(crate) fn genesis_gate_probe<T: RecoveryTransport>(
