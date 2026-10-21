@@ -327,10 +327,13 @@ impl Run {
     /// `ursulactl recover-group --target meta --accept-loss` over `nodes`:
     /// the tool's rounds, every `PLAN_POLL`, until its plan is satisfied.
     /// While a gate may still open the tool waits and observes again, as
-    /// the planner asks.
+    /// the planner asks: a gated meta replica reports its group stalled only
+    /// after `RECOVERY_STALL_AFTER` without a leader barrier, so the wait is
+    /// that and the bound.
     async fn recover_meta(&mut self, nodes: &[u64]) {
         let mut state = ursula_ctl::recovery::LoopState::default();
-        let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
+        let within = ursula_raft::RECOVERY_STALL_AFTER + meta_checks::BOUND;
+        let deadline = madsim::time::Instant::now() + within;
         loop {
             match self.cluster.recover_meta_round(&mut state, nodes).await {
                 Ok(Some(_satisfied)) => return,
@@ -339,12 +342,33 @@ impl Run {
                     self.checks
                         .observe(&self.cluster, &mut self.trace, "meta_plan");
                 }
-                Ok(None) => meta_checks::fail(
-                    &mut self.trace,
-                    meta_checks::PLAN,
-                    "meta_plan",
-                    format!("no meta plan was satisfied within {:?}", meta_checks::BOUND),
-                ),
+                Ok(None) => {
+                    let members: Vec<String> = self
+                        .cluster
+                        .plan_members(nodes)
+                        .iter()
+                        .map(|member| {
+                            format!(
+                                "node {} gate {:?} leader {:?} last {:?} committed {:?} plan {:?}",
+                                member.node_id,
+                                member.gate,
+                                member.current_leader,
+                                member.log.last_log_index,
+                                member.committed,
+                                member.plan,
+                            )
+                        })
+                        .collect();
+                    meta_checks::fail(
+                        &mut self.trace,
+                        meta_checks::PLAN,
+                        "meta_plan",
+                        format!(
+                            "no meta plan was satisfied within {within:?}: {state:?}; members: \
+                             {members:?}"
+                        ),
+                    );
+                }
                 Err(error) => meta_checks::fail(
                     &mut self.trace,
                     meta_checks::PLAN,
