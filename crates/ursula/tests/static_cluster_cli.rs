@@ -4244,18 +4244,37 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
     put_until_created(&client, &stream(&nodes[0])).await;
     post_until_no_content(&client, &stream(&nodes[0]), "before-the-damage;").await;
 
-    // 1. Node 2 stops, and its meta journal's metadata no longer reads.
-    // Node 3 is drained, so node 1 leads every data group.
+    // 1. Node 3 is drained, which hands its leaderships away. Node 2 stops,
+    // and its shutdown hands its leaderships to node 1, the only node left
+    // that takes transfers, so node 1 leads every data group. The seed
+    // initializers rotate over the nodes, so each node led some groups
+    // before. Node 2's meta journal's metadata no longer reads.
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let ctl_nodes = nodes.iter().map(MetaNode::ctl).collect::<Vec<_>>();
+    let outcome = ursula_ctl::drain_node(
+        &ctl_nodes,
+        &nodes[2].ctl(),
+        &ctl,
+        &ursula_ctl::DrainOptions {
+            drain_timeout: Duration::from_secs(60),
+            ready_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(200),
+            lag_tolerance: 16,
+            dry_run: false,
+        },
+    )
+    .await
+    .expect("drain node 3");
+    assert!(
+        matches!(outcome, ursula_ctl::DrainOutcome::Drained),
+        "{outcome:?}"
+    );
     procs.stop(2).await;
     std::fs::write(
         nodes[1].meta_dir().join("journal.meta"),
         b"not a meta journal",
     )
     .expect("damage the meta journal");
-    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
-    ctl.set_maintenance_drain(&nodes[2].ctl(), true)
-        .await
-        .expect("drain node 3");
     eventually(&mut procs, "node 1 leads every data group", async || {
         let led = leads(&try_node_metrics(&client, &nodes[0].url()).await?, 1);
         if led == META_TEST_GROUPS {

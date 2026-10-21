@@ -3881,6 +3881,15 @@ async fn static_grpc_node_that_lost_its_wal_rejoins_all_groups_through_membershi
 /// Moves the leadership of each of the first `groups` groups of `nodes`,
 /// node `i + 1` at index `i`, to node 1. Each group's seed initializer
 /// leads it first, and the initializers rotate over the nodes.
+///
+/// A handoff goes out only while node 1 takes transfers, every recovery
+/// gate on it open, the stance a production planner reads from
+/// `/__ursula/leadership-shed` before it hands off. A replica that did not
+/// initialize its group starts gated and refuses a transfer until a
+/// leader's barrier opens its gate. A leader whose transfer is refused
+/// stays parked, sending no heartbeats, until its transfer deadline, so a
+/// handoff sent to a gated node 1 only stalls the group that would open
+/// its gate.
 async fn move_every_leadership_to_node_1(nodes: &[StaticGrpcTestNode], groups: u32) {
     for group in (0..groups).map(RaftGroupId) {
         let deadline = tokio::time::Instant::now()
@@ -3891,7 +3900,7 @@ async fn move_every_leadership_to_node_1(nodes: &[StaticGrpcTestNode], groups: u
             let leader = raft.metrics().borrow_watched().current_leader;
             match leader {
                 Some(1) => break,
-                Some(other) => {
+                Some(other) if nodes[0].registry.should_accept_transfer() => {
                     let leader =
                         &nodes[usize::try_from(other.checked_sub(1).expect("node ids start at 1"))
                             .expect("node index")];
@@ -3899,7 +3908,8 @@ async fn move_every_leadership_to_node_1(nodes: &[StaticGrpcTestNode], groups: u
                         tracing::debug!(group = group.0, %err, "transfer to node 1 refused");
                     }
                 }
-                None => {}
+                // No leader yet, or node 1 does not take transfers yet.
+                Some(_) | None => {}
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
