@@ -38,6 +38,7 @@ use ursula_raft::HostingDriver;
 use ursula_raft::HostingSet;
 use ursula_raft::HostingTask;
 use ursula_raft::InProcessRaftNetworkFactory;
+use ursula_raft::MadsimOpenRaftRuntime;
 use ursula_raft::MetaPlacement;
 use ursula_raft::PlacementInputs;
 use ursula_raft::RaftGroupEngine;
@@ -71,6 +72,9 @@ pub(super) const I7: &str = "a_node_restarted_without_meta_serves";
 pub(super) const I15: &str = "every_seeded_group_forms";
 pub(super) const HOSTED: &str = "a_node_runs_only_its_placed_groups";
 
+/// Mixed into the OpenRaft seed of each placed replica's start.
+const HOST_SEED: u64 = 0x686f_7374_6564_0000;
+
 /// Every gate a placed replica ever opened with, by group and node, so I2
 /// counts the initializations of replicas that stopped too.
 #[derive(Clone, Default)]
@@ -82,6 +86,16 @@ impl StartedGates {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .push((group, node_id, rejoin));
+    }
+
+    /// How many replicas started so far.
+    fn len(&self) -> u64 {
+        let started = self
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .len();
+        u64::try_from(started).unwrap_or(u64::MAX)
     }
 
     /// The nodes whose replicas of each group ran `Initialize`.
@@ -177,15 +191,25 @@ impl SimHost {
         options.recovery = Some(Arc::clone(&rejoin));
         options.peer_cluster = Some(registry.peer_cluster().clone());
         options.fence = Some(wal.raft_wal().fence());
-        let engine = RaftGroupEngine::new_node(
-            placement,
-            node_id,
-            Arc::new(config),
-            InProcessRaftNetworkFactory::new(network.clone())
-                .with_source(node_id)
-                .with_policy(self.parts.policy.clone()),
-            store,
-            wal.recording_work(options),
+        // The driver's tasks run outside the simulation's OpenRaft seed
+        // scope, so each start gets a seed of its own, as the runtime
+        // scenarios' engine factory gives each create.
+        let seed = HOST_SEED
+            ^ node_id.rotate_left(32)
+            ^ u64::from(group).rotate_left(16)
+            ^ self.started.len();
+        let engine = MadsimOpenRaftRuntime::scope(
+            seed,
+            RaftGroupEngine::new_node(
+                placement,
+                node_id,
+                Arc::new(config),
+                InProcessRaftNetworkFactory::new(network.clone())
+                    .with_source(node_id)
+                    .with_policy(self.parts.policy.clone()),
+                store,
+                wal.recording_work(options),
+            ),
         )
         .await
         .map_err(|source| SimHostError::Engine { group, source })?;
