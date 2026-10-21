@@ -990,7 +990,7 @@ mod tests {
                 get(|| async {
                     Json(crate::metrics::test_metrics(
                         1,
-                        Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                        Some(crate::metrics::test_incarnation(1)),
                     ))
                 }),
             )
@@ -1098,7 +1098,7 @@ mod tests {
                 get(|| async {
                     Json(crate::metrics::test_metrics(
                         1,
-                        Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                        Some(crate::metrics::test_incarnation(1)),
                     ))
                 }),
             )
@@ -1188,7 +1188,7 @@ mod tests {
                         get(|| async {
                             axum::Json(crate::metrics::test_metrics(
                                 1,
-                                Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                                Some(crate::metrics::test_incarnation(1)),
                             ))
                         }),
                     )
@@ -1199,7 +1199,7 @@ mod tests {
                             async move {
                                 assert_eq!(
                                     headers[ursula_proto::admin::PROCESS_INCARNATION_HEADER],
-                                    "00000000000000000000000000000001"
+                                    "00000000000000010000000100000000"
                                 );
                                 received.fetch_add(1, Ordering::SeqCst);
                                 StatusCode::PRECONDITION_FAILED

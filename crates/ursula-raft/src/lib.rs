@@ -276,7 +276,12 @@ pub use state_machine::SnapshotRecordError;
 pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::persisted_snapshot_pointer;
+pub use target::FENCE_METADATA;
+pub use target::FenceRefusal;
+pub use target::INCARNATION_METADATA;
 pub use target::RAFT_PLANE_METADATA;
+pub use target::TARGET_INCARNATION_METADATA;
+pub use target::fence_refusal;
 pub use types::RaftCommand;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;

@@ -1,15 +1,18 @@
 //! Kernel property tests: random valid and invalid commands and history
 //! events over 1 to 6 nodes, 1 to 4 groups and replication factors 1 to 3,
-//! checked after every step against K1 to K12 and K14 to K16 of the design
+//! checked after every step against K1 to K12 and K14 to K19 of the design
 //! (issue #768):
 //! refusals change nothing, placement keys move exactly on accepted moves,
 //! converges and history events and never backwards, retirements never sit
-//! beside a role, removal is terminal, and the rest. An accepted command
+//! beside a role, removal is terminal, a root slot changes only as its
+//! table says, and the rest. An accepted command
 //! must also leave exactly the state the effect column of the command table
 //! (2.3) describes, built here from that table rather than from the
 //! dispatcher, and answer what that state says.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashSet;
 
 use proptest::prelude::ProptestConfig;
 use proptest::test_runner::RngSeed;
@@ -19,6 +22,8 @@ use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -42,6 +47,8 @@ use super::samples::membership;
 use super::samples::meta;
 use super::samples::node;
 use super::samples::params;
+use super::samples::register;
+use super::samples::root;
 use super::seed_voters;
 
 /// `x mod n` as an index.
@@ -78,6 +85,8 @@ struct Run {
     node_count: u64,
     /// Bootstraps accepted so far.
     bootstraps: u32,
+    /// Every root a slot has held released, by node.
+    released: HashSet<(NodeId, RootId)>,
 }
 
 impl Run {
@@ -86,6 +95,7 @@ impl Run {
             driver: Driver::new(),
             node_count,
             bootstraps: 0,
+            released: HashSet::new(),
         }
     }
 
@@ -128,6 +138,23 @@ impl Run {
         RaftGroupId(u32::try_from(index(x, ids)).unwrap())
     }
 
+    /// One of the three roots node `id` may run on, its first one
+    /// `root(id)`, which [`register`] registers.
+    fn pick_root(id: NodeId, x: u8) -> RootId {
+        let offset = u64::try_from(index(x, 3))
+            .unwrap()
+            .checked_mul(100)
+            .unwrap();
+        root(id.get().checked_add(offset).unwrap())
+    }
+
+    /// The root node `id`'s slot names, if it has one.
+    fn slot_root(&self, id: NodeId) -> Option<RootId> {
+        slots(&self.driver.state)
+            .get(&id)
+            .map(|(slot, _)| slot.root())
+    }
+
     /// The placement key a command names: usually the current one.
     fn expected(&self, group: RaftGroupId, y: u8) -> PlacementEpoch {
         match self.cluster().and_then(|cluster| cluster.group(group)) {
@@ -155,11 +182,16 @@ impl Run {
     /// The step `(op, x, y, z)` chooses from the current state: mostly
     /// commands a correct caller would send, some stale or invalid.
     fn generate(&self, op: u8, x: u8, y: u8, z: u8) -> Step {
-        match op.checked_rem(13).unwrap() {
-            0 => Step::Command(ControlCommand::RegisterNode {
-                node: self.pick_node(x),
-                now_ms: u64::from(y),
-            }),
+        match op.checked_rem(14).unwrap() {
+            0 => {
+                let node = self.pick_node(x);
+                Step::Command(ControlCommand::RegisterNode {
+                    node,
+                    root: Self::pick_root(node, y),
+                    empty: one_in(z, 2),
+                    now_ms: u64::from(y),
+                })
+            }
             1 => {
                 let nodes = self.voters_from_mask(y);
                 let ids: Vec<u64> = nodes.iter().map(NodeId::get).collect();
@@ -255,6 +287,15 @@ impl Run {
                     created_at,
                 })
             }
+            12 => {
+                // Mostly the root the slot names, so most releases apply.
+                let node = self.pick_node(x);
+                let root = match self.slot_root(node) {
+                    Some(root) if !one_in(y, 4) => root,
+                    Some(_) | None => Self::pick_root(node, z),
+                };
+                Step::Command(ControlCommand::ReleaseRoot { node, root })
+            }
             _ => Step::History(if one_in(x, 4) {
                 HistoryCause::Plan
             } else {
@@ -297,6 +338,7 @@ impl Run {
         }
         ensure(self.bootstraps <= 1, || "K11: two bootstraps".to_owned())?;
         check_transition(&before, after, at, &step, &outcome)?;
+        check_slots(&before, after, &step, &mut self.released)?;
         invariants(after)
     }
 }
@@ -324,6 +366,7 @@ pub(super) fn reachable(
         driver,
         node_count,
         bootstraps: 1,
+        released: HashSet::new(),
     };
     for (op, x, y, z) in steps.iter().copied() {
         let step = run.generate(op, x, y, z);
@@ -636,7 +679,9 @@ fn now_ms_of(command: &ControlCommand) -> Option<u64> {
         | ControlCommand::RequestMove { now_ms, .. }
         | ControlCommand::ReportConverged { now_ms, .. }
         | ControlCommand::SetNodeLifecycle { now_ms, .. } => Some(*now_ms),
-        ControlCommand::SetMoveLimit { .. } | ControlCommand::ReportTornDown { .. } => None,
+        ControlCommand::SetMoveLimit { .. }
+        | ControlCommand::ReportTornDown { .. }
+        | ControlCommand::ReleaseRoot { .. } => None,
     }
 }
 
@@ -708,13 +753,36 @@ fn expected_cluster(
     let since = PlacementEpoch::new(at);
     let mut expected = old.clone();
     match command {
-        ControlCommand::RegisterNode { node, now_ms } => {
-            // A new id joins `Active`. A known id changes nothing, whatever
-            // its lifecycle.
-            expected.nodes.entry(*node).or_insert(NodeRecord {
-                lifecycle: NodeLifecycle::Active,
-                since_ms: *now_ms,
-            });
+        ControlCommand::RegisterNode {
+            node,
+            root,
+            empty,
+            now_ms,
+        } => match expected.nodes.get_mut(node) {
+            // A new id joins `Active` on its root.
+            None => {
+                expected.nodes.insert(*node, NodeRecord {
+                    lifecycle: NodeLifecycle::Active,
+                    since_ms: *now_ms,
+                    root: RootSlot::Bound(*root),
+                });
+            }
+            // A known id keeps its lifecycle and time, and changes its slot
+            // only when an empty root takes a released one.
+            Some(record) => {
+                if let RootSlot::Released(released) = record.root
+                    && released != *root
+                    && *empty
+                {
+                    record.root = RootSlot::Bound(*root);
+                }
+            }
+        },
+        ControlCommand::ReleaseRoot { node, root } => {
+            let Some(record) = expected.nodes.get_mut(node) else {
+                return Err(format!("accepted {command:?} for an unregistered node"));
+            };
+            record.root = RootSlot::Released(*root);
         }
         ControlCommand::Bootstrap { .. } => {
             return Err(format!("K11: a bootstrapped cluster accepted {command:?}"));
@@ -838,6 +906,7 @@ fn expected_cluster(
                 expected.nodes.insert(*node, NodeRecord {
                     lifecycle,
                     since_ms: *now_ms,
+                    root: record.root,
                 });
                 // A node without a role is removed at once.
                 if lifecycle == NodeLifecycle::Decommissioning && !expected.has_any_role(*node) {
@@ -869,10 +938,13 @@ fn expected_cluster(
 
 /// Marks `node` removed as of `now_ms` and drops its retirements.
 fn remove(cluster: &mut Cluster, node: NodeId, now_ms: u64) {
-    cluster.nodes.insert(node, NodeRecord {
-        lifecycle: NodeLifecycle::Removed,
-        since_ms: now_ms,
-    });
+    if let Some(record) = cluster.nodes.get_mut(&node) {
+        *record = NodeRecord {
+            lifecycle: NodeLifecycle::Removed,
+            since_ms: now_ms,
+            root: record.root,
+        };
+    }
     for records in cluster.retirements.values_mut() {
         records.remove(&node);
     }
@@ -935,6 +1007,7 @@ fn check_answer(
             lifecycle: record_of(*node)?.lifecycle,
         },
         ControlCommand::SetMoveLimit { limit } => ControlApplied::MoveLimitSet { limit: *limit },
+        ControlCommand::ReleaseRoot { node, .. } => ControlApplied::RootReleased(record_of(*node)?),
         ControlCommand::ReportTornDown {
             group,
             node,
@@ -988,21 +1061,136 @@ fn check_forming(
         (
             ControlPlaneState::Forming { registered: old },
             ControlPlaneState::Forming { registered: new },
-            ControlCommand::RegisterNode { node, .. },
+            ControlCommand::RegisterNode { node, .. } | ControlCommand::ReleaseRoot { node, .. },
         ) => {
-            // A registration adds its node and changes no other.
+            // A registration adds its node and changes no other, and a
+            // known node's registration or release changes at most its slot
+            // (K17 checks how), never its time.
             ensure(
                 new.contains_key(node)
                     && old.keys().all(|id| new.contains_key(id))
                     && new.iter().all(|(id, registration)| {
-                        old.get(id)
-                            .map_or(id == node, |previous| previous == registration)
+                        old.get(id).map_or(id == node, |previous| {
+                            previous == registration
+                                || (id == node && previous.since_ms == registration.since_ms)
+                        })
                     }),
                 || "a registration changed another node".to_owned(),
-            )
+            )?;
+            let answer = match command {
+                ControlCommand::ReleaseRoot { .. } => {
+                    let registration = new[node];
+                    ControlApplied::RootReleased(NodeRecord {
+                        lifecycle: NodeLifecycle::Active,
+                        since_ms: registration.since_ms,
+                        root: registration.root,
+                    })
+                }
+                _ => ControlApplied::NodeRegistered(Registered::Forming),
+            };
+            ensure(*applied == answer, || {
+                format!("{command:?} answered {applied:?}, not {answer:?}")
+            })
         }
         _ => Err(format!("{command:?} accepted from {before:?} to {after:?}")),
     }
+}
+
+/// Every node's slot and `since_ms`: the registrations' before Bootstrap,
+/// the records' after, none after a formation cut.
+fn slots(state: &ControlPlaneState) -> BTreeMap<NodeId, (RootSlot, u64)> {
+    match state {
+        ControlPlaneState::Forming { registered } => registered
+            .iter()
+            .map(|(id, registration)| (*id, (registration.root, registration.since_ms)))
+            .collect(),
+        ControlPlaneState::FormationCut => BTreeMap::new(),
+        ControlPlaneState::Bootstrapped(cluster) => cluster
+            .nodes()
+            .iter()
+            .map(|(id, record)| (*id, (record.root, record.since_ms)))
+            .collect(),
+    }
+}
+
+/// K17 to K19 for one step, before and after Bootstrap: a slot changes only
+/// as the slot table of 2.3 says, by the command that names its node; a
+/// root registered as holding state never takes a released slot; and no
+/// root a slot ever held released binds again. `released` gathers those
+/// roots across the run. A slot change leaves the time.
+fn check_slots(
+    before: &ControlPlaneState,
+    after: &ControlPlaneState,
+    step: &Step,
+    released: &mut HashSet<(NodeId, RootId)>,
+) -> Result<(), String> {
+    let old = slots(before);
+    let new = slots(after);
+    if !matches!(after, ControlPlaneState::FormationCut) {
+        ensure(old.keys().all(|id| new.contains_key(id)), || {
+            "K17: a slot disappeared".to_owned()
+        })?;
+    }
+    for (id, (slot, since_ms)) in &new {
+        let previous = old.get(id).copied();
+        if let RootSlot::Bound(bound) = slot {
+            ensure(!released.contains(&(*id, *bound)), || {
+                format!("K19: node {id} bound its released root {bound} on {step:?}")
+            })?;
+        }
+        if previous.map(|(slot, _)| slot) == Some(*slot) {
+            continue;
+        }
+        let command = match step {
+            Step::Command(command) => Some(command),
+            Step::History(_) => None,
+        };
+        if let (
+            Some(ControlCommand::RegisterNode { empty: false, .. }),
+            Some((RootSlot::Released(_), _)),
+        ) = (command, previous)
+        {
+            return Err(format!(
+                "K18: node {id} took a released slot with a root that holds state"
+            ));
+        }
+        let allowed = match (command, previous, slot) {
+            (
+                Some(ControlCommand::RegisterNode { node, root, .. }),
+                None,
+                RootSlot::Bound(bound),
+            ) => node == id && root == bound,
+            (
+                Some(ControlCommand::RegisterNode {
+                    node,
+                    root,
+                    empty: true,
+                    ..
+                }),
+                Some((RootSlot::Released(was), _)),
+                RootSlot::Bound(bound),
+            ) => node == id && root == bound && was != *root,
+            (
+                Some(ControlCommand::ReleaseRoot { node, root }),
+                Some((RootSlot::Bound(was), _)),
+                RootSlot::Released(now),
+            ) => node == id && root == now && was == *root,
+            _ => false,
+        };
+        ensure(allowed, || {
+            format!("K17: node {id}'s slot went from {previous:?} to {slot:?} on {step:?}")
+        })?;
+        if let Some((_, previous_since)) = previous {
+            ensure(previous_since == *since_ms, || {
+                format!("K6: node {id}'s slot change moved its time on {step:?}")
+            })?;
+        }
+    }
+    released.extend(new.iter().filter_map(|(id, (slot, _))| match slot {
+        RootSlot::Released(root) => Some((*id, *root)),
+        RootSlot::Bound(_) => None,
+    }));
+    Ok(())
 }
 
 #[test]
@@ -1024,12 +1212,7 @@ fn drive(
 ) -> Result<(), String> {
     let ids: Vec<u64> = (1..=run.node_count).collect();
     let mut prelude = vec![Step::History(HistoryCause::Genesis)];
-    prelude.extend(ids.iter().map(|id| {
-        Step::Command(ControlCommand::RegisterNode {
-            node: node(*id),
-            now_ms: 1,
-        })
-    }));
+    prelude.extend(ids.iter().map(|id| Step::Command(register(*id, 1))));
     if let Some(params) = bootstrap {
         prelude.push(Step::Command(ControlCommand::Bootstrap {
             params,
@@ -1054,7 +1237,7 @@ fn steps_strategy(
 ) -> impl proptest::strategy::Strategy<Value = Vec<(u8, u8, u8, u8)>> {
     proptest::collection::vec(
         (
-            0_u8..13,
+            0_u8..14,
             proptest::num::u8::ANY,
             proptest::num::u8::ANY,
             proptest::num::u8::ANY,

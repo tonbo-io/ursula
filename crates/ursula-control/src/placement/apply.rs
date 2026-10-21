@@ -20,6 +20,8 @@ use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::NodeSet;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::group_count_within_bound;
 use ursula_shard::RaftGroupId;
@@ -56,9 +58,20 @@ impl ControlPlaneState {
             Self::FormationCut => Err(ControlError::FormationCut),
             Self::Forming { registered } => match plan_forming(registered, command)? {
                 FormingChange::Nothing(applied) => Ok(applied),
-                FormingChange::Register { node, now_ms } => {
-                    registered.insert(node, Registration { since_ms: now_ms });
+                FormingChange::Register { node, root, now_ms } => {
+                    registered.insert(node, Registration {
+                        since_ms: now_ms,
+                        root: RootSlot::Bound(root),
+                    });
                     Ok(ControlApplied::NodeRegistered(Registered::Forming))
+                }
+                FormingChange::Slot {
+                    node,
+                    registration,
+                    applied,
+                } => {
+                    registered.insert(node, registration);
+                    Ok(applied)
                 }
                 FormingChange::Bootstrap {
                     params,
@@ -133,7 +146,14 @@ enum FormingChange {
     Nothing(ControlApplied),
     Register {
         node: NodeId,
+        root: RootId,
         now_ms: u64,
+    },
+    /// A registered node's slot changes, answering `applied`.
+    Slot {
+        node: NodeId,
+        registration: Registration,
+        applied: ControlApplied,
     },
     Bootstrap {
         params: ClusterParams,
@@ -148,10 +168,21 @@ enum FormingChange {
 enum Change {
     /// The command is accepted and writes nothing.
     Nothing(ControlApplied),
-    /// A new node registers.
+    /// A new node registers on `root`.
     Register {
         node: NodeId,
+        root: RootId,
         now_ms: u64,
+    },
+    /// A registered node's root binds anew.
+    Rebind {
+        node: NodeId,
+        record: NodeRecord,
+    },
+    /// A registered node's root is released.
+    Release {
+        node: NodeId,
+        record: NodeRecord,
     },
     /// The group starts, retargets or cancels a move.
     Move {
@@ -183,11 +214,54 @@ fn plan_forming(
     command: ControlCommand,
 ) -> Result<FormingChange, ControlError> {
     match command {
-        ControlCommand::RegisterNode { node, now_ms } => Ok(if registered.contains_key(&node) {
-            FormingChange::Nothing(ControlApplied::NodeRegistered(Registered::Forming))
-        } else {
-            FormingChange::Register { node, now_ms }
-        }),
+        ControlCommand::RegisterNode {
+            node,
+            root,
+            empty,
+            now_ms,
+        } => {
+            let Some(registration) = registered.get(&node) else {
+                return Ok(FormingChange::Register { node, root, now_ms });
+            };
+            let applied = ControlApplied::NodeRegistered(Registered::Forming);
+            let slot = register_slot(node, Some(registration.root), root, empty)?;
+            Ok(if slot == registration.root {
+                FormingChange::Nothing(applied)
+            } else {
+                FormingChange::Slot {
+                    node,
+                    registration: Registration {
+                        root: slot,
+                        ..*registration
+                    },
+                    applied,
+                }
+            })
+        }
+        ControlCommand::ReleaseRoot { node, root } => {
+            let registration = registered
+                .get(&node)
+                .ok_or(ControlError::UnknownNode { node })?;
+            let slot = release_slot(node, registration.root, root)?;
+            // The record Bootstrap gives a registered node.
+            let applied = ControlApplied::RootReleased(NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: registration.since_ms,
+                root: slot,
+            });
+            Ok(if slot == registration.root {
+                FormingChange::Nothing(applied)
+            } else {
+                FormingChange::Slot {
+                    node,
+                    registration: Registration {
+                        root: slot,
+                        ..*registration
+                    },
+                    applied,
+                }
+            })
+        }
         ControlCommand::Bootstrap {
             params,
             nodes,
@@ -209,7 +283,7 @@ fn plan_forming(
 }
 
 /// The cluster a checked `Bootstrap` at `at` creates: every registered node
-/// active, every group seeded over `nodes`.
+/// active on its registration's slot, every group seeded over `nodes`.
 fn bootstrap(
     at: MetaLogId,
     registered: &BTreeMap<NodeId, Registration>,
@@ -217,10 +291,6 @@ fn bootstrap(
     nodes: &NodeSet,
     now_ms: u64,
 ) -> Cluster {
-    let record = NodeRecord {
-        lifecycle: NodeLifecycle::Active,
-        since_ms: now_ms,
-    };
     let since = PlacementEpoch::new(at);
     let groups = group_ids(params.group_count)
         .map(|group| {
@@ -233,7 +303,16 @@ fn bootstrap(
         })
         .collect();
     Cluster {
-        nodes: registered.keys().map(|node| (*node, record)).collect(),
+        nodes: registered
+            .iter()
+            .map(|(node, registration)| {
+                (*node, NodeRecord {
+                    lifecycle: NodeLifecycle::Active,
+                    since_ms: now_ms,
+                    root: registration.root,
+                })
+            })
+            .collect(),
         params,
         groups: Placements(groups),
         retirements: BTreeMap::new(),
@@ -275,7 +354,13 @@ impl Cluster {
             return Err(ControlError::UnknownGroup { group });
         }
         match command {
-            ControlCommand::RegisterNode { node, now_ms } => self.plan_register(node, now_ms),
+            ControlCommand::RegisterNode {
+                node,
+                root,
+                empty,
+                now_ms,
+            } => self.plan_register(node, root, empty, now_ms),
+            ControlCommand::ReleaseRoot { node, root } => self.plan_release(node, root),
             ControlCommand::Bootstrap { .. } => Err(ControlError::AlreadyBootstrapped),
             ControlCommand::RequestMove {
                 group,
@@ -304,16 +389,51 @@ impl Cluster {
         }
     }
 
-    fn plan_register(&self, node: NodeId, now_ms: u64) -> Result<Change, ControlError> {
+    fn plan_register(
+        &self,
+        node: NodeId,
+        root: RootId,
+        empty: bool,
+        now_ms: u64,
+    ) -> Result<Change, ControlError> {
         let Some(record) = self.node(node) else {
-            return Ok(Change::Register { node, now_ms });
+            return Ok(Change::Register { node, root, now_ms });
         };
         if record.lifecycle == NodeLifecycle::Removed {
             return Err(ControlError::NodeRemoved { node });
         }
-        Ok(Change::Nothing(ControlApplied::NodeRegistered(
-            self.registered(node, *record),
-        )))
+        let slot = register_slot(node, Some(record.root), root, empty)?;
+        if slot == record.root {
+            return Ok(Change::Nothing(ControlApplied::NodeRegistered(
+                self.registered(node, *record),
+            )));
+        }
+        Ok(Change::Rebind {
+            node,
+            record: NodeRecord {
+                root: slot,
+                ..*record
+            },
+        })
+    }
+
+    fn plan_release(&self, node: NodeId, root: RootId) -> Result<Change, ControlError> {
+        let record = self.node(node).ok_or(ControlError::UnknownNode { node })?;
+        if record.lifecycle == NodeLifecycle::Removed {
+            return Err(ControlError::NodeRemoved { node });
+        }
+        let slot = release_slot(node, record.root, root)?;
+        let released = NodeRecord {
+            root: slot,
+            ..*record
+        };
+        if slot == record.root {
+            return Ok(Change::Nothing(ControlApplied::RootReleased(released)));
+        }
+        Ok(Change::Release {
+            node,
+            record: released,
+        })
     }
 
     fn registered(&self, node: NodeId, record: NodeRecord) -> Registered {
@@ -514,6 +634,7 @@ impl Cluster {
             record: NodeRecord {
                 lifecycle,
                 since_ms: now_ms,
+                root: record.root,
             },
         })
     }
@@ -545,13 +666,22 @@ impl Cluster {
         let since = PlacementEpoch::new(at);
         match change {
             Change::Nothing(applied) => applied,
-            Change::Register { node, now_ms } => {
+            Change::Register { node, root, now_ms } => {
                 let record = NodeRecord {
                     lifecycle: NodeLifecycle::Active,
                     since_ms: now_ms,
+                    root: RootSlot::Bound(root),
                 };
                 self.nodes.insert(node, record);
                 ControlApplied::NodeRegistered(Registered::Unreferenced(record))
+            }
+            Change::Rebind { node, record } => {
+                self.nodes.insert(node, record);
+                ControlApplied::NodeRegistered(self.registered(node, record))
+            }
+            Change::Release { node, record } => {
+                self.nodes.insert(node, record);
+                ControlApplied::RootReleased(record)
             }
             Change::Move {
                 group,
@@ -633,10 +763,13 @@ impl Cluster {
             .map(|(node, _)| *node)
             .collect();
         for node in &removed {
-            self.nodes.insert(*node, NodeRecord {
-                lifecycle: NodeLifecycle::Removed,
-                since_ms: now_ms,
-            });
+            if let Some(record) = self.nodes.get_mut(node) {
+                *record = NodeRecord {
+                    lifecycle: NodeLifecycle::Removed,
+                    since_ms: now_ms,
+                    root: record.root,
+                };
+            }
         }
         if !removed.is_empty() {
             for records in self.retirements.values_mut() {
@@ -645,6 +778,42 @@ impl Cluster {
             self.retirements.retain(|_, records| !records.is_empty());
         }
         removed
+    }
+}
+
+/// The slot a registration of `root` leaves a node whose slot is `slot`
+/// (`None` for a node without one), or its refusal: the one slot table of
+/// `RegisterNode`, before Bootstrap and after. An unbound id binds, its own
+/// root changes nothing, and only an `empty` root other than the released
+/// one takes a released slot (K18). A released root never binds again
+/// (K19), and neither does a root while another holds the slot.
+fn register_slot(
+    node: NodeId,
+    slot: Option<RootSlot>,
+    root: RootId,
+    empty: bool,
+) -> Result<RootSlot, ControlError> {
+    match slot {
+        None => Ok(RootSlot::Bound(root)),
+        Some(RootSlot::Bound(bound)) if bound == root => Ok(RootSlot::Bound(root)),
+        Some(RootSlot::Released(released)) if released != root && empty => {
+            Ok(RootSlot::Bound(root))
+        }
+        Some(slot @ (RootSlot::Bound(_) | RootSlot::Released(_))) => {
+            Err(ControlError::OtherRoot { node, slot })
+        }
+    }
+}
+
+/// The slot a release of `root` leaves a node whose slot is `slot`, or its
+/// refusal: a compare-and-set on the bound root, which a repeat answers
+/// unchanged.
+fn release_slot(node: NodeId, slot: RootSlot, root: RootId) -> Result<RootSlot, ControlError> {
+    match slot {
+        RootSlot::Bound(bound) | RootSlot::Released(bound) if bound == root => {
+            Ok(RootSlot::Released(root))
+        }
+        RootSlot::Bound(_) | RootSlot::Released(_) => Err(ControlError::StaleRoot { node, slot }),
     }
 }
 

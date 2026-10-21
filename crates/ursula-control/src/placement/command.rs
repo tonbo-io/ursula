@@ -11,9 +11,12 @@ use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
+use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::NodeSet;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -26,9 +29,14 @@ use super::state::MoveLimit;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ControlCommand {
-    /// A node announces itself, at every start.
+    /// A node announces itself and the root it runs on, at every start.
+    /// `empty` says that the root held no journal record, no vote and no
+    /// snapshot record when it opened: only an empty root takes a released
+    /// slot.
     RegisterNode {
         node: NodeId,
+        root: RootId,
+        empty: bool,
         now_ms: u64,
     },
     /// Places every group over `nodes`, once.
@@ -71,6 +79,14 @@ pub enum ControlCommand {
         node: NodeId,
         created_at: MetaLogId,
     },
+    /// An operator releases `root`, the root `node` is bound to, once its
+    /// disk is revoked (`replace-disk`): a compare-and-set on the slot. The
+    /// released root never binds again. It carries no time, since a slot
+    /// change dates nothing.
+    ReleaseRoot {
+        node: NodeId,
+        root: RootId,
+    },
 }
 
 impl ControlCommand {
@@ -83,7 +99,8 @@ impl ControlCommand {
             Self::RegisterNode { .. }
             | Self::Bootstrap { .. }
             | Self::SetNodeLifecycle { .. }
-            | Self::SetMoveLimit { .. } => None,
+            | Self::SetMoveLimit { .. }
+            | Self::ReleaseRoot { .. } => None,
         }
     }
 }
@@ -158,6 +175,10 @@ pub enum ControlApplied {
     /// No retirement matched the report: it was reported, dropped, or is a
     /// newer one.
     NothingToTearDown,
+    /// The node's record with its released root. Before Bootstrap it is
+    /// the record Bootstrap gives the node: `Active`, since its
+    /// registration.
+    RootReleased(NodeRecord),
 }
 
 /// Why the state machine refused a command. The first failing check is the
@@ -222,6 +243,17 @@ pub enum ControlError {
     MetaVoter { node: NodeId },
     #[error("node {node} is decommissioning: uncordon it first")]
     Decommissioning { node: NodeId },
+    /// A registration of a root the node id is not bound to: another root
+    /// holds the slot, the root was released, or a root that holds state
+    /// met a released slot.
+    #[error(
+        "node {node} is not bound to this root, its slot is {slot}: an operator releases a root \
+         with replace-disk once its disk is revoked"
+    )]
+    OtherRoot { node: NodeId, slot: RootSlot },
+    /// A release of a root the node id is not bound to.
+    #[error("node {node} is not bound to the root named, its slot is {slot}: read the slot again")]
+    StaleRoot { node: NodeId, slot: RootSlot },
 }
 
 /// What a caller does after the state machine refused its command. Never
@@ -242,10 +274,13 @@ impl ControlError {
     /// exhaustive match, so a new refusal names its class.
     pub fn requeue(&self) -> Requeue {
         match self {
-            Self::NotBootstrapped | Self::RetirementPending { .. } | Self::MoveLimit { .. } => {
-                Requeue::Retry
-            }
+            // An empty root registers until an operator releases the slot.
+            Self::NotBootstrapped
+            | Self::RetirementPending { .. }
+            | Self::MoveLimit { .. }
+            | Self::OtherRoot { .. } => Requeue::Retry,
             Self::StalePlacement { .. }
+            | Self::StaleRoot { .. }
             | Self::UnknownNode { .. }
             | Self::GroupNotLive { .. }
             | Self::NotMoving { .. }

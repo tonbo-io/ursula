@@ -28,7 +28,10 @@
 //!
 //! The disk also stands in for the host's boot id
 //! ([`JournalDisk::boot_id`]): a power loss under a prefix starts a new boot
-//! for every path below it, and a process crash does not.
+//! for every path below it, and a process crash does not. It stands in for
+//! the device a path is mounted from too ([`JournalDisk::device`]): each
+//! attachment of a volume under a prefix ([`SimDisk::reattach`]) is a new
+//! device for every path below it.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -182,6 +185,8 @@ struct DiskState {
     next_root: u64,
     /// The prefix of every power loss so far, in order.
     power_losses: Vec<PathBuf>,
+    /// The prefix of every reattachment so far, in order.
+    attachments: Vec<PathBuf>,
 }
 
 struct Inode {
@@ -541,6 +546,17 @@ impl DiskState {
             .count();
         format!("sim-boot-{boots}")
     }
+
+    /// The simulated device of the volume holding `path`: one more for
+    /// every reattachment that covered it.
+    fn device(&self, path: &Path) -> u64 {
+        let attachments = self
+            .attachments
+            .iter()
+            .filter(|prefix| path.starts_with(prefix))
+            .count();
+        u64::try_from(attachments).unwrap_or(u64::MAX)
+    }
 }
 
 impl SimDisk {
@@ -554,6 +570,25 @@ impl SimDisk {
                     lock: lock.clone(),
                 }),
                 None => Ok(()),
+            },
+        )
+    }
+
+    /// Detaches the volume under `prefix` and attaches it again, as a volume
+    /// moved to another mount on the same host: every path below it reads
+    /// another device, the boot stays, and the page cache keeps what it
+    /// held. The node must already be stopped.
+    pub fn reattach(prefix: &Path) -> io::Result<()> {
+        io_with_disk(
+            |state| match state.locks.iter().find(|lock| lock.starts_with(prefix)) {
+                Some(lock) => Err(SimDiskError::NodeRunning {
+                    prefix: prefix.to_owned(),
+                    lock: lock.clone(),
+                }),
+                None => {
+                    state.attachments.push(prefix.to_owned());
+                    Ok(())
+                }
             },
         )
     }
@@ -731,6 +766,10 @@ impl JournalDisk for SimDisk {
 
     fn boot_id(path: &Path) -> Option<String> {
         with_disk(|state| state.boot_id(path)).ok()
+    }
+
+    fn device(path: &Path) -> io::Result<u64> {
+        with_disk(|state| state.device(path)).map_err(SimDiskError::into_io)
     }
 }
 

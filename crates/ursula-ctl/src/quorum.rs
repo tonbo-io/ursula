@@ -12,8 +12,8 @@ use anyhow::bail;
 use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
-use ursula_proto::admin::ProcessIncarnation;
 use ursula_proto::admin::QuorumPrefix;
+use ursula_proto::placement::ProcessIncarnation;
 
 use crate::MetricsClient;
 use crate::NodeInfo;
@@ -271,7 +271,7 @@ async fn verify_observed_quorum(
                     let process_incarnations = snapshot
                         .per_node
                         .iter()
-                        .map(|node| (node.node.id, node.process_incarnation.clone()))
+                        .map(|node| (node.node.id, node.process_incarnation))
                         .collect::<BTreeMap<_, _>>();
                     return Ok(QuorumVerification {
                         version: ursula_proto::admin::SchemaVersion,

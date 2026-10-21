@@ -67,6 +67,29 @@
 //!   `expected` and `actual` for `RecoveryGroupMismatch`), the field's
 //!   place unchanged: `Data` with the group id, or `Meta`, so a refusal of
 //!   the meta group never reads as one of data group 0;
+//! - the identity of a WAL root and of each process on it: `topology.bin`
+//!   records the node id and a root id the root draws, and a root opens only
+//!   under its node id; `identity.bin` counts the runs of the root and
+//!   records whether a run read a predecessor that may still run, which an
+//!   empty root, a remount, a host crash or a lost run state reads; the run
+//!   state records the device the root is mounted from, and a run that did
+//!   not end cleanly reads as `Remounted` on the same boot from another
+//!   device, replayed and gated as a host crash; a process incarnation is
+//!   the root id, the run and a nonce in 32 hex digits, and a root id is 16
+//!   lowercase hex digits in every encoding, never a number;
+//! - root slots in the placement kernel: every node record and every
+//!   registration before Bootstrap binds a root (`RootSlot`), `RegisterNode`
+//!   names the root and whether it was `empty` at open (no journal record,
+//!   vote or snapshot record, data or meta), `ReleaseRoot` releases a bound
+//!   root by compare-and-set, a slot changes only as its table says, a root
+//!   registered as holding state never takes a released slot, a released
+//!   root never binds again, and `OtherRoot` is retried while `StaleRoot`
+//!   confirms a view;
+//! - the Raft metadata of the process fence: `ursula-incarnation`,
+//!   `ursula-target-incarnation` and `ursula-fence` with its six refusals,
+//!   which a sender reads only after the mismatch text, a cluster refusal
+//!   and a misdelivery, and a misdelivery only from a refusal that names
+//!   another node than the request's target;
 //! - two variant casings, each frozen with the epoch. The Raft-layer
 //!   envelopes (`StreamCommand`, `RaftCommand`, `MetaCommand`,
 //!   `MetaResponse` and `GenesisAnswer`) keep serde's default `PascalCase`

@@ -22,7 +22,15 @@
 //! metadata), so a sender reads this refusal only through
 //! [`refusing_node`], and never records it as a format-epoch mismatch. The
 //! mismatch text decides first: a status that carries it is a version
-//! refusal, never a misdelivery, whatever metadata it carries.
+//! refusal, never a misdelivery, whatever metadata it carries. A refusal
+//! whose [`NODE_ID_METADATA`] names the request's own target is no
+//! misdelivery either: that node refused it for another reason.
+//!
+//! The module also names the metadata of the process fence
+//! ([`INCARNATION_METADATA`], [`TARGET_INCARNATION_METADATA`],
+//! [`FENCE_METADATA`]) and its closed set of refusals ([`FenceRefusal`]),
+//! which [`fence_refusal`] reads last, after the mismatch text, a refusal
+//! for another cluster and a misdelivery.
 
 use tonic::metadata::AsciiMetadataValue;
 use tonic::metadata::MetadataMap;
@@ -202,13 +210,12 @@ pub(crate) fn check_target_node(target_node: u64, local: u64) -> Result<(), Grpc
     Err(GrpcRpcError::misdelivered(local, target_node))
 }
 
-/// The node that refused an outbound request as meant for another node,
-/// read from the refusal's [`NODE_ID_METADATA`]: the address dialed now
-/// serves that node. `None` for every other status, a protocol-version
-/// refusal ([`crate::format_epoch::is_protocol_mismatch`]) among them even
-/// when it carries that metadata. The only reader of the misdelivery
-/// refusal.
-pub(crate) fn refusing_node(status: &tonic::Status) -> Option<u64> {
+/// The node a `FAILED_PRECONDITION` refusal names in its
+/// [`NODE_ID_METADATA`], unless it is a protocol-version refusal
+/// ([`crate::format_epoch::is_protocol_mismatch`]), whatever metadata that
+/// carries. [`refusing_node`] reads a peer's refusal through it, and a
+/// receiver encodes its own refused `AppendStream` item with it.
+pub(crate) fn stamped_node(status: &tonic::Status) -> Option<u64> {
     if status.code() != tonic::Code::FailedPrecondition
         || crate::format_epoch::is_protocol_mismatch(status)
     {
@@ -221,6 +228,101 @@ pub(crate) fn refusing_node(status: &tonic::Status) -> Option<u64> {
         .ok()?
         .parse()
         .ok()
+}
+
+/// The node that refused an outbound request for `target` as meant for
+/// another node, read from the refusal's [`NODE_ID_METADATA`]: the address
+/// dialed now serves that node. `None` for every other status: a
+/// protocol-version refusal ([`crate::format_epoch::is_protocol_mismatch`])
+/// even when it carries that metadata, and a refusal that names `target`
+/// itself, which the node meant refused for another reason. The only reader
+/// of the misdelivery refusal.
+pub(crate) fn refusing_node(status: &tonic::Status, target: u64) -> Option<u64> {
+    stamped_node(status).filter(|node| *node != target)
+}
+
+/// The metadata naming a process ([`ursula_proto::placement::ProcessIncarnation`],
+/// 32 hex digits): the sender's on a Raft request, the responder's on an
+/// answer or refusal.
+pub const INCARNATION_METADATA: &str = "ursula-incarnation";
+/// The metadata naming the process a Raft request is for, when the sender
+/// holds one for its target.
+pub const TARGET_INCARNATION_METADATA: &str = "ursula-target-incarnation";
+/// The metadata of a refusal by a receiver's process fence, and of an
+/// `AppendStream` it ends, in its trailers: which fence refused
+/// ([`FenceRefusal`]).
+pub const FENCE_METADATA: &str = "ursula-fence";
+
+/// Why a receiver's process fence refused a Raft RPC: a closed set, frozen
+/// with format epoch 6. A refusal is `FAILED_PRECONDITION` without the
+/// protocol-mismatch text, so it is never a format-epoch mismatch, and only
+/// [`fence_refusal`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FenceRefusal {
+    /// The receiving process is fenced.
+    Fenced,
+    /// The request names another process of the receiver than the one
+    /// running: an older run, another root or another root's run.
+    StaleTarget,
+    /// The sender is older than the newest run of its root the receiver
+    /// knows.
+    StaleSender,
+    /// The sender runs on a root the receiver's placement view does not
+    /// bind to its node id.
+    UnboundRoot,
+    /// Two processes of one run of a root.
+    Duplicate,
+    /// The request carries no sender incarnation.
+    Unidentified,
+}
+
+impl FenceRefusal {
+    /// Every refusal, in declaration order.
+    pub const ALL: [Self; 6] = [
+        Self::Fenced,
+        Self::StaleTarget,
+        Self::StaleSender,
+        Self::UnboundRoot,
+        Self::Duplicate,
+        Self::Unidentified,
+    ];
+
+    /// The refusal's [`FENCE_METADATA`] value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fenced => "fenced",
+            Self::StaleTarget => "stale_target",
+            Self::StaleSender => "stale_sender",
+            Self::UnboundRoot => "unbound_root",
+            Self::Duplicate => "duplicate",
+            Self::Unidentified => "unidentified",
+        }
+    }
+
+    /// The refusal a [`FENCE_METADATA`] value names, `None` for any other.
+    pub fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|refusal| refusal.as_str() == value)
+    }
+}
+
+/// The fence refusal of an outbound request for `target`, read from the
+/// refusal's [`FENCE_METADATA`]. It is read last: a protocol-version
+/// refusal, a refusal for another cluster
+/// ([`crate::peer_cluster::refusing_cluster`]) and a misdelivery
+/// ([`refusing_node`]) each decide first, so a status that is one of them is
+/// never a fence refusal, whatever it carries. `None` for every other
+/// status and for an unknown value.
+pub fn fence_refusal(status: &tonic::Status, target: u64) -> Option<FenceRefusal> {
+    if status.code() != tonic::Code::FailedPrecondition
+        || crate::format_epoch::is_protocol_mismatch(status)
+        || crate::peer_cluster::refusing_cluster(status).is_some()
+        || refusing_node(status, target).is_some()
+    {
+        return None;
+    }
+    FenceRefusal::parse(status.metadata().get(FENCE_METADATA)?.to_str().ok()?)
 }
 
 macro_rules! targeted_by_node_id {
@@ -294,11 +396,16 @@ targeted_by_target_node!(
 
 #[cfg(test)]
 mod tests {
+    use tonic::metadata::AsciiMetadataValue;
     use ursula_shard::RaftGroupId;
 
+    use super::FENCE_METADATA;
+    use super::FenceRefusal;
+    use super::NODE_ID_METADATA;
     use super::RaftTarget;
     use super::TargetedRequest;
     use super::WireTarget;
+    use super::fence_refusal;
     use super::refusing_node;
     use crate::raft_internal_proto as pb;
 
@@ -490,21 +597,106 @@ mod tests {
                 RaftTarget::parse(&request, 2).expect_err("node 2 is not node 8"),
             );
             assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-            assert_eq!(refusing_node(&status), Some(2));
+            assert_eq!(refusing_node(&status, 8), Some(2));
             assert!(!crate::format_epoch::is_protocol_mismatch(&status));
             assert!(crate::peer_cluster::refusing_cluster(&status).is_none());
             assert!(matches!(
-                crate::format_epoch::classify_probe_answer(Err(status)),
+                crate::format_epoch::classify_probe_answer(8, Err(status)),
                 crate::PeerFormatEpoch::Unreachable(_)
             ));
         }
         // Other refusals name no node.
         assert_eq!(
-            refusing_node(&tonic::Status::failed_precondition(
-                "raft grpc protocol mismatch: local=6, remote=5"
-            )),
+            refusing_node(
+                &tonic::Status::failed_precondition(
+                    "raft grpc protocol mismatch: local=6, remote=5"
+                ),
+                8
+            ),
             None
         );
+    }
+
+    /// A fence refusal of node `stamp` with `fence` in its metadata.
+    fn fence_status(stamp: Option<u64>, fence: &str) -> tonic::Status {
+        let mut status =
+            tonic::Status::failed_precondition("the process fence refused the request");
+        if let Some(node) = stamp {
+            status.metadata_mut().insert(
+                NODE_ID_METADATA,
+                tonic::metadata::AsciiMetadataValue::from(node),
+            );
+        }
+        status
+            .metadata_mut()
+            .insert(FENCE_METADATA, AsciiMetadataValue::try_from(fence).unwrap());
+        status
+    }
+
+    /// Each fence refusal reads as itself and as nothing else: never a
+    /// format-epoch mismatch and, stamped with the target's own id, never a
+    /// misdelivery. A stamp naming another node is a misdelivery and no
+    /// fence refusal, and the mismatch text and a cluster refusal decide
+    /// before either.
+    #[test]
+    fn fence_refusal_reads_after_the_mismatch_the_cluster_and_the_misdelivery() {
+        const TARGET: u64 = 8;
+        for refusal in FenceRefusal::ALL {
+            assert_eq!(FenceRefusal::parse(refusal.as_str()), Some(refusal));
+            for stamp in [None, Some(TARGET)] {
+                let status = fence_status(stamp, refusal.as_str());
+                assert_eq!(fence_refusal(&status, TARGET), Some(refusal), "{status:?}");
+                assert_eq!(refusing_node(&status, TARGET), None, "{status:?}");
+                assert!(!crate::format_epoch::is_protocol_mismatch(&status));
+                assert!(crate::peer_cluster::refusing_cluster(&status).is_none());
+                assert!(matches!(
+                    crate::format_epoch::classify_probe_answer(TARGET, Err(status)),
+                    crate::PeerFormatEpoch::Unreachable(_)
+                ));
+            }
+            // Another node's stamp is a misdelivery, never a fence refusal.
+            let status = fence_status(Some(2), refusal.as_str());
+            assert_eq!(refusing_node(&status, TARGET), Some(2));
+            assert_eq!(fence_refusal(&status, TARGET), None);
+            // A refusal for another cluster decides first.
+            let mut status = fence_status(Some(TARGET), refusal.as_str());
+            status.metadata_mut().insert(
+                crate::peer_cluster::CLUSTER_ID_METADATA,
+                AsciiMetadataValue::from_static("other-cluster"),
+            );
+            assert!(crate::peer_cluster::refusing_cluster(&status).is_some());
+            assert_eq!(fence_refusal(&status, TARGET), None);
+            // The mismatch text decides before everything.
+            let mut status = tonic::Status::failed_precondition(
+                "raft grpc protocol mismatch: local=7, remote=6",
+            );
+            status.metadata_mut().insert(
+                FENCE_METADATA,
+                AsciiMetadataValue::try_from(refusal.as_str()).unwrap(),
+            );
+            assert!(crate::format_epoch::is_protocol_mismatch(&status));
+            assert_eq!(fence_refusal(&status, TARGET), None);
+            // Another code is no fence refusal.
+            let mut status = tonic::Status::unavailable("down");
+            status.metadata_mut().insert(
+                FENCE_METADATA,
+                AsciiMetadataValue::try_from(refusal.as_str()).unwrap(),
+            );
+            assert_eq!(fence_refusal(&status, TARGET), None);
+        }
+        // The set is closed: another value reads as no fence refusal.
+        assert_eq!(
+            fence_refusal(&fence_status(Some(TARGET), "superseded"), TARGET),
+            None
+        );
+        assert_eq!(FenceRefusal::ALL.map(FenceRefusal::as_str), [
+            "fenced",
+            "stale_target",
+            "stale_sender",
+            "unbound_root",
+            "duplicate",
+            "unidentified"
+        ]);
     }
 
     #[test]

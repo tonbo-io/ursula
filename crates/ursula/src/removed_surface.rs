@@ -359,7 +359,7 @@ mod tests {
             ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"),
             registry.clone(),
         );
-        let incarnation = state.process_incarnation.as_str().to_owned();
+        let incarnation = state.process_incarnation.to_string();
         let admin = crate::admin_router(state);
         let path = "/__ursula/leadership-shed/maintenance";
         let incarnation_header = (

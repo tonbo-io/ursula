@@ -503,8 +503,8 @@ mod tests {
     async fn mock_metrics(State(state): State<MockNode>) -> Json<ursula_proto::admin::NodeMetrics> {
         let mut metrics = crate::metrics::test_metrics(
             state.node_id,
-            Some(ursula_proto::admin::ProcessIncarnation::from_bits(
-                u128::from(state.node_id),
+            Some(crate::metrics::test_incarnation(
+                u32::try_from(state.node_id).unwrap(),
             )),
         );
         metrics.groups.push(ursula_proto::admin::RaftGroupMetrics {

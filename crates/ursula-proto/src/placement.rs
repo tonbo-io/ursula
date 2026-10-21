@@ -8,6 +8,7 @@
 //! - **Format**: persisted in the meta log and its snapshots, replicated, or
 //!   sent between nodes. [`NodeId`], [`RaftLogId`], [`MetaLogId`],
 //!   [`MembershipLogId`], [`PlacementEpoch`], [`NodeLifecycle`],
+//!   [`RootId`] (also in the WAL's `topology.bin`), [`RootSlot`],
 //!   [`NodeRecord`], [`VoterSet`], [`NodeSet`], [`GroupCount`],
 //!   [`ReplicationFactor`], [`GenesisClaim`] (the genesis probe) and
 //!   [`Registered`] (in the kernel's answers). Every encode and decode goes
@@ -21,8 +22,11 @@
 //!   in the meta log or between nodes. [`ReplicaRole`], [`TeardownStage`],
 //!   [`WaitReason`], [`StepKind`], [`StepFailureKind`], [`StepFailure`],
 //!   [`ReconcileState`], [`ReconcileStatus`] and [`WriteEffect`].
-//! - **Never encoded**: [`ViewStage`] and [`MembershipAnswer`], which stay
-//!   inside one process and derive no serde.
+//! - **Header and admin JSON**: [`ProcessIncarnation`], one fixed grammar
+//!   of 32 hex digits, carried as a header or gRPC metadata value and in
+//!   admin JSON, in no MessagePack type.
+//! - **Never encoded**: [`ViewStage`], [`MembershipAnswer`] and
+//!   [`Relation`], which stay inside one process and derive no serde.
 //!
 //! In both encoded classes a variant is written by its `snake_case` name, so
 //! variant names are format too: renaming one is a format change, or an
@@ -35,8 +39,8 @@
 //! MessagePack closure. Each casing is frozen with format epoch 6, and
 //! neither is converted to the other. No type here uses `default`,
 //! `skip_serializing_if`, `flatten` or an untagged enum. Newtypes are
-//! transparent, and a set that is never empty decodes through a validating
-//! `try_from`.
+//! transparent but for [`RootId`], which writes its hex string, and a set
+//! that is never empty decodes through a validating `try_from`.
 //!
 //! **Admin JSON enums tolerate unknown variants.** The planners and the
 //! reconciler decide only what is proposed, so a patch of the minor may add
@@ -65,6 +69,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 use std::num::NonZeroU8;
 use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -237,11 +242,224 @@ impl fmt::Display for NodeLifecycle {
     }
 }
 
-/// A registered node's lifecycle and when it entered it (display only).
+/// The id of a node's Raft WAL root, drawn nonzero when the root's
+/// `topology.bin` is created and kept for the root's life. A new disk is a
+/// new root.
+///
+/// Encoded as 16 lowercase hex digits in every encoding, admin JSON and
+/// MessagePack alike, never as a number: a random id above 2^53 does not
+/// survive a JSON reader that parses numbers as doubles. [`FromStr`] parses
+/// the same grammar, so an operator pastes what a status printed.
+///
+/// [`FromStr`]: std::str::FromStr
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct RootId(NonZeroU64);
+
+impl RootId {
+    pub const fn new(id: NonZeroU64) -> Self {
+        Self(id)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
+/// A root id that is not 16 lowercase hex digits naming a nonzero id.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a root id is 16 lowercase hexadecimal digits and not zero, not '{found}'")]
+pub struct InvalidRootId {
+    pub found: String,
+}
+
+impl fmt::Display for RootId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
+impl std::str::FromStr for RootId {
+    type Err = InvalidRootId;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidRootId {
+            found: value.to_owned(),
+        };
+        if !lower_hex(value, 16) {
+            return Err(invalid());
+        }
+        u64::from_str_radix(value, 16)
+            .ok()
+            .and_then(NonZeroU64::new)
+            .map(Self)
+            .ok_or_else(invalid)
+    }
+}
+
+impl TryFrom<String> for RootId {
+    type Error = InvalidRootId;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<RootId> for String {
+    fn from(id: RootId) -> Self {
+        id.to_string()
+    }
+}
+
+/// Whether `value` is exactly `digits` lowercase hex digits.
+fn lower_hex(value: &str, digits: usize) -> bool {
+    value.len() == digits
+        && value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// One process of one node id: the WAL root it runs on, the run of that
+/// root it is (`run` counts the runs that opened the root, 0 for a node
+/// without a WAL), and a `nonce` drawn at start that tells apart two
+/// processes of one run counter.
+///
+/// Encoded as 32 lowercase hex digits, the root's 16 as [`RootId`] writes
+/// them, then `run` and `nonce` with 8 each: the value of the
+/// `x-ursula-process-incarnation` header ([`crate::admin`]) and of admin
+/// JSON. No MessagePack type carries one. Two incarnations are compared only
+/// by [`ProcessIncarnation::relation`], never by a derived order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ProcessIncarnation {
+    pub root: RootId,
+    pub run: u32,
+    pub nonce: u32,
+}
+
+/// How one process incarnation stands to another
+/// ([`ProcessIncarnation::relation`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Relation {
+    /// The same process.
+    Same,
+    /// An earlier run of the same root.
+    Older,
+    /// A later run of the same root.
+    Newer,
+    /// Another process of the same run of the same root: two processes
+    /// that read one run counter.
+    Duplicate,
+    /// A process of another root, which only the placement view orders.
+    OtherRoot,
+}
+
+impl ProcessIncarnation {
+    /// How `other` stands to `self`: [`Relation::Newer`] when `other` is a
+    /// later run of `self`'s root. Another root is [`Relation::OtherRoot`],
+    /// and on one root the run decides, an equal run with another nonce
+    /// being [`Relation::Duplicate`].
+    pub fn relation(&self, other: &Self) -> Relation {
+        if self.root != other.root {
+            return Relation::OtherRoot;
+        }
+        match other.run.cmp(&self.run) {
+            Ordering::Less => Relation::Older,
+            Ordering::Greater => Relation::Newer,
+            Ordering::Equal if other.nonce == self.nonce => Relation::Same,
+            Ordering::Equal => Relation::Duplicate,
+        }
+    }
+}
+
+/// A process incarnation that is not 32 lowercase hex digits whose first 16
+/// name a nonzero root.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a process incarnation is 32 lowercase hexadecimal digits, the first 16 a nonzero root id, \
+     not '{found}'"
+)]
+pub struct InvalidProcessIncarnation {
+    pub found: String,
+}
+
+impl fmt::Display for ProcessIncarnation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}{:08x}{:08x}", self.root, self.run, self.nonce)
+    }
+}
+
+impl std::str::FromStr for ProcessIncarnation {
+    type Err = InvalidProcessIncarnation;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidProcessIncarnation {
+            found: value.to_owned(),
+        };
+        if !lower_hex(value, 32) {
+            return Err(invalid());
+        }
+        let (root, rest) = value.split_at_checked(16).ok_or_else(invalid)?;
+        let (run, nonce) = rest.split_at_checked(8).ok_or_else(invalid)?;
+        Ok(Self {
+            root: root.parse().map_err(|_zero| invalid())?,
+            run: u32::from_str_radix(run, 16).map_err(|_digits| invalid())?,
+            nonce: u32::from_str_radix(nonce, 16).map_err(|_digits| invalid())?,
+        })
+    }
+}
+
+impl TryFrom<String> for ProcessIncarnation {
+    type Error = InvalidProcessIncarnation;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        value.parse()
+    }
+}
+
+impl From<ProcessIncarnation> for String {
+    fn from(incarnation: ProcessIncarnation) -> Self {
+        incarnation.to_string()
+    }
+}
+
+/// The root a node id is bound to in the meta group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RootSlot {
+    /// The node id runs on this root.
+    Bound(RootId),
+    /// An operator released this root (`replace-disk`): it never binds
+    /// again, and an empty root of the node id takes the slot.
+    Released(RootId),
+}
+
+impl RootSlot {
+    /// The root the slot names, bound or released.
+    pub fn root(self) -> RootId {
+        match self {
+            Self::Bound(root) | Self::Released(root) => root,
+        }
+    }
+}
+
+impl fmt::Display for RootSlot {
+    /// `bound <root>` or `released <root>`, the root as [`RootId`] writes it.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bound(root) => write!(f, "bound {root}"),
+            Self::Released(root) => write!(f, "released {root}"),
+        }
+    }
+}
+
+/// A registered node's lifecycle, when it entered it (display only), and
+/// the root its id is bound to. A slot change leaves `since_ms`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct NodeRecord {
     pub lifecycle: NodeLifecycle,
     pub since_ms: u64,
+    pub root: RootSlot,
 }
 
 /// A node set with no id: [`VoterSet`] and [`NodeSet`] hold at least one.
@@ -635,16 +853,23 @@ mod tests {
     use super::EmptyNodeSet;
     use super::GenesisClaim;
     use super::GroupCount;
+    use super::InvalidProcessIncarnation;
+    use super::InvalidRootId;
     use super::LearnerLag;
     use super::MetaLogId;
     use super::NodeId;
     use super::NodeLifecycle;
+    use super::NodeRecord;
     use super::NodeSet;
     use super::PlacementEpoch;
+    use super::ProcessIncarnation;
     use super::RaftLogId;
     use super::ReconcileState;
     use super::ReconcileStatus;
+    use super::Relation;
     use super::ReplicationFactor;
+    use super::RootId;
+    use super::RootSlot;
     use super::StepFailure;
     use super::StepFailureKind;
     use super::StepKind;
@@ -826,6 +1051,100 @@ mod tests {
             target_since: None,
             view_applied: None,
         });
+    }
+
+    /// A root above 2^53, which a JSON number would round.
+    const ROOT: u64 = 0x9e37_79b9_7f4a_7c15;
+
+    fn root(id: u64) -> RootId {
+        RootId::new(std::num::NonZeroU64::new(id).unwrap())
+    }
+
+    #[test]
+    fn a_root_id_is_16_lowercase_hex_digits_in_every_encoding() {
+        let id = root(ROOT);
+        assert_eq!(id.to_string(), "9e3779b97f4a7c15");
+        assert_eq!("9e3779b97f4a7c15".parse::<RootId>(), Ok(id));
+        assert_eq!("0000000000000001".parse::<RootId>(), Ok(root(1)));
+        for invalid in [
+            "",
+            "0000000000000000",
+            "9E3779B97F4A7C15",
+            "9e3779b97f4a7c1",
+            "9e3779b97f4a7c150",
+            "+e3779b97f4a7c15",
+            "9e3779b97f4a7c1g",
+            "11400714819323198485",
+        ] {
+            assert!(
+                matches!(invalid.parse::<RootId>(), Err(InvalidRootId { found }) if found == invalid),
+                "{invalid:?} parsed"
+            );
+        }
+        // Admin JSON writes the string, never a number, and decodes it back
+        // exactly, also above 2^53.
+        json_round_trip(&id, r#""9e3779b97f4a7c15""#);
+        serde_json::from_str::<RootId>(&ROOT.to_string())
+            .expect_err("a JSON number is not a root id");
+        json_round_trip(
+            &NodeRecord {
+                lifecycle: NodeLifecycle::Active,
+                since_ms: 7,
+                root: RootSlot::Released(id),
+            },
+            r#"{"lifecycle":"active","since_ms":7,"root":{"released":"9e3779b97f4a7c15"}}"#,
+        );
+        json_round_trip(&RootSlot::Bound(id), r#"{"bound":"9e3779b97f4a7c15"}"#);
+    }
+
+    #[test]
+    fn a_process_incarnation_writes_its_root_run_and_nonce() {
+        let incarnation = ProcessIncarnation {
+            root: root(ROOT),
+            run: 0x0102_0304,
+            nonce: 0xa0b0_c0d0,
+        };
+        let text = "9e3779b97f4a7c1501020304a0b0c0d0";
+        assert_eq!(incarnation.to_string(), text);
+        assert_eq!(text.parse::<ProcessIncarnation>(), Ok(incarnation));
+        json_round_trip(&incarnation, &format!("\"{text}\""));
+        for invalid in [
+            "",
+            "abcd",
+            "0000000000000000000000000000abcd",
+            "9E3779B97F4A7C1501020304A0B0C0D0",
+            "\"9e3779b97f4a7c1501020304a0b0c0d",
+            "g e3779b97f4a7c1501020304a0b0c0d",
+            "9e3779b97f4a7c1501020304a0b0c0d0a",
+        ] {
+            assert!(
+                matches!(invalid.parse::<ProcessIncarnation>(), Err(InvalidProcessIncarnation { found }) if found == invalid),
+                "{invalid:?} parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn relation_compares_the_root_then_the_run_then_the_nonce() {
+        let at = |id, run, nonce| ProcessIncarnation {
+            root: root(id),
+            run,
+            nonce,
+        };
+        let this = at(ROOT, 5, 9);
+        assert_eq!(this.relation(&this), Relation::Same);
+        assert_eq!(this.relation(&at(ROOT, 4, 9)), Relation::Older);
+        assert_eq!(this.relation(&at(ROOT, 6, 9)), Relation::Newer);
+        assert_eq!(this.relation(&at(ROOT, 5, 8)), Relation::Duplicate);
+        // A nonce never orders: an older run with a greater nonce is older.
+        assert_eq!(this.relation(&at(ROOT, 4, u32::MAX)), Relation::Older);
+        assert_eq!(this.relation(&at(ROOT, 6, 0)), Relation::Newer);
+        // Another root is never older or newer, whatever its run.
+        for run in [0, 5, 6, u32::MAX] {
+            assert_eq!(this.relation(&at(1, run, 9)), Relation::OtherRoot);
+        }
+        assert_eq!(at(ROOT, 4, 9).relation(&this), Relation::Newer);
+        assert_eq!(at(ROOT, 6, 9).relation(&this), Relation::Older);
     }
 
     #[test]

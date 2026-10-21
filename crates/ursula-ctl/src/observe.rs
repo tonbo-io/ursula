@@ -297,10 +297,8 @@ mod tests {
         for mode in [0, 2, 3, 4, 5, 6, 7, 8] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
-            let mut metrics = crate::metrics::test_metrics(
-                1,
-                Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
-            );
+            let mut metrics =
+                crate::metrics::test_metrics(1, Some(crate::metrics::test_incarnation(1)));
             let mut replica = group(0, Some(1));
             replica.node_id = 1;
             metrics.groups.push(replica);
@@ -439,7 +437,6 @@ mod tests {
         use std::sync::atomic::AtomicU64;
         use std::sync::atomic::Ordering;
 
-        use ursula_proto::admin::ProcessIncarnation;
         use ursula_proto::admin::RaftMaintenanceIssue;
 
         let polls = Arc::new(AtomicU64::new(0));
@@ -453,7 +450,7 @@ mod tests {
                     let incarnation = if poll == 0 { 1 } else { 2 };
                     let mut metrics = crate::metrics::test_metrics(
                         1,
-                        Some(ProcessIncarnation::from_bits(incarnation)),
+                        Some(crate::metrics::test_incarnation(incarnation)),
                     );
                     let mut replica = group(0, Some(1));
                     replica.node_id = 1;
@@ -512,7 +509,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             snapshot.per_node[0].process_incarnation,
-            ProcessIncarnation::from_bits(2)
+            crate::metrics::test_incarnation(2)
         );
 
         task.abort();

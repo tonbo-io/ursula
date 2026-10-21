@@ -36,6 +36,7 @@ pub mod diagnostics {
     pub use crate::log_store::LockAttempt;
     pub use crate::log_store::LogGeneration;
     pub use crate::log_store::MarkRecoveringError;
+    pub use crate::log_store::Predecessor;
     pub use crate::log_store::PreviousRun;
     pub use crate::log_store::RUN_STATE_FILE;
     pub use crate::log_store::RecordTooLarge;

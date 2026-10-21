@@ -189,9 +189,13 @@ impl RollingRestartValidator {
                     cluster_id: ursula_headers::ClusterId::new("sim").expect("a valid cluster id"),
                     process_node_id: Some(node_id),
                     // This harness models Raft state directly, not an HTTP process.
-                    process_incarnation: ursula_proto::admin::ProcessIncarnation::from_bits(
-                        u128::from(node_id),
-                    ),
+                    process_incarnation: ursula_proto::placement::ProcessIncarnation {
+                        root: ursula_proto::placement::RootId::new(
+                            std::num::NonZeroU64::new(node_id).expect("a node id is not zero"),
+                        ),
+                        run: 1,
+                        nonce: 0,
+                    },
                     groups: vec![{
                         let fixture_term = metrics.current_term;
                         let fixture_committed = metrics.local_committed.map(|log_id| log_id.index);

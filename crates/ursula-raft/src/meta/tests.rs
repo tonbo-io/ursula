@@ -107,10 +107,7 @@ fn new_history(id: u64, previous: u64, cause: HistoryCause) -> MetaCommand {
 }
 
 pub(super) fn register(node: u64) -> ControlCommand {
-    ControlCommand::RegisterNode {
-        node: NodeId::new(node),
-        now_ms: 10_u64.saturating_add(node),
-    }
+    ursula_control::samples::register(node, 10_u64.saturating_add(node))
 }
 
 /// A meta state machine over the meta journal's store in `wal`, and the

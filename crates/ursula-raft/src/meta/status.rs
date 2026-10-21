@@ -225,7 +225,10 @@ mod tests {
         };
         let (me, other) = (samples::node(2), samples::node(4));
         let forming = applied(ControlPlaneState::Forming {
-            registered: BTreeMap::from([(samples::node(3), Registration { since_ms: 5 })]),
+            registered: BTreeMap::from([(samples::node(3), Registration {
+                since_ms: 5,
+                root: ursula_proto::placement::RootSlot::Bound(samples::root(3)),
+            })]),
         });
         assert_eq!(
             cluster_view(&forming, &claim(), me, &genesis, true),
