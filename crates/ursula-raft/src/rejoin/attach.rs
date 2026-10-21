@@ -247,9 +247,10 @@ impl RecoveryGate {
     /// replica of any state machine: the barrier driver, which asks the
     /// candidates of `nodes` for a leader's barrier, the genesis vote floor
     /// task, which records the floor once every other candidate answers
-    /// `probe` empty and `seed` confirms a role, and, while `seed` shows the
-    /// replica as its group's initializer, the bootstrap driver, which
-    /// initializes the voters of `nodes` once every other candidate does.
+    /// `probe` empty and `seed` confirms a role, and, when `seed` shows the
+    /// replica as its group's initializer or may come to
+    /// ([`SeedRole::may_change`]), the bootstrap driver, which initializes
+    /// the voters of `nodes` once every other candidate does.
     /// Each reads `nodes` at each use.
     ///
     /// Each driver starts once the fence no longer holds the replica out
@@ -342,7 +343,9 @@ impl RecoveryGate {
                 }
             }));
         }
-        if seed.local_role() == Some(SeedRoleOf::Initializer) && !rejoin.holds_group_history() {
+        let may_initialize =
+            seed.may_change() || seed.local_role() == Some(SeedRoleOf::Initializer);
+        if may_initialize && !rejoin.holds_group_history() {
             self.push(crate::rt::spawn(async move {
                 crate::predecessor_wait::fence_released(&fence, target).await;
                 run_group_bootstrap(

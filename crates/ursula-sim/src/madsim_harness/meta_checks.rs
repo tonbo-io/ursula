@@ -3,6 +3,8 @@
 //!
 //! - I6 ([`I6`]): with meta's quorum lost, every data group with a quorum
 //!   commits.
+//! - On a placed cluster, the hosting checks of [`HostingChecks`] (I2, I3
+//!   and the hosting check) at every observation.
 //! - I10 ([`I10`]): every acknowledged control write survives power loss on
 //!   every meta replica, and a power loss comes after at least one
 //!   acknowledged write.
@@ -39,6 +41,7 @@ use super::SimEvent;
 use super::SimTrace;
 use super::journal_cluster::JOURNAL_GROUPS;
 use super::meta_cluster::MetaCluster;
+use super::placed_hosting::HostingChecks;
 
 pub(super) const I6: &str = "meta_loss_leaves_data_writable";
 pub(super) const I10: &str = "acknowledged_meta_writes_survive_power_loss";
@@ -64,6 +67,8 @@ pub(super) fn fail(trace: &mut SimTrace, invariant: &str, after_event: &str, mes
 /// What the checks keep across a run.
 #[derive(Debug, Default)]
 pub(super) struct MetaChecks {
+    /// The hosting checks of a placed cluster, at every observation.
+    hosting: HostingChecks,
     /// Every genesis history id some node applied, with the node first seen
     /// holding it.
     geneses: BTreeMap<u64, u64>,
@@ -79,13 +84,15 @@ pub(super) struct MetaChecks {
 
 impl MetaChecks {
     /// I12, after every action and every step of a wait: the histories the
-    /// running meta replicas applied all began at one genesis.
+    /// running meta replicas applied all began at one genesis. On a placed
+    /// cluster, the hosting checks too ([`HostingChecks::observe`]).
     pub(super) fn observe(
         &mut self,
         cluster: &MetaCluster,
         trace: &mut SimTrace,
         after_event: &str,
     ) {
+        self.hosting.observe(cluster, trace, after_event);
         for node_id in cluster.running() {
             let Some(event) = cluster
                 .registry(node_id)
@@ -407,15 +414,18 @@ pub(super) fn history_of(cluster: &MetaCluster, node_id: u64) -> Option<u64> {
         .map(|event| event.id.get())
 }
 
-/// I6: while meta has no quorum, or has not formed, every data group takes
-/// appends.
+/// I6: while meta has no quorum, or has not formed, every data group whose
+/// voters keep a quorum takes appends.
 pub(super) async fn data_commits_without_meta(
     cluster: &mut MetaCluster,
     trace: &mut SimTrace,
     after_event: &str,
 ) {
     for group in JOURNAL_GROUPS {
-        if !cluster.data.try_append(group, 3).await {
+        if !cluster.has_quorum(group) {
+            continue;
+        }
+        if !cluster.try_append(group, 3).await {
             fail(
                 trace,
                 I6,

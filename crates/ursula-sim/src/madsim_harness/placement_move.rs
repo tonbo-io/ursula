@@ -1,35 +1,48 @@
-//! Scenario `placement-move` (design 15.2), S1's meta seeds: the meta group
-//! on five journal-backed nodes ([`MetaCluster`]), meta voters `{1,2,3}`,
-//! nodes 4 and 5 meta learners, beside two static data groups on every node.
-//! S3 widens the family to moves.
+//! Scenario `placement-move` (design 15.2), S2's hosting: the meta group on
+//! three or five journal-backed nodes ([`MetaCluster`]), meta voters
+//! `{1,2,3}`, the other nodes meta learners, and two data groups that meta
+//! seeds and every node hosts by placement: each node's hosting driver opens
+//! what its journals hold and creates what a confirmed placement gives it
+//! ([`super::placed_hosting`]). S3 widens the family to moves.
 //!
-//! A family run draws from the seed the data journals' policy (`always` or
-//! `never`) and the order of the meta fault subset. Each run:
+//! A family run draws from the seed the node count, the data journals'
+//! policy (`always` or `never`), whether one node first claims other
+//! genesis values, how a group's initializer restarts before its group
+//! formed, and the order of the meta faults. Each run:
 //!
-//! - forms meta, on some seeds while node 5 claims other genesis values
-//!   until it restarts with the fixed claim (D9, r1 H1): data forms and
-//!   takes appends meanwhile, and meta forms only once the claims agree
-//!   (I12);
-//! - registers every node, nodes 4 and 5 as meta learners (I11), waits for
-//!   the bootstrapped view, and writes control commands throughout (I10);
-//! - loses meta's quorum, two meta voters' processes killed, while the data
-//!   groups keep committing (I6);
+//! - forms meta, on some seeds while the last node claims other genesis
+//!   values until it restarts with the fixed claim (D9, r1 H1): meta forms
+//!   only once the claims agree (I12), and no node hosts a data replica
+//!   before meta bootstrapped (the hosting check);
+//! - on most seeds kills the initializer of a drawn group as soon as it
+//!   learned the bootstrap, and restarts it after a process crash, with its
+//!   run state lost (a regressed meta view) or with its meta journal
+//!   deleted: every seeded group still forms on its seed voters (I15);
+//! - registers every node, the others than `{1,2,3}` as meta learners
+//!   (I11), waits for the bootstrapped view, and writes control commands
+//!   and data appends throughout (I10);
+//! - loses meta's quorum, two meta voters' processes killed, while every
+//!   data group with a quorum keeps committing (I6), and restarts a node
+//!   that serves such a group while meta has no quorum: its hosting driver
+//!   opens what its journals hold and the node serves the group (I7);
 //! - cuts the power of every meta voter under `always`, or of one under
 //!   `never`, and finds every acknowledged control write on every meta
 //!   replica (I10);
 //! - discards the meta journal of one meta voter, which opens `Recovering`
 //!   over its data history (D9) and rejoins through the meta leader (I11),
-//!   then loses the run state of the meta leader and one more meta voter,
+//!   then the meta journals of the meta leader and one more meta voter,
 //!   whose meta gates open `Recovering` and stall, and recovers meta by a
 //!   plan through `ursulactl recover-group --target meta --accept-loss`'s
 //!   loop, planner and sender (the meta plan check), after which every node
-//!   learns the view again (I11).
+//!   learns the view again (I11);
+//! - reads every acknowledged append back from every seed voter (I1).
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
-//! run that decides again how its journals open. I12 is checked after each
-//! phase and at every poll of the I11, bootstrap, plan and watch waits. The
-//! three negative controls ([`Controls`]) each run a script of their own
-//! with one meta defence off.
+//! run that decides again how its journals open. I12, I2, I3 and the
+//! hosting check are checked after each phase and at every poll of the
+//! I11, bootstrap, plan and watch waits. The negative controls
+//! ([`Controls`]) each run a script of their own with one defence off: the
+//! three meta ones over static data groups, N3 over placed ones.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -50,10 +63,12 @@ use super::journal_cluster::JOURNAL_GROUPS;
 use super::meta_checks;
 use super::meta_checks::MetaChecks;
 use super::meta_checks::STEP;
+use super::meta_cluster::Hosting;
 use super::meta_cluster::MetaCluster;
 use super::meta_cluster::claim;
+use super::placed_hosting;
 
-/// The family's nodes and meta voters.
+/// The most nodes a run starts, and the meta voters.
 const NODES: u64 = 5;
 const META_VOTERS: [u64; 3] = [1, 2, 3];
 /// How long a script watches for a second genesis.
@@ -78,6 +93,9 @@ pub(super) enum Controls {
     /// Every node loses its power under data `never`, with the meta
     /// journal's own `always` on (`true`) or off.
     PowerLossUnderNever { defended: bool },
+    /// Placed groups form on five nodes, with the seed role read from the
+    /// placement view (N3) on (`true`) or off.
+    SeededFormation { defended: bool },
 }
 
 /// The run's defences, reset when the run ends.
@@ -97,6 +115,10 @@ impl Switched {
             Defence::MetaAlwaysSync,
             controls == Controls::PowerLossUnderNever { defended: false },
         );
+        set_off(
+            Defence::InitializeOnlySeeded,
+            controls == Controls::SeededFormation { defended: false },
+        );
         Self
     }
 }
@@ -106,7 +128,21 @@ impl Drop for Switched {
         set_off(Defence::GenesisEveryPeer, false);
         set_off(Defence::MetaOverDataHistory, false);
         set_off(Defence::MetaAlwaysSync, false);
+        set_off(Defence::InitializeOnlySeeded, false);
     }
+}
+
+/// How a family run restarts a group's initializer once it learned the
+/// bootstrap, before its group formed (I15).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InitializerRestart {
+    /// Its process crashes, and its meta replica replays what it held.
+    Crash,
+    /// It loses its run state: every journal opens `Recovering`, and its
+    /// meta view stays regressed until a meta leader's barrier.
+    RunStateLost,
+    /// Its meta journal, `raft-log/meta/`, is deleted.
+    MetaDeleted,
 }
 
 /// The meta faults of a family run, in the order the seed draws.
@@ -131,6 +167,7 @@ impl Run {
         nodes: u64,
         fsync: WalFsync,
         claims: BTreeMap<u64, ursula_proto::placement::GenesisClaim>,
+        hosting: Hosting,
     ) -> Self {
         let mut trace = SimTrace::default();
         trace.push(SimEvent::ClusterBuilt { seed });
@@ -139,6 +176,7 @@ impl Run {
             JournalTuning::new(fsync),
             nodes,
             claims,
+            hosting,
         )
         .await;
         let mut run = Self {
@@ -196,6 +234,55 @@ impl Run {
         self.checks.write_limits(&self.cluster, &via, count).await;
     }
 
+    /// Every placed group forms on its seed voters within the bound (I15).
+    async fn formed(&mut self, phase: &str) {
+        self.cluster.groups_form(&mut self.trace, phase).await;
+        self.step(phase);
+    }
+
+    /// Two appends to every data group, each taken within the bound.
+    async fn append_data(&mut self, phase: &str) {
+        for group in JOURNAL_GROUPS {
+            if !self.cluster.try_append(group, 2).await {
+                meta_checks::fail(
+                    &mut self.trace,
+                    placed_hosting::I1,
+                    phase,
+                    format!("data group {group} took no append within the bound"),
+                );
+            }
+        }
+        self.step(phase);
+    }
+
+    /// Kills the initializer of `group` as soon as its view shows the
+    /// bootstrap, so its hosting driver may have created the group but the
+    /// group has seldom formed, and restarts it `how`.
+    async fn initializer_restart(&mut self, group: u32, how: InitializerRestart) {
+        const PHASE: &str = "initializer_restart";
+        let initializer = placed_hosting::initializer(&self.cluster.claims[&1], group);
+        let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
+        while self.cluster.view(initializer).cluster().is_none() {
+            if madsim::time::Instant::now() >= deadline {
+                meta_checks::fail(
+                    &mut self.trace,
+                    meta_checks::I11,
+                    PHASE,
+                    format!("node {initializer} never learned the bootstrap"),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.checks.observe(&self.cluster, &mut self.trace, PHASE);
+        }
+        match how {
+            InitializerRestart::Crash => self.cluster.stop_node(initializer).await,
+            InitializerRestart::RunStateLost => self.cluster.lose_run_state(initializer).await,
+            InitializerRestart::MetaDeleted => self.cluster.discard_meta(initializer).await,
+        }
+        self.cluster.start_node(initializer).await;
+        self.step("initializer_restarted");
+    }
+
     /// Two distinct meta voters, drawn.
     fn two_voters(&mut self) -> [u64; 2] {
         let spared = usize::try_from(self.rng.next_bounded(3)).unwrap_or(0);
@@ -210,9 +297,9 @@ impl Run {
         ]
     }
 
-    /// The meta leader and one more meta voter, drawn. A meta voter that
-    /// outlives the run state's loss while it leads would keep its gated
-    /// followers replicating, and no plan would be needed.
+    /// The meta leader and one more meta voter, drawn. A meta leader that
+    /// kept its meta journal would keep its gated followers replicating,
+    /// and no plan would be needed.
     fn leader_and_one_voter(&mut self) -> [u64; 2] {
         let leader = META_VOTERS.into_iter().find_map(|node_id| {
             let runtime = self.cluster.runtimes.get(&node_id)?;
@@ -235,9 +322,13 @@ impl Run {
         [leader, others.get(other).copied().unwrap_or(leader)]
     }
 
-    /// Node 5 claims another group count while data forms, then restarts
-    /// with the fixed claim (D9, r1 H1).
+    /// The last node claims another group count, then restarts with the
+    /// fixed claim (D9, r1 H1). Meanwhile no genesis forms meta, and no node
+    /// hosts a data replica, which only a bootstrapped placement creates
+    /// (the hosting check, at every step of the watch).
     async fn claim_mismatch(&mut self) {
+        let last = self.nodes().last().copied().unwrap_or(NODES);
+        let peers = u64::try_from(self.nodes().len()).unwrap_or(NODES);
         self.watch("claim_mismatch", Duration::from_secs(3)).await;
         self.checks.no_genesis(&mut self.trace, "claim_mismatch");
         let mismatch = self.cluster.runtimes[&1]
@@ -246,30 +337,23 @@ impl Run {
             .borrow()
             .mismatch
             .clone();
-        if !mismatch.contains_key(&NodeId::new(NODES)) {
+        if !mismatch.contains_key(&NodeId::new(last)) {
             meta_checks::fail(
                 &mut self.trace,
                 meta_checks::I12,
                 "claim_mismatch",
-                format!("the genesis node names no mismatch of node {NODES}: {mismatch:?}"),
+                format!("the genesis node names no mismatch of node {last}: {mismatch:?}"),
             );
         }
-        // Data forms and serves meanwhile.
-        meta_checks::data_commits_without_meta(
-            &mut self.cluster,
-            &mut self.trace,
-            "claim_mismatch",
-        )
-        .await;
-        self.cluster.stop_node(NODES).await;
-        self.cluster
-            .claims
-            .insert(NODES, claim(NODES, &META_VOTERS));
-        self.cluster.start_node(NODES).await;
+        self.cluster.stop_node(last).await;
+        self.cluster.claims.insert(last, claim(peers, &META_VOTERS));
+        self.cluster.start_node(last).await;
         self.step("claim_fixed");
     }
 
-    /// Two meta voters killed: data keeps committing (I6).
+    /// Two meta voters killed: every data group with a quorum keeps
+    /// committing (I6), and a node that serves such a group restarts and
+    /// serves it while meta has no quorum (I7).
     async fn quorum_loss(&mut self) {
         let victims = self.two_voters();
         for victim in victims {
@@ -282,12 +366,30 @@ impl Run {
             "meta_quorum_lost",
         )
         .await;
+        // The highest running node that is a seed voter of a group whose
+        // seed voters keep a quorum.
+        let restarted = self.cluster.running().into_iter().rev().find(|node_id| {
+            JOURNAL_GROUPS.iter().any(|group| {
+                self.cluster.seeds(*group).contains(node_id) && self.cluster.has_quorum(*group)
+            })
+        });
+        if let Some(restarted) = restarted {
+            self.cluster.stop_node(restarted).await;
+            self.cluster.start_node(restarted).await;
+            self.step("restarted_without_meta");
+            self.cluster
+                .serves_without_meta(&mut self.trace, "restarted_without_meta", restarted)
+                .await;
+            self.step("restarted_without_meta");
+        }
         for victim in victims {
             self.cluster.start_node(victim).await;
         }
         self.step("meta_quorum_back");
         self.learned("meta_quorum_back").await;
+        self.formed("meta_quorum_back").await;
         self.write(2).await;
+        self.append_data("meta_quorum_back").await;
     }
 
     /// Every meta voter loses power under `always`, one under `never`, and
@@ -303,7 +405,9 @@ impl Run {
             .acknowledged_writes_survive(&self.cluster, &mut self.trace, "power_loss", &nodes)
             .await;
         self.learned("power_loss").await;
+        self.formed("power_loss").await;
         self.write(2).await;
+        self.append_data("power_loss").await;
     }
 
     async fn power_loss_of(&mut self, victims: &[u64]) {
@@ -323,9 +427,12 @@ impl Run {
 
     /// One meta voter's meta journal discarded: it opens `Recovering` over
     /// its data history (D9) and rejoins through the meta leader (I11).
-    /// Then the meta leader and one more meta voter lose their run state, so
-    /// a majority of meta's gates open `Recovering`, where a replica neither
-    /// votes nor campaigns, and stall. A meta plan recovers meta.
+    /// Then the meta leader and one more meta voter lose their meta
+    /// journals, so a majority of meta's gates open `Recovering`, where a
+    /// replica neither votes nor campaigns, and stall. A meta plan recovers
+    /// meta. Their data journals stay: a lost run state would also gate the
+    /// data groups whose seed voters they are most of, which only a data
+    /// plan recovers.
     async fn plan(&mut self) {
         let [discarded, _] = self.two_voters();
         self.cluster.discard_meta(discarded).await;
@@ -340,12 +447,12 @@ impl Run {
         let before = meta_checks::history_of(&self.cluster, survivor)
             .expect("the surviving meta voter applied a history");
         for victim in victims {
-            self.cluster.lose_run_state(victim).await;
+            self.cluster.discard_meta(victim).await;
         }
         for victim in victims {
             self.cluster.start_node(victim).await;
         }
-        self.step("run_state_lost");
+        self.step("meta_journals_lost");
         let nodes = self.nodes();
         self.recover_meta(&nodes).await;
         self.step("meta_plan");
@@ -356,7 +463,9 @@ impl Run {
         // whether its drivers and shell then still act (D11), is not
         // checked here.
         self.learned("meta_plan_applied").await;
+        self.formed("meta_plan_applied").await;
         self.write(2).await;
+        self.append_data("meta_plan_applied").await;
     }
 
     /// `ursulactl recover-group --target meta --accept-loss` over `nodes`:
@@ -461,6 +570,7 @@ pub(super) async fn run_placement_move_inner(
         Controls::WipedMetaVoters { .. } => wiped_meta_voters(seed).await,
         Controls::MetaDiscardedOverData { .. } => meta_discarded_over_data(seed).await,
         Controls::PowerLossUnderNever { .. } => power_loss_under_never(seed).await,
+        Controls::SeededFormation { .. } => seeded_formation(seed).await,
     }
 }
 
@@ -477,20 +587,36 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
     } else {
         WalFsync::Never
     };
+    let nodes = if draws.next_bounded(3) == 0 { 3 } else { NODES };
     let mismatch = draws.next_bounded(3) == 0;
-    let mut claims = claims(NODES);
+    let restart = match draws.next_bounded(4) {
+        0 => None,
+        1 => Some(InitializerRestart::Crash),
+        2 => Some(InitializerRestart::RunStateLost),
+        _ => Some(InitializerRestart::MetaDeleted),
+    };
+    let restarted_group = JOURNAL_GROUPS
+        .get(usize::try_from(draws.next_bounded(2)).unwrap_or(0))
+        .copied()
+        .unwrap_or(0);
+    let mut claims = claims(nodes);
     if mismatch {
-        let mut other = claim(NODES, &META_VOTERS);
+        let mut other = claim(nodes, &META_VOTERS);
         other.group_count = GroupCount::new(std::num::NonZeroU32::new(3).expect("three groups"));
-        claims.insert(NODES, other);
+        claims.insert(nodes, other);
     }
-    let mut run = Run::start(seed, NODES, fsync, claims).await;
+    let mut run = Run::start(seed, nodes, fsync, claims, Hosting::Placed).await;
     if mismatch {
         run.claim_mismatch().await;
     }
+    if let Some(how) = restart {
+        run.initializer_restart(restarted_group, how).await;
+    }
+    run.formed("formed").await;
     run.learned("formed").await;
     run.bootstrapped("formed").await;
     run.write(4).await;
+    run.append_data("formed").await;
     let mut faults = vec![MetaFault::QuorumLoss, MetaFault::PowerLoss, MetaFault::Plan];
     // A seeded order of the three faults.
     for index in (1..faults.len()).rev() {
@@ -506,8 +632,29 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
         }
     }
     for group in JOURNAL_GROUPS {
-        run.cluster.data.verify_group_reads(group).await;
+        run.cluster
+            .placed_reads(&mut run.trace, "final_reads", group)
+            .await;
     }
+    run.step("final_reads");
+    run.finish()
+}
+
+/// `negative_control_initialize_only_seeded`: five nodes whose data groups
+/// form by placement. Only each group's seeded initializer initializes it.
+/// With the defence off every seed voter shows itself the initializer, and
+/// the voters that find the others empty each initialize the group (I2).
+async fn seeded_formation(seed: u64) -> ThreeNodeRaftSimOutcome {
+    let mut run = Run::start(
+        seed,
+        NODES,
+        WalFsync::Always,
+        claims(NODES),
+        Hosting::Placed,
+    )
+    .await;
+    run.formed("seeded_formation").await;
+    run.append_data("seeded_formation").await;
     run.finish()
 }
 
@@ -516,7 +663,14 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
 /// every peer, and the learners' answers hold the genesis back. With the
 /// defence off it asks the voters only and forms a second meta group (I12).
 async fn wiped_meta_voters(seed: u64) -> ThreeNodeRaftSimOutcome {
-    let mut run = Run::start(seed, NODES, WalFsync::Always, claims(NODES)).await;
+    let mut run = Run::start(
+        seed,
+        NODES,
+        WalFsync::Always,
+        claims(NODES),
+        Hosting::Static,
+    )
+    .await;
     run.learned("formed").await;
     for victim in META_VOTERS {
         run.cluster
@@ -536,7 +690,7 @@ async fn wiped_meta_voters(seed: u64) -> ThreeNodeRaftSimOutcome {
 /// `Recovering` and no genesis follows. With the defence off they open
 /// empty and form a second meta group (I12).
 async fn meta_discarded_over_data(seed: u64) -> ThreeNodeRaftSimOutcome {
-    let mut run = Run::start(seed, 3, WalFsync::Always, claims(3)).await;
+    let mut run = Run::start(seed, 3, WalFsync::Always, claims(3), Hosting::Static).await;
     run.learned("formed").await;
     for group in JOURNAL_GROUPS {
         run.cluster.data.append(group, 2).await;
@@ -558,7 +712,7 @@ async fn meta_discarded_over_data(seed: u64) -> ThreeNodeRaftSimOutcome {
 /// acknowledged write is on every meta replica (I10). With the defence off
 /// the meta journal runs `never` and loses them.
 async fn power_loss_under_never(seed: u64) -> ThreeNodeRaftSimOutcome {
-    let mut run = Run::start(seed, 3, WalFsync::Never, claims(3)).await;
+    let mut run = Run::start(seed, 3, WalFsync::Never, claims(3), Hosting::Static).await;
     run.learned("formed").await;
     run.bootstrapped("formed").await;
     for node_id in META_VOTERS {
@@ -584,6 +738,7 @@ mod tests {
     use crate::madsim_harness::ThreeNodeRaftSimConfig;
     use crate::madsim_harness::meta_checks::I10;
     use crate::madsim_harness::meta_checks::I12;
+    use crate::madsim_harness::placed_hosting::I2;
     use crate::madsim_harness::tests::sim_test_guard;
 
     const SCENARIO: SimScenario = SimScenario::PlacementMove;
@@ -680,6 +835,20 @@ mod tests {
             "meta_discarded",
         );
         assert!(message.contains("more than one meta genesis"), "{message}");
+    }
+
+    /// Seed voters that each show themselves the initializer of their
+    /// placed group initialize it more than once.
+    #[test]
+    fn negative_control_initialize_only_seeded() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::SeededFormation { defended: true },
+            Controls::SeededFormation { defended: false },
+            I2,
+            "seeded_formation",
+        );
+        assert!(message.contains("initialized more than once"), "{message}");
     }
 
     /// A meta journal under the data policy `never` loses acknowledged

@@ -582,6 +582,7 @@ mod leader_reads;
 mod membership_rollback;
 mod meta_checks;
 mod meta_cluster;
+mod placed_hosting;
 mod placement_move;
 mod recovery_wiring;
 mod routing;

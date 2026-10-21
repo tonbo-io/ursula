@@ -107,7 +107,8 @@ pub enum GroupBootstrap {
 /// of the group. It runs `Initialize` with the voters of `nodes` only once
 /// every other candidate of `nodes` answered that it is empty too, no leader
 /// was seen and `seed` confirmed the replica as the initializer, right
-/// before it opens the gate for the fresh group. It reads `nodes` at each
+/// before it opens the gate for the fresh group. It probes only while `seed`
+/// shows the replica as the initializer. It reads `nodes` at each
 /// use. `probe` asks one peer, by node id, with the bootstrap probe. Any
 /// state machine's replica runs it.
 pub async fn run_group_bootstrap<SM, P, F>(
@@ -145,6 +146,14 @@ where
         }
         if rejoin.holds_group_history() {
             return GroupBootstrap::AlreadyInitialized;
+        }
+        // A role that may change is read at each round: the driver probes
+        // only while the replica shows itself the initializer.
+        if seed.local_role() != Some(SeedRoleOf::Initializer) {
+            if !wait_recovery_change(&mut observed, &mut changes, interval).await {
+                return GroupBootstrap::Stopped;
+            }
+            continue;
         }
         let leader_seen = raft.metrics().borrow_watched().current_leader.is_some();
         if !leader_seen && let Some(at) = last_probe {
@@ -209,6 +218,7 @@ where
                     );
                     return GroupBootstrap::Stopped;
                 }
+                rejoin.note_initialized();
                 return GroupBootstrap::Initialized;
             }
             BootstrapDecision::Rejoin => {
