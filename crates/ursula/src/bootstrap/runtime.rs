@@ -3,7 +3,6 @@ use std::sync::Arc;
 use ursula_config::config::ColdBackend;
 use ursula_raft::ConfigSeeds;
 use ursula_raft::JournalTuning;
-use ursula_raft::PeerDirectory;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
@@ -348,17 +347,13 @@ fn spawn_runtime_core(
             raft_engine_config,
             registry.unwrap_or_default(),
         ),
-        Topology::StaticCluster {
-            node_id,
-            peers,
-            seeds,
-            ..
-        } => spawn_static_cluster(
+        // The node's peers reach the factory bound with its identity
+        // (`open_meta`), before the runtime starts.
+        Topology::StaticCluster { node_id, seeds, .. } => spawn_static_cluster(
             runtime_config,
             cold_store,
             storage,
             *node_id,
-            peers.clone(),
             seeds.clone(),
             snapshot_store,
             raft_engine_config,
@@ -416,7 +411,6 @@ fn spawn_static_cluster(
     cold_store: Option<ColdStoreHandle>,
     storage: GroupStorage,
     node_id: u64,
-    peers: PeerDirectory,
     seeds: ConfigSeeds,
     snapshot_store: Option<SharedSnapshotStore>,
     raft_engine_config: RaftEngineConfig,
@@ -428,12 +422,10 @@ fn spawn_static_cluster(
         });
     };
     let raft_wal = Some(log_stores.clone());
-    let factory = ursula_raft::StaticGrpcRaftGroupEngineFactory::new(
-        node_id,
-        peers,
-        seeds,
-        registry.clone(),
+    let factory = ursula_raft::PlacedRaftGroupEngineFactory::new(
         log_stores,
+        registry.clone(),
+        Arc::new(seeds.for_node(node_id)),
     )
     .with_cold_store(cold_store.clone())
     .with_snapshot_store(snapshot_store)

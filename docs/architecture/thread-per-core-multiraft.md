@@ -52,7 +52,7 @@ The factory is chosen once at startup:
 
 - `InMemoryGroupEngineFactory`: non-replicated groups over the pure `ursula-stream` state machine. Used by the zero-config development node and by tests.
 - `DurableRaftGroupEngineFactory`: single-node OpenRaft groups over the per-core journal.
-- `StaticGrpcRaftGroupEngineFactory`: OpenRaft groups over the per-core journal with a static peer map, each group's seed voters and initializer (`ConfigSeeds`) and the gRPC network.
+- `PlacedRaftGroupEngineFactory`: gated OpenRaft groups over the per-core journal and the gRPC network, with the peers bound to the node's identity and every placement input (which groups the node hosts, each group's seed role and voters) from one `PlacementInputs`, the seed rule's `ConfigSeeds` in a cluster.
 
 Threads:
 

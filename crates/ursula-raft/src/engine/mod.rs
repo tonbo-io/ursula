@@ -19,8 +19,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use factory::DurableRaftGroupEngineFactory;
+pub use factory::PlacedRaftGroupEngineFactory;
 pub use factory::RaftEngineConfig;
-pub use factory::StaticGrpcRaftGroupEngineFactory;
 pub(crate) use factory::cluster_raft_config;
 use openraft::Config;
 use openraft::OptionalSend;
@@ -1067,17 +1067,18 @@ impl RaftGroupEngine {
         Ok(())
     }
 
-    /// Attach production recovery drivers with an injected transport.
+    /// Attach production recovery drivers with an injected transport, over
+    /// the group's placement `inputs`.
     pub fn attach_recovery<T: crate::RecoveryTransport>(
         &self,
         gate: Arc<crate::GroupRejoin>,
         registry: &crate::RaftGroupHandleRegistry,
-        nodes: BTreeSet<u64>,
+        inputs: &dyn crate::PlacementInputs,
         transport: T,
         config: crate::RecoveryConfig,
     ) -> Result<(), GroupEngineError> {
         self.recovery_tasks
-            .attach(self, gate, registry, nodes, transport, config)
+            .attach(self, gate, registry, inputs, transport, config)
     }
 
     pub async fn shutdown(&self) -> Result<(), GroupEngineError> {

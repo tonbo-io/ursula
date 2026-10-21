@@ -20,6 +20,7 @@ use super::leader_tick::LeaderTick;
 use super::leader_tick::StepRetry;
 use super::leader_tick::matched_indexes;
 use super::log_index;
+use crate::GroupNodes;
 use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig;
 
@@ -108,11 +109,12 @@ fn heal_view(metrics: &RaftMetrics<UrsulaRaftTypeConfig>, configured: &BTreeSet<
 /// in place, and counts each one in `reversions` and logs it. The driver
 /// also brings the membership back to the configured voters (add a missing
 /// one as a learner, promote it once caught up, flatten a stale joint
-/// config). Returns once the Raft stops.
+/// config). It reads the configured voters from `nodes` on every tick.
+/// Returns once the Raft stops.
 pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     raft: Raft<UrsulaRaftTypeConfig, SM>,
     rejoin: Arc<GroupRejoin>,
-    configured: BTreeSet<u64>,
+    nodes: Arc<dyn GroupNodes>,
     interval: Duration,
     reversions: FollowerLogReversions,
 ) {
@@ -132,7 +134,7 @@ pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     loop {
         let Some(planned) = tick
             .next(|current| {
-                let mut view = heal_view(current, &configured);
+                let mut view = heal_view(current, &nodes.voters());
                 let joint = (!view.uniform).then_some(*current.membership_config.log_id());
                 if joint != last_joint {
                     joint_since = crate::rt::time::Instant::now();

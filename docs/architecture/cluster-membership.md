@@ -14,9 +14,12 @@ initializer come from the seed rule over the `raft.peers` ids
 `min(raft.placement.replication_factor, N)` consecutive nodes in ascending id
 from index `g mod N`, and the first of them initializes it. With `N` at most the
 replication factor, every node votes in every group. `ConfigSeeds`
-(`crates/ursula-raft/src/types.rs`) computes this table, and the server reads it
-for what a node hosts, where it routes a group it does not host, its maintenance
-inventory and its egress probe. The meta group's `Bootstrap` seeds the same rule
+(`crates/ursula-raft/src/placement_wiring.rs`) computes this table, and the
+server reads it for what a node hosts, where it routes a group it does not host,
+its maintenance inventory and its egress probe. The engine factory takes every
+input placement decides through one seam, `PlacementInputs`: which groups the
+node hosts and how each may open, the replica's seed role, and the voters its
+recovery drivers ask, initialize and heal toward, read at each use. The meta group's `Bootstrap` seeds the same rule
 over the `raft.peers` ids at genesis, so the two agree only while `raft.peers`
 keeps those ids: do not add nodes to `raft.peers` of a running cluster.
 
@@ -96,7 +99,9 @@ operator who accepts the loss of the unsynced tail calls
 leader is elected.
 
 A group's seed initializer runs `Initialize` only when every seed voter
-reports an empty log, no leader and a persisted genesis floor. A replica that
+reports an empty log, no leader and a persisted genesis floor, and it confirms
+its seed role right before it does. A replica writes its genesis floor only
+once it confirmed a seed role. A replica that
 ever held the group never initializes it again.
 
 ## 3. Admin membership surface

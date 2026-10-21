@@ -41,6 +41,7 @@ use ursula_control::ControlError;
 use ursula_control::MetaDamageKind;
 use ursula_control::PlacementView;
 use ursula_control::RegistrationStatus;
+use ursula_control::SeedRoleOf;
 use ursula_proto::admin::RecoveryPlanReport;
 use ursula_proto::admin::RecoveryPlanRequest;
 use ursula_proto::placement::GenesisClaim;
@@ -65,6 +66,8 @@ use super::replica::MetaReplicaTasks;
 use super::replica::MetaSnapshotTrigger;
 use super::status::MetaStatusReader;
 use super::target::MetaTargetSource;
+use crate::FixedNodes;
+use crate::FixedRole;
 use crate::LeadershipShedReason;
 use crate::MetaOpenError;
 use crate::RaftEngineConfig;
@@ -436,7 +439,6 @@ impl GrpcMetaRuntime {
 /// groups.
 fn recovery_config(engine: &RaftEngineConfig) -> RecoveryConfig {
     RecoveryConfig {
-        initialize: false,
         interval: crate::rejoin::REJOIN_HEAL_INTERVAL,
         barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
         stall_after: crate::rejoin::RECOVERY_STALL_AFTER,
@@ -531,8 +533,13 @@ impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
     fn spawn(&self, replica: MetaDriverContext<'_>) {
         let peers = super::genesis_driver::probed_peers(&self.claim);
         let voters: BTreeSet<u64> = self.claim.meta_voters.iter().map(NodeId::get).collect();
-        let mut recovery = self.recovery.clone();
-        recovery.initialize = self.claim.is_genesis_node(self.node);
+        // The claim decides meta's seed: the genesis node initializes, and
+        // every node writes its floor without asking.
+        let seed = FixedRole(Some(if self.claim.is_genesis_node(self.node) {
+            SeedRoleOf::Initializer
+        } else {
+            SeedRoleOf::Voter
+        }));
         let probe = genesis_gate_probe(
             self.transport.clone(),
             self.claim.clone(),
@@ -543,11 +550,14 @@ impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
             replica.core.owner().clone(),
             Arc::clone(replica.gate),
             replica.election.clone(),
-            peers,
-            voters,
+            Arc::new(FixedNodes {
+                candidates: peers,
+                voters,
+            }),
+            Arc::new(seed),
             probe,
             self.transport.clone(),
-            recovery,
+            self.recovery.clone(),
         );
         let shell = ReconcileShell {
             core: replica.core.clone(),

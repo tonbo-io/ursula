@@ -1,6 +1,5 @@
 //! Empty-group bootstrap decisions and driver.
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,11 +8,14 @@ use openraft::Raft;
 use openraft::rt::WatchReceiver;
 use openraft::rt::WatchSender;
 use openraft::storage::RaftStateMachine;
+use ursula_control::SeedRoleOf;
 use ursula_proto::placement::GenesisClaim;
 
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
+use crate::GroupNodes;
+use crate::SeedRole;
 use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
@@ -95,22 +97,25 @@ pub enum GroupBootstrap {
     AlreadyInitialized,
     Initialized,
     Rejoined,
+    /// A confirmed placement gives the replica no initializer role.
+    NotInitializer,
     /// The Raft stopped, or `Initialize` failed.
     Stopped,
 }
 
 /// Membership bootstrap of a group's initializer whose replica holds nothing
-/// of the group. It runs `Initialize` with `members` only once every other
-/// node of `probed` answered that it is empty too and no leader was seen.
-/// `probe` asks one peer, by node id, with the bootstrap probe. A data
-/// group probes and initializes its configured voters. Any state machine's
-/// replica runs it.
+/// of the group. It runs `Initialize` with the voters of `nodes` only once
+/// every other candidate of `nodes` answered that it is empty too, no leader
+/// was seen and `seed` confirmed the replica as the initializer, right
+/// before it opens the gate for the fresh group. It reads `nodes` at each
+/// use. `probe` asks one peer, by node id, with the bootstrap probe. Any
+/// state machine's replica runs it.
 pub async fn run_group_bootstrap<SM, P, F>(
     node_id: u64,
     raft: Raft<UrsulaRaftTypeConfig, SM>,
     rejoin: Arc<GroupRejoin>,
-    probed: BTreeSet<u64>,
-    members: BTreeSet<u64>,
+    nodes: &dyn GroupNodes,
+    seed: &dyn SeedRole,
     probe: P,
     interval: Duration,
     warn_every: Duration,
@@ -122,11 +127,6 @@ where
 {
     let plane = rejoin.group().plane().as_str_name();
     let group = rejoin.group().wire_group_id();
-    let peers = probed
-        .iter()
-        .copied()
-        .filter(|peer_id| *peer_id != node_id)
-        .collect::<Vec<_>>();
     let mut last_probe = None;
     let mut last_warning = crate::rt::time::Instant::now();
     let mut observed = raft.server_metrics();
@@ -158,6 +158,11 @@ where
             }
         }
         last_probe = Some(crate::rt::time::Instant::now());
+        let peers = nodes
+            .candidates()
+            .into_iter()
+            .filter(|peer_id| *peer_id != node_id)
+            .collect::<Vec<_>>();
         let answers = if leader_seen {
             Vec::new()
         } else {
@@ -170,6 +175,26 @@ where
         };
         match decision {
             BootstrapDecision::Initialize => {
+                match seed.confirmed_role().await {
+                    Ok(Some(SeedRoleOf::Initializer)) => {}
+                    Ok(Some(SeedRoleOf::Voter) | None) => {
+                        tracing::info!(
+                            plane,
+                            "raft bootstrap: node {node_id} group {group} is not the group's initializer in a confirmed placement; not initializing"
+                        );
+                        return GroupBootstrap::NotInitializer;
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            plane,
+                            "raft bootstrap: node {node_id} group {group} has no confirmed seed role yet, retrying: {err}"
+                        );
+                        if !wait_recovery_change(&mut observed, &mut changes, interval).await {
+                            return GroupBootstrap::Stopped;
+                        }
+                        continue;
+                    }
+                }
                 if let Err(err) = rejoin.allow_fresh_bootstrap().await {
                     tracing::error!(
                         plane,
@@ -177,7 +202,7 @@ where
                     );
                     return GroupBootstrap::Stopped;
                 }
-                if let Err(err) = raft.initialize(members).await {
+                if let Err(err) = raft.initialize(nodes.voters()).await {
                     tracing::error!(
                         plane,
                         "raft bootstrap: node {node_id} group {group} failed to initialize membership: {err}"

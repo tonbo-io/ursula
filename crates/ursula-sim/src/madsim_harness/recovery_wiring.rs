@@ -1,8 +1,7 @@
 //! Recovery gates of simulated nodes over the in-process network: the
-//! production gate, barrier driver and heal driver, wired the way the static
-//! gRPC engine factory wires them.
+//! production gate, barrier driver and heal driver, wired the way the
+//! placed engine factory wires them, over a [`FixedPlacement`].
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -11,6 +10,7 @@ use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
 use ursula_proto::placement::NodeId;
 use ursula_raft::BarrierAnswer;
+use ursula_raft::FixedPlacement;
 use ursula_raft::GroupRejoin;
 use ursula_raft::InProcessRaftNetworkEvent;
 use ursula_raft::InProcessRaftNetworkPolicy;
@@ -36,9 +36,18 @@ pub(super) const RECOVERY_DRIVER_INTERVAL: Duration = Duration::from_millis(50);
 /// production's `RECOVERY_STALL_AFTER`.
 pub(super) const RECOVERY_STALL_AFTER: Duration = Duration::from_secs(2);
 
-/// The configured voters `node_ids` of a simulated group.
-pub(super) fn configured_voters(node_ids: impl IntoIterator<Item = u64>) -> BTreeSet<u64> {
-    node_ids.into_iter().collect()
+/// The placement inputs of `node_id` in a simulated cluster whose groups
+/// all run on `voters`: node 1 initializes every group, and every other
+/// node waits for it.
+pub(super) fn fixed_placement(
+    node_id: u64,
+    voters: impl IntoIterator<Item = u64>,
+) -> FixedPlacement {
+    FixedPlacement {
+        node: node_id,
+        voters: voters.into_iter().collect(),
+        initializer: 1,
+    }
 }
 
 #[derive(Debug)]
@@ -105,8 +114,10 @@ pub(super) async fn in_process_probe(
 
 /// Binds `rejoin` to `node_id`'s replica of `placement`, puts it in front of
 /// the votes and appends the network delivers to that replica, and spawns
-/// the node's recovery drivers: the barrier driver and the heal driver. The
-/// drivers belong to the node's process and must be aborted with it.
+/// the node's recovery drivers over `inputs`, as the engine factory does:
+/// the barrier driver, the heal driver, the vote floor task and, on the
+/// initializer, the bootstrap driver. The drivers belong to the node's
+/// process and must be aborted with it.
 pub(super) fn wire_recovery(
     node_id: u64,
     _placement: ShardPlacement,
@@ -114,21 +125,20 @@ pub(super) fn wire_recovery(
     rejoin: &Arc<GroupRejoin>,
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
-    voters: &BTreeSet<u64>,
+    inputs: &FixedPlacement,
     recovery_registry: &RaftGroupHandleRegistry,
 ) {
     engine
         .attach_recovery(
             rejoin.clone(),
             recovery_registry,
-            voters.clone(),
+            inputs,
             InProcessRecoveryTransport {
                 registry: registry.clone(),
                 policy: policy.clone(),
                 node_id,
             },
             ursula_raft::RecoveryConfig {
-                initialize: node_id == 1,
                 interval: RECOVERY_DRIVER_INTERVAL,
                 barrier_timeout: Duration::from_secs(1),
                 stall_after: RECOVERY_STALL_AFTER,

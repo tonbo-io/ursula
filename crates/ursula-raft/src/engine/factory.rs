@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,15 +15,15 @@ use ursula_runtime::GroupEngineMetrics;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::WalOpenFailureKind;
+#[cfg(any(test, madsim, feature = "fault-injection"))]
 use ursula_shard::RaftGroupId;
 use ursula_shard::ShardPlacement;
 
 use super::RaftGroupEngine;
 use super::RaftGroupEngineOptions;
-use crate::ConfigSeeds;
+use crate::PlacementInputs;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::RaftWal;
-use crate::peer_directory::PeerDirectory;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
 use crate::rejoin::RECOVERY_STALL_AFTER;
@@ -85,7 +84,7 @@ pub struct RaftEngineConfig {
     /// here is 1, the node-wide coordinator's own default
     /// ([`crate::RaftGroupHandleRegistry`] starts with one permit and a
     /// factory changes it only through
-    /// [`StaticGrpcRaftGroupEngineFactory::with_engine_config`]), so an
+    /// [`PlacedRaftGroupEngineFactory::with_engine_config`]), so an
     /// engine built without a config, as in the tests and the simulation,
     /// keeps one build at a time and the two cannot disagree.
     pub snapshot_build_max_concurrency: usize,
@@ -289,14 +288,14 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct StaticGrpcRaftGroupEngineFactory {
+/// The data groups of a cluster node: their Raft logs live in the per-core
+/// journals of a [`RaftWal`], they talk gRPC, every replica opens behind its
+/// recovery gate, and every input placement decides comes from one
+/// [`PlacementInputs`].
+#[derive(Clone)]
+pub struct PlacedRaftGroupEngineFactory {
     transports: Arc<Mutex<BTreeMap<u16, Arc<crate::grpc::CoreRaftTransport>>>>,
-    node_id: u64,
-    /// `raft.peers`, this node among them.
-    peers: PeerDirectory,
-    /// The voters and the initializer of every group.
-    seeds: ConfigSeeds,
+    inputs: Arc<dyn PlacementInputs>,
     registry: RaftGroupHandleRegistry,
     cold_store: Option<ColdStoreHandle>,
     log_stores: RaftWal,
@@ -306,28 +305,32 @@ pub struct StaticGrpcRaftGroupEngineFactory {
     apply_fault: Option<(RaftGroupId, crate::apply_failure::ApplyFault)>,
 }
 
-impl StaticGrpcRaftGroupEngineFactory {
-    /// Groups of a static gRPC cluster whose Raft logs live in `log_stores`'
-    /// journals; how they opened is published in `registry`. They send as
-    /// the identity bound in `registry`'s peer cluster
+impl std::fmt::Debug for PlacedRaftGroupEngineFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlacedRaftGroupEngineFactory")
+            .field("engine_config", &self.engine_config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PlacedRaftGroupEngineFactory {
+    /// Groups whose Raft logs live in `log_stores`' journals; how they
+    /// opened is published in `registry`. They run as the identity and with
+    /// the peers bound in `registry`'s peer cluster
     /// ([`crate::PeerCluster::bind`]), which the caller binds before any
-    /// group opens: a group of a node with none bound, or bound as another
-    /// node, is refused as an invalid configuration. Each group runs with
-    /// the voters `seeds` gives it, and only its seed initializer may
-    /// initialize it.
+    /// group opens: a group of a node with none bound, or not among its
+    /// bound peers, is refused as an invalid configuration. `inputs` says
+    /// which groups the node hosts, how each opens, its seed role and the
+    /// node sets its recovery drivers read.
     pub fn new(
-        node_id: u64,
-        peers: PeerDirectory,
-        seeds: ConfigSeeds,
-        registry: RaftGroupHandleRegistry,
         log_stores: RaftWal,
+        registry: RaftGroupHandleRegistry,
+        inputs: Arc<dyn PlacementInputs>,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
         Self {
             transports: Arc::default(),
-            node_id,
-            peers,
-            seeds,
+            inputs,
             registry,
             cold_store: None,
             log_stores,
@@ -375,29 +378,10 @@ impl StaticGrpcRaftGroupEngineFactory {
         self.engine_config = config;
         self
     }
-
-    /// The node ids that make up the voters of `placement`'s group: its
-    /// seed voters. A group with no seed, or with a seed voter outside
-    /// `raft.peers`, is refused as an invalid configuration of its open.
-    fn group_voters(&self, placement: ShardPlacement) -> Result<BTreeSet<u64>, GroupEngineError> {
-        self.seeds
-            .voters(placement.raft_group_id)
-            .filter(|voters| {
-                !voters.is_empty() && voters.iter().all(|node_id| self.peers.contains(*node_id))
-            })
-            .cloned()
-            .ok_or_else(|| invalid_configuration(placement))
-    }
-
-    /// Whether this node initializes `raft_group_id`: it is the group's
-    /// seed initializer.
-    fn should_initialize_membership(&self, raft_group_id: RaftGroupId) -> bool {
-        self.seeds.initializer(raft_group_id) == Some(self.node_id)
-    }
 }
 
-/// The refusal of a group whose seed this node cannot run: it reaches a
-/// group's open only as an invalid configuration.
+/// The refusal of a group whose placement this node cannot run: it reaches
+/// a group's open only as an invalid configuration.
 fn invalid_configuration(placement: ShardPlacement) -> GroupEngineError {
     GroupEngineError::Infra(GroupInfraError::WalOpen {
         core_id: placement.core_id,
@@ -406,13 +390,9 @@ fn invalid_configuration(placement: ShardPlacement) -> GroupEngineError {
     })
 }
 
-impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
+impl GroupEngineFactory for PlacedRaftGroupEngineFactory {
     fn hosts_group(&self, placement: ShardPlacement) -> bool {
-        if self.seeds.hosts(self.node_id, placement.raft_group_id) {
-            return true;
-        }
-        self.registry
-            .dynamic_group_hosting_allowed(placement.raft_group_id)
+        self.inputs.admission(placement.raft_group_id).is_some()
     }
 
     fn create<'a>(
@@ -421,26 +401,37 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
         metrics: GroupEngineMetrics,
     ) -> GroupEngineCreateFuture<'a> {
         Box::pin(async move {
-            if !self.peers.contains(self.node_id) {
-                return Err(invalid_configuration(placement));
-            }
+            let group = placement.raft_group_id;
             let identity = self
                 .registry
                 .peer_cluster()
                 .identity()
-                .filter(|identity| identity.node_id() == self.node_id)
                 .ok_or_else(|| invalid_configuration(placement))?;
-            let voters = self.group_voters(placement)?;
+            let node_id = identity.node_id();
+            let peers = self.registry.peer_cluster().directory();
+            // A group the node does not host, or whose voters it cannot
+            // dial, never opens.
+            let admission = self
+                .inputs
+                .admission(group)
+                .ok_or_else(|| invalid_configuration(placement))?;
+            let voters = self.inputs.nodes(group).voters();
+            if !peers.contains(node_id)
+                || voters.is_empty()
+                || !voters.iter().all(|voter| peers.contains(*voter))
+            {
+                return Err(invalid_configuration(placement));
+            }
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
             let store = self
                 .log_stores
-                .open_waiting(placement, Admission::Create, metrics.clone())
+                .open_waiting(placement, admission, metrics.clone())
                 .await
                 .map_err(|source| super::wal_error::group_open_error(placement, source))?;
             let rejoin = Arc::new(
                 GroupRejoin::durable(
-                    self.node_id,
+                    node_id,
                     ursula_shard::RaftTarget::Data(placement.raft_group_id),
                     &store,
                 )
@@ -476,7 +467,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             let health = crate::apply_failure::ApplyHealth::default();
             let engine = RaftGroupEngine::new_node_observed(
                 placement,
-                self.node_id,
+                node_id,
                 config,
                 network,
                 store,
@@ -507,25 +498,21 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             .await
             .inspect_err(|_error| {
                 if let Some(stopped) = health.stopped() {
-                    self.registry.register_apply_stopped(
-                        placement.raft_group_id,
-                        self.node_id,
-                        stopped,
-                    );
+                    self.registry
+                        .register_apply_stopped(placement.raft_group_id, node_id, stopped);
                 }
             })?;
             let attached = engine.recovery_tasks.attach(
                 &engine,
                 rejoin,
                 &self.registry,
-                voters,
+                &*self.inputs,
                 crate::recovery_transport::GrpcRecoveryTransport {
                     transport,
                     target: crate::RaftTarget::Data(placement.raft_group_id),
                     timeout: self.engine_config.bootstrap_peer_connect,
                 },
                 crate::rejoin::RecoveryConfig {
-                    initialize: self.should_initialize_membership(placement.raft_group_id),
                     interval: REJOIN_HEAL_INTERVAL,
                     barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
                     stall_after: RECOVERY_STALL_AFTER,
@@ -550,104 +537,14 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     #[cfg(not(madsim))]
     use ursula_config::WalFsync;
+    #[cfg(not(madsim))]
     use ursula_shard::CoreId;
+    #[cfg(not(madsim))]
     use ursula_shard::ShardId;
 
     use super::*;
-
-    /// Node `node_id` of four nodes with two groups, at the default
-    /// replication factor 3.
-    #[cfg(not(madsim))]
-    fn factory_for_node(
-        node_id: u64,
-        wal_root: &tempfile::TempDir,
-    ) -> StaticGrpcRaftGroupEngineFactory {
-        let peers = PeerDirectory::new((1..=4).map(|node_id| {
-            (
-                node_id,
-                crate::PeerEndpoints::shared(format!("http://node-{node_id}")),
-            )
-        }));
-        let seeds = ConfigSeeds::new(
-            &peers,
-            2,
-            ursula_config::PlacementConfig::default().replication_factor,
-        );
-        StaticGrpcRaftGroupEngineFactory::new(
-            node_id,
-            peers,
-            seeds,
-            RaftGroupHandleRegistry::default(),
-            RaftWal::start(
-                wal_root.path().join(format!("node-{node_id}")),
-                WalFsync::Never,
-                &ursula_shard::StaticShardMap::new(1, 2).expect("valid topology"),
-            )
-            .expect("start the WAL"),
-        )
-    }
-
-    /// The seed rule over four nodes: group `g`'s voters are three
-    /// consecutive ids from index `g mod 4`, and a group without a seed is
-    /// refused rather than run on every peer.
-    #[cfg(not(madsim))]
-    #[test]
-    fn groups_take_their_seed_voters() {
-        let wal_root = tempfile::tempdir().expect("WAL root");
-        let factory = factory_for_node(1, &wal_root);
-
-        let placement = |group| ShardPlacement {
-            core_id: CoreId(1),
-            shard_id: ShardId(group),
-            raft_group_id: RaftGroupId(group),
-        };
-        assert_eq!(
-            factory.group_voters(placement(0)).unwrap(),
-            BTreeSet::from([1, 2, 3])
-        );
-        assert_eq!(
-            factory.group_voters(placement(1)).unwrap(),
-            BTreeSet::from([2, 3, 4])
-        );
-        assert!(factory.hosts_group(placement(0)));
-        assert!(!factory.hosts_group(placement(1)));
-        let err = factory
-            .group_voters(placement(2))
-            .expect_err("a group without a seed must not fall back to all peers");
-        assert_eq!(
-            err,
-            GroupEngineError::Infra(GroupInfraError::WalOpen {
-                core_id: CoreId(1),
-                group: ursula_shard::RaftTarget::Data(RaftGroupId(2)),
-                failure: WalOpenFailureKind::InvalidConfiguration,
-            })
-        );
-    }
-
-    /// Only a group's seed initializer, the first node of its window,
-    /// initializes it.
-    #[cfg(not(madsim))]
-    #[test]
-    fn only_the_seed_initializer_initializes_a_group() {
-        let wal_root = tempfile::tempdir().expect("WAL root");
-        let nodes: Vec<_> = (1..=4)
-            .map(|node_id| factory_for_node(node_id, &wal_root))
-            .collect();
-        let initializers: Vec<Vec<u64>> = (0..2)
-            .map(|group| {
-                nodes
-                    .iter()
-                    .filter(|node| node.should_initialize_membership(RaftGroupId(group)))
-                    .map(|node| node.node_id)
-                    .collect()
-            })
-            .collect();
-        assert_eq!(initializers, vec![vec![1], vec![2]]);
-    }
 
     #[test]
     fn raft_snapshot_timeout_parser_uses_positive_millis_only() {

@@ -54,6 +54,10 @@
 //!   still run, and the leadership shed of the node fence.
 //! - [`peer_directory`]: where each configured peer listens (`raft.peers`),
 //!   the one source every reader of a peer address takes it from.
+//! - `placement_wiring`: the one seam of every placement input of a data
+//!   replica's open ([`PlacementInputs`]): admission, the seed role and the
+//!   node sets its recovery drivers read, with production's interim inputs
+//!   over the seed rule ([`ConfigSeeds`]).
 //! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
 //!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
@@ -110,6 +114,7 @@ mod openraft_work;
 mod peer_channel;
 mod peer_cluster;
 mod peer_directory;
+mod placement_wiring;
 pub mod predecessor_wait;
 mod read_index;
 mod recovery_transport;
@@ -132,10 +137,10 @@ pub mod wal;
 
 pub use election::ElectionPolicy;
 pub use engine::DurableRaftGroupEngineFactory;
+pub use engine::PlacedRaftGroupEngineFactory;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;
 pub use engine::RaftGroupEngineOptions;
-pub use engine::StaticGrpcRaftGroupEngineFactory;
 pub use format_epoch::FormatEpochMismatch;
 pub use format_epoch::PeerFormatEpoch;
 pub use format_epoch::probe_peer_format_epoch;
@@ -232,6 +237,15 @@ pub use peer_cluster::PeerClusterMismatch;
 pub use peer_cluster::PeerIdentity;
 pub use peer_directory::PeerDirectory;
 pub use peer_directory::PeerEndpoints;
+pub use placement_wiring::ConfigSeedInputs;
+pub use placement_wiring::ConfigSeeds;
+pub use placement_wiring::FixedNodes;
+#[cfg(any(test, madsim, feature = "test-support"))]
+pub use placement_wiring::FixedPlacement;
+pub use placement_wiring::FixedRole;
+pub use placement_wiring::GroupNodes;
+pub use placement_wiring::PlacementInputs;
+pub use placement_wiring::SeedRole;
 pub use registry::IncomingTransferError;
 pub use registry::LeadershipShedFlag;
 pub use registry::LeadershipShedReason;
@@ -296,7 +310,6 @@ pub use target::INCARNATION_METADATA;
 pub use target::RAFT_PLANE_METADATA;
 pub use target::TARGET_INCARNATION_METADATA;
 pub use target::fence_refusal;
-pub use types::ConfigSeeds;
 pub use types::RaftCommand;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;
