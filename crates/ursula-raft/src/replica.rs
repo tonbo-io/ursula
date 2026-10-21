@@ -67,10 +67,6 @@ pub(crate) struct HistoryProposal {
     /// The last log index the new history keeps from the one it replaces.
     pub(crate) kept: u64,
     pub(crate) leader: ursula_stream::HistoryLeader,
-    #[expect(
-        dead_code,
-        reason = "the data plane's event does not record its cause; the meta plane's reads it"
-    )]
     pub(crate) cause: HistoryCause,
 }
 
@@ -87,15 +83,39 @@ pub(crate) enum HistoryCause {
 pub(crate) trait ReplicaStateMachine:
     RaftStateMachine<C, SnapshotData = SnapshotData> + Send + Sync + 'static
 {
+    /// What a written command of this plane answers.
+    type Answer: Send + 'static;
+
+    /// The target of this plane's group `group`.
+    fn target(group: RaftGroupId) -> crate::RaftTarget;
     /// The command that proposes `proposal` on this plane.
     fn history_command(proposal: HistoryProposal) -> RaftCommand;
     /// Whether the applied answer to a history command refused it: the
     /// event named another predecessor than the group's history and applied
     /// nothing, so the driver proposes again.
     fn history_refused(response: &RaftGroupResponse) -> bool;
+    /// The answer of a written command in `response`, of the kind
+    /// `expected`, or the refusal of a response of another kind.
+    fn answer(
+        response: RaftGroupResponse,
+        expected: ursula_runtime::ResponseKind,
+    ) -> Result<Result<Self::Answer, GroupEngineError>, GroupEngineError>;
 }
 
 impl ReplicaStateMachine for RaftGroupStateMachine {
+    type Answer = ursula_runtime::GroupWriteResponse;
+
+    fn target(group: RaftGroupId) -> crate::RaftTarget {
+        crate::RaftTarget::Data(group)
+    }
+
+    fn answer(
+        response: RaftGroupResponse,
+        expected: ursula_runtime::ResponseKind,
+    ) -> Result<Result<Self::Answer, GroupEngineError>, GroupEngineError> {
+        crate::forward::write_result_from_raft_response(response, expected)
+    }
+
     fn history_command(proposal: HistoryProposal) -> RaftCommand {
         let HistoryProposal {
             history,

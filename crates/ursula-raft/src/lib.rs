@@ -7,8 +7,9 @@
 //!   [`RaftCommand`] of every entry on either plane, and the
 //!   [`RaftGroupResponse`] applied-entry response around the canonical
 //!   `ursula_runtime` write types.
-//! - [`meta`]: the meta group's replicated types: its commands, its state,
-//!   its snapshot pointer and its genesis probe.
+//! - [`meta`]: the meta group: its replicated types (its commands, its
+//!   state, its snapshot pointer and its genesis probe), its state machine,
+//!   this node's meta replica and the placement views it publishes.
 //! - [`target`]: the typed target of every Raft RPC (plane, group and target
 //!   node), its one encoder and parser, and the misdelivery refusal.
 //! - [`memberships`]: the memberships a recovery barrier answers with, which
@@ -268,6 +269,7 @@ pub use state_machine::RaftMetricsWatch;
 pub use state_machine::SNAPSHOT_HANDOFF_WAIT;
 pub use state_machine::SnapshotBuildCoordinator;
 pub use state_machine::SnapshotPermitError;
+pub use state_machine::SnapshotRecordError;
 pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::persisted_snapshot_pointer;

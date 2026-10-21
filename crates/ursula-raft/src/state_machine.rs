@@ -1697,6 +1697,23 @@ impl CurrentSnapshot {
             object,
         }
     }
+
+    /// The current snapshot of an inline pointer, which names no object.
+    pub(crate) fn inline(
+        meta: SnapshotMetaOf<UrsulaRaftTypeConfig>,
+        pointer_bytes: Vec<u8>,
+    ) -> Self {
+        Self {
+            meta,
+            pointer_bytes,
+            object: None,
+        }
+    }
+
+    /// The encoded pointer OpenRaft sends.
+    pub(crate) fn pointer_bytes(&self) -> &[u8] {
+        &self.pointer_bytes
+    }
 }
 
 /// Makes `next` the group's current snapshot and records its object as

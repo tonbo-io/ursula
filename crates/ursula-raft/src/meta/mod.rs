@@ -2,12 +2,15 @@
 //! [`crate::RaftCommand::Meta`], the state its state machine holds and
 //! snapshots, and the answers it gives.
 //!
-//! Every type here but those of [`confirm`] is format (format epoch 6): persisted in the meta log and
-//! its snapshot record, replicated, or sent between nodes, so its field
-//! order and variant names are the encoding (`ursula_stream::msgpack`). No
-//! type here uses `default`, `skip_serializing_if`, `flatten` or an untagged
-//! enum. The persisted-envelopes and commands-and-responses fixtures pin
-//! each root.
+//! Every type of this module itself, and of [`genesis`] and [`snapshot`],
+//! is format (format epoch 6): persisted in the meta log and its snapshot
+//! record, replicated, or sent between nodes, so its field order and
+//! variant names are the encoding (`ursula_stream::msgpack`). No type here
+//! uses `default`, `skip_serializing_if`, `flatten` or an untagged enum. The
+//! persisted-envelopes and commands-and-responses fixtures pin each root.
+//! The replica, its state machine and its views ([`replica`],
+//! [`state_machine`], [`watch`]) encode nothing of their own, and
+//! [`state_machine`]'s dispatch of the meta log is frozen with the epoch.
 //!
 //! `#[serde(other)]` is allowed only on admin JSON enums (the admin
 //! vocabulary of `ursula_proto::placement`), and forbidden on every type
@@ -15,9 +18,9 @@
 //! MessagePack closure: an unknown variant decoding as "other" would hide a
 //! format mismatch.
 //!
-//! Nothing runs the meta group yet: this module is its format, and the
-//! state machine, the journal and the transport that use it land with the
-//! meta runtime.
+//! No server runs the meta group yet: the meta runtime that opens the
+//! replica at start-up, routes the meta plane's RPCs to it and forms the
+//! group lands later.
 //!
 //! Module map:
 //!
@@ -25,17 +28,34 @@
 //!   ([`confirm::MetaBarrierError`]), never encoded.
 //! - [`genesis`]: the genesis probe a node sends before the meta group
 //!   forms, and its answer.
-//! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, and
-//!   the bound on its size.
+//! - [`replica`]: this node's meta replica ([`replica::MetaReplica`]): its
+//!   Raft over the meta journal, the tasks it owns, its registry slot
+//!   ([`replica::ActiveMeta`]) and its restart for a recovery plan.
+//! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, the
+//!   bound on its size, and the trigger that snapshots the meta group on
+//!   its journal's age rule.
+//! - [`state_machine`]: the meta state machine ([`MetaStateMachine`]): its
+//!   dispatch of the meta log, its inline snapshot record and the views it
+//!   publishes.
+//! - [`watch`]: the node's placement views, which outlive every meta
+//!   replica.
 
 pub mod confirm;
 pub mod genesis;
+pub mod replica;
 pub mod snapshot;
+pub mod state_machine;
+pub mod watch;
 
 use std::num::NonZeroU64;
 
 use serde::Deserialize;
 use serde::Serialize;
+pub use state_machine::MetaStateMachine;
+
+#[cfg(test)]
+#[cfg(not(madsim))]
+mod tests;
 use ursula_control::ControlCommand;
 use ursula_control::ControlPlaneState;
 use ursula_control::ControlResponse;

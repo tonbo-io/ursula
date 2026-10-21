@@ -17,6 +17,11 @@ use ursula_runtime::SnapshotLocationKind;
 use ursula_runtime::SnapshotPointer;
 
 use super::MetaState;
+use super::replica::MetaSnapshotTrigger;
+use super::state_machine::META_GROUP;
+use super::state_machine::MetaStateMachine;
+use crate::WalMaintenance;
+use crate::owner::OwnerRaftHandle;
 
 /// The bytes of meta state allowed per data group: 4 KiB.
 ///
@@ -127,6 +132,56 @@ impl TryFrom<SnapshotPointer> for MetaSnapshotPointer {
                     kind: location.kind(),
                 })
             }
+        }
+    }
+}
+
+/// The meta replica's snapshot trigger, a task of the replica: every
+/// `trigger.interval` it runs a maintenance pass of the meta journal, which
+/// seals and frees segments on the journal's age rule. While the journal
+/// reports the meta group lagging, its live records keeping old segments
+/// alive, it snapshots the meta group when it applied anything the current
+/// snapshot does not cover, and otherwise purges its log through that
+/// snapshot, so the next pass frees the segments. Runs until the replica
+/// stops it.
+pub(crate) async fn run_meta_snapshot_trigger(
+    owner: OwnerRaftHandle<MetaStateMachine>,
+    wal: WalMaintenance,
+    trigger: MetaSnapshotTrigger,
+) {
+    let lagging = wal.lagging_groups();
+    loop {
+        crate::rt::time::sleep(trigger.interval).await;
+        if let Err(error) = wal
+            .maintain(crate::rt::time::Instant::now(), trigger.max_dirty_age)
+            .await
+        {
+            tracing::warn!(%error, "meta snapshot trigger: the meta journal's maintenance pass failed");
+        }
+        if !lagging.groups().contains(&META_GROUP) {
+            continue;
+        }
+        let (applied, snapshot, purged) = {
+            let metrics = owner.metrics();
+            let metrics = openraft::rt::WatchReceiver::borrow_watched(&metrics);
+            (
+                metrics.last_applied.map(|log_id| log_id.index),
+                metrics.snapshot.map(|log_id| log_id.index),
+                metrics.purged.map(|log_id| log_id.index),
+            )
+        };
+        let triggered = match snapshot {
+            Some(snapshot) if applied <= Some(snapshot) => {
+                if purged >= Some(snapshot) {
+                    continue;
+                }
+                owner.trigger().purge_log(snapshot).await
+            }
+            _ if applied.is_some() => owner.trigger().snapshot().await,
+            _ => continue,
+        };
+        if let Err(error) = triggered {
+            tracing::warn!(%error, "meta snapshot trigger: the meta Raft took no trigger");
         }
     }
 }

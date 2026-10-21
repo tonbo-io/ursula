@@ -21,6 +21,7 @@ use std::time::Duration;
 pub use factory::DurableRaftGroupEngineFactory;
 pub use factory::RaftEngineConfig;
 pub use factory::StaticGrpcRaftGroupEngineFactory;
+pub(crate) use factory::cluster_raft_config;
 use openraft::Config;
 use openraft::OptionalSend;
 use openraft::Raft;
@@ -29,6 +30,7 @@ use openraft::impls::ProgressResponder;
 use openraft::impls::leader_id_adv::LeaderId;
 use openraft::rt::WatchReceiver;
 use openraft::storage::RaftLogStorage;
+use openraft::storage::RaftStateMachine;
 use ursula_runtime::AdvanceRetentionRequest;
 use ursula_runtime::AdvanceRetentionResponse;
 use ursula_runtime::AppendExternalRequest;
@@ -276,20 +278,22 @@ pub(crate) enum DropStop {
     InBackground(crate::openraft_work::EngineWorkLedger),
 }
 
-/// What a group engine's shutdown stops, owning nothing of the engine, so
-/// that an engine dropped before its shutdown runs the same steps in the
-/// background.
-struct EngineStopper {
-    snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
-    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
-    metadata_serial: Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
-    openraft_work: crate::openraft_work::OpenRaftWork,
-    raft_group_id: ursula_shard::RaftGroupId,
-    work_stop_timeout: Duration,
+/// What a replica's shutdown stops, of either plane, owning nothing of the
+/// replica, so that one dropped before its shutdown runs the same steps in
+/// the background.
+pub(crate) struct EngineStopper<SM: RaftStateMachine<UrsulaRaftTypeConfig> = RaftGroupStateMachine>
+{
+    pub(crate) snapshot_installs: Arc<crate::openraft_work::WorkAdmission>,
+    pub(crate) raft: Raft<UrsulaRaftTypeConfig, SM>,
+    pub(crate) metadata_serial:
+        Arc<crate::rt::sync::Mutex<crate::state_machine::MetadataPublicationState>>,
+    pub(crate) openraft_work: crate::openraft_work::OpenRaftWork,
+    pub(crate) raft_group_id: ursula_shard::RaftGroupId,
+    pub(crate) work_stop_timeout: Duration,
 }
 
-impl EngineStopper {
-    async fn stop(
+impl<SM: RaftStateMachine<UrsulaRaftTypeConfig>> EngineStopper<SM> {
+    pub(crate) async fn stop(
         self,
         recovery_tasks: &crate::rejoin::RecoveryGate,
     ) -> Result<(), GroupEngineError> {

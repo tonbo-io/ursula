@@ -790,6 +790,12 @@ pub enum RecoveryGateError {
         #[source]
         source: Box<ursula_runtime::RuntimeError>,
     },
+    /// The meta replica did not restart to run its recovery cut.
+    #[error("restart the meta replica to run its recovery cut")]
+    MetaRestart {
+        #[source]
+        source: Box<crate::meta::replica::MetaReplicaError>,
+    },
 }
 
 /// A recovery gate that did not open when its replica started
@@ -884,7 +890,9 @@ impl RecoveryGateError {
             {
                 return PlanAnswer::Unavailable;
             }
-            Self::Record { .. } | Self::Restart { .. } => return PlanAnswer::Failed,
+            Self::Record { .. } | Self::Restart { .. } | Self::MetaRestart { .. } => {
+                return PlanAnswer::Failed;
+            }
             Self::OwnerStopped { .. } | Self::NotStarted { .. } | Self::JobAborted { .. } => {
                 return PlanAnswer::Unavailable;
             }
@@ -1818,6 +1826,11 @@ impl GroupRejoin {
                 openraft::EntryPayload::Normal(crate::types::RaftCommand::Stream(
                     ursula_stream::StreamCommand::ImportSnapshot { .. },
                 )) => return None,
+                openraft::EntryPayload::Normal(crate::types::RaftCommand::Meta(
+                    crate::meta::MetaCommand::NewHistory {
+                        history, previous, ..
+                    },
+                )) if previous == current => current = history.get(),
                 _ => {}
             }
         }

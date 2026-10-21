@@ -225,6 +225,12 @@ pub struct RaftGroupHandleRegistry {
     /// How often each follower lost entries it had acknowledged to a leader
     /// on this node ([`Self::follower_log_reversions`]).
     follower_log_reversions: crate::rejoin::FollowerLogReversions,
+    /// This node's running meta replica, apart from every structure keyed
+    /// by group id, where its group 0 would meet data group 0. A restart
+    /// swaps it, and an RPC resolves it per call.
+    meta: Arc<arc_swap::ArcSwapOption<crate::meta::replica::ActiveMeta>>,
+    /// This node's placement views, which outlive every meta replica.
+    placement: crate::meta::watch::PlacementPublisher,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -249,6 +255,8 @@ impl Default for RaftGroupHandleRegistry {
             wal_opening: Arc::new(Mutex::new(None)),
             peer_cluster: crate::peer_cluster::PeerCluster::default(),
             follower_log_reversions: Default::default(),
+            meta: Arc::default(),
+            placement: Default::default(),
         }
     }
 }
@@ -352,6 +360,19 @@ pub enum SnapshotInstallError {
         #[source]
         source: ursula_runtime::SnapshotStoreError,
     },
+    /// The incoming meta snapshot's pointer is not the meta group's own: it
+    /// is not inline, or names more than the bound.
+    #[error("the incoming meta snapshot's pointer is refused")]
+    MetaPointer {
+        #[source]
+        source: crate::meta::snapshot::MetaSnapshotError,
+    },
+    /// The incoming meta snapshot's state does not decode.
+    #[error("the incoming meta snapshot's state does not decode")]
+    MetaState {
+        #[source]
+        source: ursula_stream::msgpack::DecodeError,
+    },
 }
 
 impl SnapshotInstallError {
@@ -361,8 +382,10 @@ impl SnapshotInstallError {
     pub(crate) fn code(&self) -> tonic::Code {
         match self {
             Self::NotRegistered { .. } => tonic::Code::NotFound,
-            Self::PointerUndecodable { .. } => tonic::Code::InvalidArgument,
-            Self::Undecodable { .. } => tonic::Code::DataLoss,
+            Self::PointerUndecodable { .. } | Self::MetaPointer { .. } => {
+                tonic::Code::InvalidArgument
+            }
+            Self::Undecodable { .. } | Self::MetaState { .. } => tonic::Code::DataLoss,
             Self::PointerEncode { .. } => tonic::Code::Internal,
             Self::Group(error) => crate::grpc::group_rpc_code(error),
             Self::ShuttingDown { .. }
@@ -1037,6 +1060,82 @@ impl RaftGroupHandleRegistry {
             self.election
                 .refresh(entry.raft(), entry.core.recovery.clone());
         }
+        if let Some(meta) = self.meta() {
+            meta.refresh_elections();
+        }
+    }
+
+    /// This node's running meta replica, if one runs.
+    pub fn meta(&self) -> Option<Arc<crate::meta::replica::ActiveMeta>> {
+        self.meta.load_full()
+    }
+
+    /// A watch of this node's placement views.
+    pub fn placement_watch(&self) -> crate::meta::watch::PlacementWatch {
+        self.placement.subscribe()
+    }
+
+    pub(crate) fn placement_publisher(&self) -> crate::meta::watch::PlacementPublisher {
+        self.placement.clone()
+    }
+
+    /// Publishes `meta` as this node's running meta replica.
+    pub(crate) fn publish_meta(&self, meta: Option<Arc<crate::meta::replica::ActiveMeta>>) {
+        self.meta.store(meta);
+    }
+
+    /// Removes `meta` from the slot, if it still holds it: a replica that
+    /// replaced it stays.
+    pub(crate) fn unpublish_meta(&self, meta: &Arc<crate::meta::replica::ActiveMeta>) {
+        self.meta.rcu(|current| match current {
+            Some(current) if Arc::ptr_eq(current, meta) => None,
+            other => other.clone(),
+        });
+    }
+
+    /// A recovery plan on this node's meta replica, as
+    /// [`Self::accept_recovery_plan`] runs one on a data group's: the
+    /// replica takes it as one owner job, and a plan that cuts the meta log
+    /// restarts the replica through `restart` before it answers
+    /// ([`crate::meta::replica::MetaReplicaRestart::restart`]).
+    pub async fn accept_meta_recovery_plan<N>(
+        &self,
+        plan: &RecoveryPlanRequest,
+        restart: &mut crate::meta::replica::MetaReplicaRestart<N>,
+    ) -> Result<RecoveryPlanReport, RecoveryGateError>
+    where
+        N: openraft::RaftNetworkFactory<UrsulaRaftTypeConfig> + Clone + Send,
+        N::Network: RaftNetworkV2<UrsulaRaftTypeConfig, SnapshotData = SnapshotData>,
+    {
+        let raft_group_id = crate::meta::state_machine::META_GROUP;
+        let core = self
+            .meta()
+            .ok_or(RecoveryGateError::NotRegistered { raft_group_id })?
+            .core
+            .clone();
+        let applied = core
+            .owner()
+            .with_state_machine(|state_machine: &mut crate::meta::MetaStateMachine| {
+                Box::pin(std::future::ready(state_machine.applied_membership()))
+            })
+            .await
+            .map_err(|source| RecoveryGateError::OwnerStopped {
+                raft_group_id,
+                source,
+            })?;
+        core.accept_plan(&self.election, raft_group_id, plan, applied, move || {
+            futures_util::FutureExt::boxed(async move {
+                let restarted =
+                    restart
+                        .restart()
+                        .await
+                        .map_err(|source| RecoveryGateError::MetaRestart {
+                            source: Box::new(source),
+                        })?;
+                Ok::<_, RecoveryGateError>(Some(restarted.active().core.clone()))
+            })
+        })
+        .await
     }
 
     /// Serialize recovery-barrier changes with maintenance policy updates.
@@ -2896,10 +2995,10 @@ mod tests {
                 | SnapshotInstallError::CopyWrite { .. }
                 | SnapshotInstallError::CopyVerify { .. }
                 | SnapshotInstallError::NameCollision { .. } => (Code::Unavailable, true, true),
-                SnapshotInstallError::PointerUndecodable { .. } => {
-                    (Code::InvalidArgument, false, false)
-                }
-                SnapshotInstallError::Undecodable { .. } => (Code::DataLoss, false, false),
+                SnapshotInstallError::PointerUndecodable { .. }
+                | SnapshotInstallError::MetaPointer { .. } => (Code::InvalidArgument, false, false),
+                SnapshotInstallError::Undecodable { .. }
+                | SnapshotInstallError::MetaState { .. } => (Code::DataLoss, false, false),
                 SnapshotInstallError::PointerEncode { .. } => (Code::Internal, false, false),
             }
         }
@@ -2973,6 +3072,15 @@ mod tests {
             SnapshotInstallError::PointerEncode {
                 group,
                 source: store_error(),
+            },
+            SnapshotInstallError::MetaPointer {
+                source: crate::meta::snapshot::MetaSnapshotError::NotInline {
+                    kind: ursula_runtime::SnapshotLocationKind::S3,
+                },
+            },
+            SnapshotInstallError::MetaState {
+                source: ursula_stream::msgpack::decode::<crate::meta::MetaState>(&[0xc1])
+                    .expect_err("0xc1 is no MessagePack value"),
             },
         ];
         let owner_stopped =
