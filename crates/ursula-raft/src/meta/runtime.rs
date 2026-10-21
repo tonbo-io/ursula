@@ -296,6 +296,34 @@ where
     }
 }
 
+/// A server node's meta runtime, over gRPC.
+pub type GrpcMetaRuntime = MetaRuntime<crate::GrpcRaftNetworkFactory>;
+
+impl GrpcMetaRuntime {
+    /// Starts a server node's meta runtime over gRPC: meta's own transport
+    /// ([`crate::CoreRaftTransport::for_meta`]) sending as `identity`, the
+    /// meta network over it with the data groups' reconnect threshold, and
+    /// the recovery transport over it with their probe timeout
+    /// (`bootstrap_peer_connect`).
+    pub async fn start_over_grpc(
+        config: MetaRuntimeConfig,
+        journal: MetaJournal,
+        wal: RaftWal,
+        registry: RaftGroupHandleRegistry,
+        identity: crate::PeerIdentity,
+    ) -> Self {
+        let transport = Arc::new(crate::CoreRaftTransport::for_meta(&registry, identity));
+        let network = crate::GrpcRaftNetworkFactory::new(transport.clone(), RaftTarget::Meta)
+            .with_reconnect_threshold(config.engine.grpc_reconnect_after_failures);
+        let recovery = crate::recovery_transport::GrpcRecoveryTransport {
+            transport,
+            target: RaftTarget::Meta,
+            timeout: config.engine.bootstrap_peer_connect,
+        };
+        Self::start(config, journal, wal, registry, network, recovery).await
+    }
+}
+
 /// The recovery drivers' settings of the meta replica, those of the data
 /// groups.
 fn recovery_config(engine: &RaftEngineConfig) -> RecoveryConfig {

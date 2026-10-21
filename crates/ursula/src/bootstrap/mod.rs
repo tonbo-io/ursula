@@ -15,6 +15,7 @@ mod egress;
 mod format_epoch;
 mod health_gate;
 mod leadership;
+mod meta;
 mod participation;
 mod runtime;
 mod snapshot;
@@ -25,6 +26,8 @@ mod wal_disk;
 
 pub(crate) use format_epoch::check_and_stamp_format_epoch;
 pub(crate) use leadership::handoff_shutdown_leadership;
+pub(crate) use meta::MetaSlot;
+pub use meta::SpawnedMeta;
 pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;

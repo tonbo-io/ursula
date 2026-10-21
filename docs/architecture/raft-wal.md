@@ -59,6 +59,7 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | `core-N/journal.meta` | Every group's vote, log state and log generation, and the core's verified recovery epoch. |
 | `core-N/journal.lock` | Advisory lock held by the core's writer. |
 | `core-N/frozen-<group>-<seg>-<offset>-<first>-<last>-<hash>.seg` | Entry archives of apply-stopped groups (see Reclaim). |
+| `meta/` | The meta group's journal, laid out as a core's, with its snapshot record `group-0.snapshot.json`. |
 
 A second process that tries to take either lock fails with an error naming the
 lock path and the owner PID. `topology.bin` binds the root to its routing and
@@ -118,8 +119,10 @@ generation 0 until replica teardown writes `retired`.
 `run-state.bin` holds one record per journal class, each with the class's
 `fsync` policy and recovery epoch, beside the node-wide boot id and status.
 The data class covers the core journals and runs the configured policy. The
-meta class always runs `always`. Its record is written on every start but not
-yet used, because no meta journal exists yet.
+meta class always runs `always` and covers the meta journal under `meta/`.
+Every node that runs Raft opens it at start, before its runtime starts and so
+before any data group of the run opens. A meta journal that does not open
+leaves the node without a meta replica and never stops the start.
 
 The journal and state-file version is the format epoch, 6. There is no
 migration: other epochs and files without the Ursula magic are refused, and the

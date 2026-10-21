@@ -296,6 +296,12 @@ async fn init_state(
     )?;
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal;
+    // Meta's Raft starts before the warm-up, on the journal the spawn path
+    // opened before the runtime started.
+    let meta = match spawned.meta {
+        Some(meta) => meta.start().await,
+        None => crate::bootstrap::MetaSlot::default(),
+    };
 
     if !raft_peers.is_empty() {
         if per_group_voters.is_empty() {
@@ -354,7 +360,8 @@ async fn init_state(
         .with_configured_node_id(config.raft.node_id)
         .with_runtime_config(&config.runtime)
         .with_configured_cluster_id(config.server.cluster_id.clone())
-        .with_raft_wal(raft_wal);
+        .with_raft_wal(raft_wal)
+        .with_meta(meta);
     if let Some(wal_path) = log_dir {
         let monitor = crate::bootstrap::initialize_wal_disk_monitor(
             &wal_path,
@@ -436,6 +443,7 @@ async fn serve(
     let admin_listen: SocketAddr = config.server.admin_listen.parse()?;
     let runtime = state.runtime.clone();
     let raft_wal = state.raft_wal().cloned();
+    let meta = state.meta().clone();
 
     let shutdown = Arc::new(Notify::new());
     spawn_shutdown_signal_task(
@@ -510,7 +518,7 @@ async fn serve(
     }
     drop(staged_part_counting);
     tracing::info!("listeners closed; stopping the Raft groups");
-    let wal_shutdown = shutdown_raft_wal(&runtime, raft_wal.as_ref()).await;
+    let wal_shutdown = shutdown_raft_wal(&runtime, meta.take(), raft_wal.as_ref()).await;
     tracing::info!("exiting");
     Ok(wal_shutdown)
 }
@@ -529,14 +537,15 @@ pub(crate) enum WalShutdown {
 }
 
 /// The end of a graceful shutdown, after the leadership handoff and the
-/// listener drain: stops every Raft group, then the core journal writers,
-/// each of which `fsync`s its journal, and only then records a clean
-/// shutdown in the run state. A failure is logged and leaves the run
+/// listener drain: stops every data group, then the meta runtime, then the
+/// journal writers, each of which `fsync`s its journal, and only then
+/// records a clean shutdown in the run state. A failure is logged and leaves the run
 /// unclean, so the next start reads it as a crash. The shutdown grace period
 /// still bounds this: when it expires first the process exits without
 /// recording a clean shutdown.
 pub(crate) async fn shutdown_raft_wal(
     runtime: &ursula_runtime::ShardRuntime,
+    meta: Option<ursula_raft::meta::runtime::GrpcMetaRuntime>,
     raft_wal: Option<&ursula_raft::RaftWal>,
 ) -> WalShutdown {
     let Some(raft_wal) = raft_wal else {
@@ -550,6 +559,14 @@ pub(crate) async fn shutdown_raft_wal(
     // (#489).
     if let Err(err) = runtime.shutdown_group_engines().await {
         tracing::warn!(%err, "failed to stop every Raft group before closing the WAL");
+    }
+    // Meta after the data groups: a data group's shutdown never waits on
+    // meta, and meta's replica, like a group, writes no more journal records
+    // once its writer has closed.
+    if let Some(meta) = meta
+        && let Err(err) = meta.shutdown().await
+    {
+        tracing::warn!(%err, "failed to stop the meta replica before closing the WAL");
     }
     match raft_wal.shutdown().await {
         Ok(()) => {
@@ -810,7 +827,7 @@ mod tests {
             })
         );
         assert_eq!(
-            super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await,
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
             super::WalShutdown::Clean
         );
         assert!(
@@ -846,6 +863,35 @@ mod tests {
             .await
             .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let registry = state.raft_registry().cloned().expect("a Raft node");
+        // The spawn path opened the meta journal before any data group: the
+        // first one opens on the create below.
+        assert!(wal_dir.log_dir().join("meta").is_dir());
+        assert!(registry.get(super::RaftGroupId(0)).is_none());
+        // Meta forms on this node alone: its voters and nodes are this node,
+        // and the default replication factor of 3 runs as 1.
+        let mut placement = registry.placement_watch();
+        let view = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let view = placement.current();
+                if view.cluster().is_some() {
+                    return view;
+                }
+                assert!(placement.changed().await, "the meta runtime runs");
+            }
+        })
+        .await
+        .expect("meta bootstraps the cluster");
+        let me = ursula_proto::placement::NodeId::new(7);
+        let cluster = view.cluster().expect("bootstrapped");
+        assert_eq!(
+            cluster.params().meta_voters,
+            ursula_proto::placement::VoterSet::single(me)
+        );
+        assert_eq!(cluster.params().replication_factor.get(), 1);
+        assert_eq!(cluster.nodes().keys().copied().collect::<Vec<_>>(), vec![
+            me
+        ]);
         let client =
             crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default());
         let ready = |client: axum::Router| async move {
@@ -893,9 +939,99 @@ mod tests {
             .expect("the create applies");
         assert_eq!(ready(client).await, StatusCode::OK);
         assert_eq!(
-            super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await,
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
             super::WalShutdown::Clean
         );
+    }
+
+    /// A meta journal that does not read leaves the node without a meta
+    /// replica, and the node still starts, is ready and serves writes.
+    #[tokio::test]
+    async fn a_node_with_a_damaged_meta_journal_starts_and_serves() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = 1;
+        config.raft.node_id = 7;
+        config.raft.wal.path = Some(dir.path().to_owned());
+        config.raft.wal.fsync = ursula_config::WalFsync::Never;
+        config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
+        let log_dir = super::RaftWalDir::resolve(&config.raft.wal)
+            .unwrap()
+            .log_dir();
+        let start = || async {
+            super::init_state(
+                &config,
+                crate::Persistence::Raft {
+                    log_dir: log_dir.clone(),
+                },
+                false,
+            )
+            .await
+            .unwrap()
+        };
+        let stop = |state: crate::HttpState| async move {
+            let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+            assert_eq!(
+                super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal))
+                    .await,
+                super::WalShutdown::Clean
+            );
+        };
+        // The first run creates the meta journal.
+        let state = start().await;
+        assert_eq!(
+            state
+                .meta()
+                .with(ursula_raft::meta::runtime::MetaRuntime::state),
+            Some(ursula_raft::meta::runtime::MetaRuntimeState::Running)
+        );
+        stop(state).await;
+        std::fs::write(
+            log_dir.join("meta").join("journal.meta"),
+            b"broken meta metadata",
+        )
+        .unwrap();
+
+        let state = start().await;
+        assert_eq!(
+            state
+                .meta()
+                .with(ursula_raft::meta::runtime::MetaRuntime::state),
+            Some(ursula_raft::meta::runtime::MetaRuntimeState::Damaged(
+                ursula_control::MetaDamageKind::Journal
+            ))
+        );
+        let client =
+            crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default());
+        let ready = client
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(crate::READINESS_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ready.status(), StatusCode::OK);
+        let created = client
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/damaged-meta/events")
+                    .header("content-type", "text/plain")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        stop(state).await;
     }
 
     /// Without `raft.wal.path` a single node runs its WAL in a fresh
@@ -933,7 +1069,8 @@ mod tests {
         .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("the node runs Raft");
         assert_eq!(raft_wal.root(), log_dir.as_path());
-        let shutdown = super::shutdown_raft_wal(&state.runtime, Some(&raft_wal)).await;
+        let shutdown =
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await;
         assert_eq!(shutdown, super::WalShutdown::Clean);
         assert!(root.exists());
         wal_dir.close(shutdown);

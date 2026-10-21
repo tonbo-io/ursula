@@ -26,6 +26,8 @@ use crate::bootstrap::cold_health;
 use crate::bootstrap::commit_stall;
 use crate::bootstrap::egress;
 use crate::bootstrap::leadership;
+use crate::bootstrap::meta;
+use crate::bootstrap::meta::SpawnedMeta;
 use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::snapshot;
 use crate::bootstrap::snapshot::StoreGateInputs;
@@ -40,6 +42,11 @@ pub struct SpawnedRuntime {
     /// The node's Raft WAL when it runs Raft. Shut it down once the
     /// runtime's groups have stopped, so the next start finds a clean run.
     pub raft_wal: Option<RaftWal>,
+    /// The meta journal, opened before the runtime started, with what the
+    /// meta runtime starts with, when the node runs Raft. The server
+    /// starts it ([`SpawnedMeta::start`]). A caller that does not start it
+    /// runs no meta, and the WAL's shutdown closes the journal.
+    pub meta: Option<SpawnedMeta>,
 }
 
 /// Failure to spawn a runtime.
@@ -193,6 +200,31 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         &shard_map,
         config.server.cluster_id.as_ref(),
     )?;
+    // Before the runtime starts, so `raft-log/meta/` exists before any data
+    // group of the run opens and the peer identity is bound before any
+    // group dials or answers a peer.
+    let meta = match &storage {
+        GroupStorage::Raft(wal) => Some(
+            meta::open_meta(
+                config,
+                &topology,
+                wal,
+                &registry,
+                &shard_map,
+                engine_config.clone(),
+                ursula_raft::meta::replica::MetaSnapshotTrigger {
+                    interval: snapshot_drive_interval,
+                    max_dirty_age: snapshot::snapshot_cadence(
+                        &config.raft,
+                        topology.raft_group_count(),
+                    )
+                    .removal_floor,
+                },
+            )
+            .map_err(RuntimeError::from)?,
+        ),
+        GroupStorage::InMemory => None,
+    };
     let spawned = spawn_runtime_core(
         runtime_config,
         cold_store,
@@ -300,7 +332,7 @@ pub(crate) fn spawn_runtime_with_maintenance_drain(
         }
     }
 
-    Ok(spawned)
+    Ok(SpawnedRuntime { meta, ..spawned })
 }
 
 /// Core runtime construction — maps persistence + topology to the correct
@@ -384,6 +416,7 @@ fn spawn_singleton(
         runtime,
         raft_registry,
         raft_wal,
+        meta: None,
     })
 }
 
@@ -431,5 +464,6 @@ fn spawn_static_cluster(
         runtime,
         raft_registry: Some(registry),
         raft_wal,
+        meta: None,
     })
 }

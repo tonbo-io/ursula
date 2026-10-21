@@ -97,6 +97,7 @@ pub use bootstrap::Persistence;
 pub use bootstrap::SnapshotDriveSettings;
 pub use bootstrap::SnapshotDriver;
 pub use bootstrap::SpawnRuntimeError;
+pub use bootstrap::SpawnedMeta;
 pub use bootstrap::SpawnedRuntime;
 pub use bootstrap::Topology;
 pub use bootstrap::spawn_runtime;
@@ -394,6 +395,9 @@ mod http_state_fields {
         /// The node's Raft WAL when it runs Raft: how it opened, and the
         /// clean shutdown at exit.
         pub(crate) raft_wal: Option<ursula_raft::RaftWal>,
+        /// The node's meta runtime when it runs Raft, until shutdown takes
+        /// it.
+        pub(crate) meta: crate::bootstrap::MetaSlot,
         /// A Raft protocol (format-epoch) mismatch seen since start: readiness
         /// answers 503 `format_epoch_mismatch` until restart.
         pub(crate) format_epoch_mismatch: ursula_raft::FormatEpochMismatch,
@@ -608,6 +612,7 @@ impl HttpState {
             staged_parts,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
+            meta: crate::bootstrap::MetaSlot::default(),
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
@@ -635,6 +640,7 @@ impl HttpState {
             staged_parts,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
+            meta: crate::bootstrap::MetaSlot::default(),
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
@@ -683,6 +689,7 @@ impl HttpState {
             staged_parts,
             wal_disk: WalDiskMonitor::default(),
             raft_wal: None,
+            meta: crate::bootstrap::MetaSlot::default(),
             format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
             cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
         }
@@ -718,6 +725,17 @@ impl HttpState {
         }
         self.fields_mut().raft_wal = raft_wal;
         self
+    }
+
+    /// Records the node's meta runtime, which the server stops at shutdown.
+    pub(crate) fn with_meta(mut self, meta: crate::bootstrap::MetaSlot) -> Self {
+        self.fields_mut().meta = meta;
+        self
+    }
+
+    /// The node's meta runtime, while it runs.
+    pub(crate) fn meta(&self) -> &crate::bootstrap::MetaSlot {
+        &self.meta
     }
 
     /// Sets the configured `server.cluster_id` of a node without a WAL. A

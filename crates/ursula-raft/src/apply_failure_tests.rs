@@ -281,6 +281,7 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     // start the other group on that same owner, and never retry the poison
     // merely because another request or warmup arrives.
     let restarted_registry = RaftGroupHandleRegistry::default();
+    crate::peer_cluster::bind_single_node(&restarted_registry, &wal);
     let mut factory = crate::DurableRaftGroupEngineFactory::new(wal.clone())
         .with_registry(restarted_registry.clone());
     factory.fail_apply_at = Some((RaftGroupId(0), poison_index));

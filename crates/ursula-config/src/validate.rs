@@ -32,6 +32,13 @@ pub enum ValidationError {
     PeerClientUrlIsRaftUrl { node_id: u64 },
     #[error("raft.node_id {0} must be present in raft.peers")]
     NodeIdNotInPeers(u64),
+    /// The meta group's voters at genesis are nodes of the address book:
+    /// `raft.peers`, or this node alone when it is empty.
+    #[error(
+        "raft.meta_voters names node {node_id}, which is not in raft.peers (with raft.peers \
+         empty, raft.meta_voters may name only raft.node_id)"
+    )]
+    MetaVoterOutsidePeers { node_id: u64 },
     #[error("raft group {0} has no voters")]
     EmptyVoters(u32),
     #[error("raft group {0} voter {1} is not present in raft.peers")]
@@ -201,6 +208,7 @@ impl UrsulaConfig {
             return Err(ValidationError::ZeroSnapshotDriveInterval);
         }
         self.validate_peers()?;
+        self.validate_meta_voters()?;
         if !self.raft.groups.is_empty() {
             let peer_ids: BTreeSet<u64> = self.raft.peers.iter().map(|p| p.node_id).collect();
             self.validate_groups(&peer_ids)?;
@@ -338,6 +346,25 @@ impl UrsulaConfig {
             }
         }
         Ok(())
+    }
+
+    /// Every configured meta voter is in the address book: `raft.peers`, or
+    /// this node alone when it is empty.
+    fn validate_meta_voters(&self) -> Result<(), ValidationError> {
+        let Some(voters) = &self.raft.meta_voters else {
+            return Ok(());
+        };
+        let listed = |node_id: u64| {
+            if self.raft.peers.is_empty() {
+                node_id == self.raft.node_id
+            } else {
+                self.raft.peers.iter().any(|peer| peer.node_id == node_id)
+            }
+        };
+        match voters.iter().map(|id| id.get()).find(|id| !listed(*id)) {
+            Some(node_id) => Err(ValidationError::MetaVoterOutsidePeers { node_id }),
+            None => Ok(()),
+        }
     }
 
     fn validate_non_zero_durations(&self) -> Result<(), ValidationError> {

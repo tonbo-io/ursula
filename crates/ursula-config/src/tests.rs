@@ -639,6 +639,116 @@ url = "http://node-2:4439"
         );
     }
 
+    /// `raft.meta_voters` and `raft.placement` parse into the kernel's
+    /// types: unset they default (no meta voters, RF 3, 4 moves), a repeated
+    /// voter counts once and a zero move limit is kept.
+    #[test]
+    fn meta_voters_and_placement_parse_into_the_kernel_types() {
+        use ursula_proto::placement::NodeId;
+
+        let tmp = temp_config(".toml", "");
+        let defaults = load_config(Some(tmp.path()), None, Some(1)).unwrap();
+        assert_eq!(defaults.raft.meta_voters, None);
+        assert_eq!(defaults.raft.placement.replication_factor.get(), 3);
+        assert_eq!(defaults.raft.placement.max_concurrent_moves.get(), 4);
+
+        let tmp = temp_config(
+            ".toml",
+            r#"
+[server]
+cluster_id = "meta-test"
+
+[raft]
+meta_voters = [3, 1, 3]
+
+[raft.wal]
+path = "/tmp/ursula-wal"
+
+[raft.placement]
+replication_factor = 2
+max_concurrent_moves = 0
+
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:4437"
+
+[[raft.peers]]
+node_id = 3
+url = "http://127.0.0.1:4438"
+"#,
+        );
+        let config = load_config(Some(tmp.path()), None, Some(1)).unwrap();
+        let voters = config.raft.meta_voters.expect("meta voters are set");
+        assert_eq!(voters.iter().collect::<Vec<_>>(), vec![
+            NodeId::new(1),
+            NodeId::new(3)
+        ]);
+        assert_eq!(config.raft.placement.replication_factor.get(), 2);
+        assert_eq!(config.raft.placement.max_concurrent_moves.get(), 0);
+    }
+
+    /// An empty meta voter list and a zero replication factor fail the
+    /// parse, and so does an unknown `raft.placement` key.
+    #[test]
+    fn an_empty_meta_voter_list_and_a_zero_replication_factor_are_refused() {
+        for (contents, key) in [
+            ("[raft]\nmeta_voters = []\n", "meta_voters"),
+            (
+                "[raft.placement]\nreplication_factor = 0\n",
+                "replication_factor",
+            ),
+            ("[raft.placement]\ngroup_voters = 3\n", "group_voters"),
+        ] {
+            let tmp = temp_config(".toml", contents);
+            let err = load_config(Some(tmp.path()), None, Some(1)).unwrap_err();
+            assert!(
+                matches!(err, crate::ConfigError::TomlParse(_)) && err.to_string().contains(key),
+                "{contents}: {err}"
+            );
+        }
+    }
+
+    /// The meta voters are nodes of the address book: `raft.peers`, or this
+    /// node alone when it is empty.
+    #[test]
+    fn meta_voters_outside_the_address_book_are_refused() {
+        let refused = |contents: &str| {
+            let tmp = temp_config(".toml", contents);
+            match load_config(Some(tmp.path()), None, Some(1)) {
+                Err(crate::ConfigError::Validation(
+                    crate::validate::ValidationError::MetaVoterOutsidePeers { node_id },
+                )) => Some(node_id),
+                Err(err) => panic!("{contents}: {err}"),
+                Ok(_) => None,
+            }
+        };
+        assert_eq!(refused("[raft]\nmeta_voters = [1]\n"), None);
+        assert_eq!(refused("[raft]\nmeta_voters = [1, 2]\n"), Some(2));
+        let cluster = r#"
+[server]
+cluster_id = "meta-test"
+
+[raft.wal]
+path = "/tmp/ursula-wal"
+
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:4437"
+
+[[raft.peers]]
+node_id = 2
+url = "http://127.0.0.1:4438"
+"#;
+        assert_eq!(
+            refused(&format!("[raft]\nmeta_voters = [2, 1]\n{cluster}")),
+            None
+        );
+        assert_eq!(
+            refused(&format!("[raft]\nmeta_voters = [1, 4]\n{cluster}")),
+            Some(4)
+        );
+    }
+
     /// The memory WAL is gone: its settings are unknown keys, which fail the
     /// load instead of being ignored.
     #[test]

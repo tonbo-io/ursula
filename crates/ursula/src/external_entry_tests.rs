@@ -201,7 +201,7 @@ async fn external_json_writes_of_tiny_messages_make_small_entries() {
     );
 
     assert_eq!(
-        crate::server::shutdown_raft_wal(&runtime, Some(&raft_wal)).await,
+        crate::server::shutdown_raft_wal(&runtime, None, Some(&raft_wal)).await,
         crate::server::WalShutdown::Clean,
         "the Raft WAL shuts down cleanly"
     );

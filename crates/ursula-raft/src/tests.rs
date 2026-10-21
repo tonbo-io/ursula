@@ -351,10 +351,11 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
 
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
+    let wal = start_wal(wal_root.path(), 1, 1);
+    crate::peer_cluster::bind_single_node(&registry, &wal);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
-            .with_registry(registry.clone()),
+        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
@@ -441,10 +442,11 @@ async fn group_rpcs_check_their_target_before_the_group() {
 
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
+    let wal = start_wal(wal_root.path(), 1, 1);
+    crate::peer_cluster::bind_single_node(&registry, &wal);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
-            .with_registry(registry.clone()),
+        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();
@@ -555,10 +557,11 @@ async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() 
 
     let wal_root = tempfile::tempdir().unwrap();
     let registry = RaftGroupHandleRegistry::default();
+    let wal = start_wal(wal_root.path(), 1, 1);
+    crate::peer_cluster::bind_single_node(&registry, &wal);
     let runtime = ShardRuntime::spawn_with_engine_factory(
         RuntimeConfig::new(1, 1),
-        DurableRaftGroupEngineFactory::new(start_wal(wal_root.path(), 1, 1))
-            .with_registry(registry.clone()),
+        DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
     )
     .unwrap();
     runtime.warm_group(RaftGroupId(0)).await.unwrap();

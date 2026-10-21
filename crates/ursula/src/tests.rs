@@ -532,6 +532,12 @@ fn registered_durable_factory(
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
     .expect("start the Raft WAL");
+    // As the server binds its node before the runtime starts: node 1, the
+    // id of every single-node group, of the WAL's cluster.
+    registry.peer_cluster().bind(
+        ursula_raft::PeerIdentity::new(1, raft_wal.cluster_id().clone()),
+        ursula_raft::PeerDirectory::default(),
+    );
     (
         ursula_raft::DurableRaftGroupEngineFactory::new(raft_wal.clone())
             .with_registry(registry.clone()),
@@ -545,7 +551,7 @@ fn registered_durable_factory(
 /// process.
 async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
     assert_eq!(
-        crate::server::shutdown_raft_wal(runtime, Some(raft_wal)).await,
+        crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
         crate::server::WalShutdown::Clean,
         "the Raft WAL shuts down cleanly"
     );
@@ -653,6 +659,11 @@ async fn spawn_static_grpc_test_node(
             )
         }
     };
+    // As the server binds its node before the runtime starts.
+    registry.peer_cluster().bind(
+        ursula_raft::PeerIdentity::new(node_id, log_stores.cluster_id().clone()),
+        crate::shared_peers(factory_peers.clone()),
+    );
     let mut factory = StaticGrpcRaftGroupEngineFactory::new(
         node_id,
         crate::shared_peers(factory_peers),

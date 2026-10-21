@@ -22,7 +22,6 @@ use super::RaftGroupEngine;
 use super::RaftGroupEngineOptions;
 use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::RaftWal;
-use crate::peer_cluster::PeerIdentity;
 use crate::peer_directory::PeerDirectory;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
@@ -162,13 +161,11 @@ impl DurableRaftGroupEngineFactory {
 
     /// Publishes each live group's barrier, Raft handle and cold cache, or its
     /// terminal replay-failure diagnostics when committed application stops.
+    ///
+    /// It binds no peer identity: the server binds the node's
+    /// ([`crate::PeerCluster::bind`]) before the runtime starts, and a bind
+    /// here would replace it.
     pub fn with_registry(mut self, registry: RaftGroupHandleRegistry) -> Self {
-        // A single node has no peers, but its Raft gRPC plane still refuses a
-        // node of another cluster by the id of its WAL root.
-        registry.peer_cluster().bind(
-            PeerIdentity::new(SINGLE_NODE_ID, self.log_stores.cluster_id().clone()),
-            PeerDirectory::default(),
-        );
         if let Some(config) = &self.engine_config {
             registry.set_snapshot_build_max_concurrency(config.snapshot_build_max_concurrency);
         }
@@ -293,8 +290,6 @@ impl GroupEngineFactory for DurableRaftGroupEngineFactory {
 pub struct StaticGrpcRaftGroupEngineFactory {
     transports: Arc<Mutex<BTreeMap<u16, Arc<crate::grpc::CoreRaftTransport>>>>,
     node_id: u64,
-    /// This node and the cluster id of its WAL root, which its peers check.
-    identity: PeerIdentity,
     /// `raft.peers`, this node among them.
     peers: PeerDirectory,
     per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
@@ -311,8 +306,11 @@ pub struct StaticGrpcRaftGroupEngineFactory {
 
 impl StaticGrpcRaftGroupEngineFactory {
     /// Groups of a static gRPC cluster whose Raft logs live in `log_stores`'
-    /// journals; how they opened is published in `registry`, and the cluster
-    /// id their root holds is the one this node's peers must share.
+    /// journals; how they opened is published in `registry`. They send as
+    /// the identity bound in `registry`'s peer cluster
+    /// ([`crate::PeerCluster::bind`]), which the caller binds before any
+    /// group opens: a group of a node with none bound, or bound as another
+    /// node, is refused as an invalid configuration.
     pub fn new(
         node_id: u64,
         peers: PeerDirectory,
@@ -321,14 +319,9 @@ impl StaticGrpcRaftGroupEngineFactory {
         log_stores: RaftWal,
     ) -> Self {
         registry.set_wal_opening(log_stores.opening());
-        let identity = PeerIdentity::new(node_id, log_stores.cluster_id().clone());
-        registry
-            .peer_cluster()
-            .bind(identity.clone(), peers.clone());
         Self {
             transports: Arc::default(),
             node_id,
-            identity,
             peers,
             per_group_voters: BTreeMap::new(),
             initialize_membership,
@@ -477,6 +470,12 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
             if !self.peers.contains(self.node_id) {
                 return Err(invalid_configuration(placement));
             }
+            let identity = self
+                .registry
+                .peer_cluster()
+                .identity()
+                .filter(|identity| identity.node_id() == self.node_id)
+                .ok_or_else(|| invalid_configuration(placement))?;
             let voters = self.group_voters(placement)?;
             // The log store and the recovery gate go first: a gated replica's
             // Raft core starts with elections disabled.
@@ -504,7 +503,7 @@ impl GroupEngineFactory for StaticGrpcRaftGroupEngineFactory {
                 .or_insert_with(|| {
                     Arc::new(crate::grpc::CoreRaftTransport::with_budget(
                         self.registry.append_send_budget.clone(),
-                        self.identity.clone(),
+                        identity,
                         self.registry.peer_cluster().clone(),
                     ))
                 })

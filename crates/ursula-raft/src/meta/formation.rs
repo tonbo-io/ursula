@@ -44,7 +44,8 @@ const FORMATION_RECHECK: Duration = Duration::from_secs(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FormationParams {
     pub max_concurrent_moves: MoveLimit,
-    /// `Reservation` exactly under the startup reservation.
+    /// A server always passes `Placement`: the startup reservation does
+    /// not reach the meta group.
     pub maintenance: MaintenanceAuthority,
 }
 
