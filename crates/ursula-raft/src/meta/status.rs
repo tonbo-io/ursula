@@ -36,7 +36,7 @@ use super::runtime::MetaRuntimeStatus;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
 
-type Confirmation<'a> =
+pub(crate) type Confirmation<'a> =
     Pin<Box<dyn Future<Output = Result<ConfirmedView, MetaBarrierError>> + Send + 'a>>;
 type Submission<'a> =
     Pin<Box<dyn Future<Output = Result<ControlApplied, MetaWriteError>> + Send + 'a>>;
@@ -97,6 +97,28 @@ impl MetaStatusReader {
     /// Whether this node runs a meta replica now.
     pub fn state(&self) -> MetaRuntimeState {
         self.status.state.borrow().clone()
+    }
+
+    /// The node the status is of.
+    pub(crate) fn node(&self) -> NodeId {
+        self.node
+    }
+
+    pub(crate) fn registry(&self) -> &RaftGroupHandleRegistry {
+        &self.registry
+    }
+
+    /// The meta group's answers to this node's registration.
+    pub(crate) fn registration_answers(
+        &self,
+    ) -> crate::rt::sync::watch::Receiver<RegistrationStatus> {
+        self.status.registration.clone()
+    }
+
+    /// This node's view, confirmed by a meta read barrier
+    /// ([`MetaHandle::confirm_view`]).
+    pub(crate) fn confirm_view(&self) -> Confirmation<'_> {
+        self.meta.confirm_view()
     }
 
     /// This node's placement status, from its current view.

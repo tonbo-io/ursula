@@ -56,8 +56,8 @@
 //!   the one source every reader of a peer address takes it from.
 //! - `placement_wiring`: the one seam of every placement input of a data
 //!   replica's open ([`PlacementInputs`]): admission, the seed role and the
-//!   node sets its recovery drivers read, with production's interim inputs
-//!   over the seed rule ([`ConfigSeeds`]).
+//!   node sets its recovery drivers read, from meta ([`MetaPlacement`]),
+//!   with production's interim inputs over the seed rule ([`ConfigSeeds`]).
 //! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
 //!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
@@ -65,6 +65,10 @@
 //! - [`snapshot_holds`]: what one engine incarnation of a group may still
 //!   use of its own snapshot objects, held in memory, and the GC pass that
 //!   deletes every other object in the node's directory (#687, #669).
+//! - [`hosting`]: the hosting driver, the one owner of what a node runs:
+//!   it plans over the journals and the placement view, writes the
+//!   [`HostingSet`] every open is admitted by, and opens and closes
+//!   replicas through a [`GroupHost`].
 //! - [`history`]: history identity on a group: the leader's fence while
 //!   the group's history is pending and its obligation to propose the
 //!   history event (genesis, recovery plans).
@@ -103,6 +107,7 @@ mod format_epoch;
 mod forward;
 mod grpc;
 mod history;
+pub mod hosting;
 #[cfg(any(test, madsim))]
 mod in_process;
 mod log_store;
@@ -168,6 +173,12 @@ pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_server;
 pub use grpc::raft_grpc_service;
 pub use history::GroupHistory;
+pub use hosting::GroupHost;
+pub use hosting::HostingDriver;
+pub use hosting::HostingSet;
+pub use hosting::HostingStatus;
+pub use hosting::HostingStatusWatch;
+pub use hosting::HostingTask;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessEndpoint;
 #[cfg(any(test, madsim))]
@@ -244,6 +255,7 @@ pub use placement_wiring::FixedNodes;
 pub use placement_wiring::FixedPlacement;
 pub use placement_wiring::FixedRole;
 pub use placement_wiring::GroupNodes;
+pub use placement_wiring::MetaPlacement;
 pub use placement_wiring::PlacementInputs;
 pub use placement_wiring::SeedRole;
 pub use registry::IncomingTransferError;

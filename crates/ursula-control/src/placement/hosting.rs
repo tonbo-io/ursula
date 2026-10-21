@@ -333,7 +333,14 @@ pub enum SeedRoleOf {
 /// the view shows the group `Seeded` with the node among its voters. Only
 /// `Initializer` may initialize.
 pub fn seed_role(view: &ConfirmedView, me: NodeId, group: RaftGroupId) -> Option<SeedRoleOf> {
-    let placement = view.view().cluster()?.group(group)?;
+    shown_seed_role(view.view(), me, group)
+}
+
+/// The seed role a view shows, confirmed or not, by [`seed_role`]'s rule.
+/// An unconfirmed role only decides whether a seed driver starts: the
+/// driver acts on [`seed_role`] of a confirmed view.
+pub fn shown_seed_role(view: &PlacementView, me: NodeId, group: RaftGroupId) -> Option<SeedRoleOf> {
+    let placement = view.cluster()?.group(group)?;
     match placement {
         GroupPlacement::Seeded {
             voters,

@@ -205,8 +205,7 @@ impl MadsimRuntimeRaftNetworkFactory {
             .get(&raft_group_id.0)
             .ok_or(RuntimeNetworkError::GroupUnknown { raft_group_id })?;
         control.registry.unregister(leader_id);
-        self.front_door
-            .unregister_group_for_simulation(raft_group_id);
+        self.front_door.unregister_group(raft_group_id);
         Ok(leader_id)
     }
 

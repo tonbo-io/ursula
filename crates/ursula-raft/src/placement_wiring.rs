@@ -15,10 +15,13 @@
 //!   each read at its use, so a placement that changes reaches a running
 //!   replica.
 //!
-//! [`ConfigSeeds`] is production's interim implementation, the seed rule
-//! over `raft.peers`. [`FixedPlacement`] gives tests and the simulation one
-//! fixed voter set. The meta group keeps its genesis driver and passes its
-//! claim through [`FixedNodes`] and [`FixedRole`].
+//! [`MetaPlacement`] answers from meta: admission from the hosting driver's
+//! [`HostingSet`], the seed role and the node sets from this node's
+//! placement views. [`ConfigSeeds`] is production's interim
+//! implementation, the seed rule over `raft.peers`. [`FixedPlacement`]
+//! gives tests and the simulation one fixed voter set. The meta group keeps
+//! its genesis driver and passes its claim through [`FixedNodes`] and
+//! [`FixedRole`].
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -29,7 +32,10 @@ use ursula_control::Admission;
 use ursula_control::SeedRoleOf;
 use ursula_shard::RaftGroupId;
 
+use crate::hosting::HostingSet;
 use crate::meta::confirm::MetaBarrierError;
+use crate::meta::status::MetaStatusReader;
+use crate::meta::watch::GroupPlacementWatch;
 
 /// Every placement input of a data replica's open, by group.
 pub trait PlacementInputs: Send + Sync + 'static {
@@ -101,6 +107,112 @@ impl GroupNodes for FixedNodes {
 
     fn voters(&self) -> BTreeSet<u64> {
         self.voters.clone()
+    }
+}
+
+/// Production's placement inputs from meta (design 4.6):
+///
+/// - admission from the [`HostingSet`], which only the hosting driver
+///   writes ([`crate::HostingDriver`]);
+/// - the seed role from this node's view, confirmed by a meta read barrier
+///   ([`crate::meta::handle::MetaHandle::confirm_view`]) for the role a
+///   driver acts on ([`ursula_control::seed_role`]);
+/// - the node sets from the group's placement in the latest view
+///   ([`GroupPlacementWatch`]): every voter of its current and target
+///   voters as candidates, and the target voters as the voters an
+///   initializer initializes and the heal driver restores. A group without
+///   a placement has neither, so its replica asks only the members of its
+///   own membership and heals nothing.
+#[derive(Debug, Clone)]
+pub struct MetaPlacement {
+    meta: MetaStatusReader,
+    hosting: HostingSet,
+}
+
+impl MetaPlacement {
+    /// The inputs of the node `meta` reports on, admitting what `hosting`
+    /// holds.
+    pub fn new(meta: MetaStatusReader, hosting: HostingSet) -> Self {
+        Self { meta, hosting }
+    }
+}
+
+impl PlacementInputs for MetaPlacement {
+    fn admission(&self, group: RaftGroupId) -> Option<Admission> {
+        self.hosting.admission(group)
+    }
+
+    fn seed_role(&self, group: RaftGroupId) -> Arc<dyn SeedRole> {
+        Arc::new(MetaSeedRole {
+            meta: self.meta.clone(),
+            group,
+        })
+    }
+
+    fn nodes(&self, group: RaftGroupId) -> Arc<dyn GroupNodes> {
+        Arc::new(PlacedNodes(GroupPlacementWatch::new(
+            self.meta.registry().placement_watch(),
+            group,
+        )))
+    }
+}
+
+/// A seed role read from this node's placement views.
+struct MetaSeedRole {
+    meta: MetaStatusReader,
+    group: RaftGroupId,
+}
+
+impl SeedRole for MetaSeedRole {
+    fn local_role(&self) -> Option<SeedRoleOf> {
+        ursula_control::shown_seed_role(
+            &self.meta.registry().placement_watch().current(),
+            self.meta.node(),
+            self.group,
+        )
+    }
+
+    fn confirmed_role(&self) -> BoxFuture<'_, Result<Option<SeedRoleOf>, MetaBarrierError>> {
+        Box::pin(async move {
+            let confirmed = self.meta.confirm_view().await?;
+            Ok(ursula_control::seed_role(
+                &confirmed,
+                self.meta.node(),
+                self.group,
+            ))
+        })
+    }
+}
+
+/// One group's node sets from its placement in the latest view.
+struct PlacedNodes(GroupPlacementWatch);
+
+impl GroupNodes for PlacedNodes {
+    fn candidates(&self) -> BTreeSet<u64> {
+        self.0
+            .current()
+            .map(|placement| {
+                placement
+                    .current_voters()
+                    .iter()
+                    .chain(placement.target_voters().iter())
+                    .map(ursula_proto::placement::NodeId::get)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn voters(&self) -> BTreeSet<u64> {
+        self.0
+            .current()
+            .map(|placement| {
+                placement
+                    .target_voters()
+                    .iter()
+                    .map(ursula_proto::placement::NodeId::get)
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 

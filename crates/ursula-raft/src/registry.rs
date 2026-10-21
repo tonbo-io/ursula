@@ -227,6 +227,9 @@ pub struct RaftGroupHandleRegistry {
     meta: Arc<arc_swap::ArcSwapOption<crate::meta::replica::ActiveMeta>>,
     /// This node's placement views, which outlive every meta replica.
     placement: crate::meta::watch::PlacementPublisher,
+    /// Changes whenever a data group's entry is published or removed, so
+    /// the hosting driver plans again ([`crate::hosting`]).
+    group_changes: Arc<crate::rt::sync::watch::Sender<()>>,
 }
 
 impl Default for RaftGroupHandleRegistry {
@@ -252,6 +255,7 @@ impl Default for RaftGroupHandleRegistry {
             follower_log_reversions: Default::default(),
             meta: Arc::default(),
             placement: Default::default(),
+            group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
         }
     }
 }
@@ -727,6 +731,7 @@ impl RaftGroupHandleRegistry {
             groups.insert(engine.placement.raft_group_id.0, entry.clone());
             groups
         });
+        self.group_changes.send_replace(());
         self.refresh_group_elections(engine.placement.raft_group_id);
     }
 
@@ -739,15 +744,34 @@ impl RaftGroupHandleRegistry {
         self.register_engine(engine);
     }
 
-    /// Forgets this node's replica of `group`, as a node that stopped
-    /// hosting it would: the leadership view no longer knows the group.
-    #[cfg(madsim)]
-    pub fn unregister_group_for_simulation(&self, group: RaftGroupId) {
+    /// Forgets this node's replica of `group`, as a node that stops
+    /// hosting it does (step 2 of a close, design 7.3): no transport finds
+    /// its handle and the leadership view no longer knows the group. The
+    /// engine itself stops apart from this, through its runtime.
+    pub fn unregister_group(&self, group: RaftGroupId) {
         self.groups.rcu(|groups| {
             let mut groups = (**groups).clone();
             groups.remove(&group.0);
             groups
         });
+        self.group_changes.send_replace(());
+    }
+
+    /// The data groups this node publishes an entry of: every registered
+    /// engine and every group whose apply stopped.
+    pub fn registered_groups(&self) -> std::collections::BTreeSet<RaftGroupId> {
+        self.groups
+            .load()
+            .keys()
+            .copied()
+            .map(RaftGroupId)
+            .collect()
+    }
+
+    /// A watch that changes whenever a data group's entry is published or
+    /// removed.
+    pub(crate) fn subscribe_group_changes(&self) -> crate::rt::sync::watch::Receiver<()> {
+        self.group_changes.subscribe()
     }
 
     pub(crate) fn register_apply_stopped(
@@ -762,6 +786,7 @@ impl RaftGroupHandleRegistry {
             groups.insert(group.0, entry.clone());
             groups
         });
+        self.group_changes.send_replace(());
     }
 
     /// The group's recovery gate, if it has one.

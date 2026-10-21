@@ -333,6 +333,12 @@ impl RaftWal {
         self.node.opening().recovery
     }
 
+    /// Where the root's shard map places `group`, `None` past its group
+    /// count.
+    pub fn placement(&self, group: RaftGroupId) -> Option<ShardPlacement> {
+        self.topology.placement(group)
+    }
+
     /// The journal directory of core `core_id`.
     pub fn core_dir(&self, core_id: CoreId) -> PathBuf {
         core_dir(self.root(), core_id.0)
