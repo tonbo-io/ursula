@@ -45,6 +45,7 @@ use super::MetaForwardError;
 use super::confirm::MetaBarrierError;
 use super::replica::ActiveMeta;
 use super::replica::WriteOrigin;
+use super::root::RootGuard;
 use super::watch::PlacementWatch;
 use crate::BarrierAnswer;
 use crate::ForwardError;
@@ -150,6 +151,8 @@ pub struct MetaHandle<T> {
     claimed: VoterSet,
     /// The ids of `raft.peers`.
     peers: BTreeSet<NodeId>,
+    /// This run's root, which every confirmed view is checked against.
+    root: Option<RootGuard>,
 }
 
 impl<T: RecoveryTransport> MetaHandle<T> {
@@ -166,7 +169,15 @@ impl<T: RecoveryTransport> MetaHandle<T> {
             transport,
             claimed: claim.meta_voters.clone(),
             peers: claim.peers.to_set(),
+            root: None,
         }
+    }
+
+    /// Checks every view this handle confirms against `root`: a confirmed
+    /// view that binds this node id elsewhere supersedes the process.
+    pub(crate) fn with_root_guard(mut self, root: RootGuard) -> Self {
+        self.root = Some(root);
+        self
     }
 
     /// A watch of this node's placement views.
@@ -286,7 +297,7 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         drop(active);
         let bound = barrier_bound(&answer);
         let mut watch = self.registry.placement_watch();
-        crate::rt::time::timeout(CONFIRM_WAIT, async {
+        let confirmed = crate::rt::time::timeout(CONFIRM_WAIT, async {
             loop {
                 match confirm(watch.current(), bound) {
                     // Not applied up to the bound yet: wait for the next view.
@@ -304,7 +315,11 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         .await
         .map_err(|_elapsed| MetaBarrierError::TimedOut {
             waited: CONFIRM_WAIT,
-        })?
+        })??;
+        if let Some(root) = &self.root {
+            root.check_view(confirmed.view(), true);
+        }
+        Ok(confirmed)
     }
 }
 

@@ -553,12 +553,13 @@ mod tests {
         config.raft.group_count = 1;
         config.raft.node_id = 7;
         assert!(config.raft.peers.is_empty());
-        let wal = tempfile::tempdir().unwrap();
+        let wal = crate::tests::TestWalRoot::new();
         let persistence = crate::Persistence::Raft {
             log_dir: wal.path().join("raft-log"),
         };
         let state = super::init_state(&config, persistence).await.unwrap();
-        let response = crate::admin_router(state)
+        let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let response = crate::admin_router(state.clone())
             .oneshot(
                 Request::builder()
                     .uri("/__ursula/metrics")
@@ -573,6 +574,13 @@ mod tests {
                 .unwrap();
         assert_eq!(metrics["process_node_id"], 7);
         assert_eq!(metrics["process_incarnation"].as_str().unwrap().len(), 32);
+        // The WAL shuts down before its directory goes: a journal writer
+        // still running then would fail its next write and stop the test
+        // process.
+        assert!(matches!(
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
+            super::WalShutdown::Clean(_)
+        ));
     }
 
     /// A node without a WAL (in-memory mode) names the configured cluster
@@ -636,7 +644,7 @@ mod tests {
         use axum::body::to_bytes;
         use axum::http::Request;
         use tower::ServiceExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
         config.raft.group_count = 1;
@@ -711,7 +719,7 @@ mod tests {
         use axum::http::Request;
         use axum::http::StatusCode;
         use tower::ServiceExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
         config.raft.group_count = 1;
@@ -849,7 +857,7 @@ mod tests {
         use ursula_proto::admin::RecoveryPlanRefused;
         use ursula_proto::admin::RecoveryPlanRequest;
         use ursula_proto::admin::ReplicaLogView;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
         config.raft.group_count = 1;
@@ -974,7 +982,7 @@ mod tests {
         use axum::http::Request;
         use axum::http::StatusCode;
         use tower::ServiceExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
         config.raft.group_count = 1;

@@ -218,7 +218,14 @@ preserve its data.
 
 ### Rejoining a wiped node
 
-A voter whose WAL directory was wiped or replaced, for example after a lost disk, starts with an empty log for every group. For each group:
+A voter whose WAL directory was wiped or replaced, for example after a lost disk, starts with an empty log for every group under a new root. The meta group still binds the node id to the old root, so the node's data replicas stay out of every group: they grant no vote and their recovery gates stay closed. Its placement status shows the registration `root_refused` with the old root's slot, and readiness reports `root_refused`. Once the old disk is revoked (the old process ended, its volume was detached or destroyed, or its host is shut down, on Kubernetes a pod deleted normally, a force-deleted pod whose VolumeAttachment is gone, or a node tainted out of service), release it from any machine that reaches another node's admin plane:
+
+```bash
+# R is the old root, as the refused node's placement status names it
+ursulactl node replace-disk --config cluster.toml --node 3 --expect-root 9e3779b97f4a7c15
+```
+
+The release and the new disk may come in either order. The node binds its new root within a few seconds of the release with no restart, waits 12 seconds for any process of the old disk to fall silent (readiness `predecessor_wait`), and then rejoins. A release cannot be undone: the released root never binds the node id again. A process that keeps its disk past a release, or that holds state and finds its id bound to another root, fences itself for good and reports `superseded`. Release a disk, never a process. Then, for each group:
 
 - **It does not initialize the group again.** A group's initializer, the first node of its seed voters, runs `Initialize` only when every other voter of the group answers that it holds nothing for the group either and no leader is seen. A fresh install still bootstraps this way. One voter holding entries or following a leader means the group exists, and the node waits to be replicated to. It waits for every voter, not a quorum, so a fresh install with a voter that never comes up stays uninitialized (it logs "waits for every voter before initializing").
 - **It refuses replication until the leader proves a quorum without it.** The node lost its vote with its disk, so it cannot tell the current leader from a stale one. It refuses appends, heartbeats, snapshots and votes until the group's leader confirms a fresh ReadIndex barrier with a quorum of the other voters. The node then records that leader's vote as its vote floor and accepts replication. In a 3-voter group that quorum needs both other voters up. While the wiped voter waits and another voter is down, the group has no quorum and cannot commit writes.

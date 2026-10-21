@@ -64,6 +64,7 @@ use super::replica::MetaReplicaConfig;
 use super::replica::MetaReplicaRestart;
 use super::replica::MetaReplicaTasks;
 use super::replica::MetaSnapshotTrigger;
+use super::root::RootGuard;
 use super::status::MetaStatusReader;
 use super::target::MetaTargetSource;
 use crate::FixedNodes;
@@ -181,7 +182,15 @@ where
             bootstrap_refusal: refusal_rx,
             reconcile: reconcile_rx,
         };
-        let handle = MetaHandle::new(me, registry.clone(), transport.clone(), &config.claim);
+        let guard = RootGuard::new(
+            me,
+            wal.incarnation().root,
+            wal.empty_at_open(),
+            wal.fence(),
+            registry.clone(),
+        );
+        let handle = MetaHandle::new(me, registry.clone(), transport.clone(), &config.claim)
+            .with_root_guard(guard.clone());
         let pauses = MetaPauses::default();
         let mut runtime = Self {
             reader: MetaStatusReader::new(
@@ -269,9 +278,16 @@ where
             let state = runtime.status.state.clone();
             move || matches!(*state.borrow(), MetaRuntimeState::Damaged { .. })
         };
+        runtime
+            .tasks
+            .push(crate::rt::spawn(super::root::watch_views(
+                guard.clone(),
+                registry.placement_watch(),
+            )));
         runtime.tasks.push(crate::rt::spawn(run_registration(
             handle.clone(),
             registrant,
+            guard,
             registry.clone(),
             registration,
             pauses.clone(),

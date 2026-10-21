@@ -77,7 +77,10 @@ async fn an_external_append_whose_leadership_ended_during_its_put_answers_503_an
         ),
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
+    let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm");
     let raft = registry.get(RaftGroupId(0)).expect("group 0");
@@ -86,8 +89,8 @@ async fn an_external_append_whose_leadership_ended_during_its_put_answers_503_an
         .await
         .expect("leader");
     let cold_store = runtime.cold_store().expect("a memory cold store");
-    let state =
-        HttpState::with_raft_registry(runtime, registry.clone()).with_external_payload_min_bytes(1);
+    let state = HttpState::with_raft_registry(runtime.clone(), registry.clone())
+        .with_external_payload_min_bytes(1);
     let app = router_with_http_state(state);
     let created = app
         .clone()
@@ -187,5 +190,6 @@ async fn an_external_append_whose_leadership_ended_during_its_put_answers_503_an
         .await
         .expect("response");
     assert!(repeated.status().is_success(), "{:?}", repeated.status());
+    crate::tests::shutdown_test_wal(&runtime, &raft_wal).await;
     crate::tests::remove_test_path(&raft_root);
 }

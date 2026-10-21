@@ -104,6 +104,58 @@ its seed role right before it does. A replica writes its genesis floor only
 once it confirmed a seed role. A replica that
 ever held the group never initializes it again.
 
+### Roots in meta and disk replacement
+
+Each node id's record in meta holds a root slot: the root (the WAL disk,
+named by the id `topology.bin` drew) the id is bound to, `bound` or
+`released`. A node registers its root at every start, and says whether the
+root was empty when it opened. The first registration of an id binds its
+root, and a registration of the bound root changes nothing. A released slot
+binds only an empty root other than the released one, and the released root
+never binds again (`crates/ursula-control/src/placement/apply.rs`). The
+placement status shows every slot: the bootstrapped cluster's node records,
+and before Bootstrap the `registering` view's map from each registered id to
+its slot.
+
+The registration judges a refusal for another root by how the run stands on
+its root (`crates/ursula-raft/src/meta/registration.rs`,
+`crates/ursula-raft/src/meta/root.rs`). An empty root that meta has not
+bound in this run never fences itself. Its data replicas open with the run
+but are held out from its open until meta binds the root and then through
+the predecessor wait (`crates/ursula-raft/src/predecessor_wait.rs`): they
+grant no vote, run no gate driver, write no vote floor and no snapshot
+object, so their gates stay closed and they take no replication. Its meta
+replica is not held before an answer, so a forming cluster's meta group
+elects. A fresh cluster's data groups therefore form only once meta
+answered its nodes' registrations, and genesis values that disagree, which
+keep meta from forming, keep the data groups from forming too. A refusal for another root makes the run owe the predecessor wait:
+from then on its meta replica grants no vote and writes no floor, and the
+node sheds every leadership. Its registration status is `root_refused` with
+the slot, readiness reports `root_refused`, and it registers again at most
+5 seconds apart. Once an operator released the old root it binds with no
+restart, waits out its predecessor (readiness `predecessor_wait`), and its
+replicas rejoin through their gates as in the rest of this section.
+
+A root that holds state, or that meta bound in this run, is superseded for
+good on a registration refused for another root, on any applied view that
+shows its root released, and on a view a meta read barrier confirmed that
+binds its id to another root. An unconfirmed view may show the slot of a
+replica still applying history, so only a release counts there. A
+superseded process takes part in no Raft traffic, writes nothing more to
+its WAL, never records a clean end, answers clients `503` and reports
+readiness `superseded` until it exits.
+
+`ursulactl node replace-disk --node N --expect-root R` releases `R`
+through `POST /__ursula/placement/nodes/{node}/replace-disk` on another
+node's admin plane, a compare-and-set on the expected root that answers the
+node's record and `409` (`stale_root`) for a slot on another root. It reads
+`N`'s slot from a confirmed view first. Without `--force` it refuses when
+`N`'s own process still runs on `R` or reports ready. A release is safe only
+once the old disk is revoked: the old process ended, its volume was detached
+or destroyed, or its host is shut down. A process without its disk stops
+within its disk lease, and the new root waits longer than any lease from its
+binding, so the old process falls silent first.
+
 ## 3. Admin membership surface
 
 The admin plane binds `server.admin_listen`, which is pod loopback by default
@@ -121,6 +173,7 @@ and answer `400` for `meta`:
 | `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` | Take a recovery plan for a stalled group. Its `floor` names the plane (`meta` or `seeded`), and a floor of the other plane is refused with `floor_other_plane` before the plan runs. |
 | `POST /__ursula/raft/{target}/snapshot`, `.../purge` | Build a snapshot or purge the log. |
 | `POST`/`DELETE /__ursula/leadership-shed/maintenance` | Set or clear the maintenance-drain mark. |
+| `POST /__ursula/placement/nodes/{node}/replace-disk` | Release the root the node id is bound to, given as `{"expect_root": R}` (section 2). |
 
 Every server generates a fresh process incarnation at startup and publishes
 it on all listeners. Every mutating admin request, and the quorum proof, must

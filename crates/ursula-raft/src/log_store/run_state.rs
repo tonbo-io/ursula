@@ -780,7 +780,8 @@ pub enum RaftWalError {
     LockPoisoned,
     /// The run's node fence does not admit, so the run records nothing
     /// more on its root: its disk lease does not hold, or the run shut
-    /// down ([`FenceStatus::Closed`], for good).
+    /// down or was superseded ([`FenceStatus::Closed`],
+    /// [`FenceStatus::Superseded`], both for good).
     #[error("the Raft WAL root '{}' is fenced ({status:?}): this run writes nothing more to it", .root.display())]
     Fenced { root: PathBuf, status: FenceStatus },
     /// The journal holds no log of the group that `admission` may open: an
@@ -908,7 +909,8 @@ pub enum WaitFrom {
     /// The first answer of the meta group that binds the root, for an
     /// empty root: a fresh root of a node id whose old process may still
     /// run. The wait is owed from that answer on, and an answer before
-    /// Bootstrap settles it at once.
+    /// Bootstrap settles it at once. Until the answer the run's data
+    /// replicas are held out ([`ursula_runtime::NodeFence::awaits_binding`]).
     Binding,
 }
 
@@ -1055,9 +1057,13 @@ impl NodeWal {
             });
         // An empty root owes its wait only once a bootstrapped cluster binds
         // it (`WaitFrom::Binding`), so a forming cluster's meta group still
-        // elects.
-        if let Some(WaitFrom::Open(_)) = wait {
-            fence.begin_wait();
+        // elects. Until that binding its data replicas take part in
+        // nothing: an empty disk under a live id must neither vote nor take
+        // a floor beside the old process.
+        match wait {
+            Some(WaitFrom::Open(_)) => fence.begin_wait(),
+            Some(WaitFrom::Binding) => fence.await_binding(),
+            None => {}
         }
         tracing::info!(
             root = %root.display(),
@@ -1251,9 +1257,17 @@ impl NodeWal {
     /// Records a clean end of this run, once every journal is `fsync`ed,
     /// and hands the root's lock to the process ([`CleanExit`]). The fence
     /// closes for good first, so the run answers nothing and writes no
-    /// object once a successor could read this end.
+    /// object once a successor could read this end. A superseded run
+    /// records nothing: another process may run on this node id, and a
+    /// clean end would let a later run of this root skip its wait.
     pub(crate) fn record_clean(&self) -> Result<CleanExit, RaftWalError> {
         self.fence.close();
+        if let status @ FenceStatus::Superseded = self.fence.status(fence_now()) {
+            return Err(RaftWalError::Fenced {
+                root: self.root.clone(),
+                status,
+            });
+        }
         self.run_state
             .record(RunStatus::Clean, "clean")
             .map_err(RaftWalError::RecordRunState)?;

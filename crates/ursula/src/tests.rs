@@ -492,7 +492,7 @@ fn query_parser_decodes_membership_and_learner_values() {
 /// `registry`, and that WAL. Shut it down with [`shutdown_test_wal`] before
 /// `wal_root` goes.
 fn registered_durable_factory(
-    wal_root: &tempfile::TempDir,
+    wal_root: &TestWalRoot,
     registry: &RaftGroupHandleRegistry,
 ) -> (
     ursula_raft::DurableRaftGroupEngineFactory,
@@ -517,11 +517,42 @@ fn registered_durable_factory(
     )
 }
 
+/// A test's WAL root, a fresh temporary directory. It goes when the test
+/// ends, unless the test panics: a panicking test unwinds while its journal
+/// writers still run, and a writer whose directory went fails its next
+/// write and stops the whole test process, hiding the test's own failure.
+/// A test that ends normally closes its WAL first ([`shutdown_test_wal`]).
+pub(crate) struct TestWalRoot(Option<tempfile::TempDir>);
+
+impl TestWalRoot {
+    pub(crate) fn new() -> Self {
+        Self(Some(tempfile::tempdir().expect("WAL root")))
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        match &self.0 {
+            Some(dir) => dir.path(),
+            None => unreachable!("the root is taken only by its drop"),
+        }
+    }
+}
+
+impl Drop for TestWalRoot {
+    fn drop(&mut self) {
+        if std::thread::panicking()
+            && let Some(dir) = self.0.take()
+        {
+            let kept = dir.keep();
+            tracing::warn!(root = %kept.display(), "kept the WAL root of a failed test");
+        }
+    }
+}
+
 /// Stops `runtime`'s Raft groups and closes `raft_wal` as the server does,
 /// so the test may then remove the WAL directory. Removing it under a live
 /// core writer fails the writer's next journal write, which stops the
 /// process.
-async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
+pub(crate) async fn shutdown_test_wal(runtime: &ShardRuntime, raft_wal: &ursula_raft::RaftWal) {
     assert!(
         matches!(
             crate::server::shutdown_raft_wal(runtime, None, Some(raft_wal)).await,
@@ -542,7 +573,7 @@ struct StaticGrpcTestNode {
     /// The node's own WAL directory when the test gave it none: a fresh,
     /// empty one per start, as a node that lost its disk restarts.
     /// [`StaticGrpcTestNode::shutdown`] closes the WAL before it goes.
-    _wal_root: Option<tempfile::TempDir>,
+    _wal_root: Option<TestWalRoot>,
 }
 
 impl StaticGrpcTestNode {
@@ -621,7 +652,7 @@ async fn spawn_static_grpc_test_node(
             None,
         ),
         None => {
-            let wal_root = tempfile::tempdir().expect("WAL root");
+            let wal_root = TestWalRoot::new();
             (
                 ursula_raft::RaftWal::start_in_cluster(
                     wal_root.path(),
@@ -1788,19 +1819,18 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     ));
     remove_test_path(&raft_root);
 
-    let app = router(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::Raft {
-                log_dir: raft_root.clone(),
-            },
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
-    );
+    let spawned = spawn_runtime(
+        &test_config(1, 1),
+        Persistence::Raft {
+            log_dir: raft_root.clone(),
+        },
+        Topology::SingleNode {
+            raft_group_count: 1,
+        },
+    )
+    .expect("runtime");
+    let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
+    let app = router(spawned.runtime.clone());
     let response = http_put(
         &app,
         "/benchcmp/raft-http",
@@ -1872,6 +1902,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
         "expected raft journal records, got {journal_len} bytes"
     );
 
+    shutdown_test_wal(&spawned.runtime, &raft_wal).await;
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
 }
 
@@ -1900,7 +1931,10 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         ),
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
+    let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
@@ -1911,7 +1945,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .await
         .expect("wait for leader");
     let app = router_with_static_raft_cluster(
-        runtime,
+        runtime.clone(),
         registry,
         crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
     );
@@ -1957,6 +1991,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         "core journal should contain records"
     );
 
+    shutdown_test_wal(&runtime, &raft_wal).await;
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
 }
 
@@ -1987,6 +2022,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             ),
         )
         .expect("runtime");
+        // No meta runs here, so the test settles the fresh root's binding.
+        spawned.bind_without_meta();
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
         let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
@@ -2051,7 +2088,8 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("restarted runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
-        let opening = spawned.raft_wal.expect("restarted WAL").opening();
+        let raft_wal = spawned.raft_wal.expect("restarted WAL");
+        let opening = raft_wal.opening();
         assert_eq!(
             opening.previous_run,
             ursula_raft::wal::diagnostics::PreviousRun::Clean
@@ -2077,7 +2115,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "restarted durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for restarted leader");
-        let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
         let shutdown_runtime = runtime.clone();
         let app = router_with_static_raft_cluster(runtime, registry, peers);
 
@@ -2090,10 +2127,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         let body = body_bytes(response).await;
         assert_eq!(&body[..], b"restart-payload");
         drop(app);
-        shutdown_runtime
-            .shutdown_group_engine(placement)
-            .await
-            .expect("shut down restarted durable group");
+        shutdown_test_wal(&shutdown_runtime, &raft_wal).await;
     }
 
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
@@ -2121,7 +2155,7 @@ fn peer_transport(
 
 #[tokio::test]
 async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
-    let wal_root = tempfile::tempdir().expect("WAL root");
+    let wal_root = TestWalRoot::new();
     let registry = RaftGroupHandleRegistry::default();
     let mut config = RuntimeConfig::new(1, 1);
     config.threading = ursula_runtime::RuntimeThreading::HostedTokio;
@@ -3141,7 +3175,7 @@ async fn poll_payload(
 /// voter without skipping it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_replay() {
-    let root = tempfile::tempdir().expect("WAL root");
+    let root = TestWalRoot::new();
     let mut addresses = Vec::new();
     for _ in 1..=3 {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -6368,7 +6402,7 @@ async fn ingress_body_budget_holds_credit_until_response_finishes() {
 #[tokio::test]
 async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
     // A replica on an empty WAL starts gated.
-    let wal_root = tempfile::tempdir().expect("WAL root");
+    let wal_root = TestWalRoot::new();
     let store = ursula_raft::RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
@@ -6460,7 +6494,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         };
         // A missing log with either retained vote metadata or lost vote history.
         // Only the former may accept an unsynced-tail loss.
-        let wal_root = tempfile::tempdir().expect("WAL root");
+        let wal_root = TestWalRoot::new();
         let mut store = ursula_raft::RaftWal::start(
             wal_root.path(),
             ursula_config::WalFsync::Never,
@@ -8288,10 +8322,10 @@ mod snapshot_driver {
     /// keeping 8 entries below a snapshot.
     fn single_node() -> (
         crate::bootstrap::SpawnedRuntime,
-        tempfile::TempDir,
+        super::TestWalRoot,
         Duration,
     ) {
-        let root = tempfile::tempdir().expect("WAL root");
+        let root = super::TestWalRoot::new();
         let mut config = super::test_config(1, 2);
         config.raft.install_snapshot_timeout = ursula_config::HumanDuration::sec(1);
         config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(8));
@@ -8489,6 +8523,11 @@ mod snapshot_driver {
             assert_eq!(response.status(), StatusCode::NOT_FOUND, "{stream_id}");
         }
         drop(app);
+        let raft_wal = spawned
+            .raft_wal
+            .as_ref()
+            .expect("a single node runs its WAL");
+        super::shutdown_test_wal(&runtime, raft_wal).await;
         drop(spawned);
         drop(root);
     }
@@ -8500,7 +8539,7 @@ mod snapshot_driver {
     /// `204`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_single_node_admits_writes_past_twice_its_log_budget() {
-        let root = tempfile::tempdir().expect("WAL root");
+        let root = super::TestWalRoot::new();
         let budget = 64_u64 << 10;
         let mut config = super::test_config(1, 1);
         config.raft.snapshot_log_budget = ursula_config::HumanSize::bytes(budget);
@@ -8567,6 +8606,11 @@ mod snapshot_driver {
         .await;
         assert_eq!(appended.status(), StatusCode::NO_CONTENT);
         drop(app);
+        let raft_wal = spawned
+            .raft_wal
+            .as_ref()
+            .expect("a single node runs its WAL");
+        super::shutdown_test_wal(&runtime, raft_wal).await;
         drop(spawned);
         drop(root);
     }
@@ -9848,7 +9892,7 @@ mod snapshot_driver {
             blackholed: watch::Sender::new(false),
             gets: watch::Sender::new(0),
         });
-        let raft_log_dir = tempfile::tempdir().expect("WAL root");
+        let raft_log_dir = super::TestWalRoot::new();
 
         // A snapshot object the next open restores.
         let node = blackholed_store_node(&store, raft_log_dir.path()).await;
@@ -13259,7 +13303,7 @@ fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
 
 #[tokio::test]
 async fn runtime_refuses_persisted_wal_topology_changes() {
-    let dir = tempfile::tempdir().expect("WAL root");
+    let dir = TestWalRoot::new();
     let original = ursula_shard::StaticShardMap::new(4, 8).unwrap();
     let wal = ursula_raft::RaftWal::start(dir.path(), ursula_config::WalFsync::Always, &original)
         .unwrap();
@@ -13285,7 +13329,7 @@ async fn runtime_refuses_persisted_wal_topology_changes() {
 
 #[tokio::test]
 async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrier() {
-    let root = tempfile::tempdir().unwrap();
+    let root = TestWalRoot::new();
     let spawned = spawn_runtime(
         &test_config(1, 1),
         Persistence::Raft {
@@ -13299,6 +13343,8 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         ),
     )
     .unwrap();
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.unwrap();
     runtime.warm_all_groups().await.unwrap();
@@ -13354,7 +13400,7 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
 /// self-election is `self_election_elects_a_follower_unless_it_may_not_campaign`.
 #[tokio::test]
 async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
-    let root = tempfile::tempdir().unwrap();
+    let root = TestWalRoot::new();
     let spawned = spawn_runtime(
         &test_config(1, 1),
         Persistence::Raft {
@@ -13368,6 +13414,8 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         ),
     )
     .unwrap();
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let runtime = spawned.runtime;
     let registry = spawned.raft_registry.unwrap();
     runtime.warm_all_groups().await.unwrap();
@@ -13636,7 +13684,10 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
     };
     assert_eq!(readiness_reason(healthy), None);
     let mut facts = ReadinessFacts {
+        superseded: true,
         disk_lease_lost: true,
+        root_refused: true,
+        predecessor_wait: true,
         format_epoch_mismatch: true,
         wal_disk_pressure: true,
         recovery_stalled: true,
@@ -13647,7 +13698,10 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
     while let Some(reason) = readiness_reason(facts) {
         order.push(reason.clone());
         match reason {
+            Reason::Superseded => facts.superseded = false,
             Reason::DiskLeaseLost => facts.disk_lease_lost = false,
+            Reason::RootRefused => facts.root_refused = false,
+            Reason::PredecessorWait => facts.predecessor_wait = false,
             Reason::FormatEpochMismatch => facts.format_epoch_mismatch = false,
             Reason::WalDiskPressure => facts.wal_disk_pressure = false,
             Reason::RecoveryStalled => facts.recovery_stalled = false,
@@ -13657,7 +13711,10 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
         }
     }
     assert_eq!(order, vec![
+        Reason::Superseded,
         Reason::DiskLeaseLost,
+        Reason::RootRefused,
+        Reason::PredecessorWait,
         Reason::FormatEpochMismatch,
         Reason::WalDiskPressure,
         Reason::RecoveryStalled,

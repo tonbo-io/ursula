@@ -1340,7 +1340,10 @@ impl RaftGroupHandleRegistry {
         request: VoteRequest<UrsulaRaftTypeConfig>,
     ) -> Result<VoteResponse<UrsulaRaftTypeConfig>, GroupEngineError> {
         let entry = self.entry(raft_group_id)?;
-        entry.core.vote(request).await
+        entry
+            .core
+            .vote(RaftTarget::Data(raft_group_id), request)
+            .await
     }
 
     pub async fn install_full_snapshot(

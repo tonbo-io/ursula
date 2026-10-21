@@ -1123,9 +1123,21 @@ mod metrics_contract_tests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServingReadinessReason {
+    /// The meta group binds this node id to another root or released this
+    /// one: the process takes part in nothing again until it exits.
+    Superseded,
     /// No probe of the WAL disk synced within `raft.wal.lease`: the node
     /// takes part in no Raft traffic until one does.
     DiskLeaseLost,
+    /// The meta group binds this node id to another root than the empty
+    /// one this node runs on: its data replicas grant no vote and keep
+    /// their recovery gates closed until an operator releases that root
+    /// and the predecessor wait from the binding ends. The placement status
+    /// names it.
+    RootRefused,
+    /// A process of an earlier run of this root may still run: this node
+    /// grants no vote and opens no recovery gate until the wait ends.
+    PredecessorWait,
     FormatEpochMismatch,
     WalDiskPressure,
     RecoveryStalled,
@@ -1182,6 +1194,9 @@ mod serving_readiness_tests {
             ),
             (ServingReadinessReason::WalDiskPressure, "wal_disk_pressure"),
             (ServingReadinessReason::DiskLeaseLost, "disk_lease_lost"),
+            (ServingReadinessReason::Superseded, "superseded"),
+            (ServingReadinessReason::RootRefused, "root_refused"),
+            (ServingReadinessReason::PredecessorWait, "predecessor_wait"),
             (ServingReadinessReason::RecoveryStalled, "recovery_stalled"),
             (
                 ServingReadinessReason::RecoveryGateClosed,

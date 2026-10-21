@@ -10,6 +10,7 @@ use ursula_proto::placement::WriteEffect;
 use ursula_runtime::ErrorChain;
 
 use super::confirm::MetaBarrierError;
+use super::handle::MetaWriteError;
 
 /// A meta read barrier that confirmed no view applied nothing.
 impl From<MetaBarrierError> for PlacementApiError {
@@ -27,6 +28,34 @@ impl From<MetaBarrierError> for PlacementApiError {
         Self {
             reason,
             write_effect: WriteEffect::NotApplied,
+            current: None,
+            message: ErrorChain(&error).to_string(),
+        }
+    }
+}
+
+/// A meta write that did not answer with its result.
+impl From<MetaWriteError> for PlacementApiError {
+    fn from(error: MetaWriteError) -> Self {
+        let reason = match &error {
+            MetaWriteError::NoLeader => PlacementApiReason::NoLeader,
+            MetaWriteError::Stopped => PlacementApiReason::Stopped,
+            MetaWriteError::Refused(refusal) => PlacementApiReason::Refused(refusal.clone()),
+            MetaWriteError::Leader { leader, .. } => {
+                PlacementApiReason::LeaderRefused { leader: *leader }
+            }
+            MetaWriteError::Forward { leader, .. } => {
+                PlacementApiReason::ForwardFailed { leader: *leader }
+            }
+            // Only a `RegisterNode` is refused so, and no placement route
+            // sends one: the node that would forward it refused it.
+            MetaWriteError::OtherNode { origin, .. } => {
+                PlacementApiReason::LeaderRefused { leader: *origin }
+            }
+        };
+        Self {
+            reason,
+            write_effect: error.write_effect(),
             current: None,
             message: ErrorChain(&error).to_string(),
         }

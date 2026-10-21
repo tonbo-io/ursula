@@ -26,7 +26,6 @@ use reqwest::Method;
 use tokio::time::Instant;
 use ursula_control::ClusterView;
 use ursula_control::GroupPlacement;
-use ursula_control::PlacementStatus;
 use ursula_proto::admin::EntryId;
 use ursula_proto::admin::PlanFloor;
 use ursula_proto::admin::PlanStep;
@@ -1247,39 +1246,12 @@ async fn observe(
     members
 }
 
-/// The confirmed meta view of the first manifest node that answers one
-/// (`GET /__ursula/placement?confirmed=true` on its admin plane), `None`
-/// when none does.
+/// The confirmed meta view of the first manifest node that answers one,
+/// `None` when none does.
 async fn confirmed_view(client: &MetricsClient, nodes: &[NodeInfo]) -> Option<ClusterView> {
-    for node in nodes {
-        let url = match node.admin_url.join("/__ursula/placement?confirmed=true") {
-            Ok(url) => url,
-            Err(error) => {
-                tracing::warn!(node_id = node.id, %error, "recovery: no placement url");
-                continue;
-            }
-        };
-        let response = match client.http_client().get(url).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(node_id = node.id, %error, "recovery: node did not answer a confirmed view");
-                continue;
-            }
-        };
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            tracing::warn!(node_id = node.id, %status, body, "recovery: node refused a confirmed view");
-            continue;
-        }
-        match response.json::<PlacementStatus>().await {
-            Ok(placement) => return Some(placement.view),
-            Err(error) => {
-                tracing::warn!(node_id = node.id, %error, "recovery: undecodable placement status");
-            }
-        }
-    }
-    None
+    crate::placement::confirmed_status(client, nodes)
+        .await
+        .map(|(_, status)| status.view)
 }
 
 /// [`PlanTransport`] over the nodes' admin planes.
@@ -1748,7 +1720,7 @@ mod tests {
             },
             ClusterView::MetaCatchingUp,
             ClusterView::Registering {
-                registered: BTreeSet::new(),
+                registered: std::collections::BTreeMap::new(),
                 waiting_for: BTreeSet::new(),
             },
             ClusterView::FormationCut,

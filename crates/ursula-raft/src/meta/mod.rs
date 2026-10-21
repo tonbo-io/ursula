@@ -13,7 +13,7 @@
 //! [`state_machine`], [`watch`]) encode nothing of their own, and
 //! [`state_machine`]'s dispatch of the meta log is frozen with the epoch.
 //! The runtime and its tasks ([`runtime`], [`handle`], [`genesis_driver`],
-//! [`registration`], [`formation`], [`damage`], [`pause`] and the meta
+//! [`registration`], `root`, [`formation`], [`damage`], [`pause`] and the meta
 //! membership target) encode nothing either: they write only the commands
 //! above. The placement status ([`status`]) and the placement routes'
 //! refusals (`api`) are admin JSON.
@@ -48,6 +48,8 @@
 //! - [`replica`]: this node's meta replica ([`replica::MetaReplica`]): its
 //!   Raft over the meta journal, the tasks it owns, its registry slot
 //!   ([`replica::ActiveMeta`]) and its restart for a recovery plan.
+//! - `root`: this run's root as meta sees it, and the checks that
+//!   supersede the process when meta binds its node id elsewhere.
 //! - [`runtime`]: the meta runtime ([`runtime::MetaRuntime`]): the replica
 //!   with every task it owns, the node tasks and the damage supervisor.
 //! - [`snapshot`]: the meta group's snapshot pointer, always `Inline`, the
@@ -73,6 +75,7 @@ pub mod handle;
 pub mod pause;
 pub mod registration;
 pub mod replica;
+mod root;
 pub mod runtime;
 pub mod snapshot;
 pub mod state_machine;

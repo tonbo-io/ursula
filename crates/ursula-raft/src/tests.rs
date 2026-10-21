@@ -3565,6 +3565,10 @@ async fn a_single_node_engine_leads_nothing_once_its_wal_fence_closes() {
         ursula_runtime::NodeFence::leased(Duration::from_secs(5)),
     )
     .expect("start the Raft WAL");
+    // The fresh root's data replicas are held until meta answers its
+    // registration. No meta runs here, so settle it as a forming
+    // cluster's answer does.
+    wal.fence().bind(false);
     let factory = DurableRaftGroupEngineFactory::new(wal.clone()).with_registry(registry.clone());
     let runtime = ShardRuntime::spawn_with_engine_factory(hosted_config(1, 1), factory)
         .expect("spawn runtime with raft group engine factory");

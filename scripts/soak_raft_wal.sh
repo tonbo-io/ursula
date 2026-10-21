@@ -15,7 +15,7 @@ mkdir -p "$artifact_root"
   echo "kernel=$(uname -a)"
   echo "filesystem=$(df -k . | tail -n 1)"
   echo "cycles=$cycles"
-  echo "topology=three-voter replication plus a voter healed from an empty WAL"
+  echo "topology=three-voter replication plus a voter rejoined from an empty WAL after replace-disk"
 } >"$artifact_root/environment.txt"
 
 cargo test -p ursula-raft \
@@ -25,7 +25,7 @@ cargo test -p ursula-raft \
 
 tests=(
   cli_static_grpc_raft_log_dir_replicates_between_nodes
-  cli_voter_replaced_with_an_empty_wal_heals_itself
+  cli_voter_replaced_with_an_empty_wal_rejoins_once_its_lost_disk_is_released
   cli_static_grpc_raft_log_dir_recovers_with_bootstrap_enabled_after_restart
 )
 

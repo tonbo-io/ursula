@@ -248,13 +248,16 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         .map_err(crate::owner::owner_raft_error)
     }
 
-    /// An inbound vote, through the predecessor wait and the recovery
-    /// gate's vote screen. While this run owes its predecessor wait it
-    /// grants no vote, in any group or meta: its predecessor may still vote
-    /// as this node. The bootstrap probe vote is still answered, as the gate
-    /// answers it.
+    /// An inbound vote for `group`, through the node fence's hold and the
+    /// recovery gate's vote screen. While the fence holds the replica out
+    /// ([`crate::predecessor_wait::fence_holds`]) it grants no vote: in any
+    /// group or meta while this run owes its predecessor wait, whose
+    /// predecessor may still vote as this node, and in a data group while
+    /// this run's empty root awaits its binding. The bootstrap probe vote
+    /// is still answered, as the gate answers it.
     pub(crate) async fn vote(
         &self,
+        group: RaftTarget,
         request: VoteRequest<C>,
     ) -> Result<VoteResponse<C>, GroupEngineError> {
         let raft = self.owner().clone();
@@ -262,13 +265,14 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
         let fence = raft.fence().clone();
         raft.call(move |raft| async move {
             let probe = request == crate::rejoin::bootstrap_probe_vote();
-            if fence.owes_wait() && !probe {
+            if crate::predecessor_wait::fence_holds(&fence, group) && !probe {
                 let metrics = WatchReceiver::borrow_watched(&raft.metrics()).clone();
                 let last_log = WatchReceiver::borrow_watched(&raft.data_metrics()).last_log;
                 tracing::info!(
                     node_id = metrics.id,
                     candidate = %request.vote,
-                    "refusing a vote while this run waits out a predecessor that may still run"
+                    "refusing a vote while the node fence holds this replica out: a predecessor that \
+                     may still run is waited out, or this empty root awaits its binding"
                 );
                 return Ok(VoteResponse::new(metrics.vote, last_log, false));
             }
