@@ -881,8 +881,10 @@ impl NodeWal {
     /// again beside the one it belonged to. Every node that holds data
     /// creates the meta journal first, so only a discarded or lost journal
     /// gives this. A meta journal that exists opens by what it holds, so an
-    /// empty one stays empty. A data vote floor alone counts as data history,
-    /// which is safe for a journal that is gone.
+    /// empty one stays empty. Data history means a segment record. A vote,
+    /// the genesis vote floor included, lives only in a core's metadata
+    /// file, so a node whose data journals hold votes but no record opens
+    /// its lost meta journal empty, as a node without data history does.
     ///
     /// The file appears, mark included, in one atomic replace, before the
     /// journal holds anything. A crash or a failed write before then leaves
