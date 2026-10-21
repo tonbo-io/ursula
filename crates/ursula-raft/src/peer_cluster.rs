@@ -644,7 +644,7 @@ pub(crate) fn test_identity(node_id: u64) -> PeerIdentity {
 /// Binds `registry`'s node as node 1, the id of every single-node group, of
 /// `wal`'s cluster with no peers: the server binds its node before the
 /// runtime starts, and the single-node engine factory binds nothing.
-#[cfg(test)]
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn bind_single_node(registry: &crate::RaftGroupHandleRegistry, wal: &crate::RaftWal) {
     registry.peer_cluster().bind(
         PeerIdentity::new(1, wal.cluster_id().clone()),
