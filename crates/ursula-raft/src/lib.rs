@@ -27,7 +27,8 @@
 //! - [`election`]: shared campaign and leadership transfer policy.
 //! - [`recovery_transport`]: native transport adapter for recovery probes.
 //! - [`registry`]: [`RaftGroupHandleRegistry`] and the single-node network.
-//! - `in_process`: fault-injection network, compiled only for tests and madsim.
+//! - `in_process`: fault-injection network, generic over the state machine,
+//!   compiled only for tests and madsim.
 //! - [`owner`]: mailbox dispatch onto each group owner runtime.
 //! - [`leadership`]: one replica's view of its group's leadership, which
 //!   routing and forward hints share.
@@ -153,6 +154,12 @@ pub use grpc::raft_grpc_server;
 pub use grpc::raft_grpc_service;
 pub use history::GroupHistory;
 #[cfg(any(test, madsim))]
+pub use in_process::InProcessEndpoint;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessNetwork;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessNetworkFactory;
+#[cfg(any(test, madsim))]
 pub use in_process::InProcessRaftFaultAction;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRaftFaultScript;
@@ -172,6 +179,8 @@ pub use in_process::InProcessRaftNetworkPolicyEvent;
 pub use in_process::InProcessRaftRegistry;
 #[cfg(any(test, madsim))]
 pub use in_process::InProcessRaftRpcKind;
+#[cfg(any(test, madsim))]
+pub use in_process::InProcessRegistry;
 pub use log_store::JournalTuning;
 pub use log_store::LaggingGroups;
 pub use log_store::PlanCut;
