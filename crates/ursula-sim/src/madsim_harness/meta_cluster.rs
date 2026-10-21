@@ -221,22 +221,32 @@ impl MetaCluster {
         self.runtimes.insert(node_id, runtime);
     }
 
-    /// Stops `node_id`'s meta runtime, then its data replicas, as its
-    /// process ends.
+    /// Kills `node_id`'s process: stops its meta runtime and its data
+    /// replicas, then ends its WAL run as a crashed process does (the page
+    /// cache survives). Its next start is a new run, which reads the run
+    /// state this one left and decides again how the journals open.
     pub(super) async fn stop_node(&mut self, node_id: u64) {
+        self.stop_replicas(node_id).await;
+        self.data.wals[&node_id].process_crash().await;
+    }
+
+    /// Stops `node_id`'s meta runtime, then its data replicas. The WAL run
+    /// stays: the caller ends it.
+    async fn stop_replicas(&mut self, node_id: u64) {
         if let Some(runtime) = self.runtimes.remove(&node_id) {
             runtime.shutdown().await.expect("stop the meta runtime");
         }
         self.data.stop_node(node_id).await;
     }
 
-    /// Stops `node_id` and removes every file of its meta journal
-    /// (`raft-log/meta/`, the meta snapshot record included), as an
-    /// operator who discards it does. Its data journals stay.
+    /// Shuts `node_id` down cleanly and removes every file of its meta
+    /// journal (`raft-log/meta/`, the meta snapshot record included), as an
+    /// operator who discards it does. Its data journals stay, so its next
+    /// start opens the lost meta journal over data history (D9).
     pub(super) async fn discard_meta(&mut self, node_id: u64) {
-        self.stop_node(node_id).await;
-        let dir = self.data.wals[&node_id].root().join("meta");
-        remove_tree(&dir);
+        let wal = self.data.wals[&node_id].clone();
+        wal.clean_shutdown(self.stop_replicas(node_id)).await;
+        remove_tree(&wal.root().join("meta"));
     }
 
     /// Stops `node_id` and gives it an empty disk, data and meta journals

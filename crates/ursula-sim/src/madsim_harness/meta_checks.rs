@@ -4,10 +4,11 @@
 //! - I6 ([`I6`]): with meta's quorum lost, every data group with a quorum
 //!   commits.
 //! - I10 ([`I10`]): every acknowledged control write survives power loss on
-//!   every meta replica.
+//!   every meta replica, and a power loss comes after at least one
+//!   acknowledged write.
 //! - I11 ([`I11`]): a registered node is a meta learner (or the voter it is
 //!   claimed as) whose view reaches the meta leader's applied entry within
-//!   a bound, across meta plan restarts too.
+//!   a bound, after a meta plan too.
 //! - I12 ([`I12`]), in its S1 form: one genesis history event per run. No
 //!   two nodes ever apply meta histories that began at different geneses,
 //!   and none while the claims differ. Data history alone does not block a
@@ -32,6 +33,7 @@ use ursula_control::MoveLimit;
 use ursula_control::RegistrationStatus;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ViewStage;
+use ursula_proto::placement::WriteEffect;
 
 use super::SimEvent;
 use super::SimTrace;
@@ -70,8 +72,8 @@ pub(super) struct MetaChecks {
     replacements: BTreeMap<u64, u64>,
     /// The move limit of the last acknowledged `SetMoveLimit`.
     acknowledged: Option<u32>,
-    /// The limits of the writes after it whose outcome is unknown: any of
-    /// them may have applied.
+    /// The limits of the writes after it whose outcome is unknown
+    /// ([`WriteEffect::MayHaveApplied`]): any of them may have applied.
     uncertain: BTreeSet<u32>,
 }
 
@@ -125,6 +127,9 @@ impl MetaChecks {
 
     /// Writes `count` `SetMoveLimit`s through the nodes of `via` in turn,
     /// each with a new limit, and keeps the last one acknowledged for I10.
+    /// A write that did not apply ([`WriteEffect::NotApplied`]) is written
+    /// again within the bound, as a client would. Only a write whose outcome
+    /// is unknown counts as one that may have applied.
     pub(super) async fn write_limits(&mut self, cluster: &MetaCluster, via: &[u64], count: u32) {
         let base = self
             .acknowledged
@@ -132,29 +137,73 @@ impl MetaChecks {
             .max(self.uncertain.last().copied().unwrap_or(0));
         for (step, node_id) in (1..=count).zip(via.iter().copied().cycle()) {
             let limit = base.saturating_add(step);
-            match cluster
-                .handle(node_id)
-                .submit(ControlCommand::SetMoveLimit {
-                    limit: MoveLimit::new(limit),
-                })
-                .await
-            {
-                Ok(ControlApplied::MoveLimitSet { limit: set }) if set.get() == limit => {
-                    self.acknowledged = Some(limit);
-                    self.uncertain.clear();
-                }
-                Ok(answer) => panic!("node {node_id}: SetMoveLimit answered {answer:?}"),
-                // Refused or not answered: it may still apply.
-                Err(_unknown) => {
-                    self.uncertain.insert(limit);
+            let deadline = madsim::time::Instant::now() + BOUND;
+            loop {
+                match cluster
+                    .handle(node_id)
+                    .submit(ControlCommand::SetMoveLimit {
+                        limit: MoveLimit::new(limit),
+                    })
+                    .await
+                {
+                    Ok(ControlApplied::MoveLimitSet { limit: set }) if set.get() == limit => {
+                        self.acknowledged = Some(limit);
+                        self.uncertain.clear();
+                        break;
+                    }
+                    Ok(answer) => panic!("node {node_id}: SetMoveLimit answered {answer:?}"),
+                    Err(error) => match error.write_effect() {
+                        WriteEffect::MayHaveApplied => {
+                            self.uncertain.insert(limit);
+                            break;
+                        }
+                        WriteEffect::NotApplied if madsim::time::Instant::now() < deadline => {
+                            madsim::time::sleep(STEP).await;
+                        }
+                        WriteEffect::NotApplied => break,
+                    },
                 }
             }
         }
     }
 
+    /// Waits until the view of every node of `nodes` is bootstrapped, so the
+    /// control writes after it are not refused as written before bootstrap
+    /// (I11: a registered node learns the view, its bootstrap included).
+    pub(super) async fn bootstrapped(
+        &mut self,
+        cluster: &MetaCluster,
+        trace: &mut SimTrace,
+        after_event: &str,
+        nodes: &[u64],
+    ) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            self.observe(cluster, trace, after_event);
+            let forming: Vec<u64> = nodes
+                .iter()
+                .copied()
+                .filter(|node_id| cluster.view(*node_id).cluster().is_none())
+                .collect();
+            if forming.is_empty() {
+                return;
+            }
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    trace,
+                    I11,
+                    after_event,
+                    format!("the views of nodes {forming:?} are not bootstrapped"),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+        }
+    }
+
     /// I10: every meta replica of `nodes` shows the last acknowledged move
     /// limit, or one written after it whose outcome is unknown, within the
-    /// bound.
+    /// bound. A power loss that came with no write acknowledged fails it,
+    /// since it would check nothing.
     pub(super) async fn acknowledged_writes_survive(
         &self,
         cluster: &MetaCluster,
@@ -163,7 +212,12 @@ impl MetaChecks {
         nodes: &[u64],
     ) {
         let Some(acknowledged) = self.acknowledged else {
-            return;
+            fail(
+                trace,
+                I10,
+                after_event,
+                "no control write was acknowledged before the power loss".to_owned(),
+            );
         };
         let deadline = madsim::time::Instant::now() + BOUND;
         loop {

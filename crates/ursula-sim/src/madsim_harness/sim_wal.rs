@@ -222,8 +222,7 @@ impl SimNodeWal {
     }
 
     /// Crashes the node's process after its engines have stopped: the page
-    /// cache survives.
-    #[cfg(test)]
+    /// cache survives, and the next start begins a new run.
     pub(super) async fn process_crash(&self) {
         self.stop().await;
         SimDisk::process_crash(&self.root).expect("crash a stopped simulated node");

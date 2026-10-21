@@ -10,22 +10,24 @@
 //!   until it restarts with the fixed claim (D9, r1 H1): data forms and
 //!   takes appends meanwhile, and meta forms only once the claims agree
 //!   (I12);
-//! - registers every node, nodes 4 and 5 as meta learners (I11), and writes
-//!   control commands throughout (I10);
-//! - loses meta's quorum, two meta voters killed, while the data groups
-//!   keep committing (I6);
+//! - registers every node, nodes 4 and 5 as meta learners (I11), waits for
+//!   the bootstrapped view, and writes control commands throughout (I10);
+//! - loses meta's quorum, two meta voters' processes killed, while the data
+//!   groups keep committing (I6);
 //! - cuts the power of every meta voter under `always`, or of one under
 //!   `never`, and finds every acknowledged control write on every meta
 //!   replica (I10);
 //! - discards the meta journals of two meta voters, which then open
 //!   `Recovering` over their data history, and recovers meta by a plan
 //!   through `ursulactl recover-group --target meta --accept-loss`'s planner
-//!   and sender (the meta plan check), after which the learners keep
-//!   learning (I11, D11).
+//!   and sender (the meta plan check), after which every node learns the
+//!   view again (I11).
 //!
-//! I12 is checked after every action and every step of a wait. The three
-//! negative controls ([`Controls`]) each run a script of their own with one
-//! meta defence off.
+//! A killed or discarded node ends its WAL run, so its next start is a new
+//! run that decides again how its journals open. I12 is checked after each
+//! phase and at every poll of the I11, bootstrap, plan and watch waits. The
+//! three negative controls ([`Controls`]) each run a script of their own
+//! with one meta defence off.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -176,6 +178,15 @@ impl Run {
         self.step(phase);
     }
 
+    /// Every node holds the bootstrapped view, before the first control
+    /// write.
+    async fn bootstrapped(&mut self, phase: &str) {
+        let nodes = self.nodes();
+        self.checks
+            .bootstrapped(&self.cluster, &mut self.trace, phase, &nodes)
+            .await;
+    }
+
     async fn write(&mut self, count: u32) {
         let via = self.cluster.running();
         self.checks.write_limits(&self.cluster, &via, count).await;
@@ -306,8 +317,10 @@ impl Run {
         self.checks
             .plan_applied(&self.cluster, &mut self.trace, "meta_plan", &nodes, before)
             .await;
-        // D11: the restarted replicas keep their drivers and shell.
-        self.learned("meta_plan_restarted").await;
+        // I11 after the plan. Whether the plan restarted a replica, and
+        // whether its drivers and shell then still act (D11), is not
+        // checked here.
+        self.learned("meta_plan_applied").await;
         self.write(2).await;
     }
 
@@ -365,6 +378,7 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
         run.claim_mismatch().await;
     }
     run.learned("formed").await;
+    run.bootstrapped("formed").await;
     run.write(4).await;
     let mut faults = vec![MetaFault::QuorumLoss, MetaFault::PowerLoss, MetaFault::Plan];
     // A seeded order of the three faults.
@@ -435,6 +449,7 @@ async fn meta_discarded_over_data(seed: u64) -> ThreeNodeRaftSimOutcome {
 async fn power_loss_under_never(seed: u64) -> ThreeNodeRaftSimOutcome {
     let mut run = Run::start(seed, 3, WalFsync::Never, claims(3)).await;
     run.learned("formed").await;
+    run.bootstrapped("formed").await;
     for node_id in META_VOTERS {
         run.cluster.data.wals[&node_id].write_back();
     }
@@ -495,8 +510,9 @@ mod tests {
         }
     }
 
-    /// The defended script passes, and the one with `off` fails `invariant`.
-    fn assert_caught(defended: Controls, off: Controls, invariant: &str) -> String {
+    /// The defended script passes, and the one with `off` fails `invariant`
+    /// in the script's own `phase`, not while the cluster forms.
+    fn assert_caught(defended: Controls, off: Controls, invariant: &str, phase: &str) -> String {
         assert!(held(&run(SCRIPTED, defended)), "{defended:?} passes");
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
@@ -509,12 +525,16 @@ mod tests {
             .find_map(|event| match event {
                 SimEvent::InvariantFailed {
                     invariant: failed,
+                    after_event,
                     message,
-                    ..
                 } => {
                     assert_eq!(
                         failed, invariant,
                         "{off:?} failed another invariant: {message}"
+                    );
+                    assert_eq!(
+                        after_event, phase,
+                        "{off:?} failed outside its script: {message}"
                     );
                     Some(message.clone())
                 }
@@ -532,6 +552,7 @@ mod tests {
             Controls::WipedMetaVoters { defended: true },
             Controls::WipedMetaVoters { defended: false },
             I12,
+            "meta_voters_wiped",
         );
         assert!(message.contains("more than one meta genesis"), "{message}");
     }
@@ -545,6 +566,7 @@ mod tests {
             Controls::MetaDiscardedOverData { defended: true },
             Controls::MetaDiscardedOverData { defended: false },
             I12,
+            "meta_discarded",
         );
         assert!(message.contains("more than one meta genesis"), "{message}");
     }
@@ -558,6 +580,7 @@ mod tests {
             Controls::PowerLossUnderNever { defended: true },
             Controls::PowerLossUnderNever { defended: false },
             I10,
+            "power_loss",
         );
         assert!(message.contains("acknowledged move limit"), "{message}");
     }
