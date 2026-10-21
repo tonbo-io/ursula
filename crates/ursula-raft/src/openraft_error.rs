@@ -29,6 +29,7 @@ use ursula_runtime::MembershipInitRefusal;
 use ursula_runtime::Proposal;
 use ursula_runtime::ResponseKind;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use crate::GroupLeadership;
 use crate::forward::leadership_refusal;
@@ -68,7 +69,7 @@ pub(crate) fn initialize_error(
     };
     tracing::error!(raft_group_id = raft_group_id.0, %error, "OpenRaft refused to initialize the group's membership");
     GroupEngineError::Infra(GroupInfraError::MembershipInit {
-        raft_group_id,
+        group: RaftTarget::Data(raft_group_id),
         refusal,
     })
 }
@@ -84,7 +85,7 @@ pub(crate) fn leader_wait_error(
         WaitError::Timeout(..) => {
             tracing::warn!(raft_group_id = raft_group_id.0, %error, "the group observed no expected leader in time");
             GroupEngineError::Infra(GroupInfraError::LeaderWaitTimedOut {
-                raft_group_id,
+                group: RaftTarget::Data(raft_group_id),
                 timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
             })
         }

@@ -14,6 +14,7 @@ use ursula_proto::placement::GenesisClaim;
 use super::GroupRejoin;
 use super::attach::wait_recovery_change;
 use super::log_index;
+use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig;
 use crate::types::UrsulaVote;
 use crate::types::UrsulaVoteRequest;
@@ -119,7 +120,8 @@ where
     P: Fn(u64) -> F,
     F: Future<Output = Option<PeerGroupLog>>,
 {
-    let group = rejoin.raft_group_id().0;
+    let plane = rejoin.group().plane().as_str_name();
+    let group = rejoin.group().wire_group_id();
     let peers = probed
         .iter()
         .copied()
@@ -135,6 +137,7 @@ where
             Ok(false) => {}
             Err(err) => {
                 tracing::error!(
+                    plane,
                     "raft bootstrap: node {node_id} group {group} failed to check initialization: {err}"
                 );
                 return GroupBootstrap::Stopped;
@@ -169,12 +172,14 @@ where
             BootstrapDecision::Initialize => {
                 if let Err(err) = rejoin.allow_fresh_bootstrap().await {
                     tracing::error!(
+                        plane,
                         "raft bootstrap: node {node_id} group {group} could not open its recovery gate: {err}"
                     );
                     return GroupBootstrap::Stopped;
                 }
                 if let Err(err) = raft.initialize(members).await {
                     tracing::error!(
+                        plane,
                         "raft bootstrap: node {node_id} group {group} failed to initialize membership: {err}"
                     );
                     return GroupBootstrap::Stopped;
@@ -183,6 +188,7 @@ where
             }
             BootstrapDecision::Rejoin => {
                 tracing::info!(
+                    plane,
                     "raft bootstrap: node {node_id} group {group} holds nothing of a group another voter holds; not initializing, waiting to be replicated to"
                 );
                 return GroupBootstrap::Rejoined;
@@ -192,6 +198,7 @@ where
                 if now.saturating_duration_since(last_warning) >= warn_every {
                     let answered = answers.iter().filter(|answer| answer.is_some()).count();
                     tracing::warn!(
+                        plane,
                         "raft bootstrap: node {node_id} group {group} waits for every voter before initializing; {answered}/{} answered",
                         peers.len()
                     );

@@ -66,6 +66,7 @@ use tonic::transport::Endpoint;
 use crate::peer_cluster::PeerIdentity;
 use crate::peer_cluster::refusing_cluster;
 use crate::raft_internal_proto;
+use crate::target::WireTarget;
 
 /// Text every protocol-version refusal carries, in 0.5.x, 0.6 and this binary.
 pub(crate) const PROTOCOL_MISMATCH_TEXT: &str = "raft grpc protocol mismatch";
@@ -185,7 +186,7 @@ pub(crate) async fn probe_peer_with_protocol(
         protocol_version,
         ..Default::default()
     };
-    crate::target::RaftTarget::Data(ursula_shard::RaftGroupId(FORMAT_EPOCH_PROBE_GROUP))
+    ursula_shard::RaftTarget::Data(ursula_shard::RaftGroupId(FORMAT_EPOCH_PROBE_GROUP))
         .stamp(peer_id, &mut envelope);
     let mut request = tonic::Request::new(envelope);
     request.set_timeout(timeout);

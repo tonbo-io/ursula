@@ -654,7 +654,9 @@ async fn a_meta_command_stops_a_data_groups_apply_before_the_entry() {
         crate::apply_failure::ApplyFailureKind::InvariantViolation
     );
     assert!(matches!(
-        state.apply_health.check(RaftGroupId(0)),
+        state
+            .apply_health
+            .check(ursula_shard::RaftTarget::Data(RaftGroupId(0))),
         Err(GroupEngineError::Infra(GroupInfraError::ApplyStopped {
             index: 2,
             kind: crate::apply_failure::ApplyStopKind::InvariantViolation,

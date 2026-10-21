@@ -510,7 +510,10 @@ only while a follower catches up from disk.
 `wal_recovery` in the metrics JSON, the `ursula.wal.recovering` gauge and
 `RaftWal::recovery_state` report whether and why the node opened recovering.
 `recovery_gates` and the `ursula.raft.recovery_gates` gauge list gated replicas
-and stalled groups. The `ursula.raft.follower_log_reversions` counter, labelled
+and stalled groups. `recovery_gates` names a data group by its id and the meta
+group as `"meta"`, and gate errors and logs name the plane too, so the meta
+group never reads as data group 0. Only data groups make a node unready, so
+`recovery_stalled_groups` in `/__ursula/ready` lists data groups only. The `ursula.raft.follower_log_reversions` counter, labelled
 by `follower`, counts the followers a leader on this node rewound because they
 lost entries they had acknowledged. `/__ursula/ready` names `wal_disk_pressure`,
 `recovery_stalled` or `recovery_gate_closed` and reports the watermarks.

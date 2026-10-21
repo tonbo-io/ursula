@@ -7,7 +7,7 @@ pub use ursula_proto::admin::ApplyFailureKind;
 pub use ursula_runtime::ApplyStopKind;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
-use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ApplyError {
@@ -49,9 +49,9 @@ impl StoppedApply {
     }
 
     /// The refusal of every request to the stopped group.
-    pub(crate) fn error(&self, raft_group_id: RaftGroupId) -> GroupEngineError {
+    pub(crate) fn error(&self, group: RaftTarget) -> GroupEngineError {
         GroupEngineError::Infra(GroupInfraError::ApplyStopped {
-            raft_group_id,
+            group,
             term: self.term,
             index: self.index,
             kind: self.kind,
@@ -75,9 +75,9 @@ impl ApplyHealth {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get_or_insert(stopped);
     }
-    pub(crate) fn check(&self, raft_group_id: RaftGroupId) -> Result<(), GroupEngineError> {
+    pub(crate) fn check(&self, group: RaftTarget) -> Result<(), GroupEngineError> {
         match self.stopped() {
-            Some(stopped) => Err(stopped.error(raft_group_id)),
+            Some(stopped) => Err(stopped.error(group)),
             None => Ok(()),
         }
     }

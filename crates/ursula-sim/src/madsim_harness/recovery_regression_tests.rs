@@ -561,7 +561,7 @@ fn a_wiped_voter_never_lets_a_stale_leader_commit() {
                         "the production admin entry point must reject unknown vote history",
                     );
                 assert!(
-                    matches!(error, RecoveryGateError::MissingVoteFloor { raft_group_id } if raft_group_id == RaftGroupId(group)),
+                    matches!(error, RecoveryGateError::MissingVoteFloor { group: target } if target == ursula_shard::RaftTarget::Data(RaftGroupId(group))),
                     "{context}: {error:?}"
                 );
                 assert_eq!(gate(&cluster, group, wiped), RecoveryGateStatus::Stalled);

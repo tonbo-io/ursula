@@ -302,7 +302,7 @@ where
     ) -> Result<RecoveryPlanReport, RecoveryGateError> {
         let mut replica = self.replica.lock().await;
         let restart = replica.as_mut().ok_or(RecoveryGateError::NotRegistered {
-            raft_group_id: super::state_machine::META_GROUP,
+            group: RaftTarget::Meta,
         })?;
         let accepted = self.registry.accept_meta_recovery_plan(plan, restart).await;
         if let Err(RecoveryGateError::MetaRestart { source }) = &accepted {

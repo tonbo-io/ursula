@@ -8,6 +8,7 @@
 use ursula_shard::BucketStreamId;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 use ursula_stream::ClosedBy;
 use ursula_stream::ClosedEpoch;
 use ursula_stream::ProducerRefusal;
@@ -70,6 +71,9 @@ fn stream() -> BucketStreamId {
 }
 
 const GROUP: RaftGroupId = RaftGroupId(7);
+
+/// [`GROUP`] as the target an infra error names.
+const TARGET: RaftTarget = RaftTarget::Data(GROUP);
 
 /// Every sample once, in a fixed order.
 pub fn group_engine_errors() -> Vec<GroupEngineError> {
@@ -244,22 +248,22 @@ fn leadership_refusals() -> Vec<LeadershipRefusal> {
 fn infra_errors() -> Vec<GroupInfraError> {
     let mut errors = every!(GroupInfraError {
         GroupInfraError::RecoveryNodeMismatch { .. } => GroupInfraError::RecoveryNodeMismatch {
-            raft_group_id: GROUP,
+            group: TARGET,
             expected: 1,
             actual: 2,
         },
         GroupInfraError::RaftGroupNotRegistered { .. } => GroupInfraError::RaftGroupNotRegistered {
-            raft_group_id: GROUP,
+            group: TARGET,
         },
         GroupInfraError::RecoveryAlreadyBound { .. } => GroupInfraError::RecoveryAlreadyBound {
-            raft_group_id: GROUP,
+            group: TARGET,
         },
         GroupInfraError::RecoveryGroupMismatch { .. } => GroupInfraError::RecoveryGroupMismatch {
-            expected: GROUP,
-            actual: RaftGroupId(8),
+            expected: TARGET,
+            actual: RaftTarget::Data(RaftGroupId(8)),
         },
         GroupInfraError::ApplyStopped { .. } => GroupInfraError::ApplyStopped {
-            raft_group_id: GROUP,
+            group: TARGET,
             term: 4,
             index: 19,
             kind: ApplyStopKind::Panic,
@@ -269,28 +273,28 @@ fn infra_errors() -> Vec<GroupInfraError> {
         },
         GroupInfraError::WalOpen { .. } => GroupInfraError::WalOpen {
             core_id: CoreId(1),
-            raft_group_id: GROUP,
+            group: TARGET,
             failure: WalOpenFailureKind::Io,
         },
         GroupInfraError::RecoveryVoteFloor { .. } => GroupInfraError::RecoveryVoteFloor {
-            raft_group_id: GROUP,
+            group: TARGET,
         },
         GroupInfraError::RecoveryCutting { .. } => GroupInfraError::RecoveryCutting {
-            raft_group_id: GROUP,
+            group: TARGET,
         },
         GroupInfraError::CommittedOverwrite { .. } => GroupInfraError::CommittedOverwrite {
-            raft_group_id: GROUP,
+            group: TARGET,
             committed: 12,
             index: 10,
         },
         GroupInfraError::LogBehindCommit { .. } => GroupInfraError::LogBehindCommit {
-            raft_group_id: GROUP,
+            group: TARGET,
             committed: 12,
             held: Some(10),
         },
         GroupInfraError::LogBelowSnapshot { .. } => GroupInfraError::LogBelowSnapshot {
             core_id: CoreId(2),
-            raft_group_id: GROUP,
+            group: TARGET,
             snapshot: LogPosition {
                 term: 2,
                 node_id: 4,
@@ -303,25 +307,25 @@ fn infra_errors() -> Vec<GroupInfraError> {
             },
         },
         GroupInfraError::UnrelatedHistory { .. } => GroupInfraError::UnrelatedHistory {
-            raft_group_id: GROUP,
+            group: TARGET,
             history: 0x0fed_cba9,
             replaced: 0x0123_4567,
             local: Some(0x0123_4568),
         },
         GroupInfraError::RecoveryPlanFenced { .. } => GroupInfraError::RecoveryPlanFenced {
-            raft_group_id: GROUP,
+            group: TARGET,
             plan_term: 6,
         },
         GroupInfraError::RecoveryPending { .. } => GroupInfraError::RecoveryPending {
-            raft_group_id: GROUP,
+            group: TARGET,
         },
         GroupInfraError::OwnerStopped => GroupInfraError::OwnerStopped,
         GroupInfraError::EngineWorkOutlivedShutdown { .. } => GroupInfraError::EngineWorkOutlivedShutdown {
-            raft_group_id: GROUP,
+            group: TARGET,
             waited_ms: 30_000,
         },
         GroupInfraError::PreviousEngineWorkRunning { .. } => GroupInfraError::PreviousEngineWorkRunning {
-            raft_group_id: GROUP,
+            group: TARGET,
         },
         GroupInfraError::OutcomeUnknown => GroupInfraError::OutcomeUnknown,
         GroupInfraError::ColdStore { .. } => GroupInfraError::ColdStore {
@@ -373,15 +377,15 @@ fn infra_errors() -> Vec<GroupInfraError> {
         },
         GroupInfraError::RecoveryGateOpen { .. } => GroupInfraError::RecoveryGateOpen {
             core_id: CoreId(1),
-            raft_group_id: GROUP,
+            group: TARGET,
             failure: WalOpenFailureKind::Corrupt,
         },
         GroupInfraError::MembershipInit { .. } => GroupInfraError::MembershipInit {
-            raft_group_id: GROUP,
+            group: TARGET,
             refusal: MembershipInitRefusal::NotAllowed,
         },
         GroupInfraError::LeaderWaitTimedOut { .. } => GroupInfraError::LeaderWaitTimedOut {
-            raft_group_id: GROUP,
+            group: TARGET,
             timeout_ms: 2000,
         },
         GroupInfraError::Snapshot(_) => GroupInfraError::Snapshot(
@@ -395,7 +399,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
         })
         .into_iter()
         .map(|kind| GroupInfraError::ApplyStopped {
-            raft_group_id: GROUP,
+            group: TARGET,
             term: 5,
             index: 20,
             kind,
@@ -424,7 +428,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
     });
     errors.extend(failures.iter().map(|&failure| GroupInfraError::WalOpen {
         core_id: CoreId(2),
-        raft_group_id: GROUP,
+        group: TARGET,
         failure,
     }));
     errors.extend(
@@ -432,7 +436,7 @@ fn infra_errors() -> Vec<GroupInfraError> {
             .into_iter()
             .map(|failure| GroupInfraError::RecoveryGateOpen {
                 core_id: CoreId(2),
-                raft_group_id: GROUP,
+                group: TARGET,
                 failure,
             }),
     );
@@ -553,9 +557,18 @@ fn infra_errors() -> Vec<GroupInfraError> {
         })
         .into_iter()
         .map(|refusal| GroupInfraError::MembershipInit {
-            raft_group_id: GROUP,
+            group: TARGET,
             refusal,
         }),
+    );
+    // The meta group, so every target has a sample.
+    errors.extend(
+        every!(RaftTarget {
+            RaftTarget::Data(_) => TARGET,
+            RaftTarget::Meta => RaftTarget::Meta,
+        })
+        .into_iter()
+        .map(|group| GroupInfraError::RaftGroupNotRegistered { group }),
     );
     errors.extend(snapshot_errors().into_iter().map(GroupInfraError::Snapshot));
     errors

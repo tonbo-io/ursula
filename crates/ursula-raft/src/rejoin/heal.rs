@@ -20,7 +20,7 @@ use super::leader_tick::LeaderTick;
 use super::leader_tick::StepRetry;
 use super::leader_tick::matched_indexes;
 use super::log_index;
-use crate::target::RaftTarget;
+use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig;
 
 /// The leader's view of one group, as the heal driver reads it.
@@ -121,7 +121,7 @@ pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     let mut joint_since = crate::rt::time::Instant::now();
     let mut retry = StepRetry::default();
     let mut tick = LeaderTick::new(
-        RaftTarget::Data(rejoin.raft_group_id),
+        rejoin.group,
         rejoin.node_id,
         raft.server_metrics(),
         raft.metrics(),
@@ -151,10 +151,12 @@ pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
         if !retry.admit(&step, interval) {
             continue;
         }
-        let group = rejoin.raft_group_id.0;
+        let plane = rejoin.group.plane().as_str_name();
+        let group = rejoin.group.wire_group_id();
         let node_id = rejoin.node_id;
         tracing::warn!(
             node_id,
+            plane,
             raft_group_id = group,
             step = ?step,
             "recovery: restoring the group's configured voters"
@@ -186,6 +188,7 @@ pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
                 HealStep::AddLearner { .. } | HealStep::FinishJoint => {}
                 HealStep::Promote { target, .. } => tracing::info!(
                     node_id,
+                    plane,
                     raft_group_id = group,
                     target,
                     "recovery: the replica is a caught-up voter again"
@@ -193,12 +196,14 @@ pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
             },
             Ok(Err(err)) => tracing::warn!(
                 node_id,
+                plane,
                 raft_group_id = group,
                 step = ?step,
                 "recovery: heal step failed, retrying: {err}"
             ),
             Err(_elapsed) => tracing::warn!(
                 node_id,
+                plane,
                 raft_group_id = group,
                 step = ?step,
                 "recovery: heal step timed out, retrying"

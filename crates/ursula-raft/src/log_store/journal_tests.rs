@@ -1662,9 +1662,13 @@ async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
             let writer = open(previous);
             let mut store = core.store(&writer, 1);
             assert_eq!(store.log_state(), GroupLogState::Initialized);
-            let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-                .await
-                .expect("prepare the group before starting Raft");
+            let gate = crate::GroupRejoin::durable(
+                1,
+                ursula_shard::RaftTarget::Data(RaftGroupId(1)),
+                &store,
+            )
+            .await
+            .expect("prepare the group before starting Raft");
             let expected = if previous == PreviousRun::Clean {
                 committed_vote()
             } else {
@@ -1681,9 +1685,13 @@ async fn a_crashed_leaders_demotion_survives_an_immediate_clean_restart() {
 
             let writer = open(PreviousRun::Clean);
             let mut store = core.store(&writer, 1);
-            let _gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-                .await
-                .expect("clean restart");
+            let _gate = crate::GroupRejoin::durable(
+                1,
+                ursula_shard::RaftTarget::Data(RaftGroupId(1)),
+                &store,
+            )
+            .await
+            .expect("clean restart");
             assert_eq!(store.read_vote().await.expect("vote"), Some(expected));
         }
     }
@@ -2332,9 +2340,10 @@ async fn missing_metadata_beside_a_nonempty_journal_closes_the_recovery_gate() {
     let mut store = core.store(&writer, 1);
     assert_eq!(store.log_state(), GroupLogState::Recovering);
     assert_eq!(store.read_vote().await.expect("vote"), None);
-    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-        .await
-        .expect("gate");
+    let gate =
+        crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(RaftGroupId(1)), &store)
+            .await
+            .expect("gate");
     assert!(!gate.vote_gate_open());
 }
 /// Records the run that holds `root` as poisoned, as a journal writer's I/O
@@ -3112,9 +3121,10 @@ async fn the_commit_screen_refuses_a_snapshot_that_replaced_committed_entries() 
         .save_committed(Some(log_id(4)))
         .await
         .expect("save the committed entry");
-    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-        .await
-        .expect("a gate");
+    let gate =
+        crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(RaftGroupId(1)), &store)
+            .await
+            .expect("a gate");
     let later = |index: u64| openraft::LogId {
         leader_id: openraft::vote::leader_id_adv::CommittedLeaderId::new(9, 2),
         index,
@@ -3261,9 +3271,10 @@ async fn the_history_at_the_marker_follows_the_events_apply_would_take() {
         blank_entry(4),
     ])
     .await;
-    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-        .await
-        .expect("a gate");
+    let gate =
+        crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(RaftGroupId(1)), &store)
+            .await
+            .expect("a gate");
     let applied = ursula_runtime::HistoryEvent {
         id: std::num::NonZeroU64::new(1).expect("non-zero"),
         event_index: 1,
@@ -3319,9 +3330,10 @@ async fn the_screen_reads_the_commit_openraft_holds_above_the_stored_marker() {
         .expect("save the committed entry");
     // A snapshot through 100 installed: the log is purged up to it.
     store.purge(log_id(100)).await.expect("purge");
-    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-        .await
-        .expect("a gate");
+    let gate =
+        crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(RaftGroupId(1)), &store)
+            .await
+            .expect("a gate");
     let mut metrics = openraft::RaftMetrics::<UrsulaRaftTypeConfig>::new_initial(1);
     metrics.local_committed = Some(log_id(100));
     metrics.last_applied = Some(log_id(100));
@@ -3361,9 +3373,10 @@ async fn the_screen_refuses_everything_once_the_store_is_gone() {
     let writer = core.writer();
     let mut store = core.store(&writer, 1);
     append(&mut store, [blank_entry(1), blank_entry(2)]).await;
-    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-        .await
-        .expect("a gate");
+    let gate =
+        crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(RaftGroupId(1)), &store)
+            .await
+            .expect("a gate");
     drop(store);
     let append_two = openraft::raft::AppendEntriesRequest::<UrsulaRaftTypeConfig> {
         vote: openraft::Vote::new_committed(5, 1),
@@ -3391,9 +3404,10 @@ async fn the_screen_refuses_while_the_store_lags_an_admitted_install() {
         .save_committed(Some(log_id(40)))
         .await
         .expect("save the committed entry");
-    let gate = crate::GroupRejoin::durable(1, RaftGroupId(1), &store)
-        .await
-        .expect("a gate");
+    let gate =
+        crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(RaftGroupId(1)), &store)
+            .await
+            .expect("a gate");
     // OpenRaft installed a snapshot through 100; the store has not purged.
     let mut metrics = openraft::RaftMetrics::<UrsulaRaftTypeConfig>::new_initial(1);
     metrics.local_committed = Some(log_id(100));

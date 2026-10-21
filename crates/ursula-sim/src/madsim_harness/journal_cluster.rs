@@ -584,9 +584,13 @@ impl JournalCluster {
             .open(placement, self.metrics[&node_id].group_engine_metrics())
             .await;
         let rejoin = Arc::new(
-            GroupRejoin::durable(node_id, placement.raft_group_id, &store)
-                .await
-                .expect("open the recovery gate"),
+            GroupRejoin::durable(
+                node_id,
+                ursula_shard::RaftTarget::Data(placement.raft_group_id),
+                &store,
+            )
+            .await
+            .expect("open the recovery gate"),
         );
         let registry = self.registries[&group].clone();
         let mut config = (*self.config).clone();

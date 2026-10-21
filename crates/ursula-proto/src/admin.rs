@@ -684,13 +684,93 @@ impl RecoveryGateStatus {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A Raft group of either plane as admin JSON names it: the meta group as
+/// `"meta"`, a data group by its id, a number. As a JSON object key the id
+/// is a string, like every key. The kernel's form is
+/// `ursula_shard::RaftTarget`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RaftTargetKey {
+    Data(u32),
+    Meta,
+}
+
+/// The admin JSON name of the meta group.
+const META_KEY: &str = "meta";
+
+/// `meta`, or the group id: the key's JSON form, as an admin route names it.
+impl std::fmt::Display for RaftTargetKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Data(group) => write!(f, "{group}"),
+            Self::Meta => f.write_str(META_KEY),
+        }
+    }
+}
+
+impl Serialize for RaftTargetKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Data(group) => serializer.serialize_u32(*group),
+            Self::Meta => serializer.serialize_str(META_KEY),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for RaftTargetKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = RaftTargetKey;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("\"meta\" or a raft group id")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                u32::try_from(value)
+                    .map(RaftTargetKey::Data)
+                    .map_err(|_overflow| {
+                        E::invalid_value(serde::de::Unexpected::Unsigned(value), &self)
+                    })
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                u32::try_from(value)
+                    .map(RaftTargetKey::Data)
+                    .map_err(|_overflow| {
+                        E::invalid_value(serde::de::Unexpected::Signed(value), &self)
+                    })
+            }
+
+            /// `"meta"`, or a group id as an object key carries it.
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                if value == META_KEY {
+                    return Ok(RaftTargetKey::Meta);
+                }
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit())
+                    .then(|| value.parse().ok())
+                    .flatten()
+                    .map(RaftTargetKey::Data)
+                    .ok_or_else(|| E::invalid_value(serde::de::Unexpected::Str(value), &self))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+/// The recovery gates of this node's replicas that are not open, the meta
+/// replica's under `"meta"`, and the groups among them that stalled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoveryGatesReport {
-    pub gated: BTreeMap<u32, RecoveryGateStatus>,
-    pub stalled: Vec<u32>,
+    pub gated: BTreeMap<RaftTargetKey, RecoveryGateStatus>,
+    pub stalled: Vec<RaftTargetKey>,
 }
 impl RecoveryGatesReport {
-    pub fn new(gates: BTreeMap<u32, RecoveryGateStatus>) -> Self {
+    pub fn new(gates: BTreeMap<RaftTargetKey, RecoveryGateStatus>) -> Self {
         let gated: BTreeMap<_, _> = gates
             .into_iter()
             .filter(|(_, status)| *status != RecoveryGateStatus::Open)
@@ -1302,6 +1382,56 @@ mod usage_tests {
         assert_eq!(
             UsageReport::staged_part_bytes(&reports),
             (BTreeMap::from([("tenant".to_owned(), 100)]), false)
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovery_gates_report_tests {
+    use std::collections::BTreeMap;
+
+    use super::RaftTargetKey;
+    use super::RecoveryGateStatus;
+    use super::RecoveryGatesReport;
+
+    /// The report names the meta group `"meta"` and a data group by its id,
+    /// a string as an object key and a number in the stalled list, and
+    /// decodes back to itself. Meta's gate is never read as data group 0's.
+    #[test]
+    fn the_report_names_each_plane_and_round_trips() {
+        let report = RecoveryGatesReport::new(BTreeMap::from([
+            (RaftTargetKey::Data(0), RecoveryGateStatus::Open),
+            (RaftTargetKey::Data(7), RecoveryGateStatus::AwaitingBarrier),
+            (RaftTargetKey::Data(9), RecoveryGateStatus::Stalled),
+            (RaftTargetKey::Meta, RecoveryGateStatus::Stalled),
+        ]));
+        let json = serde_json::to_string(&report).expect("the report renders");
+        assert_eq!(
+            json,
+            r#"{"gated":{"7":"awaiting_barrier","9":"stalled","meta":"stalled"},"stalled":[9,"meta"]}"#
+        );
+        let decoded: RecoveryGatesReport = serde_json::from_str(&json).expect("the report decodes");
+        assert_eq!(decoded, report);
+    }
+
+    #[test]
+    fn a_key_that_names_no_group_does_not_decode() {
+        for key in [
+            r#""Meta""#,
+            r#""+7""#,
+            r#""-1""#,
+            "4294967296",
+            "-1",
+            r#""""#,
+        ] {
+            assert!(
+                serde_json::from_str::<RaftTargetKey>(key).is_err(),
+                "{key} decoded"
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<RaftTargetKey>("4294967295").expect("a group id"),
+            RaftTargetKey::Data(u32::MAX)
         );
     }
 }

@@ -803,10 +803,14 @@ async fn reopen_after_a_reordered_unsynced_tail(
                     "a complete invalid tail must close the durable recovery gate: {report:?}"
                 );
                 assert!(
-                    !GroupRejoin::durable(1, placement.raft_group_id, &store)
-                        .await
-                        .unwrap()
-                        .vote_gate_open()
+                    !GroupRejoin::durable(
+                        1,
+                        ursula_shard::RaftTarget::Data(placement.raft_group_id),
+                        &store
+                    )
+                    .await
+                    .unwrap()
+                    .vote_gate_open()
                 );
             }
             Ok(recovered)

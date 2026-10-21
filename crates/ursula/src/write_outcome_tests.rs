@@ -1203,14 +1203,14 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
         "history-pending" => {
             node.create(path, TEXT, b"").await;
             node.fail_next_write(GroupEngineError::Infra(GroupInfraError::RecoveryPending {
-                raft_group_id: ursula_shard::RaftGroupId(0),
+                group: ursula_shard::RaftTarget::Data(ursula_shard::RaftGroupId(0)),
             }));
             node.send(via, produce(path, 0, 0, b"a", &[])).await
         }
         "apply-stopped" => {
             node.create(path, TEXT, b"").await;
             node.fail_next_write(GroupEngineError::Infra(GroupInfraError::ApplyStopped {
-                raft_group_id: ursula_shard::RaftGroupId(0),
+                group: ursula_shard::RaftTarget::Data(ursula_shard::RaftGroupId(0)),
                 term: 1,
                 index: 2,
                 kind: ursula_runtime::ApplyStopKind::Panic,
@@ -1221,7 +1221,7 @@ async fn drive(world: &World, id: &str, via: Via) -> Answer {
             node.create(path, TEXT, b"").await;
             node.fail_next_write(GroupEngineError::Infra(
                 GroupInfraError::PreviousEngineWorkRunning {
-                    raft_group_id: ursula_shard::RaftGroupId(0),
+                    group: ursula_shard::RaftTarget::Data(ursula_shard::RaftGroupId(0)),
                 },
             ));
             node.send(via, produce(path, 0, 0, b"a", &[])).await

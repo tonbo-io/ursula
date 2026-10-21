@@ -239,9 +239,13 @@ async fn new_recovery_engine(
     )
     .expect("open the log store");
     let gate = Arc::new(
-        GroupRejoin::durable(id, placement().raft_group_id, &store)
-            .await
-            .expect("open the gate"),
+        GroupRejoin::durable(
+            id,
+            ursula_shard::RaftTarget::Data(placement().raft_group_id),
+            &store,
+        )
+        .await
+        .expect("open the gate"),
     );
     let peer_cluster = registry.peer_cluster().clone();
     if peer_cluster.identity().is_none() {
@@ -551,9 +555,13 @@ async fn recovery_publication_keeps_one_gate_bound_to_one_engine() {
         &gate
     ));
     let alternate = Arc::new(
-        GroupRejoin::durable(1, placement().raft_group_id, &store)
-            .await
-            .unwrap(),
+        GroupRejoin::durable(
+            1,
+            ursula_shard::RaftTarget::Data(placement().raft_group_id),
+            &store,
+        )
+        .await
+        .unwrap(),
     );
     assert!(matches!(
         engine.publish_recovery(alternate, &registry),

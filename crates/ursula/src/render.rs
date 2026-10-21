@@ -1723,7 +1723,7 @@ mod tests {
     fn stopped_apply_and_uncertain_write_render_service_unavailable() {
         for error in [
             ursula_runtime::GroupInfraError::ApplyStopped {
-                raft_group_id: ursula_shard::RaftGroupId(2),
+                group: ursula_shard::RaftTarget::Data(ursula_shard::RaftGroupId(2)),
                 term: 3,
                 index: 7,
                 kind: ursula_runtime::ApplyStopKind::Panic,

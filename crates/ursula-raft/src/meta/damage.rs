@@ -68,17 +68,15 @@ pub(crate) fn commit_screen_damage(
 #[cfg(test)]
 mod tests {
     use ursula_runtime::GroupInfraError;
-    use ursula_shard::RaftGroupId;
+    use ursula_shard::RaftTarget;
 
     use super::Screened;
     use super::commit_screen_damage;
     use crate::types::UrsulaVote;
 
-    const META: RaftGroupId = RaftGroupId(0);
-
     fn overwrite() -> GroupInfraError {
         GroupInfraError::CommittedOverwrite {
-            raft_group_id: META,
+            group: RaftTarget::Meta,
             committed: 9,
             index: 7,
         }
@@ -86,7 +84,7 @@ mod tests {
 
     fn unrelated(local: Option<u64>) -> GroupInfraError {
         GroupInfraError::UnrelatedHistory {
-            raft_group_id: META,
+            group: RaftTarget::Meta,
             history: 0xb2,
             replaced: 0xa1,
             local,
@@ -162,12 +160,12 @@ mod tests {
         }
         let transient = [
             GroupInfraError::LogBehindCommit {
-                raft_group_id: META,
+                group: RaftTarget::Meta,
                 committed: 9,
                 held: Some(3),
             },
             GroupInfraError::RecoveryCutting {
-                raft_group_id: META,
+                group: RaftTarget::Meta,
             },
             GroupInfraError::OwnerStopped,
         ];

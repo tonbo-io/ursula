@@ -103,7 +103,7 @@ fn leader_wait_error(raft_group_id: RaftGroupId, error: WaitError) -> GroupEngin
         WaitError::Timeout(..) => {
             tracing::warn!(raft_group_id = raft_group_id.0, %error, "the group observed no expected leader in time");
             GroupEngineError::Infra(GroupInfraError::LeaderWaitTimedOut {
-                raft_group_id,
+                group: ursula_shard::RaftTarget::Data(raft_group_id),
                 timeout_ms: u64::try_from(LEADER_WAIT.as_millis()).unwrap_or(u64::MAX),
             })
         }

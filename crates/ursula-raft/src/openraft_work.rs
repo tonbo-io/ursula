@@ -61,8 +61,10 @@ use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_runtime::GroupInfraError;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
 use crate::rt::sync::watch;
+use crate::target::WireTarget;
 use crate::types::UrsulaRaftTypeConfig;
 
 type NodeIdOf = <UrsulaRaftTypeConfig as RaftTypeConfig>::NodeId;
@@ -209,7 +211,7 @@ impl OpenRaftWork {
     /// Calling it again, or from several callers, waits again.
     pub(crate) async fn stop(
         &self,
-        raft_group_id: RaftGroupId,
+        group: RaftTarget,
         timeout: Duration,
     ) -> Result<(), GroupInfraError> {
         self.begin_stop();
@@ -218,7 +220,8 @@ impl OpenRaftWork {
             Err(_elapsed) => {
                 let waited_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
                 tracing::error!(
-                    raft_group_id = raft_group_id.0,
+                    plane = group.plane().as_str_name(),
+                    raft_group_id = group.wire_group_id(),
                     waited_ms,
                     workers = self.live.count(WorkKind::Worker),
                     builders = self.live.count(WorkKind::Builder),
@@ -228,10 +231,7 @@ impl OpenRaftWork {
                     "EngineWorkOutlivedShutdown: OpenRaft work of a stopped group engine still \
                      runs, and its group stays closed until that work ended"
                 );
-                Err(GroupInfraError::EngineWorkOutlivedShutdown {
-                    raft_group_id,
-                    waited_ms,
-                })
+                Err(GroupInfraError::EngineWorkOutlivedShutdown { group, waited_ms })
             }
         }
     }
@@ -798,6 +798,7 @@ mod tests {
 
     use ursula_runtime::GroupInfraError;
     use ursula_shard::RaftGroupId;
+    use ursula_shard::RaftTarget;
 
     use super::EngineWorkLedger;
     use super::OpenRaftWork;
@@ -810,11 +811,13 @@ mod tests {
         let (work, token) = OpenRaftWork::start();
         let builder = token.clone();
         assert!(!token.is_stopping());
-        let stopped = work.stop(RaftGroupId(3), Duration::from_millis(50)).await;
+        let stopped = work
+            .stop(RaftTarget::Data(RaftGroupId(3)), Duration::from_millis(50))
+            .await;
         assert!(matches!(
             stopped,
             Err(GroupInfraError::EngineWorkOutlivedShutdown {
-                raft_group_id: RaftGroupId(3),
+                group: RaftTarget::Data(RaftGroupId(3)),
                 waited_ms: 50,
             })
         ));
@@ -823,7 +826,8 @@ mod tests {
         drop(token);
         drop(builder);
         assert!(matches!(
-            work.stop(RaftGroupId(3), Duration::from_secs(5)).await,
+            work.stop(RaftTarget::Data(RaftGroupId(3)), Duration::from_secs(5))
+                .await,
             Ok(())
         ));
     }
@@ -941,8 +945,8 @@ mod tests {
     async fn two_stops_wait_together_and_report_their_own_bound() {
         let (work, token) = OpenRaftWork::start();
         let (first, second) = tokio::join!(
-            work.stop(RaftGroupId(2), Duration::from_millis(30)),
-            work.stop(RaftGroupId(2), Duration::from_millis(40)),
+            work.stop(RaftTarget::Data(RaftGroupId(2)), Duration::from_millis(30)),
+            work.stop(RaftTarget::Data(RaftGroupId(2)), Duration::from_millis(40)),
         );
         assert!(matches!(
             first,
@@ -953,7 +957,7 @@ mod tests {
             Err(GroupInfraError::EngineWorkOutlivedShutdown { waited_ms: 40, .. })
         ));
         drop(token);
-        work.stop(RaftGroupId(2), Duration::from_secs(5))
+        work.stop(RaftTarget::Data(RaftGroupId(2)), Duration::from_secs(5))
             .await
             .expect("the stop returns once the token is gone");
     }
@@ -966,11 +970,12 @@ mod tests {
         admission.close();
         assert!(admission.admit().is_none());
         assert!(matches!(
-            work.stop(RaftGroupId(1), Duration::from_millis(20)).await,
+            work.stop(RaftTarget::Data(RaftGroupId(1)), Duration::from_millis(20))
+                .await,
             Err(GroupInfraError::EngineWorkOutlivedShutdown { .. })
         ));
         drop(admitted);
-        work.stop(RaftGroupId(1), Duration::from_secs(5))
+        work.stop(RaftTarget::Data(RaftGroupId(1)), Duration::from_secs(5))
             .await
             .expect("the stop returns once the admitted task ended");
     }

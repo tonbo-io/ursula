@@ -62,7 +62,10 @@
 //! - the group engine error without its static-membership variant, with a
 //!   not-held WAL open, a control answer kind and a command of the other
 //!   plane, and with the closed `ApplyStopKind` in `ApplyStopped`, which no
-//!   longer decodes the unknown kind epoch 5 accepted;
+//!   longer decodes the unknown kind epoch 5 accepted. Each of its infra
+//!   errors that names a group names it as a `RaftTarget` in `group`, the
+//!   field's place unchanged: `Data` with the group id, or `Meta`, so a
+//!   refusal of the meta group never reads as one of data group 0;
 //! - two variant casings, each frozen with the epoch. The Raft-layer
 //!   envelopes (`StreamCommand`, `RaftCommand`, `MetaCommand`,
 //!   `MetaResponse` and `GenesisAnswer`) keep serde's default `PascalCase`

@@ -6390,9 +6390,13 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         raft_group_id: RaftGroupId(0),
     };
     let gate = Arc::new(
-        ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
-            .await
-            .expect("open the gate"),
+        ursula_raft::GroupRejoin::durable(
+            1,
+            ursula_shard::RaftTarget::Data(RaftGroupId(0)),
+            &store,
+        )
+        .await
+        .expect("open the gate"),
     );
     let engine = ursula_raft::RaftGroupEngine::new_node(
         placement,
@@ -6474,9 +6478,13 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
                 .expect("persist retained vote metadata");
         }
         let gate = Arc::new(
-            ursula_raft::GroupRejoin::durable(1, RaftGroupId(0), &store)
-                .await
-                .expect("open the gate"),
+            ursula_raft::GroupRejoin::durable(
+                1,
+                ursula_shard::RaftTarget::Data(RaftGroupId(0)),
+                &store,
+            )
+            .await
+            .expect("open the gate"),
         );
         // The log kept the group's membership: a plan elects one of its
         // voters. The gate is closed, so the entry records it recovering.

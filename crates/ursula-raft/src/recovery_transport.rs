@@ -5,6 +5,7 @@ use openraft::RaftNetworkV2;
 use openraft::network::RPCOption;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_shard::RaftTarget;
 
 use crate::BarrierAnswer;
 use crate::forward::LeaderRoute;
@@ -15,7 +16,6 @@ use crate::meta::genesis::GenesisProbe;
 use crate::rejoin::PeerGroupLog;
 use crate::rejoin::RecoveryTransport;
 use crate::rejoin::bootstrap_probe_vote;
-use crate::target::RaftTarget;
 
 /// Recovery probes over gRPC: the bootstrap probe vote about group
 /// `target`, and the genesis probe, barriers and forwarded control commands

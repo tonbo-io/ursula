@@ -277,7 +277,6 @@ pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::persisted_snapshot_pointer;
 pub use target::RAFT_PLANE_METADATA;
-pub use target::RaftTarget;
 pub use types::RaftCommand;
 pub use types::RaftGroupMaintenanceState;
 pub use types::RaftGroupMetricsSnapshot;
@@ -293,6 +292,7 @@ pub use types::UrsulaSnapshot;
 pub use types::UrsulaVote;
 pub use types::UrsulaVoteRequest;
 pub use types::UrsulaVoteResponse;
+pub use ursula_shard::RaftTarget;
 
 #[cfg(test)]
 mod tests;

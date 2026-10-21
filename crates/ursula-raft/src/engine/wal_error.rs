@@ -3,6 +3,7 @@ use ursula_runtime::ErrorChain;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::WalOpenFailureKind;
+use ursula_shard::RaftTarget;
 use ursula_shard::ShardPlacement;
 
 use crate::log_store::CoreJournalError;
@@ -19,7 +20,7 @@ pub(super) fn group_open_error(
     // Not a failure of the WAL: the group opens on a later request (#709).
     if let RaftWalError::PreviousEngineRunning { .. } = source {
         return GroupEngineError::Infra(GroupInfraError::PreviousEngineWorkRunning {
-            raft_group_id: placement.raft_group_id,
+            group: RaftTarget::Data(placement.raft_group_id),
         });
     }
     let failure = classify(&source);
@@ -29,7 +30,7 @@ pub(super) fn group_open_error(
         error = %source, source = ?source, "WAL refused to open a group");
     GroupEngineError::Infra(GroupInfraError::WalOpen {
         core_id: placement.core_id,
-        raft_group_id: placement.raft_group_id,
+        group: RaftTarget::Data(placement.raft_group_id),
         failure,
     })
 }
@@ -51,7 +52,7 @@ pub(super) fn gate_open_error(
         error = %ErrorChain(&source), "the group's recovery gate did not open");
     GroupEngineError::Infra(GroupInfraError::RecoveryGateOpen {
         core_id: placement.core_id,
-        raft_group_id: placement.raft_group_id,
+        group: RaftTarget::Data(placement.raft_group_id),
         failure,
     })
 }
@@ -217,7 +218,7 @@ mod tests {
                 }),
                 GroupEngineError::Infra(GroupInfraError::WalOpen {
                     core_id: placement.core_id,
-                    raft_group_id: placement.raft_group_id,
+                    group: RaftTarget::Data(placement.raft_group_id),
                     failure
                 })
             );
@@ -231,18 +232,18 @@ mod tests {
             shard_id: ShardId(7),
             raft_group_id: RaftGroupId(7),
         };
-        let raft_group_id = placement.raft_group_id;
+        let group = RaftTarget::Data(placement.raft_group_id);
         let cases = [
             (
                 GateOpenError::CutLog {
-                    raft_group_id,
+                    group,
                     source: std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
                 },
                 WalOpenFailureKind::Io,
             ),
             (
                 GateOpenError::StartAsFollower {
-                    raft_group_id,
+                    group,
                     source: CoreJournalError::WriterStopped {
                         journal: "journal".into(),
                     },
@@ -255,7 +256,7 @@ mod tests {
                 gate_open_error(placement, source),
                 GroupEngineError::Infra(GroupInfraError::RecoveryGateOpen {
                     core_id: placement.core_id,
-                    raft_group_id,
+                    group,
                     failure
                 })
             );
