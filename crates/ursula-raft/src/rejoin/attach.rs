@@ -249,9 +249,11 @@ impl RecoveryGate {
     /// initializes the voters of `nodes` once every other candidate does.
     /// Each reads `nodes` at each use.
     ///
-    /// Each driver starts once the node owes no predecessor wait, so a
-    /// barrier round, a vote floor and an initialization all come after the
-    /// predecessor stopped.
+    /// Each driver starts once the fence no longer holds the replica out
+    /// ([`crate::predecessor_wait::fence_holds`]): no predecessor wait is
+    /// owed and, for a data replica of an empty root, the meta group bound
+    /// the root. So a barrier round, a vote floor and an initialization all
+    /// come after the predecessor stopped.
     pub(crate) fn spawn_gate_drivers<SM, T>(
         &self,
         raft: openraft::Raft<crate::UrsulaRaftTypeConfig, SM>,
@@ -285,7 +287,7 @@ impl RecoveryGate {
         );
         let waited = fence.clone();
         self.push(crate::rt::spawn(async move {
-            waited.waited().await;
+            crate::predecessor_wait::fence_released(&waited, target).await;
             barrier.await;
         }));
         if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
@@ -295,7 +297,7 @@ impl RecoveryGate {
             let probe = probe.clone();
             let fence = fence.clone();
             self.push(crate::rt::spawn(async move {
-                fence.waited().await;
+                crate::predecessor_wait::fence_released(&fence, target).await;
                 while rejoin.needs_vote_floor() && !rejoin.holds_group_history() {
                     let mut all_empty = true;
                     for peer in &nodes.candidates() {
@@ -321,13 +323,17 @@ impl RecoveryGate {
                                 continue;
                             }
                         }
-                        if let Err(error) = rejoin.establish_vote_floor(UrsulaVote::new(0, 0)).await
-                        {
-                            // Journal I/O failures poison/stop the writer. Never retry
-                            // bootstrap after them or publish admission without fsync.
-                            tracing::error!(%error, "genesis vote persistence failed; leaving recovery closed");
+                        // The hold is checked again right before the floor is
+                        // written, as the barrier does.
+                        if !crate::predecessor_wait::fence_holds(&fence, target) {
+                            if let Err(error) = rejoin.establish_vote_floor(UrsulaVote::new(0, 0)).await
+                            {
+                                // Journal I/O failures poison/stop the writer. Never retry
+                                // bootstrap after them or publish admission without fsync.
+                                tracing::error!(%error, "genesis vote persistence failed; leaving recovery closed");
+                            }
+                            return;
                         }
-                        return;
                     }
                     crate::rt::time::sleep(config.bootstrap_interval).await;
                 }
@@ -335,7 +341,7 @@ impl RecoveryGate {
         }
         if seed.local_role() == Some(SeedRoleOf::Initializer) && !rejoin.holds_group_history() {
             self.push(crate::rt::spawn(async move {
-                fence.waited().await;
+                crate::predecessor_wait::fence_released(&fence, target).await;
                 run_group_bootstrap(
                     rejoin.node_id,
                     raft,

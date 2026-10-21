@@ -9,8 +9,9 @@
 //! the node's [`RegistrationStatus`], which status reports read.
 //!
 //! `OtherRoot` is judged by how the run stands on its root
-//! ([`super::root::RootStanding`], [`judge_answer`]): an unbound empty root
-//! is held out of everything and registers until an operator releases the
+//! ([`super::root::RootStanding`], [`judge_answer`]): an unbound empty root,
+//! whose data replicas the node fence holds out until it is bound, is held
+//! out of meta votes too and registers until an operator releases the
 //! slot, so it binds within [`RETRY_MAX`] of the release with no restart,
 //! and a bound root, one that holds state, fences itself for good.
 //! `NodeRemoved` makes the node treat itself as removed until it restarts.
@@ -142,9 +143,9 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
                     node = %me,
                     root = %registrant.root,
                     %slot,
-                    "meta registration: this node id is bound to another root. This empty root \
-                     takes part in nothing and registers again until an operator releases that \
-                     root with `ursulactl node replace-disk`"
+                    "meta registration: this node id is bound to another root. Its data replicas \
+                     stay held out and it registers again until an operator releases that root \
+                     with `ursulactl node replace-disk`"
                 );
                 guard.hold_out();
                 status.send_replace(RegistrationStatus::RootRefused { slot });

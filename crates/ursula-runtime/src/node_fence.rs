@@ -23,7 +23,11 @@
 //! The fence also carries the predecessor wait ([`NodeFence::owes_wait`]):
 //! while a process of an earlier run of the root may still run, this one
 //! grants no vote, takes no transfer, opens no gate and writes no snapshot
-//! object.
+//! object. A root that was empty at its open owes its wait from the binding
+//! the meta group answers, and until that binding its data replicas take
+//! part in nothing ([`NodeFence::awaits_binding`]): no vote, no gate, no
+//! floor and no snapshot object. Its meta replica is not held by it, so a
+//! forming cluster's meta group still elects.
 //!
 //! A process without a WAL root, or a test, runs [`NodeFence::unleased`]:
 //! no lease and no wait, only the shutdown's close.
@@ -168,7 +172,8 @@ pub enum WriteRefusal {
     DiskLeaseLost,
     Closed,
     Superseded,
-    /// A snapshot object, while a predecessor wait is owed.
+    /// A snapshot object, while a predecessor wait is owed or an empty
+    /// root awaits its binding.
     PredecessorWait,
 }
 
@@ -203,6 +208,10 @@ struct FenceState {
     closed: AtomicBool,
     superseded: AtomicBool,
     owes_wait: AtomicBool,
+    /// An empty root that the meta group has not bound yet.
+    awaits_binding: AtomicBool,
+    /// Wakes the waiters of [`NodeFence::waited`] and
+    /// [`NodeFence::bound_and_waited`].
     waited: crate::rt::sync::Notify,
 }
 
@@ -220,6 +229,7 @@ impl NodeFence {
             closed: AtomicBool::new(false),
             superseded: AtomicBool::new(false),
             owes_wait: AtomicBool::new(false),
+            awaits_binding: AtomicBool::new(false),
             waited: crate::rt::sync::Notify::new(),
         }))
     }
@@ -318,7 +328,7 @@ impl NodeFence {
         path: &str,
     ) -> Result<(), FencedWrite> {
         let refusal = match self.status(fence_now()) {
-            FenceStatus::Admits if object == FencedObject::Snapshot && self.owes_wait() => {
+            FenceStatus::Admits if object == FencedObject::Snapshot && self.holds_data() => {
                 WriteRefusal::PredecessorWait
             }
             FenceStatus::Admits => return Ok(()),
@@ -374,11 +384,53 @@ impl NodeFence {
 
     /// Returns once no predecessor wait is owed.
     pub async fn waited(&self) {
+        self.until(|fence| !fence.owes_wait()).await;
+    }
+
+    /// This run's root was empty at its open and owes its wait from the
+    /// meta group's binding: until [`Self::bind`], its data replicas take
+    /// part in nothing. A leased fence only.
+    pub fn await_binding(&self) {
+        if self.0.lease.is_some() {
+            self.0.awaits_binding.store(true, Ordering::Release);
+        }
+    }
+
+    /// The meta group answered this empty root's registration. `owes_wait`
+    /// says that the answer bound it in a bootstrapped cluster, so the run
+    /// owes the predecessor wait from now on: it begins before the hold
+    /// ends, so a data replica is never free in between.
+    pub fn bind(&self, owes_wait: bool) {
+        if owes_wait {
+            self.begin_wait();
+        }
+        self.0.awaits_binding.store(false, Ordering::Release);
+        self.0.waited.notify_waiters();
+    }
+
+    /// Whether this run's empty root awaits its binding ([`Self::await_binding`]).
+    pub fn awaits_binding(&self) -> bool {
+        self.0.awaits_binding.load(Ordering::Acquire)
+    }
+
+    /// Whether a data replica is held out now: a predecessor wait is owed,
+    /// or the empty root awaits its binding.
+    pub fn holds_data(&self) -> bool {
+        self.owes_wait() || self.awaits_binding()
+    }
+
+    /// Returns once a data replica is no longer held out
+    /// ([`Self::holds_data`]).
+    pub async fn bound_and_waited(&self) {
+        self.until(|fence| !fence.holds_data()).await;
+    }
+
+    async fn until(&self, done: impl Fn(&Self) -> bool) {
         loop {
             let notified = self.0.waited.notified();
             let mut notified = std::pin::pin!(notified);
             notified.as_mut().enable();
-            if !self.owes_wait() {
+            if done(self) {
                 return;
             }
             notified.await;
@@ -549,5 +601,38 @@ mod tests {
             .check_write(FencedObject::Cold, "DELETE", "cold/x")
             .unwrap_err();
         assert_eq!(refused.refusal, WriteRefusal::Closed);
+    }
+
+    /// An empty root awaiting its binding holds data replicas and snapshot
+    /// objects out, and a binding in a bootstrapped cluster hands the hold
+    /// to the wait with no gap. Catches a `bind` that ends the hold before
+    /// the wait begins.
+    #[test]
+    fn a_binding_hands_the_hold_to_the_wait_with_no_gap() {
+        let fence = NodeFence::leased(L);
+        let t = fence_now();
+        fence.record_probe(t, ProbeOutcome::Synced, t);
+        fence.await_binding();
+        assert!(fence.holds_data() && !fence.owes_wait());
+        assert_eq!(
+            fence
+                .check_write(FencedObject::Snapshot, "PUT", "snapshots/x")
+                .unwrap_err()
+                .refusal,
+            WriteRefusal::PredecessorWait
+        );
+        fence.bind(true);
+        assert!(fence.holds_data() && fence.owes_wait() && !fence.awaits_binding());
+        fence.end_wait();
+        assert!(!fence.holds_data());
+        // A forming cluster's answer settles the hold with no wait.
+        let forming = NodeFence::leased(L);
+        forming.await_binding();
+        forming.bind(false);
+        assert!(!forming.holds_data());
+        // An unleased fence never holds.
+        let unleased = NodeFence::unleased();
+        unleased.await_binding();
+        assert!(!unleased.holds_data());
     }
 }

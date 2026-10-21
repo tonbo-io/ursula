@@ -218,7 +218,7 @@ preserve its data.
 
 ### Rejoining a wiped node
 
-A voter whose WAL directory was wiped or replaced, for example after a lost disk, starts with an empty log for every group under a new root. The meta group still binds the node id to the old root, so the node takes part in nothing yet: its placement status shows the registration `root_refused` with the old root's slot, and readiness reports `root_refused`. Once the old disk is revoked (the old process ended, its volume was detached or destroyed, or its host is shut down, on Kubernetes a pod deleted normally, a force-deleted pod whose VolumeAttachment is gone, or a node tainted out of service), release it from any machine that reaches another node's admin plane:
+A voter whose WAL directory was wiped or replaced, for example after a lost disk, starts with an empty log for every group under a new root. The meta group still binds the node id to the old root, so the node's data replicas stay out of every group: they grant no vote and their recovery gates stay closed. Its placement status shows the registration `root_refused` with the old root's slot, and readiness reports `root_refused`. Once the old disk is revoked (the old process ended, its volume was detached or destroyed, or its host is shut down, on Kubernetes a pod deleted normally, a force-deleted pod whose VolumeAttachment is gone, or a node tainted out of service), release it from any machine that reaches another node's admin plane:
 
 ```bash
 # R is the old root, as the refused node's placement status names it

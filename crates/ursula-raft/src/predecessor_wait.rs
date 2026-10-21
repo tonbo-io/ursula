@@ -15,6 +15,13 @@
 //! wait finished, `fsync`ed, so no later run owes it again, and a restart
 //! during it waits again.
 //!
+//! An empty root's data replicas are held out from its open until that
+//! answer and then through the wait ([`fence_holds`]): an empty disk under a
+//! live id grants no data vote and opens no data gate while meta refuses
+//! it, and its floors come from barrier rounds after its predecessor
+//! stopped. Its meta replica waits only for an owed wait, so a forming
+//! cluster's meta group elects before any registration is answered.
+//!
 //! While the fence does not admit Raft traffic or a wait is owed, the node
 //! sheds leadership for [`LeadershipShedReason::Fence`]: none of its groups
 //! campaigns or takes a transfer.
@@ -30,6 +37,7 @@ use ursula_runtime::node_fence::fence_now;
 use crate::LeadershipShedReason;
 use crate::PredecessorWait;
 use crate::RaftGroupHandleRegistry;
+use crate::RaftTarget;
 use crate::RaftWalError;
 use crate::WaitFrom;
 use crate::rt::sync::watch;
@@ -48,6 +56,25 @@ pub const PREDECESSOR_WAIT: Duration = Duration::from_secs(12);
 /// How long the wait pauses before it records its end again after a
 /// failed record.
 const RECORD_RETRY: Duration = Duration::from_secs(1);
+
+/// Whether `fence` holds a replica of `target` out now: no vote but the
+/// bootstrap probe's, no gate driver and no vote floor. The one policy the
+/// vote screen, the gate drivers and the barrier read.
+pub(crate) fn fence_holds(fence: &NodeFence, target: RaftTarget) -> bool {
+    match target {
+        RaftTarget::Meta => fence.owes_wait(),
+        RaftTarget::Data(_) => fence.holds_data(),
+    }
+}
+
+/// Returns once `fence` no longer holds a replica of `target` out
+/// ([`fence_holds`]).
+pub(crate) async fn fence_released(fence: &NodeFence, target: RaftTarget) {
+    match target {
+        RaftTarget::Meta => fence.waited().await,
+        RaftTarget::Data(_) => fence.bound_and_waited().await,
+    }
+}
 
 /// Marks [`LeadershipShedReason::Fence`] while `fence` does not admit or a
 /// wait is owed, and clears it otherwise. Returns whether it is marked.
@@ -115,8 +142,15 @@ pub async fn run_predecessor_wait(
         WaitFrom::Open(opened) => Some(opened),
         WaitFrom::Binding => loop {
             match &*registration.borrow() {
-                RegistrationStatus::Answered(Registered::Forming) => break None,
-                RegistrationStatus::Answered(_) => break Some(fence_now()),
+                RegistrationStatus::Answered(Registered::Forming) => {
+                    fence.bind(false);
+                    break None;
+                }
+                RegistrationStatus::Answered(_) => {
+                    // The wait begins before the data hold ends.
+                    fence.bind(true);
+                    break Some(fence_now());
+                }
                 RegistrationStatus::Pending
                 | RegistrationStatus::RootRefused { .. }
                 | RegistrationStatus::Refused(_)
@@ -128,8 +162,6 @@ pub async fn run_predecessor_wait(
         },
     };
     if let Some(started) = started {
-        // An empty root owes the wait from its binding on.
-        fence.begin_wait();
         sync_fence_shed(&registry, &fence);
         tracing::warn!(
             wait = ?PREDECESSOR_WAIT,

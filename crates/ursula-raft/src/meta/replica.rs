@@ -285,7 +285,7 @@ impl ActiveMeta {
     /// An inbound vote, through the recovery gate's vote screen.
     pub async fn vote(&self, request: VoteRequest<C>) -> Result<VoteResponse<C>, GroupEngineError> {
         self.core.apply_health.check(RaftTarget::Meta)?;
-        self.core.vote(request).await
+        self.core.vote(RaftTarget::Meta, request).await
     }
 
     /// An inbound full snapshot. A meta snapshot is inline, so nothing is

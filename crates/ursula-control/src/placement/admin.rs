@@ -162,8 +162,9 @@ pub enum RegistrationStatus {
     /// The meta group's last answer.
     Answered(Registered),
     /// The meta group binds this node id to `slot`'s root, not to the
-    /// empty root this node runs on: the node takes part in nothing and
-    /// registers again until an operator releases that root
+    /// empty root this node runs on: the node's data replicas grant no
+    /// vote and keep their recovery gates closed, and the node registers
+    /// again until an operator releases that root
     /// (`ursulactl node replace-disk`).
     RootRefused { slot: RootSlot },
     /// The meta group refused the node for good: it registers again only

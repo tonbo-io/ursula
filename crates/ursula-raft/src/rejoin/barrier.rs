@@ -102,6 +102,19 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
                         memberships: _,
                     })) => {
                         if rejoin.needs_vote_floor() {
+                            // Checked again right before the floor is
+                            // written: a floor taken while the fence holds
+                            // the replica out could come from a round its
+                            // predecessor still took part in.
+                            if crate::predecessor_wait::fence_holds(raft.fence(), group) {
+                                tracing::debug!(
+                                    plane = group.plane().as_str_name(),
+                                    raft_group_id = group.wire_group_id(),
+                                    "recovery barrier: the node fence holds this replica out; \
+                                     no vote floor is written"
+                                );
+                                continue;
+                            }
                             // This replica has refused every replication ACK. Therefore this fresh
                             // ReadIndex used a current quorum excluding it; a stale leader cannot
                             // manufacture a proof by counting the replica whose vote was lost.

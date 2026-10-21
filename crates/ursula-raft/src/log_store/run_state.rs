@@ -909,7 +909,8 @@ pub enum WaitFrom {
     /// The first answer of the meta group that binds the root, for an
     /// empty root: a fresh root of a node id whose old process may still
     /// run. The wait is owed from that answer on, and an answer before
-    /// Bootstrap settles it at once.
+    /// Bootstrap settles it at once. Until the answer the run's data
+    /// replicas are held out ([`ursula_runtime::NodeFence::awaits_binding`]).
     Binding,
 }
 
@@ -1056,9 +1057,13 @@ impl NodeWal {
             });
         // An empty root owes its wait only once a bootstrapped cluster binds
         // it (`WaitFrom::Binding`), so a forming cluster's meta group still
-        // elects.
-        if let Some(WaitFrom::Open(_)) = wait {
-            fence.begin_wait();
+        // elects. Until that binding its data replicas take part in
+        // nothing: an empty disk under a live id must neither vote nor take
+        // a floor beside the old process.
+        match wait {
+            Some(WaitFrom::Open(_)) => fence.begin_wait(),
+            Some(WaitFrom::Binding) => fence.await_binding(),
+            None => {}
         }
         tracing::info!(
             root = %root.display(),

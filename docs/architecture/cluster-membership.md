@@ -120,9 +120,15 @@ its slot.
 The registration judges a refusal for another root by how the run stands on
 its root (`crates/ursula-raft/src/meta/registration.rs`,
 `crates/ursula-raft/src/meta/root.rs`). An empty root that meta has not
-bound in this run is held out: it owes the predecessor wait, so it grants no
-vote, takes no transfer, opens no recovery gate, writes no snapshot object
-and sheds every leadership. Its registration status is `root_refused` with
+bound in this run never fences itself. Its data replicas open with the run
+but are held out from its open until meta binds the root and then through
+the predecessor wait (`crates/ursula-raft/src/predecessor_wait.rs`): they
+grant no vote, run no gate driver, write no vote floor and no snapshot
+object, so their gates stay closed and they take no replication. Its meta
+replica is not held before an answer, so a forming cluster's meta group
+elects. A refusal for another root makes the run owe the predecessor wait:
+from then on its meta replica grants no vote and writes no floor, and the
+node sheds every leadership. Its registration status is `root_refused` with
 the slot, readiness reports `root_refused`, and it registers again at most
 5 seconds apart. Once an operator released the old root it binds with no
 restart, waits out its predecessor (readiness `predecessor_wait`), and its

@@ -6,8 +6,10 @@
 //! two ways ([`RootStanding`]): a root that was empty when it opened stands
 //! `Unbound` until the meta group answers a registration of it, and every
 //! other root stands `Bound`. An unbound root never fences itself: an empty
-//! disk under a live id takes part in nothing ([`RootGuard::hold_out`]) and
-//! registers until an operator releases the old root. A bound root fences
+//! disk under a live id registers until an operator releases the old root.
+//! Its data replicas are held out from its open until the binding and then
+//! through the predecessor wait (`NodeFence::awaits_binding`), and a refusal
+//! holds its meta replica's votes too ([`RootGuard::hold_out`]). A bound root fences
 //! itself for good ([`RootGuard::supersede`]) on a registration refused for
 //! another root, on any view that shows its root released, and on a view a
 //! meta read barrier confirmed that binds its id to another root. An
@@ -130,10 +132,14 @@ impl RootGuard {
         self.0.bound.store(true, Ordering::Release);
     }
 
-    /// Holds an unbound root out while meta binds its id to another root:
-    /// it owes the predecessor wait, so it grants no vote, takes no
-    /// transfer, opens no recovery gate and writes no snapshot object, and
-    /// it sheds every leadership. Its wait runs once meta binds it.
+    /// Holds an unbound root out while meta binds its id to another root.
+    /// Its data replicas are held from its open until its binding
+    /// (`NodeFence::awaits_binding`). The refusal also makes it owe the
+    /// predecessor wait, so its meta replica grants no vote and takes no
+    /// transfer from now on, and the node sheds every leadership. Its meta
+    /// barrier writes no floor while the wait is owed, but a meta floor
+    /// written before the refusal stays. The wait runs once meta binds the
+    /// root.
     pub(crate) fn hold_out(&self) {
         self.0.fence.begin_wait();
         crate::predecessor_wait::sync_fence_shed(&self.0.registry, &self.0.fence);

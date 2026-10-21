@@ -1081,13 +1081,31 @@ async fn single_voter_recovery_plan(cut: bool) {
         recovery["recovery"]["reason"], "unknown_history",
         "{recovery}"
     );
-    let ready = client
-        .get(format!("{base_url}/__ursula/ready"))
-        .send()
-        .await
-        .expect("readiness");
-    assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
-    let ready: serde_json::Value = ready.json().await.expect("readiness JSON");
+    // A lost run state may hide a predecessor that still runs, so the run
+    // waits it out first, unready for `predecessor_wait`. Its gate driver
+    // starts after the wait.
+    let wait_deadline = std::time::Instant::now()
+        .checked_add(
+            ursula_raft::predecessor_wait::PREDECESSOR_WAIT.saturating_add(Duration::from_secs(30)),
+        )
+        .unwrap();
+    let ready = loop {
+        let ready = client
+            .get(format!("{base_url}/__ursula/ready"))
+            .send()
+            .await
+            .expect("readiness");
+        assert_eq!(ready.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        let ready: serde_json::Value = ready.json().await.expect("readiness JSON");
+        if ready["reason"] != "predecessor_wait" {
+            break ready;
+        }
+        assert!(
+            std::time::Instant::now() < wait_deadline,
+            "the predecessor wait never ended: {ready}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
     assert_eq!(ready["reason"], "recovery_gate_closed", "{ready}");
 
     // The plan waits for the stall: until then a leader's barrier may still
@@ -4873,8 +4891,12 @@ fn bound_root(cluster: &Cluster, node: u64) -> ursula_proto::placement::RootId {
 
 /// IT-3 (#768): node 3 loses its disk and starts on an empty WAL under its
 /// live id. The meta group refuses the new root for the one it binds the
-/// id to: node 3 reports `root_refused` naming that root and takes part in
-/// nothing, while nodes 1 and 2 serve. `ursulactl node replace-disk`
+/// id to: node 3 reports `root_refused` naming that root, while nodes 1 and
+/// 2 serve. Its data replicas are held out from its open: none took a vote
+/// floor (its term stays 0, the term a barrier would adopt is the leader's),
+/// none holds a log entry, and every data gate stays closed. Its meta
+/// replica is not held before the refusal, and the test claims nothing
+/// about it. `ursulactl node replace-disk`
 /// refuses a node that still runs on the root it names, then releases the
 /// old root through another node's admin plane. Node 3 binds its new root
 /// with no restart, reports `predecessor_wait`, and rejoins: it becomes
@@ -4939,6 +4961,21 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     // The healthy nodes serve meanwhile.
     post_until_no_content(&client, &stream, "while-refused;").await;
     read_until_matches(&client, &read(&nodes[1]), b"before-the-loss;while-refused;").await;
+    // Node 3's data replicas took part in nothing, though their leaders
+    // replicated a write since it started.
+    let held = try_node_metrics(&client, &nodes[2].url())
+        .await
+        .expect("node 3 reports its replicas");
+    assert!(!held.groups.is_empty(), "node 3 runs its data replicas");
+    for group in &held.groups {
+        assert_eq!(group.current_term, 0, "no vote floor: {group:?}");
+        assert_eq!(group.last_log_index, None, "no entry: {group:?}");
+        assert_ne!(
+            group.recovery_gate,
+            ursula_proto::admin::RecoveryGateStatus::Open,
+            "a closed gate: {group:?}"
+        );
+    }
 
     // 2. The guard refuses a node that still runs on the root it names.
     let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");

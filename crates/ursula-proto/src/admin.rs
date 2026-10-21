@@ -1130,8 +1130,10 @@ pub enum ServingReadinessReason {
     /// takes part in no Raft traffic until one does.
     DiskLeaseLost,
     /// The meta group binds this node id to another root than the empty
-    /// one this node runs on: it takes part in nothing until an operator
-    /// releases that root. The placement status names it.
+    /// one this node runs on: its data replicas grant no vote and keep
+    /// their recovery gates closed until an operator releases that root
+    /// and the predecessor wait from the binding ends. The placement status
+    /// names it.
     RootRefused,
     /// A process of an earlier run of this root may still run: this node
     /// grants no vote and opens no recovery gate until the wait ends.
