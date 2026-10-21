@@ -19,11 +19,11 @@
 //!   replica (I10);
 //! - discards the meta journal of one meta voter, which opens `Recovering`
 //!   over its data history (D9) and rejoins through the meta leader (I11),
-//!   then loses the run state of two meta voters, whose meta gates open
-//!   `Recovering` and stall, and recovers meta by a plan through `ursulactl
-//!   recover-group --target meta --accept-loss`'s loop, planner and sender
-//!   (the meta plan check), after which every node learns the view again
-//!   (I11).
+//!   then loses the run state of the meta leader and one more meta voter,
+//!   whose meta gates open `Recovering` and stall, and recovers meta by a
+//!   plan through `ursulactl recover-group --target meta --accept-loss`'s
+//!   loop, planner and sender (the meta plan check), after which every node
+//!   learns the view again (I11).
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
 //! run that decides again how its journals open. I12 is checked after each
@@ -210,6 +210,31 @@ impl Run {
         ]
     }
 
+    /// The meta leader and one more meta voter, drawn. A meta voter that
+    /// outlives the run state's loss while it leads would keep its gated
+    /// followers replicating, and no plan would be needed.
+    fn leader_and_one_voter(&mut self) -> [u64; 2] {
+        let leader = META_VOTERS.into_iter().find_map(|node_id| {
+            let runtime = self.cluster.runtimes.get(&node_id)?;
+            match runtime.status_reader().placement_status().meta {
+                ursula_control::MetaReplicaStatus::Running {
+                    leader: Some(leader),
+                    ..
+                } if META_VOTERS.contains(&leader.get()) => Some(leader.get()),
+                _ => None,
+            }
+        });
+        let Some(leader) = leader else {
+            return self.two_voters();
+        };
+        let others: Vec<u64> = META_VOTERS
+            .into_iter()
+            .filter(|node_id| *node_id != leader)
+            .collect();
+        let other = usize::try_from(self.rng.next_bounded(2)).unwrap_or(0);
+        [leader, others.get(other).copied().unwrap_or(leader)]
+    }
+
     /// Node 5 claims another group count while data forms, then restarts
     /// with the fixed claim (D9, r1 H1).
     async fn claim_mismatch(&mut self) {
@@ -298,15 +323,16 @@ impl Run {
 
     /// One meta voter's meta journal discarded: it opens `Recovering` over
     /// its data history (D9) and rejoins through the meta leader (I11).
-    /// Then two meta voters lose their run state, so a majority of meta's
-    /// gates open `Recovering` and stall, and a meta plan recovers meta.
+    /// Then the meta leader and one more meta voter lose their run state, so
+    /// a majority of meta's gates open `Recovering`, where a replica neither
+    /// votes nor campaigns, and stall. A meta plan recovers meta.
     async fn plan(&mut self) {
         let [discarded, _] = self.two_voters();
         self.cluster.discard_meta(discarded).await;
         self.cluster.start_node(discarded).await;
         self.step("meta_discarded");
         self.learned("meta_discarded").await;
-        let victims = self.two_voters();
+        let victims = self.leader_and_one_voter();
         let survivor = META_VOTERS
             .into_iter()
             .find(|node_id| !victims.contains(node_id))
