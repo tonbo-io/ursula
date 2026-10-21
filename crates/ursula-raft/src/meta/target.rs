@@ -143,7 +143,12 @@ mod tests {
         );
 
         let registered = [1, 3, 4]
-            .map(|node| (samples::node(node), Registration { since_ms: node }))
+            .map(|node| {
+                (samples::node(node), Registration {
+                    since_ms: node,
+                    root: ursula_proto::placement::RootSlot::Bound(samples::root(node)),
+                })
+            })
             .into_iter()
             .collect::<BTreeMap<_, _>>();
         let forming = applied(ControlPlaneState::Forming { registered });

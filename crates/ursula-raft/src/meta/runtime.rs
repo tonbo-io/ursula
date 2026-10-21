@@ -55,6 +55,7 @@ use super::genesis_driver::GenesisStatus;
 use super::genesis_driver::genesis_gate_probe;
 use super::handle::MetaHandle;
 use super::pause::MetaPauses;
+use super::registration::Registrant;
 use super::registration::run_registration;
 use super::replica::MetaDriverContext;
 use super::replica::MetaDrivers;
@@ -216,6 +217,11 @@ where
             damage: Some(damage),
             pauses: pauses.clone(),
         };
+        let registrant = Registrant {
+            node: me,
+            root: wal.incarnation().root,
+            empty: wal.empty_at_open(),
+        };
         let replica_config = MetaReplicaConfig {
             node: config.node,
             engine: config.engine.clone(),
@@ -247,7 +253,7 @@ where
         };
         runtime.tasks.push(crate::rt::spawn(run_registration(
             handle.clone(),
-            me,
+            registrant,
             registry.clone(),
             registration,
             pauses.clone(),

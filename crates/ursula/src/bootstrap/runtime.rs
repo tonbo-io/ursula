@@ -75,18 +75,24 @@ enum GroupStorage {
 }
 
 impl GroupStorage {
-    /// Starts the Raft WAL when `persistence` runs Raft: reads the previous
-    /// run's state and records this run before any group opens a journal.
+    /// Starts node `node`'s Raft WAL when `persistence` runs Raft: reads the
+    /// previous run's state and counts and records this run before any group
+    /// opens a journal.
     fn start(
         persistence: Persistence,
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
+        node: u64,
         cluster_id: Option<&ursula_headers::ClusterId>,
     ) -> Result<Self, SpawnRuntimeError> {
         Ok(match persistence {
             Persistence::InMemory => Self::InMemory,
             Persistence::Raft { log_dir } => Self::Raft(RaftWal::start_in_cluster(
-                log_dir, tuning, topology, cluster_id,
+                log_dir,
+                tuning,
+                topology,
+                ursula_proto::placement::NodeId::new(node),
+                cluster_id,
             )?),
         })
     }
@@ -184,6 +190,7 @@ pub fn spawn_runtime(
             group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
         },
         &shard_map,
+        config.raft.node_id,
         config.server.cluster_id.as_ref(),
     )?;
     // Before the runtime starts, so `raft-log/meta/` exists before any data

@@ -76,7 +76,6 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset.unwrap_or(Preset::Default)
     );
 
-    let boot = ursula_proto::admin::ProcessIncarnation::from_bits(rand::random());
     let wal_dir = if runs_raft(&config, preset) {
         Some(RaftWalDir::resolve(&config.raft.wal)?)
     } else {
@@ -88,9 +87,7 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         },
         None => Persistence::InMemory,
     };
-    let state = init_state(&config, persistence)
-        .await?
-        .with_process_incarnation(boot);
+    let state = init_state(&config, persistence).await?;
     state.register_otel_metrics();
     let wal_shutdown = serve(state, &config).await?;
     if let Some(wal_dir) = wal_dir {
@@ -702,6 +699,7 @@ mod tests {
                 "recovery": {"state": "normal"},
                 "recovery_epoch": 0,
                 "journal_sync": "not_needed",
+                "predecessor": "may_live",
             })
         );
         assert_eq!(
@@ -888,7 +886,7 @@ mod tests {
         .await
         .expect("meta bootstraps the cluster");
         let admin = crate::admin_router(state.clone());
-        let incarnation = state.process_incarnation.as_str().to_owned();
+        let incarnation = state.process_incarnation.to_string();
         let post = |uri: String, plan: RecoveryPlanRequest| {
             let admin = admin.clone();
             let incarnation = incarnation.clone();

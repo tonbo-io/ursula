@@ -639,6 +639,7 @@ async fn spawn_static_grpc_test_node(
                 raft_log_dir,
                 ursula_raft::JournalTuning::new(ursula_config::WalFsync::Always),
                 &ursula_shard::StaticShardMap::new(1, raft_group_count).expect("valid topology"),
+                ursula_proto::placement::NodeId::new(node_id),
                 Some(&static_test_cluster_id()),
             )
             .expect("start the Raft WAL"),
@@ -652,6 +653,7 @@ async fn spawn_static_grpc_test_node(
                     ursula_raft::JournalTuning::new(ursula_config::WalFsync::Never),
                     &ursula_shard::StaticShardMap::new(1, raft_group_count)
                         .expect("valid topology"),
+                    ursula_proto::placement::NodeId::new(node_id),
                     Some(&static_test_cluster_id()),
                 )
                 .expect("start the Raft WAL"),
@@ -13087,7 +13089,7 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
         ("POST", Some("malformed"), StatusCode::PRECONDITION_FAILED),
         (
             "POST",
-            Some(old.process_incarnation.as_str()),
+            Some(old.process_incarnation.to_string().as_str()),
             StatusCode::PRECONDITION_FAILED,
         ),
     ] {
@@ -13116,7 +13118,7 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
                 .uri("/__ursula/leadership-shed/maintenance")
                 .header(
                     PROCESS_INCARNATION_HEADER,
-                    replacement.process_incarnation.as_str(),
+                    replacement.process_incarnation.to_string().as_str(),
                 )
                 .body(Body::empty())
                 .unwrap(),
@@ -13131,7 +13133,10 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
             Request::builder()
                 .method("DELETE")
                 .uri("/__ursula/leadership-shed/maintenance")
-                .header(PROCESS_INCARNATION_HEADER, old.process_incarnation.as_str())
+                .header(
+                    PROCESS_INCARNATION_HEADER,
+                    old.process_incarnation.to_string().as_str(),
+                )
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -13155,7 +13160,7 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
     let metrics: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
     assert_eq!(
         metrics["process_incarnation"],
-        replacement.process_incarnation.as_str()
+        replacement.process_incarnation.to_string().as_str()
     );
 }
 
@@ -13271,7 +13276,7 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         .await
         .unwrap();
     let state = HttpState::with_raft_registry(runtime.clone(), registry);
-    let identity = state.process_incarnation.clone();
+    let identity = state.process_incarnation;
     let admin = admin_router(state);
     let path = "/__ursula/raft/0/quorum";
     let unbound = admin
@@ -13290,7 +13295,7 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         &admin,
         "GET",
         path,
-        &[(PROCESS_INCARNATION_HEADER, identity.as_str())],
+        &[(PROCESS_INCARNATION_HEADER, identity.to_string().as_str())],
         Body::empty(),
     )
     .await;

@@ -1,16 +1,22 @@
-//! Immutable configuration of a node's WAL root: its routing counts and the
-//! cluster id (#581 section 6.5).
+//! Immutable configuration of a node's WAL root: its routing counts, the
+//! cluster id (#581 section 6.5), the node id and the root's own id.
 //!
 //! The cluster id is bound to the WAL root when the root is created: the
 //! configured `server.cluster_id`, or an id generated once for a single
 //! node without one. A node whose configured id differs from the stored one
 //! refuses to start, so a disk cannot move to another cluster unnoticed.
+//! The node id is bound the same way: a root opens only under the node id
+//! that created it ([`RaftWalError::OtherNode`]). The root id
+//! ([`RootId`]) is drawn when the root is created and names this disk to
+//! the meta group: a new disk is a new root.
 
 use std::path::Path;
 
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_headers::ClusterId;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::RootId;
 use ursula_shard::StaticShardMap;
 
 use super::RaftWalError;
@@ -35,11 +41,14 @@ impl From<&StaticShardMap> for WalTopology {
     }
 }
 
-/// The topology file's encoding: the routing counts and the cluster id.
+/// The topology file's encoding: the routing counts, the cluster id, and
+/// the node id and root id the root was created with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct TopologyFile {
     routing: WalTopology,
     cluster_id: String,
+    node: NodeId,
+    root: RootId,
 }
 
 /// The topology a root holds, its cluster id parsed when the file is read.
@@ -47,11 +56,25 @@ struct TopologyFile {
 struct StoredTopology {
     routing: WalTopology,
     cluster_id: ClusterId,
+    node: NodeId,
+    root: RootId,
 }
 
-/// A topology file of 4 cores, 8 groups and the cluster id `prod-a`, for
-/// the persisted-envelopes fixture. It decodes to the file it was encoded
-/// from and re-encodes to the same bytes.
+/// What a WAL root is bound to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BoundRoot {
+    pub(super) cluster_id: ClusterId,
+    pub(super) root: RootId,
+}
+
+/// The root id of the topology sample: above 2^53, so the fixture shows its
+/// hex string.
+#[cfg(test)]
+const SAMPLE_ROOT: u64 = 0x5eed_1d00_0000_00a7;
+
+/// A topology file of 4 cores, 8 groups, the cluster id `prod-a`, node 3
+/// and the root `5eed1d00000000a7`, for the persisted-envelopes fixture. It
+/// decodes to the file it was encoded from and re-encodes to the same bytes.
 #[cfg(test)]
 pub(crate) fn sample_file() -> Vec<u8> {
     let file = TopologyFile {
@@ -60,6 +83,8 @@ pub(crate) fn sample_file() -> Vec<u8> {
             group_count: 8,
         },
         cluster_id: "prod-a".to_owned(),
+        node: NodeId::new(3),
+        root: RootId::new(std::num::NonZeroU64::new(SAMPLE_ROOT).expect("non-zero")),
     };
     let bytes = state_file::encode(StateFileKind::Topology, &file);
     let decoded: TopologyFile =
@@ -81,15 +106,16 @@ pub fn generate_cluster_id() -> ClusterId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum TopologyDecision {
     Create,
-    Match {
-        cluster_id: ClusterId,
-    },
+    Match(BoundRoot),
     Mismatch {
         stored: WalTopology,
     },
     ClusterIdMismatch {
         stored: ClusterId,
         configured: ClusterId,
+    },
+    OtherNode {
+        stored: NodeId,
     },
     Missing,
 }
@@ -99,6 +125,7 @@ impl TopologyDecision {
         stored: Option<&StoredTopology>,
         configured: WalTopology,
         configured_cluster_id: Option<&ClusterId>,
+        node: NodeId,
         has_prior_state: bool,
     ) -> Self {
         match stored {
@@ -110,9 +137,13 @@ impl TopologyDecision {
                     stored: stored.cluster_id.clone(),
                     configured: configured.clone(),
                 },
-                _ => Self::Match {
-                    cluster_id: stored.cluster_id.clone(),
+                _ if stored.node != node => Self::OtherNode {
+                    stored: stored.node,
                 },
+                _ => Self::Match(BoundRoot {
+                    cluster_id: stored.cluster_id.clone(),
+                    root: stored.root,
+                }),
             },
             None if has_prior_state => Self::Missing,
             None => Self::Create,
@@ -150,14 +181,16 @@ pub(super) fn check_cluster_id(root: &Path, configured: &ClusterId) -> Result<()
     }
 }
 
-/// Called under the root lock, before recovery or run-state writes. Returns
-/// the root's cluster id.
+/// Called under the root lock, before recovery or run-state writes, for node
+/// `node`. Returns the root's cluster id and root id, which a new root
+/// draws.
 pub(super) fn check_or_create(
     root: &Path,
     map: &StaticShardMap,
     configured_cluster_id: Option<&ClusterId>,
+    node: NodeId,
     has_prior_state: bool,
-) -> Result<ClusterId, RaftWalError> {
+) -> Result<BoundRoot, RaftWalError> {
     let configured = WalTopology::from(map);
     let path = root.join(TOPOLOGY_FILE);
     let stored = state_file::read::<TopologyFile>(StateFileKind::Topology, &path)
@@ -167,6 +200,8 @@ pub(super) fn check_or_create(
                 .map(|cluster_id| StoredTopology {
                     routing: file.routing,
                     cluster_id,
+                    node: file.node,
+                    root: file.root,
                 })
                 .map_err(|_invalid| RaftWalError::InvalidStoredClusterId {
                     root: root.to_owned(),
@@ -178,25 +213,31 @@ pub(super) fn check_or_create(
         stored.as_ref(),
         configured,
         configured_cluster_id,
+        node,
         has_prior_state,
     ) {
         TopologyDecision::Create => {
-            let cluster_id = configured_cluster_id
-                .cloned()
-                .unwrap_or_else(generate_cluster_id);
+            let bound = BoundRoot {
+                cluster_id: configured_cluster_id
+                    .cloned()
+                    .unwrap_or_else(generate_cluster_id),
+                root: RootId::new(rand::random()),
+            };
             state_file::write(
                 StateFileKind::Topology,
                 &path,
                 &path.with_extension("tmp"),
                 &TopologyFile {
                     routing: configured,
-                    cluster_id: cluster_id.as_str().to_owned(),
+                    cluster_id: bound.cluster_id.as_str().to_owned(),
+                    node,
+                    root: bound.root,
                 },
             )
             .map_err(RaftWalError::RecordTopology)?;
-            Ok(cluster_id)
+            Ok(bound)
         }
-        TopologyDecision::Match { cluster_id } => Ok(cluster_id),
+        TopologyDecision::Match(bound) => Ok(bound),
         TopologyDecision::Mismatch { stored } => Err(RaftWalError::TopologyMismatch {
             root: root.to_owned(),
             stored_core_count: stored.core_count,
@@ -211,6 +252,11 @@ pub(super) fn check_or_create(
                 configured,
             })
         }
+        TopologyDecision::OtherNode { stored } => Err(RaftWalError::OtherNode {
+            root: root.to_owned(),
+            stored,
+            configured: node,
+        }),
         TopologyDecision::Missing => Err(RaftWalError::MissingTopology {
             root: root.to_owned(),
         }),
@@ -229,14 +275,28 @@ mod decision_tests {
         };
         let id = ClusterId::new("prod-a").unwrap();
         let other = ClusterId::new("prod-b").unwrap();
+        let node = NodeId::new(3);
+        let root = RootId::new(std::num::NonZeroU64::new(SAMPLE_ROOT).unwrap());
         let stored_as = |routing: WalTopology| StoredTopology {
             routing,
             cluster_id: id.clone(),
+            node,
+            root,
+        };
+        let bound = BoundRoot {
+            cluster_id: id.clone(),
+            root,
         };
         for has_prior_state in [false, true] {
             for configured_id in [None, Some(&id), Some(&other)] {
                 assert_eq!(
-                    TopologyDecision::decide(None, configured, configured_id, has_prior_state),
+                    TopologyDecision::decide(
+                        None,
+                        configured,
+                        configured_id,
+                        node,
+                        has_prior_state
+                    ),
                     if has_prior_state {
                         TopologyDecision::Missing
                     } else {
@@ -250,11 +310,21 @@ mod decision_tests {
                         Some(&stored_as(configured)),
                         configured,
                         configured_id,
+                        node,
                         has_prior_state
                     ),
-                    TopologyDecision::Match {
-                        cluster_id: id.clone()
-                    },
+                    TopologyDecision::Match(bound.clone()),
+                );
+                // A root opens only under the node id that created it.
+                assert_eq!(
+                    TopologyDecision::decide(
+                        Some(&stored_as(configured)),
+                        configured,
+                        configured_id,
+                        NodeId::new(4),
+                        has_prior_state
+                    ),
+                    TopologyDecision::OtherNode { stored: node },
                 );
             }
             assert_eq!(
@@ -262,6 +332,7 @@ mod decision_tests {
                     Some(&stored_as(configured)),
                     configured,
                     Some(&other),
+                    node,
                     has_prior_state
                 ),
                 TopologyDecision::ClusterIdMismatch {
@@ -284,6 +355,7 @@ mod decision_tests {
                         Some(&stored_as(stored)),
                         configured,
                         Some(&id),
+                        node,
                         has_prior_state
                     ),
                     TopologyDecision::Mismatch { stored },
@@ -324,19 +396,50 @@ mod tests {
     use crate::types::UrsulaRaftTypeConfig;
 
     /// A WAL root records its topology as the persisted-envelopes fixture's
-    /// sample holds it ([`sample_file`]).
+    /// sample holds it ([`sample_file`]), with the root id it drew.
     #[test]
     fn a_recorded_topology_is_the_fixture_sample() {
         let dir = tempfile::tempdir().unwrap();
         let map = StaticShardMap::new(4, 8).unwrap();
         let cluster_id = ClusterId::new("prod-a").unwrap();
+        let node = NodeId::new(3);
+        let bound = check_or_create(dir.path(), &map, Some(&cluster_id), node, false).unwrap();
+        assert_eq!(bound.cluster_id, cluster_id);
+        let path = dir.path().join(TOPOLOGY_FILE);
+        let recorded: TopologyFile = state_file::read(StateFileKind::Topology, &path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.root, bound.root);
+        let sample = TopologyFile {
+            root: RootId::new(std::num::NonZeroU64::new(SAMPLE_ROOT).unwrap()),
+            ..recorded
+        };
         assert_eq!(
-            check_or_create(dir.path(), &map, Some(&cluster_id), false).unwrap(),
-            cluster_id
+            state_file::encode(StateFileKind::Topology, &sample),
+            sample_file()
         );
-        let bytes = std::fs::read(dir.path().join(TOPOLOGY_FILE)).unwrap();
-        assert_eq!(bytes, sample_file());
-        assert_eq!(stored_cluster_id(dir.path()).unwrap(), Some(cluster_id));
+        assert_eq!(
+            stored_cluster_id(dir.path()).unwrap(),
+            Some(cluster_id.clone())
+        );
+        // The root keeps its id, and refuses another node id.
+        assert_eq!(
+            check_or_create(dir.path(), &map, Some(&cluster_id), node, true).unwrap(),
+            bound
+        );
+        assert!(matches!(
+            check_or_create(dir.path(), &map, Some(&cluster_id), NodeId::new(4), true),
+            Err(RaftWalError::OtherNode { stored, configured, .. })
+                if stored == node && configured == NodeId::new(4)
+        ));
+        // Another root draws another id.
+        let other = tempfile::tempdir().unwrap();
+        assert_ne!(
+            check_or_create(other.path(), &map, Some(&cluster_id), node, false)
+                .unwrap()
+                .root,
+            bound.root
+        );
     }
 
     #[tokio::test]
@@ -457,8 +560,14 @@ mod tests {
         wal.shutdown().await.unwrap();
         drop(wal);
         // Configuring the generated id later is accepted.
-        let wal =
-            RaftWal::start_in_cluster(dir.path(), tuning, &topology, Some(&generated)).unwrap();
+        let wal = RaftWal::start_in_cluster(
+            dir.path(),
+            tuning,
+            &topology,
+            NodeId::new(1),
+            Some(&generated),
+        )
+        .unwrap();
         wal.shutdown().await.unwrap();
         drop(wal);
 
@@ -466,14 +575,17 @@ mod tests {
         // touching the root.
         let dir = tempfile::tempdir().unwrap();
         let prod = ClusterId::new("prod-eu-1").unwrap();
-        let wal = RaftWal::start_in_cluster(dir.path(), tuning, &topology, Some(&prod)).unwrap();
+        let wal =
+            RaftWal::start_in_cluster(dir.path(), tuning, &topology, NodeId::new(1), Some(&prod))
+                .unwrap();
         assert_eq!(wal.cluster_id(), &prod);
         wal.shutdown().await.unwrap();
         drop(wal);
         let run_before = std::fs::read(dir.path().join(RUN_STATE_FILE)).unwrap();
         let other = ClusterId::new("prod-us-1").unwrap();
         let error =
-            RaftWal::start_in_cluster(dir.path(), tuning, &topology, Some(&other)).unwrap_err();
+            RaftWal::start_in_cluster(dir.path(), tuning, &topology, NodeId::new(1), Some(&other))
+                .unwrap_err();
         assert!(matches!(
             &error,
             RaftWalError::ClusterIdMismatch { stored, configured, .. }
@@ -501,6 +613,8 @@ mod tests {
             &TopologyFile {
                 routing: WalTopology::from(&topology),
                 cluster_id: "not a/valid id".to_owned(),
+                node: NodeId::new(1),
+                root: RootId::new(std::num::NonZeroU64::MIN),
             },
         )
         .unwrap();
@@ -512,6 +626,7 @@ mod tests {
                 dir.path(),
                 crate::JournalTuning::new(WalFsync::Never),
                 &topology,
+                NodeId::new(1),
                 configured,
             )
             .unwrap_err();

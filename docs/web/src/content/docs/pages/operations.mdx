@@ -195,6 +195,12 @@ A WAL root is bound to `runtime.core_count` and `raft.group_count` in
 recovering any group or writing the run state. A mismatch, missing record on
 an existing WAL, or corrupt record refuses startup.
 
+The same record binds the root to the `raft.node_id` that created it, and a
+root opens only under that id. A volume moved to a node with another id
+refuses startup. Each start also counts itself in `identity.bin` beside it.
+A root that holds prior state without that file refuses startup too, so
+start the node on an empty WAL instead.
+
 Keep both values explicit and unchanged when moving a persistent volume or
 resizing its host. Without explicit values, `core_count` follows the process's
 available parallelism and `group_count` defaults to that parallelism times 16

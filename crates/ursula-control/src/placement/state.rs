@@ -18,6 +18,7 @@ use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::ReplicationFactor;
+use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -55,10 +56,13 @@ impl ControlPlaneState {
     }
 }
 
-/// A node registered before Bootstrap.
+/// A node registered before Bootstrap, and the root its id is bound to,
+/// which `Bootstrap` copies into its record. A slot change leaves
+/// `since_ms`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Registration {
     pub since_ms: u64,
+    pub root: RootSlot,
 }
 
 /// A bootstrapped cluster's desired state. Fields are read through accessors

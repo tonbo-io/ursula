@@ -562,7 +562,7 @@ where
                 Ok(Ok(response)) => return Ok(response.into_inner()),
                 Ok(Err(status)) => {
                     observe_outbound_status(rpc.route(), &status);
-                    if let Some(node) = crate::target::refusing_node(&status) {
+                    if let Some(node) = crate::target::refusing_node(&status, route.leader_id) {
                         peer_cluster.observe_misdelivery(route.leader_id, address, node);
                         ForwardError::OtherNode {
                             rpc,

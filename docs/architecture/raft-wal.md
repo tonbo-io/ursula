@@ -53,8 +53,9 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | --- | --- |
 | `FORMAT_EPOCH` | Format-epoch marker of the data directory. |
 | `wal.lock` | Advisory lock held by the node for the whole run. |
-| `run-state.bin` | Boot id and status of the last run, and the `fsync` policy and recovery epoch of each journal class. |
-| `topology.bin` | Core count, group count and cluster id the root was created with. |
+| `run-state.bin` | Boot id, root device and status of the last run, and the `fsync` policy and recovery epoch of each journal class. |
+| `topology.bin` | Core count, group count, cluster id, node id and root id the root was created with. |
+| `identity.bin` | The run counter of the root, and whether a run read a predecessor that may still run. |
 | `core-N/journal-<seq>.seg` | Journal segments, 20-digit consecutive sequences starting at 1. |
 | `core-N/journal.meta` | Every group's vote, log state and log generation, and the core's verified recovery epoch. |
 | `core-N/journal.lock` | Advisory lock held by the core's writer. |
@@ -62,12 +63,25 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | `meta/` | The meta group's journal, laid out as a core's, with its snapshot record `group-0.snapshot.json`. |
 
 A second process that tries to take either lock fails with an error naming the
-lock path and the owner PID. `topology.bin` binds the root to its routing and
-its cluster: counts that differ from the stored ones refuse startup, a
+lock path and the owner PID. `topology.bin` binds the root to its routing, its
+cluster and its node: counts that differ from the stored ones refuse startup, a
 configured `server.cluster_id` that differs from the stored one refuses startup
-too, and so does prior state (a run state or a core directory) without a
+too, so does a `raft.node_id` other than the one that created the root, and so
+does prior state (a run state, a core directory or a meta journal) without a
 topology file. A root created without a configured id stores the id the node
 generated.
+
+A new root also draws its root id, 64 random nonzero bits written as 16
+lowercase hex digits, which names the disk to the meta group. Every start
+counts itself in `identity.bin`, synced, before it records itself `running` and
+before the node binds its peer identity. A process is named by its
+incarnation, the root id, the run counter and a 32-bit nonce drawn at start, in
+32 hex digits: `x-ursula-process-incarnation` and `process_incarnation` in
+`GET /__ursula/metrics` carry it. A later run of a root names itself above
+every earlier one. A node without a WAL draws a root id per start and runs as
+run 0. A root that holds prior state without `identity.bin` refuses startup,
+since a counter that started again would make a later run read as an earlier
+one, and so does a counter at its last value. An empty disk is the way back.
 
 Every segment starts with a 32-byte header, and every record is a frame:
 
@@ -88,7 +102,7 @@ declaration order and a variant keeps its name. The record is one of
 generation is that of the group's log the record belongs to. A frozen archive
 holds one such payload. Votes are not journal records.
 
-`journal.meta`, `run-state.bin` and `topology.bin` are replaced whole
+`journal.meta`, `run-state.bin`, `topology.bin` and `identity.bin` are replaced whole
 (temporary file, sync, rename, directory sync), so a crash leaves either
 version. Each carries a magic, the format epoch, a length and a CRC32, and a
 damaged one fails startup. `journal.meta` records each group's log state:
@@ -117,7 +131,8 @@ and the rewritten `journal.meta` names that generation. Every group stays at
 generation 0 until replica teardown writes `retired`.
 
 `run-state.bin` holds one record per journal class, each with the class's
-`fsync` policy and recovery epoch, beside the node-wide boot id and status.
+`fsync` policy and recovery epoch, beside the node-wide boot id, root device and
+status.
 The data class covers the core journals and runs the configured policy. The
 meta class always runs `always` and covers the meta journal under `meta/`.
 Every node that runs Raft opens it at start, before its runtime starts and so
@@ -215,18 +230,23 @@ than one entry. OpenRaft's key log ids come from the index.
 
 ## Startup and replay
 
-The node takes `wal.lock`, reads `run-state.bin`, checks `topology.bin`, reads
-every core's `journal.meta` and decides how to open the journals. Before any
-journal write it durably records itself `running` with the current boot id from
-`/proc/sys/kernel/random/boot_id` (the host's, inside a container). Without a
-boot id, a run that did not record `clean` reads as a host crash.
+The node takes `wal.lock`, reads `run-state.bin`, checks `topology.bin` and
+`identity.bin`, reads every core's `journal.meta` and decides how to open the
+journals. Before any journal write it durably records itself `running` with the
+current boot id from `/proc/sys/kernel/random/boot_id` (the host's, inside a
+container) and the device the root is mounted from (`st_dev`). Without a boot
+id, a run that did not record `clean` reads as a host crash. On the same boot,
+another device means the volume was mounted anew, whose page cache is not the
+old mount's, so the run reads as one after a host crash.
 
 | Previous run | Replay | Node recovery state |
 | --- | --- | --- |
 | No run state, no journal record, no verified epoch | Strict | normal |
 | No run state, a journal record or a verified epoch survives | Verified prefix | recovering (unknown history) |
 | `clean` | Strict | normal |
-| `running`, same boot id (process crash) | Strict | normal |
+| `running`, same boot id and device (process crash) | Strict | normal |
+| `running`, same boot id, other device (remounted), policy `always` | Strict | normal |
+| `running`, same boot id, other device (remounted), policy `never` | Verified prefix | recovering (remounted) |
 | `running`, other or unknown boot id (host crash), policy `always` | Strict | normal |
 | `running`, other or unknown boot id (host crash), policy `never` | Verified prefix | recovering (host crash) |
 | `poisoned` | Verified prefix | recovering (poisoned) |
@@ -261,6 +281,20 @@ A run that records `always` after a `never` run whose process crashed on this
 boot first syncs every core's newest segment and directory, because that run
 acknowledged writes only the page cache held. A host crash before the new run
 records itself still reads as one under `never`.
+
+The start also reads whether a process of an earlier run of the root may still
+run, its predecessor, and reports it as `predecessor` in `wal_recovery` of
+`GET /__ursula/metrics`. The first matching row decides:
+
+| At open | Predecessor |
+| --- | --- |
+| The root is empty: no core or meta journal holds a record, no core or meta metadata holds a vote, and no snapshot record exists | `may_live` |
+| `identity.bin` records a predecessor that may live | `may_live` |
+| `clean`, `poisoned`, or `running` on the same boot and device | `gone` |
+| Remounted, host crash, no run state | `may_live` |
+
+A start that reads `may_live` records it in `identity.bin` before it records
+itself, and the record stays across restarts, a clean one included.
 
 ## Fail-stop
 

@@ -618,10 +618,7 @@ async fn a_meta_command_stops_a_data_groups_apply_before_the_entry() {
         .await
         .expect("the group's genesis");
     let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
-        ursula_control::ControlCommand::RegisterNode {
-            node: ursula_control::NodeId::new(1),
-            now_ms: 1,
-        },
+        ursula_control::samples::register(1, 1),
     ));
     let error = state
         .apply(futures_util::stream::iter([

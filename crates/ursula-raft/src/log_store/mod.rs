@@ -16,8 +16,10 @@
 //! - `frozen`: immutable payload archives and validated journal references for stopped groups.
 //! - `core_meta`: each core's metadata file: every group's vote and log
 //!   state (empty, initialized or recovering).
-//! - `topology`: immutable core and group counts and cluster id of the WAL
-//!   root.
+//! - `topology`: immutable core and group counts, cluster id, node id and
+//!   root id of the WAL root.
+//! - `identity`: the root's run counter (`identity.bin`), which names each
+//!   process of the root.
 //! - `run_state`: the node's run-state file and how the journals open after
 //!   the previous run (the replay-mode decision and the recovery state).
 //! - `state_file`: the atomically replaced, checksummed state-file format.
@@ -33,6 +35,7 @@ mod frozen;
 #[cfg(test)]
 mod frozen_tests;
 mod group_log;
+mod identity;
 mod journal;
 #[cfg(all(test, not(madsim)))]
 mod journal_tests;
@@ -92,6 +95,7 @@ pub(crate) use run_state::META_FSYNC;
 pub use run_state::MetaJournalDamage;
 pub use run_state::MetaOpening;
 pub(crate) use run_state::NodeWal;
+pub use run_state::Predecessor;
 pub use run_state::PreviousRun;
 pub use run_state::RUN_STATE_FILE;
 pub use run_state::RaftWalError;
@@ -160,9 +164,10 @@ pub(crate) enum RaftGroupLogRecord {
 /// One sample of each WAL state file, by name, as the persisted-envelopes
 /// fixture holds it: the whole file, its header and checksum included.
 #[cfg(test)]
-pub(crate) fn state_file_samples() -> [(&'static str, Vec<u8>); 3] {
+pub(crate) fn state_file_samples() -> [(&'static str, Vec<u8>); 4] {
     [
         ("core_metadata_file", core_meta::sample_file()),
+        ("identity_file", identity::sample_file()),
         ("run_state_file", run_state::sample_file()),
         ("topology_file", topology::sample_file()),
     ]

@@ -77,6 +77,10 @@ pub trait JournalDisk {
     /// when the platform does not report one. It changes on every host
     /// restart and never on a process restart.
     fn boot_id(path: &Path) -> Option<String>;
+    /// The device `path` is mounted from (`st_dev`). Another device on the
+    /// same boot is another mount of the volume, whose page cache is not
+    /// the earlier mount's.
+    fn device(path: &Path) -> io::Result<u64>;
 }
 
 /// An open file of a [`JournalDisk`].
@@ -251,6 +255,18 @@ impl JournalDisk for OsDisk {
     #[cfg(not(target_os = "linux"))]
     fn boot_id(_path: &Path) -> Option<String> {
         None
+    }
+
+    #[cfg(unix)]
+    fn device(path: &Path) -> io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(fs::metadata(path)?.dev())
+    }
+
+    /// No device id outside Unix: every mount reads as the same one.
+    #[cfg(not(unix))]
+    fn device(path: &Path) -> io::Result<u64> {
+        fs::metadata(path).map(|_metadata| 0)
     }
 }
 

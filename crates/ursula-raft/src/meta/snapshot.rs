@@ -285,10 +285,7 @@ mod tests {
         };
         for node in nodes {
             control
-                .apply(at(), ControlCommand::RegisterNode {
-                    node: samples::node(node),
-                    now_ms: 1,
-                })
+                .apply(at(), samples::register(node, 1))
                 .expect("a node registers");
         }
         control

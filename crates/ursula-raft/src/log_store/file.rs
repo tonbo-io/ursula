@@ -285,6 +285,16 @@ pub(crate) fn snapshot_record_file(raft_group_id: u32) -> String {
     format!("group-{raft_group_id}.snapshot.json")
 }
 
+/// Whether `path` names a group's snapshot record
+/// ([`snapshot_record_file`]).
+pub(crate) fn is_snapshot_record_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("group-"))
+        .and_then(|rest| rest.strip_suffix(".snapshot.json"))
+        .is_some_and(|group| group.parse::<u32>().is_ok())
+}
+
 /// A recovery cut that did not run.
 #[derive(Debug, thiserror::Error)]
 pub enum RecoveryCutError {

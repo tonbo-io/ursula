@@ -644,6 +644,7 @@ mod tests {
         use ursula_proto::placement::RaftLogId;
         use ursula_proto::placement::Registered;
         use ursula_proto::placement::ReplicationFactor;
+        use ursula_proto::placement::RootSlot;
 
         let raft_log_id = |term, leader, index| RaftLogId {
             term,
@@ -677,9 +678,19 @@ mod tests {
         for (name, lifecycle) in &lifecycles {
             add(samples, name, lifecycle);
         }
+        add(samples, "placement_root_id", &kernel::wide_root(0x80));
+        let slots = every!(RootSlot {
+            RootSlot::Bound(_) => "placement_root_slot_bound": RootSlot::Bound(kernel::wide_root(0x92)),
+            RootSlot::Released(_) => "placement_root_slot_released":
+                RootSlot::Released(kernel::wide_root(0x93)),
+        });
+        for (name, slot) in &slots {
+            add(samples, name, slot);
+        }
         let record = NodeRecord {
             lifecycle: NodeLifecycle::Decommissioning,
             since_ms: 94,
+            root: RootSlot::Bound(kernel::wide_root(0x94)),
         };
         add(samples, "placement_node_record", &record);
         add(
@@ -711,6 +722,7 @@ mod tests {
                 Registered::Unreferenced(NodeRecord {
                     lifecycle: NodeLifecycle::Cordoned,
                     since_ms: 101,
+                    root: RootSlot::Released(kernel::wide_root(0x101)),
                 }),
         });
         for (name, registered) in &registered {

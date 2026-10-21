@@ -11,6 +11,8 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use ursula_config::WalFsync;
 use ursula_headers::ClusterId;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::ProcessIncarnation;
 use ursula_runtime::GroupEngineMetrics;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
@@ -26,6 +28,7 @@ use crate::log_store::META_FSYNC;
 use crate::log_store::MetaJournalDamage;
 use crate::log_store::MetaOpening;
 use crate::log_store::NodeWal;
+use crate::log_store::Predecessor;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
 use crate::log_store::RecoveryState;
@@ -127,8 +130,8 @@ pub struct RaftWal {
 }
 
 impl RaftWal {
-    /// Starts a run of the Raft WAL under `root` with the `fsync` policy and
-    /// the default segment size and entry cache.
+    /// Starts a run of node 1's Raft WAL under `root` with the `fsync`
+    /// policy and the default segment size and entry cache.
     pub fn start(
         root: impl Into<PathBuf>,
         fsync: WalFsync,
@@ -137,24 +140,29 @@ impl RaftWal {
         Self::start_with(root, JournalTuning::new(fsync), topology)
     }
 
-    /// Starts a run of the Raft WAL under `root` with `tuning`, keeping the
-    /// cluster id the root holds or generating one for a new root.
+    /// Starts a run of node 1's Raft WAL under `root` with `tuning`,
+    /// keeping the cluster id the root holds or generating one for a new
+    /// root.
     pub fn start_with(
         root: impl Into<PathBuf>,
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
     ) -> Result<Self, RaftWalError> {
-        Self::start_in_cluster(root, tuning, topology, None)
+        Self::start_in_cluster(root, tuning, topology, NodeId::new(1), None)
     }
 
-    /// Starts a run of the Raft WAL under `root` with `tuning` for the
-    /// configured `cluster_id`. A new root records it, or a generated id when
-    /// `None`. An existing root must hold the same id
-    /// ([`RaftWalError::ClusterIdMismatch`]).
+    /// Starts a run of node `node`'s Raft WAL under `root` with `tuning` for
+    /// the configured `cluster_id`. A new root records the node, a root id
+    /// it draws, and the cluster id, or a generated one when `None`. An
+    /// existing root must hold the same node id
+    /// ([`RaftWalError::OtherNode`]) and cluster id
+    /// ([`RaftWalError::ClusterIdMismatch`]). The start counts its run in
+    /// the root's identity file before it returns ([`Self::incarnation`]).
     pub fn start_in_cluster(
         root: impl Into<PathBuf>,
         tuning: JournalTuning,
         topology: &ursula_shard::StaticShardMap,
+        node: NodeId,
         cluster_id: Option<&ClusterId>,
     ) -> Result<Self, RaftWalError> {
         Ok(Self {
@@ -163,6 +171,7 @@ impl RaftWal {
                 tuning.fsync,
                 topology,
                 cluster_id,
+                node,
             )?),
             tuning,
             lagging: Arc::new(LaggingGroups::default()),
@@ -187,6 +196,24 @@ impl RaftWal {
     /// The cluster id bound to this WAL root.
     pub fn cluster_id(&self) -> &ClusterId {
         self.node.cluster_id()
+    }
+
+    /// This process's incarnation: the root's id, the run this start
+    /// counted, durably, and the nonce it drew.
+    pub fn incarnation(&self) -> ProcessIncarnation {
+        self.node.incarnation()
+    }
+
+    /// Whether the process of an earlier run of this root may still run,
+    /// as this start read it.
+    pub fn predecessor(&self) -> Predecessor {
+        self.node.predecessor()
+    }
+
+    /// Whether the root held no journal record, no vote and no snapshot
+    /// record, data or meta, when this run opened it.
+    pub fn empty_at_open(&self) -> bool {
+        self.node.empty()
     }
 
     /// The data journals' fsync policy. The meta journal always runs

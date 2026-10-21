@@ -394,10 +394,7 @@ async fn a_forwarded_write_refused_as_a_whole_answers_each_command_typed() {
     // A data group never takes a meta command: a batch that carries one is
     // refused as a whole, before anything of it is proposed.
     let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
-        ursula_control::ControlCommand::RegisterNode {
-            node: ursula_control::NodeId::new(1),
-            now_ms: 1,
-        },
+        ursula_control::samples::register(1, 1),
     ));
     let response = service
         .group_write(tonic::Request::new(
@@ -515,7 +512,7 @@ async fn group_rpcs_check_their_target_before_the_group() {
         .await
         .expect_err("node 1 is not node 2");
     assert_eq!(misdelivered.code(), tonic::Code::FailedPrecondition);
-    assert_eq!(crate::target::refusing_node(&misdelivered), Some(1));
+    assert_eq!(crate::target::refusing_node(&misdelivered, 2), Some(1));
     assert!(!crate::format_epoch::is_protocol_mismatch(&misdelivered));
     // A meta request names group 0.
     let mut meta_group = write(pb::RaftPlaneV1::Meta, 1);
@@ -534,7 +531,7 @@ async fn group_rpcs_check_their_target_before_the_group() {
         .genesis_probe(tonic::Request::new(probe.clone()))
         .await
         .expect_err("node 1 is not node 2");
-    assert_eq!(crate::target::refusing_node(&refused), Some(1));
+    assert_eq!(crate::target::refusing_node(&refused, 2), Some(1));
     let mut probe = probe;
     probe.target_node = 1;
     assert_eq!(
@@ -585,10 +582,7 @@ async fn an_append_carrying_a_meta_command_is_refused_before_openraft_sees_it() 
         tonic::Request::new(envelope)
     };
     let meta = RaftCommand::Meta(crate::meta::MetaCommand::Control(
-        ursula_control::ControlCommand::RegisterNode {
-            node: ursula_control::NodeId::new(2),
-            now_ms: 1,
-        },
+        ursula_control::samples::register(2, 1),
     ));
     let entry = Entry::new(
         LogId {

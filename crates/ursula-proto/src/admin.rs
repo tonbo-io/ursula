@@ -68,46 +68,9 @@ pub enum ApplyFailureKind {
     Unknown,
 }
 
-/// A mutation must carry the incarnation observed before its maintenance plan.
+/// A mutation must carry the process incarnation
+/// ([`crate::placement::ProcessIncarnation`]) it observed before its plan.
 pub const PROCESS_INCARNATION_HEADER: &str = "x-ursula-process-incarnation";
-
-/// A fresh identity for one server instance, shared by its HTTP listeners.
-/// This is an identity precondition, not a credential or maintenance lease.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct ProcessIncarnation(String);
-
-impl ProcessIncarnation {
-    pub fn from_bits(bits: u128) -> Self {
-        Self(format!("{bits:032x}"))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("process incarnation must be 32 lowercase hexadecimal characters")]
-pub struct InvalidProcessIncarnation;
-
-impl TryFrom<String> for ProcessIncarnation {
-    type Error = InvalidProcessIncarnation;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        if !canonical_identity(&value) {
-            return Err(InvalidProcessIncarnation);
-        }
-        Ok(Self(value))
-    }
-}
-
-fn canonical_identity(value: &str) -> bool {
-    value.len() == 32
-        && value
-            .bytes()
-            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
-}
 
 /// A replica's log as the recovery tool read it in `GET /__ursula/metrics`:
 /// what a recovery plan expects each member to still hold.
@@ -342,17 +305,10 @@ where
     Option::deserialize(deserializer)
 }
 
-impl From<ProcessIncarnation> for String {
-    fn from(value: ProcessIncarnation) -> Self {
-        value.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::ApplyFailure;
     use super::ApplyFailureKind;
-    use super::ProcessIncarnation;
     use super::RaftMaintenanceIssue;
     use super::RaftMaintenanceReport;
     use super::TransferRejection;
@@ -547,26 +503,6 @@ mod tests {
                 "a 0.7 or 0.9 body, an incomplete plan, an unknown floor or an unknown field is \
                  refused",
             );
-        }
-    }
-
-    #[test]
-    fn identity_is_canonical_and_rejects_ambiguous_input() {
-        let identity = ProcessIncarnation::from_bits(0xabcd);
-        assert_eq!(identity.as_str(), "0000000000000000000000000000abcd");
-        assert_eq!(
-            ProcessIncarnation::try_from(identity.as_str().to_owned()),
-            Ok(identity)
-        );
-        for invalid in [
-            "",
-            "abcd",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "\"00000000000000000000000000000000",
-            "g0000000000000000000000000000000",
-        ] {
-            ProcessIncarnation::try_from(invalid.to_owned())
-                .expect_err("a non-canonical incarnation must be rejected");
         }
     }
 }
@@ -920,7 +856,7 @@ pub struct NodeMetrics {
     /// The node's `server.cluster_id` (`Ursula-Cluster-Id`): every node of
     /// one deployment reports the same.
     pub cluster_id: ursula_headers::ClusterId,
-    pub process_incarnation: ProcessIncarnation,
+    pub process_incarnation: crate::placement::ProcessIncarnation,
     #[serde(deserialize_with = "Option::deserialize")]
     pub process_node_id: Option<u64>,
     #[serde(rename = "raft_groups")]
@@ -1040,7 +976,11 @@ mod metrics_contract_tests {
     fn complete() -> NodeMetrics {
         NodeMetrics {
             cluster_id: ursula_headers::ClusterId::new("prod-eu-1").unwrap(),
-            process_incarnation: ProcessIncarnation::from_bits(1),
+            process_incarnation: crate::placement::ProcessIncarnation {
+                root: crate::placement::RootId::new(std::num::NonZeroU64::MIN),
+                run: 1,
+                nonce: 2,
+            },
             process_node_id: Some(1),
             meta: None,
             raft_maintenance: Some(RaftMaintenanceReport {

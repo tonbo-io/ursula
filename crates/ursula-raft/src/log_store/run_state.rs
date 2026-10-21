@@ -57,6 +57,8 @@ use std::sync::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_config::WalFsync;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::ProcessIncarnation;
 
 use super::core_meta::CoreMetadata;
 use super::core_meta::GroupLogState;
@@ -170,6 +172,10 @@ pub struct RunState {
     pub data: JournalRun,
     /// The meta journal's policy, always `always`, and epoch.
     pub meta: JournalRun,
+    /// The device the WAL root was mounted from when the run started
+    /// (`st_dev`, [`super::disk::JournalDisk::device`]): another device on
+    /// the same boot is another mount, whose page cache is not this one's.
+    pub device: u64,
 }
 
 impl RunState {
@@ -222,9 +228,14 @@ pub enum PreviousRun {
     Unrecorded,
     /// The previous run shut down cleanly: every journal was `fsync`ed.
     Clean,
-    /// The previous run's process stopped on the host that still runs, so
-    /// the page cache kept every write.
+    /// The previous run's process stopped on the host that still runs, on
+    /// the same mount of the root, so the page cache kept every write.
     ProcessCrash,
+    /// The previous run did not shut down cleanly, and the root is mounted
+    /// from another device on the same boot: the volume moved, and the old
+    /// mount's page cache is not this one's, so the run reads as a host
+    /// crash under `fsync`, the policy the class's journals ran.
+    Remounted { fsync: WalFsync },
     /// The previous run did not shut down cleanly and the boot id changed, or
     /// is unknown: the host crashed and writeback may have left holes in what
     /// the run wrote without `fsync`. `fsync` is the policy the class's
@@ -250,6 +261,9 @@ pub enum RecoveryState {
 pub enum RecoveryReason {
     /// The host crashed while the policy was `never`.
     HostCrash,
+    /// The root was mounted from another device after a run that did not
+    /// shut down cleanly while the policy was `never`.
+    Remounted,
     /// An I/O error stopped a journal writer.
     Poisoned,
     /// The run state is missing while journals hold records: how the run
@@ -271,6 +285,49 @@ pub enum JournalSync {
     /// records `always`, under which a host crash reads as losing nothing,
     /// so it `fsync`s every core journal first.
     BeforeRecording,
+}
+
+/// Whether a process that ran this WAL root before this one may still run,
+/// read once at start ([`Predecessor::of`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Predecessor {
+    /// A process of this root may still run: nothing proves the run before
+    /// ended, or an earlier run left its wait unfinished.
+    MayLive,
+    /// The run before ended: it recorded its end, or its process held the
+    /// root's lock on this mount of this kernel.
+    Gone,
+}
+
+impl Predecessor {
+    /// The predecessor of a run whose root was `empty` when it opened (no
+    /// core or meta journal held a record, no core or meta metadata held a
+    /// vote, and no snapshot record existed), after `previous_run` and with
+    /// `predecessor_wait`, the wait the identity file says is owed. The
+    /// first matching row decides:
+    ///
+    /// - an empty root may live: a fresh root of a node id whose old
+    ///   process may still run;
+    /// - an owed wait may live: a restart never shortens one;
+    /// - `Clean`, `Poisoned` and `ProcessCrash` are gone: the run recorded
+    ///   its end, a poisoned writer aborts its process after recording it,
+    ///   and a crashed process held the `flock` on this mount of this
+    ///   kernel;
+    /// - `Remounted`, `HostCrash`, `Unrecorded` and `Absent` may live:
+    ///   without a host identity a reboot and a moved volume look alike,
+    ///   and a lost run state proves nothing.
+    pub fn of(previous_run: PreviousRun, predecessor_wait: bool, empty: bool) -> Self {
+        match previous_run {
+            _ if empty => Self::MayLive,
+            _ if predecessor_wait => Self::MayLive,
+            PreviousRun::Clean | PreviousRun::Poisoned | PreviousRun::ProcessCrash => Self::Gone,
+            PreviousRun::Remounted { .. }
+            | PreviousRun::HostCrash { .. }
+            | PreviousRun::Unrecorded
+            | PreviousRun::Absent => Self::MayLive,
+        }
+    }
 }
 
 /// How this run opens the journals.
@@ -366,10 +423,15 @@ pub(crate) enum MetaAtStart {
 /// What the start read of the meta journal.
 #[derive(Debug)]
 enum MetaRead {
-    /// No meta journal ([`MetaAtStart::Absent`]).
-    Absent,
-    /// The meta journal and what it holds.
-    Read(JournalHistory),
+    /// No meta journal ([`MetaAtStart::Absent`]), and whether the meta
+    /// group's snapshot record remains without it.
+    Absent { snapshot_records: bool },
+    /// The meta journal, what it holds, and whether it holds a record, a
+    /// vote or a snapshot record (`state`).
+    Read {
+        history: JournalHistory,
+        state: bool,
+    },
     /// The meta journal could not be read.
     Unread(MetaJournalDamage),
 }
@@ -381,29 +443,45 @@ impl MetaRead {
             Ok(JournalRead {
                 records: false,
                 metadata: false,
+                snapshot_records,
                 ..
-            }) => Self::Absent,
-            Ok(read) => Self::Read(JournalHistory::of(read.records, read.verified_epoch)),
+            }) => Self::Absent { snapshot_records },
+            Ok(read) => Self::Read {
+                history: JournalHistory::of(read.records, read.verified_epoch),
+                state: read.state(),
+            },
             Err(unread) => Self::Unread(unread.into()),
         }
     }
 
     fn at_start(&self) -> MetaAtStart {
         match self {
-            Self::Absent => MetaAtStart::Absent,
-            Self::Read(_) | Self::Unread(_) => MetaAtStart::Present,
+            Self::Absent { .. } => MetaAtStart::Absent,
+            Self::Read { .. } | Self::Unread(_) => MetaAtStart::Present,
+        }
+    }
+
+    /// Whether the meta journal holds a record, a vote or a snapshot
+    /// record. A journal that could not be read counts as holding them.
+    fn holds_state(&self) -> bool {
+        match self {
+            Self::Absent { snapshot_records } => *snapshot_records,
+            Self::Read { state, .. } => *state,
+            Self::Unread(_) => true,
         }
     }
 }
 
 impl PreviousRun {
     /// Reads `previous`, the run state the previous run left, for the
-    /// journals of `class`, given what they hold and the current `boot_id`.
+    /// journals of `class`, given what they hold, the current `boot_id` and
+    /// the `device` the root is mounted from now.
     pub fn interpret(
         previous: Option<&RunState>,
         class: JournalClass,
         journals: JournalHistory,
         boot_id: Option<&BootId>,
+        device: u64,
     ) -> Self {
         let Some(previous) = previous else {
             return match journals {
@@ -417,7 +495,12 @@ impl PreviousRun {
             RunStatus::Clean => Self::Clean,
             RunStatus::Poisoned => Self::Poisoned,
             RunStatus::Running => match (previous.boot_id.as_ref(), boot_id) {
-                (Some(before), Some(now)) if before == now => Self::ProcessCrash,
+                (Some(before), Some(now)) if before == now && previous.device == device => {
+                    Self::ProcessCrash
+                }
+                (Some(before), Some(now)) if before == now => Self::Remounted {
+                    fsync: previous.journal(class).fsync,
+                },
                 _ => Self::HostCrash {
                     fsync: previous.journal(class).fsync,
                 },
@@ -435,9 +518,15 @@ impl PreviousRun {
             | Self::ProcessCrash
             | Self::HostCrash {
                 fsync: WalFsync::Always,
+            }
+            | Self::Remounted {
+                fsync: WalFsync::Always,
             } => JournalReplayMode::Strict,
             Self::Unrecorded
             | Self::HostCrash {
+                fsync: WalFsync::Never,
+            }
+            | Self::Remounted {
                 fsync: WalFsync::Never,
             }
             | Self::Poisoned => JournalReplayMode::VerifiedPrefix,
@@ -453,11 +542,19 @@ impl PreviousRun {
             | Self::ProcessCrash
             | Self::HostCrash {
                 fsync: WalFsync::Always,
+            }
+            | Self::Remounted {
+                fsync: WalFsync::Always,
             } => RecoveryState::Normal,
             Self::HostCrash {
                 fsync: WalFsync::Never,
             } => RecoveryState::Recovering {
                 reason: RecoveryReason::HostCrash,
+            },
+            Self::Remounted {
+                fsync: WalFsync::Never,
+            } => RecoveryState::Recovering {
+                reason: RecoveryReason::Remounted,
             },
             Self::Poisoned => RecoveryState::Recovering {
                 reason: RecoveryReason::Poisoned,
@@ -471,16 +568,18 @@ impl PreviousRun {
 
 impl WalOpening {
     /// The "Startup and replay" decision for the journals of `class` in a
-    /// run on `boot_id` that runs them with the policy `fsync`, after the
-    /// run that left `previous` and what those `journals` hold.
+    /// run on `boot_id`, with the root mounted from `device`, that runs them
+    /// with the policy `fsync`, after the run that left `previous` and what
+    /// those `journals` hold.
     pub fn decide(
         previous: Option<&RunState>,
         class: JournalClass,
         journals: JournalHistory,
         boot_id: Option<&BootId>,
+        device: u64,
         fsync: WalFsync,
     ) -> Result<Self, RaftWalError> {
-        let previous_run = PreviousRun::interpret(previous, class, journals, boot_id);
+        let previous_run = PreviousRun::interpret(previous, class, journals, boot_id, device);
         let replay_mode = previous_run.replay_mode();
         let recorded = previous.map(|previous| *previous.journal(class));
         let prior_epoch = recorded
@@ -557,6 +656,26 @@ pub enum RaftWalError {
     },
     #[error("the WAL topology at '{}' holds an invalid cluster id '{stored}'", .root.display())]
     InvalidStoredClusterId { root: PathBuf, stored: String },
+    #[error("the WAL at '{}' belongs to node {stored}, but raft.node_id is {configured}. A WAL root opens only under the node id that created it: start node {stored} on it, or start node {configured} on an empty WAL", .root.display())]
+    OtherNode {
+        root: PathBuf,
+        stored: ursula_proto::placement::NodeId,
+        configured: ursula_proto::placement::NodeId,
+    },
+    #[error("the WAL identity file is missing at '{}' but prior WAL state exists. Refusing to count this root's runs again from the start, which would make this process read as an earlier one. Start the node on an empty WAL instead", .root.display())]
+    MissingIdentity { root: PathBuf },
+    #[error("the WAL at '{}' counted {run} runs, the most a root counts: start the node on an empty WAL", .root.display())]
+    RunCounterExhausted { root: PathBuf, run: u32 },
+    #[error("read the Raft WAL identity file: {0}")]
+    ReadIdentity(#[source] StateFileError),
+    #[error("record the Raft WAL identity file: {0}")]
+    RecordIdentity(#[source] JournalError),
+    #[error("read the device of the Raft WAL root '{}': {source}", .path.display())]
+    Device {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("read the Raft WAL topology: {0}")]
     ReadTopology(#[source] StateFileError),
     #[error("record the Raft WAL topology: {0}")]
@@ -708,6 +827,13 @@ pub(crate) struct NodeWal {
     /// Whether the meta journal existed at start.
     meta_at_start: MetaAtStart,
     run_state: Arc<RunStateFile>,
+    /// This process: the root, the run this start counted and its nonce.
+    incarnation: ProcessIncarnation,
+    /// Whether the process of an earlier run of the root may still run.
+    predecessor: Predecessor,
+    /// Whether the root held no journal record, vote or snapshot record at
+    /// start.
+    empty: bool,
     /// Keeps a second process off the root, so two runs never interleave
     /// their run-state writes. Released by a clean shutdown, or when the
     /// node's WAL is dropped.
@@ -715,15 +841,17 @@ pub(crate) struct NodeWal {
 }
 
 impl NodeWal {
-    /// Starts a run on the WAL under `root`: takes its lock, reads the run
-    /// state the previous run left, decides how each class of journal opens,
-    /// and durably records this run before any journal write. `fsync` is the
-    /// data journals' policy.
+    /// Starts node `node`'s run on the WAL under `root`: takes its lock,
+    /// reads the run state the previous run left, decides how each class of
+    /// journal opens, counts the run in the identity file, and durably
+    /// records this run before any journal write. `fsync` is the data
+    /// journals' policy.
     pub(crate) fn start(
         root: PathBuf,
         fsync: WalFsync,
         topology: &ursula_shard::StaticShardMap,
         cluster_id: Option<&ursula_headers::ClusterId>,
+        node: NodeId,
     ) -> Result<Self, RaftWalError> {
         create_dir_all_durable(&root).map_err(|source| RaftWalError::CreateDir {
             path: root.clone(),
@@ -749,24 +877,36 @@ impl NodeWal {
         let meta = meta_dir(&root);
         let meta_read = MetaRead::of(&meta);
         let meta_at_start = meta_read.at_start();
+        let meta_state = meta_read.holds_state();
         // Even metadata-only cores are prior state: votes must not be
         // forgotten. So is a meta journal.
-        let cluster_id = super::topology::check_or_create(
-            &root,
-            topology,
-            cluster_id,
-            previous.is_some() || !cores.is_empty() || meta_at_start == MetaAtStart::Present,
-        )?;
-        let journals = journal_history(&cores)?;
+        let has_prior_state =
+            previous.is_some() || !cores.is_empty() || meta_at_start == MetaAtStart::Present;
+        let bound =
+            super::topology::check_or_create(&root, topology, cluster_id, node, has_prior_state)?;
+        let identity = super::identity::read(&root, has_prior_state)?;
+        let (journals, data_state) = journal_history(&cores)?;
+        let empty = !data_state && !meta_state;
         let boot_id = Disk::boot_id(&root).map(BootId);
+        let device = Disk::device(&root).map_err(|source| RaftWalError::Device {
+            path: root.clone(),
+            source,
+        })?;
         let opening = WalOpening::decide(
             previous.as_ref(),
             JournalClass::Data,
             journals,
             boot_id.as_ref(),
+            device,
             fsync,
         )?;
-        let meta_opening = open_meta_class(&meta, meta_read, previous.as_ref(), boot_id.as_ref())?;
+        let meta_opening = open_meta_class(
+            &meta,
+            meta_read,
+            previous.as_ref(),
+            boot_id.as_ref(),
+            device,
+        )?;
         log_opening(
             &root,
             previous.as_ref(),
@@ -814,6 +954,18 @@ impl NodeWal {
                 })?;
             }
         }
+        // Before this run records itself, so a crash in between never
+        // reads the next start's predecessor as gone without the wait this
+        // one owes: the identity file keeps it.
+        let predecessor = Predecessor::of(opening.previous_run, identity.predecessor_wait(), empty);
+        let (_, incarnation) = super::identity::advance(&root, bound.root, identity, predecessor)?;
+        tracing::info!(
+            root = %root.display(),
+            %incarnation,
+            ?predecessor,
+            empty,
+            "counted this run of the Raft WAL root"
+        );
         let run_state = RunStateFile::new(path, RunState {
             boot_id,
             status: RunStatus::Running,
@@ -825,20 +977,41 @@ impl NodeWal {
                 fsync: META_FSYNC,
                 recovery_epoch: meta_opening.opening().recovery_epoch,
             },
+            device,
         });
         run_state
             .record(RunStatus::Running, "running")
             .map_err(RaftWalError::RecordRunState)?;
         Ok(Self {
             root,
-            cluster_id,
+            cluster_id: bound.cluster_id,
             opening,
             data_history: journals,
             meta_opening,
             meta_at_start,
             run_state: Arc::new(run_state),
+            incarnation,
+            predecessor,
+            empty,
             lock: Mutex::new(Some(lock)),
         })
+    }
+
+    /// This process's incarnation: its root, the run this start counted
+    /// and the nonce it drew.
+    pub(crate) fn incarnation(&self) -> ProcessIncarnation {
+        self.incarnation
+    }
+
+    /// Whether the process of an earlier run of this root may still run.
+    pub(crate) fn predecessor(&self) -> Predecessor {
+        self.predecessor
+    }
+
+    /// Whether the root held no journal record, vote or snapshot record at
+    /// start.
+    pub(crate) fn empty(&self) -> bool {
+        self.empty
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -967,6 +1140,7 @@ pub(crate) fn sample_file() -> Vec<u8> {
             fsync: WalFsync::Always,
             recovery_epoch: 2,
         },
+        device: 0x0001_0305,
     };
     let bytes = state_file::encode(StateFileKind::RunState, &state);
     let decoded: RunState =
@@ -1006,12 +1180,20 @@ fn open_meta_class(
     read: MetaRead,
     previous: Option<&RunState>,
     boot_id: Option<&BootId>,
+    device: u64,
 ) -> Result<MetaOpening, RaftWalError> {
     let decide = |history: JournalHistory| {
-        WalOpening::decide(previous, JournalClass::Meta, history, boot_id, META_FSYNC)
+        WalOpening::decide(
+            previous,
+            JournalClass::Meta,
+            history,
+            boot_id,
+            device,
+            META_FSYNC,
+        )
     };
     let history = match read {
-        MetaRead::Absent => {
+        MetaRead::Absent { .. } => {
             return Ok(MetaOpening::Decided(decide(JournalHistory::Empty {
                 verified_epoch: 0,
             })?));
@@ -1022,7 +1204,7 @@ fn open_meta_class(
                 damage,
             });
         }
-        MetaRead::Read(history) => history,
+        MetaRead::Read { history, .. } => history,
     };
     let opening = decide(history)?;
     // Before this run records itself, as for the cores. The policy of meta
@@ -1082,15 +1264,19 @@ impl From<HistoryReadError> for MetaJournalDamage {
 /// Gather journal records and the greatest surviving verification epoch of
 /// the journals in `dirs`. This performs I/O only; `WalOpening::decide` owns
 /// the recovery policy.
-fn journal_history(dirs: &[PathBuf]) -> Result<JournalHistory, HistoryReadError> {
+/// Whether a journal of the class holds a record, a vote or a snapshot record
+/// (`state`), with the journals' history.
+fn journal_history(dirs: &[PathBuf]) -> Result<(JournalHistory, bool), HistoryReadError> {
     let mut records = false;
+    let mut state = false;
     let mut verified_epoch = 0;
     for dir in dirs {
         let read = read_journal(dir)?;
         records |= read.records;
+        state |= read.state();
         verified_epoch = verified_epoch.max(read.verified_epoch);
     }
-    Ok(JournalHistory::of(records, verified_epoch))
+    Ok((JournalHistory::of(records, verified_epoch), state))
 }
 
 /// What one journal directory holds, as a start reads it.
@@ -1102,6 +1288,18 @@ struct JournalRead {
     metadata: bool,
     /// The epoch the metadata file records, 0 without one.
     verified_epoch: u64,
+    /// Whether the metadata file holds a vote of any group.
+    votes: bool,
+    /// Whether a group's snapshot record (`group-N.snapshot.json`) exists.
+    snapshot_records: bool,
+}
+
+impl JournalRead {
+    /// Whether the journal holds a record, a vote or a snapshot record: the
+    /// state an `empty` root holds none of.
+    fn state(&self) -> bool {
+        self.records || self.votes || self.snapshot_records
+    }
 }
 
 /// Reads the journal in `dir`. A missing directory holds nothing.
@@ -1113,10 +1311,20 @@ fn read_journal(dir: &Path) -> Result<JournalRead, HistoryReadError> {
     let path = core_metadata_path(dir);
     let (metadata, missing) = CoreMetadata::load_with_presence(&path)
         .map_err(|source| HistoryReadError::Metadata { path, source })?;
+    let snapshot_records = Disk::exists(dir)
+        && Disk::read_dir(dir)
+            .map_err(|source| HistoryReadError::Journal {
+                path: dir.to_owned(),
+                source: JournalError::io(dir, super::journal::JournalOp::Open, source),
+            })?
+            .iter()
+            .any(|path| super::file::is_snapshot_record_file(path));
     Ok(JournalRead {
         records,
         metadata: !missing,
         verified_epoch: metadata.verified_epoch(),
+        votes: metadata.groups().any(|(_, group)| group.vote.is_some()),
+        snapshot_records,
     })
 }
 
@@ -1169,6 +1377,7 @@ mod tests {
     use super::JournalReplayMode;
     use super::JournalRun;
     use super::JournalSync;
+    use super::Predecessor;
     use super::PreviousRun;
     use super::RecoveryReason;
     use super::RecoveryState;
@@ -1180,6 +1389,9 @@ mod tests {
     fn boot(id: &str) -> BootId {
         BootId::new(id)
     }
+
+    /// The device the root of every previous run here was mounted from.
+    const DEVICE: u64 = 0x0001_0305;
 
     /// A run records the run state as the persisted-envelopes fixture's
     /// sample holds it ([`super::sample_file`]).
@@ -1199,6 +1411,7 @@ mod tests {
                 fsync: WalFsync::Always,
                 recovery_epoch: 2,
             },
+            device: DEVICE,
         };
         super::RunStateFile::new(path.clone(), current.clone())
             .record(RunStatus::Poisoned, "sample")
@@ -1227,6 +1440,7 @@ mod tests {
                 fsync: WalFsync::Always,
                 recovery_epoch: 2,
             },
+            device: DEVICE,
         }
     }
 
@@ -1237,7 +1451,14 @@ mod tests {
         boot_id: Option<&BootId>,
         fsync: WalFsync,
     ) -> Result<WalOpening, super::RaftWalError> {
-        WalOpening::decide(previous, JournalClass::Data, journals, boot_id, fsync)
+        WalOpening::decide(
+            previous,
+            JournalClass::Data,
+            journals,
+            boot_id,
+            DEVICE,
+            fsync,
+        )
     }
 
     /// The previous run's state, what the journals hold, the current boot
@@ -1430,6 +1651,143 @@ mod tests {
         }
     }
 
+    /// A run that did not end cleanly, on the same boot but with the root
+    /// mounted from another device, is `Remounted`: replayed and gated as a
+    /// host crash under its policy, with nothing synced first, since the
+    /// old mount's page cache is not this one's. The device decides nothing
+    /// after a clean or poisoned run, nor without a boot id, which already
+    /// reads as a host crash.
+    #[test]
+    fn another_device_on_the_same_boot_reads_as_remounted() {
+        const RECORDS: JournalHistory = JournalHistory::Records { verified_epoch: 0 };
+        const OTHER: u64 = 0x0002_0001;
+        let opening = |previous: &RunState, boot_id: Option<&str>, device, fsync| {
+            WalOpening::decide(
+                Some(previous),
+                JournalClass::Data,
+                RECORDS,
+                boot_id.map(boot).as_ref(),
+                device,
+                fsync,
+            )
+            .expect("valid recovery epoch")
+        };
+        for fsync in [WalFsync::Never, WalFsync::Always] {
+            let crashed = previous(Some("a"), fsync, RunStatus::Running);
+            let moved = opening(&crashed, Some("a"), OTHER, fsync);
+            let host_crash = opening(&crashed, Some("b"), DEVICE, fsync);
+            assert_eq!(moved.previous_run, PreviousRun::Remounted { fsync });
+            assert_eq!(moved.replay_mode, host_crash.replay_mode);
+            assert_eq!(moved.recovery_epoch, host_crash.recovery_epoch);
+            assert_eq!(moved.recovery, match fsync {
+                WalFsync::Never => RecoveryState::Recovering {
+                    reason: RecoveryReason::Remounted,
+                },
+                WalFsync::Always => RecoveryState::Normal,
+            });
+            // A switch to `always` syncs only a process crash's page cache.
+            assert_eq!(
+                opening(&crashed, Some("a"), OTHER, WalFsync::Always).journal_sync,
+                JournalSync::NotNeeded
+            );
+            assert_eq!(
+                opening(&crashed, Some("a"), DEVICE, fsync).previous_run,
+                PreviousRun::ProcessCrash
+            );
+            assert_eq!(
+                opening(&crashed, None, OTHER, fsync).previous_run,
+                PreviousRun::HostCrash { fsync }
+            );
+            for (status, expected) in [
+                (RunStatus::Clean, PreviousRun::Clean),
+                (RunStatus::Poisoned, PreviousRun::Poisoned),
+            ] {
+                let ended = previous(Some("a"), fsync, status);
+                assert_eq!(
+                    opening(&ended, Some("a"), OTHER, fsync).previous_run,
+                    expected
+                );
+            }
+        }
+    }
+
+    /// One previous run of every variant, with the policy `never`.
+    fn every_previous_run() -> [PreviousRun; 7] {
+        let runs = [
+            PreviousRun::Absent,
+            PreviousRun::Unrecorded,
+            PreviousRun::Clean,
+            PreviousRun::ProcessCrash,
+            PreviousRun::Remounted {
+                fsync: WalFsync::Never,
+            },
+            PreviousRun::HostCrash {
+                fsync: WalFsync::Never,
+            },
+            PreviousRun::Poisoned,
+        ];
+        // A new variant does not compile until it has a row.
+        for run in runs {
+            match run {
+                PreviousRun::Absent
+                | PreviousRun::Unrecorded
+                | PreviousRun::Clean
+                | PreviousRun::ProcessCrash
+                | PreviousRun::Remounted { .. }
+                | PreviousRun::HostCrash { .. }
+                | PreviousRun::Poisoned => {}
+            }
+        }
+        runs
+    }
+
+    /// Every row of the predecessor table, first matching row first: an
+    /// empty root and an owed wait may live whatever ended, a recorded end,
+    /// a poisoned writer and a process crash are gone, and a remount, a
+    /// host crash and a lost or absent run state may live. Under either
+    /// policy alike.
+    #[test]
+    fn predecessor_of_follows_its_table_over_every_previous_run() {
+        for run in every_previous_run() {
+            for (empty, predecessor_wait) in [(true, false), (true, true), (false, true)] {
+                assert_eq!(
+                    Predecessor::of(run, predecessor_wait, empty),
+                    Predecessor::MayLive,
+                    "{run:?} empty={empty} wait={predecessor_wait}"
+                );
+            }
+            let expected = match run {
+                PreviousRun::Clean | PreviousRun::Poisoned | PreviousRun::ProcessCrash => {
+                    Predecessor::Gone
+                }
+                PreviousRun::Absent
+                | PreviousRun::Unrecorded
+                | PreviousRun::Remounted { .. }
+                | PreviousRun::HostCrash { .. } => Predecessor::MayLive,
+            };
+            assert_eq!(Predecessor::of(run, false, false), expected, "{run:?}");
+        }
+        for fsync in [WalFsync::Never, WalFsync::Always] {
+            for run in [PreviousRun::Remounted { fsync }, PreviousRun::HostCrash {
+                fsync,
+            }] {
+                assert_eq!(Predecessor::of(run, false, false), Predecessor::MayLive);
+            }
+        }
+        // The admin JSON names.
+        assert_eq!(
+            serde_json::to_value([Predecessor::MayLive, Predecessor::Gone]).unwrap(),
+            serde_json::json!(["may_live", "gone"])
+        );
+        assert_eq!(
+            serde_json::to_value(PreviousRun::Remounted {
+                fsync: WalFsync::Never
+            })
+            .unwrap(),
+            serde_json::json!({"kind": "remounted", "fsync": "never"})
+        );
+    }
+
     /// Each class of journal opens by its own record through the same
     /// table, over the node-wide status and boot id: a host crash under a
     /// data policy of `never` opens the data journals as a verified prefix
@@ -1449,6 +1807,7 @@ mod tests {
                 JournalClass::Meta,
                 journals,
                 boot_id.map(boot).as_ref(),
+                DEVICE,
                 Always,
             )
             .expect("valid recovery epoch")
@@ -1695,6 +2054,7 @@ mod tests {
                 JournalClass::Meta,
                 JournalHistory::Empty { verified_epoch: 0 },
                 Some(&boot("a")),
+                DEVICE,
                 WalFsync::Always,
             );
             assert!(matches!(

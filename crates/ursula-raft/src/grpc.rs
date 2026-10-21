@@ -363,7 +363,7 @@ pub(crate) async fn probe_rejoin_vote_barrier(
     let response = match client.rejoin_barrier(request).await {
         Ok(response) => response.into_inner(),
         Err(status) => {
-            if let Some(node) = crate::target::refusing_node(&status) {
+            if let Some(node) = crate::target::refusing_node(&status, leader_id) {
                 // Rebuilds the pooled channel, as every Raft client does.
                 network.misdelivered(node);
                 return Err(RecoveryProbeError::OtherNode { node });
@@ -452,7 +452,7 @@ pub(crate) async fn genesis_probe(
         );
         return Some(PeerGroupLog::Initialized);
     }
-    if let Some(node) = crate::target::refusing_node(&status) {
+    if let Some(node) = crate::target::refusing_node(&status, peer) {
         network.misdelivered(node);
         return None;
     }
@@ -816,15 +816,15 @@ fn refusal_status(code: tonic::Code, message: String, refusing_node: Option<u64>
 }
 
 /// A refused `AppendStream` item as the stream carries it: an item has no
-/// status metadata, so the misdelivery refusal's node travels in
-/// `refusing_node` (0 for none, as no node id is 0).
+/// status metadata, so the misdelivery refusal's node, the receiver's own,
+/// travels in `refusing_node` (0 for none, as no node id is 0).
 pub(crate) fn stream_item_error(
     status: &tonic::Status,
 ) -> raft_internal_proto::RaftAppendStreamError {
     raft_internal_proto::RaftAppendStreamError {
         code: status.code() as i32,
         message: status.message().to_owned(),
-        refusing_node: crate::target::refusing_node(status).unwrap_or(0),
+        refusing_node: crate::target::stamped_node(status).unwrap_or(0),
     }
 }
 
@@ -1914,7 +1914,7 @@ impl GrpcRaftNetwork {
         status: tonic::Status,
     ) -> (RPCError<UrsulaRaftTypeConfig>, Option<PeerRefusal>) {
         observe_outbound_status(route, &status);
-        let refusing_node = crate::target::refusing_node(&status);
+        let refusing_node = crate::target::refusing_node(&status, self.target);
         // A peer of another cluster refuses every RPC until an operator fixes
         // a configuration: to OpenRaft it is unreachable, so replication backs
         // off instead of retrying at once.
@@ -3359,7 +3359,7 @@ mod reconnect_tests {
                 .expect_err("node 1 is not node 2"),
         );
         assert_eq!(status.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(crate::target::refusing_node(&status), Some(1));
+        assert_eq!(crate::target::refusing_node(&status, 2), Some(1));
         assert!(!crate::format_epoch::is_protocol_mismatch(&status));
         server.abort();
     }

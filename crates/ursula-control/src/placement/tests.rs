@@ -10,6 +10,7 @@ use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::ReplicaRole;
+use ursula_proto::placement::RootSlot;
 use ursula_shard::RaftGroupId;
 
 use super::BlockReason;
@@ -46,6 +47,8 @@ use super::samples::meta;
 use super::samples::node;
 use super::samples::node_set;
 use super::samples::params;
+use super::samples::register;
+use super::samples::root;
 use super::samples::sample_commands;
 use super::samples::sample_errors;
 use super::samples::sample_genesis_claim;
@@ -62,12 +65,7 @@ const G1: RaftGroupId = RaftGroupId(1);
 fn forming(nodes: &[u64]) -> Driver {
     let mut driver = Driver::new();
     for id in nodes {
-        driver
-            .apply(ControlCommand::RegisterNode {
-                node: node(*id),
-                now_ms: 1,
-            })
-            .unwrap();
+        driver.apply(register(*id, 1)).unwrap();
     }
     driver
 }
@@ -115,10 +113,7 @@ fn formation_cut_refuses_everything_after_a_plans_history_event() {
         now_ms: 3,
     });
     assert!(matches!(error, ControlError::FormationCut));
-    let error = driver.refused(ControlCommand::RegisterNode {
-        node: node(4),
-        now_ms: 3,
-    });
+    let error = driver.refused(register(4, 3));
     assert!(matches!(error, ControlError::FormationCut));
     assert_eq!(
         driver.history(HistoryCause::Genesis),
@@ -206,10 +201,7 @@ fn node_removed_refuses_a_removed_nodes_registration_and_placement() {
             lifecycle: NodeLifecycle::Removed
         })
     );
-    let error = driver.refused(ControlCommand::RegisterNode {
-        node: node(4),
-        now_ms: 5,
-    });
+    let error = driver.refused(register(4, 5));
     assert!(matches!(error, ControlError::NodeRemoved { node: n } if n == node(4)));
     let expected = driver.since(G0);
     let error = driver.refused(ControlCommand::RequestMove {
@@ -474,6 +466,163 @@ fn decommissioning_refuses_cordoning_a_decommissioning_node() {
     assert!(matches!(error, ControlError::Decommissioning { node: n } if n == node(4)));
 }
 
+/// Node `id`'s slot and `since_ms`: its registration's before Bootstrap,
+/// its record's after.
+fn slot_of(driver: &Driver, id: u64) -> (RootSlot, u64) {
+    match &driver.state {
+        ControlPlaneState::Forming { registered } => {
+            let registration = registered[&node(id)];
+            (registration.root, registration.since_ms)
+        }
+        ControlPlaneState::Bootstrapped(cluster) => {
+            let record = cluster.node(node(id)).unwrap();
+            (record.root, record.since_ms)
+        }
+        ControlPlaneState::FormationCut => panic!("no slots after a formation cut"),
+    }
+}
+
+fn register_root(id: u64, root_id: u64, empty: bool) -> ControlCommand {
+    ControlCommand::RegisterNode {
+        node: node(id),
+        root: root(root_id),
+        empty,
+        now_ms: 70,
+    }
+}
+
+fn release(id: u64, root_id: u64) -> ControlCommand {
+    ControlCommand::ReleaseRoot {
+        node: node(id),
+        root: root(root_id),
+    }
+}
+
+/// The slot table of 2.3 before Bootstrap and after, node 1 being a meta
+/// voter: K17 (a slot changes only as the table says), K18 (a root that
+/// holds state never takes a released slot) and K19 (the root a released
+/// slot names never binds again).
+#[test]
+fn other_root_refuses_a_root_its_slot_does_not_take() {
+    for bootstrapped in [false, true] {
+        let mut driver = forming(&[1, 2, 3]);
+        if bootstrapped {
+            bootstrap(&mut driver, &[1, 2, 3], 3).unwrap();
+        }
+        let (bound, since_ms) = slot_of(&driver, 1);
+        assert_eq!(bound, RootSlot::Bound(root(1)));
+        // Its own root again changes nothing.
+        driver.apply(register(1, 71)).unwrap();
+        assert_eq!(slot_of(&driver, 1), (bound, since_ms));
+        // Another root, empty or not, while the slot is bound.
+        for empty in [false, true] {
+            let error = driver.refused(register_root(1, 11, empty));
+            assert!(
+                matches!(error, ControlError::OtherRoot { node: n, slot } if n == node(1) && slot == bound),
+                "{error:?}"
+            );
+            assert_eq!(error.requeue(), super::Requeue::Retry);
+        }
+        driver.apply(release(1, 1)).unwrap();
+        let released = RootSlot::Released(root(1));
+        assert_eq!(slot_of(&driver, 1), (released, since_ms));
+        // K19: the root the released slot names never binds again, empty or not.
+        for empty in [false, true] {
+            let error = driver.refused(register_root(1, 1, empty));
+            assert!(
+                matches!(error, ControlError::OtherRoot { slot, .. } if slot == released),
+                "{error:?}"
+            );
+        }
+        // K18: a root that holds state never takes the released slot.
+        let error = driver.refused(register_root(1, 11, false));
+        assert!(
+            matches!(error, ControlError::OtherRoot { slot, .. } if slot == released),
+            "{error:?}"
+        );
+        // An empty root takes it, and the slot change dates nothing.
+        let registered = driver.apply(register_root(1, 11, true)).unwrap();
+        assert!(matches!(registered, ControlApplied::NodeRegistered(_)));
+        assert_eq!(slot_of(&driver, 1), (RootSlot::Bound(root(11)), since_ms));
+        // Once bound, the new root's later starts register as it holds
+        // state, and the old root stays refused.
+        driver.apply(register_root(1, 11, false)).unwrap();
+        let error = driver.refused(register_root(1, 1, true));
+        assert!(
+            matches!(error, ControlError::OtherRoot { slot, .. } if slot == RootSlot::Bound(root(11))),
+            "{error:?}"
+        );
+        // No other node's slot moved.
+        assert_eq!(slot_of(&driver, 2).0, RootSlot::Bound(root(2)));
+    }
+    // A removed node is refused as removed whatever its slot.
+    let mut driver = Driver::live(&[1, 2, 3, 4], 1, 3);
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    let error = driver.refused(register_root(4, 41, true));
+    assert!(matches!(error, ControlError::NodeRemoved { node: n } if n == node(4)));
+}
+
+#[test]
+fn stale_root_refuses_a_release_of_another_root() {
+    for bootstrapped in [false, true] {
+        let mut driver = forming(&[1, 2, 3]);
+        if bootstrapped {
+            bootstrap(&mut driver, &[1, 2, 3], 3).unwrap();
+        }
+        let (_, since_ms) = slot_of(&driver, 2);
+        let error = driver.refused(release(2, 12));
+        assert!(
+            matches!(error, ControlError::StaleRoot { node: n, slot } if n == node(2) && slot == RootSlot::Bound(root(2))),
+            "{error:?}"
+        );
+        assert_eq!(error.requeue(), super::Requeue::ConfirmView);
+        // The release answers the record, and a repeat changes nothing.
+        let record = NodeRecord {
+            lifecycle: NodeLifecycle::Active,
+            since_ms,
+            root: RootSlot::Released(root(2)),
+        };
+        assert_eq!(
+            driver.apply(release(2, 2)),
+            Ok(ControlApplied::RootReleased(record))
+        );
+        let before = driver.state.clone();
+        assert_eq!(
+            driver.apply(release(2, 2)),
+            Ok(ControlApplied::RootReleased(record))
+        );
+        assert_eq!(driver.state, before);
+        let error = driver.refused(release(2, 12));
+        assert!(
+            matches!(error, ControlError::StaleRoot { slot, .. } if slot == RootSlot::Released(root(2))),
+            "{error:?}"
+        );
+        let error = driver.refused(release(9, 9));
+        assert!(matches!(error, ControlError::UnknownNode { node: n } if n == node(9)));
+    }
+    // Bootstrap copies each registration's slot.
+    let mut driver = forming(&[1, 2, 3]);
+    driver.apply(release(3, 3)).unwrap();
+    bootstrap(&mut driver, &[1, 2, 3], 3).unwrap();
+    assert_eq!(slot_of(&driver, 3).0, RootSlot::Released(root(3)));
+    assert_eq!(slot_of(&driver, 1).0, RootSlot::Bound(root(1)));
+    // A release keeps the lifecycle, and a removed node's is refused.
+    // Group 0 is seeded on {1, 2, 3}: node 4 has no role.
+    let mut driver = Driver::live(&[1, 2, 3, 4], 1, 3);
+    driver.lifecycle(4, LifecycleChange::Cordon).unwrap();
+    assert!(matches!(
+        driver.apply(release(4, 4)),
+        Ok(ControlApplied::RootReleased(NodeRecord {
+            lifecycle: NodeLifecycle::Cordoned,
+            ..
+        }))
+    ));
+    driver.lifecycle(4, LifecycleChange::Decommission).unwrap();
+    assert_eq!(slot_of(&driver, 4).0, RootSlot::Released(root(4)));
+    let error = driver.refused(release(4, 4));
+    assert!(matches!(error, ControlError::NodeRemoved { node: n } if n == node(4)));
+}
+
 #[test]
 fn every_error_variant_has_a_unit_test_named_after_it() {
     // One name per variant, in a match that fails to compile when a variant
@@ -500,6 +649,8 @@ fn every_error_variant_has_a_unit_test_named_after_it() {
             ControlError::NotTarget { .. } => "not_target",
             ControlError::MetaVoter { .. } => "meta_voter",
             ControlError::Decommissioning { .. } => "decommissioning",
+            ControlError::OtherRoot { .. } => "other_root",
+            ControlError::StaleRoot { .. } => "stale_root",
         })
         .collect();
     let source = include_str!("tests.rs");
@@ -515,10 +666,7 @@ fn every_error_variant_has_a_unit_test_named_after_it() {
 fn bootstrap_seeds_every_group_and_activates_every_registered_node() {
     let mut driver = forming(&[1, 2, 3, 4]);
     assert_eq!(
-        driver.apply(ControlCommand::RegisterNode {
-            node: node(2),
-            now_ms: 9
-        }),
+        driver.apply(register(2, 9)),
         Ok(ControlApplied::NodeRegistered(Registered::Forming))
     );
     bootstrap(&mut driver, &[1, 2, 3, 4], 3).unwrap();
@@ -639,6 +787,7 @@ fn a_decommissioning_node_is_removed_by_the_converge_that_takes_its_last_role() 
         Some(&NodeRecord {
             lifecycle: NodeLifecycle::Removed,
             since_ms: 35,
+            root: RootSlot::Bound(root(4)),
         })
     );
     assert_eq!(
@@ -646,6 +795,7 @@ fn a_decommissioning_node_is_removed_by_the_converge_that_takes_its_last_role() 
         Some(&NodeRecord {
             lifecycle: NodeLifecycle::Removed,
             since_ms: 40,
+            root: RootSlot::Bound(root(5)),
         })
     );
     assert!(driver.cluster().retirements().is_empty());
@@ -661,12 +811,7 @@ fn a_decommissioning_node_is_removed_by_the_converge_that_takes_its_last_role() 
 #[test]
 fn a_registration_answers_whether_the_node_has_a_role() {
     let mut driver = Driver::live(&[1, 2, 3, 4], 1, 3);
-    let answer = |driver: &mut Driver, id| {
-        driver.apply(ControlCommand::RegisterNode {
-            node: node(id),
-            now_ms: 8,
-        })
-    };
+    let answer = |driver: &mut Driver, id| driver.apply(register(id, 8));
     assert!(matches!(
         answer(&mut driver, 1),
         Ok(ControlApplied::NodeRegistered(Registered::Referenced(_)))
@@ -731,18 +876,12 @@ fn a_known_node_registering_again_keeps_its_cordon_or_decommission() {
     let before = driver.state.clone();
     // Nodes register at every start, which must not undo either change.
     assert!(matches!(
-        driver.apply(ControlCommand::RegisterNode {
-            node: node(4),
-            now_ms: 50,
-        }),
+        driver.apply(register(4, 50)),
         Ok(ControlApplied::NodeRegistered(Registered::Referenced(record)))
             if record.lifecycle == NodeLifecycle::Decommissioning
     ));
     assert!(matches!(
-        driver.apply(ControlCommand::RegisterNode {
-            node: node(5),
-            now_ms: 50,
-        }),
+        driver.apply(register(5, 50)),
         Ok(ControlApplied::NodeRegistered(Registered::Unreferenced(record)))
             if record.lifecycle == NodeLifecycle::Cordoned
     ));
@@ -924,6 +1063,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
     let record = NodeRecord {
         lifecycle: NodeLifecycle::Cordoned,
         since_ms: 81,
+        root: RootSlot::Bound(super::samples::wide_root(0x81)),
     };
     let metas = [
         MetaReplicaStatus::Running {

@@ -12,8 +12,8 @@ use reqwest::Client;
 use reqwest::Method;
 use reqwest::RequestBuilder;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
-use ursula_proto::admin::ProcessIncarnation;
 pub use ursula_proto::admin::TransferLeaderResponse;
+use ursula_proto::placement::ProcessIncarnation;
 
 use crate::provider::NodeInfo;
 
@@ -60,7 +60,7 @@ impl MetricsClient {
                 );
             }
         } else {
-            pins.insert(node.id, observed.clone());
+            pins.insert(node.id, *observed);
         }
         Ok(())
     }
@@ -76,7 +76,7 @@ impl MetricsClient {
             self.pin_incarnation(node, &incarnation)?;
             return Ok(incarnation);
         }
-        Ok(self.fetch_node(node).await?.process_incarnation.clone())
+        Ok(self.fetch_node(node).await?.process_incarnation)
     }
 
     pub(crate) async fn admin_request(
@@ -89,7 +89,7 @@ impl MetricsClient {
         Ok(self
             .client
             .request(method, url)
-            .header(PROCESS_INCARNATION_HEADER, incarnation.as_str()))
+            .header(PROCESS_INCARNATION_HEADER, incarnation.to_string()))
     }
 
     pub async fn serving_readiness(
@@ -492,6 +492,16 @@ impl ClusterSnapshot {
     }
 }
 
+/// The incarnation of run `run` of one sample root.
+#[cfg(test)]
+pub(crate) fn test_incarnation(run: u32) -> ProcessIncarnation {
+    ProcessIncarnation {
+        root: ursula_proto::placement::RootId::new(std::num::NonZeroU64::MIN),
+        run,
+        nonce: 0,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn test_metrics(
     id: u64,
@@ -590,7 +600,7 @@ pub(crate) fn test_view(node: NodeInfo, groups: Vec<RaftGroupView>) -> NodeMetri
     let process_node_id = Some(node.id);
     NodeMetricsView::new(node, ursula_proto::admin::NodeMetrics {
         cluster_id: ursula_headers::ClusterId::new("test").unwrap(),
-        process_incarnation: ProcessIncarnation::from_bits(1),
+        process_incarnation: crate::metrics::test_incarnation(1),
         process_node_id,
         groups,
         meta: None,
@@ -630,11 +640,11 @@ mod tests {
             .route(
                 "/__ursula/metrics",
                 axum::routing::get(move || {
-                    let identity = metrics_identity.lock().unwrap().clone();
+                    let identity = *metrics_identity.lock().unwrap();
                     async move {
                         let mut body = serde_json::to_value(test_metrics(
                             id,
-                            Some(ProcessIncarnation::from_bits(1)),
+                            Some(crate::metrics::test_incarnation(1)),
                         ))
                         .unwrap();
                         body["process_incarnation"] = serde_json::to_value(identity).unwrap();
@@ -645,14 +655,14 @@ mod tests {
             .route(
                 "/__ursula/leadership-shed/maintenance",
                 post(move |headers: axum::http::HeaderMap| {
-                    let identity = mutation_identity.lock().unwrap().clone();
+                    let identity = *mutation_identity.lock().unwrap();
                     let count = mutation_count.clone();
                     async move {
                         if let Some(identity) = identity {
                             let Some(observed) = headers.get(PROCESS_INCARNATION_HEADER) else {
                                 return StatusCode::PRECONDITION_REQUIRED;
                             };
-                            if observed.to_str().ok() != Some(identity.as_str()) {
+                            if observed.to_str().ok() != Some(identity.to_string().as_str()) {
                                 return StatusCode::PRECONDITION_FAILED;
                             }
                         }
@@ -681,7 +691,7 @@ mod tests {
     async fn metrics_client_rejects_missing_safety_fields_and_unknown_versions() {
         for missing in [Some("raft_maintenance"), None] {
             let mut wire =
-                serde_json::to_value(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
+                serde_json::to_value(test_metrics(1, Some(crate::metrics::test_incarnation(1))))
                     .unwrap();
             if let Some(field) = missing {
                 wire.as_object_mut().unwrap().remove(field);
@@ -727,15 +737,10 @@ mod tests {
     #[tokio::test]
     async fn cached_incarnation_rejects_rebound_endpoint_and_cannot_be_refreshed() {
         let (node, identity, applied, task) =
-            incarnation_node(1, Some(ProcessIncarnation::from_bits(1))).await;
+            incarnation_node(1, Some(crate::metrics::test_incarnation(1))).await;
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
-        let pinned = client
-            .fetch_node(&node)
-            .await
-            .unwrap()
-            .process_incarnation
-            .clone();
-        *identity.lock().unwrap() = Some(ProcessIncarnation::from_bits(2));
+        let pinned = client.fetch_node(&node).await.unwrap().process_incarnation;
+        *identity.lock().unwrap() = Some(crate::metrics::test_incarnation(2));
         let error = client
             .clone()
             .set_maintenance_drain(&node, true)
@@ -751,14 +756,14 @@ mod tests {
                 .to_string()
                 .contains("changed during")
         );
-        assert_eq!(pinned, ProcessIncarnation::from_bits(1));
+        assert_eq!(pinned, crate::metrics::test_incarnation(1));
         task.abort();
     }
 
     #[tokio::test]
     async fn identity_checks_apply_even_before_raft_groups_are_registered() {
         let (mut node, _, applied, task) =
-            incarnation_node(1, Some(ProcessIncarnation::from_bits(1))).await;
+            incarnation_node(1, Some(crate::metrics::test_incarnation(1))).await;
         node.id = 2;
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
         let error = client.set_maintenance_drain(&node, true).await.unwrap_err();
@@ -811,7 +816,7 @@ mod tests {
                 axum::routing::get(|| async {
                     axum::Json(crate::metrics::test_metrics(
                         1,
-                        Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                        Some(crate::metrics::test_incarnation(1)),
                     ))
                 }),
             )
@@ -822,7 +827,7 @@ mod tests {
                      axum::Json(body): axum::Json<serde_json::Value>| async move {
                         assert_eq!(
                             headers[PROCESS_INCARNATION_HEADER],
-                            "00000000000000000000000000000001"
+                            "00000000000000010000000100000000"
                         );
                         assert_eq!(body["current_term"], 7);
                         StatusCode::PRECONDITION_FAILED
@@ -865,7 +870,7 @@ mod tests {
                         observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         axum::Json(crate::metrics::test_metrics(
                             1,
-                            Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                            Some(crate::metrics::test_incarnation(1)),
                         ))
                     }
                 }),
@@ -875,7 +880,7 @@ mod tests {
                 axum::routing::get(|headers: axum::http::HeaderMap| async move {
                     assert_eq!(
                         headers[PROCESS_INCARNATION_HEADER],
-                        "00000000000000000000000000000001"
+                        "00000000000000010000000100000000"
                     );
                     axum::Json(ursula_proto::admin::QuorumPrefix {
                         raft_group_id: 0,
@@ -921,7 +926,7 @@ mod tests {
                     axum::routing::get(|| async {
                         axum::Json(crate::metrics::test_metrics(
                             1,
-                            Some(ursula_proto::admin::ProcessIncarnation::from_bits(1)),
+                            Some(crate::metrics::test_incarnation(1)),
                         ))
                     }),
                 )
@@ -971,7 +976,7 @@ mod tests {
         let app = Router::new().route(
             "/__ursula/metrics",
             axum::routing::get(|| async {
-                axum::Json(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
+                axum::Json(test_metrics(1, Some(crate::metrics::test_incarnation(1))))
             }),
         );
         let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -995,7 +1000,7 @@ mod tests {
     async fn metrics_refuse_each_misdirected_identity_before_pinning() {
         for identity in 0..3 {
             let mut wire =
-                serde_json::to_value(test_metrics(1, Some(ProcessIncarnation::from_bits(1))))
+                serde_json::to_value(test_metrics(1, Some(crate::metrics::test_incarnation(1))))
                     .unwrap();
             match identity {
                 0 => wire["process_node_id"] = serde_json::json!(2),

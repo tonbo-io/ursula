@@ -1,12 +1,15 @@
 //! This node's registration with the meta group (design 3.6).
 //!
 //! A node registers itself at every start, and again after
-//! [`REREGISTER_AFTER`] without a meta leader. It retries a refusal that
-//! may pass later and every failure to reach the leader with a capped
+//! [`REREGISTER_AFTER`] without a meta leader, naming the root it runs on
+//! and whether that root was empty when it opened. It retries a refusal
+//! that may pass later and every failure to reach the leader with a capped
 //! back-off, and stops at a permanent refusal
-//! (`ursula_control::ControlError::requeue`). `NodeRemoved` makes the node
-//! treat itself as removed until it restarts. Each answer is published as
-//! the node's [`RegistrationStatus`], which status reports read.
+//! (`ursula_control::ControlError::requeue`). `OtherRoot` is retried: an
+//! empty root registers until an operator releases the slot. `NodeRemoved`
+//! makes the node treat itself as removed until it restarts. Each answer is
+//! published as the node's [`RegistrationStatus`], which status reports
+//! read.
 
 use std::sync::Arc;
 use std::sync::Weak;
@@ -19,6 +22,7 @@ use ursula_control::ControlError;
 use ursula_control::RegistrationStatus;
 use ursula_control::Requeue;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::RootId;
 
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
@@ -42,22 +46,34 @@ pub(crate) fn back_off(pause: Duration) -> Duration {
     pause.saturating_mul(2).min(RETRY_MAX)
 }
 
-/// Registers node `me` until the meta group answers for good, publishing
-/// each answer on `status`. Ends at a permanent refusal, or once `stopped`
-/// is true.
+/// What this node registers: its id, the root it runs on, and whether the
+/// root held no journal record, vote or snapshot record when it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Registrant {
+    pub(crate) node: NodeId,
+    pub(crate) root: RootId,
+    pub(crate) empty: bool,
+}
+
+/// Registers `registrant` until the meta group answers for good,
+/// publishing each answer on `status`. Ends at a permanent refusal, or once
+/// `stopped` is true.
 pub(crate) async fn run_registration<T: RecoveryTransport>(
     handle: MetaHandle<T>,
-    me: NodeId,
+    registrant: Registrant,
     registry: RaftGroupHandleRegistry,
     status: watch::Sender<RegistrationStatus>,
     pauses: MetaPauses,
     stopped: impl Fn() -> bool,
 ) {
+    let me = registrant.node;
     let mut pause = RETRY_MIN;
     while !stopped() {
         pauses.at(MetaPausePoint::Registration).await;
         let command = ControlCommand::RegisterNode {
             node: me,
+            root: registrant.root,
+            empty: registrant.empty,
             now_ms: ursula_runtime::unix_time_ms(),
         };
         match handle.submit(command).await {
@@ -78,6 +94,15 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
                 tracing::warn!(node = %me, "meta registration: this node is removed");
                 status.send_replace(RegistrationStatus::Removed);
                 return;
+            }
+            Err(MetaWriteError::Refused(refusal @ ControlError::OtherRoot { .. })) => {
+                tracing::warn!(
+                    node = %me,
+                    root = %registrant.root,
+                    %refusal,
+                    "meta registration: this node id is bound to another root; retrying until \
+                     an operator releases it"
+                );
             }
             Err(MetaWriteError::Refused(refusal)) if refusal.requeue() == Requeue::Permanent => {
                 tracing::error!(%refusal, "meta registration: refused for good");

@@ -1,5 +1,5 @@
 //! Small state files the WAL replaces whole: each core's metadata file and
-//! the node's run-state and topology files.
+//! the node's run-state, topology and identity files.
 //!
 //! A state file is written to a temporary file next to it, `fsync`ed, renamed
 //! over the old file and published with an `fsync` of its directory, all
@@ -46,6 +46,8 @@ pub enum StateFileKind {
     RunState,
     /// The immutable routing configuration of this WAL root.
     Topology,
+    /// The run counter of this WAL root.
+    Identity,
 }
 
 impl StateFileKind {
@@ -54,6 +56,7 @@ impl StateFileKind {
             Self::CoreMetadata => *b"URSWMETA",
             Self::RunState => *b"URSWRUN\0",
             Self::Topology => *b"URSWTOPO",
+            Self::Identity => *b"URSWIDNT",
         }
     }
 }

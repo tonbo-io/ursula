@@ -67,20 +67,28 @@ fn classify(error: &RaftWalError) -> WalOpenFailureKind {
         | RaftWalError::MaintainMetaJournal { source } => core_failure(source),
         RaftWalError::TopologyMismatch { .. }
         | RaftWalError::MissingTopology { .. }
-        | RaftWalError::ClusterIdMismatch { .. } => WalOpenFailureKind::InvalidConfiguration,
+        | RaftWalError::ClusterIdMismatch { .. }
+        | RaftWalError::OtherNode { .. }
+        | RaftWalError::MissingIdentity { .. } => WalOpenFailureKind::InvalidConfiguration,
         RaftWalError::InvalidStoredClusterId { .. } => WalOpenFailureKind::Corrupt,
         RaftWalError::ReadTopology(source)
         | RaftWalError::ReadRunState(source)
+        | RaftWalError::ReadIdentity(source)
         | RaftWalError::ReadCoreMetadata(source) => state_failure(source),
-        // Only corrupt or forged core metadata can hold the last epoch.
-        RaftWalError::RecoveryEpochExhausted { .. } => WalOpenFailureKind::Corrupt,
+        // Only corrupt or forged core metadata can hold the last epoch, and
+        // only a forged identity file the last run.
+        RaftWalError::RecoveryEpochExhausted { .. } | RaftWalError::RunCounterExhausted { .. } => {
+            WalOpenFailureKind::Corrupt
+        }
         RaftWalError::RecordTopology(source)
         | RaftWalError::RecordRunState(source)
+        | RaftWalError::RecordIdentity(source)
         | RaftWalError::ReadJournal { source, .. }
         | RaftWalError::SyncJournal { source, .. } => journal_failure(source),
         RaftWalError::CreateDir { .. }
         | RaftWalError::Lock { .. }
-        | RaftWalError::ListCores { .. } => WalOpenFailureKind::Io,
+        | RaftWalError::ListCores { .. }
+        | RaftWalError::Device { .. } => WalOpenFailureKind::Io,
         RaftWalError::Locked { .. } | RaftWalError::CoreWriterStopping { .. } => {
             WalOpenFailureKind::Locked
         }

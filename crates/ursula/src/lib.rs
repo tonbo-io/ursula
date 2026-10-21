@@ -129,7 +129,7 @@ use ursula_headers::value::Epoch;
 use ursula_headers::value::Incarnation;
 use ursula_proto::ContentFaultV1;
 use ursula_proto::admin::PROCESS_INCARNATION_HEADER;
-use ursula_proto::admin::ProcessIncarnation;
+use ursula_proto::placement::ProcessIncarnation;
 use ursula_raft::IncomingTransferError;
 use ursula_raft::LeadershipShedReason;
 use ursula_raft::OwnerRaftHandle;
@@ -363,7 +363,7 @@ mod http_state_fields {
     use std::sync::Arc;
 
     use ursula_headers::ClusterId;
-    use ursula_proto::admin::ProcessIncarnation;
+    use ursula_proto::placement::ProcessIncarnation;
     use ursula_raft::RaftGroupHandleRegistry;
     use ursula_runtime::ShardRuntime;
 
@@ -574,11 +574,6 @@ impl HttpState {
         }
     }
 
-    pub(crate) fn with_process_incarnation(mut self, boot: ProcessIncarnation) -> Self {
-        self.fields_mut().process_incarnation = boot;
-        self
-    }
-
     pub(crate) fn with_configured_node_id(mut self, node_id: u64) -> Self {
         self.fields_mut().configured_node_id = Some(node_id);
         self
@@ -587,7 +582,7 @@ impl HttpState {
     pub fn new(runtime: ShardRuntime) -> Self {
         let staged_parts = staged_parts::StagedParts::observing(&runtime, None);
         HttpStateFields {
-            process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
             runtime,
             raft_registry: None,
@@ -614,7 +609,7 @@ impl HttpState {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
         HttpStateFields {
-            process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
@@ -665,7 +660,7 @@ impl HttpState {
                 peers,
                 per_group_voters,
             )),
-            process_incarnation: ProcessIncarnation::from_bits(rand::random()),
+            process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
@@ -704,10 +699,13 @@ impl HttpState {
     }
 
     /// Records the node's Raft WAL: the metrics JSON reports how it opened,
-    /// the server shuts it down cleanly, and its root holds the cluster id.
+    /// the server shuts it down cleanly, its root holds the cluster id, and
+    /// the run it counted names this process
+    /// ([`ursula_raft::RaftWal::incarnation`]) to the admin precondition.
     pub fn with_raft_wal(mut self, raft_wal: Option<ursula_raft::RaftWal>) -> Self {
         if let Some(wal) = &raft_wal {
             self.fields_mut().cluster_id = Arc::new(wal.cluster_id().clone());
+            self.fields_mut().process_incarnation = wal.incarnation();
         }
         self.fields_mut().raft_wal = raft_wal;
         self
@@ -1350,7 +1348,7 @@ fn reject_admin_incarnation(
                 .into_response(),
         );
     };
-    if identity.to_str().ok() != Some(state.process_incarnation.as_str()) {
+    if identity.to_str().ok() != Some(state.process_incarnation.to_string().as_str()) {
         return Some(
             (
                 StatusCode::PRECONDITION_FAILED,
@@ -2071,6 +2069,8 @@ struct WalRecoveryReport {
     opening: ursula_raft::WalOpening,
     /// How the meta journal opened, by its own run-state class.
     meta: MetaWalRecoveryReport,
+    /// Whether a process of an earlier run of the root may still run.
+    predecessor: ursula_raft::wal::diagnostics::Predecessor,
 }
 
 /// How the meta journal opened, and why it could not be read, if it could
@@ -2097,7 +2097,18 @@ impl WalRecoveryReport {
                     }
                 },
             },
+            predecessor: raft_wal.predecessor(),
         }
+    }
+}
+
+/// The incarnation of a process without a WAL: a root drawn for this
+/// start, run 0. It serves the admin precondition only.
+fn unpersisted_incarnation() -> ProcessIncarnation {
+    ProcessIncarnation {
+        root: ursula_proto::placement::RootId::new(rand::random()),
+        run: 0,
+        nonce: rand::random(),
     }
 }
 
@@ -2110,7 +2121,7 @@ pub(crate) async fn metrics(State(state): State<HttpState>) -> Response {
     axum::Json(render::MetricsResponse {
         node: ursula_proto::admin::NodeMetrics {
             cluster_id: state.cluster_id().clone(),
-            process_incarnation: state.process_incarnation.clone(),
+            process_incarnation: state.process_incarnation,
             process_node_id: state
                 .node_id()
                 .or_else(|| raft_groups.first().map(|group| group.node_id)),

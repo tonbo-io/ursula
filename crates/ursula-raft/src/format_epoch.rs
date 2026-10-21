@@ -196,7 +196,7 @@ pub(crate) async fn probe_peer_with_protocol(
     )
     .vote(request)
     .await;
-    classify_probe_answer(result.map(|_| ()))
+    classify_probe_answer(peer_id, result.map(|_| ()))
 }
 
 /// NOT_FOUND is a peer on this protocol; FAILED_PRECONDITION with the
@@ -204,7 +204,10 @@ pub(crate) async fn probe_peer_with_protocol(
 /// FAILED_PRECONDITION naming a cluster id is a peer of another cluster,
 /// and naming a node an address that serves another node, unreachable for
 /// the peer probed; anything else is treated as unreachable.
-pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFormatEpoch {
+pub(crate) fn classify_probe_answer(
+    peer_id: u64,
+    result: Result<(), tonic::Status>,
+) -> PeerFormatEpoch {
     let status = match result {
         Err(status) => status,
         // No node registers the probe group; a success is not a known answer.
@@ -221,7 +224,7 @@ pub(crate) fn classify_probe_answer(result: Result<(), tonic::Status>) -> PeerFo
     if let Some(cluster_id) = refusing_cluster(&status) {
         return PeerFormatEpoch::OtherCluster(cluster_id);
     }
-    if let Some(node) = crate::target::refusing_node(&status) {
+    if let Some(node) = crate::target::refusing_node(&status, peer_id) {
         return PeerFormatEpoch::Unreachable(format!("the address serves node {node}"));
     }
     PeerFormatEpoch::Unreachable(status.to_string())
@@ -306,7 +309,7 @@ mod tests {
              only a cluster of its own format epoch)",
         );
         assert!(matches!(
-            classify_probe_answer(Err(from_0_9)),
+            classify_probe_answer(2, Err(from_0_9)),
             PeerFormatEpoch::Refused(_)
         ));
     }
@@ -330,14 +333,14 @@ mod tests {
         );
         for status in [naming_a_node, naming_a_cluster] {
             assert!(is_protocol_mismatch(&status), "{status:?}");
-            assert_eq!(crate::target::refusing_node(&status), None);
+            assert_eq!(crate::target::refusing_node(&status, 2), None);
             assert_eq!(refusing_cluster(&status), None);
             assert_eq!(
                 crate::grpc::stream_item_error(&status).refusing_node,
                 0,
                 "{status:?}"
             );
-            match classify_probe_answer(Err(status)) {
+            match classify_probe_answer(2, Err(status)) {
                 PeerFormatEpoch::Refused(refused) => assert_eq!(refused, message),
                 other => panic!("expected a refusal, got {other:?}"),
             }

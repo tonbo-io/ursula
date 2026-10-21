@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::num::NonZeroU32;
+use std::num::NonZeroU64;
 
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::GroupCount;
@@ -23,6 +24,8 @@ use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::RaftLogId;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::ReplicationFactor;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
@@ -66,6 +69,27 @@ macro_rules! every {
 
 pub fn node(id: u64) -> NodeId {
     NodeId::new(id)
+}
+
+/// The root `id`, which must not be zero.
+pub fn root(id: u64) -> RootId {
+    RootId::new(NonZeroU64::new(id).expect("a sample root is not zero"))
+}
+
+/// A root above 2^53 whose last digits are `n`: a JSON number would round
+/// it, so the samples show that every encoding keeps it whole.
+pub fn wide_root(n: u64) -> RootId {
+    root(0x9e37_79b9_7f4a_7c00_u64.wrapping_add(n))
+}
+
+/// Node `id` registering on its own root, `root(id)`, which holds state.
+pub fn register(id: u64, now_ms: u64) -> ControlCommand {
+    ControlCommand::RegisterNode {
+        node: node(id),
+        root: root(id),
+        empty: false,
+        now_ms,
+    }
 }
 
 /// The voter set of `ids`, which must not be empty.
@@ -157,12 +181,7 @@ impl Driver {
     pub(crate) fn bootstrapped(nodes: &[u64], params: ClusterParams) -> Self {
         let mut driver = Self::new();
         for id in nodes {
-            driver
-                .apply(ControlCommand::RegisterNode {
-                    node: node(*id),
-                    now_ms: 10,
-                })
-                .unwrap();
+            driver.apply(register(*id, 10)).unwrap();
         }
         driver
             .apply(ControlCommand::Bootstrap {
@@ -300,22 +319,27 @@ pub fn sample_state() -> ControlPlaneState {
             (node(1), NodeRecord {
                 lifecycle: NodeLifecycle::Active,
                 since_ms: 11,
+                root: RootSlot::Bound(wide_root(0x11)),
             }),
             (node(2), NodeRecord {
                 lifecycle: NodeLifecycle::Cordoned,
                 since_ms: 12,
+                root: RootSlot::Released(wide_root(0x12)),
             }),
             (node(3), NodeRecord {
                 lifecycle: NodeLifecycle::Decommissioning,
                 since_ms: 13,
+                root: RootSlot::Bound(wide_root(0x13)),
             }),
             (node(4), NodeRecord {
                 lifecycle: NodeLifecycle::Removed,
                 since_ms: 14,
+                root: RootSlot::Released(wide_root(0x14)),
             }),
             (node(5), NodeRecord {
                 lifecycle: NodeLifecycle::Active,
                 since_ms: 15,
+                root: RootSlot::Bound(wide_root(0x15)),
             }),
         ]),
         groups: Placements(groups),
@@ -333,7 +357,10 @@ pub fn sample_state() -> ControlPlaneState {
 pub fn sample_states() -> Vec<ControlPlaneState> {
     every!(ControlPlaneState {
         ControlPlaneState::Forming { .. } => ControlPlaneState::Forming {
-            registered: BTreeMap::from([(node(7), Registration { since_ms: 31 })]),
+            registered: BTreeMap::from([(node(7), Registration {
+                since_ms: 31,
+                root: RootSlot::Released(wide_root(0x31)),
+            })]),
         },
         ControlPlaneState::FormationCut => ControlPlaneState::FormationCut,
         ControlPlaneState::Bootstrapped(..) => sample_state(),
@@ -343,9 +370,17 @@ pub fn sample_states() -> Vec<ControlPlaneState> {
 /// One command of every variant, and one lifecycle command per change.
 pub fn sample_commands() -> Vec<ControlCommand> {
     every!(ControlCommand {
-        ControlCommand::RegisterNode { .. } => ControlCommand::RegisterNode {
+        ControlCommand::RegisterNode { empty: true, .. } => ControlCommand::RegisterNode {
             node: node(9),
+            root: wide_root(0x41),
+            empty: true,
             now_ms: 41,
+        },
+        ControlCommand::RegisterNode { empty: false, .. } => ControlCommand::RegisterNode {
+            node: node(21),
+            root: wide_root(0x59),
+            empty: false,
+            now_ms: 59,
         },
         ControlCommand::Bootstrap { .. } => ControlCommand::Bootstrap {
             params: params(&[1, 2, 3], 4, 3, 2),
@@ -397,6 +432,10 @@ pub fn sample_commands() -> Vec<ControlCommand> {
             node: node(6),
             created_at: meta(12, 49),
         },
+        ControlCommand::ReleaseRoot { .. } => ControlCommand::ReleaseRoot {
+            node: node(22),
+            root: wide_root(0x60),
+        },
     })
 }
 
@@ -411,12 +450,14 @@ pub fn sample_responses() -> Vec<ControlResponse> {
             ControlApplied::NodeRegistered(Registered::Referenced(NodeRecord {
                 lifecycle: NodeLifecycle::Cordoned,
                 since_ms: 51,
+                root: RootSlot::Bound(wide_root(0x51)),
             }))
         },
         ControlApplied::NodeRegistered(Registered::Unreferenced(_)) => {
             ControlApplied::NodeRegistered(Registered::Unreferenced(NodeRecord {
                 lifecycle: NodeLifecycle::Active,
                 since_ms: 52,
+                root: RootSlot::Released(wide_root(0x52)),
             }))
         },
         ControlApplied::Bootstrapped => ControlApplied::Bootstrapped,
@@ -436,6 +477,11 @@ pub fn sample_responses() -> Vec<ControlResponse> {
         },
         ControlApplied::TornDown => ControlApplied::TornDown,
         ControlApplied::NothingToTearDown => ControlApplied::NothingToTearDown,
+        ControlApplied::RootReleased(_) => ControlApplied::RootReleased(NodeRecord {
+            lifecycle: NodeLifecycle::Decommissioning,
+            since_ms: 61,
+            root: RootSlot::Released(wide_root(0x61)),
+        }),
     });
     applied
         .into_iter()
@@ -499,6 +545,14 @@ pub fn sample_errors() -> Vec<ControlError> {
         },
         ControlError::MetaVoter { .. } => ControlError::MetaVoter { node: node(18) },
         ControlError::Decommissioning { .. } => ControlError::Decommissioning { node: node(19) },
+        ControlError::OtherRoot { .. } => ControlError::OtherRoot {
+            node: node(26),
+            slot: RootSlot::Bound(wide_root(0x26)),
+        },
+        ControlError::StaleRoot { .. } => ControlError::StaleRoot {
+            node: node(27),
+            slot: RootSlot::Released(wide_root(0x27)),
+        },
     });
     errors.extend(
         every!(BootstrapProblem {

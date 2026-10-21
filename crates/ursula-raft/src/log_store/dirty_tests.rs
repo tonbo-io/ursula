@@ -155,6 +155,7 @@ impl Journal {
                         fsync: WalFsync::Always,
                         recovery_epoch: 0,
                     },
+                    device: 0,
                 },
             )),
             node_recovery: RecoveryState::Normal,

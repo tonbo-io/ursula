@@ -626,12 +626,9 @@ impl World {
         let nodes = NodeSet::new(ids.clone()).expect("a cluster has a node");
         let mut meta = Meta::genesis();
         for id in &ids {
-            meta.apply(ControlCommand::RegisterNode {
-                node: *id,
-                now_ms: 0,
-            })
-            .1
-            .expect("a node registers");
+            meta.apply(crate::placement::samples::register(id.get(), 0))
+                .1
+                .expect("a node registers");
         }
         let configured = ReplicationFactor::new(NonZeroU8::new(rf).expect("a replication factor"));
         let replication_factor = effective_replication_factor(configured, &nodes);
@@ -1737,7 +1734,8 @@ impl World {
             state.lagging = at != ViewAt::Latest;
             state.view = view;
         }
-        let answer = self.submit(ControlCommand::RegisterNode { node, now_ms: 0 });
+        // A restarted node keeps its disk: it registers its own root again.
+        let answer = self.submit(crate::placement::samples::register(node.get(), 0));
         if let Some(Err(ControlError::NodeRemoved { .. })) = answer
             && let Some(state) = self.nodes.get_mut(&node)
         {
@@ -1797,7 +1795,8 @@ impl World {
                 | ControlCommand::ReportConverged { .. }
                 | ControlCommand::SetNodeLifecycle { .. }
                 | ControlCommand::SetMoveLimit { .. }
-                | ControlCommand::ReportTornDown { .. } => None,
+                | ControlCommand::ReportTornDown { .. }
+                | ControlCommand::ReleaseRoot { .. } => None,
             })
             .collect();
         let Some(raft) = self.raft_mut(group) else {
