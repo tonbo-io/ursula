@@ -17,11 +17,13 @@
 //! - cuts the power of every meta voter under `always`, or of one under
 //!   `never`, and finds every acknowledged control write on every meta
 //!   replica (I10);
-//! - discards the meta journals of two meta voters, which then open
-//!   `Recovering` over their data history, and recovers meta by a plan
-//!   through `ursulactl recover-group --target meta --accept-loss`'s planner
-//!   and sender (the meta plan check), after which every node learns the
-//!   view again (I11).
+//! - discards the meta journal of one meta voter, which opens `Recovering`
+//!   over its data history (D9) and rejoins through the meta leader (I11),
+//!   then loses the run state of two meta voters, whose meta gates open
+//!   `Recovering` and stall, and recovers meta by a plan through `ursulactl
+//!   recover-group --target meta --accept-loss`'s loop, planner and sender
+//!   (the meta plan check), after which every node learns the view again
+//!   (I11).
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
 //! run that decides again how its journals open. I12 is checked after each
@@ -294,9 +296,16 @@ impl Run {
         self.step("power_loss");
     }
 
-    /// Two meta voters' meta journals discarded: they open `Recovering`
-    /// over their data history, and a meta plan recovers meta.
+    /// One meta voter's meta journal discarded: it opens `Recovering` over
+    /// its data history (D9) and rejoins through the meta leader (I11).
+    /// Then two meta voters lose their run state, so a majority of meta's
+    /// gates open `Recovering` and stall, and a meta plan recovers meta.
     async fn plan(&mut self) {
+        let [discarded, _] = self.two_voters();
+        self.cluster.discard_meta(discarded).await;
+        self.cluster.start_node(discarded).await;
+        self.step("meta_discarded");
+        self.learned("meta_discarded").await;
         let victims = self.two_voters();
         let survivor = META_VOTERS
             .into_iter()
@@ -305,12 +314,12 @@ impl Run {
         let before = meta_checks::history_of(&self.cluster, survivor)
             .expect("the surviving meta voter applied a history");
         for victim in victims {
-            self.cluster.discard_meta(victim).await;
+            self.cluster.lose_run_state(victim).await;
         }
         for victim in victims {
             self.cluster.start_node(victim).await;
         }
-        self.step("meta_discarded");
+        self.step("run_state_lost");
         let nodes = self.nodes();
         self.recover_meta(&nodes).await;
         self.step("meta_plan");

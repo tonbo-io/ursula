@@ -64,6 +64,7 @@ use ursula_raft::meta::runtime::MetaJournal;
 use ursula_raft::meta::runtime::MetaRuntime;
 use ursula_raft::meta::runtime::MetaRuntimeConfig;
 use ursula_raft::wal::diagnostics::JournalDisk;
+use ursula_raft::wal::diagnostics::RUN_STATE_FILE;
 use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::RuntimeMetrics;
 
@@ -269,6 +270,17 @@ impl MetaCluster {
         let wal = self.data.wals[&node_id].clone();
         wal.clean_shutdown(self.stop_replicas(node_id)).await;
         remove_tree(&wal.root().join("meta"));
+    }
+
+    /// Kills `node_id`'s process and removes its run state, as a host that
+    /// lost it does: how the last run ended is unknown, so its next start
+    /// opens its journals `Recovering`, the meta journal included, with the
+    /// history they hold.
+    pub(super) async fn lose_run_state(&mut self, node_id: u64) {
+        self.stop_node(node_id).await;
+        let root = self.data.wals[&node_id].root().to_owned();
+        SimDisk::remove_file(&root.join(RUN_STATE_FILE)).expect("remove the run state");
+        SimDisk::sync_dir(&root).expect("sync the node's root");
     }
 
     /// Stops `node_id` and gives it an empty disk, data and meta journals
