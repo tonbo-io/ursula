@@ -9,11 +9,16 @@
 //! `Create` (4.2).
 //!
 //! A pass reads what the journals hold ([`RaftWal::local_groups`]) first,
-//! then confirms the view when the plan asks for it, then plans. So the
+//! then confirms the view when the plan asks for it, then plans. So a new
 //! confirming barrier comes after the inputs the plan reads. The driver
 //! plans on every view change, every change of the registry's engines,
-//! every registration answer and every [`PLAN_INTERVAL`], and confirms at
-//! most once per interval. Each pass then:
+//! every registration answer, every end of one of its opens and closes and
+//! every [`PLAN_INTERVAL`], and confirms at most once per interval. Until
+//! a confirmation is one interval old, it also confirms every later view
+//! that still carries its stamp ([`ConfirmedView::new`]), with no new
+//! barrier. So the `Create` admissions of a confirmed plan hold between
+//! two confirmations, and a plan may read a confirmation up to one
+//! interval older than its inputs. Each pass then:
 //!
 //! - publishes the plan's admissions in the hosting set. For every replica
 //!   the set drops this is the first step of its close: no request reopens
@@ -21,7 +26,8 @@
 //! - opens every admitted group the node does not run, `Create` and `Open`
 //!   alike, with at most [`ACTIONS_PER_CORE`] opens and closes running per
 //!   core. No failed open stops anything: the group stays closed under its
-//!   open back-off and a later pass opens it again.
+//!   open back-off and a pass one [`PLAN_INTERVAL`] later opens it again.
+//!   A failed close is retried likewise.
 //! - closes every running replica the plan does not admit (7.3's steps 1
 //!   to 3), then forgets its gauges and its open back-off.
 //! - publishes a [`HostingStatus`] for readiness.
@@ -46,11 +52,13 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use ursula_control::Admission;
 use ursula_control::ConfirmedStamp;
+use ursula_control::ConfirmedView;
 use ursula_control::Counts;
 use ursula_control::HostingInput;
 use ursula_control::HostingPlan;
 use ursula_control::HostingStep;
 use ursula_control::LocalReplica;
+use ursula_control::PlacementView;
 use ursula_control::RegistrationStatus;
 use ursula_control::Standing;
 use ursula_control::ViewInput;
@@ -215,7 +223,8 @@ impl<H: GroupHost> HostingDriver<H> {
         loop {
             actions.reap();
             self.pass(&mut actions, &mut confirms).await;
-            let finished = crate::rt::select! {
+            let ended = crate::rt::select! {
+                biased;
                 changed = views.changed(), if views_open => {
                     views_open = changed;
                     None
@@ -228,11 +237,11 @@ impl<H: GroupHost> HostingDriver<H> {
                     answers_open = changed.is_ok();
                     None
                 }
-                group = actions.done.recv() => group,
+                ended = actions.done.recv() => ended,
                 () = crate::rt::time::sleep(PLAN_INTERVAL) => None,
             };
-            if let Some(group) = finished {
-                actions.running.remove(&group);
+            if let Some((group, end)) = ended {
+                actions.end(group, end);
             }
         }
     }
@@ -271,20 +280,29 @@ impl<H: GroupHost> HostingDriver<H> {
         };
         let view = self.registry.placement_watch().current();
         let mut plan = plan_hosting(&input(ViewInput::Unconfirmed(&view)));
-        if plan.steps.first() == Some(&HostingStep::ConfirmView) && confirms.due() {
-            confirms.at = Some(Instant::now());
-            match self.meta.confirm_view().await {
-                Ok(confirmed) => {
-                    plan = plan_hosting(&input(ViewInput::Confirmed(&confirmed)));
-                    confirms.last = Some(confirmed.stamp());
+        if plan.steps.first() == Some(&HostingStep::ConfirmView) {
+            if let Some(confirmed) = confirms.carried(&view) {
+                plan = plan_hosting(&input(ViewInput::Confirmed(&confirmed)));
+            } else if confirms.due() {
+                let started = Instant::now();
+                confirms.at = Some(started);
+                match self.meta.confirm_view().await {
+                    Ok(confirmed) => {
+                        plan = plan_hosting(&input(ViewInput::Confirmed(&confirmed)));
+                        confirms.last = Some(Confirmed {
+                            at: started,
+                            stamp: confirmed.stamp(),
+                        });
+                    }
+                    Err(error) => tracing::debug!(
+                        %error,
+                        "hosting: the view is not confirmed; planning from the unconfirmed view"
+                    ),
                 }
-                Err(error) => tracing::debug!(
-                    %error,
-                    "hosting: the view is not confirmed; planning from the unconfirmed view"
-                ),
             }
         }
-        self.act(plan, actions, confirms.last);
+        let confirmed = confirms.last.map(|last| last.stamp);
+        self.act(plan, actions, confirmed);
     }
 
     /// Publishes the plan's admissions, opens what the node does not run
@@ -326,12 +344,18 @@ impl<H: GroupHost> HostingDriver<H> {
                 let host = Arc::clone(&self.host);
                 self.begin(actions, group, async move {
                     match host.close(group).await {
-                        Ok(()) => host.forget(group),
-                        Err(error) => tracing::warn!(
-                            group = group.0,
-                            %error,
-                            "hosting: the replica the plan does not admit did not close; retrying"
-                        ),
+                        Ok(()) => {
+                            host.forget(group);
+                            ActionEnd::Done
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                group = group.0,
+                                %error,
+                                "hosting: the replica the plan does not admit did not close; retrying"
+                            );
+                            ActionEnd::Failed
+                        }
                     }
                 });
             }
@@ -342,12 +366,16 @@ impl<H: GroupHost> HostingDriver<H> {
             }
             let host = Arc::clone(&self.host);
             self.begin(actions, group, async move {
-                if let Err(error) = host.open(group).await {
-                    tracing::debug!(
-                        group = group.0,
-                        %error,
-                        "hosting: the admitted replica did not open; retrying"
-                    );
+                match host.open(group).await {
+                    Ok(()) => ActionEnd::Done,
+                    Err(error) => {
+                        tracing::debug!(
+                            group = group.0,
+                            %error,
+                            "hosting: the admitted replica did not open; retrying"
+                        );
+                        ActionEnd::Failed
+                    }
                 }
             });
         }
@@ -365,13 +393,14 @@ impl<H: GroupHost> HostingDriver<H> {
         });
     }
 
-    /// Starts `work` on `group` unless an action of the group runs or its
+    /// Starts `work` on `group` unless an action of the group runs, the
+    /// group's last action failed less than [`PLAN_INTERVAL`] ago or its
     /// core runs [`ACTIONS_PER_CORE`] already.
     fn begin(
         &self,
         actions: &mut Actions,
         group: RaftGroupId,
-        work: impl Future<Output = ()> + Send + 'static,
+        work: impl Future<Output = ActionEnd> + Send + 'static,
     ) {
         let Some(core) = self.wal.placement(group).map(|placement| placement.core_id) else {
             tracing::debug!(
@@ -380,25 +409,34 @@ impl<H: GroupHost> HostingDriver<H> {
             );
             return;
         };
-        if actions.running.contains_key(&group) || !actions.room(core) {
+        if actions.running.contains_key(&group)
+            || actions.failed.contains_key(&group)
+            || !actions.room(core)
+        {
             return;
         }
         let done = actions.done_tx.clone();
         let task = crate::rt::spawn(async move {
-            work.await;
+            let end = work.await;
             // The driver stopped: nothing waits for the end.
-            let _closed = done.send(group);
+            let _closed = done.send((group, end));
         });
         actions.running.insert(group, Action { core, task });
     }
 }
 
-/// When the driver last confirmed, and the view its last confirmed plan
-/// read.
+/// When the driver last tried to confirm, and its last confirmation.
 #[derive(Debug, Default)]
 struct Confirms {
     at: Option<Instant>,
-    last: Option<ConfirmedStamp>,
+    last: Option<Confirmed>,
+}
+
+/// A confirmation: the barrier's stamp, and when the barrier started.
+#[derive(Debug, Clone, Copy)]
+struct Confirmed {
+    at: Instant,
+    stamp: ConfirmedStamp,
 }
 
 impl Confirms {
@@ -406,6 +444,25 @@ impl Confirms {
     fn due(&self) -> bool {
         self.at.is_none_or(|at| at.elapsed() >= PLAN_INTERVAL)
     }
+
+    /// `view` confirmed by the last confirmation, when that confirmation
+    /// started less than [`PLAN_INTERVAL`] ago and `view` still carries
+    /// its stamp, by the kernel's rule ([`ConfirmedView::new`]).
+    fn carried(&self, view: &Arc<PlacementView>) -> Option<ConfirmedView> {
+        let last = self.last?;
+        if last.at.elapsed() >= PLAN_INTERVAL {
+            return None;
+        }
+        ConfirmedView::new(Arc::clone(view), last.stamp).ok()
+    }
+}
+
+/// How an open or close ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionEnd {
+    Done,
+    /// The group is not acted on again for one [`PLAN_INTERVAL`].
+    Failed,
 }
 
 /// One open or close the driver runs.
@@ -417,8 +474,11 @@ struct Action {
 /// The opens and closes the driver runs, one per group at a time.
 struct Actions {
     running: BTreeMap<RaftGroupId, Action>,
-    done_tx: mpsc::UnboundedSender<RaftGroupId>,
-    done: mpsc::UnboundedReceiver<RaftGroupId>,
+    /// The groups whose last action failed less than [`PLAN_INTERVAL`]
+    /// ago, each with when the driver learned it failed.
+    failed: BTreeMap<RaftGroupId, Instant>,
+    done_tx: mpsc::UnboundedSender<(RaftGroupId, ActionEnd)>,
+    done: mpsc::UnboundedReceiver<(RaftGroupId, ActionEnd)>,
 }
 
 impl Actions {
@@ -426,15 +486,32 @@ impl Actions {
         let (done_tx, done) = mpsc::unbounded_channel();
         Self {
             running: BTreeMap::new(),
+            failed: BTreeMap::new(),
             done_tx,
             done,
         }
     }
 
-    /// Forgets every action that ended.
+    /// Forgets every action that ended, and every failure older than
+    /// [`PLAN_INTERVAL`].
     fn reap(&mut self) {
-        while let Ok(group) = self.done.try_recv() {
-            self.running.remove(&group);
+        while let Ok((group, end)) = self.done.try_recv() {
+            self.end(group, end);
+        }
+        self.failed
+            .retain(|_, failed| failed.elapsed() < PLAN_INTERVAL);
+    }
+
+    /// Forgets the action of `group`, which ended by `end`.
+    fn end(&mut self, group: RaftGroupId, end: ActionEnd) {
+        self.running.remove(&group);
+        match end {
+            ActionEnd::Done => {
+                self.failed.remove(&group);
+            }
+            ActionEnd::Failed => {
+                self.failed.insert(group, Instant::now());
+            }
         }
     }
 
