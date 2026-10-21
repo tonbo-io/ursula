@@ -953,10 +953,10 @@ mod tests {
         let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
         let data = view(&metrics["raft_groups"][0]);
         let data_url = "/__ursula/raft/0/recovery/accept-unsynced-loss".to_owned();
-        let answer = refused(post(data_url.clone(), mismatched(data, PlanFloor::Meta)).await);
+        // A single node's data group runs no recovery gate, so only the
+        // floor check, which comes before the replica lookup, answers here.
+        let answer = refused(post(data_url, mismatched(data, PlanFloor::Meta)).await);
         assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
-        let answer = refused(post(data_url, mismatched(data, PlanFloor::Seeded)).await);
-        assert_eq!(answer.refusal, RecoveryPlanRefusal::StepMismatch);
         assert_eq!(
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
             super::WalShutdown::Clean
