@@ -56,6 +56,8 @@ const NODES: u64 = 5;
 const META_VOTERS: [u64; 3] = [1, 2, 3];
 /// How long a script watches for a second genesis.
 const WATCH: Duration = Duration::from_secs(8);
+/// How often the meta recovery observes the replicas again.
+const PLAN_POLL: Duration = Duration::from_millis(250);
 /// Mixed into the seed of a run's draws.
 const SALT: u64 = 0x6d65_7461_6d6f_7665;
 
@@ -310,9 +312,7 @@ impl Run {
         }
         self.step("meta_discarded");
         let nodes = self.nodes();
-        if let Err(error) = self.cluster.recover_meta(&nodes).await {
-            meta_checks::fail(&mut self.trace, meta_checks::PLAN, "meta_plan", error);
-        }
+        self.recover_meta(&nodes).await;
         self.step("meta_plan");
         self.checks
             .plan_applied(&self.cluster, &mut self.trace, "meta_plan", &nodes, before)
@@ -322,6 +322,37 @@ impl Run {
         // checked here.
         self.learned("meta_plan_applied").await;
         self.write(2).await;
+    }
+
+    /// `ursulactl recover-group --target meta --accept-loss` over `nodes`:
+    /// the tool's rounds, every `PLAN_POLL`, until its plan is satisfied.
+    /// While a gate may still open the tool waits and observes again, as
+    /// the planner asks.
+    async fn recover_meta(&mut self, nodes: &[u64]) {
+        let mut state = ursula_ctl::recovery::LoopState::default();
+        let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
+        loop {
+            match self.cluster.recover_meta_round(&mut state, nodes).await {
+                Ok(Some(_satisfied)) => return,
+                Ok(None) if madsim::time::Instant::now() < deadline => {
+                    madsim::time::sleep(PLAN_POLL).await;
+                    self.checks
+                        .observe(&self.cluster, &mut self.trace, "meta_plan");
+                }
+                Ok(None) => meta_checks::fail(
+                    &mut self.trace,
+                    meta_checks::PLAN,
+                    "meta_plan",
+                    format!("no meta plan was satisfied within {:?}", meta_checks::BOUND),
+                ),
+                Err(error) => meta_checks::fail(
+                    &mut self.trace,
+                    meta_checks::PLAN,
+                    "meta_plan",
+                    format!("the meta recovery stopped: {error}"),
+                ),
+            }
+        }
     }
 
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {

@@ -22,10 +22,17 @@ use ursula_control::ControlResponse;
 use ursula_control::MoveLimit;
 use ursula_control::PlacementView;
 use ursula_ctl::recovery::GroupPlan;
+use ursula_ctl::recovery::LoopState;
 use ursula_ctl::recovery::PlanMember;
 use ursula_ctl::recovery::PlanTransport;
+use ursula_ctl::recovery::RecoverError;
+use ursula_ctl::recovery::RecoverOutcome;
 use ursula_ctl::recovery::SendError;
-use ursula_ctl::recovery::plan_group;
+use ursula_ctl::recovery::Step;
+use ursula_ctl::recovery::electorate;
+use ursula_ctl::recovery::next_step;
+use ursula_ctl::recovery::plan_sent;
+use ursula_ctl::recovery::send_follows;
 use ursula_ctl::recovery::send_plan;
 use ursula_proto::admin::PlanFloor;
 use ursula_proto::admin::RecoveryPlanRefused;
@@ -66,6 +73,21 @@ use super::recovery_wiring::RecoveryProbeError;
 
 /// A node's meta runtime in the simulation.
 pub(super) type SimMetaRuntime = MetaRuntime<InProcessMetaNetworkFactory>;
+
+/// How many plans one meta recovery may send, as `ursulactl
+/// recover-group --max-plans` bounds it.
+const MAX_META_PLANS: usize = 3;
+
+/// Why a meta recovery round ended without a satisfied plan.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum MetaRecoverFailed {
+    /// The recovery tool stopped.
+    #[error(transparent)]
+    Recover(#[from] RecoverError),
+    /// The tool found nothing to plan.
+    #[error("the meta group needed no plan: {outcome:?}")]
+    NoPlan { outcome: RecoverOutcome },
+}
 
 /// The meta snapshot trigger every node runs: often enough that a run's
 /// meta journals roll and snapshot.
@@ -303,24 +325,46 @@ impl MetaCluster {
             .collect()
     }
 
-    /// `ursulactl recover-group --target meta --accept-loss` over the meta
-    /// replicas of `nodes`: the shipped planner and sender, through each
-    /// node's production plan entry point. Returns the plan.
-    pub(super) async fn recover_meta(&mut self, nodes: &[u64]) -> Result<GroupPlan, String> {
+    /// One round of `ursulactl recover-group --target meta --accept-loss`
+    /// over the meta replicas of `nodes`: the shipped planning step
+    /// (`next_step`), planner and sender, through each node's production
+    /// plan entry point, as the tool's loop drives them. Answers the plan
+    /// once it is satisfied, and `None` while the tool would observe again.
+    pub(super) async fn recover_meta_round(
+        &mut self,
+        state: &mut LoopState,
+        nodes: &[u64],
+    ) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
         let members = self.plan_members(nodes);
-        let plan = plan_group(&members).map_err(|error| format!("no meta plan: {error}"))?;
-        let sent = send_plan(
-            &mut MetaPlanTransport { cluster: self },
-            plan,
-            PlanFloor::Meta,
-            &members,
-        )
-        .await
-        .map_err(|error| format!("{plan:?}: {error}"))?;
-        if !sent.refused.is_empty() {
-            return Err(format!("{plan:?}: members refused: {:?}", sent.refused));
+        match next_step(state, &members, MAX_META_PLANS)? {
+            Step::Done(RecoverOutcome::Satisfied { plan, .. }) => Ok(Some(plan)),
+            Step::Done(outcome) => Err(MetaRecoverFailed::NoPlan { outcome }),
+            Step::Wait => Ok(None),
+            Step::Plan(plan) => {
+                state.plans_sent = state.plans_sent.saturating_add(1);
+                let sent = send_plan(
+                    &mut MetaPlanTransport { cluster: self },
+                    plan,
+                    PlanFloor::Meta,
+                    &members,
+                )
+                .await;
+                plan_sent(state, plan, sent, &electorate(&plan, &members))?;
+                Ok(None)
+            }
+            Step::Resume { plan, leader_term } => {
+                let sent = send_follows(
+                    &mut MetaPlanTransport { cluster: self },
+                    plan,
+                    PlanFloor::Meta,
+                    leader_term,
+                    &members,
+                )
+                .await;
+                plan_sent(state, plan, Ok(sent), &electorate(&plan, &members))?;
+                Ok(None)
+            }
         }
-        Ok(plan)
     }
 }
 
