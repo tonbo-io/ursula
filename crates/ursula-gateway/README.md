@@ -549,6 +549,12 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
   force-deleted pod or a powered-off host, fails the requests waiting on them
   within `--upstream-tcp-user-timeout` with `502`. The request may have
   reached the node, so the client decides whether to retry it.
+- The gateway reuses an idle upstream connection for at most 0.5 s. A node
+  that stops gracefully keeps an idle connection open for up to 1 s and
+  answers a request on it with `Connection: close`, so a graceful stop fails
+  no request the gateway sends on a pooled connection. A new connection to the
+  stopping node is refused, and the gateway answers as for an unreachable
+  upstream.
 - Upstreams that fail at the transport are skipped for a while. See
   [Upstream Selection](#upstream-selection).
 - Request bodies are buffered up to `--max-request-body-bytes` because internal

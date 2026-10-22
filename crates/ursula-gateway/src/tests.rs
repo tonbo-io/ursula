@@ -3551,6 +3551,86 @@ mod upstream_keepalive {
     }
 }
 
+/// The gateway's upstream pool against a node's graceful drain
+/// ([`ursula_observability::serve::CLIENT_IDLE_BOUND`]).
+mod upstream_drain {
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    use axum::Router;
+    use axum::extract::ConnectInfo;
+    use axum::http::StatusCode;
+    use axum::routing::any;
+    use http_body_util::BodyExt;
+    use ursula_observability::serve::serve_until_shutdown;
+
+    use super::gateway_for_url;
+    use super::post_path;
+
+    /// A write the gateway sends on its pooled connection to a node after the
+    /// node's graceful drain began is answered over that connection, and the
+    /// gateway returns the answer. A drain that closed the idle connection at
+    /// once failed such a write with `502` when the gateway had just sent it,
+    /// and with `503` a moment later, when the node's listener refused the
+    /// gateway's new connection.
+    #[tokio::test]
+    async fn a_draining_node_answers_a_write_on_the_gateways_pooled_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the node");
+        let addr = listener.local_addr().expect("the node's address");
+        let (peers, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            "/{bucket}/{stream}",
+            any(move |ConnectInfo(peer): ConnectInfo<SocketAddr>| {
+                peers.send(peer).expect("the test reads the arrivals");
+                async { "ok" }
+            }),
+        );
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let node = tokio::spawn(serve_until_shutdown(
+            listener,
+            app,
+            async move {
+                drop(stopped.await);
+            },
+            Some(Duration::from_secs(30)),
+        ));
+        let gateway = gateway_for_url(format!("http://{addr}"));
+
+        let first = gateway.handle(post_path("/bucket/stream")).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        // Read to its end, the answer gives its connection back to the pool.
+        first
+            .into_body()
+            .collect()
+            .await
+            .expect("the first answer's body");
+
+        stop.send(()).expect("the node drains");
+        // The drain began once the node refuses a new connection. The write
+        // follows a moment later.
+        while tokio::net::TcpStream::connect(addr).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let second = gateway.handle(post_path("/bucket/stream")).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let first_peer = arrivals.recv().await.expect("the first write arrived");
+        let second_peer = arrivals.recv().await.expect("the second write arrived");
+        assert_eq!(
+            first_peer, second_peer,
+            "both writes went over the pooled connection"
+        );
+        tokio::time::timeout(Duration::from_secs(10), node)
+            .await
+            .expect("the drain ends")
+            .expect("the node's task")
+            .expect("the node served");
+    }
+}
+
 /// A refusal the gateway decides from a request's head alone reaches a client
 /// that sends its whole body before it reads the answer: the gateway reads the
 /// body first, up to `max_request_body_bytes`, for

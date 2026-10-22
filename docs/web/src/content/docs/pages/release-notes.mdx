@@ -83,6 +83,7 @@ See [Upgrading to 0.10](/docs/operations#upgrading-to-010).
 - **Raft RPCs name the processes.** Every Raft request names the sender's process and, when it knows it, the target's (`ursula-incarnation`, `ursula-target-incarnation`), and every answer names the responder's (`ursula-node-id`, `ursula-incarnation`). A receiver refuses a request for another process of it, from a stale or unbound sender, a duplicate or one that names no sender, and a sender reads every such refusal as a lost RPC.
 - **`x-ursula-process-incarnation` keeps its 32 hex digits,** now the WAL root ID, the run counter and a nonce. It still changes on every restart.
 - **A clean shutdown keeps the WAL lock** until the process exits, and the node fence closes before `clean` is recorded. Shutdown stops the data groups, then the meta group, then the WAL.
+- **A graceful stop answers a request on an idle connection.** Once a node stops accepting connections, it marks every HTTP/1 answer `Connection: close` and keeps each connection open for up to 1 s, so a request a client sends on an idle connection is answered before the connection closes. The gateway reuses an idle upstream connection for at most 0.5 s. 0.9 closed idle connections at once, and a write the gateway sent on one at that moment failed with `502`. A stop takes up to 1 s longer while a client or a peer keeps a connection open.
 
 ### Single node
 

@@ -99,6 +99,7 @@ use ursula_headers::SizeLimit;
 use ursula_headers::immutable;
 use ursula_headers::lowered_request_limit;
 use ursula_headers::names;
+use ursula_observability::serve::CLIENT_IDLE_BOUND;
 use ursula_shard::BucketStreamId;
 use ursula_shard::StaticShardMap;
 
@@ -1463,10 +1464,17 @@ impl UpstreamKeepalive {
 /// follow. A connection to an upstream that stopped answering fails within
 /// `upstream_tcp_user_timeout_secs`, whether a request waits on it or it is
 /// idle.
+///
+/// A pooled connection is reused only while it has been idle for at most
+/// [`CLIENT_IDLE_BOUND`]. A node's graceful drain keeps an idle connection
+/// open longer than that, so it answers every request the gateway sends on
+/// one, and closes it after the answer. A request sent on a connection that
+/// then closes unanswered may have reached the node, and is a `502`.
 fn upstream_client(config: &GatewayConfig) -> reqwest::Client {
     let keepalive = UpstreamKeepalive::for_user_timeout(config.upstream_tcp_user_timeout_secs);
     let builder = reqwest::Client::builder()
         .connect_timeout(config.connect_timeout)
+        .pool_idle_timeout(CLIENT_IDLE_BOUND)
         .tcp_keepalive(keepalive.idle)
         .tcp_keepalive_interval(keepalive.interval)
         .tcp_keepalive_retries(keepalive.retries)
