@@ -4696,8 +4696,9 @@ async fn cli_four_nodes_host_only_the_groups_meta_seeds_on_them() {
 /// placed on it, and every node reads every write. Then meta voters 1 and 2
 /// are killed, which leaves meta no quorum: the group seeded on {3, 4, 5}
 /// keeps taking writes, and node 4, killed and started again while meta
-/// stays down, runs exactly the groups its journal holds, takes a write and
-/// reads every write of that group. A restart that hosts by anything but
+/// stays down, runs exactly the groups its journal holds, routes a write,
+/// applies it on its own replica, and a read through it returns every write
+/// of that group. A restart that hosts by anything but
 /// the placement its journal and view hold fails it, and so does a data
 /// group, or a restarted node's open, that needs meta to serve (G2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4790,6 +4791,34 @@ async fn cli_five_nodes_keep_their_placement_across_a_full_restart_and_serve_wit
     })
     .await;
     post_until_no_content(&client, &url(&nodes[3], stream), "after-node-4-restarted;").await;
+    // The client follows redirects, and {3, 5} is a quorum without node 4,
+    // so check node 4's own replica: it applies past the write. The leader
+    // that acknowledged it is one of nodes 3 to 5, and its committed index
+    // only grows, so the greatest of theirs covers the write.
+    let group_metrics = |metrics: &ursula_proto::admin::NodeMetrics| {
+        metrics
+            .groups
+            .iter()
+            .find(|metrics| metrics.raft_group_id == u64::from(group.0))
+            .cloned()
+    };
+    let mut written = None;
+    for node in &nodes[2..] {
+        let metrics = node_metrics(&client, &node.url()).await;
+        written = written.max(group_metrics(&metrics).and_then(|group| group.committed_index));
+    }
+    let written = written.expect("the group's leader knows its committed entry");
+    let what = format!("node 4 applies group {} up to index {written}", group.0);
+    eventually(&mut procs, &what, async || {
+        let metrics = try_node_metrics(&client, &nodes[3].url()).await?;
+        let applied = group_metrics(&metrics).and_then(|group| group.last_applied_index);
+        if applied >= Some(written) {
+            Ok(())
+        } else {
+            Err(format!("node 4 applied {applied:?}"))
+        }
+    })
+    .await;
     read_until_matches(
         &client,
         &read(&nodes[3], stream),
@@ -6038,7 +6067,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
 /// every such group is listed with `missing_group` or `recovery_barrier`,
 /// never `missing_group` after `recovery_barrier`, the report is not
 /// serving-ready and the node answers `503`, and every group reaches
-/// `recovery_barrier` while its install waits. Once the installs pass,
+/// `recovery_barrier` while installs are held. Once the installs pass,
 /// node 3 becomes ready with each group a voter that counts and no group
 /// issue, and reads every write. A report keyed by the replicas a node
 /// runs, under which a wiped voter is a node with no group, fails it.
@@ -6203,7 +6232,16 @@ async fn cli_a_wiped_voter_is_not_ready_before_its_groups() {
         },
     )
     .await;
-    assert!(*proxy.blocked.borrow(), "an install waited");
+    // A group reports `recovery_barrier` as soon as its replica opens with
+    // the gate closed, which can be before any leader has sent the held
+    // install, so wait for one to arrive.
+    tokio::time::timeout(
+        META_WAIT,
+        proxy.blocked.clone().wait_for(|blocked| *blocked),
+    )
+    .await
+    .expect("an install is held")
+    .unwrap();
 
     // 4. The installs pass: node 3 catches up and becomes ready.
     proxy.release.send_replace(true);
