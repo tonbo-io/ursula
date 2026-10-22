@@ -12,8 +12,8 @@ use ursula_observability::serve::serve_until_shutdown;
 use ursula_observability::serve::shutdown_signal;
 use ursula_shard::RaftGroupId;
 
+use crate::ClusterWal;
 use crate::HttpState;
-use crate::Persistence;
 use crate::Topology;
 use crate::bootstrap::spawn_runtime;
 use crate::client_router_with_admission;
@@ -47,7 +47,7 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset = Some(Preset::Default);
     }
 
-    let config = load_config(config_path.as_deref(), preset, args.node_id)?;
+    let mut config = load_config(config_path.as_deref(), preset, args.node_id)?;
 
     let tokio_console =
         config.observability.tokio_console || std::env::var_os("URSULA_TOKIO_CONSOLE").is_some();
@@ -74,22 +74,19 @@ pub async fn run(args: ServerArgs) -> Result<(), Box<dyn std::error::Error>> {
         preset.unwrap_or(Preset::Default)
     );
 
-    let wal_dir = if runs_raft(&config, preset) {
-        Some(RaftWalDir::resolve(&config.raft.wal)?)
+    let wal = if runs_raft(&config, preset) {
+        Some(ClusterWal::resolve(&config.raft.wal)?)
     } else {
         None
     };
-    let persistence = match &wal_dir {
-        Some(wal_dir) => Persistence::Raft {
-            log_dir: wal_dir.log_dir(),
-        },
-        None => Persistence::InMemory,
-    };
-    let state = init_state(&config, persistence).await?;
+    if let Some(ClusterWal::Temporary(_)) = &wal {
+        complete_temporary_node(&mut config);
+    }
+    let state = init_state(&config, wal.clone()).await?;
     state.register_otel_metrics();
     let wal_shutdown = serve(state, &config).await?;
-    if let Some(wal_dir) = wal_dir {
-        wal_dir.close(&wal_shutdown);
+    if let Some(wal) = wal {
+        wal.close(matches!(wal_shutdown, WalShutdown::Clean(_)));
     }
     // A clean run's root lock stays held until the process exits, so no
     // successor reads the clean end beside a task of this run that is still
@@ -106,70 +103,26 @@ fn runs_raft(config: &ursula_config::UrsulaConfig, preset: Option<Preset>) -> bo
     preset != Some(Preset::Default) || !config.raft.peers.is_empty()
 }
 
-/// Where this process keeps its Raft WAL.
-#[derive(Debug)]
-enum RaftWalDir {
-    /// `raft.wal.path`, kept across runs.
-    Configured(PathBuf),
-    /// No path is configured, which only a single node allows: a fresh
-    /// temporary directory for this run. Only [`RaftWalDir::close`] after a
-    /// clean WAL shutdown removes it. Dropping it, as an error return does,
-    /// leaves it, because a core writer may still write to it, and a journal
-    /// write that fails stops the process.
-    Temporary(PathBuf),
-}
-
-impl RaftWalDir {
-    fn resolve(wal: &ursula_config::WalConfig) -> std::io::Result<Self> {
-        match &wal.path {
-            Some(path) => Ok(Self::Configured(path.clone())),
-            None => {
-                let dir = tempfile::Builder::new()
-                    .prefix("ursula-wal-")
-                    .tempdir()?
-                    .keep();
-                tracing::info!(
-                    path = %dir.display(),
-                    "raft.wal.path is not set: the Raft WAL runs in a temporary directory that \
-                     is removed after a clean shutdown"
-                );
-                Ok(Self::Temporary(dir))
-            }
-        }
-    }
-
-    /// The journal directory: the WAL directory's `raft-log` subdirectory.
-    fn log_dir(&self) -> PathBuf {
-        let (Self::Configured(root) | Self::Temporary(root)) = self;
-        root.join(ursula_config::WalConfig::LOG_SUBDIR)
-    }
-
-    /// After the server stopped: removes a temporary WAL directory once its
-    /// WAL shut down cleanly. Only then has every core writer closed, so
-    /// nothing writes to the directory any more.
-    fn close(self, shutdown: &WalShutdown) {
-        let Self::Temporary(path) = self else {
-            return;
+/// A node on a temporary WAL runs as a deployment of its own. With an empty
+/// `raft.peers` it lists itself, at its cluster listener, else its client
+/// listener, and without `server.cluster_id` it runs under a generated one,
+/// new at every start, as its fresh WAL is.
+fn complete_temporary_node(config: &mut ursula_config::UrsulaConfig) {
+    if config.raft.peers.is_empty() {
+        let server = &config.server;
+        let client = format!("http://{}", server.listen);
+        let (url, client_url) = match &server.cluster_listen {
+            Some(cluster) => (format!("http://{cluster}"), Some(client)),
+            None => (client, None),
         };
-        if !matches!(shutdown, WalShutdown::Clean(_)) {
-            tracing::warn!(
-                path = %path.display(),
-                ?shutdown,
-                "kept the temporary Raft WAL directory: the WAL did not shut down cleanly"
-            );
-            return;
-        }
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => tracing::info!(
-                path = %path.display(),
-                "removed the temporary Raft WAL directory"
-            ),
-            Err(err) => tracing::warn!(
-                path = %path.display(),
-                %err,
-                "could not remove the temporary Raft WAL directory"
-            ),
-        }
+        config.raft.peers.push(ursula_config::RaftPeerConfig {
+            node_id: config.raft.node_id,
+            url,
+            client_url,
+        });
+    }
+    if config.server.cluster_id.is_none() {
+        config.server.cluster_id = Some(ursula_raft::generate_cluster_id());
     }
 }
 
@@ -181,36 +134,41 @@ fn init_telemetry(
     ursula_observability::init(options)
 }
 
+/// The server's state over a runtime of `config`: a Raft node over `wal`,
+/// or, without one, the in-memory development engine. The caller completes
+/// the config of a node on a temporary WAL first
+/// ([`complete_temporary_node`]).
 async fn init_state(
     config: &ursula_config::UrsulaConfig,
-    persistence: Persistence,
+    wal: Option<ClusterWal>,
 ) -> Result<HttpState, Box<dyn std::error::Error>> {
     // The one source of every configured peer address.
     let raft_peers = ursula_raft::PeerDirectory::from_config(&config.raft.peers);
-
-    let topology = if raft_peers.is_empty() {
-        Topology::SingleNode {
-            raft_group_count: config.raft.group_count,
-        }
-    } else {
-        Topology::static_cluster(
-            config.raft.node_id,
-            raft_peers.clone(),
-            config.raft.group_count,
-            config.raft.placement.replication_factor,
-        )
+    let group_count = config.raft.effective_group_count();
+    let log_dir = wal.as_ref().map(ClusterWal::log_dir);
+    let topology = match wal {
+        None => Topology::Development { group_count },
+        Some(wal) => Topology::Cluster {
+            node_id: config.raft.node_id,
+            peers: raft_peers.clone(),
+            group_count,
+            wal,
+        },
     };
     // Interim, removed in S2(h): the seed table decides what this node
     // warms, where it routes a group it does not host, and what its
-    // maintenance inventory and egress gate expect.
-    let seeds = topology.config_seeds().cloned().unwrap_or_default();
+    // maintenance inventory expects. It is the spawn path's seed rule.
+    let seeds = ursula_raft::ConfigSeeds::new(
+        &raft_peers,
+        group_count,
+        config.raft.placement.replication_factor,
+    );
 
     // Format epoch: refuse data and peers of another epoch before anything is
     // written.
-    let log_dir = persistence.log_dir().map(std::path::Path::to_path_buf);
     crate::bootstrap::check_and_stamp_format_epoch(config, &raft_peers, log_dir.as_deref()).await?;
 
-    let spawned = spawn_runtime(config, persistence, topology)?;
+    let spawned = spawn_runtime(config, topology)?;
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal;
     // Meta's Raft starts before the warm-up, on the journal the spawn path
@@ -220,10 +178,10 @@ async fn init_state(
         None => crate::bootstrap::MetaSlot::default(),
     };
 
-    if !raft_peers.is_empty() {
+    if spawned.raft_registry.is_some() {
         // The hosted groups open concurrently, as `warm_all_groups` opens
         // every group, so startup waits for the slowest open, not their sum.
-        let hosted: Vec<RaftGroupId> = (0..config.raft.group_count)
+        let hosted: Vec<RaftGroupId> = (0..group_count)
             .map(|raw_group_id| {
                 RaftGroupId(
                     u32::try_from(raw_group_id)
@@ -261,24 +219,17 @@ async fn init_state(
         }
     }
 
-    let state = if raft_peers.is_empty() {
-        match spawned.raft_registry {
-            Some(registry) => HttpState::with_raft_registry(runtime, registry),
-            None => HttpState::new(runtime),
-        }
-    } else {
-        let registry = spawned
-            .raft_registry
-            .expect("static grpc topology returns registry");
+    let state = match spawned.raft_registry {
+        None => HttpState::new(runtime),
         // Leader redirects send clients to a peer's client plane, which is
         // not its Raft `url` when the cluster plane listens apart.
-        HttpState::with_static_raft_cluster_topology(
+        Some(registry) => HttpState::with_static_raft_cluster_topology(
             runtime,
             registry,
             config.raft.node_id,
             raft_peers,
             seeds.voter_table(),
-        )
+        ),
     };
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
@@ -550,14 +501,16 @@ mod tests {
         use tower::ServiceExt;
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.raft.node_id = 7;
-        assert!(config.raft.peers.is_empty());
+        super::complete_temporary_node(&mut config);
         let wal = crate::tests::TestWalRoot::new();
-        let persistence = crate::Persistence::Raft {
-            log_dir: wal.path().join("raft-log"),
-        };
-        let state = super::init_state(&config, persistence).await.unwrap();
+        let state = super::init_state(
+            &config,
+            Some(crate::ClusterWal::Durable(wal.path().to_owned())),
+        )
+        .await
+        .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let response = crate::admin_router(state.clone())
             .oneshot(
@@ -592,11 +545,9 @@ mod tests {
         use tower::ServiceExt;
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.server.cluster_id = Some(ursula_headers::ClusterId::new("dev-local").unwrap());
-        let state = super::init_state(&config, crate::Persistence::InMemory)
-            .await
-            .unwrap();
+        let state = super::init_state(&config, None).await.unwrap();
         let response =
             crate::client_router_with_admission(state, crate::IngressAdmission::default())
                 .oneshot(
@@ -647,17 +598,15 @@ mod tests {
         let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
         config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
-        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
-        assert!(matches!(wal_dir, super::RaftWalDir::Configured(_)));
-        let persistence = crate::Persistence::Raft {
-            log_dir: wal_dir.log_dir(),
-        };
-        let state = super::init_state(&config, persistence).await.unwrap();
+        super::complete_temporary_node(&mut config);
+        let wal_dir = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+        assert!(matches!(wal_dir, crate::ClusterWal::Durable(_)));
+        let state = super::init_state(&config, Some(wal_dir)).await.unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let response = crate::admin_router(state.clone())
             .oneshot(
@@ -711,8 +660,8 @@ mod tests {
         );
     }
 
-    /// A single-node durable server has no static inventory. It is ready
-    /// before its first group exists and while its groups serve.
+    /// A single durable node opens its groups at start, as every Raft node
+    /// does, and is ready while they serve.
     #[tokio::test]
     async fn a_single_node_durable_server_becomes_ready() {
         use axum::body::Body;
@@ -722,22 +671,21 @@ mod tests {
         let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
         config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
-        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
-        let persistence = crate::Persistence::Raft {
-            log_dir: wal_dir.log_dir(),
-        };
-        let state = super::init_state(&config, persistence).await.unwrap();
+        super::complete_temporary_node(&mut config);
+        let wal_dir = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+        let log_dir = wal_dir.log_dir();
+        let state = super::init_state(&config, Some(wal_dir)).await.unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let registry = state.raft_registry().cloned().expect("a Raft node");
-        // The spawn path opened the meta journal before any data group: the
-        // first one opens on the create below.
-        assert!(wal_dir.log_dir().join("meta").is_dir());
-        assert!(registry.get(super::RaftGroupId(0)).is_none());
+        // The spawn path opened the meta journal before any data group, and
+        // the start opened the group the node hosts.
+        assert!(log_dir.join("meta").is_dir());
+        assert!(registry.get(super::RaftGroupId(0)).is_some());
         // Meta forms on this node alone: its voters and nodes are this node,
         // and the default replication factor of 3 runs as 1.
         let mut placement = registry.placement_watch();
@@ -860,17 +808,14 @@ mod tests {
         let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
         config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
-        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
-        let state = super::init_state(&config, crate::Persistence::Raft {
-            log_dir: wal_dir.log_dir(),
-        })
-        .await
-        .unwrap();
+        super::complete_temporary_node(&mut config);
+        let wal_dir = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+        let state = super::init_state(&config, Some(wal_dir)).await.unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let registry = state.raft_registry().cloned().expect("a Raft node");
         let mut placement = registry.placement_watch();
@@ -985,21 +930,15 @@ mod tests {
         let dir = crate::tests::TestWalRoot::new();
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.raft.node_id = 7;
         config.raft.wal.path = Some(dir.path().to_owned());
         config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
-        let log_dir = super::RaftWalDir::resolve(&config.raft.wal)
-            .unwrap()
-            .log_dir();
-        let start = || async {
-            super::init_state(&config, crate::Persistence::Raft {
-                log_dir: log_dir.clone(),
-            })
-            .await
-            .unwrap()
-        };
+        super::complete_temporary_node(&mut config);
+        let wal = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+        let log_dir = wal.log_dir();
+        let start = || async { super::init_state(&config, Some(wal.clone())).await.unwrap() };
         let stop = |state: crate::HttpState| async move {
             let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
             assert!(matches!(
@@ -1117,12 +1056,13 @@ mod tests {
 
     /// Without `raft.wal.path` a single node runs its WAL in a fresh
     /// temporary directory, removed once the server shut down cleanly and
-    /// kept otherwise. Only the zero-config default runs without Raft.
+    /// kept otherwise, listing itself under a generated cluster id. Only the
+    /// zero-config default runs without Raft.
     #[tokio::test]
     async fn a_single_node_without_a_wal_path_runs_in_a_temporary_directory() {
         let mut config = ursula_config::UrsulaConfig::default();
         config.runtime.core_count = 1;
-        config.raft.group_count = 1;
+        config.raft.group_count = Some(1);
         config.raft.node_id = 1;
         config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
         assert!(!super::runs_raft(
@@ -1132,25 +1072,33 @@ mod tests {
         assert!(super::runs_raft(&config, Some(ursula_config::Preset::Tiny)));
         assert!(super::runs_raft(&config, None));
 
-        let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
-        let super::RaftWalDir::Temporary(root) = &wal_dir else {
+        let wal_dir = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+        let crate::ClusterWal::Temporary(root) = &wal_dir else {
             panic!("no path configured: {wal_dir:?}");
         };
         let root = root.clone();
         let log_dir = wal_dir.log_dir();
         assert_eq!(log_dir, root.join("raft-log"));
-        let state = super::init_state(&config, crate::Persistence::Raft {
-            log_dir: log_dir.clone(),
-        })
-        .await
-        .unwrap();
+        config.server.listen = "127.0.0.1:4500".to_owned();
+        config.server.cluster_listen = Some("127.0.0.1:4501".to_owned());
+        super::complete_temporary_node(&mut config);
+        let peer = config.raft.peers.first().expect("the node lists itself");
+        assert_eq!(config.raft.peers.len(), 1);
+        assert_eq!(
+            (peer.node_id, peer.url.as_str(), peer.client_base_url()),
+            (1, "http://127.0.0.1:4501", "http://127.0.0.1:4500")
+        );
+        assert!(config.server.cluster_id.is_some());
+        let state = super::init_state(&config, Some(wal_dir.clone()))
+            .await
+            .unwrap();
         let raft_wal = state.raft_wal().cloned().expect("the node runs Raft");
         assert_eq!(raft_wal.root(), log_dir.as_path());
         let shutdown =
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await;
         assert!(matches!(shutdown, super::WalShutdown::Clean(_)));
         assert!(root.exists());
-        wal_dir.close(&shutdown);
+        wal_dir.close(matches!(shutdown, super::WalShutdown::Clean(_)));
         assert!(!root.exists(), "a clean shutdown removes the temporary WAL");
     }
 
@@ -1160,15 +1108,15 @@ mod tests {
     fn a_temporary_wal_directory_stays_without_a_clean_shutdown() {
         let config = ursula_config::UrsulaConfig::default();
         let resolve = || {
-            let wal_dir = super::RaftWalDir::resolve(&config.raft.wal).unwrap();
-            let super::RaftWalDir::Temporary(root) = &wal_dir else {
+            let wal_dir = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+            let crate::ClusterWal::Temporary(root) = &wal_dir else {
                 panic!("no path configured: {wal_dir:?}");
             };
             let root = root.clone();
             (wal_dir, root)
         };
         let (wal_dir, unclean) = resolve();
-        wal_dir.close(&super::WalShutdown::Unclean);
+        wal_dir.close(false);
         assert!(unclean.exists(), "an unclean shutdown keeps the directory");
         let (wal_dir, dropped) = resolve();
         drop(wal_dir);

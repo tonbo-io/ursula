@@ -36,8 +36,11 @@ list is never dialed: its network client answers unreachable without dialing,
 followers neither forward to it nor redirect to it, and each node logs it once
 (`PeerCluster::cluster_url` in `crates/ursula-raft/src/peer_cluster.rs`). The
 server binds the directory with the node's identity before its runtime starts
-(`crates/ursula/src/bootstrap/meta.rs`). A node whose `raft.peers` is empty
-binds itself alone, at its cluster listener. To move a node, change `raft.peers` on every node and restart them. Membership
+(`crates/ursula/src/bootstrap/meta.rs`). Every node with a WAL path lists
+itself in `raft.peers`, a single node included. A node on a temporary WAL
+with an empty `raft.peers` runs with an entry of itself, at its cluster
+listener, else its client listener (`complete_temporary_node` in
+`crates/ursula/src/server.rs`). To move a node, change `raft.peers` on every node and restart them. Membership
 entries, snapshot records and installed snapshots name each member by node ID
 only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 

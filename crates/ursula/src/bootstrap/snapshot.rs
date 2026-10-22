@@ -337,19 +337,6 @@ pub(crate) fn deleted_data_sample<'a>(
         })
 }
 
-/// Whether a node refuses client writes with a body while its
-/// unsnapshotted Raft log is past [`SnapshotCadence::hard_limit_bytes`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LogWriteGate {
-    /// From the hard limit until the log is back at
-    /// [`SnapshotCadence::resume_bytes`], HTTP admission answers such writes
-    /// `503 RAFT_LOG_PRESSURE`: a cluster node.
-    RefuseAtHardLimit,
-    /// Never: a single node, which 0.8.0 never refused for its log, and
-    /// which a patch release does not start refusing.
-    Open,
-}
-
 /// The snapshot policy of a node, a single node's as a cluster node's
 /// (F12e, #519, #669).
 pub(crate) fn snapshot_cadence(raft: &ursula_config::RaftConfig, groups: usize) -> SnapshotCadence {
@@ -362,17 +349,11 @@ pub(crate) fn snapshot_cadence(raft: &ursula_config::RaftConfig, groups: usize) 
 }
 
 /// Sets the coordinator's log-pressure flag, which HTTP admission reads,
-/// from the node's unsnapshotted Raft log bytes under `gate`.
-fn gate_writes(
-    coordinator: &SnapshotBuildCoordinator,
-    gate: LogWriteGate,
-    log_bytes: u64,
-    limit: u64,
-    resume: u64,
-) {
-    if gate == LogWriteGate::Open {
-        return;
-    }
+/// from the node's unsnapshotted Raft log bytes: from the hard limit
+/// `limit` until the log is back at `resume`, HTTP admission answers client
+/// writes with a body `503 RAFT_LOG_PRESSURE`. Every Raft node, a single
+/// node included, refuses them so.
+fn gate_writes(coordinator: &SnapshotBuildCoordinator, log_bytes: u64, limit: u64, resume: u64) {
     match coordinator.observe_log_bytes(log_bytes, limit, resume) {
         Some(true) => tracing::warn!(
             log_bytes,
@@ -385,12 +366,11 @@ fn gate_writes(
 }
 
 /// Keeps the coordinator's log-pressure flag (read by HTTP admission) in step
-/// with the node's unsnapshotted Raft log bytes under `gate`, and reports the
+/// with the node's unsnapshotted Raft log bytes, and reports the
 /// pressure the snapshot driver works under and the deleted data its groups
 /// still hold (#669).
 fn spawn_log_pressure_monitor(
     coordinator: SnapshotBuildCoordinator,
-    gate: LogWriteGate,
     cadence: SnapshotCadence,
     max_builds: usize,
     metrics: RuntimeMetrics,
@@ -411,7 +391,7 @@ fn spawn_log_pressure_monitor(
                 &cadence,
                 &coordinator.running_log_progress(),
             ));
-            gate_writes(&coordinator, gate, log_bytes, limit, resume);
+            gate_writes(&coordinator, log_bytes, limit, resume);
             tokio::time::sleep(LOG_PRESSURE_POLL).await;
         }
     });
@@ -1036,14 +1016,13 @@ impl SnapshotDriver {
 /// ([`spawn_store_health_gate`]) on the same interval, and owns it: the gate
 /// stops when the driver does. Only an external store is probed: inline
 /// snapshots depend on nothing outside the node, so the inline driver never
-/// sheds leadership. `write_gate` says whether the node refuses client
-/// writes while its log is past the hard limit. The driver alone takes every
+/// sheds leadership. The node refuses client writes while its log is
+/// past the hard limit ([`gate_writes`]). The driver alone takes every
 /// snapshot: OpenRaft's own snapshot policy is off on every group.
 pub fn spawn_snapshot_driver(
     runtime: &ShardRuntime,
     registry: &RaftGroupHandleRegistry,
     store: Option<(SharedSnapshotStore, StoreGateInputs<'_>)>,
-    write_gate: LogWriteGate,
     interval: Duration,
     cadence: SnapshotCadence,
     wal: Option<WalMaintenance>,
@@ -1076,7 +1055,6 @@ pub fn spawn_snapshot_driver(
     });
     spawn_log_pressure_monitor(
         driver.coordinator.clone(),
-        write_gate,
         cadence,
         driver.limits.max_builds,
         runtime.metrics(),
@@ -1112,7 +1090,6 @@ mod tests {
 
     use super::FIRST_HOLD;
     use super::HeldGroups;
-    use super::LogWriteGate;
     use super::PassOutcome;
     use super::SNAPSHOT_PRESSURE_RETICK;
     use super::Trigger;
@@ -1274,19 +1251,16 @@ mod tests {
         );
     }
 
-    /// #669: a single node, which 0.8.0 never refused for its log, never
-    /// closes admission for it. A cluster node does past the hard limit,
-    /// until its log is back at the resume level.
+    /// A node closes admission past the hard limit, until its log is back
+    /// at the resume level.
     #[test]
-    fn a_single_node_never_refuses_writes_for_its_log() {
+    fn a_node_refuses_writes_past_its_hard_limit_until_its_log_resumes() {
         let coordinator = SnapshotBuildCoordinator::default();
-        gate_writes(&coordinator, LogWriteGate::Open, 10, 5, 3);
-        assert!(!coordinator.log_pressured());
-        gate_writes(&coordinator, LogWriteGate::RefuseAtHardLimit, 10, 5, 3);
+        gate_writes(&coordinator, 10, 5, 3);
         assert!(coordinator.log_pressured());
-        gate_writes(&coordinator, LogWriteGate::RefuseAtHardLimit, 4, 5, 3);
+        gate_writes(&coordinator, 4, 5, 3);
         assert!(coordinator.log_pressured());
-        gate_writes(&coordinator, LogWriteGate::RefuseAtHardLimit, 2, 5, 3);
+        gate_writes(&coordinator, 2, 5, 3);
         assert!(!coordinator.log_pressured());
     }
 

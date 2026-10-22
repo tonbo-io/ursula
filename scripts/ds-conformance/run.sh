@@ -35,9 +35,14 @@ fi
 cat >"$work/ursula.toml" <<TOML
 [server]
 listen = "127.0.0.1:$port"
+cluster_id = "ds-conformance"
 
 [raft.wal]
 path = "$work/wal"
+
+[[raft.peers]]
+node_id = 1
+url = "http://127.0.0.1:$port"
 TOML
 "$binary" server --config "$work/ursula.toml" --node-id 1 >"$work/ursula.log" 2>&1 &
 pids+=($!)

@@ -34,7 +34,6 @@ use ursula_headers::value::Seq;
 
 use crate::HttpState;
 use crate::IngressAdmission;
-use crate::Persistence;
 use crate::Topology;
 use crate::WallClock;
 use crate::client_router_with_admission;
@@ -61,12 +60,10 @@ fn app(now_ms: &Arc<AtomicU64>) -> Router {
 fn app_with_runtime(now_ms: &Arc<AtomicU64>) -> (Router, ursula_runtime::ShardRuntime) {
     let mut config = ursula_config::UrsulaConfig::default();
     config.runtime.core_count = 1;
-    config.raft.group_count = 1;
-    let runtime = spawn_runtime(&config, Persistence::InMemory, Topology::SingleNode {
-        raft_group_count: 1,
-    })
-    .expect("runtime")
-    .runtime;
+    config.raft.group_count = Some(1);
+    let runtime = spawn_runtime(&config, Topology::Development { group_count: 1 })
+        .expect("runtime")
+        .runtime;
     let state = HttpState::new(runtime.clone()).with_wall_clock(Clock(Arc::clone(now_ms)));
     (
         client_router_with_admission(state, IngressAdmission::default()),

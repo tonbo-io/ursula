@@ -14,10 +14,16 @@ use crate::config::WalConfig;
 pub enum ValidationError {
     #[error("raft.append_transport_budget_bytes must be between 1 and 4294967295")]
     AppendTransportBudget,
-    #[error("raft.wal.path is required when raft.peers is set")]
+    /// A node of a cluster of several keeps its WAL across restarts.
+    #[error("raft.wal.path is required when raft.peers lists another node")]
     RaftWalPathRequired,
-    #[error("server.cluster_id is required when raft.peers is set")]
+    /// Every node of a durable deployment names it, so none draws its own.
+    #[error("server.cluster_id is required when raft.wal.path is set")]
     ClusterIdRequired,
+    /// Every node of a cluster runs the same groups, so none may take the
+    /// default of its own host.
+    #[error("raft.group_count is required when raft.peers lists another node")]
+    GroupCountRequired,
     #[error("storage.cold.s3.bucket is required when cold backend is 's3'")]
     ColdS3BucketRequired,
     /// A node that splits its cluster plane off serves no client route on
@@ -31,10 +37,15 @@ pub enum ValidationError {
          server.cluster_listen is set"
     )]
     PeerClientUrlIsRaftUrl { node_id: u64 },
-    #[error("raft.node_id {0} must be present in raft.peers")]
+    /// Every node with `raft.wal.path`, a single node included, lists
+    /// itself in `raft.peers`, as does any node whose `raft.peers` is set.
+    #[error(
+        "raft.node_id {0} must be present in raft.peers (every node with raft.wal.path lists \
+         itself)"
+    )]
     NodeIdNotInPeers(u64),
-    /// The meta group's voters at genesis are nodes of the address book:
-    /// `raft.peers`, or this node alone when it is empty.
+    /// The meta group's voters at genesis are nodes of `raft.peers`, or
+    /// this node alone when it is empty.
     #[error(
         "raft.meta_voters names node {node_id}, which is not in raft.peers (with raft.peers \
          empty, raft.meta_voters may name only raft.node_id)"
@@ -141,21 +152,19 @@ impl UrsulaConfig {
                 "raft.node_id is required (use --node-id CLI flag)".into(),
             ));
         }
-        if !u64::try_from(self.raft.group_count)
-            .is_ok_and(ursula_proto::placement::group_count_within_bound)
+        let group_count = self.raft.effective_group_count();
+        if !u64::try_from(group_count).is_ok_and(ursula_proto::placement::group_count_within_bound)
         {
-            return Err(ValidationError::GroupCountAboveMax {
-                group_count: self.raft.group_count,
-            });
+            return Err(ValidationError::GroupCountAboveMax { group_count });
         }
-        // A static cluster member keeps its WAL across restarts; only a
-        // single node may run on a temporary one.
-        if !self.raft.peers.is_empty() && self.raft.wal.path.is_none() {
+        // A cluster member keeps its WAL across restarts; only a single
+        // node may run on a temporary one.
+        if self.raft.lists_another_peer() && self.raft.wal.path.is_none() {
             return Err(ValidationError::RaftWalPathRequired);
         }
-        // Every node of a cluster names the same deployment, so none may
-        // draw its own.
-        if !self.raft.peers.is_empty() && self.server.cluster_id.is_none() {
+        // Every node of a durable deployment names it, so none may draw
+        // its own.
+        if self.raft.wal.path.is_some() && self.server.cluster_id.is_none() {
             return Err(ValidationError::ClusterIdRequired);
         }
         let minimum = self.raft.wal.min_available_size.as_bytes();
@@ -296,18 +305,16 @@ impl UrsulaConfig {
 
     /// On a node that installs snapshots through an S3 snapshot store, a
     /// follower's install copy fits inside `raft.install_snapshot_timeout`.
-    /// The defaults leave a margin. Only a cluster node (`raft.peers` set,
-    /// the predicate the server's topology is chosen by) uses the snapshot
-    /// store: a single node keeps its snapshots inline and never copies.
+    /// The defaults leave a margin. Every Raft node, a single node
+    /// included, uses the store of `storage.snapshot.backend`.
     fn validate_install_copy_budget(&self) -> Result<(), ValidationError> {
-        let cluster_node = !self.raft.peers.is_empty();
         let s3_snapshots = self
             .storage
             .snapshot
             .backend
             .resolve(self.storage.cold.backend)
             == RaftSnapshotBackend::S3;
-        if !(cluster_node && s3_snapshots) {
+        if !s3_snapshots {
             return Ok(());
         }
         let copy_budget = self.storage.snapshot.install_copy_budget();
@@ -331,7 +338,8 @@ impl UrsulaConfig {
                 )));
             }
         }
-        if !self.raft.peers.is_empty() && !seen_ids.contains(&self.raft.node_id) {
+        let must_list_itself = !self.raft.peers.is_empty() || self.raft.wal.path.is_some();
+        if must_list_itself && !seen_ids.contains(&self.raft.node_id) {
             return Err(ValidationError::NodeIdNotInPeers(self.raft.node_id));
         }
         if self.server.cluster_listen.is_some() {
@@ -348,11 +356,14 @@ impl UrsulaConfig {
                 }
             }
         }
+        if self.raft.lists_another_peer() && self.raft.group_count.is_none() {
+            return Err(ValidationError::GroupCountRequired);
+        }
         Ok(())
     }
 
-    /// Every configured meta voter is in the address book: `raft.peers`, or
-    /// this node alone when it is empty.
+    /// Every configured meta voter is in `raft.peers`, or, when it is empty
+    /// (a node on a temporary WAL), this node.
     fn validate_meta_voters(&self) -> Result<(), ValidationError> {
         let Some(voters) = &self.raft.meta_voters else {
             return Ok(());
@@ -458,10 +469,10 @@ mod tests {
         config.raft.node_id = 1;
         config.validate().expect("the default group count is valid");
         let max = usize::try_from(ursula_proto::placement::MAX_GROUP_COUNT).unwrap();
-        config.raft.group_count = max;
+        config.raft.group_count = Some(max);
         config.validate().expect("the bound is valid");
         let above = max.checked_add(1).unwrap();
-        config.raft.group_count = above;
+        config.raft.group_count = Some(above);
         let err = config
             .validate()
             .expect_err("one group above the bound is refused");
@@ -702,21 +713,75 @@ mod tests {
         ));
     }
 
-    /// A single node keeps its snapshots inline whatever the backend says
-    /// and never copies one, so no snapshot-store budget refuses it. The
-    /// same config on a cluster node is refused.
+    /// Every Raft node uses the snapshot store of `storage.snapshot.backend`,
+    /// so a node on a temporary WAL with no peers listed is refused for a
+    /// copy that outlasts its install as a cluster node is.
     #[test]
-    fn a_single_node_is_not_refused_for_a_copy_it_never_makes() {
-        let mut cluster = s3_snapshot_cluster_node();
-        cluster.storage.snapshot.backend = crate::RaftSnapshotBackend::S3;
-        cluster.storage.snapshot.s3_max_retries = 3;
+    fn a_node_on_a_temporary_wal_is_refused_for_a_copy_that_outlasts_its_install() {
+        let mut single = s3_snapshot_cluster_node();
+        single.storage.snapshot.backend = crate::RaftSnapshotBackend::S3;
+        single.storage.snapshot.s3_max_retries = 3;
+        single.raft.peers.clear();
+        single.raft.wal.path = None;
         assert!(matches!(
-            cluster.validate(),
+            single.validate(),
             Err(ValidationError::SnapshotCopyOutlastsInstall { .. })
         ));
-        let mut single = cluster;
-        single.raft.peers.clear();
-        single.validate().expect("a single node copies no snapshot");
+    }
+
+    /// A node with `raft.wal.path` lists itself and names its deployment, and
+    /// a node that lists another peer keeps a WAL path and sets the group
+    /// count. Each refusal is its own variant.
+    #[test]
+    fn a_durable_node_lists_itself_and_a_cluster_sets_its_group_count() {
+        let mut durable = UrsulaConfig::default();
+        durable.raft.node_id = 1;
+        durable.raft.wal.path = Some(std::path::PathBuf::from("/var/lib/ursula/raft"));
+        assert!(matches!(
+            durable.validate(),
+            Err(ValidationError::ClusterIdRequired)
+        ));
+        durable.server.cluster_id =
+            Some(ursula_headers::ClusterId::new("validate-test").expect("a valid cluster id"));
+        assert!(matches!(
+            durable.validate(),
+            Err(ValidationError::NodeIdNotInPeers(1))
+        ));
+        let peer = |node_id: u64| crate::config::RaftPeerConfig {
+            node_id,
+            url: format!("http://node-{node_id}:4437"),
+            client_url: None,
+        };
+        durable.raft.peers = vec![peer(1)];
+        durable
+            .validate()
+            .expect("a single durable node that lists itself");
+
+        let mut cluster = durable.clone();
+        cluster.raft.peers.push(peer(2));
+        assert!(matches!(
+            cluster.validate(),
+            Err(ValidationError::GroupCountRequired)
+        ));
+        cluster.raft.group_count = Some(8);
+        cluster
+            .validate()
+            .expect("a cluster node with its group count");
+        cluster.raft.wal.path = None;
+        assert!(matches!(
+            cluster.validate(),
+            Err(ValidationError::RaftWalPathRequired)
+        ));
+
+        // A temporary WAL needs neither: the server lists the node and
+        // generates its cluster id.
+        let mut temporary = UrsulaConfig::default();
+        temporary.raft.node_id = 1;
+        temporary.validate().expect("a node on a temporary WAL");
+        temporary.raft.peers = vec![peer(1)];
+        temporary
+            .validate()
+            .expect("a node on a temporary WAL that lists itself");
     }
 
     #[test]

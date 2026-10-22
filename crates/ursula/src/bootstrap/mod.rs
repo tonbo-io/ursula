@@ -32,12 +32,14 @@ pub use meta::SpawnedMeta;
 pub use runtime::SpawnRuntimeError;
 pub use runtime::SpawnedRuntime;
 pub use runtime::spawn_runtime;
+#[cfg(test)]
+pub(crate) use runtime::spawn_runtime_with_placement;
 pub use snapshot::SnapshotDriveSettings;
 pub use snapshot::SnapshotDriver;
 // Internals the crate's unit tests exercise directly.
 #[cfg(test)]
 pub(crate) use test_reexports::*;
-pub use topology::Persistence;
+pub use topology::ClusterWal;
 pub use topology::Topology;
 pub(crate) use wal_disk::initialize_wal_disk_monitor;
 pub(crate) use wal_disk::spawn_wal_disk_gate;
@@ -60,7 +62,6 @@ mod test_reexports {
     pub(crate) use super::leadership::plan_leadership_balance;
     pub(crate) use super::leadership::plan_leadership_balance_with_eligible_nodes;
     pub(crate) use super::participation::PeerParticipation;
-    pub(crate) use super::snapshot::LogWriteGate;
     pub(crate) use super::snapshot::ScrubPurge;
     pub(crate) use super::snapshot::StoreGateInputs;
     pub(crate) use super::snapshot::Trigger;

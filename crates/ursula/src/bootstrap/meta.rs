@@ -31,12 +31,11 @@ use ursula_raft::meta::status::MetaStatusReader;
 use ursula_shard::ShardMapError;
 
 use crate::bootstrap::participation::PeerParticipation;
-use crate::bootstrap::topology::Topology;
 
 /// What the spawn path prepared for the meta runtime: the opened meta
 /// journal, the node's peer identity, WAL and registry, the meta runtime's
-/// config, and a cluster node's view of its peers' participation, which
-/// the meta shed hands leaderships by.
+/// config, and the node's view of its peers' participation, which the meta
+/// shed hands leaderships by.
 #[derive(Debug)]
 pub struct SpawnedMeta {
     journal: MetaJournal,
@@ -44,14 +43,14 @@ pub struct SpawnedMeta {
     wal: RaftWal,
     registry: RaftGroupHandleRegistry,
     config: MetaRuntimeConfig,
-    participation: Option<PeerParticipation>,
+    participation: PeerParticipation,
     /// The meta journal's WAL counters.
     wal_metrics: ursula_runtime::RuntimeMetrics,
 }
 
 impl SpawnedMeta {
-    /// Starts the meta runtime over gRPC on the prepared journal, and on a
-    /// cluster node its meta shed.
+    /// Starts the meta runtime over gRPC on the prepared journal, and its
+    /// meta shed.
     pub(crate) async fn start(self) -> MetaSlot {
         let node_id = self.config.node;
         let registry = self.registry.clone();
@@ -63,14 +62,12 @@ impl SpawnedMeta {
             self.identity,
         )
         .await;
-        let shed = self.participation.map(|participation| {
-            super::meta_shed::spawn_meta_shed(
-                registry,
-                participation,
-                runtime.status_reader().clone(),
-                node_id,
-            )
-        });
+        let shed = super::meta_shed::spawn_meta_shed(
+            registry,
+            self.participation,
+            runtime.status_reader().clone(),
+            node_id,
+        );
         MetaSlot(Arc::new(Mutex::new(Some(ServerMeta {
             runtime,
             shed,
@@ -83,7 +80,7 @@ impl SpawnedMeta {
 #[derive(Debug)]
 struct ServerMeta {
     runtime: GrpcMetaRuntime,
-    shed: Option<tokio::task::JoinHandle<()>>,
+    shed: tokio::task::JoinHandle<()>,
     wal_metrics: ursula_runtime::RuntimeMetrics,
 }
 
@@ -100,9 +97,7 @@ impl MetaSlot {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        if let Some(shed) = meta.shed {
-            shed.abort();
-        }
+        meta.shed.abort();
         Some(meta.runtime)
     }
 
@@ -146,23 +141,23 @@ impl MetaSlot {
     }
 }
 
-/// Binds this node's peer identity, its Raft node id and the cluster id
-/// of its WAL root, with its peers, both read from `topology` alone
-/// ([`node_and_peers`]), then opens the meta journal under
+/// Binds this node's peer identity, its Raft node id `node_id` and the
+/// cluster id of its WAL root, with its peers `directory` (`raft.peers`,
+/// which lists the node), then opens the meta journal under
 /// `raft-log/meta/`. A journal that does not open is handed on as such:
 /// the meta runtime then runs `Damaged` and the node serves.
 pub(crate) fn open_meta(
     config: &ursula_config::UrsulaConfig,
-    topology: &Topology,
+    node_id: u64,
+    directory: PeerDirectory,
     wal: &RaftWal,
     registry: &RaftGroupHandleRegistry,
     shard_map: &ursula_shard::StaticShardMap,
     engine: RaftEngineConfig,
     snapshots: MetaSnapshotTrigger,
-    participation: Option<PeerParticipation>,
+    participation: PeerParticipation,
 ) -> Result<SpawnedMeta, ShardMapError> {
     let raft = &config.raft;
-    let (node_id, directory) = node_and_peers(config, topology);
     let identity = PeerIdentity::of_process(
         node_id,
         wal.cluster_id().clone(),
@@ -209,29 +204,4 @@ pub(crate) fn open_meta(
         },
         participation,
     })
-}
-
-/// The node this process runs as and its peers, from the topology the
-/// runtime spawns with, so the bound identity and the data groups' static
-/// factory read one source: a static cluster's node id and peers, or, on a
-/// single node, `raft.node_id` with its address book
-/// ([`ursula_config::RaftConfig::address_book`]).
-fn node_and_peers(
-    config: &ursula_config::UrsulaConfig,
-    topology: &Topology,
-) -> (u64, PeerDirectory) {
-    match topology {
-        Topology::StaticCluster { node_id, peers, .. } => (*node_id, peers.clone()),
-        Topology::SingleNode { .. } => (
-            config.raft.node_id,
-            PeerDirectory::from_config(&config.raft.address_book(&self_url(&config.server))),
-        ),
-    }
-}
-
-/// The cluster URL of a node whose `raft.peers` is empty, for its own
-/// address book entry: its cluster listener, else its client listener.
-fn self_url(server: &ursula_config::ServerConfig) -> String {
-    let listen = server.cluster_listen.as_deref().unwrap_or(&server.listen);
-    format!("http://{listen}")
 }

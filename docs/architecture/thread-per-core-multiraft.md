@@ -42,7 +42,7 @@ raft_group = fnv1a64(bucket_id + "/" + stream_id) % raft.group_count
 core       = raft_group % runtime.core_count
 ```
 
-This is a plain modulo map, not consistent hashing. `raft.group_count` (default `16 * core_count`) is fixed for the life of a cluster and every node must use the same value, so a group ID names the same streams on every node. Changing it remaps most streams, which is why groups never split, merge or resize online. The core is a local choice that depends only on the node's own `runtime.core_count`.
+This is a plain modulo map, not consistent hashing. `raft.group_count` (default `16 * core_count` on a single node, required once `raft.peers` lists another node) is fixed for the life of a cluster and every node must use the same value, so a group ID names the same streams on every node. Changing it remaps most streams, which is why groups never split, merge or resize online. The core is a local choice that depends only on the node's own `runtime.core_count`.
 
 ## Owner-core runtime
 
@@ -51,7 +51,7 @@ This is a plain modulo map, not consistent hashing. `raft.group_count` (default 
 The factory is chosen once at startup:
 
 - `InMemoryGroupEngineFactory`: non-replicated groups over the pure `ursula-stream` state machine. Used by the zero-config development node and by tests.
-- `PlacedRaftGroupEngineFactory`: gated OpenRaft groups over the per-core journal and the gRPC network, with the peers bound to the node's identity and every placement input (which groups the node hosts, each group's seed role and voters) from one `PlacementInputs`, the seed rule's `ConfigSeeds`. A single node runs it too, under `raft.node_id` and seeded over its address book of itself, so it is every group's only voter and initializer. The open of a group's only voter returns once it leads, or after one minimum election timeout when its recovery gate keeps it from leading, so a group a request opens can serve that request.
+- `PlacedRaftGroupEngineFactory`: gated OpenRaft groups over the per-core journal and the gRPC network, with the peers bound to the node's identity and every placement input (which groups the node hosts, each group's seed role and voters) from one `PlacementInputs`, the seed rule's `ConfigSeeds`. Every Raft node runs it, a single node too, under `raft.node_id` and seeded over `raft.peers`, which lists the node itself, so a single node is every group's only voter and initializer. The open of a group's only voter returns once it leads, or after one minimum election timeout when its recovery gate keeps it from leading, so a group a request opens can serve that request.
 
 Threads:
 

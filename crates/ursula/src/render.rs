@@ -89,7 +89,6 @@ pub(crate) fn runtime_error_answer(err: &RuntimeError) -> (StatusCode, ErrorCode
         }
         RuntimeError::InvalidConfig(_)
         | RuntimeError::ColdStoreConfig { .. }
-        | RuntimeError::StaticMembershipConfig { .. }
         | RuntimeError::MailboxClosed { .. }
         | RuntimeError::ResponseDropped { .. }
         | RuntimeError::SpawnCoreThread { .. }

@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use openraft::raft::TransferLeaderRequest;
+use openraft::rt::WatchReceiver;
 use openraft::storage::RaftStateMachine;
 use openraft::vote::RaftLeaderId;
 use ursula_runtime::GroupEngineError;
@@ -280,10 +281,39 @@ impl ElectionPolicy {
         Ok(())
     }
 
+    /// Whether the replica behind `gate` may campaign in a group whose
+    /// effective membership has no voter but this node when `alone`. A
+    /// shed never stops such a group's campaign: no other voter can take
+    /// its leadership, so refusing would only leave it leaderless, and the
+    /// handoff planners find nothing to do there. Only the fence, which
+    /// stops all Raft traffic of the node, and the gate still do.
+    fn may_campaign_in(&self, gate: Option<&GroupRejoin>, alone: bool) -> bool {
+        let state = self.state();
+        let shed_allows = if alone {
+            !state.contains(LeadershipShedState::FENCE)
+        } else {
+            state.should_campaign()
+        };
+        shed_allows && gate.is_none_or(GroupRejoin::may_campaign)
+    }
+
+    /// Sets the replica's election switch by this policy, against its gate
+    /// and the effective membership its metrics show now. A membership
+    /// change alone does not set it again: the next shed change, gate
+    /// change or plan does.
     pub(crate) fn refresh<SM>(&self, raft: &OwnerRaftHandle<SM>, gate: Option<Arc<GroupRejoin>>)
     where SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData> {
         let policy = self.clone();
-        raft.elect(move || policy.may_campaign(gate.as_deref()));
+        let alone = {
+            let metrics = raft.metrics();
+            let metrics = metrics.borrow_watched();
+            metrics
+                .membership_config
+                .membership()
+                .voter_ids()
+                .all(|voter| voter == metrics.id)
+        };
+        raft.elect(move || policy.may_campaign_in(gate.as_deref(), alone));
     }
 }
 

@@ -147,7 +147,7 @@ backend = "s3"
         assert_eq!(config.runtime.core_count, 16);
         // node_id is not in the file — it comes from CLI --node-id at runtime
         assert_eq!(config.raft.node_id, 0); // serde default
-        assert_eq!(config.raft.group_count, 256);
+        assert_eq!(config.raft.group_count, Some(256));
         use crate::config::ColdBackend;
         use crate::config::RaftSnapshotBackend;
         assert_eq!(
@@ -432,7 +432,7 @@ listen = "127.0.0.1:4437"
         let config = load_config(Some(tmp.path()), Some(Preset::Tiny), Some(1)).unwrap();
         // preset no longer overrides core_count
         assert_eq!(config.runtime.core_count, available_cores());
-        assert_eq!(config.raft.group_count, 64); // from tiny preset
+        assert_eq!(config.raft.group_count, Some(64)); // from tiny preset
         assert_eq!(config.raft.wal.path, None); // a single node may run without a path
     }
 
@@ -503,7 +503,7 @@ core_count = 2
         );
         let config = load_config(Some(tmp.path()), Some(Preset::Tiny), Some(1)).unwrap();
         assert_eq!(config.runtime.core_count, 2); // user overrides preset's 4
-        assert_eq!(config.raft.group_count, 64); // preset still applies
+        assert_eq!(config.raft.group_count, Some(64)); // preset still applies
     }
 
     #[test]
@@ -545,7 +545,7 @@ url = "http://127.0.0.1:4438"
         let tmp = temp_config(
             ".toml",
             &format!(
-                "[server]\ncluster_id = \"prod-eu-1\"\n[raft.wal]\npath = \"/tmp/ursula-wal\"\n{peers}"
+                "[server]\ncluster_id = \"prod-eu-1\"\n[raft]\ngroup_count = 8\n[raft.wal]\npath = \"/tmp/ursula-wal\"\n{peers}"
             ),
         );
         let config = load_config(Some(tmp.path()), None, Some(1))
@@ -564,6 +564,9 @@ url = "http://127.0.0.1:4438"
 listen = "0.0.0.0:4437"
 cluster_listen = "0.0.0.0:4439"
 cluster_id = "prod-eu-1"
+
+[raft]
+group_count = 8
 
 [raft.wal]
 path = "/tmp/ursula-wal"
@@ -660,6 +663,7 @@ cluster_id = "meta-test"
 
 [raft]
 meta_voters = [3, 1, 3]
+group_count = 8
 
 [raft.wal]
 path = "/tmp/ursula-wal"
@@ -708,10 +712,10 @@ url = "http://127.0.0.1:4438"
         }
     }
 
-    /// The meta voters are nodes of the address book: `raft.peers`, or this
-    /// node alone when it is empty.
+    /// The meta voters are nodes of `raft.peers`, or, with it empty (a node
+    /// on a temporary WAL), this node alone.
     #[test]
-    fn meta_voters_outside_the_address_book_are_refused() {
+    fn meta_voters_outside_the_peers_are_refused() {
         let refused = |contents: &str| {
             let tmp = temp_config(".toml", contents);
             match load_config(Some(tmp.path()), None, Some(1)) {
@@ -740,11 +744,15 @@ node_id = 2
 url = "http://127.0.0.1:4438"
 "#;
         assert_eq!(
-            refused(&format!("[raft]\nmeta_voters = [2, 1]\n{cluster}")),
+            refused(&format!(
+                "[raft]\nmeta_voters = [2, 1]\ngroup_count = 8\n{cluster}"
+            )),
             None
         );
         assert_eq!(
-            refused(&format!("[raft]\nmeta_voters = [1, 4]\n{cluster}")),
+            refused(&format!(
+                "[raft]\nmeta_voters = [1, 4]\ngroup_count = 8\n{cluster}"
+            )),
             Some(4)
         );
     }
@@ -806,7 +814,7 @@ url = "http://127.0.0.1:4438"
         use crate::config::WalFsync;
 
         assert_eq!(crate::UrsulaConfig::default().raft.wal.fsync, None);
-        let disk = |fsync: &str| format!("[raft.wal]\npath = \"/tmp/ursula-wal\"\n{fsync}\n");
+        let disk = |fsync: &str| format!("[raft.wal]\n{fsync}\n");
         for (line, expected) in [
             ("", None),
             ("fsync = \"always\"", Some(WalFsync::Always)),
@@ -833,7 +841,6 @@ url = "http://127.0.0.1:4438"
             ".toml",
             r#"
 [raft.wal]
-path = "/tmp/ursula-wal"
 min_available_size = "1GiB"
 resume_available_size = "512MiB"
 "#,
@@ -857,7 +864,6 @@ resume_available_size = "512MiB"
             ".toml",
             r#"
 [raft.wal]
-path = "/tmp/ursula-wal"
 segment_size = "8MiB"
 cache_size = "32MiB"
 "#,
@@ -870,7 +876,6 @@ cache_size = "32MiB"
             ".toml",
             r#"
 [raft.wal]
-path = "/tmp/ursula-wal"
 segment_size = "1KiB"
 "#,
         );
@@ -936,6 +941,9 @@ max_size = "128MiB"
             r#"
 [server]
 cluster_id = "test"
+
+[raft]
+group_count = 8
 
 [raft.wal]
 path = "/tmp/ursula-wal"
@@ -1045,7 +1053,7 @@ listen = "127.0.0.1:4437"
     fn preset_alone_without_config_file() {
         let config = load_config(None, Some(Preset::Tiny), Some(1)).unwrap();
         assert_eq!(config.runtime.core_count, available_cores());
-        assert_eq!(config.raft.group_count, 64);
+        assert_eq!(config.raft.group_count, Some(64));
         assert_eq!(config.raft.node_id, 1);
         assert_eq!(
             config
@@ -1086,7 +1094,7 @@ listen = "127.0.0.1:4437"
             );
             let actual = (
                 config.runtime.live_read_max_waiters_per_core,
-                config.raft.group_count,
+                config.raft.effective_group_count(),
                 config
                     .raft
                     .max_uncommitted_size_per_group
