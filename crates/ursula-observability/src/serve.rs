@@ -7,8 +7,9 @@
 //! exit after a grace period, multiple listeners) compose these primitives
 //! instead of re-rolling signal handling.
 //!
-//! A drain closes no HTTP/1 connection under a request the client may have
-//! sent on it: see [`serve_until_shutdown`] and [`CLIENT_IDLE_BOUND`].
+//! A drain answers a request a client sends on a pooled HTTP/1 connection
+//! that was idle when the drain began, within the bounds and with the gaps
+//! that [`serve_until_shutdown`] names. See also [`CLIENT_IDLE_BOUND`].
 
 use std::fmt::Debug;
 use std::future::Future;
@@ -44,10 +45,12 @@ use tokio::sync::watch;
 pub const CLOSE_NOTICE: Duration = Duration::from_secs(1);
 
 /// The longest an HTTP/1 client may keep a pooled connection to an Ursula
-/// server idle and still send a request on it, so that a drain answers every
-/// request the client sends: the server keeps the connection open for
-/// [`CLOSE_NOTICE`], and the rest of the notice covers a request sent at this
-/// bound on its way to the server. The gateway's upstream pool keeps to it.
+/// server idle and still send a request on it, so that a drain answers a
+/// request the client sends on a connection that was idle when the drain
+/// began: the server keeps that connection open for [`CLOSE_NOTICE`], and the
+/// rest of the notice covers a request sent at this bound on its way to the
+/// server. [`serve_until_shutdown`] names the closes this does not cover. The
+/// gateway's upstream pool keeps to it.
 pub const CLIENT_IDLE_BOUND: Duration = Duration::from_millis(500);
 
 const _: () = assert!(CLIENT_IDLE_BOUND.as_millis() < CLOSE_NOTICE.as_millis());
@@ -232,18 +235,30 @@ async fn announce_close(
 ///    client that it sent nothing. A connection the kernel completed but the
 ///    server had not accepted yet is reset instead, the one close of the
 ///    drain that its client cannot tell from a lost request.
-/// 2. Every HTTP/1 answer carries `Connection: close`, and its connection
-///    closes after it. A connection its client keeps idle stays open, so a
-///    request the client sends on it is answered.
+/// 2. Every HTTP/1 answer the server starts from then on carries
+///    `Connection: close`, and its connection closes after it. A connection
+///    its client keeps idle stays open, so a request the client sends on it
+///    is answered.
 /// 3. Once every connection has closed, or after [`CLOSE_NOTICE`], the
 ///    connections still open close as each finishes its request in flight:
 ///    an idle HTTP/1 connection at once, an HTTP/2 connection after `GOAWAY`.
 ///
-/// So a client that reuses a connection idle for at most
-/// [`CLIENT_IDLE_BOUND`] never sends a request on a connection the drain
-/// closes without reading it. An HTTP/1 client cannot tell such a request
-/// from one the server read and lost, so a proxy answers it `502` and must
-/// not send it again.
+/// So a request a client sends on a pooled connection that went idle at most
+/// [`CLIENT_IDLE_BOUND`] earlier is answered, if the connection was idle when
+/// the drain began or its last answer started after that, the request reaches
+/// the server within the rest of the notice (0.5 s), and `drain_timeout` is
+/// at least [`CLOSE_NOTICE`]. Two closes are not covered:
+///
+/// - A connection the kernel completed but the server had not accepted when
+///   the listener closed is reset, after its client may have written a
+///   request on it.
+/// - An answer the server started before the drain began carries no
+///   `Connection: close`. Its connection closes after it, at once if it ends
+///   after [`CLOSE_NOTICE`] and at the end of the notice otherwise, so its
+///   client may send its next request into that close.
+///
+/// An HTTP/1 client cannot tell a request lost to either from one the server
+/// read and lost, so a proxy answers it `502` and must not send it again.
 ///
 /// Every connection it accepts sets `TCP_NODELAY`: without it, Nagle's
 /// algorithm and the peer's delayed acknowledgement hold back a second reply

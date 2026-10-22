@@ -1466,10 +1466,14 @@ impl UpstreamKeepalive {
 /// idle.
 ///
 /// A pooled connection is reused only while it has been idle for at most
-/// [`CLIENT_IDLE_BOUND`]. A node's graceful drain keeps an idle connection
-/// open longer than that, so it answers every request the gateway sends on
-/// one, and closes it after the answer. A request sent on a connection that
-/// then closes unanswered may have reached the node, and is a `502`.
+/// [`CLIENT_IDLE_BOUND`]. A node's graceful drain keeps a connection that was
+/// idle when it began open longer than that, so it answers a request the
+/// gateway sends on one in time, and closes the connection after the answer.
+/// A request sent on a connection that then closes unanswered may have
+/// reached the node, and is a `502`. The drain still closes two kinds of
+/// connection that way: one the node had not accepted when its listener
+/// closed, and one whose last answer started before the drain
+/// ([`ursula_observability::serve::serve_until_shutdown`]).
 fn upstream_client(config: &GatewayConfig) -> reqwest::Client {
     let keepalive = UpstreamKeepalive::for_user_timeout(config.upstream_tcp_user_timeout_secs);
     let builder = reqwest::Client::builder()
