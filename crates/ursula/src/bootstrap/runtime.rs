@@ -1,8 +1,9 @@
 use std::sync::Arc;
 
 use ursula_config::config::ColdBackend;
-use ursula_raft::ConfigSeeds;
+use ursula_raft::HostingSet;
 use ursula_raft::JournalTuning;
+use ursula_raft::MetaPlacement;
 use ursula_raft::PeerDirectory;
 use ursula_raft::PlacementInputs;
 use ursula_raft::RaftEngineConfig;
@@ -25,6 +26,7 @@ use ursula_runtime::spawn_cold_ref_offload_worker;
 use crate::bootstrap::cold_health;
 use crate::bootstrap::commit_stall;
 use crate::bootstrap::egress;
+use crate::bootstrap::hosting::SpawnedHosting;
 use crate::bootstrap::leadership;
 use crate::bootstrap::meta;
 use crate::bootstrap::meta::SpawnedMeta;
@@ -50,6 +52,13 @@ pub struct SpawnedRuntime {
     /// records unbound then stay held out
     /// ([`ursula_runtime::NodeFence::awaits_binding`]) for the whole run.
     pub meta: Option<SpawnedMeta>,
+    /// The placement inputs of a Raft node's groups, which its HTTP routes
+    /// read too.
+    pub placement: Option<Arc<dyn PlacementInputs>>,
+    /// The hosting set and placement the hosting driver takes, when the
+    /// node's groups are placed by meta. The server starts the driver
+    /// ([`SpawnedHosting::start`]). Until then the node hosts nothing.
+    pub hosting: Option<SpawnedHosting>,
 }
 
 #[cfg(test)]
@@ -83,16 +92,23 @@ pub enum SpawnRuntimeError {
 }
 
 /// Spawns a runtime from a typed `ursula_config::UrsulaConfig`. A Raft
-/// node's groups take the seed rule's voters and initializer over
-/// `raft.peers` ([`ConfigSeeds`], interim: meta's placement replaces it in
-/// S2(h)).
+/// node's groups are placed by meta ([`MetaPlacement`]): it hosts nothing
+/// until the server starts its hosting driver ([`SpawnedRuntime::hosting`]).
 pub fn spawn_runtime(
     config: &ursula_config::UrsulaConfig,
     topology: Topology,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
-    let replication_factor = config.raft.placement.replication_factor;
-    spawn_with_inputs(config, topology, |node_id, peers, group_count| {
-        Arc::new(ConfigSeeds::new(peers, group_count, replication_factor).for_node(node_id))
+    spawn_with_inputs(config, topology, |node_id, registry| {
+        let hosting = HostingSet::default();
+        let placement = MetaPlacement::new(
+            ursula_proto::placement::NodeId::new(node_id),
+            registry.clone(),
+            hosting.clone(),
+        );
+        (
+            Arc::new(placement.clone()),
+            Some(SpawnedHosting { placement, hosting }),
+        )
     })
 }
 
@@ -104,18 +120,22 @@ pub(crate) fn spawn_runtime_with_placement(
     topology: Topology,
     placement: ursula_raft::FixedPlacement,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
-    spawn_with_inputs(config, topology, move |_node_id, _peers, _group_count| {
-        Arc::new(placement)
+    spawn_with_inputs(config, topology, move |_node_id, _registry| {
+        (Arc::new(placement), None)
     })
 }
 
+/// The placement inputs of a node's groups, by its node id and registry,
+/// and what its hosting driver takes, if one decides what it hosts.
+type NodeInputs = (Arc<dyn PlacementInputs>, Option<SpawnedHosting>);
+
 /// The one spawn path. A Raft node's groups open behind their recovery
-/// gates with the placement inputs `inputs` gives for the node, its peers
-/// and its group count.
+/// gates with the placement inputs `inputs` gives for the node and its
+/// registry.
 fn spawn_with_inputs(
     config: &ursula_config::UrsulaConfig,
     topology: Topology,
-    inputs: impl FnOnce(u64, &PeerDirectory, usize) -> Arc<dyn PlacementInputs>,
+    inputs: impl FnOnce(u64, &RaftGroupHandleRegistry) -> NodeInputs,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let mut runtime_config =
         RuntimeConfig::from_ursula_config(&config.runtime, topology.group_count());
@@ -142,17 +162,16 @@ fn spawn_with_inputs(
                 raft_registry: None,
                 raft_wal: None,
                 meta: None,
+                placement: None,
+                hosting: None,
             }
         }
         Topology::Cluster {
             node_id,
             peers,
-            group_count,
+            group_count: _,
             wal,
-        } => {
-            let inputs = inputs(node_id, &peers, group_count);
-            spawn_raft_node(config, runtime_config, node_id, peers, &wal, inputs)?
-        }
+        } => spawn_raft_node(config, runtime_config, node_id, peers, &wal, inputs)?,
     };
     ursula_runtime::tidy_worker::spawn_tidy_worker(
         &spawned.runtime,
@@ -187,15 +206,15 @@ fn cold_store(
 }
 
 /// A Raft node, a single node as a node of a cluster: its WAL, its meta
-/// journal, its groups over `inputs`, and every gate and driver of a
-/// Raft node.
+/// journal, its groups over the placement inputs `inputs` gives, and every
+/// gate and driver of a Raft node.
 fn spawn_raft_node(
     config: &ursula_config::UrsulaConfig,
     runtime_config: RuntimeConfig,
     node_id: u64,
     peers: PeerDirectory,
     wal: &ClusterWal,
-    inputs: Arc<dyn PlacementInputs>,
+    inputs: impl FnOnce(u64, &RaftGroupHandleRegistry) -> NodeInputs,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let group_count = runtime_config.raft_group_count;
     let snapshot_store =
@@ -277,11 +296,15 @@ fn spawn_raft_node(
         participation.clone(),
     )
     .map_err(RuntimeError::from)?;
-    let factory =
-        ursula_raft::PlacedRaftGroupEngineFactory::new(raft_wal.clone(), registry.clone(), inputs)
-            .with_cold_store(cold_store.clone())
-            .with_snapshot_store(snapshot_store.clone())
-            .with_engine_config(engine_config);
+    let (placement, hosting) = inputs(node_id, &registry);
+    let factory = ursula_raft::PlacedRaftGroupEngineFactory::new(
+        raft_wal.clone(),
+        registry.clone(),
+        Arc::clone(&placement),
+    )
+    .with_cold_store(cold_store.clone())
+    .with_snapshot_store(snapshot_store.clone())
+    .with_engine_config(engine_config);
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         runtime_config,
         factory,
@@ -327,5 +350,7 @@ fn spawn_raft_node(
         raft_registry: Some(registry),
         raft_wal: Some(raft_wal),
         meta: Some(meta),
+        placement: Some(placement),
+        hosting,
     })
 }

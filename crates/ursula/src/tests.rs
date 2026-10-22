@@ -310,8 +310,7 @@ fn group_engine_leadership_refusal_is_detected_without_matching_message() {
 // typed.
 #[test]
 fn leader_redirect_never_points_at_this_node() {
-    let router = ClientWriteLeaderRouter::with_static_topology(
-        Some(2),
+    let router = ClientWriteLeaderRouter::new(
         bound_peer_cluster(
             2,
             crate::shared_peers([
@@ -319,7 +318,7 @@ fn leader_redirect_never_points_at_this_node() {
                 (2, "http://node-2".to_owned()),
             ]),
         ),
-        BTreeMap::new(),
+        Arc::new(ursula_raft::FixedPlacement::single(2)),
     );
     let forward = |leader: Option<KnownLeader>| RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
@@ -358,8 +357,7 @@ fn leader_redirect_never_points_at_this_node() {
 // and `leader_url` both give up.
 #[test]
 fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
-    let router = ClientWriteLeaderRouter::with_static_topology(
-        Some(2),
+    let router = ClientWriteLeaderRouter::new(
         bound_peer_cluster(
             2,
             crate::shared_peers([
@@ -367,7 +365,7 @@ fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
                 (2, "http://node-2:4437".to_owned()),
             ]),
         ),
-        BTreeMap::new(),
+        Arc::new(ursula_raft::FixedPlacement::single(2)),
     );
     let unlisted = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
@@ -577,6 +575,8 @@ struct StaticGrpcTestNode {
     /// The node's router, for requests sent in process.
     app: Router,
     registry: RaftGroupHandleRegistry,
+    /// What the node's groups and its routes read of placement.
+    placement: Arc<dyn ursula_raft::PlacementInputs>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
     raft_wal: ursula_raft::RaftWal,
@@ -604,6 +604,74 @@ impl StaticGrpcTestNode {
             }
         }
         shutdown_test_wal(&self.runtime, &self.raft_wal).await;
+    }
+}
+
+/// The seed rule's placement of every group of the static test cluster,
+/// as meta's `Bootstrap` seeds it over the peers
+/// ([`ursula_control::seed_voters`], [`ursula_control::initializer`]): a
+/// group's seed voters host it and may create it, and its initializer
+/// initializes it. No meta runs in these tests.
+#[derive(Debug)]
+struct SeededPlacement(BTreeMap<RaftGroupId, ursula_raft::FixedPlacement>);
+
+impl SeededPlacement {
+    fn new(
+        node: u64,
+        peers: &ursula_raft::PeerDirectory,
+        group_count: usize,
+        replication_factor: ursula_proto::placement::ReplicationFactor,
+    ) -> Self {
+        let nodes = ursula_proto::placement::NodeSet::new(
+            peers
+                .node_ids()
+                .map(ursula_proto::placement::NodeId::new)
+                .collect(),
+        )
+        .expect("the test cluster has peers");
+        let factor = ursula_control::effective_replication_factor(replication_factor, &nodes);
+        let groups = (0..group_count)
+            .map(|group| {
+                let group = RaftGroupId(u32::try_from(group).expect("group ids fit u32"));
+                let seed = ursula_raft::FixedPlacement {
+                    node,
+                    voters: ursula_control::seed_voters(group, factor, &nodes)
+                        .iter()
+                        .map(ursula_proto::placement::NodeId::get)
+                        .collect(),
+                    initializer: ursula_control::initializer(group, &nodes).get(),
+                };
+                (group, seed)
+            })
+            .collect();
+        Self(groups)
+    }
+
+    /// The seed of `group` when this node is one of its voters.
+    fn hosted(&self, group: RaftGroupId) -> Option<&ursula_raft::FixedPlacement> {
+        self.0
+            .get(&group)
+            .filter(|seed| seed.voters.contains(&seed.node))
+    }
+}
+
+impl ursula_raft::PlacementInputs for SeededPlacement {
+    fn admission(&self, group: RaftGroupId) -> Option<ursula_control::Admission> {
+        self.hosted(group)?.admission(group)
+    }
+
+    fn seed_role(&self, group: RaftGroupId) -> Arc<dyn ursula_raft::SeedRole> {
+        match self.hosted(group) {
+            Some(seed) => seed.seed_role(group),
+            None => Arc::new(ursula_raft::FixedRole(None)),
+        }
+    }
+
+    fn nodes(&self, group: RaftGroupId) -> Arc<dyn ursula_raft::GroupNodes> {
+        match self.0.get(&group) {
+            Some(seed) => seed.nodes(group),
+            None => Arc::new(ursula_raft::FixedNodes::from_voters(BTreeSet::new())),
+        }
     }
 }
 
@@ -691,18 +759,18 @@ async fn spawn_static_grpc_test_node(
             )
         }
     };
-    // The seed rule over the peers, as the server seeds its groups over
-    // `raft.peers`, then the bind, as the server binds its node before the
-    // runtime starts.
+    // The seed rule over the peers, as meta's `Bootstrap` seeds the groups
+    // over `raft.peers`, then the bind, as the server binds its node before
+    // the runtime starts.
     let peers = crate::shared_peers(peers);
-    let seeds = ursula_raft::ConfigSeeds::new(
+    let placement: Arc<dyn ursula_raft::PlacementInputs> = Arc::new(SeededPlacement::new(
+        node_id,
         &peers,
         raft_group_count,
         storage
             .replication_factor
             .unwrap_or(ursula_config::PlacementConfig::default().replication_factor),
-    );
-    let voter_table = seeds.voter_table();
+    ));
     registry.peer_cluster().bind(
         ursula_raft::PeerIdentity::new(node_id, log_stores.cluster_id().clone()),
         peers,
@@ -710,7 +778,7 @@ async fn spawn_static_grpc_test_node(
     let mut factory = PlacedRaftGroupEngineFactory::new(
         log_stores.clone(),
         registry.clone(),
-        Arc::new(seeds.for_node(node_id)),
+        Arc::clone(&placement),
     );
     factory = factory.with_cold_store(storage.cold_store.clone());
     if let Some(engine_config) = storage.engine_config {
@@ -727,13 +795,8 @@ async fn spawn_static_grpc_test_node(
             .expect("runtime");
     // Its answers name the cluster its WAL holds, as a server's do.
     let app = router_with_http_state(
-        HttpState::with_static_raft_cluster_topology(
-            runtime.clone(),
-            registry.clone(),
-            Some(node_id),
-            voter_table,
-        )
-        .with_configured_cluster_id(Some(static_test_cluster_id())),
+        HttpState::with_raft_cluster(runtime.clone(), registry.clone(), Arc::clone(&placement))
+            .with_configured_cluster_id(Some(static_test_cluster_id())),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let served = app.clone();
@@ -752,6 +815,7 @@ async fn spawn_static_grpc_test_node(
         runtime,
         app,
         registry,
+        placement,
         shutdown: Some(shutdown_tx),
         server,
         raft_wal: log_stores,
@@ -1995,6 +2059,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
+    let inputs = spawned.placement.expect("a Raft node's placement");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
         .get(RaftGroupId(0))
@@ -2003,7 +2068,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .current_leader(1, "static durable gRPC Raft group should elect node 1")
         .await
         .expect("wait for leader");
-    let app = router_with_static_raft_cluster(runtime.clone(), registry);
+    let app = router_with_raft_cluster(runtime.clone(), registry, inputs);
 
     let response = http_put(
         &app,
@@ -2073,6 +2138,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         spawned.bind_without_meta();
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
+        let inputs = spawned.placement.expect("a Raft node's placement");
         let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
         runtime.warm_all_groups().await.expect("warm group");
         let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
@@ -2084,7 +2150,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "static durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for leader");
-        let app = router_with_static_raft_cluster(runtime, registry);
+        let app = router_with_raft_cluster(runtime, registry, inputs);
 
         let response = http_put(
             &app,
@@ -2128,6 +2194,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("restarted runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
+        let inputs = spawned.placement.expect("a Raft node's placement");
         let raft_wal = spawned.raft_wal.expect("restarted WAL");
         let opening = raft_wal.opening();
         assert_eq!(
@@ -2156,7 +2223,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .await
             .expect("wait for restarted leader");
         let shutdown_runtime = runtime.clone();
-        let app = router_with_static_raft_cluster(runtime, registry);
+        let app = router_with_raft_cluster(runtime, registry, inputs);
 
         let response = http_get(
             &app,
@@ -2811,17 +2878,16 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
     // Pressure comes after routing: a follower whose WAL disk is under
     // pressure redirects a write, and the leader under the same pressure
     // refuses it with a retryable `503`.
-    let pressured = |node: &StaticGrpcTestNode, node_id: u64| {
+    let pressured = |node: &StaticGrpcTestNode| {
         let monitor = WalDiskMonitor::new(100, 200);
         assert_eq!(
             monitor.observe_available(99),
             crate::wal_disk::WalDiskTransition::EnterPressure
         );
-        let state = HttpState::with_static_raft_cluster_topology(
+        let state = HttpState::with_raft_cluster(
             node.runtime.clone(),
             node.registry.clone(),
-            Some(node_id),
-            BTreeMap::new(),
+            Arc::clone(&node.placement),
         )
         .with_wal_disk_monitor(monitor.clone());
         client_router_with_admission(
@@ -2842,10 +2908,10 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
         )
         .await
     };
-    let redirected = append(pressured(&nodes[1], 2)).await;
+    let redirected = append(pressured(&nodes[1])).await;
     assert_eq!(redirected.status(), StatusCode::TEMPORARY_REDIRECT);
     assert!(redirected.headers().contains_key(names::X_URSULA_RAFT_TERM));
-    let refused = append(pressured(&nodes[0], 1)).await;
+    let refused = append(pressured(&nodes[0])).await;
     assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert!(
         refused
@@ -6947,7 +7013,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
     }
 }
 #[tokio::test]
-async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_missing() {
+async fn raft_readiness_uses_the_placed_inventory_even_when_every_group_is_missing() {
     let runtime = spawn_runtime(&test_config(1, 2), Topology::Development { group_count: 2 })
         .expect("runtime")
         .runtime;
@@ -6960,7 +7026,12 @@ async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_m
             (3, "http://localhost:4439".to_owned()),
         ]),
     );
-    let state = HttpState::with_static_raft_cluster_topology(runtime, registry, 1, BTreeMap::new());
+    let placement = ursula_raft::FixedPlacement {
+        node: 1,
+        voters: BTreeSet::from([1, 2, 3]),
+        initializer: 1,
+    };
+    let state = HttpState::with_raft_cluster(runtime, registry, Arc::new(placement));
     let app = client_router_with_admission(state, IngressAdmission::default());
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -10141,6 +10212,7 @@ mod cluster_egress {
     use std::collections::BTreeMap;
     use std::collections::BTreeSet;
 
+    use ursula_proto::placement::NodeId;
     use ursula_raft::RaftGroupMetricsSnapshot;
     use ursula_shard::RaftGroupId;
 
@@ -10266,17 +10338,23 @@ mod cluster_egress {
     /// each, not once per group.
     #[test]
     fn one_probe_per_peer_whatever_the_group_count() {
-        let seeds = ursula_raft::ConfigSeeds::new(
-            &peers(),
-            1024,
+        let nodes = ursula_proto::placement::NodeSet::new((1..=4).map(NodeId::new).collect())
+            .expect("four nodes");
+        let factor = ursula_control::effective_replication_factor(
             ursula_config::PlacementConfig::default().replication_factor,
+            &nodes,
         );
         // The groups whose seed voters list node 1, as its replicas count.
-        let voters = seeds
-            .voter_table()
-            .into_iter()
-            .filter(|(_, voters)| voters.contains(&1))
-            .map(|(group, voters)| (group, vec![voters]))
+        let voters = (0..1024)
+            .map(|group| {
+                let voters: BTreeSet<u64> =
+                    ursula_control::seed_voters(RaftGroupId(group), factor, &nodes)
+                        .iter()
+                        .map(NodeId::get)
+                        .collect();
+                (RaftGroupId(group), vec![voters])
+            })
+            .filter(|(_, configs)| configs.iter().any(|voters| voters.contains(&1)))
             .collect();
         let plan = cluster_egress_probe_plan(1, &peers(), &voters);
 
@@ -10285,6 +10363,27 @@ mod cluster_egress {
         assert_eq!(plan.peer_urls.keys().copied().collect::<Vec<_>>(), vec![
             2, 3, 4
         ]);
+    }
+
+    /// A group whose configs all leave this node out is not probed: the
+    /// node cannot lead it, though its replica counts by its placed role.
+    /// The bug it catches: a degraded group the node cannot lead sheds
+    /// every leadership the node holds.
+    #[test]
+    fn a_group_whose_configs_leave_this_node_out_is_not_probed() {
+        let voters = BTreeMap::from([
+            (RaftGroupId(0), vec![BTreeSet::from([1, 2, 3])]),
+            (RaftGroupId(1), vec![BTreeSet::from([2, 3, 4])]),
+        ]);
+        let plan = cluster_egress_probe_plan(1, &peers(), &voters);
+
+        let probed: Vec<_> = plan
+            .groups
+            .iter()
+            .map(|group| group.raft_group_id)
+            .collect();
+        assert_eq!(probed, vec![RaftGroupId(0)]);
+        assert!(plan.degraded(&BTreeSet::from([2])).is_none());
     }
 
     /// A group short of a quorum of answers degrades the tick, and only

@@ -31,6 +31,11 @@
 //! - closes every running replica the plan does not admit (7.3's steps 1
 //!   to 3), then forgets its gauges and its open back-off.
 //! - publishes a [`HostingStatus`] for readiness.
+//! - refreshes the elections of every running replica whose placed voters
+//!   made it its group's only voter and no longer do, or the reverse
+//!   ([`RaftGroupHandleRegistry::refresh_only_voter_elections`]): the shed
+//!   exemption of an only voter reads those voters, and the election switch
+//!   holds what it read last.
 //!
 //! While the node fence refuses, the driver creates and closes nothing:
 //! every admission it publishes is `Open`, and no group leaves the set.
@@ -98,7 +103,7 @@ pub trait GroupHost: Send + Sync + 'static {
 
     /// Forgets what the node kept of a closed replica of `group`: its
     /// gauges and its open back-off (7.3, step 6).
-    fn forget(&self, group: RaftGroupId);
+    fn forget(&self, group: RaftGroupId) -> BoxFuture<'_, ()>;
 }
 
 /// The data groups this node may run, and how each may open. Only the
@@ -220,9 +225,11 @@ impl<H: GroupHost> HostingDriver<H> {
         let (mut views_open, mut groups_open, mut answers_open) = (true, true, true);
         let mut actions = Actions::new();
         let mut confirms = Confirms::default();
+        let mut only_voter = BTreeSet::new();
         loop {
             actions.reap();
             self.pass(&mut actions, &mut confirms).await;
+            self.registry.refresh_only_voter_elections(&mut only_voter);
             let ended = crate::rt::select! {
                 biased;
                 changed = views.changed(), if views_open => {
@@ -346,7 +353,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 self.begin(actions, group, async move {
                     match host.close(group).await {
                         Ok(()) => {
-                            host.forget(group);
+                            host.forget(group).await;
                             ActionEnd::Done
                         }
                         Err(error) => {

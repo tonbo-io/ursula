@@ -3,8 +3,8 @@
 //! [`PeerDirectory`] maps a node id to its [`PeerEndpoints`]: the URL peers
 //! dial for its cluster plane and the URL clients reach its client plane at.
 //! The server builds it once at config load, lends it at startup (the
-//! format-epoch probe, meta's genesis node set and the interim seed table)
-//! and moves it into the one [`crate::PeerCluster::bind`]. Every other
+//! format-epoch probe and meta's genesis node set) and moves it into the
+//! one [`crate::PeerCluster::bind`]. Every other
 //! reader of a configured peer address, the engine factory, the leader
 //! router, the leadership-shed polls, the egress probe and the shutdown
 //! handoff, reads it there at each use ([`crate::PeerCluster::directory`]).

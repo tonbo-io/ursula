@@ -354,10 +354,18 @@ pub(super) async fn run_leader_read_linearizability_inner(
         ),
         peers,
     );
-    let state = HttpState::with_static_raft_cluster(runtime.clone(), registry)
-        .with_wall_clock_handle(Arc::new(SimHttpWallClock {
-            now_ms: Arc::new(AtomicU64::new(1_000)),
-        }));
+    let state = HttpState::with_raft_cluster(
+        runtime.clone(),
+        registry,
+        Arc::new(ursula_raft::FixedPlacement {
+            node: 1,
+            voters: (1..=3).collect(),
+            initializer: 1,
+        }),
+    )
+    .with_wall_clock_handle(Arc::new(SimHttpWallClock {
+        now_ms: Arc::new(AtomicU64::new(1_000)),
+    }));
     let app = router_with_http_state(state);
     trace.push(SimEvent::ClusterBuilt { seed: config.seed });
 

@@ -4058,6 +4058,25 @@ async fn try_node_metrics(
         .map_err(|err| format!("GET {url}: {err}"))
 }
 
+/// The metrics of `node` once it runs a replica of every group, as its
+/// hosting driver opens each group the cluster places on it.
+async fn placed_replicas(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+) -> ursula_proto::admin::NodeMetrics {
+    let what = format!("node {} runs its placed replicas", node.id);
+    eventually(procs, &what, async || {
+        let metrics = try_node_metrics(client, &node.url()).await?;
+        if metrics.groups.len() == META_TEST_GROUPS {
+            Ok(metrics)
+        } else {
+            Err(format!("{:?}", metrics.groups))
+        }
+    })
+    .await
+}
+
 /// Asserts that every data replica node `node` reports took part in
 /// nothing: no vote floor (term 0, where a barrier would adopt its
 /// leader's), no entry and a closed recovery gate.
@@ -4270,9 +4289,10 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
 /// and the meta group records them, while no meta voter can dial them yet.
 /// Once nodes 1 to 3 restart one at a time with the full `raft.peers`, the
 /// meta leader replicates to nodes 4 and 5 as meta learners, and their
-/// views reach the bootstrapped cluster. Until placement decides hosting,
-/// the data groups follow the seed rule over `raft.peers`, which this test
-/// grows, so it asserts nothing of them.
+/// views reach the bootstrapped cluster. Placement decides what each node
+/// hosts: every group stays on the genesis peers it was seeded on, though
+/// `raft.peers` grew, and nodes 4 and 5, in no group's seeds, host nothing
+/// and route a write to a node that hosts its group.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_learn() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -4383,6 +4403,141 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
             .all(|id| meta_metrics.learner_ids.contains(id)),
         "{meta_metrics:?}"
     );
+
+    // 4. Nodes 1 to 3 run every group, and the late nodes none. A seed
+    // rule read over the grown `raft.peers` would place groups on nodes 4
+    // and 5 instead.
+    for node in &nodes[..3] {
+        placed_replicas(&client, &mut procs, node).await;
+    }
+    for node in &nodes[3..] {
+        let metrics = node_metrics(&client, &node.url()).await;
+        assert!(metrics.groups.is_empty(), "node {}: {metrics:?}", node.id);
+    }
+    // A write to a late node redirects to a node its view places the
+    // group on, typed as `NotHosted`, and lands there.
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client without redirects");
+    let stream = format!("{}/meta-cli/late-node", nodes[3].url());
+    let redirect = eventually(&mut procs, "node 4 redirects a write", async || {
+        let response = no_redirect
+            .put(&stream)
+            .header("content-type", "text/plain")
+            .send()
+            .await
+            .map_err(|err| format!("PUT {stream}: {err}"))?;
+        if response.status() == reqwest::StatusCode::TEMPORARY_REDIRECT {
+            Ok(response)
+        } else {
+            Err(format!("PUT {stream}: {}", response.status()))
+        }
+    })
+    .await;
+    let routing = ursula_headers::RoutingAnswer::parse(
+        redirect.status().as_u16(),
+        redirect
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+    );
+    assert!(
+        matches!(
+            routing,
+            Ok(Some(ursula_headers::RoutingAnswer::NotHosted { .. }))
+        ),
+        "{routing:?}"
+    );
+    let location = redirect.headers()["location"].to_str().expect("a location");
+    assert!(
+        nodes[..3]
+            .iter()
+            .any(|node| location == format!("{}/meta-cli/late-node", node.url())),
+        "the redirect names a seeded node: {location}"
+    );
+    put_until_created(&client, &stream).await;
+    let metrics = node_metrics(&client, &nodes[3].url()).await;
+    assert!(metrics.groups.is_empty(), "node 4: {metrics:?}");
+}
+
+/// Placement-driven hosting where the nodes outnumber the replication
+/// factor (#768, 4.1 to 4.3): four nodes at replication factor 3 each host
+/// the three groups whose seed voters list them, and no other. A node's own
+/// opens hold its one core's journal while it plans, so a plan may read the
+/// core's other groups as unknown and try to open the group it is not
+/// placed in: that open fails, and the node never runs the group. After a
+/// restart, a node opens what its journal holds and only that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_four_nodes_host_only_the_groups_meta_seeds_on_them() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 4);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
+    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    let seeded = |node: &MetaNode| -> BTreeSet<u64> {
+        cluster
+            .groups()
+            .iter()
+            .filter(|(_, placement)| placement.current_voters().contains(NodeId::new(node.id)))
+            .map(|(group, _)| u64::from(group.0))
+            .collect()
+    };
+    for node in &nodes {
+        assert_eq!(seeded(node).len(), 3, "node {}: {cluster:?}", node.id);
+        runs_exactly(&client, &mut procs, node, &seeded(node)).await;
+    }
+    let stream = format!("{}/meta-cli/four-nodes", nodes[0].url());
+    put_until_created(&client, &stream).await;
+    post_until_no_content(&client, &stream, "placed;").await;
+
+    procs.stop(1).await;
+    procs.start(binary, &nodes[0]);
+    runs_exactly(&client, &mut procs, &nodes[0], &seeded(&nodes[0])).await;
+    let read = format!(
+        "{}/meta-cli/four-nodes?offset=0&max_bytes=64",
+        nodes[0].url()
+    );
+    read_until_matches(&client, &read, b"placed;").await;
+}
+
+/// Waits until `node` runs a replica of exactly the groups `groups`.
+async fn runs_exactly(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+    groups: &BTreeSet<u64>,
+) {
+    let what = format!("node {} runs exactly {groups:?}", node.id);
+    eventually(procs, &what, async || {
+        let metrics = try_node_metrics(client, &node.url()).await?;
+        let running: BTreeSet<u64> = metrics
+            .groups
+            .iter()
+            .map(|group| group.raft_group_id)
+            .collect();
+        if running == *groups {
+            Ok(())
+        } else {
+            Err(format!("runs {running:?}"))
+        }
+    })
+    .await;
 }
 
 /// S1 acceptance (#768): a node whose meta journal does not read runs no
@@ -4541,9 +4696,9 @@ async fn cli_a_node_with_damaged_meta_serves_data_and_sheds_its_leaderships() {
 }
 
 /// S1, r1 H1 (#768): while node 3 claims another replication factor, the
-/// genesis node names node 3 and its claim and meta does not form. Every
-/// root is fresh and meta binds none of them, so no data replica takes
-/// part either: no data group forms while meta waits. Node 3 restarts with
+/// genesis node names node 3 and its claim and meta does not form. No
+/// view places a group, so no node hosts a data replica: no data group
+/// forms while meta waits. Node 3 restarts with
 /// the fixed claim while node 1's `raft.peers` names node 2's address for
 /// node 3: node 2 refuses the misdelivered genesis probes as meant for
 /// another node, which leave node 3 unanswered and are never read as a
@@ -4609,8 +4764,8 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
         node_ids(claim.meta_voters.iter()),
         BTreeSet::from([1, 2, 3])
     );
-    // The data groups would have formed within these 5 s if a fresh root's
-    // data replicas took part before meta bound it.
+    // The data groups would have formed within these 5 s if a node hosted
+    // a replica before a view placed it.
     for node in &nodes {
         wait_placement(&client, &mut procs, node, "listens without meta", no_meta).await;
     }
@@ -4624,7 +4779,7 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
             let metrics = try_node_metrics(&client, &node.url())
                 .await
                 .expect("node metrics");
-            assert_data_held(&metrics, node.id);
+            assert!(metrics.groups.is_empty(), "node {}: {metrics:?}", node.id);
         }
     }
 
@@ -5129,9 +5284,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     read_until_matches(&client, &read(&nodes[1]), b"before-the-loss;while-refused;").await;
     // Node 3's data replicas took part in nothing, though their leaders
     // replicated a write since it started.
-    let held = try_node_metrics(&client, &nodes[2].url())
-        .await
-        .expect("node 3 reports its replicas");
+    let held = placed_replicas(&client, &mut procs, &nodes[2]).await;
     assert_data_held(&held, 3);
     // A restart while refused: still refused and held, never superseded.
     procs.kill(3);
@@ -5157,9 +5310,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     )
     .await;
     post_until_no_content(&client, &stream, "while-restarted;").await;
-    let held = try_node_metrics(&client, &nodes[2].url())
-        .await
-        .expect("node 3 reports its replicas after the restart");
+    let held = placed_replicas(&client, &mut procs, &nodes[2]).await;
     assert_data_held(&held, 3);
 
     // 2. The guard refuses a node that still runs on the root it names.

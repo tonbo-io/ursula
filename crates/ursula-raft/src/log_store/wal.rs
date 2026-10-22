@@ -500,10 +500,12 @@ impl RaftWal {
     /// Opens the writer of every core whose directory holds metadata, a
     /// segment record or a snapshot record, and keeps each for the run
     /// (4.3 and 7.2 of #768), then reads what the journals hold
-    /// ([`Self::local_groups`]). A core whose writer does not open stops
-    /// nothing: its groups read [`LocalLog::Unknown`] until an open of one
-    /// of them opens the writer. Only a WAL that shut down, or whose state
-    /// lock is poisoned, fails the call.
+    /// ([`Self::local_groups`]). The cores replay in parallel, each on a
+    /// thread of its own, so a caller on an async runtime runs this on its
+    /// blocking pool. A core whose writer does not open stops nothing: its
+    /// groups read [`LocalLog::Unknown`] until an open of one of them opens
+    /// the writer. Only a WAL that shut down, or whose state lock is
+    /// poisoned, fails the call.
     ///
     /// From then on the run keeps every core writer it opens, so
     /// [`Self::local_groups`] lists every group a journal names.
@@ -512,26 +514,64 @@ impl RaftWal {
         metrics: GroupEngineMetrics,
     ) -> Result<LocalGroups, RaftWalError> {
         self.keeps_writers.store(true, Ordering::SeqCst);
-        for core in 0..self.topology.core_count() {
-            // The core's first group names the core for its metrics. A core
-            // without a group holds nothing.
-            let Some(placement) = self.topology.placement(RaftGroupId(u32::from(core))) else {
-                continue;
-            };
-            match self.core_writer(placement, metrics.clone(), Admission::Open) {
-                // A core that holds nothing names no group and stays closed.
-                Ok(_) | Err(RaftWalError::NotHeld { .. }) => {}
-                Err(error @ (RaftWalError::ShutDown { .. } | RaftWalError::LockPoisoned)) => {
-                    return Err(error);
-                }
-                Err(error) => tracing::error!(
+        // The core's first group names the core for its metrics. A core
+        // without a group holds nothing.
+        let cores: Vec<(u16, ShardPlacement)> = (0..self.topology.core_count())
+            .filter_map(|core| {
+                let placement = self.topology.placement(RaftGroupId(u32::from(core)))?;
+                Some((core, placement))
+            })
+            .collect();
+        let open = |(core, placement): (u16, ShardPlacement)| {
+            self.open_held_core(core, placement, metrics.clone())
+        };
+        // The simulated disk is in memory and its runtime runs one thread,
+        // so the simulation replays the cores in turn.
+        #[cfg(madsim)]
+        let opened: Vec<Result<(), RaftWalError>> = cores.into_iter().map(open).collect();
+        #[cfg(not(madsim))]
+        let opened: Vec<Result<(), RaftWalError>> = std::thread::scope(|scope| {
+            let open = &open;
+            let replays: Vec<_> = cores
+                .into_iter()
+                .map(|core| scope.spawn(move || open(core)))
+                .collect();
+            replays
+                .into_iter()
+                .map(|replay| {
+                    replay
+                        .join()
+                        .unwrap_or_else(|panicked| std::panic::resume_unwind(panicked))
+                })
+                .collect()
+        });
+        for result in opened {
+            result?;
+        }
+        self.local_groups()
+    }
+
+    /// Opens and keeps `core`'s writer, whose first group is `placement`,
+    /// for [`Self::open_held_cores`].
+    fn open_held_core(
+        &self,
+        core: u16,
+        placement: ShardPlacement,
+        metrics: GroupEngineMetrics,
+    ) -> Result<(), RaftWalError> {
+        match self.core_writer(placement, metrics, Admission::Open) {
+            // A core that holds nothing names no group and stays closed.
+            Ok(_) | Err(RaftWalError::NotHeld { .. }) => Ok(()),
+            Err(error @ (RaftWalError::ShutDown { .. } | RaftWalError::LockPoisoned)) => Err(error),
+            Err(error) => {
+                tracing::error!(
                     core = core,
                     %error,
                     "the core journal did not open; its groups stay unknown until one opens"
-                ),
+                );
+                Ok(())
             }
         }
-        self.local_groups()
     }
 
     /// What the journals hold of each data group, as of now: the groups of

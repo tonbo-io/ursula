@@ -1198,6 +1198,29 @@ impl RaftGroupHandleRegistry {
         }
     }
 
+    /// Refreshes the elections of every running data replica whose node
+    /// sets make it its group's only voter now and did not in `only_voter`,
+    /// the set the last call left, or the reverse, then leaves the current
+    /// set there. A replica's election switch holds the shed exemption it
+    /// read when it was last refreshed ([`ElectionPolicy`]), and the node
+    /// sets of a placed replica follow the placement views, so the hosting
+    /// driver calls this after every pass.
+    pub(crate) fn refresh_only_voter_elections(&self, only_voter: &mut BTreeSet<RaftGroupId>) {
+        let now: BTreeSet<RaftGroupId> = self
+            .groups
+            .load()
+            .iter()
+            .filter_map(|(id, entry)| {
+                let gate = entry.active()?.core.recovery.as_deref()?;
+                gate.is_only_voter().then_some(RaftGroupId(*id))
+            })
+            .collect();
+        for group in now.symmetric_difference(only_voter) {
+            self.refresh_group_elections(*group);
+        }
+        *only_voter = now;
+    }
+
     #[cfg(test)]
     fn is_leadership_shed(&self) -> bool {
         self.leadership_shed_state().is_shed()

@@ -10,7 +10,6 @@ use ursula_config::find_default_config;
 use ursula_config::load_config;
 use ursula_observability::serve::serve_until_shutdown;
 use ursula_observability::serve::shutdown_signal;
-use ursula_shard::RaftGroupId;
 
 use crate::ClusterWal;
 use crate::HttpState;
@@ -146,14 +145,6 @@ async fn init_state(
     // lent to the format-epoch probe and moved into the node's one bind.
     let raft_peers = ursula_raft::PeerDirectory::from_config(&config.raft.peers);
     let group_count = config.raft.effective_group_count();
-    // Interim, removed in S2(h): the seed table decides what this node
-    // warms, where it routes a group it does not host, and what its
-    // maintenance inventory expects. It is the spawn path's seed rule.
-    let seeds = ursula_raft::ConfigSeeds::new(
-        &raft_peers,
-        group_count,
-        config.raft.placement.replication_factor,
-    );
 
     // Format epoch: refuse data and peers of another epoch before anything is
     // written.
@@ -173,64 +164,29 @@ async fn init_state(
     let spawned = spawn_runtime(config, topology)?;
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal;
-    // Meta's Raft starts before the warm-up, on the journal the spawn path
-    // opened before the runtime started.
+    // Meta's Raft starts on the journal the spawn path opened before the
+    // runtime started. Its first view is published once it returns.
     let meta = match spawned.meta {
         Some(meta) => meta.start().await,
         None => crate::bootstrap::MetaSlot::default(),
     };
-
-    if spawned.raft_registry.is_some() {
-        // The hosted groups open concurrently, as `warm_all_groups` opens
-        // every group, so startup waits for the slowest open, not their sum.
-        let hosted: Vec<RaftGroupId> = (0..group_count)
-            .map(|raw_group_id| {
-                RaftGroupId(
-                    u32::try_from(raw_group_id)
-                        .expect("runtime config validates raft group ids fit u32"),
-                )
-            })
-            .filter(|raft_group_id| seeds.hosts(config.raft.node_id, *raft_group_id))
-            .collect();
-        let results = futures_util::future::join_all(
-            hosted
-                .iter()
-                .map(|raft_group_id| runtime.warm_group(*raft_group_id)),
-        )
-        .await;
-        for (RaftGroupId(raft_group_id), result) in hosted.into_iter().zip(results) {
-            let Err(error) = result else {
-                continue;
-            };
-            // A group whose replay stopped, or whose snapshot store did not
-            // answer its restore, stays closed on its core, which reopens the
-            // latter after a back-off.
-            if !error.leaves_group_closed() {
-                return Err(error.into());
-            }
-            if matches!(&error, ursula_runtime::RuntimeError::GroupEngine {
-                error: ursula_runtime::GroupEngineError::Infra(
-                    ursula_runtime::GroupInfraError::ApplyStopped { .. }
-                ),
-                ..
-            }) {
-                tracing::error!(raft_group_id, %error, "group replay stopped; other groups remain available");
-            } else {
-                tracing::warn!(raft_group_id, %error, "the snapshot store did not answer the group's restore; other groups remain available");
-            }
-        }
+    // Then the hosting driver decides what the node runs, its first plan
+    // opening what the journals hold, without waiting for a meta leader.
+    // No open failure stops the start (design 4.3).
+    if let (Some(hosting), Some(registry), Some(wal)) =
+        (spawned.hosting, &spawned.raft_registry, &raft_wal)
+    {
+        meta.start_hosting(hosting, runtime.clone(), registry.clone(), wal.clone())
+            .await;
     }
 
-    let state = match spawned.raft_registry {
-        None => HttpState::new(runtime),
+    let state = match (spawned.raft_registry, spawned.placement) {
         // Leader redirects send clients to a peer's client plane, which is
         // not its Raft `url` when the cluster plane listens apart.
-        Some(registry) => HttpState::with_static_raft_cluster_topology(
-            runtime,
-            registry,
-            config.raft.node_id,
-            seeds.voter_table(),
-        ),
+        (Some(registry), Some(placement)) => {
+            HttpState::with_raft_cluster(runtime, registry, placement)
+        }
+        _ => HttpState::new(runtime),
     };
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
@@ -366,7 +322,8 @@ pub(crate) enum WalShutdown {
 }
 
 /// The end of a graceful shutdown, after the leadership handoff and the
-/// listener drain: stops every data group, then the meta runtime, then the
+/// listener drain: stops the hosting driver, then every data group, then
+/// the meta runtime, then the
 /// journal writers, each of which `fsync`s its journal, and only then
 /// records a clean shutdown in the run state. A failure is logged and leaves the run
 /// unclean, so the next start reads it as a crash. The shutdown grace period
@@ -374,11 +331,22 @@ pub(crate) enum WalShutdown {
 /// recording a clean shutdown.
 pub(crate) async fn shutdown_raft_wal(
     runtime: &ursula_runtime::ShardRuntime,
-    meta: Option<ursula_raft::meta::runtime::GrpcMetaRuntime>,
+    meta: Option<crate::bootstrap::TakenMeta>,
     raft_wal: Option<&ursula_raft::RaftWal>,
 ) -> WalShutdown {
     let Some(raft_wal) = raft_wal else {
         return WalShutdown::NoWal;
+    };
+    // The hosting driver stops first, so it opens no group again while the
+    // groups stop.
+    let meta = match meta {
+        Some(meta) => {
+            if let Some(hosting) = meta.hosting {
+                hosting.shutdown().await;
+            }
+            Some(meta.runtime)
+        }
+        None => None,
     };
     // A group that failed to stop writes no more journal records once its
     // core writer has closed, so the WAL still shuts down. Its snapshot
@@ -660,8 +628,9 @@ mod tests {
         );
     }
 
-    /// A single durable node opens its groups at start, as every Raft node
-    /// does, and is ready while they serve.
+    /// A single durable node hosts what meta places on it: once meta
+    /// bootstrapped the cluster on this node alone, the hosting driver
+    /// creates every group, and the node is ready while they serve.
     #[tokio::test]
     async fn a_single_node_durable_server_becomes_ready() {
         use axum::body::Body;
@@ -682,10 +651,8 @@ mod tests {
         let state = super::init_state(&config, Some(wal_dir)).await.unwrap();
         let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
         let registry = state.raft_registry().cloned().expect("a Raft node");
-        // The spawn path opened the meta journal before any data group, and
-        // the start opened the group the node hosts.
+        // The spawn path opened the meta journal before any data group.
         assert!(log_dir.join("meta").is_dir());
-        assert!(registry.get(super::RaftGroupId(0)).is_some());
         // Meta forms on this node alone: its voters and nodes are this node,
         // and the default replication factor of 3 runs as 1.
         let mut placement = registry.placement_watch();
@@ -740,6 +707,8 @@ mod tests {
         assert_eq!(confirmed.view, placement.view);
         let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
         assert_eq!(metrics["meta"]["current_leader"], 7);
+        // The placement makes this node the group's only voter.
+        wait_hosted(&state, 0).await;
         let ready = |client: axum::Router| async move {
             client
                 .oneshot(
@@ -770,7 +739,7 @@ mod tests {
         // just after the state machine answered the create (#503).
         state
             .raft_registry()
-            .and_then(|registry| registry.get(super::RaftGroupId(0)))
+            .and_then(|registry| registry.get(ursula_shard::RaftGroupId(0)))
             .expect("the create started group 0")
             .wait(Some(std::time::Duration::from_secs(10)))
             .metrics(
@@ -887,6 +856,7 @@ mod tests {
 
         // A committed write in group 0 settles its leader and term before
         // the test reads the view it plans against.
+        wait_hosted(&state, 0).await;
         let created = create_a_stream(&state).await;
         assert_eq!(created, StatusCode::CREATED);
         let (_, metrics) = get_json(&admin, "/__ursula/metrics").await;
@@ -900,6 +870,19 @@ mod tests {
             super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
             super::WalShutdown::Clean(_)
         ));
+    }
+
+    /// Waits until the hosting driver of `state`'s node runs its replica of
+    /// `group`.
+    async fn wait_hosted(state: &crate::HttpState, group: u32) {
+        let registry = state.raft_registry().expect("a Raft node");
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while registry.get(ursula_shard::RaftGroupId(group)).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the hosting driver opens the group");
     }
 
     /// Creates a stream through the client router, a write in group 0.
@@ -920,7 +903,8 @@ mod tests {
     }
 
     /// A meta journal that does not read leaves the node without a meta
-    /// replica, and the node still starts, is ready and serves writes.
+    /// replica, and the node still starts, opens the group its journal
+    /// holds from its unconfirmed, empty view, and serves writes.
     #[tokio::test]
     async fn a_node_with_a_damaged_meta_journal_starts_and_serves() {
         use axum::body::Body;
@@ -970,6 +954,8 @@ mod tests {
         .await
         .expect("meta answers the registration")
         .expect("the registration runs");
+        // The group's log holds its first entries, so the next run holds it.
+        wait_hosted(&state, 0).await;
         stop(state).await;
         std::fs::write(
             log_dir.join("meta").join("journal.meta"),
@@ -1028,17 +1014,9 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let refusal: ursula_control::PlacementApiError = serde_json::from_value(refusal).unwrap();
         assert_eq!(refusal.reason, ursula_control::PlacementApiReason::Stopped);
-        let ready = client
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(crate::READINESS_PATH)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(ready.status(), StatusCode::OK);
+        // No view confirms anything, so the driver admits what the journal
+        // holds and creates nothing.
+        wait_hosted(&state, 0).await;
         let created = client
             .oneshot(
                 Request::builder()

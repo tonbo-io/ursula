@@ -59,8 +59,7 @@
 //!   the one source every reader of a peer address takes it from.
 //! - `placement_wiring`: the one seam of every placement input of a data
 //!   replica's open ([`PlacementInputs`]): admission, the seed role and the
-//!   node sets its recovery drivers read, from meta ([`MetaPlacement`]),
-//!   with production's interim inputs over the seed rule ([`ConfigSeeds`]).
+//!   node sets its recovery drivers read, from meta ([`MetaPlacement`]).
 //! - [`peer_channel`]: the endpoint policy (connect timeout, HTTP/2 and TCP
 //!   keepalive) of every gRPC channel a node opens to a peer.
 //! - [`snapshot_cadence`]: the byte-based snapshot cadence policy (F12e) and
@@ -261,8 +260,6 @@ pub use peer_cluster::PeerClusterMismatch;
 pub use peer_cluster::PeerIdentity;
 pub use peer_directory::PeerDirectory;
 pub use peer_directory::PeerEndpoints;
-pub use placement_wiring::ConfigSeedInputs;
-pub use placement_wiring::ConfigSeeds;
 pub use placement_wiring::FixedNodes;
 #[cfg(any(test, madsim, feature = "test-support"))]
 pub use placement_wiring::FixedPlacement;
