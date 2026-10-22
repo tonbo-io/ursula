@@ -242,7 +242,11 @@ entries are a majority too. The replica's membership reconcile shell
 (`crates/ursula-raft/src/rejoin/reconcile.rs`) observes and counts each
 reversion.
 
-Every replica runs that shell. On the leader it reads the group's target
+Every replica runs that shell, and plans only while it leads live under a
+committed vote: a quorum acknowledged it within 3 s, or it is the group's
+only voter and so its own quorum (`leads_live` in
+`crates/ursula-raft/src/rejoin.rs`), so a group of one voter moves too. On
+the leader it reads the group's target
 from its placement in the node's latest view: the placement's target voters,
 `Seeded` or `Moving` at the placement's key, or `Settled` for a live group
 that does not move. It asks the pure planner
@@ -504,7 +508,16 @@ highest ordinal down, and moves on only once the replaced pod passes its
 readiness probe (`GET /__ursula/ready`), which the chart always renders. A
 replaced voter runs the graceful shutdown on `SIGTERM`: it hands off its
 leaderships, then records a clean shutdown, so its restart reads its journals
-strictly. The controller does not look at the other pods, so an upgrade starts
+strictly. Between the two it drains its HTTP listeners
+(`serve_until_shutdown` in `crates/ursula-observability/src/serve.rs`): a
+listener refuses new connections, every HTTP/1 answer it starts from then on
+carries `Connection: close`, and a connection that was idle when the drain began stays
+open for up to `CLOSE_NOTICE` (1 s), so a request sent on it is answered. The
+gateway reuses an idle upstream connection for at most `CLIENT_IDLE_BOUND`
+(0.5 s). A gateway request can still fail with `502` on a connection the node's
+kernel completed but the node had not accepted when its listener closed, and
+on one whose last answer started before the drain, which closes without
+`Connection: close`. The controller does not look at the other pods, so an upgrade starts
 only once `ursulactl verify-cluster` passes, and the default
 PodDisruptionBudget limits evictions to one server pod at a time.
 
@@ -521,5 +534,8 @@ and rollback that changes the count, the chart's `scale-check` hook
 (`charts/ursula/templates/scale-check.yaml`) reads the live StatefulSet's
 count and runs `ursulactl node verify-removed` for every id a lower count
 drops and `verify-not-removed` for every id a higher count starts, against
-the meta leader's view. It refuses a raise from one pod, whose cluster
-recorded one meta voter and a replication factor of 1 at its bootstrap.
+the meta leader's view. It refuses a raise from one pod. That cluster
+recorded one meta voter and a replication factor of 1 at its bootstrap, and
+the chart sets neither `raft.meta_voters` nor
+`raft.placement.replication_factor`, so the pods of a raised count would
+claim the defaults and report `replication_factor_mismatch`.
