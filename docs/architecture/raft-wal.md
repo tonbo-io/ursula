@@ -495,15 +495,20 @@ closed, or that does not lead and whose bootstrapped view gives its node the
 role `Outgoing`, `Abandoned` or none, it sends a `RejoinBarrier` to the group's
 leader candidates in order (`ursula_control::leader_candidates`, with the open
 replica's effective membership). It asks after each change of the replica's
-vote, and every 30 seconds until an append with a vote of at least its last
-answer's follows that answer. Each ask is one of the driver's actions under
-its per-core budget, begun after the pass's opens and closes, and none goes
-out while the node fence refuses. Its answers reach the mark as the gate
-driver's do, and the driver's status keeps the latest answer of each group.
-Client reads read the predicate too: a follower replica that does not count
-answers every read like a leader-only read, forwarding it to a known leader
-or refusing as a follower that knows none. A follower never answers a `HEAD`
-itself.
+vote, and again every 30 seconds unless an append with a vote of at least its
+last answer's arrived since the previous check. Each check after the
+interval, asked or skipped, moves that baseline to now. So a voter dropped
+after a `Voter` answer, which keeps its vote when elections are off for its
+node, asks again within one interval once its leader stops replicating to
+it. Each ask is one of the driver's actions under its per-core budget, begun
+after the pass's opens and closes, and none goes out while the node fence
+refuses. Its answers reach the mark as the gate driver's do, and the
+driver's status keeps the latest answer of each group. Client reads read the
+predicate too: a follower replica that does not count answers every read
+like a leader-only read, forwarding it to a known leader or refusing as a
+follower that knows none. A live read pinned to its owner's read index keeps
+its own rule, refused by every follower and never forwarded. A follower never
+answers a `HEAD` itself.
 
 **Rewind in place.** A follower that answers `Conflict` at or below the index it
 had matched in this leadership lost entries. Every group with a recovery gate

@@ -1623,9 +1623,15 @@ impl GroupEngine for RaftGroupEngine {
             // A replica that does not count as a voter, such as an incoming
             // learner or a voter its group dropped, answers every client
             // read like a leader-only read (design 9): it forwards to a
-            // known leader or refuses as a follower that knows none.
+            // known leader or refuses as a follower that knows none. A live
+            // read pinned to its owner's read index keeps its own rule
+            // below: every follower refuses it, and none forwards it.
             let mut request = request;
-            if !request.leader_only && !self.leads() && !self.counts_as_voter() {
+            if !request.leader_only
+                && request.read_index.is_none()
+                && !self.leads()
+                && !self.counts_as_voter()
+            {
                 request.leader_only = true;
             }
             let original_request = request.clone();

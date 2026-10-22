@@ -91,7 +91,6 @@ use crate::rt::time::Instant;
 mod asker;
 
 pub use asker::ASK_INTERVAL;
-use asker::Answered;
 use asker::Askers;
 pub use asker::GroupAnswer;
 
@@ -520,7 +519,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 candidates,
             );
             if self.begin(actions, *group, work) {
-                askers.started(*group, vote);
+                askers.started(*group, vote, marks);
             }
         }
     }
@@ -597,7 +596,7 @@ enum ActionEnd {
     /// The group is not acted on again for one [`PLAN_INTERVAL`].
     Failed,
     /// An ask ended, with a live leader's answer or none.
-    Asked(Option<Answered>),
+    Asked(Option<GroupAnswer>),
 }
 
 /// One open, close or ask the driver runs.
