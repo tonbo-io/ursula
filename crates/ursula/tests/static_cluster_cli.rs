@@ -6169,12 +6169,28 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
     )
     .await;
     // The moved group's third voter is drained and node 5 dies: node 4 is
-    // the only voter that may campaign.
+    // the only voter that may campaign. The drain mark only stops the
+    // third voter from campaigning and taking transfers, and a leadership
+    // it holds stays, so it hands that one to node 5 first: node 4, without
+    // meta, takes no transfer.
     let ctl = ctl_client();
     let drained = node_of(&nodes, staying);
     ctl.set_maintenance_drain(&drained.ctl(), true)
         .await
         .expect("drain the third voter");
+    let what = format!("node {staying} hands group {} off", moved.0);
+    eventually(&mut procs, &what, async || {
+        let Err(led) = leading_replica(&client, &nodes, &BTreeSet::from([4, 5]), moved).await
+        else {
+            return Ok(());
+        };
+        let answer = ctl
+            .transfer_leader(&drained.ctl(), u64::from(moved.0), 5)
+            .await
+            .map_err(|err| format!("{led}; transfer to node 5: {err:#}"))?;
+        Err(format!("{led}; transfer to node 5: {answer:?}"))
+    })
+    .await;
     procs.kill(5);
     let what = format!("node 4 leads group {}", moved.0);
     eventually(&mut procs, &what, async || {
