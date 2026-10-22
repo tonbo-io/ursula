@@ -301,13 +301,9 @@ impl<T: RecoveryTransport> MetaHandle<T> {
                     failure: error.into(),
                 })?
         } else {
-            self.transport
-                .barrier(leader.get(), RaftTarget::Meta)
+            self.barrier(leader, RaftTarget::Meta)
                 .await
-                .map_err(|error| MetaBarrierError::Barrier {
-                    leader,
-                    failure: error.into(),
-                })?
+                .map_err(|failure| MetaBarrierError::Barrier { leader, failure })?
         };
         drop(active);
         let bound = barrier_bound(&answer);
