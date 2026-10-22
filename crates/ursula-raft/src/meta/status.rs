@@ -25,7 +25,6 @@ use ursula_control::ControlPlaneState;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::MetaRole;
 use ursula_control::MoveLimit;
-use ursula_control::PlacementApiError;
 use ursula_control::PlacementGroupStatus;
 use ursula_control::PlacementStatus;
 use ursula_control::PlacementView;
@@ -37,7 +36,6 @@ use ursula_proto::placement::RootId;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
-use super::api::refused_read;
 use super::confirm::MetaBarrierError;
 use super::genesis_driver::GenesisStatus;
 use super::handle::MetaHandle;
@@ -52,6 +50,18 @@ pub(crate) type Confirmation<'a> =
     Pin<Box<dyn Future<Output = Result<ConfirmedView, MetaBarrierError>> + Send + 'a>>;
 type Submission<'a> =
     Pin<Box<dyn Future<Output = Result<ControlApplied, MetaWriteError>> + Send + 'a>>;
+
+/// Why [`MetaStatusReader::group_status`] answered with no group status.
+#[derive(Debug, thiserror::Error)]
+pub enum GroupStatusError {
+    /// A meta read barrier confirmed no view.
+    #[error(transparent)]
+    Unconfirmed(#[from] MetaBarrierError),
+    /// The view refuses the read as the meta state machine would refuse a
+    /// command: no bootstrapped cluster, or no such group.
+    #[error("this node's placement view refuses the read")]
+    Refused(#[source] ControlError),
+}
 
 /// A meta read barrier on this node's view, and a write to the meta group,
 /// whatever the transport.
@@ -210,7 +220,7 @@ impl MetaStatusReader {
         &self,
         group: RaftGroupId,
         confirmed: bool,
-    ) -> Result<PlacementGroupStatus, PlacementApiError> {
+    ) -> Result<PlacementGroupStatus, GroupStatusError> {
         let view = if confirmed {
             Arc::new(self.meta.confirm_view().await?.view().clone())
         } else {
@@ -219,15 +229,17 @@ impl MetaStatusReader {
         let cluster = match &*view.state {
             ControlPlaneState::Bootstrapped(cluster) => cluster,
             ControlPlaneState::Forming { .. } => {
-                return Err(refused_read(ControlError::NotBootstrapped));
+                return Err(GroupStatusError::Refused(ControlError::NotBootstrapped));
             }
             ControlPlaneState::FormationCut => {
-                return Err(refused_read(ControlError::FormationCut));
+                return Err(GroupStatusError::Refused(ControlError::FormationCut));
             }
         };
         let placement = cluster
             .group(group)
-            .ok_or_else(|| refused_read(ControlError::UnknownGroup { group }))?
+            .ok_or(GroupStatusError::Refused(ControlError::UnknownGroup {
+                group,
+            }))?
             .clone();
         let replica = self
             .registry

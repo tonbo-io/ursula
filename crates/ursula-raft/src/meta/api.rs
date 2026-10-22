@@ -13,6 +13,7 @@ use ursula_runtime::ErrorChain;
 
 use super::confirm::MetaBarrierError;
 use super::handle::MetaWriteError;
+use super::status::GroupStatusError;
 
 /// A meta read barrier that confirmed no view applied nothing.
 impl From<MetaBarrierError> for PlacementApiError {
@@ -36,14 +37,20 @@ impl From<MetaBarrierError> for PlacementApiError {
     }
 }
 
-/// A placement read the node's view refuses as the meta state machine
-/// would refuse a command: an unknown group, or no bootstrapped cluster.
-pub(crate) fn refused_read(error: ControlError) -> PlacementApiError {
-    PlacementApiError {
-        message: ErrorChain(&error).to_string(),
-        reason: PlacementApiReason::Refused(error),
-        write_effect: WriteEffect::NotApplied,
-        current: None,
+/// A group status read that answered with no status: a barrier failure
+/// answers as on every other route, and a read the view refuses as the
+/// meta state machine would refuse a command, with the refusal as reason.
+impl From<GroupStatusError> for PlacementApiError {
+    fn from(error: GroupStatusError) -> Self {
+        match error {
+            GroupStatusError::Unconfirmed(barrier) => Self::from(barrier),
+            GroupStatusError::Refused(ref refusal) => Self {
+                message: ErrorChain(&error).to_string(),
+                reason: PlacementApiReason::Refused(refusal.clone()),
+                write_effect: WriteEffect::NotApplied,
+                current: None,
+            },
+        }
     }
 }
 

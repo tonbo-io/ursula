@@ -124,7 +124,7 @@ pub(crate) async fn admin_group_status(
         .await
     {
         Ok(status) => Json(status).into_response(),
-        Err(error) => placement_api_error_response(error),
+        Err(error) => placement_api_error_response(error.into()),
     }
 }
 
