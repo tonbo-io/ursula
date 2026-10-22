@@ -92,8 +92,10 @@ use super::write_keys::Controls;
 use super::write_keys::run_idle_expiry_cannot_reopen_an_epoch_inner;
 use super::write_keys::run_producer_repeats_are_exactly_once_inner;
 
-/// The simulated time a placement-move run may take.
-const PLACEMENT_MOVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+/// The simulated time a placement-move run may take: its meta faults and
+/// plans, then each move with the teardowns it leaves, whose asks may each
+/// wait an ask interval.
+const PLACEMENT_MOVE_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// Runs one scenario workload under a fresh madsim runtime for `seed` and
 /// wraps the outcome into a `SimReport`.

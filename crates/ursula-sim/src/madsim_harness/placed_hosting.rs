@@ -24,16 +24,23 @@
 //!   the faults and moves are over, every running node's view shows every
 //!   group `Live` and stable on one voter set, and the group's leader holds
 //!   a committed uniform membership of exactly those voters, with no
-//!   learner.
+//!   learner. Its teardown half is a wait too: no running node holds a log
+//!   of a group the latest view gives it no role in.
 //! - I4 ([`I4`]), P-SELF: every membership entry lists the leader that
 //!   appended it in its last config, but the RF 1 step, whose configs have
 //!   one voter each.
-//! - I8 ([`I8`]), as S3 has it without teardown: no voter change appended
-//!   in a term above every term the group's replicas held when the
-//!   placement took a node's role away (abandoned or retired) adds that
-//!   node. A leader elected later confirms its view after the change, so
-//!   only a step planned in an earlier leadership, or from an unconfirmed
-//!   view, adds it.
+//! - I5 ([`I5`]) is a wait and a script's check: once a group's replicas
+//!   without a role are torn down, the latest view keeps no retirement
+//!   record of the group, and a log a node retired and reopened replays
+//!   nothing of its retired life. The family keeps its snapshots inline, so
+//!   no snapshot record or owned object exists for I5 to judge.
+//! - I8 ([`I8`]): no voter change appended in a term above every term the
+//!   group's replicas held when the placement took a node's role away
+//!   (abandoned or retired) adds that node. A leader elected later confirms
+//!   its view after the change, so only a step planned in an earlier
+//!   leadership, or from an unconfirmed view, adds it. And no running node
+//!   has retired its log of a group whose latest committed membership lists
+//!   it as a voter.
 //! - I9 ([`I9`]): once a view shows a move's report, no membership of the
 //!   group above the one it names was committed before (checked when the
 //!   report is first seen, which follows its proof by the report's
@@ -64,6 +71,8 @@ use futures_util::lock::Mutex as AsyncMutex;
 use openraft::Raft;
 use openraft::ServerState;
 use openraft::storage::RaftLogReader;
+use openraft::storage::RaftLogStorage;
+use ursula_control::LocalLog;
 use ursula_ctl::recovery::Floor;
 use ursula_ctl::recovery::FloorError;
 use ursula_ctl::recovery::LoopState;
@@ -116,6 +125,7 @@ pub(super) const I1: &str = "acknowledged_writes_read_back";
 pub(super) const I2: &str = "no_group_initialized_twice";
 pub(super) const I3: &str = "every_group_settles_on_its_placement";
 pub(super) const I4: &str = "membership_entries_keep_their_leader";
+pub(super) const I5: &str = "a_teardown_leaves_nothing_behind";
 pub(super) const I7: &str = "a_node_restarted_without_meta_serves";
 pub(super) const I8: &str = "a_voter_change_adds_only_placed_nodes";
 pub(super) const I9: &str = "a_report_names_the_latest_membership";
@@ -995,6 +1005,93 @@ impl MetaCluster {
             .max_by_key(|(index, _, _)| *index)
     }
 
+    /// The voters of `group`'s latest committed membership among its
+    /// running replicas, when it is uniform.
+    pub(super) fn committed_voters(&self, group: u32) -> Option<BTreeSet<u64>> {
+        let (_, configs, _) = self.latest_committed(group)?;
+        match configs.as_slice() {
+            [voters] => Some(voters.clone()),
+            _ => None,
+        }
+    }
+
+    /// What `node_id`'s journals hold of `group`, if its process runs and
+    /// they name the group.
+    pub(super) fn local_log(&self, node_id: u64, group: u32) -> Option<LocalLog> {
+        if !self.runtimes.contains_key(&node_id) {
+            return None;
+        }
+        self.data
+            .wals
+            .get(&node_id)?
+            .raft_wal()
+            .local_groups()
+            .ok()?
+            .get(RaftGroupId(group))
+    }
+
+    /// I3's teardown half: a running node that holds a log of `group`
+    /// which the latest view gives it no role in, if one does. A log on a
+    /// core that did not open is never torn down.
+    pub(super) fn unplaced_replica(&self, group: u32) -> Option<String> {
+        let latest = self.latest_view();
+        let bootstrapped = latest.cluster()?;
+        self.running().into_iter().find_map(|node_id| {
+            let log = self.local_log(node_id, group)?;
+            let role = bootstrapped.role(
+                RaftGroupId(group),
+                ursula_proto::placement::NodeId::new(node_id),
+            );
+            (role.is_none() && matches!(log, LocalLog::Empty | LocalLog::Holding)).then(|| {
+                format!(
+                    "node {node_id} holds a {log:?} log of group {group}, which the latest \
+                     view gives it no role in"
+                )
+            })
+        })
+    }
+
+    /// I5's record half: the retirement records of `group` the latest view
+    /// keeps, if it keeps any.
+    pub(super) fn unreported(&self, group: u32) -> Option<String> {
+        let latest = self.latest_view();
+        let records = latest.cluster()?.retirements().get(&RaftGroupId(group))?;
+        (!records.is_empty()).then(|| {
+            format!(
+                "the latest view keeps group {group}'s retirement records of nodes {:?}",
+                node_ids(records.keys().copied())
+            )
+        })
+    }
+
+    /// I5's replay half, for a log `node_id` retired, reopened and opened
+    /// again before its new life took an entry: what the log holds, if it
+    /// holds anything. Such a log is empty, so an entry or a purge in it
+    /// came from the retired life.
+    pub(super) async fn replayed_life(&self, node_id: u64, group: u32) -> Option<String> {
+        let Some(store) = self.data.wals.get(&node_id)?.store(RaftGroupId(group)) else {
+            return Some(format!(
+                "node {node_id}'s reopened log of group {group} has no open store"
+            ));
+        };
+        let mut store = Arc::clone(&store);
+        let state = match store.get_log_state().await {
+            Ok(state) => state,
+            Err(error) => {
+                return Some(format!(
+                    "node {node_id}'s reopened log of group {group} does not read: {error}"
+                ));
+            }
+        };
+        (state.last_log_id.is_some() || state.last_purged_log_id.is_some()).then(|| {
+            format!(
+                "node {node_id}'s reopened log of group {group}, which took no entry since the \
+                 reopen, holds entries up to {:?} and a purge at {:?}: its retired life replays",
+                state.last_log_id, state.last_purged_log_id
+            )
+        })
+    }
+
     /// The running nodes that host a replica of `group`.
     fn hosting(&self, group: u32) -> Vec<(u64, Arc<SimHost>)> {
         self.placed()
@@ -1429,13 +1526,18 @@ impl MetaCluster {
         ursula_ctl::recovery::group_floor(group, confirmed.as_ref())
     }
 
-    /// `ursulactl recover-group --accept-loss` for each data group after a
-    /// meta plan, as the operations order has it (meta first): the floor
-    /// the tool reads from a confirmed view, then over the group's running
-    /// seed voters, the tool's rounds until its plan is satisfied, or until
-    /// it finds the group healthy.
-    pub(super) async fn recover_data(&mut self, trace: &mut SimTrace, after_event: &str) {
-        for group in JOURNAL_GROUPS {
+    /// `ursulactl recover-group --accept-loss` for each data group of
+    /// `groups` after a meta plan, as the operations order has it (meta
+    /// first): the floor the tool reads from a confirmed view, then over the
+    /// group's running seed voters, the tool's rounds until its plan is
+    /// satisfied, or until it finds the group healthy.
+    pub(super) async fn recover_data(
+        &mut self,
+        trace: &mut SimTrace,
+        after_event: &str,
+        groups: &[u32],
+    ) {
+        for group in groups.iter().copied() {
             let floor = match self.data_floor(group).await {
                 Ok(floor) => floor,
                 Err(error) => fail(
@@ -1488,6 +1590,34 @@ impl MetaCluster {
                     ),
                 }
             }
+        }
+    }
+}
+
+/// I8's teardown half: no running node has retired its log of `group`
+/// while the group's latest committed membership lists it as a voter. A
+/// teardown retires a log only once a live leader answered that the node
+/// is no member, after the replica stopped.
+fn voters_keep_their_logs(
+    cluster: &MetaCluster,
+    group: u32,
+    trace: &mut SimTrace,
+    after_event: &str,
+) {
+    let Some((index, configs, _)) = cluster.latest_committed(group) else {
+        return;
+    };
+    for node_id in configs.iter().flatten() {
+        if cluster.local_log(*node_id, group) == Some(LocalLog::Retired) {
+            fail(
+                trace,
+                I8,
+                after_event,
+                format!(
+                    "node {node_id} retired its log of group {group}, whose latest committed \
+                     membership {configs:?} (index {index}) lists it as a voter"
+                ),
+            );
         }
     }
 }
@@ -1555,6 +1685,7 @@ impl HostingChecks {
         for group in JOURNAL_GROUPS {
             self.entries(placed, group, trace, after_event);
             self.reports(cluster, placed, group, trace, after_event);
+            voters_keep_their_logs(cluster, group, trace, after_event);
         }
     }
 

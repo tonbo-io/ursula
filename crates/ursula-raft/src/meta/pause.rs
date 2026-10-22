@@ -1,14 +1,16 @@
 //! A node's one pause registry, for tests and simulations that stop the
 //! node at a step and act while it waits there, as a data group's
-//! `pause_plans_after_the_fence` does for plans: the meta runtime's steps
-//! and the step of every replica's membership reconcile shell. The node's
-//! registry holds it ([`crate::RaftGroupHandleRegistry::pauses`]), so its
-//! meta runtime and every replica it opens share it, and a new process
+//! `pause_plans_after_the_fence` does for plans: the meta runtime's steps,
+//! the step of every replica's membership reconcile shell and the steps of
+//! the hosting driver's teardowns. The node's registry holds it
+//! ([`crate::RaftGroupHandleRegistry::pauses`]), so its meta runtime, its
+//! hosting driver and every replica it opens share it, and a new process
 //! starts with none closed.
 //!
 //! [`MetaPauses::pause`] (tests, simulations and the `fault-injection`
 //! feature only) closes a point: every later pass waits there until the
-//! returned semaphore has a permit. Elsewhere a pass never waits.
+//! returned semaphore has a permit, and [`MetaPauses::waiting`] tells
+//! whether a pass waits there now. Elsewhere a pass never waits.
 
 #[cfg(any(test, madsim, feature = "fault-injection"))]
 use std::sync::Arc;
@@ -16,8 +18,14 @@ use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(any(test, madsim, feature = "fault-injection"))]
 use std::sync::PoisonError;
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+use std::sync::atomic::AtomicUsize;
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+use std::sync::atomic::Ordering;
 
+use ursula_control::TeardownStep;
 use ursula_proto::placement::StepKind;
+use ursula_shard::RaftGroupId;
 use ursula_shard::RaftTarget;
 
 #[cfg(any(test, madsim, feature = "fault-injection"))]
@@ -42,11 +50,47 @@ pub enum MetaPausePoint {
     /// of kind `step` and published it, before the step runs: a held step
     /// runs as it was planned, whatever changed while it waited.
     ShellStep { target: RaftTarget, step: StepKind },
+    /// In the hosting driver's teardown of this node's replica of `group`,
+    /// once the teardown reached `step`, before the step's action runs: a
+    /// held step runs once released, whatever changed while it waited.
+    Teardown {
+        group: RaftGroupId,
+        step: TeardownStep,
+    },
 }
 
-/// Each closed point with the semaphore its passes wait on.
+/// A closed point: the semaphore its passes wait on, and how many wait.
 #[cfg(any(test, madsim, feature = "fault-injection"))]
-type Points = Vec<(MetaPausePoint, Arc<Semaphore>)>;
+#[derive(Debug)]
+struct Closed {
+    point: MetaPausePoint,
+    pause: Arc<Semaphore>,
+    waiting: Arc<AtomicUsize>,
+}
+
+/// Every closed point.
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+type Points = Vec<Closed>;
+
+/// One pass counted as waiting at a closed point until it goes on or is
+/// dropped, an aborted pass included.
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+struct Waiting(Arc<AtomicUsize>);
+
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+impl Waiting {
+    fn enter(count: Arc<AtomicUsize>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+}
+
+#[cfg(any(test, madsim, feature = "fault-injection"))]
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// The node's pause points (see the module docs).
 #[derive(Debug, Clone, Default)]
@@ -62,8 +106,12 @@ impl MetaPauses {
     pub fn pause(&self, point: MetaPausePoint) -> Arc<Semaphore> {
         let pause = Arc::new(Semaphore::new(0));
         let mut points = self.points.lock().unwrap_or_else(PoisonError::into_inner);
-        points.retain(|(held, _)| *held != point);
-        points.push((point, Arc::clone(&pause)));
+        points.retain(|closed| closed.point != point);
+        points.push(Closed {
+            point,
+            pause: Arc::clone(&pause),
+            waiting: Arc::new(AtomicUsize::new(0)),
+        });
         pause
     }
 
@@ -71,23 +119,34 @@ impl MetaPauses {
     #[cfg(any(test, madsim, feature = "fault-injection"))]
     pub fn release(&self, point: MetaPausePoint) {
         let points = self.points.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some((_, pause)) = points.iter().find(|(held, _)| *held == point) {
-            pause.add_permits(1);
+        if let Some(closed) = points.iter().find(|closed| closed.point == point) {
+            closed.pause.add_permits(1);
         }
+    }
+
+    /// Whether a pass waits at the closed `point` now.
+    #[cfg(any(test, madsim, feature = "fault-injection"))]
+    pub fn waiting(&self, point: MetaPausePoint) -> bool {
+        self.points
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|closed| closed.point == point && closed.waiting.load(Ordering::Acquire) > 0)
     }
 
     /// Waits at `point` while it is closed.
     pub(crate) async fn at(&self, point: MetaPausePoint) {
         #[cfg(any(test, madsim, feature = "fault-injection"))]
         {
-            let pause = self
+            let closed = self
                 .points
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .iter()
-                .find(|(held, _)| *held == point)
-                .map(|(_, pause)| Arc::clone(pause));
-            if let Some(pause) = pause {
+                .find(|closed| closed.point == point)
+                .map(|closed| (Arc::clone(&closed.pause), Arc::clone(&closed.waiting)));
+            if let Some((pause, waiting)) = closed {
+                let _waiting = Waiting::enter(waiting);
                 drop(pause.acquire().await);
             }
         }

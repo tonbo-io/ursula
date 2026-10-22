@@ -27,7 +27,9 @@
 //!   mark.
 //!
 //! The plan then reports the retirement (`ReportTornDown`), which the
-//! driver submits as one more action of the group.
+//! driver submits as one more action of the group. Each step's action waits
+//! first at the node's pause point of that step
+//! ([`MetaPausePoint::Teardown`]), which only tests and simulations close.
 //!
 //! **Owned objects.** A group's snapshot objects under the node's directory
 //! go by its live incarnation's GC. Every other one belongs to no replica,
@@ -49,6 +51,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::future::Future;
 use std::sync::Arc;
 
 use ursula_control::Admission;
@@ -62,11 +65,13 @@ use ursula_control::TeardownEvent;
 use ursula_control::TeardownOutcome;
 use ursula_control::TeardownStep;
 use ursula_control::leader_candidates;
+use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::TeardownStage;
 use ursula_runtime::SnapshotStoreError;
 use ursula_shard::RaftGroupId;
+use ursula_stream::sim_controls::Defence;
 
 use super::ActionEnd;
 use super::Actions;
@@ -78,6 +83,7 @@ use super::asker::Askers;
 use super::asker::GroupAnswer;
 use crate::RetireGroupError;
 use crate::log_store::CoreJournalError;
+use crate::meta::pause::MetaPausePoint;
 use crate::rt::sync::oneshot;
 use crate::rt::task::JoinHandle;
 use crate::rt::time::Instant;
@@ -96,6 +102,19 @@ pub(super) enum StepEnd {
     Done,
     /// The second ask ended, with a live leader's answer or none.
     Answered(Option<GroupAnswer>),
+}
+
+/// What an ask's answer tells a teardown: a live leader's classification
+/// of this node, or nothing. With `Defence::RetireAnswer` off every ask
+/// hears `NotMember`, so a teardown goes on without the group's answers.
+fn heard(answer: Option<MembershipAnswer>) -> TeardownEvent {
+    if ursula_stream::sim_controls::off(Defence::RetireAnswer) {
+        return TeardownEvent::Answered(Some(MembershipAnswer::NotMember));
+    }
+    if answer.is_some_and(|answer| answer != MembershipAnswer::NotMember) {
+        ursula_stream::sim_controls::note_fired(Defence::RetireAnswer);
+    }
+    TeardownEvent::Answered(answer)
 }
 
 /// One running teardown.
@@ -181,11 +200,12 @@ impl Teardowns {
         let Some(running) = self.0.get_mut(&group) else {
             return;
         };
-        let Some(answer) = askers.answer_since(group, running.answers_from) else {
+        let answer = askers.answer_since(group, running.answers_from);
+        if answer.is_none() && !ursula_stream::sim_controls::off(Defence::RetireAnswer) {
             return;
-        };
+        }
         running.answers_from = askers.answer_count(group);
-        self.advance(group, TeardownEvent::Answered(Some(answer.answer)));
+        self.advance(group, heard(answer.map(|answer| answer.answer)));
     }
 
     /// Records how the action of `group`'s step `at` ended. An end of a
@@ -202,9 +222,7 @@ impl Teardowns {
         }
         let event = match end {
             StepEnd::Done => TeardownEvent::StepDone,
-            StepEnd::Answered(answer) => {
-                TeardownEvent::Answered(answer.map(|answer| answer.answer))
-            }
+            StepEnd::Answered(answer) => heard(answer.map(|answer| answer.answer)),
         };
         let outcome = self.advance(group, event);
         if at == TeardownStep::Unregister
@@ -397,7 +415,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 TeardownStep::Fence => {}
                 TeardownStep::Unregister | TeardownStep::Stop => {
                     let host = Arc::clone(&self.host);
-                    self.begin(actions, group, async move {
+                    self.begin_step(actions, group, at, async move {
                         match host.close(group).await {
                             Ok(()) => done(StepEnd::Done),
                             Err(error) => {
@@ -413,7 +431,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 }
                 TeardownStep::AwaitIdle => {
                     let wal = self.wal.clone();
-                    self.begin(actions, group, async move {
+                    self.begin_step(actions, group, at, async move {
                         let ended = wal.engine_work_ended(group);
                         match crate::rt::time::timeout(PLAN_INTERVAL, ended).await {
                             Ok(()) => done(StepEnd::Done),
@@ -439,13 +457,13 @@ impl<H: GroupHost> HostingDriver<H> {
                         group,
                         candidates,
                     );
-                    self.begin(actions, group, async move {
+                    self.begin_step(actions, group, at, async move {
                         done(StepEnd::Answered(asked.await))
                     });
                 }
                 TeardownStep::Retire => {
                     let wal = self.wal.clone();
-                    self.begin(actions, group, async move {
+                    self.begin_step(actions, group, at, async move {
                         match wal.retire_group(group).await {
                             Ok(()) => done(StepEnd::Done),
                             // The retirement is in doubt until a restart.
@@ -472,7 +490,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 TeardownStep::ForgetMetrics => {
                     let host = Arc::clone(&self.host);
                     let registry = self.registry.clone();
-                    self.begin(actions, group, async move {
+                    self.begin_step(actions, group, at, async move {
                         host.forget(group).await;
                         registry.forget_group_snapshots(group);
                         registry.left_marks().forget(group);
@@ -481,6 +499,24 @@ impl<H: GroupHost> HostingDriver<H> {
                 }
             }
         }
+    }
+
+    /// Begins the action of step `at` of `group`'s teardown, which first
+    /// waits at the node's pause point of that step.
+    fn begin_step(
+        &self,
+        actions: &mut Actions,
+        group: RaftGroupId,
+        at: TeardownStep,
+        work: impl Future<Output = ActionEnd> + Send + 'static,
+    ) -> bool {
+        let pauses = self.registry.pauses().clone();
+        self.begin(actions, group, async move {
+            pauses
+                .at(MetaPausePoint::Teardown { group, step: at })
+                .await;
+            work.await
+        })
     }
 
     /// Reports each retirement the plan reports torn down, one action of
