@@ -292,6 +292,17 @@ pub enum CoreJournalError {
         raft_group_id: RaftGroupId,
         admission: Admission,
     },
+    /// A retirement of a group whose log is at the last generation: only
+    /// a forged metadata file holds it.
+    #[error(
+        "raft group {} on OpenRaft core journal '{}' has no generation left to retire into",
+        .raft_group_id.0,
+        .journal.display()
+    )]
+    GenerationsExhausted {
+        journal: PathBuf,
+        raft_group_id: RaftGroupId,
+    },
     #[cfg(not(madsim))]
     #[error("spawn the OpenRaft core journal writer: {source}")]
     SpawnWriter {
@@ -381,7 +392,8 @@ impl From<CoreJournalError> for io::Error {
             CoreJournalError::NotHeld { .. } => io::ErrorKind::NotFound,
             CoreJournalError::RecordTooLarge(_) => io::ErrorKind::InvalidInput,
             CoreJournalError::InvalidRecord { source, .. } => source.kind(),
-            CoreJournalError::InconsistentLog { .. } => io::ErrorKind::InvalidData,
+            CoreJournalError::InconsistentLog { .. }
+            | CoreJournalError::GenerationsExhausted { .. } => io::ErrorKind::InvalidData,
             CoreJournalError::WriterPoisoned { cause, .. } => cause.kind(),
             CoreJournalError::WriterStopped { .. } => io::ErrorKind::BrokenPipe,
             #[cfg(not(madsim))]
@@ -457,46 +469,117 @@ pub(crate) struct OpenedGroup {
     pub(crate) generation: LogGeneration,
 }
 
-/// Records recovering every empty group of the journal in `dir` whose
-/// snapshot record is of the generation the metadata names: the record is
-/// history of the group on this replica, as a frame is, even when the
-/// metadata lost the group or never recorded its first purge. A record
-/// that does not read counts too, and the group's restore reports it. A
-/// record of another generation restores nothing and changes nothing here.
-/// Returns whether the metadata changed.
-fn recover_recorded_groups(
+/// A snapshot record beside a core journal: its group, its file, and the
+/// generation of the group's log it names, or why it does not read.
+struct RecordFile {
+    group_id: u32,
+    path: PathBuf,
+    generation: Result<LogGeneration, crate::state_machine::SnapshotRecordError>,
+}
+
+/// The snapshot records beside the core journal in `dir` that the open
+/// reads, by the core's `metadata` as it was found (`None` when it was
+/// missing). A record of a group the metadata names held, at the first
+/// generation, is left unread: only a store of that generation wrote it,
+/// so it is current, and the group's restore reads it anyway.
+fn snapshot_records(
     dir: &Path,
-    metadata: &mut CoreMetadata,
-) -> Result<bool, CoreJournalError> {
+    metadata: Option<&CoreMetadata>,
+) -> Result<Vec<RecordFile>, CoreJournalError> {
     let entries = Disk::read_dir(dir).map_err(|source| CoreJournalError::io(dir, source))?;
+    Ok(entries
+        .into_iter()
+        .filter_map(|path| {
+            let group_id = super::file::snapshot_record_group(&path)?;
+            let current = metadata.map(|metadata| metadata.group(group_id));
+            if current.is_some_and(|group| {
+                group.generation == LogGeneration::FIRST
+                    && matches!(
+                        group.log,
+                        GroupLogState::Initialized | GroupLogState::Recovering
+                    )
+            }) {
+                return None;
+            }
+            let generation = crate::state_machine::snapshot_record_generation(&path);
+            Some(RecordFile {
+                group_id,
+                path,
+                generation,
+            })
+        })
+        .collect())
+}
+
+/// Settles the snapshot records beside a core journal against its repaired
+/// `metadata` (7.2 of #768), and returns the records that restore nothing
+/// and go: one of another generation than the metadata names, and any
+/// record of a retired log, which no store wrote since its retirement.
+/// Every empty group whose record is of its generation is recorded
+/// recovering: the record is history of the group on this replica, as a
+/// frame is, even when the metadata lost the group or never recorded its
+/// first purge. A record that does not read counts too, and the group's
+/// restore reports it. Also returns whether the metadata changed.
+fn settle_snapshot_records(
+    dir: &Path,
+    records: Vec<RecordFile>,
+    metadata: &mut CoreMetadata,
+) -> (bool, Vec<PathBuf>) {
     let mut changed = false;
-    for path in entries {
-        let Some(group_id) = super::file::snapshot_record_group(&path) else {
-            continue;
-        };
-        let group = metadata.group(group_id);
-        if group.log != GroupLogState::Empty {
-            continue;
-        }
-        match crate::state_machine::snapshot_record_generation(&path) {
-            Ok(generation) if generation != group.generation => continue,
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                path = %path.display(),
-                raft_group_id = group_id,
-                error = %ursula_runtime::ErrorChain(&error),
+    let mut inert = Vec::new();
+    for record in records {
+        let group = metadata.group(record.group_id);
+        match (group.log, &record.generation) {
+            (GroupLogState::Retired, _) => {
+                inert.push(record.path);
+                continue;
+            }
+            (_, Ok(generation)) if *generation != group.generation => {
+                inert.push(record.path);
+                continue;
+            }
+            (GroupLogState::Empty, Ok(_)) => {}
+            (GroupLogState::Empty, Err(error)) => tracing::warn!(
+                path = %record.path.display(),
+                raft_group_id = record.group_id,
+                error = %ursula_runtime::ErrorChain(error),
                 "the group's snapshot record does not read; the group opens recovering"
             ),
+            (GroupLogState::Initialized | GroupLogState::Recovering, _) => continue,
         }
         tracing::warn!(
             path = %dir.display(),
-            raft_group_id = group_id,
+            raft_group_id = record.group_id,
             "raft group holds a snapshot record but no log on this replica; it recovers before \
              it votes"
         );
-        changed |= metadata.initialize(group_id, GroupLogState::Recovering);
+        changed |= metadata.initialize(record.group_id, GroupLogState::Recovering);
     }
-    Ok(changed)
+    (changed, inert)
+}
+
+/// Deletes the snapshot records `paths` beside the core journal in `dir`,
+/// which restore nothing: a record of a retired generation or of a group's
+/// retired log. A record that stays is still inert, and the core's next
+/// open deletes it.
+fn delete_inert_records(dir: &Path, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    for path in paths {
+        if let Err(error) = Disk::remove_file(path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "an inert snapshot record did not go; it restores nothing"
+            );
+        }
+    }
+    if let Err(error) = Disk::sync_dir(dir) {
+        tracing::warn!(path = %dir.display(), %error, "sync the core journal directory");
+    }
 }
 
 /// Closes once a core writer's worker has stopped. The last handle's drop
@@ -596,6 +679,22 @@ pub(crate) enum CoreWriteOp {
     /// gate stays closed across restarts until a leader's barrier or a new
     /// plan (m2, #581 review).
     DropPlan { group_id: u32 },
+    /// A group's log is torn down (7.2 of #768): one replacement of the
+    /// metadata file records it retired in `generation`, with no vote, no
+    /// log and no recovery plan, and writes no frame. The group's log,
+    /// which no store holds, left the core's groups when the retirement was
+    /// sent: every segment that holds a frame of it now holds dead frames.
+    /// Once the metadata is durable, the group's snapshot record, now
+    /// inert, is deleted.
+    Retire {
+        group_id: u32,
+        generation: LogGeneration,
+        log: Option<Arc<Mutex<GroupLog>>>,
+    },
+    /// A retired group opens again ([`CoreFileLogWriter::open_group`]): the
+    /// metadata file records its log recovering, empty and with no vote, in
+    /// its generation. Every write of the group's new store follows it.
+    Reopen { group_id: u32 },
     /// Writes nothing: answered once every record written before it is
     /// durable, as the journal is synced for a `Recovery` record. A group's
     /// snapshot record is published only after one ([`SnapshotRecord`]).
@@ -650,9 +749,16 @@ impl CoreFileLogWriter {
         let mut logs = BTreeMap::<u32, GroupLog>::new();
         let replayed_groups = std::cell::RefCell::new(std::collections::BTreeSet::new());
         // Each group's log is rebuilt from the records of one generation
-        // only: the metadata's, or without metadata the highest.
-        let generations =
-            std::cell::RefCell::new(ReplayGenerations::of(&metadata, metadata_missing));
+        // only: the metadata's, or without metadata the highest among its
+        // frames and its snapshot record.
+        let records = snapshot_records(&dir, (!metadata_missing).then_some(&metadata))?;
+        let mut generations = ReplayGenerations::of(&metadata, metadata_missing);
+        for record in &records {
+            if let Ok(generation) = record.generation {
+                generations.seed(record.group_id, generation);
+            }
+        }
+        let generations = std::cell::RefCell::new(generations);
         // Segments holding frames of a generation replay does not keep.
         let mut dead_generations = BTreeSet::new();
         let mut invalid_tail = false;
@@ -685,8 +791,8 @@ impl CoreFileLogWriter {
                         return Ok(());
                     }
                     ReplayRecord::Replace => {
-                        if let Some(older) = logs.remove(&record.group_id) {
-                            dead_generations.extend(older.into_dead_segments());
+                        if let Some(mut older) = logs.remove(&record.group_id) {
+                            dead_generations.extend(older.dead_segments());
                         }
                     }
                 }
@@ -697,7 +803,12 @@ impl CoreFileLogWriter {
                 let RaftGroupLogRecord::FrozenAppend(frozen) = record.record else {
                     return log.apply(record.record, at, ApplyMode::Replay);
                 };
-                let selected = match super::frozen::selected(&dir, record.group_id, &frozen) {
+                let selected = match super::frozen::selected(
+                    &dir,
+                    record.group_id,
+                    record.generation,
+                    &frozen,
+                ) {
                     Ok(selected) => selected,
                     Err(error) => {
                         archive_failure = Some(error);
@@ -801,8 +912,10 @@ impl CoreFileLogWriter {
             (RecoveryState::Normal, false) => GroupLogState::Initialized,
             _ => GroupLogState::Recovering,
         };
+        // Without metadata, every group with a surviving frame opens
+        // recovering, even one whose frames are only commit markers.
         for (group_id, log) in &logs {
-            if log.holds_log() {
+            if log.holds_log() || metadata_missing {
                 metadata_changed |= metadata.initialize(*group_id, repaired);
             }
         }
@@ -826,10 +939,13 @@ impl CoreFileLogWriter {
             );
             metadata_changed |= metadata.set_log_state(group_id, GroupLogState::Recovering);
         }
-        metadata_changed |= recover_recorded_groups(&dir, &mut metadata)?;
+        let (recorded_changed, inert_records) =
+            settle_snapshot_records(&dir, records, &mut metadata);
+        metadata_changed |= recorded_changed;
         if metadata_changed {
             metadata.store(&metadata_path)?;
         }
+        delete_inert_records(&dir, &inert_records);
 
         let (active_id, sealed) = match recovered.segments.split_last() {
             Some((active, sealed)) => (
@@ -953,10 +1069,14 @@ impl CoreFileLogWriter {
     ///
     /// Either admission opens a log the metadata names, unless it is
     /// retired. Only [`Admission::Create`] opens a group the metadata does
-    /// not name, with a fresh log. A retired log is refused either way
-    /// until its reopen lands, and so is an [`Admission::Open`] of a group
-    /// the metadata does not name ([`CoreJournalError::NotHeld`]), before
-    /// anything is written.
+    /// not name, with a fresh log, and reopens a retired one (7.3 of
+    /// #768): recovering, empty and with no vote, in the generation its
+    /// retirement named, so its recovery gate starts closed and a snapshot
+    /// record of the retired generation stays inert. The reopen is sent to
+    /// the writer before this returns, so every write of the new store
+    /// follows it in the journal's order. An [`Admission::Open`] of a group
+    /// the metadata does not name, or of a retired log, is refused
+    /// ([`CoreJournalError::NotHeld`]) before anything is written.
     pub(crate) fn open_group(
         &self,
         raft_group_id: RaftGroupId,
@@ -979,8 +1099,29 @@ impl CoreFileLogWriter {
                 return Err(self.not_held(raft_group_id, admission));
             }
         };
-        let Some(state) = recorded.log.held() else {
-            return Err(self.not_held(raft_group_id, admission));
+        let state = match (recorded.log.held(), admission) {
+            (Some(state), _) => state,
+            (None, Admission::Create) => {
+                self.send(CoreWriterRequest::Write(CoreFileLogWrite {
+                    op: CoreWriteOp::Reopen {
+                        group_id: raft_group_id.0,
+                    },
+                    reply: WriteReply::Flush(FlushCompletion {
+                        callback: Some(Box::new(move |result: WriteResult| {
+                            if let Err(error) = result {
+                                tracing::warn!(
+                                    raft_group_id = raft_group_id.0,
+                                    %error,
+                                    "the reopen of a retired log did not become durable"
+                                );
+                            }
+                        })),
+                        stopped: self.stopped(),
+                    }),
+                }))?;
+                HeldLogState::Recovering
+            }
+            (None, Admission::Open) => return Err(self.not_held(raft_group_id, admission)),
         };
         groups.recorded.remove(&raft_group_id.0);
         groups.opened.insert(raft_group_id.0, state);
@@ -1046,6 +1187,61 @@ impl CoreFileLogWriter {
                 (RaftGroupId(group_id), local)
             })
             .collect())
+    }
+
+    /// Tears down `raft_group_id`'s log on this replica ([`CoreWriteOp::Retire`]):
+    /// once this returns, the metadata file durably records it retired in
+    /// its next generation and its snapshot record is gone. Refused while a
+    /// store holds the group ([`CoreJournalError::GroupAlreadyOpen`]),
+    /// before anything is written. A retired log, or a group the journal
+    /// does not name, has nothing to tear down: nothing is written. From
+    /// the call on, an open of the group finds it retired.
+    pub(crate) async fn retire_group(
+        &self,
+        raft_group_id: RaftGroupId,
+    ) -> Result<(), CoreJournalError> {
+        let (reply, response) = oneshot::channel();
+        {
+            let mut groups = self
+                .groups
+                .lock()
+                .map_err(|_poisoned| CoreJournalError::LockPoisoned)?;
+            if groups.opened.contains_key(&raft_group_id.0) {
+                return Err(CoreJournalError::GroupAlreadyOpen {
+                    journal: self.dir.clone(),
+                    raft_group_id,
+                });
+            }
+            let Some(recorded) = groups.recorded.get(&raft_group_id.0).copied() else {
+                return Ok(());
+            };
+            if recorded.log == GroupLogState::Retired {
+                return Ok(());
+            }
+            let generation = recorded.generation.next().ok_or_else(|| {
+                CoreJournalError::GenerationsExhausted {
+                    journal: self.dir.clone(),
+                    raft_group_id,
+                }
+            })?;
+            // Sent under the groups' lock, so a reopen follows it.
+            self.send(CoreWriterRequest::Write(CoreFileLogWrite {
+                op: CoreWriteOp::Retire {
+                    group_id: raft_group_id.0,
+                    generation,
+                    log: groups.logs.remove(&raft_group_id.0),
+                },
+                reply: WriteReply::Wait(reply),
+            }))?;
+            groups.recorded.insert(raft_group_id.0, GroupMetadata {
+                vote: None,
+                log: GroupLogState::Retired,
+                recovery: None,
+                generation,
+            });
+        }
+        response.await.map_err(|_dropped| self.stopped())??;
+        Ok(())
     }
 
     /// Takes back a group whose store closed, with what that store recorded
@@ -2209,6 +2405,7 @@ pub(crate) fn read_entries(
             RaftGroupLogRecord::FrozenAppend(frozen) => super::frozen::selected(
                 path.parent().unwrap_or_else(|| Path::new(".")),
                 group_id,
+                record.generation,
                 &frozen,
             )?,
             _ => return Err(mismatch(first_wanted)),
@@ -2274,6 +2471,9 @@ fn write_core_log_batch(
     let mut metadata_ops = 0_u64;
     let mut requires_sync = false;
     let mut metadata_changed = false;
+    // Groups this batch retires: their snapshot records go once the
+    // metadata that retires them is durable.
+    let mut retired = Vec::new();
     let mut batch = batch.into_iter();
     while let Some(request) = batch.next() {
         let request = match request {
@@ -2316,6 +2516,25 @@ fn write_core_log_batch(
                     .metadata
                     .set_log_state(*group_id, GroupLogState::Recovering);
                 requires_sync = true;
+                None
+            }
+            CoreWriteOp::Retire {
+                group_id,
+                generation,
+                log,
+            } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.retire(*group_id, *generation);
+                if let Some(log) = log {
+                    let dead = lock_log(log).dead_segments();
+                    journal.note_died(dead);
+                }
+                retired.push(*group_id);
+                None
+            }
+            CoreWriteOp::Reopen { group_id } => {
+                metadata_ops = metadata_ops.saturating_add(1);
+                metadata_changed |= journal.metadata.reopen(*group_id);
                 None
             }
             CoreWriteOp::TakePlan { group_id, record } => {
@@ -2430,6 +2649,17 @@ fn write_core_log_batch(
             return poison_core_journal(&journal.context, cause, requests);
         }
     };
+    let retired_records = retired
+        .into_iter()
+        .map(|group_id| {
+            journal
+                .context
+                .dir
+                .join(super::file::snapshot_record_file(group_id))
+        })
+        .filter(|path| Disk::exists(path))
+        .collect::<Vec<_>>();
+    delete_inert_records(&journal.context.dir, &retired_records);
 
     let fsync_records = match (requires_sync, metadata_changed) {
         (true, true) => journal_records.saturating_add(metadata_ops),

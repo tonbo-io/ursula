@@ -440,6 +440,44 @@ async fn a_dirty_newest_segment_is_sealed_at_open(name: &str) {
     assert_eq!(log_ids(&removed).await, Vec::<u64>::new());
 }
 
+/// A retired group's frames (7.2 of #768) leave every segment within the
+/// age, as a purged group's do, though the journal is far below its
+/// budget: the retirement marks every segment that held its log dead.
+/// Catches a retirement that drops the log but leaves its segments clean,
+/// whose frames only the budget would then free.
+async fn retired_frames_leave_every_segment(name: &str) {
+    let journal = Journal::new(name, WalFsync::Never);
+    let writer = journal.writer();
+    let start = Instant::now();
+    let mut quiet = journal.store(&writer, QUIET);
+    let mut retired = journal.store(&writer, REMOVED);
+    append(&mut quiet, (1..=3).map(|index| entry(index, b"quiet;"))).await;
+    quiet.save_committed(Some(log_id(3))).await.expect("commit");
+    for index in 1..=40 {
+        append(&mut retired, [entry(index, &marked(500))]).await;
+        writer.maintain(start, MAX_AGE).await.expect("a pass");
+        if index >= 8 && journal.segments().len() >= 3 && !holds_marker(&journal.active()) {
+            break;
+        }
+    }
+    drop(retired);
+    writer
+        .retire_group(RaftGroupId(REMOVED))
+        .await
+        .expect("retire the group");
+    writer.maintain(start, MAX_AGE).await.expect("a pass");
+    assert!(
+        !journal.files_with_marker().is_empty(),
+        "dead frames younger than the age stay"
+    );
+    assert!(journal.metrics.snapshot().wal_dirty_segments > 0);
+    assert_eq!(journal.metrics.snapshot().wal_rewritten_bytes, 0);
+    journal
+        .maintain_until_clean(&writer, later(start, MAX_AGE))
+        .await;
+    assert_eq!(log_ids(&quiet).await, [1, 2, 3]);
+}
+
 /// Makes every file of the journal `by` older than now: on the operating
 /// system's disk its modification time moves back, on the simulated disk
 /// time moves on.
@@ -467,6 +505,24 @@ async fn age_the_journal(_journal: &Journal, by: Duration) {
 #[tokio::test]
 async fn a_removed_groups_frames_leave_every_segment_on_disk() {
     dead_frames_leave_every_segment("dead-frames").await;
+}
+
+#[cfg(not(madsim))]
+#[tokio::test]
+async fn a_retired_groups_frames_leave_every_segment_on_disk() {
+    retired_frames_leave_every_segment("retired-frames").await;
+}
+
+#[cfg(madsim)]
+#[test]
+fn a_retired_groups_frames_leave_every_simulated_segment() {
+    crate::tests::check_madsim_determinism(674, madsim::Config::default(), || async {
+        crate::sim_runtime::MadsimOpenRaftRuntime::scope(
+            674,
+            retired_frames_leave_every_segment("retired-frames"),
+        )
+        .await;
+    });
 }
 
 #[cfg(not(madsim))]

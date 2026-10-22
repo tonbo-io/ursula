@@ -461,9 +461,9 @@ impl GroupLog {
     }
 
     /// Every segment that holds a frame of this log, for a replay that
-    /// drops the log for a later generation of its group: all of them now
-    /// hold dead frames.
-    pub(crate) fn into_dead_segments(mut self) -> BTreeSet<SegmentId> {
+    /// drops the log for a later generation of its group or a retirement
+    /// that drops it: all of them now hold dead frames.
+    pub(crate) fn dead_segments(&mut self) -> BTreeSet<SegmentId> {
         let mut dead = std::mem::take(&mut self.died);
         dead.extend(self.live.keys().copied());
         dead.extend(self.committed_at);

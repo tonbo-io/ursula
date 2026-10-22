@@ -4,9 +4,10 @@
 //! of the group's log on this replica ([`GroupLogState`]). Neither may be lost
 //! in any crash, so the file is always replaced with an `fsync`
 //! ([`state_file::write`]), whatever the journal's fsync policy. Votes change
-//! only during elections and the log state only when a group is initialized
-//! or enters or leaves recovery, which keeps this cost off the append path,
-//! and a vote no longer forces an `fsync` of the shared journal.
+//! only during elections and the log state only when a group is initialized,
+//! enters or leaves recovery, or is retired or reopened, which keeps this
+//! cost off the append path, and a vote no longer forces an `fsync` of the
+//! shared journal.
 //!
 //! A group's log state leaves [`GroupLogState::Empty`] before its first entry
 //! or purge is acknowledged and never returns to it. A replica whose log is
@@ -48,8 +49,7 @@ use crate::types::UrsulaRaftTypeConfig;
 /// record therefore name the generation they belong to, and only what
 /// belongs to the generation the metadata names is read back: older frames
 /// are dead bytes the age rule frees, and an older snapshot record restores
-/// nothing. Until replica teardown lands, every group stays at
-/// [`LogGeneration::FIRST`].
+/// nothing and goes at the core's next open.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct LogGeneration(u64);
@@ -64,6 +64,16 @@ impl LogGeneration {
 
     pub const fn get(self) -> u64 {
         self.0
+    }
+
+    /// The generation after this one, which a retirement records. `None`
+    /// only past the last one, which no replica retires a group often
+    /// enough to reach.
+    pub const fn next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(next) => Some(Self(next)),
+            None => None,
+        }
     }
 }
 
@@ -85,8 +95,8 @@ pub enum GroupLogState {
     /// generation after the retired one and holds no vote and no recovery
     /// plan for it. It counts as initialized, so the replica never joins a
     /// new group's first election or answers as empty. Only a retirement
-    /// records it, and only the replica's reopen leaves it. Nothing records
-    /// it before replica teardown lands.
+    /// records it, and only the replica's reopen leaves it, for
+    /// [`Self::Recovering`].
     Retired,
 }
 
@@ -236,11 +246,37 @@ impl CoreMetadata {
             .map(|(group_id, group)| (*group_id, *group))
     }
 
-    /// Replaces `group_id`'s entry with `group`, for tests that set up a
-    /// state no write records yet, such as a retired log.
-    #[cfg(all(test, not(madsim)))]
-    pub(crate) fn set_group(&mut self, group_id: u32, group: GroupMetadata) {
-        self.groups.insert(group_id, group);
+    /// Records `group_id`'s log retired in `generation`, the one after its
+    /// current one: no vote, no log and no recovery plan, which bind only a
+    /// log the replica no longer has. Whether anything changed.
+    pub(crate) fn retire(&mut self, group_id: u32, generation: LogGeneration) -> bool {
+        let retired = GroupMetadata {
+            vote: None,
+            log: GroupLogState::Retired,
+            recovery: None,
+            generation,
+        };
+        self.groups.insert(group_id, retired) != Some(retired)
+    }
+
+    /// Reopens a retired `group_id` (7.3 of #768): its log is recorded
+    /// recovering, empty and with no vote, in the generation the retirement
+    /// named, so a snapshot record of the retired one stays inert. Whether
+    /// anything changed: a log that is not retired keeps its state.
+    pub(crate) fn reopen(&mut self, group_id: u32) -> bool {
+        let Some(group) = self.groups.get_mut(&group_id) else {
+            return false;
+        };
+        if group.log != GroupLogState::Retired {
+            return false;
+        }
+        *group = GroupMetadata {
+            vote: None,
+            log: GroupLogState::Recovering,
+            recovery: None,
+            generation: group.generation,
+        };
+        true
     }
 
     /// Records `vote` for `group_id`; whether anything changed.
@@ -322,8 +358,8 @@ impl CoreMetadata {
 
 /// Which generation of each group's log a replay of a core journal keeps:
 /// the one the core's metadata names, or, without a metadata file, the
-/// highest among the group's records, since nothing then says which life
-/// of the group is current.
+/// highest among the group's frames and its snapshot record, since nothing
+/// then says which life of the group is current.
 #[derive(Debug)]
 pub(crate) enum ReplayGenerations {
     /// The metadata file names each group's generation; a group it does not
@@ -358,6 +394,19 @@ impl ReplayGenerations {
                     .map(|(group_id, group)| (group_id, group.generation))
                     .collect(),
             )
+        }
+    }
+
+    /// Counts the generation of `group_id`'s snapshot record, before the
+    /// frames replay: without metadata, a record of a later generation than
+    /// every frame of the group makes those frames dead, as a frame of that
+    /// generation would. With metadata it changes nothing.
+    pub(crate) fn seed(&mut self, group_id: u32, generation: LogGeneration) {
+        if let Self::Highest(highest) = self {
+            let kept = highest.entry(group_id).or_insert(generation);
+            if kept.get() < generation.get() {
+                *kept = generation;
+            }
         }
     }
 
@@ -398,6 +447,18 @@ impl ReplayGenerations {
             .flatten()
             .map(|(group_id, generation)| (*group_id, *generation))
     }
+}
+
+/// The generation the metadata file of the core journal in `core_dir` names
+/// for `group_id`, as a store of the group opens it: the first when the
+/// file does not name the group or does not exist.
+#[cfg(any(test, madsim, feature = "test-support"))]
+pub(crate) fn named_generation(
+    core_dir: &Path,
+    group_id: u32,
+) -> Result<LogGeneration, StateFileError> {
+    CoreMetadata::load(&core_metadata_path(core_dir))
+        .map(|metadata| metadata.group(group_id).generation)
 }
 
 /// Moves every initialized group of the core whose metadata file is at
@@ -596,12 +657,28 @@ mod tests {
         assert_eq!(metadata.group(2).log, GroupLogState::Recovering);
     }
 
-    /// A retired log leaves `Retired` only by the reopen: neither recovery
-    /// nor a first entry moves it, and nothing but a retirement enters it.
+    /// A retirement drops the vote, the log and the plan and names the next
+    /// generation. A retired log leaves `Retired` only by the reopen, which
+    /// records it recovering with no vote in the same generation: neither
+    /// recovery nor a first entry moves it, and nothing but a retirement
+    /// enters it.
     #[test]
-    fn a_retired_log_stays_retired() {
+    fn a_retired_log_stays_retired_until_its_reopen() {
         let mut metadata = CoreMetadata::default();
-        metadata.groups.insert(1, GroupMetadata {
+        metadata.set_vote(1, openraft::Vote::new_committed(4, 2));
+        metadata.initialize(1, GroupLogState::Initialized);
+        metadata.set_recovery(
+            1,
+            Some(super::RecoveryRecord {
+                leader: 2,
+                point: 9,
+                leader_term: 3,
+                cut: super::PlanCut::NoCut,
+            }),
+        );
+        assert!(metadata.retire(1, LogGeneration::new(1)));
+        assert!(!metadata.retire(1, LogGeneration::new(1)));
+        assert_eq!(metadata.group(1), GroupMetadata {
             vote: None,
             log: GroupLogState::Retired,
             recovery: None,
@@ -613,6 +690,18 @@ mod tests {
         assert!(!metadata.set_log_state(1, GroupLogState::Initialized));
         assert!(!metadata.mark_recovering());
         assert_eq!(metadata.group(1).log, GroupLogState::Retired);
+        assert!(metadata.reopen(1));
+        assert!(!metadata.reopen(1), "only a retired log reopens");
+        assert_eq!(metadata.group(1), GroupMetadata {
+            vote: None,
+            log: GroupLogState::Recovering,
+            recovery: None,
+            generation: LogGeneration::new(1),
+        });
+        assert!(
+            !metadata.reopen(4),
+            "an unnamed group has nothing to reopen"
+        );
 
         assert!(metadata.initialize(2, GroupLogState::Initialized));
         assert!(!metadata.set_log_state(2, GroupLogState::Retired));
@@ -677,12 +766,17 @@ mod tests {
     #[test]
     fn replay_without_metadata_keeps_each_groups_highest_generation() {
         let mut generations = ReplayGenerations::of(&CoreMetadata::default(), true);
+        // A snapshot record counts as a frame of its generation: group 2's
+        // frames of generation 3 replace its record's, and group 3 has only
+        // its record.
+        generations.seed(2, LogGeneration::new(1));
+        generations.seed(3, LogGeneration::new(4));
         let admitted = [(1, 0), (1, 0), (2, 3), (1, 2), (1, 0), (1, 2), (2, 1)]
             .map(|(group, generation)| generations.admit(group, LogGeneration::new(generation)));
         assert_eq!(admitted, [
             ReplayRecord::Keep,
             ReplayRecord::Keep,
-            ReplayRecord::Keep,
+            ReplayRecord::Replace,
             ReplayRecord::Replace,
             ReplayRecord::Skip,
             ReplayRecord::Keep,
@@ -691,7 +785,12 @@ mod tests {
         assert_eq!(generations.adopted().collect::<Vec<_>>(), [
             (1, LogGeneration::new(2)),
             (2, LogGeneration::new(3)),
+            (3, LogGeneration::new(4)),
         ]);
+        let mut named = ReplayGenerations::of(&CoreMetadata::default(), false);
+        named.seed(5, LogGeneration::new(2));
+        assert_eq!(named.admit(5, LogGeneration::FIRST), ReplayRecord::Keep);
+        assert_eq!(named.adopted().count(), 0);
     }
 
     #[test]

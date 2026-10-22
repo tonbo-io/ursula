@@ -138,7 +138,8 @@ damaged one fails startup. `journal.meta` records each group's log state:
   stays closed until the state returns to `initialized`.
 - `retired`: the replica's log of the group was torn down, and the entry
   names the next generation with no vote and no recovery plan. It counts as
-  initialized. The format holds this state, but nothing writes it yet.
+  initialized, so the replica never joins a new group's first election or
+  answers as empty.
 
 A group leaves `empty` in the batch that persists its first entry or purge and
 never returns to it. That write records `recovering` instead of `initialized`
@@ -147,26 +148,45 @@ when the group's gate is closed and the replica holds nothing of it.
 Each group's entry also names its log generation, 0 until the replica's first
 retirement of the group and one more after each. A core journal interleaves
 the frames of its groups, so the frames of a retired log cannot be erased in
-place. Every journal record and every snapshot pointer therefore names its
-generation, and only what belongs to the generation `journal.meta` names is
-read back. Older frames are dead bytes that reclaim frees, and a pointer of
-another generation restores nothing. Without `journal.meta`, replay keeps each
-group's highest generation among its frames, the group opens `recovering`,
-and the rewritten `journal.meta` names that generation. Every group stays at
-generation 0 until replica teardown writes `retired`.
+place. Every journal record, every frozen archive and every snapshot record
+therefore names its generation, and only what belongs to the generation
+`journal.meta` names is read back. Older frames are dead bytes that the
+dead-frame age rule frees (see Reclaim), an archive is read only for a record
+of its own generation, and a snapshot record of another generation restores
+nothing. Without `journal.meta`, each group's generation is the highest among
+its frames and its snapshot record, every group with a surviving frame or a
+record of that generation opens `recovering`, and the rewritten
+`journal.meta` names that generation. Archives follow their segments: replay
+keeps the archive references of every generation, so a retired generation's
+archives go only once reclaim deletes the segments that refer to them.
 
-A core's open also records `recovering` every `empty` group whose snapshot
-record is of the generation `journal.meta` names. A group the replica knows
-only by its record then opens as a held log that stays out of elections until
-its gate opens, as a group whose `journal.meta` was lost does.
+`RaftWal::retire_group` tears a group's log down, refused while a store holds
+the group. One synced replacement of `journal.meta` records it `retired` in
+the next generation, with no vote, no log and no recovery plan, and writes no
+frame. The vote goes because a removed replica campaigns and would depose a
+leader once the group is placed on it again. Every segment that held the log
+now holds dead frames, and once `journal.meta` is durable the group's
+snapshot record is deleted. While `journal.meta` survives, a torn-down log
+never revives. Without it, the retired frames that remain open as a gated
+replica.
+
+A core's open deletes every snapshot record of another generation than
+`journal.meta` names, and the record of a `retired` log, which a crash
+between the retirement and the record's deletion leaves. It also records
+`recovering` every `empty` group whose snapshot record is of its generation.
+A group the replica knows only by its record then opens as a held log that
+stays out of elections until its gate opens, as a group whose `journal.meta`
+was lost does.
 
 A group's store opens with an admission. `Open` opens only a log
-`journal.meta` names, and `Create` also opens a group it does not name, with a
-fresh log. A `retired` log is refused either way, and so is an `Open` of a
-group `journal.meta` does not name, before anything is written for the group.
-An `Open` never creates a core's journal: on a core that holds nothing it is
-refused before the core opens. The engine factories open with `Create` until
-placement decides what a node hosts.
+`journal.meta` names, other than a `retired` one. `Create` also opens a group
+it does not name, with a fresh log, and reopens a `retired` log: one synced
+replacement of `journal.meta` records it `recovering`, empty and with no vote,
+in the generation the retirement named, before any write of the new store, so
+its recovery gate starts closed. Every other open is refused before anything
+is written for the group. An `Open` never creates a core's journal: on a core
+that holds nothing it is refused before the core opens. The engine factories
+open with `Create` until placement decides what a node hosts.
 
 `RaftWal::open_held_cores` opens the writer of every core whose directory
 holds `journal.meta`, a segment record or a snapshot record, and the run keeps
@@ -565,7 +585,8 @@ segment and from which segments hold dead entries:
    and snapshots them ahead of its cadence, so their purge frees the segment.
 
 **Dead entries age out (#669).** An entry is dead once it is purged, truncated,
-written again or copied forward by a rewrite. Its frame stays in its segment
+written again or copied forward by a rewrite, and every frame of a retired log
+or of a generation replay does not keep is dead. Its frame stays in its segment
 until the segment is deleted. The writer keeps, per segment, since when it holds
 a dead entry. The writer has no timer: at most once per drive interval
 (`storage.snapshot.drive_interval`), however often the driver ticks, the
@@ -599,8 +620,8 @@ of the oldest segment within the pass budget. Its entries go to an immutable
 `FrozenAppend` record carrying the archive's length, CRC32, BLAKE3 hash and the
 log ids still live in it. A `FrozenAppend` is copied forward as a reference with
 only its live log ids, so purged or truncated entries never return. Replay and
-reads verify an archive's length, checksums, group and index range. An archive
-is deleted only after the segments referencing it are durably gone, and not
+reads verify an archive's length, checksums, group, generation and index range.
+An archive is deleted only after the segments referencing it are durably gone, and not
 before the segments present at a startup that cut a tail are gone.
 
 Before deleting a segment the pass syncs the segment being written, under either

@@ -2514,16 +2514,13 @@ fn named_snapshot_keys(wal_dir: &Path) -> BTreeSet<String> {
     let Some(record) = records.first() else {
         return BTreeSet::new();
     };
-    let bytes = match std::fs::read(record) {
-        Ok(bytes) => bytes,
-        // The node's directory was wiped since the walk.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return BTreeSet::new();
-        }
-        Err(err) => panic!("read the snapshot record {}: {err}", record.display()),
+    // `None`: the node's directory was wiped since the walk, or the record
+    // is of a retired generation and restores nothing.
+    let Some(pointer) = ursula_raft::current_snapshot_pointer(record)
+        .unwrap_or_else(|err| panic!("read the snapshot record {}: {err}", record.display()))
+    else {
+        return BTreeSet::new();
     };
-    let pointer = ursula_raft::persisted_snapshot_pointer(&bytes)
-        .unwrap_or_else(|err| panic!("decode the snapshot record {}: {err}", record.display()));
     match pointer.location {
         ursula_runtime::SnapshotLocation::S3 { key, .. } => [key].into(),
         other => panic!(
@@ -5151,8 +5148,9 @@ async fn cli_an_s3_backed_node_refuses_a_non_inline_meta_record() {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let what = format!("node {} records its meta snapshot", node.id);
         let pointer = eventually(&mut procs, &what, async || {
-            let bytes = std::fs::read(record(node)).map_err(|err| err.to_string())?;
-            ursula_raft::persisted_snapshot_pointer(&bytes).map_err(|err| err.to_string())
+            ursula_raft::current_snapshot_pointer(&record(node))
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "no current snapshot record yet".to_owned())
         })
         .await;
         assert!(

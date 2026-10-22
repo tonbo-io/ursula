@@ -242,6 +242,7 @@ pub use log_store::RaftWal;
 pub use log_store::RaftWalError;
 pub use log_store::RecoveryRecord;
 pub use log_store::RecoveryState;
+pub use log_store::RetireGroupError;
 pub use log_store::SnapshotOrderError;
 pub use log_store::SnapshotRecord;
 pub use log_store::WaitFrom;
@@ -326,6 +327,8 @@ pub use sim_runtime::run_isolated;
 pub use snapshot_codec::decode_group_snapshot;
 pub use snapshot_codec::group_snapshot_frames;
 pub use state_machine::BuildsChanged;
+#[cfg(any(madsim, feature = "test-support"))]
+pub use state_machine::CurrentPointerError;
 pub use state_machine::GroupSnapshotWork;
 pub use state_machine::Handoff;
 pub use state_machine::PurgeBusy;
@@ -339,7 +342,7 @@ pub use state_machine::SnapshotPermitError;
 pub use state_machine::SnapshotRecordError;
 pub use state_machine::SnapshotStartError;
 #[cfg(any(madsim, feature = "test-support"))]
-pub use state_machine::persisted_snapshot_pointer;
+pub use state_machine::current_snapshot_pointer;
 #[cfg(any(madsim, feature = "test-support"))]
 pub use state_machine::snapshot_record_with_pointer;
 pub use target::FENCE_METADATA;

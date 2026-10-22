@@ -149,6 +149,31 @@ pub enum MetaOpenError {
     LockPoisoned,
 }
 
+/// Failure to tear down a group's log ([`RaftWal::retire_group`]). Nothing
+/// was retired.
+#[derive(Debug, thiserror::Error)]
+pub enum RetireGroupError {
+    /// The root's shard map places no such group.
+    #[error("raft group {} is outside the WAL's shard map", .group.0)]
+    NotPlaced { group: RaftGroupId },
+    /// The group's core journal is not open in this run, or is opening: its
+    /// groups are unknown, and none of them is torn down.
+    #[error("the journal of core {} is not open", .core.0)]
+    CoreNotOpen { core: CoreId },
+    /// The journal refused or failed the retirement: a store holds the
+    /// group, or the writer stopped.
+    #[error("retire raft group {} on core {}: {source}", .placement.raft_group_id.0, .placement.core_id.0)]
+    Journal {
+        placement: ShardPlacement,
+        #[source]
+        source: CoreJournalError,
+    },
+    #[error("the Raft WAL under '{}' has shut down", .root.display())]
+    ShutDown { root: PathBuf },
+    #[error("Raft WAL state mutex poisoned")]
+    LockPoisoned,
+}
+
 /// Opens each group's durable log store over its core's shared journal, for
 /// one run of the node's Raft WAL.
 ///
@@ -465,13 +490,14 @@ impl RaftWal {
     /// Opens `placement`'s log store as `admission` allows (4.2 of #768).
     /// Either admission opens a log the core's repaired metadata names,
     /// unless it is retired: replay names every group whose journal holds
-    /// an entry or a purge, and every empty group whose snapshot record is
-    /// of its generation, which opens recovering. [`Admission::Create`]
-    /// also opens a group the metadata does not name, with a fresh log.
-    /// Every other open is refused ([`RaftWalError::NotHeld`]), a retired
-    /// log's included until its reopen lands. A refusal writes nothing for
-    /// the group, and an `Open` on a core that holds nothing does not open
-    /// the core.
+    /// a frame of its generation, and every empty group whose snapshot
+    /// record is of its generation, which opens recovering.
+    /// [`Admission::Create`] also opens a group the metadata does not name,
+    /// with a fresh log, and reopens a retired log (7.3 of #768):
+    /// recovering, empty and with no vote, behind a closed gate. Every
+    /// other open is refused ([`RaftWalError::NotHeld`]). A refusal writes
+    /// nothing for the group, and an `Open` on a core that holds nothing
+    /// does not open the core.
     ///
     /// A group whose previous engine's OpenRaft work still runs is refused
     /// at once ([`RaftWalError::PreviousEngineRunning`]): that work may
@@ -627,6 +653,54 @@ impl RaftWal {
             }
         }
         Ok(LocalGroups { groups })
+    }
+
+    /// Tears down this replica's log of `group` (7.2 and 7.3 of #768): one
+    /// synced replacement of its core's metadata records it retired in the
+    /// next generation, with no vote, no log and no recovery plan, writing
+    /// no frame, and its snapshot record, then inert, is deleted. Its
+    /// frames are dead bytes the age rule frees, and an `Open` of it is
+    /// refused from then on, while a `Create` reopens it behind a closed
+    /// gate. Refused while a store holds the group, and on a core whose
+    /// journal is not open. A retired log, or a group the journal does not
+    /// name, is left as it is. The caller ends the group's engine work
+    /// first, so nothing it runs writes for the group again.
+    pub async fn retire_group(&self, group: RaftGroupId) -> Result<(), RetireGroupError> {
+        let placement = self
+            .topology
+            .placement(group)
+            .ok_or(RetireGroupError::NotPlaced { group })?;
+        let core = placement.core_id;
+        let slot = match &*self
+            .core_writers
+            .lock()
+            .map_err(|_poisoned| RetireGroupError::LockPoisoned)?
+        {
+            CoreWriterSlots::Running(slots) => slots.get(&core.0).cloned(),
+            CoreWriterSlots::ShutDown => {
+                return Err(RetireGroupError::ShutDown {
+                    root: self.root().to_owned(),
+                });
+            }
+        };
+        // A slot that is locked is opening its journal: its groups are not
+        // known yet.
+        let writer = slot.and_then(|slot| match slot.try_lock() {
+            Ok(slot) => match &slot.held {
+                HeldCore::Held(writer) => Some(Ok(writer.clone())),
+                HeldCore::Lazy => slot.writer.upgrade().map(Ok),
+                HeldCore::Unopened => None,
+            },
+            Err(std::sync::TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+                Some(Err(RetireGroupError::LockPoisoned))
+            }
+        });
+        let writer = writer.ok_or(RetireGroupError::CoreNotOpen { core })??;
+        writer
+            .retire_group(group)
+            .await
+            .map_err(|source| RetireGroupError::Journal { placement, source })
     }
 
     /// The groups the shard map places on `core`.

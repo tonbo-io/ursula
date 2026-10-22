@@ -117,7 +117,8 @@ fn core_failure(error: &CoreJournalError) -> WalOpenFailureKind {
         CoreJournalError::RecordTooLarge(_) | CoreJournalError::InvalidRecord { .. } => {
             WalOpenFailureKind::InvalidRecord
         }
-        CoreJournalError::InconsistentLog { .. } => WalOpenFailureKind::Corrupt,
+        CoreJournalError::InconsistentLog { .. }
+        | CoreJournalError::GenerationsExhausted { .. } => WalOpenFailureKind::Corrupt,
         CoreJournalError::WriterPoisoned { .. } | CoreJournalError::LockPoisoned => {
             WalOpenFailureKind::Poisoned
         }

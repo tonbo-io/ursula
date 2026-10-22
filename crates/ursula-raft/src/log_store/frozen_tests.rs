@@ -119,7 +119,7 @@ fn published_archive_survives_power_loss_and_identical_retry() {
             let before = SimDisk::read(&frozen::path(&dir, reference.id)).unwrap();
             SimDisk::power_loss(&dir).unwrap();
             assert_eq!(
-                encode_wire(&frozen::read(&dir, 7, &reference).unwrap()),
+                encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &reference).unwrap()),
                 encode_wire(&expected)
             );
             assert_eq!(
@@ -133,7 +133,7 @@ fn published_archive_survives_power_loss_and_identical_retry() {
                 before
             );
             assert_eq!(
-                encode_wire(&frozen::read(&dir, 7, &reference).unwrap()),
+                encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &reference).unwrap()),
                 encode_wire(&expected)
             );
         });
@@ -179,7 +179,7 @@ fn publication_faults_never_return_a_reference_and_retry_survives_power_loss() {
                 frozen::publish(&dir, archive_id(), LogGeneration::FIRST, entries(22)).unwrap();
             SimDisk::power_loss_losing_unsynced(&dir).unwrap();
             assert_eq!(
-                encode_wire(&frozen::read(&dir, 7, &reference).unwrap()),
+                encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &reference).unwrap()),
                 encode_wire(&entries(22))
             );
         }
@@ -199,11 +199,11 @@ fn reused_source_position_publishes_distinct_content_without_overwriting_old_pay
         assert_eq!(SimDisk::read(&first_path).unwrap(), before);
         SimDisk::power_loss_losing_unsynced(&dir).unwrap();
         assert_eq!(
-            encode_wire(&frozen::read(&dir, 7, &first).unwrap()),
+            encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &first).unwrap()),
             encode_wire(&entries(33))
         );
         assert_eq!(
-            encode_wire(&frozen::read(&dir, 7, &second).unwrap()),
+            encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &second).unwrap()),
             encode_wire(&entries(44))
         );
     });
@@ -233,8 +233,13 @@ fn missing_truncated_corrupt_and_wrong_group_archives_fail_closed_without_repair
             }
             let before = SimDisk::exists(&path).then(|| SimDisk::read(&path).unwrap());
             for _ in 0..2 {
-                let error =
-                    frozen::read(&dir, if defect == 3 { 8 } else { 7 }, &reference).unwrap_err();
+                let error = frozen::read(
+                    &dir,
+                    if defect == 3 { 8 } else { 7 },
+                    LogGeneration::FIRST,
+                    &reference,
+                )
+                .unwrap_err();
                 match defect {
                     0 => assert!(
                         matches!(error, JournalError::Io { op: JournalOp::Open, source, .. }
@@ -278,7 +283,7 @@ fn checksum_matching_incomplete_archive_is_still_rejected() {
         SimDisk::rename(&path, &malformed_path).unwrap();
         SimDisk::sync_dir(&dir).unwrap();
         assert!(matches!(
-            frozen::read(&dir, 7, &reference).unwrap_err(),
+            frozen::read(&dir, 7, LogGeneration::FIRST, &reference).unwrap_err(),
             JournalError::FrozenArchive {
                 defect: ArchiveDefect::Content,
                 ..
@@ -375,7 +380,7 @@ fn selected_reference_keeps_exact_live_ids_and_rejects_invalid_selection() {
             log_ids: vec![ids[0], ids[2]],
         };
         assert_eq!(
-            encode_wire(&frozen::selected(&dir, 7, &reference).unwrap()),
+            encode_wire(&frozen::selected(&dir, 7, LogGeneration::FIRST, &reference).unwrap()),
             encode_wire(&vec![values[0].clone(), values[2].clone()])
         );
         let before = SimDisk::read(&frozen::path(&dir, archive.id)).unwrap();
@@ -397,7 +402,7 @@ fn selected_reference_keeps_exact_live_ids_and_rejects_invalid_selection() {
                 log_ids,
             };
             assert!(matches!(
-                frozen::selected(&dir, 7, &reference).unwrap_err(),
+                frozen::selected(&dir, 7, LogGeneration::FIRST, &reference).unwrap_err(),
                 JournalError::FrozenArchive {
                     defect: ArchiveDefect::Content,
                     ..
@@ -476,7 +481,10 @@ fn archive_and_journal_reference_have_separate_durability_boundaries() {
                     let RaftGroupLogRecord::FrozenAppend(reference) = record.record else {
                         panic!("expected frozen reference")
                     };
-                    resolved.extend(frozen::selected(&dir, record.group_id, &reference).unwrap());
+                    resolved.extend(
+                        frozen::selected(&dir, record.group_id, record.generation, &reference)
+                            .unwrap(),
+                    );
                     Ok(())
                 },
             )
@@ -488,7 +496,7 @@ fn archive_and_journal_reference_have_separate_durability_boundaries() {
                 assert!(resolved.is_empty());
                 assert_eq!(SimDisk::read(&original).unwrap(), original_bytes);
                 assert_eq!(
-                    encode_wire(&frozen::read(&dir, 7, &archive).unwrap()),
+                    encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &archive).unwrap()),
                     encode_wire(&values)
                 );
                 frozen::collect(&dir, &Default::default()).unwrap();
@@ -553,7 +561,7 @@ fn garbage_collection_preserves_duplicate_references_and_syncs_their_deletion_fi
             assert!(SimDisk::exists(path));
         }
         assert_eq!(
-            encode_wire(&frozen::read(&dir, 7, &archive).unwrap()),
+            encode_wire(&frozen::read(&dir, 7, LogGeneration::FIRST, &archive).unwrap()),
             encode_wire(&values)
         );
         for path in &references {

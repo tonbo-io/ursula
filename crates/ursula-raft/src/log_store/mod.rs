@@ -14,8 +14,8 @@
 //!   it reports lagging.
 //! - `journal`: the framed, checksummed format of one segment.
 //! - `frozen`: immutable payload archives and validated journal references for stopped groups.
-//! - `core_meta`: each core's metadata file: every group's vote and log
-//!   state (empty, initialized or recovering).
+//! - `core_meta`: each core's metadata file: every group's vote, log state
+//!   (empty, initialized, recovering or retired) and log generation.
 //! - `topology`: immutable core and group counts, cluster id, node id and
 //!   root id of the WAL root.
 //! - `identity`: the root's run counter (`identity.bin`), which names each
@@ -62,6 +62,8 @@ pub use core_meta::PlanCut;
 pub use core_meta::RecoveryRecord;
 #[cfg(all(test, not(madsim)))]
 pub(crate) use core_meta::core_metadata_path;
+#[cfg(any(test, madsim, feature = "test-support"))]
+pub(crate) use core_meta::named_generation;
 #[cfg(madsim)]
 pub use disk::JournalDisk;
 #[cfg(madsim)]
@@ -72,6 +74,8 @@ pub use file::RaftGroupFileLogStore;
 pub use file::RecoveryCutError;
 pub use file::SnapshotOrderError;
 pub use file::SnapshotRecord;
+#[cfg(any(test, madsim, feature = "test-support"))]
+pub(crate) use file::snapshot_record_group;
 pub use frozen::ArchiveDefect;
 #[cfg(test)]
 pub(crate) use frozen::ArchiveId;
@@ -141,6 +145,7 @@ pub use wal::LocalGroups;
 pub use wal::MetaOpenError;
 pub use wal::PredecessorWait;
 pub use wal::RaftWal;
+pub use wal::RetireGroupError;
 pub use wal::WalMaintenance;
 pub(crate) use writer::CoreFileLogWriter;
 pub use writer::CoreJournalError;

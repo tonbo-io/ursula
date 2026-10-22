@@ -2044,13 +2044,63 @@ pub(crate) fn snapshot_record_bytes(
     bytes
 }
 
-/// The pointer of a group's snapshot record (`group-N.snapshot.json`),
-/// decoded as a restore decodes it, for tests and simulations that check
-/// which object a node's durable metadata names (#687).
+/// The pointer the snapshot record at `record` (`group-N.snapshot.json`
+/// beside its core journal) names for a restore, decoded as a restore
+/// decodes it, for tests and simulations that check which object a node's
+/// durable metadata names (#687). `None` when there is no record, or when
+/// it is of another generation of the group's log than the core's metadata
+/// names: such a record restores nothing, and its object may be gone.
 #[cfg(any(test, madsim, feature = "test-support"))]
-pub fn persisted_snapshot_pointer(bytes: &[u8]) -> Result<SnapshotPointer, SnapshotStoreError> {
-    let persisted = decode_snapshot_envelope::<PersistedSnapshot>(bytes)?;
+pub fn current_snapshot_pointer(
+    record: &Path,
+) -> Result<Option<SnapshotPointer>, CurrentPointerError> {
+    let (Some(dir), Some(group)) = (
+        record.parent(),
+        crate::log_store::snapshot_record_group(record),
+    ) else {
+        return Err(CurrentPointerError::NotARecord {
+            path: record.to_path_buf(),
+        });
+    };
+    let generation = crate::log_store::named_generation(dir, group).map_err(|source| {
+        CurrentPointerError::Metadata {
+            path: record.to_path_buf(),
+            source,
+        }
+    })?;
+    if !Disk::exists(record) {
+        return Ok(None);
+    }
+    let persisted = read_persisted_snapshot(record)?;
+    if persisted.generation != generation {
+        return Ok(None);
+    }
     SnapshotPointer::decode(&persisted.pointer_bytes)
+        .map(Some)
+        .map_err(|source| {
+            CurrentPointerError::Record(SnapshotRecordError::Decode {
+                path: record.to_path_buf(),
+                source,
+            })
+        })
+}
+
+/// Why [`current_snapshot_pointer`] read no pointer.
+#[cfg(any(test, madsim, feature = "test-support"))]
+#[derive(Debug, thiserror::Error)]
+pub enum CurrentPointerError {
+    /// The path names no group's snapshot record.
+    #[error("'{}' is not a snapshot record", .path.display())]
+    NotARecord { path: PathBuf },
+    /// The core metadata beside the record did not read.
+    #[error("read the core metadata beside '{}'", .path.display())]
+    Metadata {
+        path: PathBuf,
+        #[source]
+        source: crate::log_store::StateFileError,
+    },
+    #[error(transparent)]
+    Record(#[from] SnapshotRecordError),
 }
 
 /// The snapshot record `bytes` with its pointer replaced by `pointer`, its
@@ -3545,7 +3595,9 @@ mod tests {
             decode_snapshot_envelope::<PersistedSnapshot>(&binary).expect("decode binary record");
         let pointer = SnapshotPointer::decode(&persisted.pointer_bytes).expect("binary pointer");
         // The simulations' decoder reads the pointer as the restore does.
-        let decoded = persisted_snapshot_pointer(&binary).expect("decode the record's pointer");
+        let decoded = current_snapshot_pointer(&metadata_path)
+            .expect("decode the record's pointer")
+            .expect("a record of the generation the core names");
         assert_eq!(decoded.snapshot_id, pointer.snapshot_id);
         assert_eq!(decoded.location, pointer.location);
 
