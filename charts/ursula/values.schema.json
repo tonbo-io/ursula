@@ -316,6 +316,60 @@
             "clientIngressFrom"
           ]
         },
+        "scaleCheck": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The pre-upgrade,pre-rollback hook that checks a change of replicaCount against the meta leader's view.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render the scale-check hook."
+            },
+            "activeDeadlineSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Deadline of the check's Job."
+            },
+            "kubectlImage": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "The image kubectl is copied from.",
+              "properties": {
+                "repository": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "tag": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pullPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "Always",
+                    "IfNotPresent",
+                    "Never"
+                  ]
+                }
+              },
+              "required": [
+                "repository",
+                "tag",
+                "pullPolicy"
+              ]
+            },
+            "resources": {
+              "type": "object",
+              "description": "Resources of the check's container."
+            }
+          },
+          "required": [
+            "enabled",
+            "activeDeadlineSeconds",
+            "kubectlImage",
+            "resources"
+          ]
+        },
         "podAnnotations": {
           "type": "object",
           "additionalProperties": {
@@ -518,7 +572,8 @@
         "podDisruptionBudget",
         "scheduling",
         "clusterListen",
-        "networkPolicy"
+        "networkPolicy",
+        "scaleCheck"
       ]
     },
     "gateway": {
@@ -1028,7 +1083,7 @@
     },
     "raft": {
       "type": "object",
-      "description": "Static Raft cluster settings.",
+      "description": "Raft settings: the group count, the WAL, and snapshot and recovery limits. The meta group places every group.",
       "properties": {
         "groupCount": {
           "type": "integer",

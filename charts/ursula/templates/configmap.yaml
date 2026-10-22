@@ -9,7 +9,6 @@
 {{- /* The chart always renders [[raft.peers]], and a node with peers requires server.cluster_id. */ -}}
 {{- $clusterId := required "server.clusterId is required: name the deployment, for example after its environment and region (prod-us-east-1), the same for every install of it and different for every deployment one client can reach" .Values.server.clusterId | toString -}}
 {{- $peers := list -}}
-{{- $nodes := list -}}
 {{- range $i := until $replicaCount -}}
 {{- $podName := printf "%s-%d" $fullname $i -}}
 {{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $namespace $clusterDomain -}}
@@ -22,8 +21,6 @@
 {{- else -}}
 {{- $peers = append $peers (dict "node_id" $nodeId "url" $clusterUrl) -}}
 {{- end -}}
-{{- /* http_url is the Raft address. ursulactl reads metrics and readiness at client_url. */ -}}
-{{- $nodes = append $nodes (dict "id" $nodeId "http_url" $clusterUrl "client_url" $clientUrl "host" $host "name" $podName) -}}
 {{- end -}}
 {{- $s3Bucket := .Values.s3.bucket | toString -}}
 {{- $s3Region := .Values.s3.region | toString -}}
@@ -216,4 +213,4 @@ data:
 
     exec /usr/local/bin/ursula server --config "${config_path}" --node-id "${node_id}" "$@"
   cluster-manifest.json: |
-{{ dict "nodes" $nodes | toPrettyJson | indent 4 }}
+{{ include "ursula.clusterManifest" . | indent 4 }}

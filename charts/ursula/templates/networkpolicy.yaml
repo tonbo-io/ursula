@@ -30,6 +30,11 @@ spec:
             matchLabels:
               {{- include "ursula.testSelectorLabels" $ | nindent 14 }}
         {{- end }}
+        {{- if $.Values.server.scaleCheck.enabled }}
+        - podSelector:
+            matchLabels:
+              {{- include "ursula.scaleCheckSelectorLabels" $ | nindent 14 }}
+        {{- end }}
       {{- end }}
     # Cluster plane: only this release's server pods.
     - ports:

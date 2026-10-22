@@ -1,0 +1,205 @@
+{{- if .Values.server.scaleCheck.enabled }}
+{{- $name := printf "%s-scale-check" (include "ursula.fullname" . | trunc 50 | trimSuffix "-") -}}
+{{- $sts := include "ursula.fullname" . -}}
+{{/*
+Scale check, before an upgrade or a rollback changes server.replicaCount.
+
+Node ids are ordinal + 1, so a lower count drops the highest ids for good,
+and a higher count starts ids again. The hook reads the live StatefulSet's
+replicas with kubectl, since Helm's lookup is empty under Argo CD, and
+passes when there is none (a fresh install, Argo CD's first PreSync) or the
+count is unchanged, so an image-only upgrade of an unhealthy cluster passes.
+A raise from 1 is refused: a single node keeps one meta voter and RF 1 as
+its Bootstrap fixed them. Otherwise it runs `ursulactl node verify-removed`
+for every id a lower count drops, which passes once `ursulactl node
+decommission --wait` removed them, and `verify-not-removed` for every id a
+higher count starts, since a removed id never holds a group again. ursulactl
+reads the meta leader's view over the pods' client plane, which the
+NetworkPolicy opens to this hook's label.
+*/}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scale-check
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+automountServiceAccountToken: false
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scale-check
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+rules:
+  # The live replica count, of this release's StatefulSet only.
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    resourceNames: [{{ $sts | quote }}]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scale-check
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $name }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scale-check
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "-10"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded,hook-failed
+data:
+  # The manifest of the new count: the meta voters are its lowest ids.
+  cluster-manifest.json: |
+{{ include "ursula.clusterManifest" . | indent 4 }}
+  scale-check.sh: |
+    #!/bin/sh
+    set -eu
+    desired={{ .Values.server.replicaCount | int }}
+    live="$(kubectl --namespace {{ .Release.Namespace | quote }} get statefulset {{ $sts | quote }} \
+      --ignore-not-found --output 'jsonpath={.spec.replicas}')"
+    if [ -z "${live}" ]; then
+      echo "scale check: no StatefulSet {{ $sts }} yet, nothing to check"
+      exit 0
+    fi
+    if [ "${live}" -eq "${desired}" ]; then
+      echo "scale check: server.replicaCount stays ${live}"
+      exit 0
+    fi
+    if [ "${live}" -eq 1 ]; then
+      echo "scale check: refused, server.replicaCount ${live} to ${desired}: a single node keeps one meta voter and replication factor 1, so it never grows. Install a new release and restore a backup into it" >&2
+      exit 1
+    fi
+    if [ "${desired}" -lt "${live}" ]; then
+      verb=verify-removed
+      first=$((desired + 1))
+      last="${live}"
+    else
+      verb=verify-not-removed
+      first=$((live + 1))
+      last="${desired}"
+    fi
+    set --
+    id="${first}"
+    while [ "${id}" -le "${last}" ]; do
+      set -- "$@" --node "${id}"
+      id=$((id + 1))
+    done
+    echo "scale check: server.replicaCount ${live} to ${desired}, ursulactl node ${verb}" "$@"
+    exec ursulactl node "${verb}" --config /etc/ursula/scale-check/cluster-manifest.json "$@"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ursula.labels" . | nindent 4 }}
+    app.kubernetes.io/component: scale-check
+  annotations:
+    "helm.sh/hook": pre-upgrade,pre-rollback
+    "helm.sh/hook-weight": "0"
+    # A failed Job stays until the next attempt, so its refusal can be read.
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.server.scaleCheck.activeDeadlineSeconds }}
+  template:
+    metadata:
+      labels:
+        {{- include "ursula.scaleCheckSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: true
+      restartPolicy: Never
+      {{- with .Values.server.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # The check runs ursulactl from the Ursula image, which has no
+        # kubectl, so one is copied in.
+        - name: copy-kubectl
+          image: {{ printf "%s:%s" .Values.server.scaleCheck.kubectlImage.repository .Values.server.scaleCheck.kubectlImage.tag | quote }}
+          imagePullPolicy: {{ .Values.server.scaleCheck.kubectlImage.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - cp "$(command -v kubectl)" /tools/kubectl
+          {{- with .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+      containers:
+        - name: scale-check
+          image: {{ include "ursula.image" . | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              export PATH="/tools:/usr/local/bin:${PATH}"
+              exec /bin/sh /etc/ursula/scale-check/scale-check.sh
+          {{- with .Values.server.scaleCheck.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.server.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: tools
+              mountPath: /tools
+              readOnly: true
+            - name: scale-check
+              mountPath: /etc/ursula/scale-check
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tools
+          emptyDir: {}
+        - name: scale-check
+          configMap:
+            name: {{ $name }}
+        - name: tmp
+          emptyDir: {}
+{{- end }}

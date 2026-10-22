@@ -1,6 +1,8 @@
 //! The batch decisions and the `--replace` expansion, on states the real
 //! kernel built.
 
+use std::collections::BTreeMap;
+
 use reqwest::StatusCode;
 use ursula_control::ControlCommand;
 use ursula_control::ControlError;
@@ -24,7 +26,10 @@ use ursula_shard::RaftGroupId;
 use super::Answered;
 use super::Decision;
 use super::Intent;
+use super::Live;
+use super::MetaLeaderReport;
 use super::MoveRefusal;
+use super::NodeEligibility;
 use super::Pending;
 use super::Replacement;
 use super::WriteAnswer;
@@ -92,7 +97,14 @@ impl Meta {
     }
 
     fn decide(&self, group: u32, intent: &Intent, retarget: bool) -> Decision {
-        decide(&self.state, RaftGroupId(group), intent, None, retarget)
+        decide(
+            &self.state,
+            RaftGroupId(group),
+            intent,
+            None,
+            retarget,
+            Live::Any,
+        )
     }
 }
 
@@ -158,6 +170,7 @@ fn a_moving_group_keeps_its_target_unless_the_move_retargets_or_cancels() {
         &to(&[1, 2, 5]),
         Some(since),
         false,
+        Live::Any,
     );
     assert_eq!(expected, retarget);
     assert_eq!(
@@ -229,6 +242,7 @@ fn a_request_over_the_move_limit_queues_and_other_refusals_end_the_group() {
         &to(&[1, 2, 5]),
         Some(PlacementEpoch::new(meta_id(1, 1))),
         false,
+        Live::Any,
     );
     assert!(matches!(
         refused(stale),
@@ -372,5 +386,76 @@ fn an_answer_classifies_by_the_kernels_requeue() {
     assert!(matches!(
         answered(2, stale_incarnation, false),
         Answered::Refuse(MoveRefusal::Unexpected { via: 2, .. })
+    ));
+}
+
+/// Catches a move onto a node the meta leader does not report live without
+/// `--allow-not-live`, and a cancel held back by liveness: only the nodes a
+/// move adds are checked, and a node the report leaves out is not live.
+#[test]
+fn a_move_adds_only_nodes_the_meta_leader_reports_live() {
+    let mut meta = Meta::new(4);
+    let report = |eligibility: &[(u64, NodeEligibility)]| MetaLeaderReport {
+        leader: node(1),
+        leader_since_ms: 5,
+        eligibility: eligibility
+            .iter()
+            .map(|(id, eligibility)| (node(*id), *eligibility))
+            .collect(),
+        decommission_blocked: Vec::new(),
+        sweep_pending: BTreeMap::new(),
+        last_bootstrap_refusal: None,
+        oldest_move_age_ms: None,
+    };
+    let decide_live = |meta: &Meta, intent: &Intent, report: Option<&MetaLeaderReport>| {
+        decide(
+            &meta.state,
+            RaftGroupId(0),
+            intent,
+            None,
+            false,
+            Live::Eligible(report),
+        )
+    };
+    let onto_four = to(&[1, 2, 4]);
+    assert_eq!(
+        decide_live(&meta, &onto_four, None),
+        Decision::Refuse(MoveRefusal::NoLeaderReport {
+            group: RaftGroupId(0)
+        })
+    );
+    // Node 4 sheds for its WAL disk, and node 5 is not listed.
+    let shedding = report(&[
+        (1, NodeEligibility::Eligible),
+        (2, NodeEligibility::Eligible),
+        (3, NodeEligibility::Eligible),
+        (4, NodeEligibility::DiskPressure),
+    ]);
+    assert_eq!(
+        decide_live(&meta, &onto_four, Some(&shedding)),
+        Decision::Refuse(MoveRefusal::NotLive {
+            group: RaftGroupId(0),
+            node: node(4),
+            eligibility: Some(NodeEligibility::DiskPressure),
+        })
+    );
+    assert_eq!(
+        decide_live(&meta, &to(&[1, 2, 5]), Some(&shedding)),
+        Decision::Refuse(MoveRefusal::NotLive {
+            group: RaftGroupId(0),
+            node: node(5),
+            eligibility: None,
+        })
+    );
+    // The current voters need no entry, only the node the move adds.
+    let four_live = report(&[(4, NodeEligibility::Eligible)]);
+    assert!(matches!(
+        decide_live(&meta, &onto_four, Some(&four_live)),
+        Decision::Submit(_)
+    ));
+    meta.start_move(0, &[1, 2, 4]);
+    assert!(matches!(
+        decide_live(&meta, &Intent::Cancel, None),
+        Decision::Submit(_)
     ));
 }

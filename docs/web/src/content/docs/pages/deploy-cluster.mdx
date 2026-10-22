@@ -39,7 +39,7 @@ With cold storage enabled the chart also turns on cold-chunk compaction and lets
 
 For MinIO or another S3-compatible backend, set `s3.endpoint`. Prefer workload identity over static S3 credentials. To use a registry mirror, set `global.image.repository`, `global.image.tag`, and optionally `global.imagePullSecrets`.
 
-`server.replicaCount` is the server pod count: `1`, or `3` and more. The chart refuses `2`, which tolerates no node loss. Each Raft group has at most three voters whatever the pod count, so production should use `3`. Raising it on a cluster of three or more pods adds pods that register and hold no group. Lowering it, or growing a single pod, is not supported.
+`server.replicaCount` is the server pod count: `1`, or `3` and more. The chart refuses `2`, which tolerates no node loss. Each Raft group has at most three voters whatever the pod count, so production should use `3`. Raising it on a cluster of three or more pods adds pods that register and hold no group, and `ursulactl placement move` moves groups onto them. Lowering it is permanent: node ids are the pod ordinal plus one, so first run `ursulactl node decommission --node <id> --wait` for every id above the new count (never a meta voter, ids 1 to 3), then lower the count and delete the dropped pods' PVCs. A single pod never grows. Before every upgrade and rollback the chart's scale-check hook refuses a raise from 1 and a lower count whose dropped ids are not removed.
 
 ### On AWS (EKS)
 

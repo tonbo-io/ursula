@@ -314,6 +314,7 @@ The admin plane binds `server.admin_listen`, which is pod loopback by default
 | `POST /__ursula/placement/groups/{group}/move` | Move a live group to `to`, as many voters as it has, while its placement is at `expected` (`RequestMove`). A move of a moving group retargets it, and a move to its source cancels it. |
 | `POST /__ursula/placement/move-limit` | Set how many groups may move at once (`SetMoveLimit`). |
 | `POST /__ursula/placement/nodes/{node}/replace-disk` | Release the root the node id is bound to, given as `{"expect_root": R}` (section 2). |
+| `POST /__ursula/placement/nodes/{node}/cordon`, `.../uncordon`, `.../decommission` | Change the node's lifecycle (`SetNodeLifecycle`), with no body. The answer is `{"lifecycle": L}`, the lifecycle after the change, `removed` for a decommission of a node with no role. A meta voter's decommission answers `409` (`meta_voter`). |
 
 `GET /__ursula/placement/groups/{group}`, on the client and the admin
 listener, answers the group's placement in the node's view, confirmed by a

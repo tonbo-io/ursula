@@ -9,10 +9,13 @@
 //! The admin listener's writes go to the meta leader:
 //! `POST /__ursula/placement/groups/{group}/move` ([`request_move`]) starts,
 //! retargets or cancels a move, `POST /__ursula/placement/move-limit`
-//! ([`set_move_limit`]) sets the move limit, and
+//! ([`set_move_limit`]) sets the move limit,
 //! `POST /__ursula/placement/nodes/{node}/replace-disk` ([`replace_disk`])
 //! releases the root a node id is bound to, the `ursulactl node
-//! replace-disk` verb.
+//! replace-disk` verb, and `POST /__ursula/placement/nodes/{node}/cordon`,
+//! `.../uncordon` and `.../decommission` ([`cordon`], [`uncordon`],
+//! [`decommission`]) change a node's lifecycle, the `ursulactl node`
+//! lifecycle verbs.
 //!
 //! Every refusal of a placement route answers through
 //! [`placement_api_error_response`], one status per reason.
@@ -26,6 +29,8 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use ursula_control::ControlApplied;
 use ursula_control::ControlError;
+use ursula_control::LifecycleChange;
+use ursula_control::LifecycleResponse;
 use ursula_control::MoveLimitRequest;
 use ursula_control::MoveLimitResponse;
 use ursula_control::MoveRequest;
@@ -44,6 +49,9 @@ pub(crate) const GROUP_ROUTE: &str = "/__ursula/placement/groups/{group}";
 pub(crate) const MOVE_ROUTE: &str = "/__ursula/placement/groups/{group}/move";
 pub(crate) const MOVE_LIMIT_ROUTE: &str = "/__ursula/placement/move-limit";
 pub(crate) const REPLACE_DISK_ROUTE: &str = "/__ursula/placement/nodes/{node}/replace-disk";
+pub(crate) const CORDON_ROUTE: &str = "/__ursula/placement/nodes/{node}/cordon";
+pub(crate) const UNCORDON_ROUTE: &str = "/__ursula/placement/nodes/{node}/uncordon";
+pub(crate) const DECOMMISSION_ROUTE: &str = "/__ursula/placement/nodes/{node}/decommission";
 
 /// The query of the placement reads.
 #[derive(Debug, Default, serde::Deserialize)]
@@ -186,6 +194,43 @@ pub(crate) async fn replace_disk(
     {
         Ok(ControlApplied::RootReleased(record)) => Json(record).into_response(),
         Ok(other) => other_command_response("replace-disk", &other),
+        Err(error) => placement_api_error_response(error.into()),
+    }
+}
+
+/// Cordons `node`: it keeps its replicas and takes no new one.
+pub(crate) async fn cordon(state: State<HttpState>, node: Path<u64>) -> Response {
+    set_lifecycle(state, node, LifecycleChange::Cordon).await
+}
+
+/// Uncordons `node`, which aborts its decommission while it has a role.
+pub(crate) async fn uncordon(state: State<HttpState>, node: Path<u64>) -> Response {
+    set_lifecycle(state, node, LifecycleChange::Uncordon).await
+}
+
+/// Decommissions `node`: the meta leader moves its groups away, and the
+/// node is removed for good once it has no role. A meta voter answers
+/// `409` (`meta_voter`).
+pub(crate) async fn decommission(state: State<HttpState>, node: Path<u64>) -> Response {
+    set_lifecycle(state, node, LifecycleChange::Decommission).await
+}
+
+/// Changes `node`'s lifecycle through the meta leader and answers the
+/// lifecycle after the change. An unknown node answers `404`, a removed
+/// one `409` (`node_removed`).
+async fn set_lifecycle(
+    State(state): State<HttpState>,
+    Path(node): Path<u64>,
+    change: LifecycleChange,
+) -> Response {
+    let Some(reader) = state.meta().status_reader() else {
+        return placement_api_error_response(no_meta_runtime());
+    };
+    match reader.set_lifecycle(NodeId::new(node), change).await {
+        Ok(ControlApplied::LifecycleChanged { lifecycle }) => {
+            Json(LifecycleResponse { lifecycle }).into_response()
+        }
+        Ok(other) => other_command_response("lifecycle", &other),
         Err(error) => placement_api_error_response(error.into()),
     }
 }

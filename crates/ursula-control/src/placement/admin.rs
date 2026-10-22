@@ -21,6 +21,7 @@ use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::MetaLogId;
 pub use ursula_proto::placement::MetaRole;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::RootId;
@@ -252,6 +253,15 @@ pub struct MoveLimitRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveLimitResponse {
     pub limit: MoveLimit,
+}
+
+/// The answer to `POST /__ursula/placement/nodes/{node}/cordon`,
+/// `.../uncordon` and `.../decommission`, which carry no body: the node's
+/// lifecycle after the change. A decommission answers `removed` when the
+/// node had no role left.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleResponse {
+    pub lifecycle: NodeLifecycle,
 }
 
 /// Why a placement write did not answer with its result.

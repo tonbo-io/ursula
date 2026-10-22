@@ -116,6 +116,15 @@ pub async fn drain_node(
             .with_context(|| format!("mark maintenance-drain on node {}", target.id))?;
     }
 
+    // A node the view shows removed is skipped: it may be stopped.
+    let members = match crate::view::without_removed(client, nodes).await {
+        Ok(members) => members,
+        Err(err) => {
+            clear_maintenance_drain(client, target).await;
+            return Err(err).context("pre-flight placement view");
+        }
+    };
+    let nodes = members.as_slice();
     let snapshot = match client.fetch_cluster(nodes).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
@@ -326,8 +335,9 @@ pub async fn wait_node_ready(
 
 /// Wait until, in the meta leader's view, every group is live with no move
 /// and runs on exactly its target voters ([`check_groups`]), and every node
-/// is a caught-up voter where the view places it or its report counts it
-/// ([`check_readiness`]), sampled twice to avoid acting on a transient view.
+/// the view does not show removed is a caught-up voter where the view places
+/// it or its report counts it ([`check_readiness`]), sampled twice to avoid
+/// acting on a transient view.
 pub async fn wait_cluster_ready(
     phase: &str,
     nodes: &[NodeInfo],
@@ -353,7 +363,7 @@ pub async fn wait_cluster_ready(
                 {
                     unready.push(refusal.to_string());
                 }
-                for node in nodes {
+                for node in view.members(nodes) {
                     let placed = view.voter_groups(node.id);
                     let report = check_readiness(&snap, &placed, node.id, lag_tolerance);
                     if !report.all_ready {

@@ -94,8 +94,22 @@ server:
     enabled: false
     # NetworkPolicy peers (podSelector, namespaceSelector, ipBlock) allowed to
     # reach the client port. Empty admits every source. This release's
-    # gateway and Helm test pods are always admitted.
+    # gateway, Helm test and scale-check pods are always admitted.
     clientIngressFrom: []
+  scaleCheck:
+    # Render the pre-upgrade,pre-rollback hook that checks a change of
+    # replicaCount: a lower count needs every dropped node id removed by
+    # `ursulactl node decommission --wait`, a higher one needs no started id
+    # removed, and a raise from 1 is refused. It reads the live StatefulSet
+    # with kubectl (RBAC: get on this release's StatefulSet).
+    enabled: true
+    activeDeadlineSeconds: 300
+    # The image kubectl is copied from into the check's Ursula container.
+    kubectlImage:
+      repository: alpine/k8s
+      tag: 1.33.3
+      pullPolicy: IfNotPresent
+    resources: {}
   # Extra annotations applied to Ursula server pods.
   podAnnotations: {}
   # Extra labels applied to Ursula server pods.
