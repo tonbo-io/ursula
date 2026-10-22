@@ -2,8 +2,9 @@
 //! identity and opens the meta journal ([`open_meta`]), before the runtime
 //! starts and so before any data group of the run opens. `init_state`
 //! then starts the meta runtime on that journal ([`SpawnedMeta::start`]),
-//! with the meta shed of a cluster node ([`super::meta_shed`]), and keeps
-//! both in a [`MetaSlot`] until shutdown.
+//! with the meta shed of a cluster node ([`super::meta_shed`]), then the
+//! hosting driver over meta's views ([`MetaSlot::start_hosting`]), and
+//! keeps all three in a [`MetaSlot`] until shutdown.
 
 use std::num::NonZeroU32;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::GroupCount;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeSet;
+use ursula_raft::HostingTask;
 use ursula_raft::PeerDirectory;
 use ursula_raft::PeerIdentity;
 use ursula_raft::RaftEngineConfig;
@@ -30,6 +32,7 @@ use ursula_raft::meta::runtime::MetaRuntimeConfig;
 use ursula_raft::meta::status::MetaStatusReader;
 use ursula_shard::ShardMapError;
 
+use crate::bootstrap::hosting::SpawnedHosting;
 use crate::bootstrap::participation::PeerParticipation;
 
 /// What the spawn path prepared for the meta runtime: the opened meta
@@ -71,17 +74,30 @@ impl SpawnedMeta {
         MetaSlot(Arc::new(Mutex::new(Some(ServerMeta {
             runtime,
             shed,
+            hosting: None,
             wal_metrics: self.wal_metrics,
         }))))
     }
 }
 
-/// The meta runtime and the meta shed task of a server node.
+/// The meta runtime, the meta shed task and the hosting driver of a server
+/// node.
 #[derive(Debug)]
 struct ServerMeta {
     runtime: GrpcMetaRuntime,
     shed: tokio::task::JoinHandle<()>,
+    /// The hosting driver, once [`MetaSlot::start_hosting`] started it.
+    hosting: Option<HostingTask>,
     wal_metrics: ursula_runtime::RuntimeMetrics,
+}
+
+/// What shutdown stops of a node's meta: the hosting driver first, so no
+/// replica opens again while the groups stop, then the meta runtime once
+/// the groups stopped.
+#[derive(Debug)]
+pub(crate) struct TakenMeta {
+    pub(crate) runtime: GrpcMetaRuntime,
+    pub(crate) hosting: Option<HostingTask>,
 }
 
 /// Where the server keeps its meta runtime until shutdown takes it.
@@ -89,16 +105,43 @@ struct ServerMeta {
 pub struct MetaSlot(Arc<Mutex<Option<ServerMeta>>>);
 
 impl MetaSlot {
-    /// The meta runtime, once: shutdown stops it. The meta shed stops
-    /// here.
-    pub(crate) fn take(&self) -> Option<GrpcMetaRuntime> {
+    /// The meta runtime and the hosting driver, once: shutdown stops them.
+    /// The meta shed stops here.
+    pub(crate) fn take(&self) -> Option<TakenMeta> {
         let meta = self
             .0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
         meta.shed.abort();
-        Some(meta.runtime)
+        Some(TakenMeta {
+            runtime: meta.runtime,
+            hosting: meta.hosting,
+        })
+    }
+
+    /// Starts the hosting driver of `hosting` over `runtime`'s groups and
+    /// the meta runtime's views ([`SpawnedHosting::start`]), and keeps it
+    /// for shutdown. Without a meta runtime, nothing starts and the node
+    /// hosts nothing.
+    pub(crate) async fn start_hosting(
+        &self,
+        hosting: SpawnedHosting,
+        runtime: ursula_runtime::ShardRuntime,
+        registry: RaftGroupHandleRegistry,
+        wal: RaftWal,
+    ) {
+        let Some(reader) = self.status_reader() else {
+            tracing::warn!("hosting: no meta runtime runs; the node hosts nothing");
+            return;
+        };
+        let task = hosting.start(runtime, registry, wal, reader).await;
+        let mut meta = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        match meta.as_mut() {
+            Some(meta) => meta.hosting = Some(task),
+            // Shutdown took the runtime meanwhile: the driver stops too.
+            None => drop(tokio::spawn(task.shutdown())),
+        }
     }
 
     /// The meta journal's WAL counters, while the meta runtime runs.

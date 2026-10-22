@@ -669,10 +669,12 @@ impl Node {
         let mut state = HttpState::new(runtime)
             .with_wall_clock(Clock(clock.clone()))
             .with_wal_disk_monitor(wal_disk.clone());
-        // Peer 2 is this node itself: a redirect to it is a redirect the
-        // gateway can follow, and it answers each hop with a redirect again.
+        // Peer 2 is this server itself, which routes as node 1: a redirect
+        // to node 2 is a redirect the gateway can follow, and it answers
+        // each hop with a redirect again.
         state.fields_mut().client_write_router = Some(ClientWriteLeaderRouter::new(
-            crate::tests::bound_peer_cluster(2, crate::shared_peers([(2, url.clone())])),
+            crate::tests::bound_peer_cluster(1, crate::shared_peers([(2, url.clone())])),
+            Arc::new(ursula_raft::FixedPlacement::single(1)),
         ));
         // A stream holds two staged, unused parts at most, so the third is
         // refused for the bound.

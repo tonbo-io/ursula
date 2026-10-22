@@ -1776,6 +1776,24 @@ impl ShardRuntime {
         .await
     }
 
+    /// Forgets the gauges of `raft_group_id`, a group whose engine the node
+    /// shut down and no longer hosts, so the node reports nothing of it. A
+    /// group its core opened again since keeps them.
+    pub async fn forget_group(&self, raft_group_id: RaftGroupId) -> Result<(), RuntimeError> {
+        let placement = self.placement_for_group(raft_group_id)?;
+        let mailbox = self.mailbox(placement.core_id)?;
+        let (response_tx, response_rx) = oneshot::channel();
+        self.send_core_command(
+            mailbox,
+            CoreCommand::ForgetGroup {
+                placement,
+                response_tx,
+            },
+            response_rx,
+        )
+        .await
+    }
+
     /// Stops one hosted group's engine, waiting for its durable resources to
     /// be released, and starts it again from its durable state through the
     /// engine factory. A recovery plan's cut runs in between (#581 section
@@ -1905,7 +1923,8 @@ impl ShardRuntime {
             .ok_or(RuntimeError::MailboxClosed { core_id })
     }
 
-    fn placement_for_group(
+    /// Where `raft_group_id` runs, by the runtime's shard map.
+    pub fn placement_for_group(
         &self,
         raft_group_id: RaftGroupId,
     ) -> Result<ShardPlacement, RuntimeError> {

@@ -9,6 +9,15 @@
 //! a membership yet: until that first report the metrics show none, also
 //! when the log lists the node ([`crate::GroupRejoin::counts`]).
 //!
+//! An open replica that holds nothing and has no confirmed role counts for
+//! nothing, so its closed gate holds back no participation. A server node's
+//! wiped voter (#729) never runs in that state: the hosting driver creates
+//! a replica it does not hold only from a confirmed view, whose role the
+//! predicate then reads, and opens only what its journal holds from an
+//! unconfirmed one. A replica that kept anything counts as an open replica
+//! with a held log does, so its gate keeps the node out of handoffs until
+//! it opens (design 5.8).
+//!
 //! The left mark of each group ([`LeftMarks`]) belongs to the node, not to
 //! a replica's engine, so a replica closed and opened again keeps it for
 //! the run. Two producers feed it:

@@ -54,7 +54,7 @@
 //!   out.
 //! - **Bootstrap** ([`run_group_bootstrap`]): a group's initializer whose
 //!   replica holds nothing of the group runs `Initialize` only when every
-//!   configured voter answers a probe `Vote` with an empty log and no
+//!   placed voter answers a probe `Vote` with an empty log and no
 //!   leader and has persisted its genesis floor, and its seed role
 //!   ([`crate::SeedRole`]) confirms it as the initializer right before. The reserved T0-N0 probe
 //!   is read-only; its grant bit reports this readiness. A replica that ever
@@ -2972,7 +2972,7 @@ mod tests {
                 voters: BTreeSet::from([1, 2, 3]),
             })
         );
-        // The configured voters, all present: nothing to do. A follower that
+        // The placed voters, all present: nothing to do. A follower that
         // lost entries stays a voter, and OpenRaft rewinds it in place.
         assert_eq!(plan_heal_step(&view(&[1, 2, 3], &[])), None);
         let mut follower_view = view(&[1, 2], &[]);

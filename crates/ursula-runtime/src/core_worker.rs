@@ -134,6 +134,11 @@ pub(crate) enum CoreCommand {
         placement: ShardPlacement,
         response_tx: oneshot::Sender<Result<(), RuntimeError>>,
     },
+    /// Forgets the gauges of a group the core does not run.
+    ForgetGroup {
+        placement: ShardPlacement,
+        response_tx: oneshot::Sender<Result<(), RuntimeError>>,
+    },
     #[cfg(madsim)]
     InstallGroupEngine {
         placement: ShardPlacement,
@@ -484,6 +489,17 @@ impl CoreWorker {
             } => {
                 debug_assert_eq!(placement.core_id, self.core_id);
                 self.shutdown_group_engine(placement, response_tx).await;
+            }
+            CoreCommand::ForgetGroup {
+                placement,
+                response_tx,
+            } => {
+                debug_assert_eq!(placement.core_id, self.core_id);
+                // A slot means the group opened again: its gauges are live.
+                if !self.groups.contains_key(&placement.raft_group_id) {
+                    self.metrics.forget_group(placement.raft_group_id);
+                }
+                reply(response_tx, Ok(()));
             }
             #[cfg(madsim)]
             CoreCommand::InstallGroupEngine {

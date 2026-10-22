@@ -1,4 +1,4 @@
-//! Leader-side membership repair toward a group's configured voters.
+//! Leader-side membership repair toward a group's placed voters.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -44,11 +44,11 @@ pub(crate) struct HealView {
 /// One step of the heal driver. A follower that lost entries stays a
 /// member: OpenRaft rewinds it in place (log reversion is allowed in every
 /// gated group), so the driver only brings the membership back to the
-/// configured voters: after an operator removed one, or a recovery plan
+/// placed voters: after an operator removed one, or a recovery plan
 /// kept a membership that lacks one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum HealStep {
-    /// Add a configured voter that is missing as a learner.
+    /// Add a placed voter that is missing as a learner.
     AddLearner { target: u64 },
     /// Promote a caught-up learner: `voters` is the current voters plus it.
     Promote { target: u64, voters: BTreeSet<u64> },
@@ -68,7 +68,7 @@ pub(crate) fn plan_heal_step(view: &HealView) -> Option<HealStep> {
     if !view.voters.is_subset(&view.configured) {
         return None;
     }
-    // Several configured voters can be missing at once (two overlapping
+    // Several placed voters can be missing at once (two overlapping
     // restarts in a group of five): promote whichever caught up first, and
     // add the others back as learners one step at a time.
     let missing = view.configured.difference(&view.voters);
@@ -107,9 +107,9 @@ fn heal_view(metrics: &RaftMetrics<UrsulaRaftTypeConfig>, configured: &BTreeSet<
 /// Leader-side heal driver for one group. While this replica leads, its
 /// [`LeaderTick`] observes follower log reversions, which OpenRaft repairs
 /// in place, and counts each one in `reversions` and logs it. The driver
-/// also brings the membership back to the configured voters (add a missing
+/// also brings the membership back to the placed voters (add a missing
 /// one as a learner, promote it once caught up, flatten a stale joint
-/// config). It reads the configured voters from `nodes` on every tick.
+/// config). It reads the placed voters from `nodes` on every tick.
 /// Returns once the Raft stops.
 pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     raft: Raft<UrsulaRaftTypeConfig, SM>,
@@ -161,7 +161,7 @@ pub(crate) async fn run_rejoin_heal<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
             plane,
             raft_group_id = group,
             step = ?step,
-            "recovery: restoring the group's configured voters"
+            "recovery: restoring the group's placed voters"
         );
         let result = match &step {
             HealStep::AddLearner { target } => crate::rt::time::timeout(

@@ -338,7 +338,9 @@ impl GroupHost for SimHost {
     }
 
     /// A simulated node keeps no gauges or open back-off of its own.
-    fn forget(&self, _group: RaftGroupId) {}
+    fn forget(&self, _group: RaftGroupId) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 /// A running node's host and hosting driver.
@@ -385,9 +387,15 @@ impl MetaCluster {
         let placed = self.placed_mut();
         let started = placed.started.clone();
         let parts = self.data.replica_parts(node_id);
+        let inputs = MetaPlacement::new(
+            ursula_proto::placement::NodeId::new(node_id),
+            parts.registry.clone(),
+            hosting.clone(),
+        );
+        inputs.bind_meta(reader.clone());
         let host = Arc::new(SimHost {
             parts,
-            inputs: MetaPlacement::new(reader.clone(), hosting.clone()),
+            inputs,
             replicas: Mutex::new(BTreeMap::new()),
             started,
         });

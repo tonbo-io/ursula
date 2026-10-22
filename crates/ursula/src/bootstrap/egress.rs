@@ -79,7 +79,12 @@ fn remote_peers_needed_for_quorum(node_id: u64, voters: &BTreeSet<u64>) -> usize
 /// The probe plan of `node_id` over `groups`, the voter configs of the
 /// effective membership of each replica that counts as a voter
 /// ([`RaftGroupHandleRegistry::counting_voter_configs`]).
-/// A config none of whose other voters `raft.peers` lists is not probed.
+/// A group none of whose configs lists this node is not probed: the node
+/// cannot lead it, so the group's peers say nothing of the leaderships it
+/// would shed, even while the replica counts by its placed role. Every
+/// config of a group that lists the node in one is probed, since a leader
+/// of a joint membership needs a quorum of each. A config none of whose
+/// other voters `raft.peers` lists is not probed.
 pub(crate) fn cluster_egress_probe_plan(
     node_id: u64,
     peers: &PeerDirectory,
@@ -88,6 +93,7 @@ pub(crate) fn cluster_egress_probe_plan(
     let mut peer_urls = BTreeMap::new();
     let groups = groups
         .iter()
+        .filter(|(_, configs)| configs.iter().any(|voters| voters.contains(&node_id)))
         .flat_map(|(raft_group_id, configs)| {
             configs.iter().map(move |voters| (*raft_group_id, voters))
         })

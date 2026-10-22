@@ -355,9 +355,10 @@ mod tests {
     #[tokio::test]
     async fn the_maintenance_fence_header_answers_400_and_mutates_nothing() {
         let registry = ursula_raft::RaftGroupHandleRegistry::default();
-        let state = crate::HttpState::with_raft_registry(
+        let state = crate::HttpState::with_raft_cluster(
             ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"),
             registry.clone(),
+            std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
         );
         let incarnation = state.process_incarnation.to_string();
         let admin = crate::admin_router(state);

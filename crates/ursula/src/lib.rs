@@ -97,6 +97,7 @@ pub use bootstrap::ClusterWal;
 pub use bootstrap::SnapshotDriveSettings;
 pub use bootstrap::SnapshotDriver;
 pub use bootstrap::SpawnRuntimeError;
+pub use bootstrap::SpawnedHosting;
 pub use bootstrap::SpawnedMeta;
 pub use bootstrap::SpawnedRuntime;
 pub use bootstrap::Topology;
@@ -414,38 +415,22 @@ impl HttpState {
         Arc::make_mut(&mut self.0)
     }
 
-    /// The static topology is the expected inventory. Observed metrics cannot
-    /// establish which groups or voters are missing after a restart. A
-    /// single-node durable runtime has no static inventory and creates its
-    /// groups on first use, so it certifies the groups it hosts.
+    /// The placement is the expected inventory: the voters this node's
+    /// placement inputs give each group, which are meta's seeds in the
+    /// node's latest view on a server node. Observed metrics cannot
+    /// establish which groups or voters are missing after a restart. Before
+    /// a bootstrapped view the node expects no group.
     fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
         let registry = self.raft_registry()?;
+        let router = self.client_write_router.as_ref()?;
         let snapshots = registry.metrics_snapshot();
-        let Some(topology) = self.client_write_router.as_ref() else {
-            let node_id = snapshots.first()?.node_id;
-            let expected = snapshots
-                .iter()
-                .map(|group| (group.raft_group_id, BTreeSet::from([node_id])))
-                .collect();
-            return Some(ursula_raft::check_raft_maintenance(
-                &snapshots, node_id, expected, 16,
-            ));
-        };
-        let node_id = topology
-            .node_id
+        let node_id = router
+            .node_id()
             .or_else(|| snapshots.first().map(|group| group.node_id))?;
-        let all_voters = topology
-            .peers
-            .directory()
-            .node_ids()
-            .collect::<BTreeSet<_>>();
         let expected = (0..self.runtime.raft_group_count())
             .filter_map(|id| {
-                let voters = topology
-                    .per_group_voters
-                    .get(&RaftGroupId(id))
-                    .unwrap_or(&all_voters);
-                voters.contains(&node_id).then(|| (id, voters.clone()))
+                let voters = router.placed_voters(RaftGroupId(id));
+                voters.contains(&node_id).then_some((id, voters))
             })
             .collect();
         Some(ursula_raft::check_raft_maintenance(
@@ -479,14 +464,14 @@ impl HttpState {
         self.fields_mut().staged_parts = staged_parts;
     }
 
-    /// This node's id, when it has one: configured, or named by its static
-    /// topology.
+    /// This node's id, when it has one: configured, or the one its peer
+    /// cluster binds.
     pub(crate) fn node_id(&self) -> Option<u64> {
         self.configured_node_id
             .or_else(|| {
                 self.client_write_router
                     .as_ref()
-                    .and_then(|topology| topology.node_id)
+                    .and_then(ClientWriteLeaderRouter::node_id)
             })
             .or_else(|| {
                 self.raft_registry().and_then(|registry| {
@@ -609,60 +594,24 @@ impl HttpState {
         .into()
     }
 
-    pub fn with_raft_registry(
+    /// A Raft node of a cluster. Its leader redirects read the peers
+    /// `raft_registry`'s peer cluster binds, and its `NotHosted` hints and
+    /// its maintenance inventory read the voters `placement`, the node's
+    /// placement inputs, gives each group.
+    pub fn with_raft_cluster(
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
+        placement: Arc<dyn ursula_raft::PlacementInputs>,
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
+        let router = ClientWriteLeaderRouter::new(raft_registry.peer_cluster().clone(), placement);
         HttpStateFields {
             process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
             runtime,
             raft_registry: Some(raft_registry),
-            client_write_router: None,
-            http_metrics: Arc::new(HttpMetrics::default()),
-            wall_clock: Arc::new(SystemWallClock),
-            node_memory: NodeMemoryMonitor::default(),
-            external_payload_min_bytes: 1024 * 1024,
-            snapshot_commits: snapshot_parts::SnapshotCommits::default(),
-            staged_parts,
-            wal_disk: WalDiskMonitor::default(),
-            raft_wal: None,
-            meta: crate::bootstrap::MetaSlot::default(),
-            format_epoch_mismatch: ursula_raft::FormatEpochMismatch::global(),
-            cluster_id: Arc::new(ursula_raft::generate_cluster_id()),
-        }
-        .into()
-    }
-
-    /// A node of a cluster whose peers `raft_registry`'s peer cluster
-    /// binds: its leader redirects read them there.
-    pub fn with_static_raft_cluster(
-        runtime: ShardRuntime,
-        raft_registry: RaftGroupHandleRegistry,
-    ) -> Self {
-        Self::with_static_raft_cluster_topology(runtime, raft_registry, None, BTreeMap::new())
-    }
-
-    pub fn with_static_raft_cluster_topology(
-        runtime: ShardRuntime,
-        raft_registry: RaftGroupHandleRegistry,
-        node_id: impl Into<Option<u64>>,
-        per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
-    ) -> Self {
-        let staged_parts =
-            staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
-        HttpStateFields {
-            client_write_router: Some(ClientWriteLeaderRouter::with_static_topology(
-                node_id,
-                raft_registry.peer_cluster().clone(),
-                per_group_voters,
-            )),
-            runtime,
-            raft_registry: Some(raft_registry),
-            process_incarnation: unpersisted_incarnation(),
-            configured_node_id: None,
+            client_write_router: Some(router),
             http_metrics: Arc::new(HttpMetrics::default()),
             wall_clock: Arc::new(SystemWallClock),
             node_memory: NodeMemoryMonitor::default(),
@@ -876,36 +825,38 @@ impl Drop for AbortOnDrop {
 /// ([`ursula_raft::PeerDirectory::client_url`]): its `client_url`, or its
 /// Raft `url` when the node serves both planes on `server.listen`. Clients
 /// and gateways must be able to reach these URLs. A leader that `raft.peers`
-/// does not list is never a redirect target.
+/// does not list is never a redirect target. A group this node does not
+/// host redirects to a voter its placement gives the group, read at each
+/// redirect: none before a bootstrapped view.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     peers: ursula_raft::PeerCluster,
-    node_id: Option<u64>,
-    per_group_voters: Arc<BTreeMap<RaftGroupId, BTreeSet<u64>>>,
+    placement: Arc<dyn ursula_raft::PlacementInputs>,
 }
 
 impl ClientWriteLeaderRouter {
-    pub fn new(peers: ursula_raft::PeerCluster) -> Self {
-        Self::with_static_topology(None, peers, BTreeMap::new())
+    pub fn new(
+        peers: ursula_raft::PeerCluster,
+        placement: Arc<dyn ursula_raft::PlacementInputs>,
+    ) -> Self {
+        Self { peers, placement }
     }
 
-    pub fn with_static_topology(
-        node_id: impl Into<Option<u64>>,
-        peers: ursula_raft::PeerCluster,
-        per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
-    ) -> Self {
-        Self {
-            peers,
-            node_id: node_id.into(),
-            per_group_voters: Arc::new(per_group_voters),
-        }
+    /// This node's id, as its peer cluster binds it.
+    fn node_id(&self) -> Option<u64> {
+        self.peers.identity().map(|identity| identity.node_id())
+    }
+
+    /// The voters this node's placement gives `group`.
+    fn placed_voters(&self, group: RaftGroupId) -> BTreeSet<u64> {
+        self.placement.nodes(group).voters()
     }
 
     /// The client URL `raft.peers` lists for `leader_id`. `None` for this
     /// node itself, and for a leader that `raft.peers` does not list, which
     /// the caller answers with a retryable `503`.
     fn peer_base(&self, leader_id: u64) -> Option<String> {
-        if Some(leader_id) == self.node_id {
+        if Some(leader_id) == self.node_id() {
             return None;
         }
         self.peers
@@ -921,14 +872,14 @@ impl ClientWriteLeaderRouter {
             .map(|base| format!("{base}{request_target}"))
     }
 
-    /// A node that hosts a replica of `raft_group_id`, other than this one.
+    /// A voter this node's placement gives `raft_group_id`, other than this
+    /// node, that `raft.peers` lists.
     fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<String> {
-        let voters = self.per_group_voters.get(&raft_group_id)?;
+        let me = self.node_id();
         let peers = self.peers.directory();
-        voters
-            .iter()
-            .copied()
-            .filter(|node_id| Some(*node_id) != self.node_id)
+        self.placed_voters(raft_group_id)
+            .into_iter()
+            .filter(|node_id| Some(*node_id) != me)
             .find_map(|node_id| peers.client_url(node_id).map(str::to_owned))
     }
 
@@ -1201,46 +1152,16 @@ pub fn router(runtime: ShardRuntime) -> Router {
         ))
 }
 
-pub fn router_with_raft_registry(
+pub fn router_with_raft_cluster(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
+    placement: Arc<dyn ursula_raft::PlacementInputs>,
 ) -> Router {
-    let state = HttpState::with_raft_registry(runtime, raft_registry);
+    let state = HttpState::with_raft_cluster(runtime, raft_registry, placement);
     cluster_router_from_state(state.clone()).merge(client_router_with_admission(
         state,
         IngressAdmission::default(),
     ))
-}
-
-pub fn router_with_static_raft_cluster(
-    runtime: ShardRuntime,
-    raft_registry: RaftGroupHandleRegistry,
-) -> Router {
-    let state = HttpState::with_static_raft_cluster(runtime, raft_registry);
-    cluster_router_from_state(state.clone()).merge(client_router_with_admission(
-        state,
-        IngressAdmission::default(),
-    ))
-}
-
-pub fn router_with_static_raft_cluster_topology(
-    runtime: ShardRuntime,
-    raft_registry: RaftGroupHandleRegistry,
-    node_id: u64,
-    per_group_voters: BTreeMap<RaftGroupId, BTreeSet<u64>>,
-) -> Router {
-    let state = HttpState::with_static_raft_cluster_topology(
-        runtime,
-        raft_registry,
-        Some(node_id),
-        per_group_voters,
-    );
-    cluster_router_from_state(state.clone())
-        .merge(admin_ops_router(state.clone()))
-        .merge(client_router_with_admission(
-            state,
-            IngressAdmission::default(),
-        ))
 }
 
 /// Convenience wrapper that merges the client, cluster, and admin planes into
@@ -1566,13 +1487,12 @@ async fn readiness(State(state): State<HttpState>) -> Response {
         .raft_registry()
         .is_none_or(RaftGroupHandleRegistry::recovery_barriers_ready);
     let raft_maintenance = state.raft_maintenance_report();
-    // Non-Raft dev mode has no static voter role. A single-node durable
-    // runtime has nothing to certify before its first group exists. A cluster
-    // registry without its topology cannot certify its local replica inventory.
+    // Non-Raft dev mode has no voter role. A Raft node that knows no node
+    // id of its own cannot certify its local replica inventory.
     let raft_ready = match (state.raft_registry(), raft_maintenance.as_ref()) {
         (None, _) => true,
         (Some(_), Some(report)) => report.serving_ready(),
-        (Some(registry), None) => state.client_write_router.is_none() && registry.is_empty(),
+        (Some(_), None) => false,
     };
     // A node whose disk lease lapsed, or that was superseded, takes part in
     // no Raft traffic, and one that owes its predecessor wait grants no vote.

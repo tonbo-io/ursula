@@ -16,7 +16,7 @@ use ursula_runtime::ColdStore;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::ShardRuntime;
 
-use crate::router_with_raft_registry;
+use crate::router_with_raft_cluster;
 
 /// A body just under the request limit: `[0,0,...,0]`, whose normalized
 /// text is one `0\n` message per value, the most messages a body can hold.
@@ -134,7 +134,11 @@ async fn external_json_writes_of_tiny_messages_make_small_entries() {
     let wal_root = crate::tests::TestWalRoot::new();
     let registry = ursula_raft::RaftGroupHandleRegistry::default();
     let (runtime, raft_wal) = durable_runtime_with_cold_store(&wal_root, &registry);
-    let app = router_with_raft_registry(runtime.clone(), registry);
+    let app = router_with_raft_cluster(
+        runtime.clone(),
+        registry,
+        Arc::new(ursula_raft::FixedPlacement::single(1)),
+    );
     let body = tiny_messages_body();
 
     // An append to an existing stream.

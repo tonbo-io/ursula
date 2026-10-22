@@ -6,31 +6,45 @@ Kubernetes replace a voter without losing quorum.
 
 ## 1. Membership model
 
-Membership is static and comes from configuration. `raft.peers` lists every
-node and its cluster URL. `raft.group_count` fixes the number of data groups,
-and streams hash to a group by that count. Each data group's voters and its
-initializer come from the seed rule over the `raft.peers` ids
-(`crates/ursula-control/src/placement/seed.rs`): group `g` runs on
-`min(raft.placement.replication_factor, N)` consecutive nodes in ascending id
-from index `g mod N`, and the first of them initializes it. With `N` at most the
-replication factor, every node votes in every group. `ConfigSeeds`
-(`crates/ursula-raft/src/placement_wiring.rs`) computes this table, and the
-server reads it for what a node hosts, where it routes a group it does not host
-and its maintenance inventory. The egress probe judges each voter config of the
-effective membership of every replica that counts as a voter
+`raft.peers` lists every node and its cluster URL. `raft.group_count` fixes
+the number of data groups, and streams hash to a group by that count. The meta
+group places every data group at its `Bootstrap`, by the seed rule over the
+`raft.peers` ids at genesis (`crates/ursula-control/src/placement/seed.rs`):
+group `g` runs on `min(raft.placement.replication_factor, N)` consecutive nodes
+in ascending id from index `g mod N`, and the first of them initializes it.
+With `N` at most the replication factor, every node votes in every group.
+
+Placement decides what each node hosts. The engine factory takes every input
+placement decides through one seam, `PlacementInputs`
+(`crates/ursula-raft/src/placement_wiring.rs`): which groups the node hosts
+and how each may open, the replica's seed role, and the voters its recovery
+drivers ask, initialize and heal toward, read at each use. On a server node
+it is `MetaPlacement`. The node's view gives the seed role and the voters,
+and the hosting set gives the admission. Only the hosting driver writes that
+set (`crates/ursula-raft/src/hosting.rs`, started by
+`crates/ursula/src/bootstrap/hosting.rs`). The runtime starts with an empty
+set, so no replica opens before the driver admits it. The driver starts once
+the meta runtime has published its first view. Before, the node opens the
+cores its journals hold, in parallel. The driver's first plan then reopens
+every group a journal holds, unconfirmed and without a meta leader. It
+creates a group only from a view a meta read barrier confirmed, on a node
+that view places in the group. No open failure stops the start: such a group
+stays closed under its open back-off, and the driver opens it again. A node
+that `raft.peers` gained after genesis is in no group's seeds, so it hosts
+nothing.
+
+The voters each group's placement gives are also what the node routes a group
+it does not host to (`NotHosted`) and what its maintenance inventory expects.
+Before a bootstrapped view the node routes no such group and expects none. The
+egress probe judges each voter config of the effective membership of every
+replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
-The engine factory takes every
-input placement decides through one seam, `PlacementInputs`: which groups the
-node hosts and how each may open, the replica's seed role, and the voters its
-recovery drivers ask, initialize and heal toward, read at each use. The meta group's `Bootstrap` seeds the same rule
-over the `raft.peers` ids at genesis, so the two agree only while `raft.peers`
-keeps those ids: do not add nodes to `raft.peers` of a running cluster.
 
 `raft.peers` is the only source of peer addresses, and Raft membership is the
 electorate. The server builds one `PeerDirectory` from `raft.peers` at config
 load (`crates/ursula-raft/src/peer_directory.rs`), lends it at startup (the
-format-epoch probe, meta's genesis node set and the interim seed table) and
-moves it into the node's one bind. Every other reader of a peer
+format-epoch probe and meta's genesis node set) and moves it into the node's
+one bind. Every other reader of a peer
 address reads the bound directory at each use (`PeerCluster::directory`): the
 Raft network client, leader forwarding, recovery probes, the egress probe, the
 leadership-shed polls, the shutdown handoff and leader redirects. The directory
@@ -48,10 +62,9 @@ listener, else its client listener (`complete_temporary_node` in
 entries, snapshot records and installed snapshots name each member by node ID
 only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 
-There is no runtime membership authority for data groups. The meta Raft
-group forms over the nodes of `raft.peers` and records the cluster's
-bootstrap. Every node that runs Raft runs a replica of it, unless its meta
-journal or replica is damaged. No data group reads its placements, and the
+The meta Raft group forms over the nodes of `raft.peers` and records the
+cluster's bootstrap and every group's placement. Every node that runs Raft
+runs a replica of it, unless its meta journal or replica is damaged. The
 server never moves a group to another node or changes its voter count.
 `GET /__ursula/placement`, on the client and the admin listener, reports what
 the node's meta replica applied, its role and leader, and its registration
@@ -64,10 +77,10 @@ again every 30 seconds (`crates/ursula/src/bootstrap/meta_shed.rs`). A node
 that sheds for a reason that refuses transfers, such as the maintenance
 drain, hands its meta leadership away too. A node that sheds only for cold
 health keeps it, so an object store outage that every node sheds for does
-not pass meta from voter to voter. The configured voter set is the target that the heal driver restores
-(section 2). The admin routes (section 3) can change a group's OpenRaft
-membership directly, and the heal driver adds a configured voter that is
-missing back as a learner and promotes it.
+not pass meta from voter to voter. The target voters of a group's placement
+are the set that the heal driver restores (section 2). The admin routes
+(section 3) can change a group's OpenRaft membership directly, and the heal
+driver adds a placed voter that is missing back as a learner and promotes it.
 
 ## 2. Replica loss and rejoin
 
@@ -95,7 +108,7 @@ membership changes. Its conflict counts as its acknowledgement of the leader,
 so the leader keeps its quorum, and this holds when the followers that lost
 entries are a majority too. The heal driver
 (`crates/ursula-raft/src/rejoin/heal.rs`) observes and counts each reversion.
-It also adds a configured voter that is missing as a learner, promotes it once
+It also adds a placed voter that is missing as a learner, promotes it once
 it caught up, and flattens a joint configuration whose second step never
 committed.
 
@@ -216,9 +229,11 @@ without it.
 
 Readiness and maintenance eligibility are two answers from one report
 (`check_raft_maintenance` in `crates/ursula-raft/src/maintenance.rs`). The
-report compares local replicas against the configured inventory and lists
-issues per group, such as `incomplete_voter_set`, `unconfigured_member` (a
-member that is not a configured voter, which the leader never removes),
+report compares local replicas against the placement's inventory, the groups
+whose target voters in the node's latest view list the node, with those
+voters, and lists issues per group, such as `incomplete_voter_set`,
+`unconfigured_member` (a member that is not a placed voter, which the leader
+never removes),
 `joint_membership`, `apply_lag` or `apply_stopped`. `GET /__ursula/ready` uses
 `serving_ready()`, which ignores incomplete voter sets, unconfigured members,
 joint membership and stopped apply, so

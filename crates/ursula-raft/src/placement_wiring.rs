@@ -17,29 +17,30 @@
 //!
 //! [`MetaPlacement`] answers from meta: admission from the hosting driver's
 //! [`HostingSet`], the seed role and the node sets from this node's
-//! placement views. [`ConfigSeeds`] is production's interim
-//! implementation, the seed rule over `raft.peers`. [`FixedPlacement`]
+//! placement views. Every Raft node of a server runs it. [`FixedPlacement`]
 //! gives tests and the simulation one fixed voter set. The meta group keeps
 //! its genesis driver and passes its claim through [`FixedNodes`] and
 //! [`FixedRole`].
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use futures_util::future::BoxFuture;
 use ursula_control::Admission;
 use ursula_control::SeedRoleOf;
+use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ReplicaRole;
 use ursula_shard::RaftGroupId;
 
+use crate::RaftGroupHandleRegistry;
 use crate::hosting::HostingSet;
 use crate::meta::confirm::MetaBarrierError;
 use crate::meta::status::MetaStatusReader;
 use crate::meta::watch::GroupPlacementWatch;
 
 /// Every placement input of a data replica's open, by group.
-pub trait PlacementInputs: Send + Sync + 'static {
+pub trait PlacementInputs: std::fmt::Debug + Send + Sync + 'static {
     /// How the node may open `group`, `None` when it does not host it.
     fn admission(&self, group: RaftGroupId) -> Option<Admission>;
     /// The node's seed role in `group`.
@@ -152,17 +153,38 @@ impl GroupNodes for FixedNodes {
 ///   initializer initializes and the heal driver restores. A group without
 ///   a placement has neither, so its replica asks only the members of its
 ///   own membership and heals nothing.
+///
+/// The engine factory takes the inputs before the meta runtime starts, so
+/// the meta read barrier binds later ([`Self::bind_meta`]). Until then the
+/// hosting set is empty, so no replica opens, and a confirmation fails as
+/// it does on a node that runs no meta replica
+/// ([`MetaBarrierError::Stopped`]). Cloning shares the binding.
 #[derive(Debug, Clone)]
 pub struct MetaPlacement {
-    meta: MetaStatusReader,
+    node: NodeId,
+    registry: RaftGroupHandleRegistry,
     hosting: HostingSet,
+    meta: Arc<OnceLock<MetaStatusReader>>,
 }
 
 impl MetaPlacement {
-    /// The inputs of the node `meta` reports on, admitting what `hosting`
-    /// holds.
-    pub fn new(meta: MetaStatusReader, hosting: HostingSet) -> Self {
-        Self { meta, hosting }
+    /// The inputs of node `node`, read from `registry`'s placement views,
+    /// admitting what `hosting` holds.
+    pub fn new(node: NodeId, registry: RaftGroupHandleRegistry, hosting: HostingSet) -> Self {
+        Self {
+            node,
+            registry,
+            hosting,
+            meta: Arc::default(),
+        }
+    }
+
+    /// Confirms views through `meta`, the meta runtime of this node and
+    /// registry, from now on. The first binding holds.
+    pub fn bind_meta(&self, meta: MetaStatusReader) {
+        if self.meta.set(meta).is_err() {
+            tracing::warn!("placement inputs: meta was bound already; the first binding stays");
+        }
     }
 }
 
@@ -173,14 +195,14 @@ impl PlacementInputs for MetaPlacement {
 
     fn seed_role(&self, group: RaftGroupId) -> Arc<dyn SeedRole> {
         Arc::new(MetaSeedRole {
-            meta: self.meta.clone(),
+            placement: self.clone(),
             group,
         })
     }
 
     fn nodes(&self, group: RaftGroupId) -> Arc<dyn GroupNodes> {
         Arc::new(PlacedNodes(GroupPlacementWatch::new(
-            self.meta.registry().placement_watch(),
+            self.registry.placement_watch(),
             group,
         )))
     }
@@ -188,7 +210,7 @@ impl PlacementInputs for MetaPlacement {
 
 /// A seed role read from this node's placement views.
 struct MetaSeedRole {
-    meta: MetaStatusReader,
+    placement: MetaPlacement,
     group: RaftGroupId,
 }
 
@@ -213,8 +235,8 @@ impl SeedRole for MetaSeedRole {
             return Some(SeedRoleOf::Initializer);
         }
         ursula_control::shown_seed_role(
-            &self.meta.registry().placement_watch().current(),
-            self.meta.node(),
+            &self.placement.registry.placement_watch().current(),
+            self.placement.node,
             self.group,
         )
     }
@@ -230,10 +252,11 @@ impl SeedRole for MetaSeedRole {
             if any_view_initializes() {
                 return Ok(Some(SeedRoleOf::Initializer));
             }
-            let confirmed = self.meta.confirm_view().await?;
+            let meta = self.placement.meta.get().ok_or(MetaBarrierError::Stopped)?;
+            let confirmed = meta.confirm_view().await?;
             Ok(ursula_control::seed_role(
                 &confirmed,
-                self.meta.node(),
+                self.placement.node,
                 self.group,
             ))
         })
@@ -243,11 +266,11 @@ impl SeedRole for MetaSeedRole {
     /// barrier's stamp still covers it
     /// ([`crate::RaftGroupHandleRegistry::confirmed_view`]).
     fn placed_role(&self) -> Option<ReplicaRole> {
-        let confirmed = self.meta.registry().confirmed_view()?;
+        let confirmed = self.placement.registry.confirmed_view()?;
         confirmed
             .view()
             .cluster()?
-            .role(self.group, self.meta.node())
+            .role(self.group, self.placement.node)
     }
 }
 
@@ -323,194 +346,5 @@ impl PlacementInputs for FixedPlacement {
 
     fn nodes(&self, _group: RaftGroupId) -> Arc<dyn GroupNodes> {
         Arc::new(FixedNodes::from_voters(self.voters.clone()))
-    }
-}
-
-/// The voters and the initializer of every data group of a static cluster:
-/// the kernel's seed rule ([`ursula_control::seed_voters`] and
-/// [`ursula_control::initializer`]) over the `raft.peers` ids, at the
-/// configured replication factor, at most the node count.
-///
-/// Interim: removed in S2(h), where meta's seeds decide what a node hosts.
-/// Until then [`ConfigSeeds::for_node`] gives production's placement inputs.
-/// Meta's `Bootstrap` seeds the same rule over the genesis claim's peers,
-/// which are the `raft.peers` ids at genesis. The two agree only while
-/// `raft.peers` keeps those ids, so `raft.peers` may not grow until then.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ConfigSeeds {
-    groups: BTreeMap<RaftGroupId, GroupSeed>,
-}
-
-/// One data group's seed: its voters and the voter that initializes it.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct GroupSeed {
-    voters: BTreeSet<u64>,
-    initializer: u64,
-}
-
-impl ConfigSeeds {
-    /// The seeds of groups `0..group_count` over the node ids of `peers`.
-    /// No peers seed nothing.
-    pub fn new(
-        peers: &crate::PeerDirectory,
-        group_count: usize,
-        replication_factor: ursula_proto::placement::ReplicationFactor,
-    ) -> Self {
-        let ids = peers
-            .node_ids()
-            .map(ursula_proto::placement::NodeId::new)
-            .collect();
-        let Ok(nodes) = ursula_proto::placement::NodeSet::new(ids) else {
-            return Self::default();
-        };
-        let replication_factor =
-            ursula_control::effective_replication_factor(replication_factor, &nodes);
-        let groups = (0..group_count)
-            .map_while(|group| u32::try_from(group).ok())
-            .map(|group| {
-                let group = RaftGroupId(group);
-                let seed = GroupSeed {
-                    voters: ursula_control::seed_voters(group, replication_factor, &nodes)
-                        .iter()
-                        .map(ursula_proto::placement::NodeId::get)
-                        .collect(),
-                    initializer: ursula_control::initializer(group, &nodes).get(),
-                };
-                (group, seed)
-            })
-            .collect();
-        Self { groups }
-    }
-
-    /// The voters `group` is seeded on.
-    pub fn voters(&self, group: RaftGroupId) -> Option<&BTreeSet<u64>> {
-        self.groups.get(&group).map(|seed| &seed.voters)
-    }
-
-    /// The node that initializes `group`.
-    pub fn initializer(&self, group: RaftGroupId) -> Option<u64> {
-        self.groups.get(&group).map(|seed| seed.initializer)
-    }
-
-    /// Whether `node_id` is one of `group`'s seed voters.
-    pub fn hosts(&self, node_id: u64, group: RaftGroupId) -> bool {
-        self.voters(group)
-            .is_some_and(|voters| voters.contains(&node_id))
-    }
-
-    /// The seed voters of every group.
-    pub fn voter_table(&self) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
-        self.groups
-            .iter()
-            .map(|(group, seed)| (*group, seed.voters.clone()))
-            .collect()
-    }
-}
-
-/// [`ConfigSeeds`] as one node's placement inputs: the node hosts, and may
-/// create, the groups it is a seed voter of, and confirms its seed role
-/// without asking, since configuration decided it.
-///
-/// Interim: removed in S2(h), with [`ConfigSeeds`].
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfigSeedInputs {
-    node: u64,
-    seeds: ConfigSeeds,
-}
-
-impl ConfigSeeds {
-    /// The placement inputs of node `node`.
-    pub fn for_node(self, node: u64) -> ConfigSeedInputs {
-        ConfigSeedInputs { node, seeds: self }
-    }
-}
-
-impl ConfigSeedInputs {
-    /// The node's role in `group`: its initializer, another seed voter, or
-    /// none.
-    fn role(&self, group: RaftGroupId) -> Option<SeedRoleOf> {
-        if self.seeds.initializer(group) == Some(self.node) {
-            Some(SeedRoleOf::Initializer)
-        } else if self.seeds.hosts(self.node, group) {
-            Some(SeedRoleOf::Voter)
-        } else {
-            None
-        }
-    }
-}
-
-impl PlacementInputs for ConfigSeedInputs {
-    fn admission(&self, group: RaftGroupId) -> Option<Admission> {
-        self.seeds
-            .hosts(self.node, group)
-            .then_some(Admission::Create)
-    }
-
-    fn seed_role(&self, group: RaftGroupId) -> Arc<dyn SeedRole> {
-        Arc::new(FixedRole(self.role(group)))
-    }
-
-    fn nodes(&self, group: RaftGroupId) -> Arc<dyn GroupNodes> {
-        Arc::new(FixedNodes::from_voters(
-            self.seeds.voters(group).cloned().unwrap_or_default(),
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use ursula_shard::RaftGroupId;
-
-    use super::Admission;
-    use super::ConfigSeeds;
-    use super::PlacementInputs;
-    use super::SeedRoleOf;
-
-    /// The seed rule's inputs over four nodes at the default replication
-    /// factor: group `g`'s voters are three consecutive ids from index
-    /// `g mod 4` and its initializer is the first of them. A node hosts only
-    /// the groups it is a seed voter of, and a group without a seed is
-    /// hosted nowhere, never run on every peer.
-    #[test]
-    fn config_seeds_admit_the_seed_voters_and_name_one_initializer() {
-        let peers = crate::PeerDirectory::new((1..=4).map(|node_id| {
-            (
-                node_id,
-                crate::PeerEndpoints::shared(format!("http://node-{node_id}")),
-            )
-        }));
-        let seeds = ConfigSeeds::new(
-            &peers,
-            2,
-            ursula_config::PlacementConfig::default().replication_factor,
-        );
-        let nodes: Vec<_> = (1..=4).map(|node| seeds.clone().for_node(node)).collect();
-
-        let voters = |group| nodes[0].nodes(RaftGroupId(group)).voters();
-        assert_eq!(voters(0), BTreeSet::from([1, 2, 3]));
-        assert_eq!(voters(1), BTreeSet::from([2, 3, 4]));
-        assert_eq!(voters(2), BTreeSet::new());
-        let hosted = |group| {
-            nodes
-                .iter()
-                .filter(|node| node.admission(RaftGroupId(group)) == Some(Admission::Create))
-                .map(|node| node.node)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(hosted(0), vec![1, 2, 3]);
-        assert_eq!(hosted(1), vec![2, 3, 4]);
-        assert_eq!(hosted(2), Vec::<u64>::new());
-
-        let roles = |group| {
-            nodes
-                .iter()
-                .map(|node| node.seed_role(RaftGroupId(group)).local_role())
-                .collect::<Vec<_>>()
-        };
-        let (init, voter) = (Some(SeedRoleOf::Initializer), Some(SeedRoleOf::Voter));
-        assert_eq!(roles(0), vec![init, voter, voter, None]);
-        assert_eq!(roles(1), vec![None, init, voter, voter]);
     }
 }

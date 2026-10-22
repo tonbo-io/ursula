@@ -614,6 +614,23 @@ impl RuntimeMetricsInner {
             .sub_saturating_at(group_index, 1);
     }
 
+    /// Zeroes the gauges of `group_id`, a group the node no longer runs:
+    /// its mailbox depth, its journal cache, its open back-off and its hot
+    /// bytes. Its counters keep their totals.
+    pub(crate) fn forget_group(&self, group_id: RaftGroupId) {
+        let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
+        for gauge in [
+            &self.per_group_group_mailbox_depth,
+            &self.per_group_wal_cache_bytes,
+            &self.per_group_wal_indexed_entries,
+            &self.per_group_open_backoff,
+            &self.per_group_cold_hot_bytes,
+            &self.per_group_cold_hot_bytes_current_max,
+        ] {
+            gauge.store_at(group_index, 0);
+        }
+    }
+
     /// Records whether `group_id` waits in open back-off.
     pub(crate) fn record_open_backoff(&self, group_id: RaftGroupId, closed: bool) {
         let group_index = usize::try_from(group_id.0).expect("u32 fits usize");
