@@ -280,10 +280,35 @@ impl ElectionPolicy {
         Ok(())
     }
 
+    /// Whether the replica behind `gate` may campaign, `alone` when its
+    /// group's placement makes this node the group's only voter. A shed
+    /// never stops such a group's campaign: no other voter can take its
+    /// leadership, so refusing would only leave it leaderless, and the
+    /// handoff planners find nothing to do there. Only the fence, which
+    /// stops all Raft traffic of the node, and the gate still do.
+    fn may_campaign_in(&self, gate: Option<&GroupRejoin>, alone: bool) -> bool {
+        let state = self.state();
+        let shed_allows = if alone {
+            !state.contains(LeadershipShedState::FENCE)
+        } else {
+            state.should_campaign()
+        };
+        shed_allows && gate.is_none_or(GroupRejoin::may_campaign)
+    }
+
+    /// Sets the replica's election switch by this policy, against its gate
+    /// and, for the shed exemption, the voters of the group's placement
+    /// inputs, which the gate holds once its drivers spawned
+    /// ([`GroupRejoin::is_only_voter`]). The replica's own membership plays
+    /// no part: a fresh replica knows none before its group initializes,
+    /// and a switch set then would stay set after it joins a group of more
+    /// voters. A replica without a gate, or whose gate holds no node sets
+    /// yet, gets no exemption.
     pub(crate) fn refresh<SM>(&self, raft: &OwnerRaftHandle<SM>, gate: Option<Arc<GroupRejoin>>)
     where SM: RaftStateMachine<UrsulaRaftTypeConfig, SnapshotData = SnapshotData> {
         let policy = self.clone();
-        raft.elect(move || policy.may_campaign(gate.as_deref()));
+        let alone = gate.as_deref().is_some_and(GroupRejoin::is_only_voter);
+        raft.elect(move || policy.may_campaign_in(gate.as_deref(), alone));
     }
 }
 

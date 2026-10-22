@@ -143,8 +143,21 @@ async fn body_bytes(response: Response) -> Bytes {
 fn test_config(core_count: usize, group_count: usize) -> ursula_config::UrsulaConfig {
     let mut config = ursula_config::UrsulaConfig::default();
     config.runtime.core_count = core_count;
-    config.raft.group_count = group_count;
+    config.raft.group_count = Some(group_count);
     config
+}
+
+/// A single Raft node 1 over the WAL directory `root`, listing itself, with
+/// `group_count` groups. Tests spawn it with
+/// [`ursula_raft::FixedPlacement::single`], so it is every group's only
+/// voter and initializer.
+pub(crate) fn single_raft_node(root: &std::path::Path, group_count: usize) -> Topology {
+    Topology::Cluster {
+        node_id: 1,
+        peers: crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
+        group_count,
+        wal: crate::ClusterWal::Durable(root.to_owned()),
+    }
 }
 
 #[derive(Clone)]
@@ -1810,14 +1823,10 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     ));
     remove_test_path(&raft_root);
 
-    let spawned = spawn_runtime(
+    let spawned = crate::bootstrap::spawn_runtime_with_placement(
         &test_config(1, 1),
-        Persistence::Raft {
-            log_dir: raft_root.clone(),
-        },
-        Topology::SingleNode {
-            raft_group_count: 1,
-        },
+        crate::tests::single_raft_node(&raft_root, 1),
+        ursula_raft::FixedPlacement::single(1),
     )
     .expect("runtime");
     // No meta runs here, so the test settles the fresh root's binding.
@@ -1889,7 +1898,7 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
     assert!(body.contains("\"wal_write_ns\":"));
     assert!(body.contains("\"wal_sync_ns\":"));
 
-    let journal_len = core_journal_record_bytes(&raft_root.join("core-0"));
+    let journal_len = core_journal_record_bytes(&raft_root.join("raft-log").join("core-0"));
     assert!(
         journal_len > 0,
         "expected raft journal records, got {journal_len} bytes"
@@ -1897,6 +1906,52 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
 
     shutdown_test_wal(&spawned.runtime, &raft_wal).await;
     std::fs::remove_dir_all(&raft_root).expect("remove raft root");
+}
+
+/// A shed never stops the campaign of a group whose only voter is this
+/// node, since no other voter could take its leadership. A single node
+/// whose maintenance drain sheds it, which stops a cluster node's
+/// campaigns, still elects its group and serves a write, while it answers
+/// its peers that it may not campaign.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shedding_single_node_still_elects_its_groups() {
+    let root = TestWalRoot::new();
+    let spawned = crate::bootstrap::spawn_runtime_with_placement(
+        &test_config(1, 1),
+        single_raft_node(root.path(), 1),
+        ursula_raft::FixedPlacement::single(1),
+    )
+    .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
+    let registry = spawned.raft_registry.clone().expect("a Raft registry");
+    registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    assert!(!registry.should_campaign());
+    let runtime = spawned.runtime.clone();
+    tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())
+        .await
+        .expect("warm the groups in time")
+        .expect("warm the groups");
+    registry
+        .get(RaftGroupId(0))
+        .expect("the group opened")
+        .wait(Some(Duration::from_secs(10)))
+        .current_leader(1, "the only voter elects itself while the node sheds")
+        .await
+        .expect("the group elects its only voter");
+    let app = router(runtime.clone());
+    let created = http_put(
+        &app,
+        "/benchcmp/shed-single",
+        &[(CONTENT_TYPE.as_str(), "text/plain")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    assert!(!registry.should_campaign());
+    drop(app);
+    let raft_wal = spawned.raft_wal.as_ref().expect("a Raft node runs its WAL");
+    shutdown_test_wal(&runtime, raft_wal).await;
 }
 
 #[tokio::test]
@@ -1911,17 +1966,10 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     ));
     remove_test_path(&raft_root);
 
-    let spawned = spawn_runtime(
+    let spawned = crate::bootstrap::spawn_runtime_with_placement(
         &test_config(1, 1),
-        Persistence::Raft {
-            log_dir: raft_root.as_path().into(),
-        },
-        Topology::static_cluster(
-            1,
-            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
-            1,
-            ursula_config::PlacementConfig::default().replication_factor,
-        ),
+        crate::tests::single_raft_node(&raft_root, 1),
+        ursula_raft::FixedPlacement::single(1),
     )
     .expect("runtime");
     // No meta runs here, so the test settles the fresh root's binding.
@@ -1980,7 +2028,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     assert!(body.contains("\"wal_records\":"));
 
     assert!(
-        core_journal_record_bytes(&raft_root.join("core-0")) > 0,
+        core_journal_record_bytes(&raft_root.join("raft-log").join("core-0")) > 0,
         "core journal should contain records"
     );
 
@@ -2002,17 +2050,10 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     let peers = crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]);
 
     {
-        let spawned = spawn_runtime(
+        let spawned = crate::bootstrap::spawn_runtime_with_placement(
             &test_config(1, 1),
-            Persistence::Raft {
-                log_dir: raft_root.as_path().into(),
-            },
-            Topology::static_cluster(
-                1,
-                peers.clone(),
-                1,
-                ursula_config::PlacementConfig::default().replication_factor,
-            ),
+            crate::tests::single_raft_node(&raft_root, 1),
+            ursula_raft::FixedPlacement::single(1),
         )
         .expect("runtime");
         // No meta runs here, so the test settles the fresh root's binding.
@@ -2061,22 +2102,15 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
     }
 
     assert!(
-        core_journal_record_bytes(&raft_root.join("core-0")) > 0,
+        core_journal_record_bytes(&raft_root.join("raft-log").join("core-0")) > 0,
         "core journal should contain records"
     );
 
     {
-        let spawned = spawn_runtime(
+        let spawned = crate::bootstrap::spawn_runtime_with_placement(
             &test_config(1, 1),
-            Persistence::Raft {
-                log_dir: raft_root.as_path().into(),
-            },
-            Topology::static_cluster(
-                1,
-                peers.clone(),
-                1,
-                ursula_config::PlacementConfig::default().replication_factor,
-            ),
+            crate::tests::single_raft_node(&raft_root, 1),
+            ursula_raft::FixedPlacement::single(1),
         )
         .expect("restarted runtime");
         let runtime = spawned.runtime;
@@ -5689,15 +5723,9 @@ async fn snapshot_publish_errors_and_overwrite_follow_extension_statuses() {
 
 fn test_router() -> Router {
     router(
-        spawn_runtime(
-            &test_config(2, 8),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 8,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(2, 8), Topology::Development { group_count: 8 })
+            .expect("runtime")
+            .runtime,
     )
 }
 
@@ -5713,15 +5741,9 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
     // a tonic-style response (200/415/501) while the client router stays in
     // HTTP append's error space (4xx, never 200).
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let client = client_router_with_admission(state.clone(), IngressAdmission::default());
     let response = http_post(&client, RAFT_GRPC_APPEND_PATH, &[], Body::empty()).await;
@@ -5747,15 +5769,9 @@ async fn client_router_does_not_serve_cluster_plane_via_grpc_service() {
 #[tokio::test]
 async fn cluster_router_serves_every_raft_rpc_path() {
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let cluster = cluster_router_from_state(state);
     for path in [
@@ -5787,15 +5803,9 @@ async fn cluster_router_serves_every_raft_rpc_path() {
 #[tokio::test]
 async fn cluster_router_does_not_expose_client_plane_routes() {
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let cluster = cluster_router_from_state(state.clone());
     // A normal client append must be 404 on the cluster router.
@@ -5818,15 +5828,9 @@ async fn cluster_router_does_not_expose_client_plane_routes() {
 #[tokio::test]
 async fn cluster_router_answers_the_egress_probe() {
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let cluster = cluster_router_from_state(state);
     let response = http_post(
@@ -5845,15 +5849,9 @@ async fn cluster_router_answers_the_egress_probe() {
 #[tokio::test]
 async fn a_shared_listener_answers_the_egress_probe_under_write_pressure() {
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let server = ursula_config::ServerConfig {
         http_inflight_body_size: ursula_config::HumanSize::kib(1),
@@ -5887,15 +5885,9 @@ async fn cluster_router_reports_leadership_shed_policy() {
     let registry = RaftGroupHandleRegistry::default();
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::ColdHealth);
     let state = HttpState::with_raft_registry(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
         registry,
     );
     let cluster = cluster_router_from_state(state);
@@ -5916,15 +5908,9 @@ async fn cluster_router_reports_leadership_shed_policy() {
 async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
     let registry = RaftGroupHandleRegistry::default();
     let state = HttpState::with_raft_registry(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
         registry,
     );
     let router = cluster_router_from_state(state.clone())
@@ -6061,20 +6047,110 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
     }
 }
 
+/// A shed exempts only a group whose placement makes this node its only
+/// voter. Nodes 1 and 2 are drained. Node 1, group 0's initializer, still
+/// leads once: OpenRaft campaigns as it initializes, and the other voters
+/// learn the membership only from that leader. Once node 3 took the
+/// leadership and stopped, neither drained voter campaigns, so the group
+/// elects nobody until a drain ends. The bug this catches: an exemption
+/// read from the replica's own membership, which is empty when its gate
+/// opens, and which nothing read again once the group had three voters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drained_voters_of_a_three_voter_group_do_not_campaign() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        peers.push((
+            node_id,
+            format!("http://{}", listener.local_addr().expect("listener addr")),
+        ));
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        nodes.push(
+            spawn_static_grpc_test_node(
+                u64::try_from(index + 1).expect("node id fits u64"),
+                listener,
+                peers.clone(),
+                peers.clone(),
+                1,
+                StaticGrpcTestNodeStorage {
+                    // Node 1 is group 0's initializer.
+                    start_maintenance_drained: index < 2,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for node in &nodes {
+        node.runtime
+            .warm_all_groups()
+            .await
+            .expect("warm raft group");
+    }
+    let group = RaftGroupId(0);
+    let rafts = nodes
+        .iter()
+        .map(|node| node.registry.get(group).expect("registered group"))
+        .collect::<Vec<_>>();
+    rafts[0]
+        .wait(Some(Duration::from_secs(10)))
+        .current_leader(1, "the drained initializer leads as it initializes")
+        .await
+        .expect("the group initializes");
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .expect("deadline");
+    while rafts[2].metrics().borrow_watched().current_leader != Some(3) {
+        if let Err(err) = nodes[0].registry.transfer_leader(group, 3).await {
+            tracing::debug!(%err, "transfer to node 3 refused");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 3 never takes group 0's leadership"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    nodes.pop().expect("node 3").shutdown().await;
+    let term = rafts[0].metrics().borrow_watched().current_term;
+    // Several maximum election timeouts (3 s) with only drained voters
+    // left.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    for drained in rafts.iter().take(2) {
+        let metrics = drained.metrics().borrow_watched().clone();
+        assert!(
+            metrics.current_term <= term && metrics.vote.leader_id.term <= term,
+            "no drained voter campaigns once the leader left: {metrics:?}"
+        );
+        assert_ne!(metrics.state, openraft::ServerState::Leader, "{metrics:?}");
+    }
+    // The scenario can elect: once node 2's drain ends, it leads.
+    nodes[1]
+        .registry
+        .clear_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    rafts[1]
+        .wait(Some(Duration::from_secs(15)))
+        .current_leader(2, "the undrained voter elects itself")
+        .await
+        .expect("the group elects once a drain ends");
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
     // still answer both client and cluster routes from one bind.
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let merged = cluster_router_from_state(state.clone())
         .merge(admin_ops_router(state.clone()))
@@ -6101,15 +6177,9 @@ async fn merged_router_serves_both_planes() {
 async fn http_state_wall_clock_drives_protocol_now_ms() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     )
     .with_wall_clock(TestWallClock {
         now_ms: Arc::clone(&now_ms),
@@ -6147,15 +6217,9 @@ async fn http_state_wall_clock_drives_protocol_now_ms() {
 async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     )
     .with_wall_clock(TestWallClock {
         now_ms: Arc::clone(&now_ms),
@@ -6223,15 +6287,9 @@ async fn pinned_long_poll_ends_when_an_expired_stream_is_recreated() {
 async fn delete_of_an_expired_stream_answers_404_and_ends_its_long_poll() {
     let now_ms = Arc::new(AtomicU64::new(1_000));
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     )
     .with_wall_clock(TestWallClock {
         now_ms: Arc::clone(&now_ms),
@@ -6453,15 +6511,9 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         &ursula_raft::LeftMarks::default(),
     );
     engine.publish_recovery(gate, &registry).unwrap();
-    let runtime = spawn_runtime(
-        &test_config(1, 1),
-        Persistence::InMemory,
-        Topology::SingleNode {
-            raft_group_count: 1,
-        },
-    )
-    .expect("runtime")
-    .runtime;
+    let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+        .expect("runtime")
+        .runtime;
     let app = client_router_with_admission(
         HttpState::with_raft_registry(runtime, registry.clone()),
         IngressAdmission::default(),
@@ -6581,15 +6633,9 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         }
         let registry = RaftGroupHandleRegistry::default();
         engine.publish_recovery(gate.clone(), &registry).unwrap();
-        let runtime = spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime;
+        let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime;
         let state = HttpState::with_raft_registry(runtime, registry.clone());
         let client = client_router_with_admission(state.clone(), IngressAdmission::default());
         let admin = admin_router(state.clone());
@@ -6928,15 +6974,9 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
 }
 #[tokio::test]
 async fn raft_readiness_uses_the_configured_inventory_even_when_every_group_is_missing() {
-    let runtime = spawn_runtime(
-        &test_config(1, 2),
-        Persistence::InMemory,
-        Topology::SingleNode {
-            raft_group_count: 2,
-        },
-    )
-    .expect("runtime")
-    .runtime;
+    let runtime = spawn_runtime(&test_config(1, 2), Topology::Development { group_count: 2 })
+        .expect("runtime")
+        .runtime;
     let state = HttpState::with_static_raft_cluster_topology(
         runtime,
         RaftGroupHandleRegistry::default(),
@@ -6979,15 +7019,9 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
         crate::wal_disk::WalDiskTransition::EnterPressure
     );
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     )
     .with_wal_disk_monitor(monitor.clone());
     let app = client_router_with_admission(
@@ -7050,15 +7084,9 @@ async fn wal_disk_pressure_rejects_writes_and_marks_readiness_unavailable() {
 async fn a_recorded_format_epoch_mismatch_makes_readiness_unavailable() {
     let mismatch = ursula_raft::FormatEpochMismatch::default();
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     )
     .with_format_epoch_mismatch(mismatch.clone());
     let app = client_router_with_admission(state, IngressAdmission::default());
@@ -7083,15 +7111,9 @@ async fn a_recorded_format_epoch_mismatch_makes_readiness_unavailable() {
 async fn raft_log_pressure_rejects_body_writes_with_retry_after() {
     let coordinator = ursula_raft::SnapshotBuildCoordinator::new(1);
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let app = client_router_with_admission(
         state,
@@ -7361,11 +7383,9 @@ mod snapshot_driver {
     use crate::ADMIN_SNAPSHOT_PUBLISH_WAIT;
     use crate::HttpState;
     use crate::admin_router;
-    use crate::bootstrap::LogWriteGate;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ScrubPurge;
     use crate::bootstrap::StoreGateInputs;
-    use crate::bootstrap::Topology;
     use crate::bootstrap::Trigger;
     use crate::bootstrap::deleted_data_sample;
     use crate::bootstrap::group_log_progress;
@@ -7468,29 +7488,11 @@ mod snapshot_driver {
         );
     }
 
-    /// #669: a single node keeps its snapshots inline whatever
-    /// `storage.snapshot.backend` says, so its driver ticks on the inline
-    /// default, under a cluster node's cadence.
+    /// #669: every Raft node, a single node included, drives its snapshots
+    /// under one cadence of `raft.snapshot_log_budget` and
+    /// `raft.snapshot_backstop_logs`.
     #[test]
-    fn a_single_node_drives_inline_snapshots_under_the_cluster_cadence() {
-        let single = Topology::SingleNode {
-            raft_group_count: 4,
-        };
-        assert!(!single.uses_snapshot_store(true));
-        assert!(!single.uses_snapshot_store(false));
-        let cluster = Topology::static_cluster(
-            1,
-            crate::shared_peers([(1, "http://127.0.0.1:4437".to_owned())]),
-            4,
-            ursula_config::PlacementConfig::default().replication_factor,
-        );
-        assert!(cluster.uses_snapshot_store(true));
-        assert!(!cluster.uses_snapshot_store(false));
-        assert_eq!(
-            resolve_snapshot_drive_interval(None, single.uses_snapshot_store(true)),
-            Duration::from_secs(1)
-        );
-
+    fn every_raft_node_drives_its_snapshots_under_one_cadence() {
         let mut raft = ursula_config::RaftConfig::default();
         let cadence = snapshot_cadence(&raft, 64);
         assert_eq!(cadence.backstop_entries, 100_000);
@@ -8230,7 +8232,6 @@ mod snapshot_driver {
                 cold_flush_interval: Duration::from_secs(1),
                 participation: &participation,
             })),
-            LogWriteGate::RefuseAtHardLimit,
             interval,
             cadence,
             None,
@@ -8332,14 +8333,10 @@ mod snapshot_driver {
         config.raft.deleted_data_max_age = Some(ursula_config::HumanDuration::sec(8));
         config.raft.max_in_snapshot_log_to_keep = 8;
         config.raft.wal.segment_size = ursula_config::HumanSize::kib(64);
-        let spawned = crate::bootstrap::spawn_runtime(
+        let spawned = crate::bootstrap::spawn_runtime_with_placement(
             &config,
-            crate::bootstrap::Persistence::Raft {
-                log_dir: root.path().to_owned(),
-            },
-            Topology::SingleNode {
-                raft_group_count: 2,
-            },
+            crate::tests::single_raft_node(root.path(), 2),
+            ursula_raft::FixedPlacement::single(1),
         )
         .expect("spawn a single node");
         // No meta runs here, so the test settles the fresh root's binding.
@@ -8535,26 +8532,22 @@ mod snapshot_driver {
         drop(root);
     }
 
-    /// #669: a single node never closes admission for its log, as in 0.8.0.
+    /// A single node closes admission for its log as a cluster node does.
     /// With its driver ticking once an hour, so that no snapshot frees the
     /// log, the log grows past twice a tiny `raft.snapshot_log_budget`, the
-    /// driver's monitor reports it, and a write with a body still answers
-    /// `204`.
+    /// hard limit, and a write with a body then answers `503
+    /// RAFT_LOG_PRESSURE`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_single_node_admits_writes_past_twice_its_log_budget() {
+    async fn a_single_node_refuses_writes_past_twice_its_log_budget() {
         let root = super::TestWalRoot::new();
         let budget = 64_u64 << 10;
         let mut config = super::test_config(1, 1);
         config.raft.snapshot_log_budget = ursula_config::HumanSize::bytes(budget);
         config.storage.snapshot.drive_interval = Some(ursula_config::HumanDuration::hour(1));
-        let spawned = crate::bootstrap::spawn_runtime(
+        let spawned = crate::bootstrap::spawn_runtime_with_placement(
             &config,
-            crate::bootstrap::Persistence::Raft {
-                log_dir: root.path().to_owned(),
-            },
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
+            crate::tests::single_raft_node(root.path(), 1),
+            ursula_raft::FixedPlacement::single(1),
         )
         .expect("spawn a single node");
         // No meta runs here, so the test settles the fresh root's binding.
@@ -8596,12 +8589,19 @@ mod snapshot_driver {
                 Body::from(vec![7_u8; 8 << 10]),
             )
             .await;
+            // The monitor may close admission before the gauge shows the
+            // log past the limit.
+            if appended.status() == StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
             assert_eq!(appended.status(), StatusCode::NO_CONTENT);
         }
-        // Past twice the budget, which closes a cluster node's admission.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(runtime.metrics().snapshot().raft_log_bytes > limit);
-        assert!(!coordinator.log_pressured());
+        // Past twice the budget, the hard limit, the monitor closes
+        // admission within its poll.
+        while !coordinator.log_pressured() {
+            assert!(Instant::now() < deadline, "admission stays open");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let appended = super::http_post(
             &app,
             stream,
@@ -8609,7 +8609,11 @@ mod snapshot_driver {
             Body::from(vec![7_u8; 8 << 10]),
         )
         .await;
-        assert_eq!(appended.status(), StatusCode::NO_CONTENT);
+        assert_eq!(appended.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            crate::render::error_code_of(appended).await,
+            ursula_headers::ErrorCode::RaftLogPressure
+        );
         drop(app);
         let raft_wal = spawned
             .raft_wal
@@ -8660,7 +8664,6 @@ mod snapshot_driver {
             &node.runtime,
             &node.registry,
             None,
-            LogWriteGate::RefuseAtHardLimit,
             Duration::from_millis(100),
             SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
@@ -8934,7 +8937,6 @@ mod snapshot_driver {
             &node.runtime,
             &node.registry,
             None,
-            LogWriteGate::RefuseAtHardLimit,
             Duration::from_millis(100),
             SnapshotCadence::new(1 << 30, 2, 100_000).with_deleted_data_max_age(max_age),
             None,
@@ -10437,7 +10439,6 @@ mod leadership_shed {
     use super::StaticGrpcTestNodeStorage;
     use super::spawn_static_grpc_test_node;
     use crate::bootstrap::LeadershipShed;
-    use crate::bootstrap::LogWriteGate;
     use crate::bootstrap::PeerParticipation;
     use crate::bootstrap::ShedHandoff;
     use crate::bootstrap::ShedPace;
@@ -10843,7 +10844,6 @@ mod leadership_shed {
                 cold_flush_interval: Duration::from_secs(1),
                 participation: &participation,
             })),
-            LogWriteGate::RefuseAtHardLimit,
             Duration::from_secs(1),
             SnapshotCadence::new(1 << 30, usize::try_from(GROUPS).unwrap(), 100_000),
             None,
@@ -12322,15 +12322,9 @@ async fn backup_restore_drill_preserves_streams_and_allows_continued_appends() {
 #[tokio::test]
 async fn purge_is_served_on_the_admin_listener_only() {
     let state = HttpState::new(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     );
     let client = client_router_with_admission(state.clone(), IngressAdmission::default());
     let admin = admin_router(state);
@@ -13088,15 +13082,9 @@ async fn admin_test_request(
 
 #[tokio::test]
 async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_drain() {
-    let runtime = spawn_runtime(
-        &test_config(1, 1),
-        Persistence::InMemory,
-        Topology::SingleNode {
-            raft_group_count: 1,
-        },
-    )
-    .expect("runtime")
-    .runtime;
+    let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+        .expect("runtime")
+        .runtime;
     let old = HttpState::with_raft_registry(runtime.clone(), RaftGroupHandleRegistry::default());
     let registry = RaftGroupHandleRegistry::default();
     let replacement = HttpState::with_raft_registry(runtime, registry.clone());
@@ -13190,15 +13178,9 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
 async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() {
     let registry = RaftGroupHandleRegistry::default();
     let state = HttpState::with_raft_registry(
-        spawn_runtime(
-            &test_config(1, 1),
-            Persistence::InMemory,
-            Topology::SingleNode {
-                raft_group_count: 1,
-            },
-        )
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
         registry.clone(),
     );
     let response = admin_router(state)
@@ -13249,19 +13231,19 @@ fn core_journal_record_bytes(core_dir: &std::path::Path) -> u64 {
 async fn runtime_refuses_persisted_wal_topology_changes() {
     let dir = TestWalRoot::new();
     let original = ursula_shard::StaticShardMap::new(4, 8).unwrap();
-    let wal = ursula_raft::RaftWal::start(dir.path(), ursula_config::WalFsync::Always, &original)
-        .unwrap();
+    let wal = ursula_raft::RaftWal::start(
+        dir.path().join("raft-log"),
+        ursula_config::WalFsync::Always,
+        &original,
+    )
+    .unwrap();
     wal.shutdown().await.unwrap();
     drop(wal);
     for (cores, groups) in [(8, 8), (4, 16)] {
-        let error = spawn_runtime(
+        let error = crate::bootstrap::spawn_runtime_with_placement(
             &test_config(cores, groups),
-            Persistence::Raft {
-                log_dir: dir.path().to_owned(),
-            },
-            Topology::SingleNode {
-                raft_group_count: groups,
-            },
+            crate::tests::single_raft_node(dir.path(), groups),
+            ursula_raft::FixedPlacement::single(1),
         )
         .unwrap_err();
         assert!(matches!(
@@ -13274,17 +13256,10 @@ async fn runtime_refuses_persisted_wal_topology_changes() {
 #[tokio::test]
 async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrier() {
     let root = TestWalRoot::new();
-    let spawned = spawn_runtime(
+    let spawned = crate::bootstrap::spawn_runtime_with_placement(
         &test_config(1, 1),
-        Persistence::Raft {
-            log_dir: root.path().into(),
-        },
-        Topology::static_cluster(
-            1,
-            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
-            1,
-            ursula_config::PlacementConfig::default().replication_factor,
-        ),
+        crate::tests::single_raft_node(root.path(), 1),
+        ursula_raft::FixedPlacement::single(1),
     )
     .unwrap();
     // No meta runs here, so the test settles the fresh root's binding.
@@ -13345,17 +13320,10 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
 #[tokio::test]
 async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     let root = TestWalRoot::new();
-    let spawned = spawn_runtime(
+    let spawned = crate::bootstrap::spawn_runtime_with_placement(
         &test_config(1, 1),
-        Persistence::Raft {
-            log_dir: root.path().into(),
-        },
-        Topology::static_cluster(
-            1,
-            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
-            1,
-            ursula_config::PlacementConfig::default().replication_factor,
-        ),
+        crate::tests::single_raft_node(root.path(), 1),
+        ursula_raft::FixedPlacement::single(1),
     )
     .unwrap();
     // No meta runs here, so the test settles the fresh root's binding.

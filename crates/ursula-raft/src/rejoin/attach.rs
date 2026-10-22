@@ -240,6 +240,9 @@ impl RecoveryGate {
             transport,
             config,
         );
+        // The gate now knows the group's node sets, so whether the replica
+        // is its only voter decides its elections from here.
+        registry.refresh_group_elections(group);
         Ok(())
     }
 
@@ -251,7 +254,8 @@ impl RecoveryGate {
     /// replica as its group's initializer or may come to
     /// ([`SeedRole::may_change`]), the bootstrap driver, which initializes
     /// the voters of `nodes` once every other candidate does.
-    /// Each reads `nodes` at each use.
+    /// Each reads `nodes` at each use, and the gate keeps them for the
+    /// election policy ([`GroupRejoin::bind_nodes`]).
     ///
     /// Each driver starts once the fence no longer holds the replica out
     /// ([`crate::predecessor_wait::fence_holds`]): no predecessor wait is
@@ -274,6 +278,7 @@ impl RecoveryGate {
         T: RecoveryTransport,
     {
         rejoin.set_stall_after(config.stall_after);
+        rejoin.bind_nodes(nodes.clone());
         let target = rejoin.group;
         let fence = owner.fence().clone();
         let barrier = run_rejoin_vote_barrier(

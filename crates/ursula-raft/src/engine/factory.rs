@@ -464,7 +464,7 @@ impl PlacedRaftGroupEngineFactory {
         // that request for want of a leader. A gate that waits for a
         // recovery plan keeps it from leading, and the open returns at the
         // bound with the replica waiting.
-        if self.inputs.nodes(group).voters() == std::collections::BTreeSet::from([node_id])
+        if self.inputs.nodes(group).is_only_voter(node_id)
             && engine
                 .wait_for_current_leader(node_id, sole_voter_wait)
                 .await

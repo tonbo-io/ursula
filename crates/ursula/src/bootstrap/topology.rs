@@ -1,94 +1,104 @@
+use std::path::Path;
 use std::path::PathBuf;
 
-use ursula_proto::placement::ReplicationFactor;
-use ursula_raft::ConfigSeeds;
 use ursula_raft::PeerDirectory;
 
-/// Persistence strategy for the runtime.
-#[derive(Debug, Clone)]
-pub enum Persistence {
-    /// No Raft: the in-memory engine. Nothing survives the process.
-    InMemory,
-    /// Raft over the per-core journals under `log_dir`.
-    Raft { log_dir: PathBuf },
-}
-
-impl Persistence {
-    /// The Raft WAL's journal directory, if the runtime runs Raft.
-    pub fn log_dir(&self) -> Option<&std::path::Path> {
-        match self {
-            Self::InMemory => None,
-            Self::Raft { log_dir } => Some(log_dir),
-        }
-    }
-}
-
-/// Deployment topology.
-#[derive(Debug, Clone)]
+/// What the runtime runs: the in-memory development engine, or one Raft
+/// node, which every node with a WAL is, a single node included. Every Raft
+/// node runs one spawn path and one set of gates.
+#[derive(Debug)]
 pub enum Topology {
-    SingleNode {
-        raft_group_count: usize,
-    },
-    StaticCluster {
+    /// No Raft: the in-memory engine of the zero-config development mode.
+    /// Nothing survives the process.
+    Development { group_count: usize },
+    /// A Raft node: `node_id` among `peers` (`raft.peers`, which lists the
+    /// node itself), running `group_count` groups over the journals of
+    /// `wal`.
+    Cluster {
         node_id: u64,
-        /// `raft.peers`, this node among them.
         peers: PeerDirectory,
-        raft_group_count: usize,
-        /// Every data group's voters and initializer, by the seed rule over
-        /// `peers`. Interim: removed in S2(h).
-        seeds: ConfigSeeds,
+        group_count: usize,
+        wal: ClusterWal,
     },
 }
 
 impl Topology {
-    pub fn raft_group_count(&self) -> usize {
+    pub fn group_count(&self) -> usize {
         match self {
-            Topology::SingleNode { raft_group_count } => *raft_group_count,
-            Topology::StaticCluster {
-                raft_group_count, ..
-            } => *raft_group_count,
+            Self::Development { group_count } | Self::Cluster { group_count, .. } => *group_count,
+        }
+    }
+}
+
+/// Where a Raft node keeps its WAL: the directory whose `raft-log`
+/// subdirectory holds the journals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClusterWal {
+    /// `raft.wal.path`, kept across runs.
+    Durable(PathBuf),
+    /// No path is configured, which only a single node allows: a fresh
+    /// temporary directory for this run. Only [`ClusterWal::close`] after
+    /// a clean WAL shutdown removes it. An error return leaves it, because
+    /// a core writer may still write to it, and a journal write that fails
+    /// stops the process.
+    Temporary(PathBuf),
+}
+
+impl ClusterWal {
+    /// `raft.wal.path`, or, unset, a new temporary directory.
+    pub fn resolve(wal: &ursula_config::WalConfig) -> std::io::Result<Self> {
+        match &wal.path {
+            Some(path) => Ok(Self::Durable(path.clone())),
+            None => {
+                let dir = tempfile::Builder::new()
+                    .prefix("ursula-wal-")
+                    .tempdir()?
+                    .keep();
+                tracing::info!(
+                    path = %dir.display(),
+                    "raft.wal.path is not set: the Raft WAL runs in a temporary directory that \
+                     is removed after a clean shutdown"
+                );
+                Ok(Self::Temporary(dir))
+            }
         }
     }
 
-    /// Whether the node's groups snapshot to the configured external
-    /// snapshot store (`snapshot_store_configured`). A single node keeps its
-    /// snapshots inline whatever `storage.snapshot.backend` says (#669): a
-    /// single node rolled back to 0.8.0 reads only its inline pointer files.
-    pub fn uses_snapshot_store(&self, snapshot_store_configured: bool) -> bool {
-        match self {
-            Topology::SingleNode { .. } => false,
-            Topology::StaticCluster { .. } => snapshot_store_configured,
-        }
+    /// The WAL directory.
+    pub fn root(&self) -> &Path {
+        let (Self::Durable(root) | Self::Temporary(root)) = self;
+        root
     }
 
-    /// A static cluster of `peers` whose data groups are seeded over the
-    /// `peers` ids at `replication_factor`, at most the node count
-    /// ([`ConfigSeeds`]).
-    pub fn static_cluster(
-        node_id: u64,
-        peers: PeerDirectory,
-        raft_group_count: usize,
-        replication_factor: ReplicationFactor,
-    ) -> Self {
-        let seeds = ConfigSeeds::new(&peers, raft_group_count, replication_factor);
-        Self::StaticCluster {
-            node_id,
-            peers,
-            raft_group_count,
-            seeds,
-        }
+    /// The journal directory: the WAL directory's `raft-log` subdirectory.
+    pub fn log_dir(&self) -> PathBuf {
+        self.root().join(ursula_config::WalConfig::LOG_SUBDIR)
     }
 
-    /// The seeds of a static cluster's data groups: what the node hosts,
-    /// where it routes a group it does not host, and what its maintenance
-    /// inventory and egress gate expect. Interim: removed in S2(h), where
-    /// meta's seeds take over. Meta's `Bootstrap` seeds the same rule over
-    /// the `raft.peers` ids at genesis, so the two agree only while
-    /// `raft.peers` keeps those ids: `raft.peers` may not grow until then.
-    pub fn config_seeds(&self) -> Option<&ConfigSeeds> {
-        match self {
-            Topology::SingleNode { .. } => None,
-            Topology::StaticCluster { seeds, .. } => Some(seeds),
+    /// After the server stopped: removes a temporary WAL directory once its
+    /// WAL shut down cleanly (`clean`). Only then has every core writer
+    /// closed, so nothing writes to the directory any more.
+    pub(crate) fn close(self, clean: bool) {
+        let Self::Temporary(path) = self else {
+            return;
+        };
+        if !clean {
+            tracing::warn!(
+                path = %path.display(),
+                "kept the temporary Raft WAL directory: the WAL did not shut down cleanly"
+            );
+            return;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!(
+                path = %path.display(),
+                "removed the temporary Raft WAL directory"
+            ),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                %err,
+                "could not remove the temporary Raft WAL directory"
+            ),
         }
     }
 }

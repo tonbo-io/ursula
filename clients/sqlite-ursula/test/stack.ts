@@ -228,7 +228,8 @@ export const CLUSTER_ID = "sqlite-ursula-test";
 /**
  * The TOML of one `ursula server` node bootstrapping alone: its Raft WAL in `dir`, `server.cluster_id`
  * set, so a node whose WAL was wiped and restored (test/history-real.e2e.ts) stays the same
- * deployment, and the cold store `cold` (`none` for none).
+ * deployment, itself as its only `[[raft.peers]]` entry, as every node with a WAL path lists
+ * itself, and the cold store `cold` (`none` for none).
  */
 export function singleNodeToml(o: { port: number; adminPort: number; dir: string; cores: number; groups: number; cold: string }): string {
 	return [
@@ -246,6 +247,10 @@ export function singleNodeToml(o: { port: number; adminPort: number; dir: string
 		"",
 		"[raft.wal]",
 		`path = "${join(o.dir, "wal")}"`,
+		"",
+		"[[raft.peers]]",
+		"node_id = 1",
+		`url = "http://127.0.0.1:${o.port}"`,
 		"",
 		...(o.cold === "none" ? [] : ["[storage.cold]", `backend = "${o.cold}"`, ""]),
 	].join("\n");

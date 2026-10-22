@@ -78,6 +78,13 @@ pub trait GroupNodes: Send + Sync + 'static {
     /// The voters an initializer initializes, which the heal driver also
     /// restores.
     fn voters(&self) -> BTreeSet<u64>;
+
+    /// Whether `node` is the group's only voter, so no other node could
+    /// take its leadership. Never while the voters are unknown (empty).
+    fn is_only_voter(&self, node: u64) -> bool {
+        let voters = self.voters();
+        voters.len() == 1 && voters.contains(&node)
+    }
 }
 
 /// A role that needs no confirmation: configuration, or a test, decided it.

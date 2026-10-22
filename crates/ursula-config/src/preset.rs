@@ -55,7 +55,7 @@ impl From<Preset> for UrsulaConfig {
             }
             Preset::Tiny => {
                 config.runtime.live_read_max_waiters_per_core = Some(8_192);
-                config.raft.group_count = 64;
+                config.raft.group_count = Some(64);
                 config.raft.max_uncommitted_size_per_group = Some(HumanSize::mib(8));
                 config.server.http_inflight_body_size = HumanSize::mib(64);
                 config.storage.cold.flush_size = HumanSize::mib(4);
@@ -71,7 +71,7 @@ impl From<Preset> for UrsulaConfig {
             }
             Preset::Small => {
                 config.runtime.live_read_max_waiters_per_core = Some(8_192);
-                config.raft.group_count = 128;
+                config.raft.group_count = Some(128);
                 config.raft.max_uncommitted_size_per_group = Some(HumanSize::mib(16));
                 config.server.http_inflight_body_size = HumanSize::mib(64);
                 config.storage.cold.flush_size = HumanSize::mib(4);
@@ -87,7 +87,7 @@ impl From<Preset> for UrsulaConfig {
             }
             Preset::Standard => {
                 config.runtime.live_read_max_waiters_per_core = Some(65_536);
-                config.raft.group_count = 256;
+                config.raft.group_count = Some(256);
                 config.raft.max_uncommitted_size_per_group = Some(HumanSize::mib(64));
                 config.server.http_inflight_body_size = HumanSize::mib(256);
                 config.storage.cold.flush_size = HumanSize::mib(8);
@@ -103,7 +103,7 @@ impl From<Preset> for UrsulaConfig {
             }
             Preset::Large => {
                 config.runtime.live_read_max_waiters_per_core = Some(131_072);
-                config.raft.group_count = 512;
+                config.raft.group_count = Some(512);
                 config.raft.max_uncommitted_size_per_group = Some(HumanSize::mib(128));
                 config.server.http_inflight_body_size = HumanSize::mib(512);
                 config.storage.cold.flush_size = HumanSize::mib(16);

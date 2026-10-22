@@ -1987,11 +1987,12 @@ async fn cli_deleted_stream_leaves_snapshots_and_logs_within_the_bound() {
     std::fs::remove_dir_all(&root).expect("remove temp root");
 }
 
-/// #669: a node without `raft.peers` runs the snapshot driver, and its
-/// group's leader sweeps expired streams in the background. A stream whose
-/// TTL ran out and that nothing reads or writes again leaves the node's
-/// snapshot, its Raft log and every file in its Raft log directory within
-/// `raft.deleted_data_max_age` of the sweep, and a read of it answers 404.
+/// #669: a single node, which lists only itself in `raft.peers`, runs the
+/// snapshot driver, and its group's leader sweeps expired streams in the
+/// background. A stream whose TTL ran out and that nothing reads or writes
+/// again leaves the node's snapshot, its Raft log and every file in its Raft
+/// log directory within `raft.deleted_data_max_age` of the sweep, and a read
+/// of it answers 404.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -2014,7 +2015,7 @@ async fn cli_single_node_expired_stream_leaves_its_files_within_the_bound() {
     let max_age = Duration::from_secs(16);
     let config = root.join("node.toml");
     let wal_dir = root.join("node-log");
-    let admin_port = write_cluster_config(&config, port, 1, 1, &[], &wal_dir);
+    let admin_port = write_single_node_cluster_config(&config, port, 1, 1, &base_url, &wal_dir);
     let text = std::fs::read_to_string(&config).expect("read node config");
     assert!(text.contains("[raft.wal]\n"));
     std::fs::write(

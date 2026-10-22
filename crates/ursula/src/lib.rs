@@ -93,7 +93,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use axum::routing::put;
-pub use bootstrap::Persistence;
+pub use bootstrap::ClusterWal;
 pub use bootstrap::SnapshotDriveSettings;
 pub use bootstrap::SnapshotDriver;
 pub use bootstrap::SpawnRuntimeError;
@@ -5659,7 +5659,6 @@ fn refused_before_proposal(err: &RuntimeError) -> bool {
         | RuntimeError::InvalidRaftGroup { .. }
         | RuntimeError::SnapshotPlacementMismatch { .. }
         | RuntimeError::ColdStoreConfig { .. }
-        | RuntimeError::StaticMembershipConfig { .. }
         | RuntimeError::ColdStoreIo { .. }
         | RuntimeError::LiveReadBackpressure { .. }
         | RuntimeError::MailboxClosed { .. }

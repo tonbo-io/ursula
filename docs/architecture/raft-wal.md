@@ -29,7 +29,7 @@ pointer and a host restart the old one. Recovery accepts either.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `raft.wal.path` | none | WAL directory. Journals live in its `raft-log` subdirectory. Required when `raft.peers` is set. |
+| `raft.wal.path` | none | WAL directory. Journals live in its `raft-log` subdirectory. Required when `raft.peers` lists another node. With it, `raft.peers` lists this node and `server.cluster_id` is set. |
 | `raft.wal.fsync` | see below | When appends reach stable storage: `always` or `never`. |
 | `raft.wal.segment_size` | 64 MiB | Size at which a core journal starts a new segment, at least 4 KiB. |
 | `raft.wal.cache_size` | 256 MiB | Recent entries kept in memory per node, split evenly between its groups. |
@@ -38,8 +38,8 @@ pointer and a host restart the old one. Recovery accepts either.
 | `raft.wal.lease` | 5 s | The disk lease: with no synced probe of the root for this long, the node stops all Raft traffic. From 2 s to 10 s. |
 
 Unset, `raft.wal.fsync` resolves from the voters each group has, the
-configured replication factor at most the node count of the address book
-(`raft.peers`, or the node alone when it is empty): `always` for one or two
+configured replication factor at most the node count of `raft.peers`, which
+lists every Raft node itself: `always` for one or two
 voters and `never` for more (`RaftConfig::wal_fsync`). A group of one or two
 voters has no quorum without a replica that a host crash under `never` sends
 through the recovery gate, so only `always` lets it restart unattended. The run
@@ -51,9 +51,18 @@ periodic `fsync` would not change recovery.
 
 The zero-config development mode (the `default` preset on one node) runs
 without Raft. Any other single node without `raft.wal.path` uses a temporary
-directory, removed only after a clean WAL shutdown. A single node's groups run
-as a cluster node's do, each behind its recovery gate under `raft.node_id`,
-with the node as their only voter. The Helm chart sets the
+directory, removed only after a clean WAL shutdown, and runs under a
+generated cluster id. Every Raft node, a single node included, runs one
+topology (`Topology::Cluster` in `crates/ursula/src/bootstrap/topology.rs`)
+and one spawn path: its groups open behind their recovery gates under
+`raft.node_id`, and it runs the snapshot store of `storage.snapshot.backend`,
+the log write gate, the store, egress and cold-health gates, the leadership
+balancer and the commit-stall watchdog. A shed never stops the campaign of a
+group whose placement inputs make the node its only voter
+(`ElectionPolicy::refresh`), since no other voter could take its leadership.
+The replica's own membership plays no part, so a replica that joins a group
+of more voters gets no exemption, even while it knows no membership yet. The
+Helm chart sets the
 path to `raft.logDir` on each voter's `raft-data` PVC and exposes the other keys
 as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 `raft.minAvailableBytes` and `raft.resumeAvailableBytes`.

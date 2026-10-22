@@ -3,6 +3,8 @@ use std::sync::Arc;
 use ursula_config::config::ColdBackend;
 use ursula_raft::ConfigSeeds;
 use ursula_raft::JournalTuning;
+use ursula_raft::PeerDirectory;
+use ursula_raft::PlacementInputs;
 use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
@@ -12,7 +14,6 @@ use ursula_runtime::InMemoryGroupEngineFactory;
 use ursula_runtime::RuntimeConfig;
 use ursula_runtime::RuntimeError;
 use ursula_runtime::ShardRuntime;
-use ursula_runtime::SharedSnapshotStore;
 use ursula_runtime::snapshot_store_from_config;
 use ursula_runtime::spawn_cold_compaction_worker_if_configured;
 use ursula_runtime::spawn_cold_flush_worker_if_configured;
@@ -30,7 +31,7 @@ use crate::bootstrap::meta::SpawnedMeta;
 use crate::bootstrap::participation::PeerParticipation;
 use crate::bootstrap::snapshot;
 use crate::bootstrap::snapshot::StoreGateInputs;
-use crate::bootstrap::topology::Persistence;
+use crate::bootstrap::topology::ClusterWal;
 use crate::bootstrap::topology::Topology;
 
 /// Result of spawning a runtime.
@@ -81,49 +82,43 @@ pub enum SpawnRuntimeError {
     },
 }
 
-/// Where the runtime's groups keep their Raft logs, once the WAL has
-/// started.
-enum GroupStorage {
-    /// No Raft: the in-memory engine.
-    InMemory,
-    /// Raft over the per-core journals of this run of the WAL.
-    Raft(RaftWal),
-}
-
-impl GroupStorage {
-    /// Starts node `node`'s Raft WAL when `persistence` runs Raft: reads the
-    /// previous run's state and counts and records this run before any group
-    /// opens a journal.
-    fn start(
-        persistence: Persistence,
-        tuning: JournalTuning,
-        topology: &ursula_shard::StaticShardMap,
-        node: u64,
-        cluster_id: Option<&ursula_headers::ClusterId>,
-        fence: &ursula_runtime::NodeFence,
-    ) -> Result<Self, SpawnRuntimeError> {
-        Ok(match persistence {
-            Persistence::InMemory => Self::InMemory,
-            Persistence::Raft { log_dir } => Self::Raft(RaftWal::start_in_cluster(
-                log_dir,
-                tuning,
-                topology,
-                ursula_proto::placement::NodeId::new(node),
-                cluster_id,
-                fence.clone(),
-            )?),
-        })
-    }
-}
-
-/// Spawn a runtime from a typed `ursula_config::UrsulaConfig`.
+/// Spawns a runtime from a typed `ursula_config::UrsulaConfig`. A Raft
+/// node's groups take the seed rule's voters and initializer over
+/// `raft.peers` ([`ConfigSeeds`], interim: meta's placement replaces it in
+/// S2(h)).
 pub fn spawn_runtime(
     config: &ursula_config::UrsulaConfig,
-    persistence: Persistence,
     topology: Topology,
 ) -> Result<SpawnedRuntime, SpawnRuntimeError> {
+    let replication_factor = config.raft.placement.replication_factor;
+    spawn_with_inputs(config, topology, |node_id, peers, group_count| {
+        Arc::new(ConfigSeeds::new(peers, group_count, replication_factor).for_node(node_id))
+    })
+}
+
+/// [`spawn_runtime`] with every Raft group placed by `placement`, for a
+/// test that runs no meta: production's placement inputs are interim.
+#[cfg(test)]
+pub(crate) fn spawn_runtime_with_placement(
+    config: &ursula_config::UrsulaConfig,
+    topology: Topology,
+    placement: ursula_raft::FixedPlacement,
+) -> Result<SpawnedRuntime, SpawnRuntimeError> {
+    spawn_with_inputs(config, topology, move |_node_id, _peers, _group_count| {
+        Arc::new(placement)
+    })
+}
+
+/// The one spawn path. A Raft node's groups open behind their recovery
+/// gates with the placement inputs `inputs` gives for the node, its peers
+/// and its group count.
+fn spawn_with_inputs(
+    config: &ursula_config::UrsulaConfig,
+    topology: Topology,
+    inputs: impl FnOnce(u64, &PeerDirectory, usize) -> Arc<dyn PlacementInputs>,
+) -> Result<SpawnedRuntime, SpawnRuntimeError> {
     let mut runtime_config =
-        RuntimeConfig::from_ursula_config(&config.runtime, topology.raft_group_count());
+        RuntimeConfig::from_ursula_config(&config.runtime, topology.group_count());
     runtime_config.raft_max_uncommitted_bytes_per_group =
         config.raft.max_uncommitted_size_per_group.and_then(|s| {
             let bytes = s.as_bytes();
@@ -134,127 +129,31 @@ pub fn spawn_runtime(
             let bytes = s.as_bytes();
             if bytes == 0 { None } else { Some(bytes) }
         });
-    let snapshot_store = snapshot_store_from_config(
-        &config.storage.snapshot,
-        &config.storage.cold,
-        config.raft.node_id,
-    )
-    .map_err(|err| RuntimeError::ColdStoreConfig {
-        message: ursula_runtime::ErrorChain(&err).to_string(),
-    })?;
-    let engine_config = RaftEngineConfig::from(&config.raft);
-    let snapshot_drive_interval = snapshot::resolve_snapshot_drive_interval(
-        config
-            .storage
-            .snapshot
-            .drive_interval
-            .map(|interval| interval.as_duration()),
-        topology.uses_snapshot_store(snapshot_store.is_some()),
-    );
-    let registry = RaftGroupHandleRegistry::default()
-        .with_append_transport_budget_bytes(config.raft.append_transport_budget_bytes)
-        .with_snapshot_install(
-            config.raft.snapshot_install_max_concurrency,
-            config.raft.install_snapshot_timeout.as_duration(),
-        );
-
-    // The node fence: a disk lease over the WAL root for a node that runs
-    // Raft, which its WAL keeps, its transports and leader predicate read,
-    // and its object stores check before each PUT and DELETE.
-    let fence = match &persistence {
-        Persistence::Raft { .. } => {
-            ursula_runtime::NodeFence::leased(config.raft.wal.lease.as_duration())
+    let spawned = match topology {
+        Topology::Development { .. } => {
+            let cold_store = cold_store(config, ursula_runtime::NodeFence::unleased())?;
+            let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
+            SpawnedRuntime {
+                runtime: ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                    runtime_config,
+                    factory,
+                    cold_store,
+                )?,
+                raft_registry: None,
+                raft_wal: None,
+                meta: None,
+            }
         }
-        Persistence::InMemory => ursula_runtime::NodeFence::unleased(),
-    };
-    let cold_store = if config.storage.cold.backend != ColdBackend::None {
-        Some(Arc::new(
-            ColdStore::try_new(&config.storage.cold)
-                .map_err(|err| RuntimeError::ColdStoreConfig {
-                    message: err.to_string(),
-                })?
-                .with_fence(fence.clone()),
-        ))
-    } else {
-        None
-    };
-
-    // Built before the runtime starts, so a failure leaves nothing running.
-    let participation = match &topology {
-        Topology::StaticCluster { node_id, peers, .. } => Some(PeerParticipation::new(
-            *node_id,
+        Topology::Cluster {
+            node_id,
             peers,
-            reqwest::Client::builder()
-                .timeout(
-                    config
-                        .governance
-                        .leadership_balance
-                        .peer_timeout
-                        .as_duration(),
-                )
-                .build()
-                .map_err(|source| SpawnRuntimeError::PeerStatusClient { source })?,
-        )),
-        Topology::SingleNode { .. } => None,
+            group_count,
+            wal,
+        } => {
+            let inputs = inputs(node_id, &peers, group_count);
+            spawn_raft_node(config, runtime_config, node_id, peers, &wal, inputs)?
+        }
     };
-
-    let wal = &config.raft.wal;
-    let shard_map = ursula_shard::StaticShardMap::new(
-        runtime_config.core_count,
-        runtime_config.raft_group_count,
-    )
-    .map_err(RuntimeError::from)?;
-    let storage = GroupStorage::start(
-        persistence,
-        JournalTuning {
-            // The resolved policy, which the WAL records in its run state.
-            fsync: config.raft.wal_fsync(),
-            segment_bytes: wal.segment_size.as_bytes(),
-            group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
-        },
-        &shard_map,
-        config.raft.node_id,
-        config.server.cluster_id.as_ref(),
-        &fence,
-    )?;
-    // Before the runtime starts, so `raft-log/meta/` exists before any data
-    // group of the run opens and the peer identity is bound before any
-    // group dials or answers a peer.
-    let meta = match &storage {
-        GroupStorage::Raft(wal) => Some(
-            meta::open_meta(
-                config,
-                &topology,
-                wal,
-                &registry,
-                &shard_map,
-                engine_config.clone(),
-                ursula_raft::meta::replica::MetaSnapshotTrigger {
-                    interval: snapshot_drive_interval,
-                    max_dirty_age: snapshot::snapshot_cadence(
-                        &config.raft,
-                        topology.raft_group_count(),
-                    )
-                    .removal_floor,
-                },
-                participation.clone(),
-            )
-            .map_err(RuntimeError::from)?,
-        ),
-        GroupStorage::InMemory => None,
-    };
-    let spawned = spawn_runtime_core(
-        runtime_config,
-        cold_store,
-        storage,
-        &topology,
-        snapshot_store.clone(),
-        engine_config,
-        registry,
-        config.raft.node_id,
-        config.raft.placement.replication_factor,
-    )?;
-
     ursula_runtime::tidy_worker::spawn_tidy_worker(
         &spawned.runtime,
         config.raft.effective_deleted_data_max_age(),
@@ -267,181 +166,173 @@ pub fn spawn_runtime(
         spawn_cold_orphan_sweep_worker(&spawned.runtime);
         spawn_cold_ref_offload_worker(&spawned.runtime);
     }
-
-    // A single node that runs Raft drives its snapshots as a cluster node
-    // does (#669), with inline snapshots and no write gate.
-    if let (Topology::SingleNode { .. }, Some(registry), Some(wal)) =
-        (&topology, &spawned.raft_registry, &spawned.raft_wal)
-    {
-        snapshot::spawn_snapshot_driver(
-            &spawned.runtime,
-            registry,
-            None,
-            snapshot::LogWriteGate::Open,
-            snapshot_drive_interval,
-            snapshot::snapshot_cadence(&config.raft, topology.raft_group_count()),
-            Some(wal.maintenance()),
-            config.raft.snapshot_pressure_max_groups_per_tick,
-        );
-    }
-
-    if let (Topology::StaticCluster { peers, .. }, Some(participation)) =
-        (&topology, &participation)
-    {
-        let registry = spawned
-            .raft_registry
-            .clone()
-            .expect("static cluster has registry");
-        snapshot::spawn_snapshot_driver(
-            &spawned.runtime,
-            &registry,
-            snapshot_store.map(|store| {
-                (store, StoreGateInputs {
-                    s3: config.storage.cold.s3.as_ref(),
-                    cold_flush_interval: config.storage.cold.flush_interval.as_duration(),
-                    participation,
-                })
-            }),
-            snapshot::LogWriteGate::RefuseAtHardLimit,
-            snapshot_drive_interval,
-            snapshot::snapshot_cadence(&config.raft, topology.raft_group_count()),
-            spawned
-                .raft_wal
-                .as_ref()
-                .map(ursula_raft::RaftWal::maintenance),
-            config.raft.snapshot_pressure_max_groups_per_tick,
-        );
-        leadership::spawn_leadership_balancer(
-            &registry,
-            participation,
-            &config.governance.leadership_balance,
-        );
-        egress::spawn_egress_gate(
-            &registry,
-            participation,
-            peers,
-            &config.governance.cluster_probe,
-        );
-        commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
-        // Hot bytes are a cold-tier backlog signal only when a cold store can
-        // drain them. Memory-only clusters intentionally retain all payloads
-        // hot, so applying the cold-health watermark there would eventually
-        // make every voter shed leadership.
-        if spawned.runtime.has_cold_store() {
-            cold_health::spawn_cold_health_gate(
-                &spawned.runtime,
-                &registry,
-                participation,
-                &config.governance.cold_health,
-            );
-        }
-    }
-
-    Ok(SpawnedRuntime { meta, ..spawned })
+    Ok(spawned)
 }
 
-/// Core runtime construction — maps persistence + topology to the correct
-/// engine factory and spawns the runtime.  No background workers started here.
-fn spawn_runtime_core(
-    runtime_config: RuntimeConfig,
-    cold_store: Option<ColdStoreHandle>,
-    storage: GroupStorage,
-    topology: &Topology,
-    snapshot_store: Option<SharedSnapshotStore>,
-    raft_engine_config: RaftEngineConfig,
-    registry: RaftGroupHandleRegistry,
-    node_id: u64,
-    replication_factor: ursula_proto::placement::ReplicationFactor,
-) -> Result<SpawnedRuntime, RuntimeError> {
-    match (topology, storage) {
-        (Topology::SingleNode { .. }, GroupStorage::InMemory) => {
-            let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
-            Ok(SpawnedRuntime {
-                runtime: ShardRuntime::spawn_with_engine_factory_and_cold_store(
-                    runtime_config,
-                    factory,
-                    cold_store,
-                )?,
-                raft_registry: None,
-                raft_wal: None,
-                meta: None,
-            })
-        }
-        // A single node's groups run the gated open path of a cluster node's
-        // under `raft.node_id`, seeded over the address book `open_meta`
-        // bound: this node alone (D5, removed in S2(g)), so the node is
-        // every group's only voter and initializer. Its snapshots stay
-        // inline (`Topology::uses_snapshot_store`).
-        (Topology::SingleNode { raft_group_count }, GroupStorage::Raft(log_stores)) => {
-            let seeds = ConfigSeeds::new(
-                &registry.peer_cluster().directory(),
-                *raft_group_count,
-                replication_factor,
-            );
-            spawn_placed(
-                runtime_config,
-                cold_store,
-                log_stores,
-                node_id,
-                seeds,
-                None,
-                raft_engine_config,
-                registry,
-            )
-        }
-        // The node's peers reach the factory bound with its identity
-        // (`open_meta`), before the runtime starts.
-        (Topology::StaticCluster { node_id, seeds, .. }, GroupStorage::Raft(log_stores)) => {
-            spawn_placed(
-                runtime_config,
-                cold_store,
-                log_stores,
-                *node_id,
-                seeds.clone(),
-                snapshot_store,
-                raft_engine_config,
-                registry,
-            )
-        }
-        (Topology::StaticCluster { .. }, GroupStorage::InMemory) => {
-            Err(RuntimeError::StaticMembershipConfig {
-                message: "static cluster topology requires Raft persistence".to_owned(),
-            })
-        }
+/// The cold store of `storage.cold`, behind `fence`, if one is configured.
+fn cold_store(
+    config: &ursula_config::UrsulaConfig,
+    fence: ursula_runtime::NodeFence,
+) -> Result<Option<ColdStoreHandle>, RuntimeError> {
+    if config.storage.cold.backend == ColdBackend::None {
+        return Ok(None);
     }
+    Ok(Some(Arc::new(
+        ColdStore::try_new(&config.storage.cold)
+            .map_err(|err| RuntimeError::ColdStoreConfig {
+                message: err.to_string(),
+            })?
+            .with_fence(fence),
+    )))
 }
 
-/// Raft groups over the per-core journals of `log_stores`, each opened
-/// behind its recovery gate by the placed engine factory over `seeds` for
-/// `node_id`, publishing themselves in `registry`.
-fn spawn_placed(
+/// A Raft node, a single node as a node of a cluster: its WAL, its meta
+/// journal, its groups over `inputs`, and every gate and driver of a
+/// Raft node.
+fn spawn_raft_node(
+    config: &ursula_config::UrsulaConfig,
     runtime_config: RuntimeConfig,
-    cold_store: Option<ColdStoreHandle>,
-    log_stores: RaftWal,
     node_id: u64,
-    seeds: ConfigSeeds,
-    snapshot_store: Option<SharedSnapshotStore>,
-    raft_engine_config: RaftEngineConfig,
-    registry: RaftGroupHandleRegistry,
-) -> Result<SpawnedRuntime, RuntimeError> {
-    let raft_wal = Some(log_stores.clone());
-    let factory = ursula_raft::PlacedRaftGroupEngineFactory::new(
-        log_stores,
-        registry.clone(),
-        Arc::new(seeds.for_node(node_id)),
+    peers: PeerDirectory,
+    wal: &ClusterWal,
+    inputs: Arc<dyn PlacementInputs>,
+) -> Result<SpawnedRuntime, SpawnRuntimeError> {
+    let group_count = runtime_config.raft_group_count;
+    let snapshot_store =
+        snapshot_store_from_config(&config.storage.snapshot, &config.storage.cold, node_id)
+            .map_err(|err| RuntimeError::ColdStoreConfig {
+                message: ursula_runtime::ErrorChain(&err).to_string(),
+            })?;
+    let engine_config = RaftEngineConfig::from(&config.raft);
+    let snapshot_drive_interval = snapshot::resolve_snapshot_drive_interval(
+        config
+            .storage
+            .snapshot
+            .drive_interval
+            .map(|interval| interval.as_duration()),
+        snapshot_store.is_some(),
+    );
+    let cadence = snapshot::snapshot_cadence(&config.raft, group_count);
+    let registry = RaftGroupHandleRegistry::default()
+        .with_append_transport_budget_bytes(config.raft.append_transport_budget_bytes)
+        .with_snapshot_install(
+            config.raft.snapshot_install_max_concurrency,
+            config.raft.install_snapshot_timeout.as_duration(),
+        );
+
+    // The node fence: a disk lease over the WAL root, which the WAL keeps,
+    // the transports and leader predicate read, and the object stores
+    // check before each PUT and DELETE.
+    let fence = ursula_runtime::NodeFence::leased(config.raft.wal.lease.as_duration());
+    let cold_store = cold_store(config, fence.clone())?;
+
+    // Built before the runtime starts, so a failure leaves nothing running.
+    let participation = PeerParticipation::new(
+        node_id,
+        &peers,
+        reqwest::Client::builder()
+            .timeout(
+                config
+                    .governance
+                    .leadership_balance
+                    .peer_timeout
+                    .as_duration(),
+            )
+            .build()
+            .map_err(|source| SpawnRuntimeError::PeerStatusClient { source })?,
+    );
+
+    let wal_config = &config.raft.wal;
+    let shard_map = ursula_shard::StaticShardMap::new(runtime_config.core_count, group_count)
+        .map_err(RuntimeError::from)?;
+    // Reads the previous run's state and counts and records this run
+    // before any group opens a journal.
+    let raft_wal = RaftWal::start_in_cluster(
+        wal.log_dir(),
+        JournalTuning {
+            // The resolved policy, which the WAL records in its run state.
+            fsync: config.raft.wal_fsync(),
+            segment_bytes: wal_config.segment_size.as_bytes(),
+            group_cache_bytes: wal_config.group_cache_bytes(group_count),
+        },
+        &shard_map,
+        ursula_proto::placement::NodeId::new(node_id),
+        config.server.cluster_id.as_ref(),
+        fence,
+    )?;
+    let probe_peers = peers.clone();
+    // Before the runtime starts, so `raft-log/meta/` exists before any data
+    // group of the run opens and the peer identity is bound before any
+    // group dials or answers a peer.
+    let meta = meta::open_meta(
+        config,
+        node_id,
+        peers,
+        &raft_wal,
+        &registry,
+        &shard_map,
+        engine_config.clone(),
+        ursula_raft::meta::replica::MetaSnapshotTrigger {
+            interval: snapshot_drive_interval,
+            max_dirty_age: cadence.removal_floor,
+        },
+        participation.clone(),
     )
-    .with_cold_store(cold_store.clone())
-    .with_snapshot_store(snapshot_store)
-    .with_engine_config(raft_engine_config);
+    .map_err(RuntimeError::from)?;
+    let factory =
+        ursula_raft::PlacedRaftGroupEngineFactory::new(raft_wal.clone(), registry.clone(), inputs)
+            .with_cold_store(cold_store.clone())
+            .with_snapshot_store(snapshot_store.clone())
+            .with_engine_config(engine_config);
     let runtime = ShardRuntime::spawn_with_engine_factory_and_cold_store(
         runtime_config,
         factory,
         cold_store,
     )?;
+
+    snapshot::spawn_snapshot_driver(
+        &runtime,
+        &registry,
+        snapshot_store.map(|store| {
+            (store, StoreGateInputs {
+                s3: config.storage.cold.s3.as_ref(),
+                cold_flush_interval: config.storage.cold.flush_interval.as_duration(),
+                participation: &participation,
+            })
+        }),
+        snapshot_drive_interval,
+        cadence,
+        Some(raft_wal.maintenance()),
+        config.raft.snapshot_pressure_max_groups_per_tick,
+    );
+    leadership::spawn_leadership_balancer(
+        &registry,
+        &participation,
+        &config.governance.leadership_balance,
+    );
+    egress::spawn_egress_gate(
+        &registry,
+        &participation,
+        &probe_peers,
+        &config.governance.cluster_probe,
+    );
+    commit_stall::spawn_commit_stall_watchdog(&registry, &config.governance.commit_stall);
+    // Hot bytes are a cold-tier backlog signal only when a cold store can
+    // drain them. Memory-only nodes intentionally retain all payloads hot,
+    // so applying the cold-health watermark there would eventually make
+    // every voter shed leadership.
+    if runtime.has_cold_store() {
+        cold_health::spawn_cold_health_gate(
+            &runtime,
+            &registry,
+            &participation,
+            &config.governance.cold_health,
+        );
+    }
     Ok(SpawnedRuntime {
         runtime,
         raft_registry: Some(registry),
-        raft_wal,
-        meta: None,
+        raft_wal: Some(raft_wal),
+        meta: Some(meta),
     })
 }

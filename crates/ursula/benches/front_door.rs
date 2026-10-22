@@ -20,7 +20,6 @@ use criterion::criterion_main;
 use tower::ServiceExt;
 use ursula::HttpState;
 use ursula::IngressAdmission;
-use ursula::Persistence;
 use ursula::Topology;
 use ursula::client_router_with_admission;
 use ursula::spawn_runtime;
@@ -40,12 +39,10 @@ async fn call(router: &Router, request: Request<Body>) -> axum::response::Respon
 async fn node() -> (HttpState, Router, String) {
     let mut config = ursula_config::UrsulaConfig::default();
     config.runtime.core_count = 1;
-    config.raft.group_count = 1;
-    let runtime = spawn_runtime(&config, Persistence::InMemory, Topology::SingleNode {
-        raft_group_count: 1,
-    })
-    .expect("runtime")
-    .runtime;
+    config.raft.group_count = Some(1);
+    let runtime = spawn_runtime(&config, Topology::Development { group_count: 1 })
+        .expect("runtime")
+        .runtime;
     let state = HttpState::new(runtime);
     let router = client_router_with_admission(state.clone(), IngressAdmission::default());
     let created = call(

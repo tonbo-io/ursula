@@ -33,11 +33,11 @@ listen = "127.0.0.1:4437"
 # cluster_listen = "10.0.0.1:4439"
 
 # The deployment's id, sent as Ursula-Cluster-Id on every HEAD: 1 to 64
-# characters from A-Z, a-z, 0-9, ".", "_" and "-". Required when raft.peers
-# is set, the same on every node and different for every deployment a client
-# can reach. A single node without it generates one at its first start and
-# keeps it in its WAL. The WAL records the id, and a node whose configured id
-# differs refuses to start.
+# characters from A-Z, a-z, 0-9, ".", "_" and "-". Required when
+# raft.wal.path is set, the same on every node and different for every
+# deployment a client can reach. A single node without raft.wal.path runs
+# under a generated one, new at every start. The WAL records the id, and a
+# node whose configured id differs refuses to start.
 # cluster_id = "prod-us-east-1"
 
 # Process-wide cap on accepted write body bytes held by the HTTP layer.
@@ -86,6 +86,7 @@ node_id = 1
 
 # Number of Raft groups (shards).  Each stream hashes to exactly one group.
 # More groups = finer-grained parallelism but slightly more memory overhead.
+# Required once raft.peers lists another node, the same on every node.
 group_count = 16
 
 # Per-group cap on raft-submitted-but-not-yet-applied payload bytes.
@@ -144,9 +145,10 @@ group_count = 16
 # The Raft WAL is the per-core journal on disk.
 #
 # Directory for the WAL files.  Ursula appends a "raft-log" subdirectory
-# automatically.  Required when raft.peers is set.  Without it a single node
-# runs its WAL in a fresh temporary directory that is removed on clean
-# shutdown, so nothing survives a restart.
+# automatically.  Required when raft.peers lists another node.  With it,
+# raft.peers lists this node and server.cluster_id is set, on a single node
+# too.  Without it a single node runs its WAL in a fresh temporary directory
+# that is removed on clean shutdown, so nothing survives a restart.
 # path = "/data/ursula"
 
 # When WAL appends reach stable storage: "never" | "always"
@@ -160,8 +162,9 @@ group_count = 16
 # ------------------------------------------------------------------------------
 # [raft.peers]  — Static gRPC Raft peers (repeatable table)
 # ------------------------------------------------------------------------------
-# Uncomment and repeat for every node in the cluster. `url` is the address
-# peers dial: server.listen, or server.cluster_listen when that is set. With
+# Uncomment and repeat for every node in the cluster, this node included.  A
+# single node with raft.wal.path lists itself.  `url` is the address peers
+# dial: server.listen, or server.cluster_listen when that is set. With
 # cluster_listen set, add `client_url` (the peer's server.listen address),
 # which leader redirects name, for example:
 #   url = "http://10.0.0.1:4439"

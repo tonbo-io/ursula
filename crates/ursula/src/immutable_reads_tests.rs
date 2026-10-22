@@ -33,7 +33,6 @@ use ursula_headers::names;
 use ursula_headers::value::Incarnation;
 use ursula_headers::value::Offset;
 
-use crate::Persistence;
 use crate::Topology;
 use crate::router;
 use crate::spawn_runtime;
@@ -45,13 +44,11 @@ const URI: &str = "/immutable/s";
 fn app() -> Router {
     let mut config = ursula_config::UrsulaConfig::default();
     config.runtime.core_count = 1;
-    config.raft.group_count = 1;
+    config.raft.group_count = Some(1);
     router(
-        spawn_runtime(&config, Persistence::InMemory, Topology::SingleNode {
-            raft_group_count: 1,
-        })
-        .expect("runtime")
-        .runtime,
+        spawn_runtime(&config, Topology::Development { group_count: 1 })
+            .expect("runtime")
+            .runtime,
     )
 }
 

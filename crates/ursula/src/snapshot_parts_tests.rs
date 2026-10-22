@@ -1812,19 +1812,12 @@ async fn a_new_raft_term_lists_the_stream_again() {
     crate::tests::remove_test_path(&raft_root);
     let mut config = ursula_config::UrsulaConfig::default();
     config.runtime.core_count = 1;
-    config.raft.group_count = 1;
+    config.raft.group_count = Some(1);
     config.storage.cold.backend = ursula_config::ColdBackend::Memory;
-    let spawned = spawn_runtime(
+    let spawned = crate::bootstrap::spawn_runtime_with_placement(
         &config,
-        Persistence::Raft {
-            log_dir: raft_root.as_path().into(),
-        },
-        Topology::static_cluster(
-            1,
-            crate::shared_peers([(1, "http://127.0.0.1:4477".to_owned())]),
-            1,
-            ursula_config::PlacementConfig::default().replication_factor,
-        ),
+        crate::tests::single_raft_node(&raft_root, 1),
+        ursula_raft::FixedPlacement::single(1),
     )
     .expect("runtime");
     // No meta runs here, so the test settles the fresh root's binding.

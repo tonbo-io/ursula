@@ -42,8 +42,6 @@ pub enum RuntimeError {
     },
     #[error("invalid cold store config: {message}")]
     ColdStoreConfig { message: String },
-    #[error("invalid static Raft membership config: {message}")]
-    StaticMembershipConfig { message: String },
     #[error("cold store IO error: {message}")]
     ColdStoreIo { message: String },
     #[error(
@@ -170,7 +168,6 @@ impl RuntimeError {
             | Self::InvalidRaftGroup { .. }
             | Self::SnapshotPlacementMismatch { .. }
             | Self::ColdStoreConfig { .. }
-            | Self::StaticMembershipConfig { .. }
             | Self::ColdStoreIo { .. }
             | Self::MailboxClosed { .. }
             | Self::ResponseDropped { .. }

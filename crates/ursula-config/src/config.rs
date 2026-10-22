@@ -98,11 +98,11 @@ pub struct ServerConfig {
     /// Process-wide cap on accepted write body bytes held by the HTTP layer.
     pub http_inflight_body_size: HumanSize,
     /// The id of the deployment, sent as `Ursula-Cluster-Id` on every HEAD:
-    /// 1 to 64 bytes of `[A-Za-z0-9._-]`. Required whenever `raft.peers` is
-    /// set, the same on every node and different for every deployment one
-    /// client can reach. A single node without it generates one at its first
-    /// start and keeps it in its WAL. The WAL records the id, and a node whose
-    /// configured id differs from its WAL's refuses to start.
+    /// 1 to 64 bytes of `[A-Za-z0-9._-]`. Required whenever `raft.wal.path`
+    /// is set, the same on every node and different for every deployment one
+    /// client can reach. A node on a temporary WAL without it runs under a
+    /// generated one, new at every start. The WAL records the id, and a node
+    /// whose configured id differs from its WAL's refuses to start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster_id: Option<ClusterId>,
 }
@@ -171,9 +171,11 @@ pub struct RaftConfig {
     /// Must be present in `peers` and must be non-zero.
     pub node_id: u64,
     /// Number of Raft groups (shards), at most
-    /// [`ursula_proto::placement::MAX_GROUP_COUNT`]. Defaults to
-    /// `core_count * 16` within that bound.
-    pub group_count: usize,
+    /// [`ursula_proto::placement::MAX_GROUP_COUNT`]. Required once `peers`
+    /// lists another node, since every node of a cluster runs the same
+    /// groups. Unset, it is [`RaftConfig::effective_group_count`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_count: Option<usize>,
     /// Per-group cap on raft-submitted-but-not-yet-applied payload bytes.
     /// `None` or `0` disables the admission. Catches raft replication lag before
     /// in-memory queues grow unbounded.
@@ -181,10 +183,13 @@ pub struct RaftConfig {
     /// Raft WAL configuration.
     pub wal: WalConfig,
     /// Static gRPC Raft peers. Each entry maps a `node_id` to its gRPC URL.
+    /// Every node with `wal.path` lists itself here, a single node
+    /// included. A node on a temporary WAL with no peers runs with an entry
+    /// of itself, at its cluster listener, else its client listener.
     pub peers: Vec<RaftPeerConfig>,
     /// The meta group's voters at its genesis: ids of `raft.peers`, or this
     /// node's id when `raft.peers` is empty. Unset, the smallest
-    /// `min(3, N)` ids of the address book ([`RaftConfig::address_book`]).
+    /// `min(3, N)` ids of `raft.peers`.
     /// Read at genesis only: the meta group's committed voters rule after
     /// it. A repeated id counts once, and an empty list is refused.
     pub meta_voters: Option<VoterSet>,
@@ -276,19 +281,25 @@ impl RaftConfig {
     pub const DEFAULT_DELETED_DATA_MAX_AGE: std::time::Duration =
         std::time::Duration::from_secs(60 * 60);
 
-    /// This node's address book: `raft.peers`, or, when it is empty, this
-    /// node alone at `self_url`, so every Raft node can run the meta group.
-    /// The data topology does not read it. Removed in S2 (#768), where
-    /// every node with `raft.wal.path` lists itself in `raft.peers`.
-    pub fn address_book(&self, self_url: &str) -> Vec<RaftPeerConfig> {
-        if !self.peers.is_empty() {
-            return self.peers.clone();
-        }
-        vec![RaftPeerConfig {
-            node_id: self.node_id,
-            url: self_url.to_owned(),
-            client_url: None,
-        }]
+    /// The group count the node runs: `group_count`, or, unset,
+    /// `core_count * 16` of this host within
+    /// [`ursula_proto::placement::MAX_GROUP_COUNT`], so a large host's
+    /// default stays valid.
+    pub fn effective_group_count(&self) -> usize {
+        self.group_count.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().saturating_mul(16).max(1))
+                .unwrap_or(16)
+                .min(
+                    usize::try_from(ursula_proto::placement::MAX_GROUP_COUNT).unwrap_or(usize::MAX),
+                )
+        })
+    }
+
+    /// Whether `raft.peers` lists a node other than this one: the node is
+    /// one of a cluster of several.
+    pub fn lists_another_peer(&self) -> bool {
+        self.peers.iter().any(|peer| peer.node_id != self.node_id)
     }
 
     /// The journal policy the node runs: `raft.wal.fsync`, or, unset,
@@ -296,13 +307,13 @@ impl RaftConfig {
     /// otherwise. A group of one or two voters has no quorum without a
     /// replica that a host crash under `never` gates, so only `always`
     /// lets it restart unattended after one. The voter count is
-    /// `min(raft.placement.replication_factor, N)` over the N nodes of the
-    /// address book: `raft.peers`, or this node alone when it is empty.
+    /// `min(raft.placement.replication_factor, N)` over the N nodes of
+    /// `raft.peers`, which lists every Raft node itself.
     pub fn wal_fsync(&self) -> WalFsync {
         if let Some(fsync) = self.wal.fsync {
             return fsync;
         }
-        let nodes = self.peers.len().max(1);
+        let nodes = self.peers.len();
         let voters = nodes.min(usize::from(self.placement.replication_factor.get()));
         if voters <= 2 {
             WalFsync::Always
@@ -334,14 +345,7 @@ impl Default for RaftConfig {
     fn default() -> Self {
         Self {
             node_id: 0,
-            // At most the bound `validate` checks, so a large host's
-            // default stays valid.
-            group_count: std::thread::available_parallelism()
-                .map(|n| n.get().saturating_mul(16).max(1))
-                .unwrap_or(16)
-                .min(
-                    usize::try_from(ursula_proto::placement::MAX_GROUP_COUNT).unwrap_or(usize::MAX),
-                ),
+            group_count: None,
             max_uncommitted_size_per_group: None,
             wal: WalConfig::default(),
             peers: Vec::new(),
@@ -371,9 +375,10 @@ impl Default for RaftConfig {
 #[serde(default, deny_unknown_fields)]
 pub struct WalConfig {
     /// Directory for the WAL files; the journals live in its `raft-log`
-    /// subdirectory. Required whenever `raft.peers` is set. A single node
-    /// without a path runs its WAL in a fresh temporary directory that is
-    /// removed on clean shutdown.
+    /// subdirectory. Required once `raft.peers` lists another node, and
+    /// with it `raft.peers` lists this node and `server.cluster_id` is set.
+    /// A single node without a path runs its WAL in a fresh temporary
+    /// directory that is removed on clean shutdown.
     pub path: Option<PathBuf>,
     /// When journal appends reach stable storage. Unset, it resolves from
     /// the replication factor ([`RaftConfig::wal_fsync`]).

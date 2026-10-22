@@ -195,7 +195,7 @@ Coverage is the complement of the hot buffer. In read planning and in the restor
 | Cold-GC queue | replicated | bounded while GC is healthy | F14b |
 | `bucket_usage`, `erased_buckets` | replicated | O(buckets ever written or purged) | F15 (exception) |
 | Group snapshot | replicated | encodes the above, cadence by bytes | F12a to F12e |
-| Unpurged Raft log | node | near the log budget, hard limit 2 × budget on a cluster node (a single node has no write gate) | F12e, F17 |
+| Unpurged Raft log | node | near the log budget, hard limit 2 × budget on every Raft node | F12e, F17 |
 | TTL heap | node | ≤ 2 entries per live TTL stream | F8 |
 | Staged-part tallies | node | ≤ 16,384 unheld streams, LRU, plus held ones | F16 |
 | Staged-part group totals | node | one entry per stream with staged parts in a led group | F16 |
