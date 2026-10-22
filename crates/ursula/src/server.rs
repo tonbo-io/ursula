@@ -954,8 +954,19 @@ mod tests {
         .await
         .expect("meta answers the registration")
         .expect("the registration runs");
-        // The group's log holds its first entries, so the next run holds it.
+        // The group's log holds its first entries once its only voter leads,
+        // so the next run holds it. A stop before that leaves an empty
+        // replica, which no unconfirmed view can initialize.
         wait_hosted(&state, 0).await;
+        state
+            .raft_registry()
+            .expect("a Raft node")
+            .get(ursula_shard::RaftGroupId(0))
+            .expect("the driver opened group 0")
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .current_leader(7, "the first run's replica leads its group")
+            .await
+            .expect("the first run's replica leads");
         stop(state).await;
         std::fs::write(
             log_dir.join("meta").join("journal.meta"),
