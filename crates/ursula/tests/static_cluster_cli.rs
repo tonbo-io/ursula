@@ -29,6 +29,7 @@ use ursula_control::GroupPlacement;
 use ursula_control::MetaDamageKind;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::MetaRole;
+use ursula_control::NodeEligibility;
 use ursula_control::PlacementStatus;
 use ursula_control::RegistrationStatus;
 use ursula_control::Target;
@@ -5331,6 +5332,43 @@ async fn move_converges(
     assert_eq!(end, GroupEnd::Converged { to: voter_set(to) }, "{out}");
 }
 
+/// Waits until the meta leader's report lists each of `ids` `Eligible`, read
+/// as `ursulactl placement move` reads it (`PlacementStatus.leader_report`)
+/// over the nodes of `nodes` but `skip`. A move without `--allow-not-live`
+/// refuses a node the report leaves out, and the leader lists a node only a
+/// pass after it holds both the node's acknowledgement within
+/// `LIVE_WITHIN` and its WAL-disk state, which it asks for every few
+/// seconds. So a node that just resumed, or any node under a meta leader
+/// elected a moment ago, is not listed yet, and a move must wait for the
+/// report instead of racing it.
+async fn wait_eligible(procs: &mut Processes, nodes: &[MetaNode], skip: &[u64], ids: &[u64]) {
+    let ctl = ctl_client();
+    let manifest = ctl_manifest(nodes, skip);
+    let what = format!("the meta leader reports nodes {ids:?} eligible");
+    eventually(procs, &what, async || {
+        let status = ursula_ctl::view::leader_status(&ctl, &manifest)
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(|refusal| refusal.to_string())?;
+        let report = status
+            .leader_report
+            .ok_or_else(|| format!("node {} publishes no leader report", status.node))?;
+        let missing: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                report.eligibility.get(&NodeId::new(*id)) != Some(&NodeEligibility::Eligible)
+            })
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("nodes {missing:?} are not eligible: {report:?}"))
+        }
+    })
+    .await;
+}
+
 fn replace(old: u64, new: u64) -> Intent {
     Intent::Replace(Replacement {
         old: NodeId::new(old),
@@ -6039,6 +6077,9 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
         } else {
             procs.kill(lowest);
         }
+        // Node 5 was stopped in phase 3, and the voter just killed or
+        // stopped may have led meta.
+        wait_eligible(&mut procs, &nodes, &[lowest], &[5]).await;
         let load = GatewayLoad::start(vec![stream.clone()], "through-the-gateway");
         let mut to = stays.clone();
         to.insert(5);
@@ -6117,6 +6158,7 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
     .await;
     // Node 5's place goes to the node the group was placed off, the one
     // node of 1 to 3 the group has no retirement for.
+    wait_eligible(&mut procs, &nodes, &[5], &[first_meta_leader]).await;
     let (end, out) = placement_move(
         &nodes,
         &[5],
@@ -6250,6 +6292,8 @@ async fn cli_a_durable_single_node_grows_to_three_and_moves_its_groups() {
     // 2. Group 0 moves onto node 2 and group 1 onto node 3.
     for (group, to) in [(0_u32, 2_u64), (1, 3)] {
         let to_set = BTreeSet::from([to]);
+        // Node 1, meta's only voter, restarted above.
+        wait_eligible(&mut procs, &nodes, &[], &[to]).await;
         move_converges(
             &nodes,
             &[],
@@ -6438,7 +6482,7 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
 
     // 2. A group moves onto {x, 4, 5}, x a meta voter.
     let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
-    let (group, to) = current_voters(&cluster)
+    let (group, from, to) = current_voters(&cluster)
         .into_iter()
         .find_map(|(group, voters)| {
             let kept = voters
@@ -6447,17 +6491,26 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
                 .find(|id| META_VOTERS.contains(id))
                 .unwrap_or(1);
             let to = BTreeSet::from([kept, 4, 5]);
-            (to != voters).then_some((group, to))
+            (to != voters).then_some((group, voters, to))
         })
         .unwrap_or_else(|| panic!("a group is placed off some {{x, 4, 5}}: {cluster:?}"));
+    let added: Vec<u64> = to.difference(&from).copied().collect();
+    wait_eligible(&mut procs, &nodes, &[], &added).await;
     move_converges(&nodes, &[], group, Intent::To(voter_set(&to)), &to).await;
+    // The move changed which nodes may lead the group, so the balancer may
+    // still hand leaderships on. A create or append it races can answer
+    // `OUTCOME_UNKNOWN` and still apply: a retried create then answers `200`,
+    // which `create_stream` takes, and a retried append lands twice, while
+    // the cut below must keep exactly one copy. So the writes wait until the
+    // leaders settled again.
+    wait_leaders_settle(&client, &mut procs, &nodes).await;
     let kept = *to.first().expect("three voters");
     let cut_stream = format!(
         "{}/cut/{}",
         node_of(&nodes, kept).url(),
         stream_per_group("cut")[usize::try_from(group.0).unwrap()]
     );
-    put_until_created(&client, &cut_stream).await;
+    create_stream(&client, &mut procs, &cut_stream).await;
     post_until_no_content(&client, &cut_stream, "before-the-cut;").await;
     let moved = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
     let placement = moved.group(group).cloned().expect("the group is placed");
