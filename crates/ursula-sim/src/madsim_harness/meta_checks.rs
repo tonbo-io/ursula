@@ -3,8 +3,8 @@
 //!
 //! - I6 ([`I6`]): with meta's quorum lost, every data group with a quorum
 //!   commits.
-//! - On a placed cluster, the hosting checks of [`HostingChecks`] (I2, I3
-//!   and the hosting check) at every observation.
+//! - On a placed cluster, the hosting checks of [`HostingChecks`] (I2 to
+//!   I4, I8, I9 and the hosting check) at every observation.
 //! - I10 ([`I10`]): every acknowledged control write survives power loss on
 //!   every meta replica, and a power loss comes after at least one
 //!   acknowledged write.

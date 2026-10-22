@@ -7,25 +7,48 @@
 //! engine factory does. Nothing else starts a placed replica, so a node runs
 //! what its journals hold and what a confirmed placement gives it.
 //!
+//! Each placed replica's metrics are watched for the run, so every
+//! membership entry some replica held, effective or committed, is kept with
+//! the leader that appended it ([`MembershipLog`]). The leader of a group
+//! asks the recovery gates of the learners it would promote from each
+//! learner's node registry ([`SimPeerGates`]), as a participation answer
+//! carries them.
+//!
 //! The hosting checks ([`HostingChecks`]) run at every observation of the
 //! meta checks:
 //!
 //! - I2 ([`I2`]): no group is initialized twice, and no two replicas lead
 //!   one group in one term.
-//! - I3 ([`I3`]), while no group moves: every membership a running replica
-//!   holds is its group's seed voters, with no learner. Its live half is a
-//!   wait: once the faults are over, every running node's view shows every
-//!   group `Live` and stable on its seed voters, as each group's leader
-//!   reported them.
-//! - The hosting check ([`HOSTED`]): a node runs only the groups it is a
-//!   seed voter of, and no node runs one before the view of some running
-//!   node bootstrapped. It does not see whether the placement that created
-//!   a replica was confirmed.
+//! - I3 ([`I3`]): every membership a running replica holds names only nodes
+//!   some placement of the group gave a role. Its live half is a wait: once
+//!   the faults and moves are over, every running node's view shows every
+//!   group `Live` and stable on one voter set, and the group's leader holds
+//!   a committed uniform membership of exactly those voters, with no
+//!   learner.
+//! - I4 ([`I4`]), P-SELF: every membership entry lists the leader that
+//!   appended it in its last config, but the RF 1 step, whose configs have
+//!   one voter each.
+//! - I8 ([`I8`]), as S3 has it without teardown: no voter change appended
+//!   in a term above every term the group's replicas held when the
+//!   placement took a node's role away (abandoned or retired) adds that
+//!   node. A leader elected later confirms its view after the change, so
+//!   only a step planned in an earlier leadership, or from an unconfirmed
+//!   view, adds it.
+//! - I9 ([`I9`]): once a view shows a move's report, no membership of the
+//!   group above the one it names was committed before (checked when the
+//!   report is first seen, which follows its proof by the report's
+//!   latency), and the latest committed membership never lists a node the
+//!   placement retired as a voter.
+//! - The hosting check ([`HOSTED`]): a node runs only the groups some
+//!   placement gave it a role in, no node runs one before the view of some
+//!   running node bootstrapped, and a node creates a log it did not hold
+//!   only while its own view is bootstrapped. It does not see whether the
+//!   placement that created a replica was confirmed.
 //!
-//! I1 ([`I1`]), I7 ([`I7`]) and I15 ([`I15`]) are waits the family runs
-//! after its faults: every seed voter reads the acknowledged appends, a
-//! node restarted without meta serves its groups, and every seeded group
-//! forms.
+//! I1 ([`I1`]), I7 ([`I7`]), I14 ([`I14`]) and I15 ([`I15`]) are waits:
+//! every voter reads the acknowledged appends, a node restarted without
+//! meta serves its groups, a settled cluster's leaderships stay where they
+//! are, and every seeded group forms.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -87,8 +110,12 @@ use super::recovery_wiring;
 
 pub(super) const I1: &str = "acknowledged_writes_read_back";
 pub(super) const I2: &str = "no_group_initialized_twice";
-pub(super) const I3: &str = "memberships_are_the_seed_voters";
+pub(super) const I3: &str = "every_group_settles_on_its_placement";
+pub(super) const I4: &str = "membership_entries_keep_their_leader";
 pub(super) const I7: &str = "a_node_restarted_without_meta_serves";
+pub(super) const I8: &str = "a_voter_change_adds_only_placed_nodes";
+pub(super) const I9: &str = "a_report_names_the_latest_membership";
+pub(super) const I14: &str = "a_settled_reconciler_makes_no_transfer";
 pub(super) const I15: &str = "every_seeded_group_forms";
 pub(super) const HOSTED: &str = "a_node_runs_only_its_placed_groups";
 pub(super) const DATA_PLAN: &str = "data_plans_recover_after_meta";
@@ -136,6 +163,172 @@ impl StartedGates {
     }
 }
 
+/// One membership entry as some placed replica's metrics showed it.
+#[derive(Debug, Clone)]
+pub(super) struct SeenMembership {
+    /// The leader that appended it.
+    pub(super) leader: u64,
+    /// Its voter configs: two for a joint entry.
+    pub(super) configs: Vec<BTreeSet<u64>>,
+    /// Whether some replica showed it committed.
+    pub(super) committed: bool,
+}
+
+/// Every membership entry some placed replica showed, effective or
+/// committed, by group and then by log id as (index, term).
+#[derive(Clone, Default)]
+pub(super) struct MembershipLog(Arc<Mutex<BTreeMap<u32, BTreeMap<(u64, u64), SeenMembership>>>>);
+
+impl MembershipLog {
+    fn record(&self, group: u32, metrics: &openraft::RaftMetrics<UrsulaRaftTypeConfig>) {
+        let mut log = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let entries = log.entry(group).or_default();
+        for (stored, committed) in [
+            (&metrics.membership_config, false),
+            (&metrics.committed_membership_config, true),
+        ] {
+            let Some(log_id) = stored.log_id() else {
+                continue;
+            };
+            let key = (log_id.index, log_id.leader_id.term);
+            let membership = stored.membership();
+            let seen = entries.entry(key).or_insert_with(|| SeenMembership {
+                leader: log_id.leader_id.node_id,
+                configs: membership.get_joint_config().clone(),
+                committed: false,
+            });
+            seen.committed |= committed;
+        }
+    }
+
+    /// The entries of `group` seen so far.
+    pub(super) fn of(&self, group: u32) -> BTreeMap<(u64, u64), SeenMembership> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .get(&group)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+/// Watches `raft`'s metrics until it stops, keeping every membership
+/// entry it shows in `log`.
+fn watch_memberships(
+    log: MembershipLog,
+    group: u32,
+    raft: Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>,
+) -> madsim::task::JoinHandle<()> {
+    madsim::task::spawn(async move {
+        let mut metrics = raft.metrics();
+        loop {
+            log.record(
+                group,
+                &openraft::rt::WatchReceiver::borrow_watched(&metrics),
+            );
+            if openraft::rt::WatchReceiver::changed(&mut metrics)
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+    })
+}
+
+/// A log a node created that its journals did not hold, and whether the
+/// node's own view was bootstrapped then.
+#[derive(Debug, Clone, Copy)]
+struct Creation {
+    group: u32,
+    node_id: u64,
+    bootstrapped: bool,
+}
+
+/// Every creation of a run's nodes ([`Creation`]).
+#[derive(Clone, Default)]
+pub(super) struct Creations(Arc<Mutex<Vec<Creation>>>);
+
+impl Creations {
+    fn push(&self, creation: Creation) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(creation);
+    }
+
+    fn unbootstrapped(&self) -> Vec<Creation> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|creation| !creation.bootstrapped)
+            .copied()
+            .collect()
+    }
+}
+
+/// The registry of each node whose process runs, which answers for its
+/// node's participation.
+#[derive(Clone, Default)]
+pub(super) struct NodeRegistries(Arc<Mutex<BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>>>);
+
+impl NodeRegistries {
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>> {
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// The peer gates of one node's reconcile shells (design 5.8): each
+/// learner's recovery gate as its node's registry reports it
+/// ([`ursula_raft::RaftGroupHandleRegistry::recovery_gates`]), the state a
+/// participation answer carries, read right before a promotion. A learner
+/// whose process does not run, or that the data plane cuts off from this
+/// node, answers nothing and stays `Unknown`.
+#[derive(Debug)]
+struct SimPeerGates {
+    node_id: u64,
+    policy: ursula_raft::InProcessRaftNetworkPolicy,
+    registries: NodeRegistries,
+}
+
+impl std::fmt::Debug for NodeRegistries {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NodeRegistries")
+    }
+}
+
+impl ursula_raft::PeerGates for SimPeerGates {
+    fn gates(
+        &self,
+        replica: ursula_raft::RaftTarget,
+        learners: &BTreeSet<ursula_proto::placement::NodeId>,
+    ) -> BoxFuture<'_, BTreeMap<ursula_proto::placement::NodeId, ursula_control::PeerGate>> {
+        let key = match replica {
+            ursula_raft::RaftTarget::Data(group) => {
+                ursula_proto::admin::RaftTargetKey::Data(group.0)
+            }
+            ursula_raft::RaftTarget::Meta => ursula_proto::admin::RaftTargetKey::Meta,
+        };
+        let registries = self.registries.lock();
+        let gates = learners
+            .iter()
+            .filter(|learner| !self.policy.partitioned(self.node_id, learner.get()))
+            .filter_map(|learner| {
+                let status = registries
+                    .get(&learner.get())?
+                    .recovery_gates()
+                    .get(&key)
+                    .copied()?;
+                Some((*learner, ursula_control::PeerGate::of_status(status)))
+            })
+            .collect();
+        Box::pin(std::future::ready(gates))
+    }
+}
+
 /// One placed replica.
 struct Hosted {
     engine: Arc<AsyncMutex<RaftGroupEngine>>,
@@ -144,6 +337,8 @@ struct Hosted {
     /// What the replica showed once it opened, before its drivers ran,
     /// with the vote its store held.
     opened: ReplicaMarks,
+    /// The task that keeps its memberships in the run's log.
+    watcher: madsim::task::JoinHandle<()>,
 }
 
 /// What a replica's gate and vote show.
@@ -202,6 +397,8 @@ pub(super) struct SimHost {
     inputs: MetaPlacement,
     replicas: Mutex<BTreeMap<u32, Hosted>>,
     started: StartedGates,
+    memberships: MembershipLog,
+    creations: Creations,
     /// Whether the process no longer answers for its node
     /// ([`MetaCluster::take_host`]).
     detached: std::sync::atomic::AtomicBool,
@@ -216,6 +413,27 @@ impl SimHost {
             .admission(placement.raft_group_id)
             .ok_or(SimHostError::NotAdmitted { group })?;
         let wal = &self.parts.wal;
+        if admission == ursula_control::Admission::Create {
+            let held = wal
+                .raft_wal()
+                .local_groups()
+                .ok()
+                .and_then(|local| local.get(placement.raft_group_id))
+                .is_some_and(ursula_control::LocalLog::is_held);
+            if !held {
+                self.creations.push(Creation {
+                    group,
+                    node_id,
+                    bootstrapped: self
+                        .parts
+                        .registry
+                        .placement_watch()
+                        .current()
+                        .cluster()
+                        .is_some(),
+                });
+            }
+        }
         let store = wal
             .open_admitted(
                 placement,
@@ -309,11 +527,13 @@ impl SimHost {
         if let Some(vote) = stored_vote {
             opened.vote = vote;
         }
+        let watcher = watch_memberships(self.memberships.clone(), group, raft.clone());
         let hosted = Hosted {
             opened,
             raft,
             engine: Arc::new(AsyncMutex::new(engine)),
             rejoin,
+            watcher,
         };
         self.lock().insert(group, hosted);
         Ok(())
@@ -332,6 +552,7 @@ impl SimHost {
         let Some(hosted) = hosted else {
             return Ok(());
         };
+        hosted.watcher.abort();
         let engine = hosted.engine.lock().await;
         engine
             .shutdown()
@@ -470,6 +691,13 @@ pub(super) struct Placed {
     started: StartedGates,
     /// The groups whose stream was created.
     created: BTreeSet<u32>,
+    pub(super) memberships: MembershipLog,
+    creations: Creations,
+    /// The registry of each node whose host runs, for its peers' gates.
+    registries: NodeRegistries,
+    /// How many keyed appends each group acknowledged: the next one's
+    /// producer sequence number.
+    appended: BTreeMap<u32, u64>,
 }
 
 /// `group`'s seed voters by the kernel's seed rule over `claim`.
@@ -498,21 +726,33 @@ impl MetaCluster {
         }
         let reader = self.runtimes[&node_id].status_reader().clone();
         let hosting = HostingSet::default();
-        let placed = self.placed_mut();
-        let started = placed.started.clone();
         let mut parts = self.data.replica_parts(node_id);
         parts.process = self.process(node_id);
+        let placed = self.placed_mut();
+        let started = placed.started.clone();
+        let memberships = placed.memberships.clone();
+        let creations = placed.creations.clone();
+        let registries = placed.registries.clone();
+        registries.lock().insert(node_id, parts.registry.clone());
+        let gates = SimPeerGates {
+            node_id,
+            policy: parts.policy.clone(),
+            registries,
+        };
         let inputs = MetaPlacement::new(
             ursula_proto::placement::NodeId::new(node_id),
             parts.registry.clone(),
             hosting.clone(),
-        );
+        )
+        .with_peer_gates(Arc::new(gates));
         inputs.bind_meta(reader.clone());
         let host = Arc::new(SimHost {
             parts,
             inputs,
             replicas: Mutex::new(BTreeMap::new()),
             started,
+            memberships,
+            creations,
             detached: std::sync::atomic::AtomicBool::new(false),
         });
         let driver = HostingDriver::start(Arc::clone(&host), wal, reader, hosting);
@@ -528,12 +768,18 @@ impl MetaCluster {
         node.host
             .detached
             .store(false, std::sync::atomic::Ordering::Release);
+        let registry = node.host.parts.registry.clone();
+        self.placed_mut()
+            .registries
+            .lock()
+            .insert(node_id, registry);
         self.placed_mut().hosts.insert(node_id, node);
     }
 
     /// Takes `node_id`'s running host and driver out of the cluster, which
     /// keeps running them until [`DetachedHost::kill`].
     pub(super) fn take_host(&mut self, node_id: u64) -> Option<DetachedHost> {
+        self.placed_mut().registries.lock().remove(&node_id);
         let node = self.placed_mut().hosts.remove(&node_id)?;
         node.host
             .detached
@@ -561,6 +807,7 @@ impl MetaCluster {
 
     /// Stops `node_id`'s hosting driver, then every replica it runs.
     pub(super) async fn stop_host(&mut self, node_id: u64) {
+        self.placed_mut().registries.lock().remove(&node_id);
         let Some(node) = self.placed_mut().hosts.remove(&node_id) else {
             return;
         };
@@ -587,6 +834,75 @@ impl MetaCluster {
     /// The seed voters of `group` by the claim of node 1.
     pub(super) fn seeds(&self, group: u32) -> BTreeSet<u64> {
         seed_voters(&self.claims[&1], group)
+    }
+
+    /// The view of the running node whose meta replica applied the most.
+    pub(super) fn latest_view(&self) -> Arc<ursula_control::PlacementView> {
+        self.running()
+            .into_iter()
+            .map(|node_id| self.view(node_id))
+            .max_by_key(|view| view.applied().map(|applied| applied.get().index))
+            .unwrap_or_else(|| Arc::new(ursula_control::PlacementView::empty()))
+    }
+
+    /// `group`'s placement in the latest view.
+    pub(super) fn placement(&self, group: u32) -> Option<ursula_control::GroupPlacement> {
+        self.latest_view()
+            .cluster()
+            .and_then(|cluster| cluster.group(RaftGroupId(group)))
+            .cloned()
+    }
+
+    /// The voters `group` is placed on now, by the latest view: its seed
+    /// voters until the view shows a placement.
+    pub(super) fn placed_voters(&self, group: u32) -> BTreeSet<u64> {
+        match self.placement(group) {
+            Some(placement) => node_ids(placement.current_voters().iter()),
+            None => self.seeds(group),
+        }
+    }
+
+    /// The replica of `group` on `node_id`'s running host.
+    pub(super) fn hosted_raft(
+        &self,
+        node_id: u64,
+        group: u32,
+    ) -> Option<Raft<UrsulaRaftTypeConfig, RaftGroupStateMachine>> {
+        self.placed().hosts.get(&node_id)?.host.raft(group)
+    }
+
+    /// The leader of `group` some running replica names, if it runs.
+    pub(super) fn leader_of(&self, group: u32) -> Option<u64> {
+        self.placed_leader(group)
+    }
+
+    /// The highest term any running replica of `group` holds.
+    fn max_term(&self, group: u32) -> u64 {
+        self.hosting(group)
+            .iter()
+            .filter_map(|(_, host)| host.raft(group))
+            .map(|raft| openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).current_term)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The latest committed membership of `group` among its running
+    /// replicas, by log index: its voter configs and learners.
+    fn latest_committed(&self, group: u32) -> Option<(u64, Vec<BTreeSet<u64>>, BTreeSet<u64>)> {
+        self.hosting(group)
+            .iter()
+            .filter_map(|(_, host)| host.raft(group))
+            .filter_map(|raft| {
+                let metrics = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).clone();
+                let stored = &metrics.committed_membership_config;
+                let index = stored.log_id().as_ref()?.index;
+                Some((
+                    index,
+                    stored.membership().get_joint_config().clone(),
+                    stored.membership().learner_ids().collect(),
+                ))
+            })
+            .max_by_key(|(index, _, _)| *index)
     }
 
     /// The running nodes that host a replica of `group`.
@@ -631,21 +947,33 @@ impl MetaCluster {
     /// Appends `count` payloads to `group` through its leader, retrying
     /// while leadership moves, and answers `false` at the first one the
     /// group does not take within the bound.
+    /// Each append is keyed: its producer sequence number is the count the
+    /// group acknowledged, so a retry of one whose answer was lost applies
+    /// once.
     pub(super) async fn placed_append(&mut self, group: u32, count: usize) -> bool {
         for _ in 0..count {
             let acknowledged = self.data.acknowledged.entry(group).or_default();
             let payload = format!("g{group}-{};", acknowledged.len()).into_bytes();
+            let seq = self.placed().appended.get(&group).copied().unwrap_or(0);
             let deadline = madsim::time::Instant::now() + BOUND;
             loop {
                 let engine = self
                     .placed_leader(group)
                     .and_then(|leader| self.placed().hosts.get(&leader)?.host.engine(group));
+                let mut request = AppendRequest::from_bytes(group_stream(group), payload.clone());
+                request.producer = Some(ursula_runtime::ProducerRequest {
+                    producer_id: format!("sim-placed-{group}"),
+                    producer_epoch: 0,
+                    producer_seq: seq,
+                    digest: None,
+                    ..Default::default()
+                });
                 if let Some(engine) = engine
                     && engine
                         .lock()
                         .await
                         .append(
-                            AppendRequest::from_bytes(group_stream(group), payload.clone()),
+                            request,
                             group_placement(group),
                             ColdWriteAdmission::default(),
                         )
@@ -664,6 +992,9 @@ impl MetaCluster {
                 .entry(group)
                 .or_default()
                 .extend_from_slice(&payload);
+            self.placed_mut()
+                .appended
+                .insert(group, seq.saturating_add(1));
         }
         true
     }
@@ -715,11 +1046,11 @@ impl MetaCluster {
         }
     }
 
-    /// I1: every running seed voter of `group` reads the group's
-    /// acknowledged payloads within the bound.
+    /// I1: every running voter of `group`, as the latest view places it,
+    /// reads the group's acknowledged payloads within the bound.
     pub(super) async fn placed_reads(&self, trace: &mut SimTrace, after_event: &str, group: u32) {
         let deadline = madsim::time::Instant::now() + BOUND;
-        for node_id in self.seeds(group) {
+        for node_id in self.placed_voters(group) {
             if !self.runtimes.contains_key(&node_id) {
                 continue;
             }
@@ -812,53 +1143,70 @@ impl MetaCluster {
         }
     }
 
-    /// I3's live half: each group's leader reports the voters it formed on
-    /// (design 5.7), so within the bound every running node's view shows
-    /// every group `Live` and stable on its seed voters.
+    /// I3's live half: within the bound, every running node's view shows
+    /// every group `Live` and stable on one voter set, and the group's
+    /// leader holds a committed uniform membership of exactly those voters,
+    /// with no learner.
     pub(super) async fn groups_live(&self, trace: &mut SimTrace, after_event: &str) {
         let deadline = madsim::time::Instant::now() + BOUND;
         for group in JOURNAL_GROUPS {
-            let seeds = self.seeds(group);
-            loop {
-                let behind: Vec<(u64, Option<ursula_control::GroupPlacement>)> = self
-                    .running()
-                    .into_iter()
-                    .filter_map(|node_id| {
-                        let placement = self
-                            .view(node_id)
-                            .cluster()
-                            .and_then(|cluster| cluster.group(RaftGroupId(group)))
-                            .cloned();
-                        let live = placement.as_ref().is_some_and(|placement| {
-                            matches!(placement, ursula_control::GroupPlacement::Live { .. })
-                                && placement.moving().is_none()
-                                && placement
-                                    .current_voters()
-                                    .iter()
-                                    .map(ursula_proto::placement::NodeId::get)
-                                    .collect::<BTreeSet<u64>>()
-                                    == seeds
-                        });
-                        (!live).then_some((node_id, placement))
-                    })
-                    .collect();
-                if behind.is_empty() {
-                    break;
-                }
+            while let Some(behind) = self.not_settled(group) {
                 if madsim::time::Instant::now() >= deadline {
-                    fail(
-                        trace,
-                        I3,
-                        after_event,
-                        format!(
-                            "group {group} is not live on its seed voters {seeds:?} in every \
-                             view: {behind:?}"
-                        ),
-                    );
+                    fail(trace, I3, after_event, behind);
                 }
                 madsim::time::sleep(STEP).await;
             }
         }
+    }
+
+    /// Why `group` has not settled on its placement, if it has not.
+    pub(super) fn not_settled(&self, group: u32) -> Option<String> {
+        let mut placed: Option<BTreeSet<u64>> = None;
+        for node_id in self.running() {
+            let placement = self
+                .view(node_id)
+                .cluster()
+                .and_then(|cluster| cluster.group(RaftGroupId(group)))
+                .cloned();
+            let stable = placement.as_ref().and_then(|placement| {
+                (matches!(placement, ursula_control::GroupPlacement::Live { .. })
+                    && placement.moving().is_none())
+                .then(|| node_ids(placement.current_voters().iter()))
+            });
+            let Some(voters) = stable else {
+                return Some(format!(
+                    "group {group} is not live and stable in node {node_id}'s view: {placement:?}"
+                ));
+            };
+            if placed.as_ref().is_some_and(|placed| *placed != voters) {
+                return Some(format!(
+                    "the views place group {group} on {placed:?} and on {voters:?}"
+                ));
+            }
+            placed = Some(voters);
+        }
+        let placed = placed.unwrap_or_default();
+        let Some(leader) = self.placed_leader(group) else {
+            return Some(format!("group {group} has no running leader"));
+        };
+        let raft = self.hosted_raft(leader, group)?;
+        let metrics = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics()).clone();
+        let membership = metrics.committed_membership_config.membership();
+        let configs = membership.get_joint_config();
+        let learners: BTreeSet<u64> = membership.learner_ids().collect();
+        let uncommitted =
+            metrics.committed_membership_config.log_id() != metrics.membership_config.log_id();
+        if uncommitted
+            || configs.len() != 1
+            || configs.first() != Some(&placed)
+            || !learners.is_empty()
+        {
+            return Some(format!(
+                "group {group}'s leader {leader} holds {configs:?} with learners {learners:?} \
+                 (uncommitted change: {uncommitted}), not its placement {placed:?}"
+            ));
+        }
+        None
     }
 
     /// I7: `node_id`, restarted while meta has no quorum, serves every
@@ -1059,10 +1407,26 @@ impl MetaCluster {
 pub(super) struct HostingChecks {
     /// The leader of each group in each term some replica led it in.
     leaders: BTreeMap<(u32, u64), u64>,
+    /// Every node some view gave a role in each group.
+    placed: BTreeMap<u32, BTreeSet<u64>>,
+    /// Each node whose role in a group the latest view took away, with
+    /// the highest term the group's replicas held when it was first seen.
+    lost: BTreeMap<(u32, u64), u64>,
+    /// The placement of each group in the latest view at the last
+    /// observation.
+    last: BTreeMap<u32, ursula_control::GroupPlacement>,
+}
+
+/// `nodes` as node ids.
+pub(super) fn node_ids(
+    nodes: impl Iterator<Item = ursula_proto::placement::NodeId>,
+) -> BTreeSet<u64> {
+    nodes.map(ursula_proto::placement::NodeId::get).collect()
 }
 
 impl HostingChecks {
-    /// I2, I3 and the hosting check, over every running placed replica.
+    /// I2, I3, I4, I8, I9 and the hosting check, over every running placed
+    /// replica and every membership entry the run's replicas showed.
     pub(super) fn observe(
         &mut self,
         cluster: &MetaCluster,
@@ -1082,6 +1446,84 @@ impl HostingChecks {
                 );
             }
         }
+        self.learn_roles(cluster);
+        self.hosted(cluster, placed, trace, after_event);
+        for group in JOURNAL_GROUPS {
+            self.entries(placed, group, trace, after_event);
+            self.reports(cluster, placed, group, trace, after_event);
+        }
+    }
+
+    /// Every role each running node's view gives, and the roles the latest
+    /// view took away or gave back.
+    fn learn_roles(&mut self, cluster: &MetaCluster) {
+        let nodes: Vec<u64> = cluster.data.nodes().collect();
+        for node_id in cluster.running() {
+            let view = cluster.view(node_id);
+            let Some(bootstrapped) = view.cluster() else {
+                continue;
+            };
+            for group in JOURNAL_GROUPS {
+                for node in &nodes {
+                    if bootstrapped
+                        .role(
+                            RaftGroupId(group),
+                            ursula_proto::placement::NodeId::new(*node),
+                        )
+                        .is_some()
+                    {
+                        self.placed.entry(group).or_default().insert(*node);
+                    }
+                }
+            }
+        }
+        let latest = cluster.latest_view();
+        let Some(bootstrapped) = latest.cluster() else {
+            return;
+        };
+        for group in JOURNAL_GROUPS {
+            let term = cluster.max_term(group);
+            for node in self.placed.get(&group).cloned().unwrap_or_default() {
+                let role = bootstrapped.role(
+                    RaftGroupId(group),
+                    ursula_proto::placement::NodeId::new(node),
+                );
+                match role {
+                    None | Some(ursula_proto::placement::ReplicaRole::Abandoned) => {
+                        self.lost.entry((group, node)).or_insert(term);
+                    }
+                    Some(
+                        ursula_proto::placement::ReplicaRole::Voter
+                        | ursula_proto::placement::ReplicaRole::Incoming
+                        | ursula_proto::placement::ReplicaRole::Outgoing,
+                    ) => {
+                        self.lost.remove(&(group, node));
+                    }
+                }
+            }
+        }
+    }
+
+    /// The hosting check, I2's leaders and I3's memberships, over every
+    /// running placed replica.
+    fn hosted(
+        &mut self,
+        cluster: &MetaCluster,
+        placed: &Placed,
+        trace: &mut SimTrace,
+        after_event: &str,
+    ) {
+        if let Some(creation) = placed.creations.unbootstrapped().first() {
+            fail(
+                trace,
+                HOSTED,
+                after_event,
+                format!(
+                    "node {} created group {} before its own view bootstrapped",
+                    creation.node_id, creation.group
+                ),
+            );
+        }
         let bootstrapped = cluster
             .running()
             .iter()
@@ -1091,7 +1533,13 @@ impl HostingChecks {
             let unplaced: Vec<u32> = groups
                 .iter()
                 .copied()
-                .filter(|group| !bootstrapped || !cluster.seeds(*group).contains(node_id))
+                .filter(|group| {
+                    !bootstrapped
+                        || !self
+                            .placed
+                            .get(group)
+                            .is_some_and(|nodes| nodes.contains(node_id))
+                })
                 .collect();
             if !unplaced.is_empty() {
                 fail(
@@ -1099,7 +1547,7 @@ impl HostingChecks {
                     HOSTED,
                     after_event,
                     format!(
-                        "node {node_id} runs groups {unplaced:?} it is no seed voter of \
+                        "node {node_id} runs groups {unplaced:?} no placement gave it a role in \
                          (bootstrapped: {bootstrapped})"
                     ),
                 );
@@ -1127,24 +1575,137 @@ impl HostingChecks {
                     }
                 }
                 let membership = metrics.membership_config.membership();
-                let configs = membership.get_joint_config();
-                if configs.is_empty() || configs.iter().all(BTreeSet::is_empty) {
-                    continue;
-                }
-                let voters: BTreeSet<u64> = membership.voter_ids().collect();
-                let learners: Vec<u64> = membership.learner_ids().collect();
-                let seeds = cluster.seeds(group);
-                if configs.len() != 1 || voters != seeds || !learners.is_empty() {
+                let named: BTreeSet<u64> = membership
+                    .get_joint_config()
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .chain(membership.learner_ids())
+                    .collect();
+                let roles = self.placed.get(&group).cloned().unwrap_or_default();
+                let strangers: Vec<u64> = named.difference(&roles).copied().collect();
+                if !strangers.is_empty() {
                     fail(
                         trace,
                         I3,
                         after_event,
                         format!(
-                            "node {node_id} holds group {group}'s membership {configs:?} with \
-                             learners {learners:?}, not its seed voters {seeds:?}"
+                            "node {node_id} holds group {group}'s membership {:?} naming nodes \
+                             {strangers:?} no placement gave a role",
+                            membership.get_joint_config()
                         ),
                     );
                 }
+            }
+        }
+    }
+
+    /// I4 and I8 over every membership entry of `group` the run's replicas
+    /// showed.
+    fn entries(&self, placed: &Placed, group: u32, trace: &mut SimTrace, after_event: &str) {
+        for ((index, term), entry) in placed.memberships.of(group) {
+            // The initial membership has no leader.
+            if term == 0 {
+                continue;
+            }
+            let rf_one_step = entry.configs.iter().all(|config| config.len() == 1);
+            if !rf_one_step
+                && !entry
+                    .configs
+                    .last()
+                    .is_some_and(|config| config.contains(&entry.leader))
+            {
+                fail(
+                    trace,
+                    I4,
+                    after_event,
+                    format!(
+                        "leader {} of term {term} appended group {group}'s membership {:?} at \
+                         index {index}, which leaves it out",
+                        entry.leader, entry.configs
+                    ),
+                );
+            }
+            let [old, new] = entry.configs.as_slice() else {
+                continue;
+            };
+            for added in new.difference(old) {
+                if let Some(lost) = self.lost.get(&(group, *added))
+                    && term > *lost
+                {
+                    fail(
+                        trace,
+                        I8,
+                        after_event,
+                        format!(
+                            "leader {} of term {term} made node {added} a voter of group \
+                             {group} ({old:?} to {new:?}, index {index}) after the placement \
+                             took its role away at term {lost}",
+                            entry.leader
+                        ),
+                    );
+                }
+            }
+        }
+    }
+
+    /// I9 over `group`'s placement in the latest view.
+    fn reports(
+        &mut self,
+        cluster: &MetaCluster,
+        placed: &Placed,
+        group: u32,
+        trace: &mut SimTrace,
+        after_event: &str,
+    ) {
+        let Some(placement) = cluster.placement(group) else {
+            return;
+        };
+        let previous = self.last.insert(group, placement.clone());
+        if let ursula_control::GroupPlacement::Live { converged_at, .. } = &placement
+            && let Some(previous @ ursula_control::GroupPlacement::Live { .. }) = &previous
+            && previous.moving().is_some()
+            && placement.moving().is_none()
+        {
+            let reported = converged_at.get().index;
+            let later: Vec<(u64, u64)> = placed
+                .memberships
+                .of(group)
+                .into_iter()
+                .filter(|((index, _), entry)| entry.committed && *index > reported)
+                .map(|(key, _)| key)
+                .collect();
+            if !later.is_empty() {
+                fail(
+                    trace,
+                    I9,
+                    after_event,
+                    format!(
+                        "group {group}'s move converged at membership index {reported}, but \
+                         memberships {later:?} (index, term) were committed before"
+                    ),
+                );
+            }
+        }
+        let retired: BTreeSet<u64> = cluster
+            .latest_view()
+            .cluster()
+            .and_then(|bootstrapped| bootstrapped.retirements().get(&RaftGroupId(group)))
+            .map(|records| node_ids(records.keys().copied()))
+            .unwrap_or_default();
+        if let Some((index, configs, _)) = cluster.latest_committed(group) {
+            let voters: BTreeSet<u64> = configs.iter().flatten().copied().collect();
+            let listed: Vec<u64> = voters.intersection(&retired).copied().collect();
+            if !listed.is_empty() {
+                fail(
+                    trace,
+                    I9,
+                    after_event,
+                    format!(
+                        "group {group}'s latest committed membership {configs:?} (index {index}) \
+                         lists retired nodes {listed:?} as voters"
+                    ),
+                );
             }
         }
     }

@@ -182,6 +182,7 @@ jobs:
             --seed-family snapshot-objects-stay-owned \
             --seed-family snapshot-objects-stay-owned-extended \
             --seed-family placement-move \
+            --seed-family placement-move-extended \
             --seed-family identity-fence
 
       # Bounded-state DST default seeds (bounded-stream-state DST invariants): producer

@@ -346,8 +346,8 @@ fn generate_snapshot_objects_stay_owned(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::SnapshotObjectsStayOwned)
 }
 
-/// The placement-move family's meta seeds: the run draws its meta faults
-/// from the seed.
+/// The placement-move family's seeds: the run draws its shape, its meta
+/// faults and its moves from the seed.
 fn generate_placement_move(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::PlacementMove)
 }
@@ -524,6 +524,13 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 1119,
         kind: "identity-fence",
         generate: generate_identity_fence,
+    },
+    SeedFamily {
+        name: "placement-move-extended",
+        start: 1120,
+        end: 1159,
+        kind: "placement-move",
+        generate: generate_placement_move,
     },
     SeedFamily {
         name: "deleted-data-after-expiry",

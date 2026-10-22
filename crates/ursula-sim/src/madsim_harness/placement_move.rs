@@ -1,14 +1,20 @@
-//! Scenario `placement-move` (design 15.2), S2's hosting: the meta group on
-//! three or five journal-backed nodes ([`MetaCluster`]), meta voters
-//! `{1,2,3}`, the other nodes meta learners, and two data groups that meta
+//! Scenario `placement-move` (design 15.2): the meta group on two to five
+//! journal-backed nodes ([`MetaCluster`]), meta voters `{1,2,3}` (`{1,2}` on
+//! two nodes), the other nodes meta learners, and two data groups that meta
 //! seeds and every node hosts by placement: each node's hosting driver opens
 //! what its journals hold and creates what a confirmed placement gives it
-//! ([`super::placed_hosting`]). S3 widens the family to moves.
+//! ([`super::placed_hosting`]), and each group's leader reconciles its
+//! membership toward the placement and reports each convergence.
 //!
-//! A family run draws from the seed the node count, the data journals'
-//! policy (`always` or `never`), whether one node first claims other
-//! genesis values, how a group's initializer restarts before its group
-//! formed, and the order of the meta faults. Each run:
+//! A family run draws from the seed the data journals' policy (`always` or
+//! `never`) and a shape: the meta faults on three or five nodes at RF 3,
+//! followed on five nodes by moves, or moves alone on three nodes at RF 2,
+//! on four nodes at RF 2 (a full replacement) or on two nodes at RF 1 with
+//! node 1 drained, whose shed exemption as its group's only voter goes and
+//! comes back as the move and its cancel change the group's placed voters.
+//! A meta run draws whether one node first claims other genesis values,
+//! how a group's initializer restarts before its group formed, and the
+//! order of the meta faults. Each meta run:
 //!
 //! - forms meta, on some seeds while the last node claims other genesis
 //!   values until it restarts with the fixed claim (design 3.5): meta forms
@@ -37,23 +43,40 @@
 //!   learns the view again (I11), and then every data group those two
 //!   stalled by a data plan through the same tool;
 //! - waits until every group's leader reported its seed voters, so every
-//!   running node's view shows every group `Live` (I3's live half);
-//! - reads every acknowledged append back from every seed voter (I1).
+//!   running node's view shows every group `Live` (I3's live half).
+//!
+//! The moves ([`super::placed_moves`]), each to nodes that hold no role in
+//! the group and no retirement of it, with keyed appends between steps:
+//! on some seeds a move of each group at the move limit 1, the second
+//! refused until the first converged, then of each group one move of one
+//! voter (two at RF 2 on four nodes), its outgoing voter the leader on some
+//! seeds, and on some seeds the leader cut off on the data plane while it
+//! moves, or the move cancelled or retargeted at a drawn time or while the
+//! leader's shell holds a drawn step at its pause point. Every group then
+//! settles live on its placement (I3), a settled five-node cluster keeps
+//! its leaderships (I14, narrowed: the balancer runs in crate `ursula`), and
+//! every voter reads every acknowledged append back (I1).
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
 //! run that decides again how its journals open. I12, I2, I3 and the
-//! hosting check are checked after each phase and at every poll of the
-//! I11, bootstrap, plan and watch waits. The negative controls
-//! ([`Controls`]) each run a script of their own with one defence off: the
-//! three meta ones over static data groups, N3 over placed ones.
+//! hosting checks (I2 to I4, I8, I9) are checked after each phase and at
+//! every poll of the waits. The negative controls ([`Controls`]) each run a
+//! script of their own with one defence off: the three meta ones over
+//! static data groups, N3 and the reconciler's N1, N5 and N9 over placed
+//! ones.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use ursula_config::WalFsync;
+use ursula_control::ControlApplied;
+use ursula_control::ControlError;
 use ursula_proto::placement::GroupCount;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::StepKind;
 use ursula_raft::JournalTuning;
+use ursula_raft::meta::handle::MetaWriteError;
 use ursula_stream::sim_controls::Defence;
 use ursula_stream::sim_controls::set_off;
 
@@ -69,7 +92,9 @@ use super::meta_checks::STEP;
 use super::meta_cluster::Hosting;
 use super::meta_cluster::MetaCluster;
 use super::meta_cluster::claim;
+use super::meta_cluster::claim_with_factor;
 use super::placed_hosting;
+use super::placed_hosting::I3;
 
 /// The most nodes a run starts, and the meta voters.
 const NODES: u64 = 5;
@@ -80,6 +105,18 @@ const WATCH: Duration = Duration::from_secs(8);
 const PLAN_POLL: Duration = Duration::from_millis(250);
 /// Mixed into the seed of a run's draws.
 const SALT: u64 = 0x6d65_7461_6d6f_7665;
+/// How long a move may take to settle: the new replica's creation from a
+/// confirmed view, its catch-up and gate, and the steps, through a
+/// partition's heal.
+const MOVE_BOUND: Duration = Duration::from_secs(40);
+/// How long a family run waits for a leader to hold a drawn step. A leader
+/// that confirmed its view earlier in its leadership never plans
+/// `ConfirmView`, and the move then ends without a hold.
+const HELD_BOUND: Duration = Duration::from_secs(10);
+/// How long a partitioned leader stays cut off.
+const CUT: Duration = Duration::from_secs(2);
+/// How long a settled cluster is watched for a leadership change (I14).
+const SETTLED: Duration = Duration::from_secs(3);
 
 /// Which run a scenario makes, and which meta defence it turns off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -100,6 +137,18 @@ pub(super) enum Controls {
     /// Placed groups form on five nodes, with the seed role read from the
     /// placement view (N3) on (`true`) or off.
     SeededFormation { defended: bool },
+    /// A leader's voter change held while the move is cancelled and the
+    /// leadership goes to another voter and back, with the step's CAS (N1)
+    /// on (`true`) or off.
+    StaleStep { defended: bool },
+    /// A leader whose meta replica lags at a move's first target, after a
+    /// retarget converged without it, with voter changes waiting for a
+    /// confirmed view (N5) on (`true`) or off.
+    LaggingLeader { defended: bool },
+    /// A leader whose report is held while it is deposed and cut off on the
+    /// data plane, and its successor, whose meta replica lags, changes the
+    /// membership, with the leadership proof (N9) on (`true`) or off.
+    DeposedReport { defended: bool },
 }
 
 /// The run's defences, reset when the run ends.
@@ -123,6 +172,18 @@ impl Switched {
             Defence::InitializeOnlySeeded,
             controls == Controls::SeededFormation { defended: false },
         );
+        set_off(
+            Defence::MembershipCas,
+            controls == Controls::StaleStep { defended: false },
+        );
+        set_off(
+            Defence::PlacementBarrier,
+            controls == Controls::LaggingLeader { defended: false },
+        );
+        set_off(
+            Defence::ConvergeLeadershipProof,
+            controls == Controls::DeposedReport { defended: false },
+        );
         Self
     }
 }
@@ -133,6 +194,9 @@ impl Drop for Switched {
         set_off(Defence::MetaOverDataHistory, false);
         set_off(Defence::MetaAlwaysSync, false);
         set_off(Defence::InitializeOnlySeeded, false);
+        set_off(Defence::MembershipCas, false);
+        set_off(Defence::PlacementBarrier, false);
+        set_off(Defence::ConvergeLeadershipProof, false);
     }
 }
 
@@ -155,6 +219,105 @@ enum MetaFault {
     QuorumLoss,
     PowerLoss,
     Plan,
+}
+
+/// The shape of a family run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    /// `nodes` nodes at RF 3: the meta faults, then on five nodes the moves.
+    Meta { nodes: u64 },
+    /// Three nodes at RF 2: each group moves one voter to the third node.
+    Rf2,
+    /// Four nodes at RF 2: one group moves both voters, the other one.
+    FullReplacement,
+    /// Two nodes at RF 1 with node 1 drained: each group moves its voter to
+    /// the other node, the first with a cancel while the step that replaces
+    /// the voter is held.
+    Rf1,
+}
+
+/// When a move is cancelled or retargeted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum At {
+    /// This long after the move was accepted.
+    After(Duration),
+    /// While the leader's shell holds a step of this kind at its pause
+    /// point, which it runs as planned once released.
+    Held(StepKind),
+}
+
+/// How a move ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    Converges,
+    /// Cancelled, back to the move's source.
+    Cancel(At),
+    /// Retargeted to another fresh node in place of the first.
+    Retarget(At),
+}
+
+/// One move of a group's voters to fresh nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MoveDraw {
+    /// Every voter moves, not one.
+    full: bool,
+    /// The leader is the voter that moves out.
+    outgoing_leader: bool,
+    /// The leader is cut off on the data plane while it moves.
+    partition: bool,
+    ending: Ending,
+}
+
+impl MoveDraw {
+    /// A plain move of one voter, not the leader.
+    const ONE: Self = Self {
+        full: false,
+        outgoing_leader: false,
+        partition: false,
+        ending: Ending::Converges,
+    };
+
+    /// A move with every option drawn, for a group with `fresh` fresh
+    /// nodes.
+    fn drawn(draws: &mut SplitMix64, fresh: usize) -> Self {
+        let partition = draws.next_bounded(4) == 0;
+        let outgoing_leader = draws.next_bounded(2) == 0;
+        let at = if partition || draws.next_bounded(2) == 0 {
+            let millis = [0, 200, 500, 1_000, 2_000];
+            let index = usize::try_from(draws.next_bounded(5)).unwrap_or(0);
+            At::After(Duration::from_millis(
+                millis.get(index).copied().unwrap_or(0),
+            ))
+        } else {
+            // An outgoing leader hands off before any voter change, so it
+            // holds only the steps it takes first.
+            let kinds: &[StepKind] = if outgoing_leader {
+                &[StepKind::AddLearners, StepKind::ConfirmView]
+            } else {
+                &[
+                    StepKind::AddLearners,
+                    StepKind::ConfirmView,
+                    StepKind::ChangeVoters,
+                    StepKind::ReportConverged,
+                ]
+            };
+            let bound = u64::try_from(kinds.len()).unwrap_or(1);
+            let index = usize::try_from(draws.next_bounded(bound)).unwrap_or(0);
+            At::Held(kinds.get(index).copied().unwrap_or(StepKind::AddLearners))
+        };
+        let ending = match draws.next_bounded(5) {
+            0 | 1 => Ending::Converges,
+            2 => Ending::Cancel(at),
+            _ if fresh >= 2 => Ending::Retarget(at),
+            _ => Ending::Cancel(at),
+        };
+        Self {
+            full: false,
+            outgoing_leader,
+            partition,
+            ending,
+        }
+    }
 }
 
 struct Run {
@@ -552,6 +715,421 @@ impl Run {
             .join("; ")
     }
 
+    /// Waits until `ready` answers `None`, checking at every step, and
+    /// fails `invariant` with its last answer after `bound`.
+    async fn until(
+        &mut self,
+        phase: &str,
+        invariant: &str,
+        bound: Duration,
+        ready: impl Fn(&MetaCluster) -> Option<String>,
+    ) {
+        let deadline = madsim::time::Instant::now() + bound;
+        loop {
+            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            let Some(why) = ready(&self.cluster) else {
+                return;
+            };
+            if madsim::time::Instant::now() >= deadline {
+                meta_checks::fail(&mut self.trace, invariant, phase, why);
+            }
+            madsim::time::sleep(STEP).await;
+        }
+    }
+
+    /// Whether `ready` holds within `bound`, checking at every step.
+    async fn within(
+        &mut self,
+        phase: &str,
+        bound: Duration,
+        ready: impl Fn(&MetaCluster) -> bool,
+    ) -> bool {
+        let deadline = madsim::time::Instant::now() + bound;
+        loop {
+            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            if ready(&self.cluster) {
+                return true;
+            }
+            if madsim::time::Instant::now() >= deadline {
+                return false;
+            }
+            madsim::time::sleep(STEP).await;
+        }
+    }
+
+    /// Asks the meta group to move `group` to `to`, through the running
+    /// nodes in turn but `avoid`, as an operator retries a write that did
+    /// not apply, until the latest view targets `to`. The refusal of a
+    /// command the meta group applied answers.
+    async fn request(
+        &mut self,
+        phase: &str,
+        group: u32,
+        to: &BTreeSet<u64>,
+        avoid: Option<u64>,
+    ) -> Result<(), ControlError> {
+        let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
+        let via: Vec<u64> = self
+            .cluster
+            .running()
+            .into_iter()
+            .filter(|node_id| Some(*node_id) != avoid)
+            .collect();
+        let mut turn = 0usize;
+        loop {
+            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            if self.cluster.target_voters(group).as_ref() == Some(to) {
+                return Ok(());
+            }
+            if madsim::time::Instant::now() >= deadline {
+                meta_checks::fail(
+                    &mut self.trace,
+                    I3,
+                    phase,
+                    format!("no move of group {group} to {to:?} applied within the bound"),
+                );
+            }
+            let node_id = via.get(turn % via.len().max(1)).copied().unwrap_or(1);
+            turn = turn.wrapping_add(1);
+            match self.cluster.submit_move(node_id, group, to).await {
+                Ok(ControlApplied::MoveAccepted { .. }) => {
+                    let to = to.clone();
+                    self.until(phase, I3, meta_checks::BOUND, move |cluster| {
+                        (cluster.target_voters(group).as_ref() != Some(&to))
+                            .then(|| format!("no view shows group {group}'s move to {to:?}"))
+                    })
+                    .await;
+                    return Ok(());
+                }
+                Ok(answer) => panic!("node {node_id}: a move of group {group} answered {answer:?}"),
+                // The view the command named its placement from was behind.
+                Err(MetaWriteError::Refused(ControlError::StalePlacement { .. })) => {}
+                Err(MetaWriteError::Refused(error)) => return Err(error),
+                // Not applied, or it may have: the view shows which.
+                Err(_unanswered) => {}
+            }
+            madsim::time::sleep(STEP).await;
+        }
+    }
+
+    /// [`Self::request`] of a move the meta group must accept.
+    async fn accepted(&mut self, phase: &str, group: u32, to: &BTreeSet<u64>, avoid: Option<u64>) {
+        if let Err(error) = self.request(phase, group, to, avoid).await {
+            panic!("the move of group {group} to {to:?} was refused: {error}");
+        }
+    }
+
+    /// Sets the move limit, as an operator retries a write that did not
+    /// apply.
+    async fn set_limit(&mut self, limit: u32) {
+        let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
+        for node_id in self.cluster.running().into_iter().cycle() {
+            match self.cluster.submit_limit(node_id, limit).await {
+                Ok(ControlApplied::MoveLimitSet { .. }) => return,
+                Ok(answer) => panic!("node {node_id}: SetMoveLimit answered {answer:?}"),
+                Err(_not_now) if madsim::time::Instant::now() < deadline => {
+                    madsim::time::sleep(STEP).await;
+                }
+                Err(error) => panic!("the move limit {limit} was not set: {error}"),
+            }
+        }
+    }
+
+    /// I3 for one group: it settles live on `voters` within the move bound.
+    async fn settled(&mut self, phase: &str, group: u32, voters: &BTreeSet<u64>) {
+        let voters = voters.clone();
+        self.until(phase, I3, MOVE_BOUND, move |cluster| {
+            cluster.not_settled(group).or_else(|| {
+                let placed = cluster.placed_voters(group);
+                (placed != voters)
+                    .then(|| format!("group {group} settled on {placed:?}, not on {voters:?}"))
+            })
+        })
+        .await;
+    }
+
+    /// The running leader of `group`, once it has one.
+    async fn leader(&mut self, phase: &str, group: u32) -> u64 {
+        self.until(phase, I3, meta_checks::BOUND, move |cluster| {
+            cluster
+                .leader_of(group)
+                .is_none()
+                .then(|| format!("group {group} has no running leader"))
+        })
+        .await;
+        self.cluster.leader_of(group).unwrap_or(0)
+    }
+
+    /// Hands `group`'s leadership from `from` to `to` through OpenRaft, and
+    /// waits until `to` leads.
+    async fn transfer(&mut self, phase: &str, group: u32, from: u64, to: u64) {
+        let deadline = madsim::time::Instant::now() + meta_checks::BOUND;
+        while self.cluster.leader_of(group) != Some(to) {
+            if madsim::time::Instant::now() >= deadline {
+                panic!("group {group}'s leadership did not move from {from} to {to}");
+            }
+            self.cluster.trigger_transfer(group, from, to).await;
+            let moved = self
+                .within(phase, Duration::from_secs(2), move |cluster| {
+                    cluster.leader_of(group) == Some(to)
+                })
+                .await;
+            if moved {
+                return;
+            }
+        }
+    }
+
+    /// The nodes of the run that hold neither a role in `group` nor a
+    /// retirement of it, in id order.
+    fn fresh(&self, group: u32) -> Vec<u64> {
+        let view = self.cluster.latest_view();
+        let Some(bootstrapped) = view.cluster() else {
+            return Vec::new();
+        };
+        self.nodes()
+            .into_iter()
+            .filter(|node_id| {
+                let node = NodeId::new(*node_id);
+                let group = ursula_shard::RaftGroupId(group);
+                bootstrapped.role(group, node).is_none()
+                    && bootstrapped.retirement(group, node).is_none()
+            })
+            .collect()
+    }
+
+    /// One move of `group` as `draw` has it, to fresh nodes, with keyed
+    /// appends before and after, that settles live on its last target.
+    async fn move_group(&mut self, group: u32, draw: MoveDraw) {
+        const PHASE: &str = "move";
+        let from = self.cluster.placed_voters(group);
+        let fresh = self.fresh(group);
+        let leader = self.leader(PHASE, group).await;
+        let mut to: BTreeSet<u64> = if draw.full {
+            fresh.iter().copied().take(from.len()).collect()
+        } else {
+            let out = if draw.outgoing_leader {
+                Some(leader)
+            } else {
+                from.iter()
+                    .copied()
+                    .filter(|node_id| *node_id != leader)
+                    .max()
+            };
+            let mut to = from.clone();
+            if let (Some(out), Some(fresh)) = (out, fresh.first()) {
+                to.remove(&out);
+                to.insert(*fresh);
+            }
+            to
+        };
+        if to.len() != from.len() || to == from {
+            return;
+        }
+        let held = match draw.ending {
+            Ending::Cancel(At::Held(step)) | Ending::Retarget(At::Held(step)) => Some(step),
+            Ending::Converges | Ending::Cancel(At::After(_)) | Ending::Retarget(At::After(_)) => {
+                None
+            }
+        };
+        if let Some(step) = held {
+            self.cluster.hold(leader, group, step);
+        }
+        self.trace.push(SimEvent::FaultApplied {
+            phase: format!("move group {group} from {from:?} to {to:?}: {draw:?}"),
+        });
+        self.accepted(PHASE, group, &to, None).await;
+        self.append_data(PHASE).await;
+        if draw.partition {
+            self.cluster.cut_data(leader);
+            self.watch(PHASE, CUT).await;
+            self.cluster.heal_data(leader);
+            self.step("leader_healed");
+        }
+        let at = match draw.ending {
+            Ending::Converges => None,
+            Ending::Cancel(at) | Ending::Retarget(at) => Some(at),
+        };
+        if let Some(at) = at {
+            match at {
+                At::After(wait) => self.watch(PHASE, wait).await,
+                At::Held(step) => {
+                    // A step the leader never plans is never held: the move
+                    // ends when the bound has passed.
+                    self.within(PHASE, HELD_BOUND, move |cluster| {
+                        cluster.stepping(leader, group, step)
+                    })
+                    .await;
+                }
+            }
+            let next = match draw.ending {
+                Ending::Retarget(_) => {
+                    let first = fresh.first().copied();
+                    match fresh.get(1).copied() {
+                        Some(other) => {
+                            let mut next = to.clone();
+                            if let Some(first) = first {
+                                next.remove(&first);
+                            }
+                            next.insert(other);
+                            next
+                        }
+                        None => from.clone(),
+                    }
+                }
+                Ending::Converges | Ending::Cancel(_) => from.clone(),
+            };
+            match self.request(PHASE, group, &next, None).await {
+                Ok(()) => to = next,
+                // The move converged before its end came, and a move back
+                // to a retired voter is refused.
+                Err(_refused) if self.cluster.moving(group).is_none() => {}
+                Err(error) => panic!("the end of group {group}'s move was refused: {error}"),
+            }
+        }
+        if let Some(step) = held {
+            self.cluster.release(leader, group, step);
+        }
+        self.settled(PHASE, group, &to).await;
+        self.append_data(PHASE).await;
+    }
+
+    /// Both groups move at the move limit 1: the second move is refused
+    /// until the first converged.
+    async fn limit_one(&mut self) {
+        const PHASE: &str = "limit_one";
+        self.set_limit(1).await;
+        let mut moves = Vec::new();
+        for group in JOURNAL_GROUPS {
+            let from = self.cluster.placed_voters(group);
+            let leader = self.leader(PHASE, group).await;
+            let (Some(out), Some(fresh)) = (
+                from.iter()
+                    .copied()
+                    .filter(|node_id| *node_id != leader)
+                    .max(),
+                self.fresh(group).first().copied(),
+            ) else {
+                continue;
+            };
+            let mut to = from;
+            to.remove(&out);
+            to.insert(fresh);
+            moves.push((group, to));
+        }
+        if let [(first, first_to), (second, second_to)] = moves.as_slice() {
+            self.accepted(PHASE, *first, first_to, None).await;
+            match self.request(PHASE, *second, second_to, None).await {
+                Err(ControlError::MoveLimit { .. }) => {}
+                answer => panic!("a second move at the move limit 1 answered {answer:?}"),
+            }
+            self.settled(PHASE, *first, first_to).await;
+            self.append_data(PHASE).await;
+            self.accepted(PHASE, *second, second_to, None).await;
+            self.settled(PHASE, *second, second_to).await;
+            self.append_data(PHASE).await;
+        }
+        self.set_limit(2).await;
+    }
+
+    /// The moves of `shape`, drawn.
+    async fn moves(&mut self, shape: Shape, draws: &mut SplitMix64) {
+        match shape {
+            Shape::Meta { nodes } if nodes < NODES => return,
+            Shape::Meta { .. } => {
+                if draws.next_bounded(2) == 0 {
+                    self.limit_one().await;
+                }
+                for group in JOURNAL_GROUPS {
+                    let fresh = self.fresh(group).len();
+                    if fresh > 0 {
+                        let draw = MoveDraw::drawn(draws, fresh);
+                        self.move_group(group, draw).await;
+                    }
+                }
+            }
+            Shape::Rf2 => {
+                for group in JOURNAL_GROUPS {
+                    let mut draw = MoveDraw::drawn(draws, 1);
+                    if draws.next_bounded(3) != 0 {
+                        draw.partition = false;
+                    }
+                    self.move_group(group, draw).await;
+                }
+            }
+            Shape::FullReplacement => {
+                let full = MoveDraw {
+                    full: true,
+                    ..MoveDraw::ONE
+                };
+                self.move_group(0, full).await;
+                let draw = MoveDraw::drawn(draws, 1);
+                self.move_group(1, draw).await;
+            }
+            Shape::Rf1 => {
+                self.cluster.drain(1);
+                self.step("node_drained");
+                let cancelled = MoveDraw {
+                    full: true,
+                    ending: Ending::Cancel(At::Held(StepKind::ChangeVoters)),
+                    ..MoveDraw::ONE
+                };
+                self.move_group(0, cancelled).await;
+                let moved = MoveDraw {
+                    full: true,
+                    ..MoveDraw::ONE
+                };
+                self.move_group(1, moved).await;
+            }
+        }
+    }
+
+    /// I14, narrowed: a settled cluster, every group live on its placement
+    /// with no fault, keeps every leadership where it is.
+    async fn leaderships_stay(&mut self, phase: &str) {
+        let leaders = |cluster: &MetaCluster| -> Vec<(u32, Option<(u64, u64)>)> {
+            JOURNAL_GROUPS
+                .iter()
+                .map(|group| {
+                    let leader = cluster.leader_of(*group).and_then(|leader| {
+                        let raft = cluster.hosted_raft(leader, *group)?;
+                        let term = openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
+                            .current_term;
+                        Some((leader, term))
+                    });
+                    (*group, leader)
+                })
+                .collect()
+        };
+        let before = leaders(&self.cluster);
+        self.watch(phase, SETTLED).await;
+        let after = leaders(&self.cluster);
+        if before != after {
+            meta_checks::fail(
+                &mut self.trace,
+                placed_hosting::I14,
+                phase,
+                format!("a settled cluster's leaderships moved from {before:?} to {after:?}"),
+            );
+        }
+    }
+
+    /// The end of every placed run: every group settles live on its
+    /// placement (I3), and every voter reads every acknowledged append
+    /// (I1).
+    async fn settle_and_read(&mut self) {
+        self.cluster
+            .groups_live(&mut self.trace, "groups_live")
+            .await;
+        self.step("groups_live");
+        for group in JOURNAL_GROUPS {
+            self.cluster
+                .placed_reads(&mut self.trace, "final_reads", group)
+                .await;
+        }
+        self.step("final_reads");
+    }
+
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
         self.trace.push(SimEvent::PlacementMoveMetaHeld {
             genesis: self.checks.genesis().unwrap_or(0),
@@ -579,12 +1157,28 @@ pub(super) async fn run_placement_move_inner(
         Controls::MetaDiscardedOverData { .. } => meta_discarded_over_data(seed).await,
         Controls::PowerLossUnderNever { .. } => power_loss_under_never(seed).await,
         Controls::SeededFormation { .. } => seeded_formation(seed).await,
+        Controls::StaleStep { .. } => stale_step(seed).await,
+        Controls::LaggingLeader { .. } => lagging_leader(seed).await,
+        Controls::DeposedReport { .. } => deposed_report(seed).await,
     }
 }
 
 fn claims(nodes: u64) -> BTreeMap<u64, ursula_proto::placement::GenesisClaim> {
+    claims_with_factor(nodes, 3)
+}
+
+/// The claims of `nodes` nodes at replication factor `factor`, the meta
+/// voters the smallest `min(3, nodes)` ids.
+fn claims_with_factor(
+    nodes: u64,
+    factor: u8,
+) -> BTreeMap<u64, ursula_proto::placement::GenesisClaim> {
+    let voters: Vec<u64> = META_VOTERS
+        .into_iter()
+        .filter(|node_id| *node_id <= nodes)
+        .collect();
     (1..=nodes)
-        .map(|node_id| (node_id, claim(nodes, &META_VOTERS)))
+        .map(|node_id| (node_id, claim_with_factor(nodes, &voters, factor)))
         .collect()
 }
 
@@ -595,7 +1189,28 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
     } else {
         WalFsync::Never
     };
-    let nodes = if draws.next_bounded(3) == 0 { 3 } else { NODES };
+    let shape = match draws.next_bounded(6) {
+        0 => Shape::Meta { nodes: 3 },
+        1 | 2 => Shape::Meta { nodes: NODES },
+        3 => Shape::Rf2,
+        4 => Shape::FullReplacement,
+        _ => Shape::Rf1,
+    };
+    match shape {
+        Shape::Meta { nodes } => meta_family(seed, &mut draws, fsync, nodes).await,
+        Shape::Rf2 => moves_family(seed, &mut draws, fsync, shape, 3, 2).await,
+        Shape::FullReplacement => moves_family(seed, &mut draws, fsync, shape, 4, 2).await,
+        Shape::Rf1 => moves_family(seed, &mut draws, fsync, shape, 2, 1).await,
+    }
+}
+
+/// The meta faults on `nodes` nodes at RF 3, then on five nodes the moves.
+async fn meta_family(
+    seed: u64,
+    draws: &mut SplitMix64,
+    fsync: WalFsync,
+    nodes: u64,
+) -> ThreeNodeRaftSimOutcome {
     let mismatch = draws.next_bounded(3) == 0;
     let restart = match draws.next_bounded(4) {
         0 => None,
@@ -641,12 +1256,34 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
     }
     run.cluster.groups_live(&mut run.trace, "groups_live").await;
     run.step("groups_live");
-    for group in JOURNAL_GROUPS {
-        run.cluster
-            .placed_reads(&mut run.trace, "final_reads", group)
-            .await;
+    let shape = Shape::Meta { nodes };
+    run.moves(shape, draws).await;
+    run.settle_and_read().await;
+    if nodes == NODES {
+        run.leaderships_stay("settled").await;
     }
-    run.step("final_reads");
+    run.finish()
+}
+
+/// The moves of `shape` alone, on `nodes` nodes at RF `factor`.
+async fn moves_family(
+    seed: u64,
+    draws: &mut SplitMix64,
+    fsync: WalFsync,
+    shape: Shape,
+    nodes: u64,
+    factor: u8,
+) -> ThreeNodeRaftSimOutcome {
+    let claims = claims_with_factor(nodes, factor);
+    let mut run = Run::start(seed, nodes, fsync, claims, Hosting::Placed).await;
+    run.formed("formed").await;
+    run.learned("formed").await;
+    run.bootstrapped("formed").await;
+    run.append_data("formed").await;
+    run.cluster.groups_live(&mut run.trace, "groups_live").await;
+    run.step("groups_live");
+    run.moves(shape, draws).await;
+    run.settle_and_read().await;
     run.finish()
 }
 
@@ -665,6 +1302,225 @@ async fn seeded_formation(seed: u64) -> ThreeNodeRaftSimOutcome {
     .await;
     run.formed("seeded_formation").await;
     run.append_data("seeded_formation").await;
+    run.finish()
+}
+
+/// Five placed nodes at RF 3 under `always`, live on their seeds, and
+/// group 0's roles: its leader, its other two voters and the two nodes
+/// outside it, each pair in id order.
+async fn placed_five(seed: u64) -> (Run, Roles) {
+    let mut run = Run::start(
+        seed,
+        NODES,
+        WalFsync::Always,
+        claims(NODES),
+        Hosting::Placed,
+    )
+    .await;
+    run.formed("formed").await;
+    run.learned("formed").await;
+    run.bootstrapped("formed").await;
+    run.append_data("formed").await;
+    run.cluster.groups_live(&mut run.trace, "groups_live").await;
+    run.step("groups_live");
+    let leader = run.leader("groups_live", 0).await;
+    let voters = run.cluster.placed_voters(0);
+    let others: Vec<u64> = voters
+        .iter()
+        .copied()
+        .filter(|node_id| *node_id != leader)
+        .collect();
+    let spares = run.fresh(0);
+    let roles = Roles {
+        leader,
+        voters,
+        others: [others[0], others[1]],
+        spares: [spares[0], spares[1]],
+    };
+    (run, roles)
+}
+
+/// Group 0's roles in a control's script.
+struct Roles {
+    leader: u64,
+    voters: BTreeSet<u64>,
+    /// The voters other than the leader.
+    others: [u64; 2],
+    /// The nodes outside the group.
+    spares: [u64; 2],
+}
+
+impl Roles {
+    /// The voters with `out` replaced by `into`.
+    fn with(&self, out: u64, into: u64) -> BTreeSet<u64> {
+        let mut voters = self.voters.clone();
+        voters.remove(&out);
+        voters.insert(into);
+        voters
+    }
+}
+
+/// `negative_control_membership_cas` (N1): group 0's leader A holds its
+/// voter change toward a move's target, and the move is cancelled. The
+/// leadership goes to B, which holds its removal of the cancelled learner,
+/// and back to A in a later term. A's held change then runs: its CAS on
+/// the leadership it was planned under refuses it. With the defence off it
+/// makes the abandoned learner a voter (I8).
+async fn stale_step(seed: u64) -> ThreeNodeRaftSimOutcome {
+    const PHASE: &str = "stale_step";
+    const GROUP: u32 = 0;
+    let (mut run, roles) = placed_five(seed).await;
+    let [b, c] = roles.others;
+    let [z, _] = roles.spares;
+    let a = roles.leader;
+    run.cluster.hold(a, GROUP, StepKind::ChangeVoters);
+    run.accepted(PHASE, GROUP, &roles.with(c, z), None).await;
+    assert!(
+        run.within(PHASE, MOVE_BOUND, move |cluster| cluster.stepping(
+            a,
+            GROUP,
+            StepKind::ChangeVoters
+        ))
+        .await,
+        "node {a} never held its voter change"
+    );
+    run.accepted(PHASE, GROUP, &roles.voters, None).await;
+    let voters = roles.voters.clone();
+    run.until(PHASE, I3, meta_checks::BOUND, move |cluster| {
+        (!cluster.every_view_targets(GROUP, &voters)).then(|| "a view misses the cancel".to_owned())
+    })
+    .await;
+    run.cluster.hold(b, GROUP, StepKind::RemoveLearners);
+    run.transfer(PHASE, GROUP, a, b).await;
+    assert!(
+        run.within(PHASE, MOVE_BOUND, move |cluster| cluster.stepping(
+            b,
+            GROUP,
+            StepKind::RemoveLearners
+        ))
+        .await,
+        "node {b} never held its learner removal"
+    );
+    run.transfer(PHASE, GROUP, b, a).await;
+    run.cluster.release(a, GROUP, StepKind::ChangeVoters);
+    run.watch(PHASE, CUT).await;
+    run.cluster.release(b, GROUP, StepKind::RemoveLearners);
+    run.settled(PHASE, GROUP, &roles.voters).await;
+    run.settle_and_read().await;
+    run.finish()
+}
+
+/// `negative_control_placement_barrier` (N5): group 0 moves toward a first
+/// target, and its voter B's meta replica is cut off once B's view shows
+/// it. The move is retargeted, and the leader converges without the first
+/// target's node z, which the report retires. The leadership goes to B,
+/// whose view still shows the first target: B adds z back as a learner,
+/// and its voter change waits for a confirmation it cannot get. With the
+/// defence off B promotes z (I8).
+async fn lagging_leader(seed: u64) -> ThreeNodeRaftSimOutcome {
+    const PHASE: &str = "lagging_leader";
+    const GROUP: u32 = 0;
+    let (mut run, roles) = placed_five(seed).await;
+    let [b, c] = roles.others;
+    let [z, w] = roles.spares;
+    let a = roles.leader;
+    let first = roles.with(c, z);
+    let second = roles.with(c, w);
+    run.cluster.hold(a, GROUP, StepKind::ConfirmView);
+    run.accepted(PHASE, GROUP, &first, None).await;
+    let targets = first.clone();
+    assert!(
+        run.within(PHASE, MOVE_BOUND, move |cluster| {
+            cluster.stepping(a, GROUP, StepKind::ConfirmView)
+                && cluster.every_view_targets(GROUP, &targets)
+        })
+        .await,
+        "node {a} never held its confirmation"
+    );
+    run.cluster.cut_meta(b);
+    run.accepted(PHASE, GROUP, &second, Some(b)).await;
+    run.cluster.release(a, GROUP, StepKind::ConfirmView);
+    let retired = second.clone();
+    run.until(PHASE, I3, MOVE_BOUND, move |cluster| {
+        let view = cluster.latest_view();
+        let converged = view.cluster().is_some_and(|bootstrapped| {
+            bootstrapped
+                .retirement(ursula_shard::RaftGroupId(GROUP), NodeId::new(z))
+                .is_some()
+        });
+        (!converged || cluster.placed_voters(GROUP) != retired)
+            .then(|| format!("group {GROUP} has not converged on {retired:?}"))
+    })
+    .await;
+    run.transfer(PHASE, GROUP, a, b).await;
+    run.watch(PHASE, Duration::from_secs(5)).await;
+    run.cluster.heal_meta(b);
+    run.settled(PHASE, GROUP, &second).await;
+    run.settle_and_read().await;
+    run.finish()
+}
+
+/// `negative_control_converge_leadership_proof` (N9): group 0 moves toward a
+/// first target, and its voter B's meta replica is cut off once B's view
+/// shows it. The move is retargeted, and the leader A reaches the new
+/// target and holds its report. The leadership goes to B and A is cut off
+/// on the data plane. B, whose view still shows the first target, adds the
+/// first target's node as a learner. A's report then runs: its leadership
+/// proof fails. With the defence off A reports the membership B changed
+/// (I9).
+async fn deposed_report(seed: u64) -> ThreeNodeRaftSimOutcome {
+    const PHASE: &str = "deposed_report";
+    const GROUP: u32 = 0;
+    let (mut run, roles) = placed_five(seed).await;
+    let [b, c] = roles.others;
+    let [x, y] = roles.spares;
+    let a = roles.leader;
+    let first = roles.with(c, y);
+    let second = roles.with(c, x);
+    run.cluster.hold(a, GROUP, StepKind::ConfirmView);
+    run.accepted(PHASE, GROUP, &first, None).await;
+    let targets = first.clone();
+    assert!(
+        run.within(PHASE, MOVE_BOUND, move |cluster| {
+            cluster.stepping(a, GROUP, StepKind::ConfirmView)
+                && cluster.every_view_targets(GROUP, &targets)
+        })
+        .await,
+        "node {a} never held its confirmation"
+    );
+    run.cluster.cut_meta(b);
+    run.cluster.hold(a, GROUP, StepKind::ReportConverged);
+    run.accepted(PHASE, GROUP, &second, Some(b)).await;
+    run.cluster.release(a, GROUP, StepKind::ConfirmView);
+    assert!(
+        run.within(PHASE, MOVE_BOUND, move |cluster| {
+            cluster.stepping(a, GROUP, StepKind::ReportConverged)
+        })
+        .await,
+        "node {a} never held its report"
+    );
+    run.transfer(PHASE, GROUP, a, b).await;
+    run.cluster.cut_data(a);
+    run.step(PHASE);
+    assert!(
+        run.within(PHASE, MOVE_BOUND, move |cluster| {
+            cluster.hosted_raft(b, GROUP).is_some_and(|raft| {
+                openraft::rt::WatchReceiver::borrow_watched(&raft.metrics())
+                    .committed_membership_config
+                    .membership()
+                    .learner_ids()
+                    .any(|learner| learner == y)
+            })
+        })
+        .await,
+        "node {b} never added node {y} back as a learner"
+    );
+    run.cluster.release(a, GROUP, StepKind::ReportConverged);
+    run.watch(PHASE, Duration::from_secs(3)).await;
+    run.cluster.heal_meta(b);
+    run.cluster.heal_data(a);
+    run.settled(PHASE, GROUP, &second).await;
+    run.settle_and_read().await;
     run.finish()
 }
 
@@ -749,6 +1605,8 @@ mod tests {
     use crate::madsim_harness::meta_checks::I10;
     use crate::madsim_harness::meta_checks::I12;
     use crate::madsim_harness::placed_hosting::I2;
+    use crate::madsim_harness::placed_hosting::I8;
+    use crate::madsim_harness::placed_hosting::I9;
     use crate::madsim_harness::tests::sim_test_guard;
 
     const SCENARIO: SimScenario = SimScenario::PlacementMove;
@@ -859,6 +1717,54 @@ mod tests {
             "seeded_formation",
         );
         assert!(message.contains("initialized more than once"), "{message}");
+    }
+
+    /// A voter change planned in an earlier leadership runs after the move
+    /// was cancelled when its step goes without its CAS.
+    #[test]
+    fn negative_control_membership_cas() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::StaleStep { defended: true },
+            Controls::StaleStep { defended: false },
+            I8,
+            "stale_step",
+        );
+        assert!(
+            message.contains("after the placement took its role away"),
+            "{message}"
+        );
+    }
+
+    /// A leader whose meta replica lags promotes a node the placement
+    /// retired when a voter change needs no confirmed view.
+    #[test]
+    fn negative_control_placement_barrier() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::LaggingLeader { defended: true },
+            Controls::LaggingLeader { defended: false },
+            I8,
+            "lagging_leader",
+        );
+        assert!(
+            message.contains("after the placement took its role away"),
+            "{message}"
+        );
+    }
+
+    /// A deposed leader reports a membership its successor changed when a
+    /// report goes without the leadership proof.
+    #[test]
+    fn negative_control_converge_leadership_proof() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::DeposedReport { defended: true },
+            Controls::DeposedReport { defended: false },
+            I9,
+            "deposed_report",
+        );
+        assert!(message.contains("were committed before"), "{message}");
     }
 
     /// A meta journal under the data policy `never` loses acknowledged

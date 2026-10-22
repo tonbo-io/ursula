@@ -26,6 +26,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use ursula_proto::admin::RecoveryGateStatus;
 use ursula_proto::placement::LearnerLag;
 use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::MembershipLogId;
@@ -57,6 +58,22 @@ pub enum PeerGate {
     Closed,
     /// No answer arrived.
     Unknown,
+}
+
+impl PeerGate {
+    /// The gate a learner's recovery gate status answers: open only when
+    /// the replica votes and campaigns, closed in every gated state.
+    pub fn of_status(status: RecoveryGateStatus) -> Self {
+        match status {
+            RecoveryGateStatus::Open => Self::Open,
+            RecoveryGateStatus::AwaitingBarrier
+            | RecoveryGateStatus::Stalled
+            | RecoveryGateStatus::CatchingUp
+            | RecoveryGateStatus::Planned
+            | RecoveryGateStatus::LeadsPlan
+            | RecoveryGateStatus::Cutting => Self::Closed,
+        }
+    }
 }
 
 /// One OpenRaft membership config: the voters of one or two configs, and
