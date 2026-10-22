@@ -3,7 +3,8 @@
 //!
 //! A node writes its snapshot objects under its own directory of the store,
 //! `{prefix}/node-{node}/group-{gid}/`, each under a name no object had
-//! before, and only that node deletes them. A follower that installs a
+//! before, and only that node deletes them, but for the removed-node sweep
+//! below. A follower that installs a
 //! peer's snapshot writes its own copy and commits the copy. So whatever a
 //! node may still use of an object is the node's own business, and it is
 //! held here, in memory, never in the store:
@@ -34,6 +35,15 @@
 //! a key out, for a later pass, or lists a deleted one again, whose second
 //! DELETE does nothing. No step reads a clock or a modification time.
 //!
+//! The one exception to owner-only deletion is the meta leader's sweep of
+//! a removed node's objects (design 8.3, `meta::sweep`), which
+//! [`sweep_removed_group`] runs in the same order: it lists the removed
+//! node's objects of a group, then waits for the group's answer, then
+//! deletes exactly the listed objects when a live leader answered that the
+//! node is no member. That answer is its holds: a removed node never
+//! regains a role, so no replica of it uses those objects again, and an
+//! object written after the listing is not in it.
+//!
 //! A pass is owed at once when a key leaves the holds, and after the
 //! restore. A write that failed may still land, so it owes a second pass
 //! one `raft.install_snapshot_timeout` later, and so does the restore, for
@@ -42,12 +52,15 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::Weak;
 use std::time::Duration;
 
+use ursula_proto::placement::MembershipAnswer;
+use ursula_proto::placement::NodeId;
 use ursula_runtime::KeyHold;
 use ursula_runtime::KeyHolds;
 use ursula_runtime::OwnedLocation;
@@ -226,7 +239,7 @@ impl SnapshotPass {
 /// off by [`gc_retry_delay`].
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SnapshotGcError {
-    /// Listing the node's directory for the group failed.
+    /// Listing a node's directory for the group failed.
     #[error("list the group's own snapshot objects")]
     List(#[source] SnapshotStoreError),
     /// Deleting an object nothing held failed.
@@ -669,6 +682,59 @@ pub(crate) async fn collect_unowned(
     delete_unheld(store, group, BTreeSet::new).await
 }
 
+/// How the sweep of a removed node's objects of one group ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GroupSweep {
+    /// The node's directory for the group held no object of it.
+    Empty,
+    /// The group's live leader answered that the node is no member, and
+    /// every listed object is deleted.
+    Swept { deleted: u64 },
+    /// No live leader answered, `None`, or the answer still counts the node:
+    /// nothing is deleted.
+    Kept { answer: Option<MembershipAnswer> },
+}
+
+/// Lists `removed`'s objects of `group`, then awaits `answer`, the group's
+/// live leader's answer about `removed`, then deletes exactly the listed
+/// objects if it is `NotMember` (see the module docs).
+pub(crate) async fn sweep_removed_group(
+    store: &SharedSnapshotStore,
+    removed: NodeId,
+    group: RaftGroupId,
+    answer: impl Future<Output = Option<MembershipAnswer>>,
+) -> Result<GroupSweep, SnapshotGcError> {
+    let listing = store
+        .list_node_group(removed.get(), group)
+        .await
+        .map_err(SnapshotGcError::List)?;
+    if !listing.foreign.is_empty() {
+        tracing::warn!(
+            raft_group_id = group.0,
+            node = removed.get(),
+            files = ?listing.foreign,
+            "the removed-node sweep leaves files in the node's snapshot directory that are not its objects"
+        );
+    }
+    if listing.objects.is_empty() {
+        return Ok(GroupSweep::Empty);
+    }
+    // Awaited after the LIST returned: the answer covers every listed object.
+    let answer = answer.await;
+    if answer != Some(MembershipAnswer::NotMember) {
+        return Ok(GroupSweep::Kept { answer });
+    }
+    let mut deleted = 0_u64;
+    for object in listing.objects {
+        store
+            .delete_node_object(object)
+            .await
+            .map_err(SnapshotGcError::Delete)?;
+        deleted = deleted.saturating_add(1);
+    }
+    Ok(GroupSweep::Swept { deleted })
+}
+
 /// Lists the node's directory for `group`, then reads `held`, then deletes
 /// every listed object `held` leaves out: one GC pass. The number it
 /// deleted.
@@ -1076,6 +1142,84 @@ mod tests {
             ));
             assert_eq!(fenced.download(&late).await.unwrap(), b"e");
         }
+    }
+
+    /// The removed-node sweep of node 10's group, from node 1's store on
+    /// both backends: an answer that still counts node 10, or none,
+    /// deletes nothing, and `NotMember` deletes exactly what the LIST
+    /// showed. An object node 10 writes while the group answers is not in
+    /// the listing and stays, as do node 10's objects of another group and
+    /// node 1's own. Through a fenced store it deletes nothing. A sweep
+    /// that asked before it listed, or deleted on `Voter` or `Learner`,
+    /// fails it.
+    #[tokio::test]
+    async fn the_sweep_deletes_exactly_what_it_listed_once_the_group_answers_not_member() {
+        use ursula_proto::placement::MembershipAnswer;
+        use ursula_proto::placement::NodeId;
+        use ursula_runtime::FencedSnapshotStore;
+        use ursula_runtime::NodeFence;
+        use ursula_runtime::snapshot_harness::MemorySnapshotBucket;
+        use ursula_runtime::snapshot_harness::SnapshotStoreFaults;
+        use ursula_runtime::snapshot_harness::check_no_foreign_delete;
+
+        use super::GroupSweep;
+        use super::sweep_removed_group;
+
+        const REMOVED: NodeId = NodeId::new(10);
+        let prefix = SnapshotPrefix::try_from("snapshots").unwrap();
+        let bucket = MemorySnapshotBucket::new(5, prefix, SnapshotStoreFaults::none());
+        let s3 = S3SnapshotStore::memory_for_tests("snapshots", 1).unwrap();
+        let backends: [(SharedSnapshotStore, SharedSnapshotStore); 2] = [
+            (Arc::new(s3.sibling_for_tests(10)), Arc::new(s3)),
+            (Arc::new(bucket.store(10)), Arc::new(bucket.store(1))),
+        ];
+        for (ten, one) in backends {
+            let listed = [write(&ten, 1, b"a").await, write(&ten, 2, b"b").await];
+            let other_group = write_to(&ten, RaftGroupId(8), 3, b"c").await;
+            let own = write(&one, 4, b"d").await;
+            for answer in [
+                Some(MembershipAnswer::Voter),
+                Some(MembershipAnswer::Learner),
+                None,
+            ] {
+                assert_eq!(
+                    sweep_removed_group(&one, REMOVED, GROUP, async { answer })
+                        .await
+                        .unwrap(),
+                    GroupSweep::Kept { answer }
+                );
+            }
+            for kept in &listed {
+                assert_eq!(ten.download(kept).await.unwrap().len(), 1);
+            }
+
+            let fence = NodeFence::unleased();
+            fence.close();
+            let fenced = FencedSnapshotStore::wrap(one.clone(), fence);
+            assert!(matches!(
+                sweep_removed_group(&fenced, REMOVED, GROUP, async {
+                    Some(MembershipAnswer::NotMember)
+                })
+                .await,
+                Err(SnapshotGcError::Delete(_))
+            ));
+
+            let late = std::sync::OnceLock::new();
+            let swept = sweep_removed_group(&one, REMOVED, GROUP, async {
+                late.set(write(&ten, 5, b"e").await).unwrap();
+                Some(MembershipAnswer::NotMember)
+            })
+            .await
+            .unwrap();
+            assert_eq!(swept, GroupSweep::Swept { deleted: 2 });
+            for deleted in &listed {
+                assert!(gone(ten.download(deleted).await));
+            }
+            assert_eq!(ten.download(late.get().unwrap()).await.unwrap(), b"e");
+            assert_eq!(ten.download(&other_group).await.unwrap(), b"c");
+            assert_eq!(one.download(&own).await.unwrap(), b"d");
+        }
+        assert_eq!(check_no_foreign_delete(&bucket.view()), Ok(()));
     }
 
     /// The holds of one group write no object of another group: the check

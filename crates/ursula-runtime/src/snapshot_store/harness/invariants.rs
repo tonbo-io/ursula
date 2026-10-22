@@ -10,7 +10,8 @@
 //! - I1 ([`check_named_keys_exist`]): every key a node's metadata names
 //!   exists.
 //! - I2 ([`check_no_foreign_delete`]): no node deletes outside its own
-//!   directory.
+//!   directory, but the removed-node sweep, which deletes only keys of the
+//!   other node it sweeps.
 //! - I3 ([`check_committed_reads_found`]): no restore, no committed
 //!   install and no read inside a send's RPC sees `NotFound`.
 //! - I4 ([`check_superseded_without_marker`]): past the bound, no object
@@ -53,6 +54,18 @@ pub struct ViewObject {
 pub struct StoreDelete {
     pub node_id: u64,
     pub path: String,
+    pub kind: DeleteKind,
+}
+
+/// Which store call sent a DELETE.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteKind {
+    /// A delete of an object the deleting node owns, or any delete outside
+    /// the store's methods.
+    Own,
+    /// The removed-node sweep's delete of an object of node `of`
+    /// (`SnapshotStore::delete_node_object`).
+    Swept { of: u64 },
 }
 
 /// What one node names: the object keys its durable snapshot metadata
@@ -148,7 +161,7 @@ pub struct CommittedRead {
 pub enum SnapshotInvariantViolation {
     #[error("I1: node {node_id} names {path}, which the store does not hold")]
     NamedKeyMissing { node_id: u64, path: String },
-    #[error("I2: node {node_id} deleted {path}, outside its own directory")]
+    #[error("I2: node {node_id} deleted {path}, outside its own directory and no sweep's key")]
     ForeignDelete { node_id: u64, path: String },
     #[error("I3: node {node_id} found no object at {path} in a {purpose}")]
     CommittedReadNotFound {
@@ -186,13 +199,16 @@ pub fn check_named_keys_exist<'n, N: NodeSnapshotNames + 'n>(
     Ok(())
 }
 
-/// I2: every DELETE the store saw targets a key of the deleting node.
+/// I2: every DELETE the store saw targets a key of the deleting node, or,
+/// sent by the removed-node sweep, a key of the other node it sweeps.
 pub fn check_no_foreign_delete(view: &SnapshotStoreView) -> Result<(), SnapshotInvariantViolation> {
-    match view
-        .deletes
-        .iter()
-        .find(|delete| !is_owned_by(&view.prefix, delete.node_id, &delete.path))
-    {
+    let admitted = |delete: &StoreDelete| match delete.kind {
+        DeleteKind::Own => is_owned_by(&view.prefix, delete.node_id, &delete.path),
+        DeleteKind::Swept { of } => {
+            of != delete.node_id && is_owned_by(&view.prefix, of, &delete.path)
+        }
+    };
+    match view.deletes.iter().find(|delete| !admitted(delete)) {
         Some(delete) => Err(SnapshotInvariantViolation::ForeignDelete {
             node_id: delete.node_id,
             path: delete.path.clone(),

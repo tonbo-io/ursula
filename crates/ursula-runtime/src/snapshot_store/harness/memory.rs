@@ -33,7 +33,9 @@
 //! [`SnapshotStoreEvent::SentObjectMissing`].
 //!
 //! A DELETE of a key outside the deleting node's own directory is a
-//! violation of invariant I2, and the store panics on it. A negative control
+//! violation of invariant I2, and the store panics on it, but the
+//! removed-node sweep's delete of another node's key it listed
+//! ([`SnapshotStore::delete_node_object`]). A negative control
 //! that wants to see the damage builds its bucket with
 //! [`MemorySnapshotBucket::recording_foreign_deletes`] instead.
 //!
@@ -61,12 +63,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use ursula_shard::RaftGroupId;
 
+use super::invariants::DeleteKind;
 use super::invariants::SnapshotStoreView;
 use super::invariants::StoreDelete;
 use super::invariants::ViewObject;
 use super::is_owned_by;
 use crate::SnapshotStoreOperation;
 use crate::rt::time::Instant;
+use crate::snapshot_store::NodeListing;
+use crate::snapshot_store::NodeObject;
 use crate::snapshot_store::OwnListing;
 use crate::snapshot_store::OwnedDirectory;
 use crate::snapshot_store::OwnedKey;
@@ -367,10 +372,12 @@ pub enum SnapshotStoreEvent {
         path: String,
         found: bool,
     },
-    /// A DELETE in the deleting node's own directory.
+    /// A DELETE in the deleting node's own directory, or the removed-node
+    /// sweep's of another node's key (`kind`).
     Delete {
         node_id: u64,
         path: String,
+        kind: DeleteKind,
         existed: bool,
         outcome: DeleteOutcome,
     },
@@ -621,6 +628,7 @@ impl MemorySnapshotBucket {
                 SnapshotStoreEvent::ForeignDelete { node_id, path } => Some(StoreDelete {
                     node_id: *node_id,
                     path: path.clone(),
+                    kind: DeleteKind::Own,
                 }),
                 _ => None,
             })
@@ -705,10 +713,20 @@ impl MemorySnapshotBucket {
             .events
             .iter()
             .filter_map(|event| match event {
-                SnapshotStoreEvent::Delete { node_id, path, .. }
-                | SnapshotStoreEvent::ForeignDelete { node_id, path } => Some(StoreDelete {
+                SnapshotStoreEvent::Delete {
+                    node_id,
+                    path,
+                    kind,
+                    ..
+                } => Some(StoreDelete {
                     node_id: *node_id,
                     path: path.clone(),
+                    kind: *kind,
+                }),
+                SnapshotStoreEvent::ForeignDelete { node_id, path } => Some(StoreDelete {
+                    node_id: *node_id,
+                    path: path.clone(),
+                    kind: DeleteKind::Own,
                 }),
                 _ => None,
             })
@@ -999,11 +1017,13 @@ impl BucketState {
         Ok(listing)
     }
 
-    /// A DELETE of `path` by `node_id`, in its own directory, at `now`.
+    /// A DELETE of `path` by `node_id`, in its own directory or, `kind`
+    /// says, the swept node's, at `now`.
     fn delete(
         &mut self,
         node_id: u64,
         path: String,
+        kind: DeleteKind,
         now: Instant,
     ) -> Result<(), SnapshotStoreError> {
         let faults = self.faults.clone();
@@ -1023,6 +1043,7 @@ impl BucketState {
         self.events.push(SnapshotStoreEvent::Delete {
             node_id,
             path: path.clone(),
+            kind,
             existed,
             outcome,
         });
@@ -1215,7 +1236,7 @@ impl MemorySnapshotStore {
             let path = key.clone();
             return self
                 .bucket
-                .request(move |state, now| state.delete(node_id, path, now))
+                .request(move |state, now| state.delete(node_id, path, DeleteKind::Own, now))
                 .await;
         }
         // A recording bucket lets the delete go ahead, as S3 would.
@@ -1329,7 +1350,7 @@ impl SnapshotStore for MemorySnapshotStore {
             }
             let node_id = self.node_id;
             self.bucket
-                .request(move |state, now| state.delete(node_id, object.path, now))
+                .request(move |state, now| state.delete(node_id, object.path, DeleteKind::Own, now))
                 .await
         })
     }
@@ -1339,6 +1360,43 @@ impl SnapshotStore for MemorySnapshotStore {
             let prefix = self.prefix().clone();
             self.bucket
                 .request(move |state, _now| state.node_groups(&prefix, node))
+                .await
+        })
+    }
+
+    fn list_node_group<'a>(
+        &'a self,
+        node: u64,
+        raft_group_id: RaftGroupId,
+    ) -> SnapshotStoreFuture<'a, NodeListing> {
+        Box::pin(async move {
+            let owner = SnapshotOwner {
+                node_id: node,
+                raft_group_id,
+            };
+            let prefix = self.prefix().clone();
+            let listing = self
+                .bucket
+                .request(move |state, now| state.list(&prefix, owner, now))
+                .await?;
+            Ok(NodeListing::of_listed(listing))
+        })
+    }
+
+    /// Records the delete as the sweep's of the listed node's key, which
+    /// I2 admits from any other node.
+    fn delete_node_object<'a>(&'a self, object: NodeObject) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move {
+            if OwnedKey::parse(self.prefix(), &object.path) != Ok(object.key) {
+                self.foreign_delete(&object.path);
+                return Err(SnapshotStoreError::NotOwnedHere { path: object.path });
+            }
+            let node_id = self.node_id;
+            let kind = DeleteKind::Swept {
+                of: object.key.owner.node_id,
+            };
+            self.bucket
+                .request(move |state, now| state.delete(node_id, object.path, kind, now))
                 .await
         })
     }

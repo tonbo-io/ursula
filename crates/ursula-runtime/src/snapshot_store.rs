@@ -12,14 +12,23 @@
 //!
 //! Owned objects (#687). A node writes the objects it may commit under
 //! `{prefix}/node-{node}/group-{gid}/` ([`OwnedKey`]), each under a fresh
-//! name, and only that node deletes them. [`SnapshotStore::stage`] draws the
+//! name, and only that node deletes them, but for the removed-node sweep
+//! below. [`SnapshotStore::stage`] draws the
 //! name without I/O, [`SnapshotStore::write_staged`] creates the object only
 //! if no object has the name, and [`SnapshotStore::list_own`] and
 //! [`SnapshotStore::delete_own`] serve the owner's GC.
 //! [`SnapshotStore::list_node_groups`] names the groups a node's directory
 //! holds objects of, for the objects of a replica the node tore down or
 //! never ran (design 7.3). [`OwnedPointer`] is a
-//! pointer this node may commit. Nothing else lives in the store: no
+//! pointer this node may commit.
+//!
+//! The one exception to owner-only deletion is the meta leader's sweep of a
+//! removed node's directory (design 8.3): [`SnapshotStore::list_node_group`]
+//! lists another node's objects of a group as [`NodeObject`]s, and
+//! [`SnapshotStore::delete_node_object`] deletes one of them, only once the
+//! group's live leader answered that the node is no member of it. A removed
+//! node never regains a role, so no replica of it uses those objects again.
+//! Nothing else lives in the store: no
 //! reference or pin records, and no object any node shares. A node that
 //! installs a peer's snapshot writes its own copy before it commits it, and
 //! what a node may still use is held in its memory, never in the store.
@@ -675,6 +684,55 @@ pub struct OwnListing {
     pub foreign: Vec<String>,
 }
 
+/// An object under another node's directory, as a store listed it for the
+/// removed-node sweep ([`SnapshotStore::list_node_group`]): the only form
+/// [`SnapshotStore::delete_node_object`] takes, so the sweep deletes only
+/// what it listed.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct NodeObject {
+    key: OwnedKey,
+    path: String,
+}
+
+impl NodeObject {
+    pub fn key(&self) -> &OwnedKey {
+        &self.key
+    }
+
+    /// The object's full key in the store.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+}
+
+/// What a listing of a node's directory for a group holds
+/// ([`SnapshotStore::list_node_group`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NodeListing {
+    /// The objects that parse as the node's keys of the group, in key order.
+    pub objects: Vec<NodeObject>,
+    /// Every other file in the directory.
+    pub foreign: Vec<String>,
+}
+
+impl NodeListing {
+    /// `listing`, a store's listing of the listed node's directory, as the
+    /// sweep reads it.
+    pub(crate) fn of_listed(listing: OwnListing) -> Self {
+        Self {
+            objects: listing
+                .owned
+                .into_iter()
+                .map(|object| NodeObject {
+                    key: object.key,
+                    path: object.path,
+                })
+                .collect(),
+            foreign: listing.foreign,
+        }
+    }
+}
+
 /// The backend of a [`SnapshotStore`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotBackend {
@@ -929,6 +987,25 @@ pub trait SnapshotStore: Send + Sync + Debug {
         Box::pin(async move { Ok(BTreeSet::new()) })
     }
 
+    /// Lists `node`'s directory for `raft_group_id`, for the removed-node
+    /// sweep, the one reader of another node's objects that deletes them
+    /// (see the module docs). The default is a store that holds no object:
+    /// an empty listing.
+    fn list_node_group<'a>(
+        &'a self,
+        _node: u64,
+        _raft_group_id: RaftGroupId,
+    ) -> SnapshotStoreFuture<'a, NodeListing> {
+        Box::pin(async move { Ok(NodeListing::default()) })
+    }
+
+    /// Deletes an object [`Self::list_node_group`] listed, for the
+    /// removed-node sweep. A missing one is not an error. The default is a
+    /// store that holds no object, so the object is another store's.
+    fn delete_node_object<'a>(&'a self, object: NodeObject) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move { Err(SnapshotStoreError::NotOwnedHere { path: object.path }) })
+    }
+
     /// Reads the stored body at `location`, checked against its stored
     /// size.
     fn read_stored<'a>(
@@ -1076,6 +1153,21 @@ impl SnapshotStore for FencedSnapshotStore {
 
     fn list_node_groups<'a>(&'a self, node: u64) -> SnapshotStoreFuture<'a, BTreeSet<RaftGroupId>> {
         self.inner.list_node_groups(node)
+    }
+
+    fn list_node_group<'a>(
+        &'a self,
+        node: u64,
+        raft_group_id: RaftGroupId,
+    ) -> SnapshotStoreFuture<'a, NodeListing> {
+        self.inner.list_node_group(node, raft_group_id)
+    }
+
+    fn delete_node_object<'a>(&'a self, object: NodeObject) -> SnapshotStoreFuture<'a, ()> {
+        Box::pin(async move {
+            self.check("DELETE", object.path())?;
+            self.inner.delete_node_object(object).await
+        })
     }
 
     fn read_stored<'a>(
@@ -1257,6 +1349,8 @@ mod s3 {
     use opendal::Scheme;
     use ursula_shard::RaftGroupId;
 
+    use super::NodeListing;
+    use super::NodeObject;
     use super::OwnListing;
     use super::OwnedDirectory;
     use super::OwnedKey;
@@ -1477,6 +1571,52 @@ mod s3 {
             Ok(Self::new(operator, prefix, node_id))
         }
 
+        /// Lists `owner`'s directory: the objects that parse as its keys,
+        /// and every other file, each in key order.
+        async fn list_directory(
+            &self,
+            owner: SnapshotOwner,
+        ) -> Result<OwnListing, SnapshotStoreError> {
+            let directory = owner.directory(&self.prefix);
+            let entries = self
+                .operator
+                .list_with(&directory)
+                .recursive(true)
+                .await
+                .map_err(|err| {
+                    SnapshotStoreError::backend(SnapshotStoreOperation::List, &directory, err)
+                })?;
+            let mut listing = OwnListing::default();
+            for entry in entries {
+                if !entry.metadata().mode().is_file() {
+                    continue;
+                }
+                match OwnedKey::parse(&self.prefix, entry.path()) {
+                    Ok(key) if key.owner == owner => listing.owned.push(OwnedObject {
+                        key,
+                        path: entry.path().to_owned(),
+                    }),
+                    Ok(_) | Err(_) => listing.foreign.push(entry.path().to_owned()),
+                }
+            }
+            listing.owned.sort_unstable();
+            listing.foreign.sort_unstable();
+            Ok(listing)
+        }
+
+        /// Deletes the object at `path`. A missing one is not an error.
+        async fn delete_path(&self, path: String) -> Result<(), SnapshotStoreError> {
+            match self.operator.delete(&path).await {
+                Ok(()) => Ok(()),
+                Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
+                Err(err) => Err(SnapshotStoreError::backend(
+                    SnapshotStoreOperation::Delete,
+                    path,
+                    err,
+                )),
+            }
+        }
+
         /// Creates `key` only if no object has the name: a found object is
         /// a [`SnapshotStoreError::NameCollision`], never reused or
         /// overwritten. A backend that cannot create conditionally is
@@ -1644,34 +1784,7 @@ mod s3 {
             &'a self,
             raft_group_id: RaftGroupId,
         ) -> SnapshotStoreFuture<'a, OwnListing> {
-            Box::pin(async move {
-                let owner = self.owner(raft_group_id);
-                let directory = owner.directory(&self.prefix);
-                let entries = self
-                    .operator
-                    .list_with(&directory)
-                    .recursive(true)
-                    .await
-                    .map_err(|err| {
-                        SnapshotStoreError::backend(SnapshotStoreOperation::List, &directory, err)
-                    })?;
-                let mut listing = OwnListing::default();
-                for entry in entries {
-                    if !entry.metadata().mode().is_file() {
-                        continue;
-                    }
-                    match OwnedKey::parse(&self.prefix, entry.path()) {
-                        Ok(key) if key.owner == owner => listing.owned.push(OwnedObject {
-                            key,
-                            path: entry.path().to_owned(),
-                        }),
-                        Ok(_) | Err(_) => listing.foreign.push(entry.path().to_owned()),
-                    }
-                }
-                listing.owned.sort_unstable();
-                listing.foreign.sort_unstable();
-                Ok(listing)
-            })
+            Box::pin(self.list_directory(self.owner(raft_group_id)))
         }
 
         fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()> {
@@ -1681,15 +1794,7 @@ mod s3 {
                 if !owned {
                     return Err(SnapshotStoreError::NotOwnedHere { path: object.path });
                 }
-                match self.operator.delete(&object.path).await {
-                    Ok(()) => Ok(()),
-                    Err(err) if matches!(err.kind(), ErrorKind::NotFound) => Ok(()),
-                    Err(err) => Err(SnapshotStoreError::backend(
-                        SnapshotStoreOperation::Delete,
-                        object.path,
-                        err,
-                    )),
-                }
+                self.delete_path(object.path).await
             })
         }
 
@@ -1715,6 +1820,29 @@ mod s3 {
                         .filter(|entry| entry.metadata().mode().is_file())
                         .map(|entry| entry.path()),
                 ))
+            })
+        }
+
+        fn list_node_group<'a>(
+            &'a self,
+            node: u64,
+            raft_group_id: RaftGroupId,
+        ) -> SnapshotStoreFuture<'a, NodeListing> {
+            Box::pin(async move {
+                let owner = SnapshotOwner {
+                    node_id: node,
+                    raft_group_id,
+                };
+                Ok(NodeListing::of_listed(self.list_directory(owner).await?))
+            })
+        }
+
+        fn delete_node_object<'a>(&'a self, object: NodeObject) -> SnapshotStoreFuture<'a, ()> {
+            Box::pin(async move {
+                if OwnedKey::parse(&self.prefix, &object.path) != Ok(object.key) {
+                    return Err(SnapshotStoreError::NotOwnedHere { path: object.path });
+                }
+                self.delete_path(object.path).await
             })
         }
 
@@ -2558,6 +2686,83 @@ mod tests {
             keys(&ten.list_own(RaftGroupId(7)).await.unwrap()),
             vec![written[2]],
             "node 1's deletes leave node 10's object"
+        );
+    }
+
+    /// The sweep's listing of node 10's group 7 from node 1's store holds
+    /// node 10's keys of that group only, apart from a stray file, and its
+    /// deletes take exactly them: node 1's objects of the group, node 10's
+    /// of another group and the stray file stay. A missing object is no
+    /// error, and the fenced store refuses the DELETE.
+    #[cfg(not(madsim))]
+    #[tokio::test]
+    async fn s3_the_sweep_deletes_exactly_the_listed_objects_of_another_node() {
+        let one = node_store(1);
+        let ten = one.sibling_for_tests(10);
+        let mut written = Vec::new();
+        for (store, group, index) in [(&ten, 7, 4), (&ten, 7, 3), (&ten, 8, 5), (&one, 7, 6)] {
+            let staged = store
+                .stage(RaftGroupId(group), index, body(b"body"))
+                .await
+                .unwrap();
+            written.push(*staged.key().unwrap());
+            store.write_staged(staged).await.unwrap();
+        }
+        let stray = "snapshots/node-10/group-7/stray.json";
+        one.write_raw_for_tests(stray, b"{}".to_vec())
+            .await
+            .unwrap();
+
+        let listing = one.list_node_group(10, RaftGroupId(7)).await.unwrap();
+        let listed: Vec<OwnedKey> = listing.objects.iter().map(|object| *object.key()).collect();
+        assert_eq!(listed, vec![written[1], written[0]]);
+        assert_eq!(listing.foreign, vec![stray.to_owned()]);
+        assert_eq!(
+            one.list_node_group(1, RaftGroupId(7))
+                .await
+                .unwrap()
+                .objects
+                .iter()
+                .map(|object| *object.key())
+                .collect::<Vec<_>>(),
+            vec![written[3]],
+            "node 1's directory is not node 10's"
+        );
+
+        let fence = crate::NodeFence::unleased();
+        fence.close();
+        let fenced = FencedSnapshotStore::wrap(Arc::new(one.sibling_for_tests(1)), fence);
+        assert!(matches!(
+            fenced.delete_node_object(listing.objects[0].clone()).await,
+            Err(SnapshotStoreError::Fenced(_))
+        ));
+        for object in listing.objects {
+            one.delete_node_object(object.clone()).await.unwrap();
+            one.delete_node_object(object).await.unwrap();
+        }
+        let tens = ten.list_own(RaftGroupId(7)).await.unwrap();
+        assert!(tens.owned.is_empty());
+        assert_eq!(tens.foreign, vec![stray.to_owned()]);
+        let kept = |listing: OwnListing| -> Vec<OwnedKey> {
+            listing.owned.iter().map(|object| *object.key()).collect()
+        };
+        assert_eq!(kept(ten.list_own(RaftGroupId(8)).await.unwrap()), vec![
+            written[2]
+        ]);
+        assert_eq!(kept(one.list_own(RaftGroupId(7)).await.unwrap()), vec![
+            written[3]
+        ]);
+    }
+
+    /// The inline store holds no object, so the sweep lists none there.
+    #[tokio::test]
+    async fn the_inline_store_lists_no_object_for_the_sweep() {
+        assert_eq!(
+            InlineSnapshotStore
+                .list_node_group(2, RaftGroupId(7))
+                .await
+                .unwrap(),
+            NodeListing::default()
         );
     }
 }

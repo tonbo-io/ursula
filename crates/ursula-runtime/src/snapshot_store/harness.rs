@@ -11,8 +11,9 @@
 //!   request waits a drawn delay before and after it acts. PUTs can fail to
 //!   the client and land anyway, LISTs can omit recent keys and repeat
 //!   deleted ones, creates honour If-None-Match, nonces come from the seed,
-//!   and a DELETE outside the deleting node's directory panics (I2). Its GC
-//!   is the owner's pass: it keeps no reference records.
+//!   and a DELETE outside the deleting node's directory panics (I2), but the
+//!   removed-node sweep's of another node's listed key. Its GC is the
+//!   owner's pass: it keeps no reference records.
 //! - [`gated`]: [`GatedSnapshotStore`], which wraps a node's store and
 //!   pauses each owned-key operation before or after it acts until a test
 //!   releases it, so a test can force one order of a build against a GC
@@ -36,6 +37,7 @@ pub use gated::SnapshotStoreGates;
 pub use gated::StoreOp;
 pub use invariants::CommittedRead;
 pub use invariants::CommittedReadPurpose;
+pub use invariants::DeleteKind;
 pub use invariants::NodeNames;
 pub use invariants::NodeSnapshotNames;
 pub use invariants::ReadOutcome;
