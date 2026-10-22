@@ -163,13 +163,25 @@ impl SimNodeWal {
     }
 
     /// [`SimNodeWal::open`], reporting a journal that does not open. Every
-    /// simulated open may create its group, as the engine factories' do.
+    /// simulated open outside the placement family may create its group, as
+    /// the engine factories' do with fixed placement inputs.
     pub(super) async fn try_open(
         &self,
         placement: ShardPlacement,
         metrics: GroupEngineMetrics,
     ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
-        let store = self.run()?.open(placement, Admission::Create, metrics)?;
+        self.open_admitted(placement, Admission::Create, metrics)
+    }
+
+    /// Opens `placement`'s log store with `admission`, as the hosting
+    /// driver admits it: `Open` refuses a group the journals do not hold.
+    pub(super) fn open_admitted(
+        &self,
+        placement: ShardPlacement,
+        admission: Admission,
+        metrics: GroupEngineMetrics,
+    ) -> Result<Arc<RaftGroupFileLogStore>, RaftWalError> {
+        let store = self.run()?.open(placement, admission, metrics)?;
         self.stores
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())

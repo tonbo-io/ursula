@@ -1052,6 +1052,9 @@ pub struct GroupRejoin {
     /// A data replica's placed role and its group's left mark, which the
     /// voter predicate reads (`crate::voter`). Bound once, at attach.
     placed: OnceLock<PlacedReplica>,
+    /// This replica ran `Initialize` for its group: its bootstrap driver
+    /// found every voter empty.
+    initialized: AtomicBool,
 }
 
 /// The Raft a gate is bound to ([`GroupRejoin::bind`]).
@@ -1247,6 +1250,7 @@ impl GroupRejoin {
             plan_pause: Mutex::new(None),
             plan_in_flight: AtomicBool::new(false),
             placed: OnceLock::new(),
+            initialized: AtomicBool::new(false),
         })
     }
 
@@ -1474,6 +1478,18 @@ impl GroupRejoin {
         }
         self.open(GateOpening::CaughtUp).await?;
         Ok(true)
+    }
+
+    /// Records that this replica ran `Initialize` for its group.
+    pub(crate) fn note_initialized(&self) {
+        self.initialized.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether this replica ran `Initialize` for its group, for a
+    /// simulation that checks no group is initialized twice.
+    #[cfg(madsim)]
+    pub fn initialized_here(&self) -> bool {
+        self.initialized.load(Ordering::SeqCst)
     }
 
     /// Called only after every peer was proven empty: this replica

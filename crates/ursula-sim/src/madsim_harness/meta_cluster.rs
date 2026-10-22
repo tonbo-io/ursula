@@ -6,9 +6,9 @@
 //! A node opens its meta journal before its data replicas, as the server's
 //! spawn path does, so a lost meta journal over data history is told apart
 //! from a new one. The data and meta planes share the cluster's one network
-//! policy, so a partition cuts both. Every node is a voter of every data
-//! group, as static data groups place them in S1, and the meta voters are
-//! the claim's.
+//! policy, so a partition cuts both. The data replicas are static, every
+//! node a voter of every data group, or placed, opened by each node's
+//! hosting driver ([`Hosting`]). The meta voters are the claim's.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -70,23 +70,24 @@ use ursula_runtime::RuntimeMetrics;
 
 use super::journal_cluster::JOURNAL_GROUPS;
 use super::journal_cluster::JournalCluster;
+use super::placed_hosting::Placed;
 use super::recovery_wiring::RecoveryProbeError;
 
 /// A node's meta runtime in the simulation.
 pub(super) type SimMetaRuntime = MetaRuntime<InProcessMetaNetworkFactory>;
 
-/// How many plans one meta recovery may send, as `ursulactl
-/// recover-group --max-plans` bounds it.
+/// How many plans one recovery may send, as `ursulactl recover-group
+/// --max-plans` bounds it.
 const MAX_META_PLANS: usize = 3;
 
-/// Why a meta recovery round ended without a satisfied plan.
+/// Why a recovery round ended without a satisfied plan.
 #[derive(Debug, thiserror::Error)]
 pub(super) enum MetaRecoverFailed {
     /// The recovery tool stopped.
     #[error(transparent)]
     Recover(#[from] RecoverError),
     /// The tool found nothing to plan.
-    #[error("the meta group needed no plan: {outcome:?}")]
+    #[error("the group needed no plan: {outcome:?}")]
     NoPlan { outcome: RecoverOutcome },
 }
 
@@ -164,6 +165,19 @@ impl ursula_raft::RecoveryTransport for MetaTransport {
     }
 }
 
+/// How a [`MetaCluster`]'s nodes host their data replicas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Hosting {
+    /// Every node is a voter of every data group, which node 1 initializes
+    /// ([`super::recovery_wiring::fixed_placement`]), and the groups form
+    /// before the cluster starts.
+    Static,
+    /// Each node's hosting driver opens what its journals hold and what its
+    /// placement gives it ([`super::placed_hosting`]). The groups form once
+    /// meta bootstrapped.
+    Placed,
+}
+
 /// The data cluster with a meta runtime on every running node.
 pub(super) struct MetaCluster {
     pub(super) data: JournalCluster,
@@ -171,36 +185,47 @@ pub(super) struct MetaCluster {
     /// The claim each node starts its meta runtime with.
     pub(super) claims: BTreeMap<u64, GenesisClaim>,
     pub(super) runtimes: BTreeMap<u64, SimMetaRuntime>,
+    /// The placed data plane, when the nodes host by placement.
+    pub(super) placed: Option<Placed>,
 }
 
 impl MetaCluster {
     /// `nodes` nodes whose data WALs run with `tuning`, each started with
     /// its claim in `claims` (`claim` by default): every node's meta
-    /// runtime, then its data replicas, then the data groups form.
+    /// runtime, then its data replicas by `hosting`. Static data groups
+    /// then form.
     pub(super) async fn start(
         name: &str,
         tuning: JournalTuning,
         nodes: u64,
         claims: BTreeMap<u64, GenesisClaim>,
+        hosting: Hosting,
     ) -> Self {
         let mut cluster = Self {
             data: JournalCluster::provisioned(name, tuning, nodes),
             meta: InProcessMetaRegistry::default(),
             claims,
             runtimes: BTreeMap::new(),
+            placed: (hosting == Hosting::Placed).then(Placed::default),
         };
         for node_id in 1..=nodes {
             cluster.start_node(node_id).await;
         }
-        cluster.data.form_groups().await;
+        if hosting == Hosting::Static {
+            cluster.data.form_groups().await;
+        }
         cluster
     }
 
     /// Starts `node_id`'s meta runtime on its meta journal, then its data
-    /// replicas.
+    /// replicas, or its hosting driver when the nodes host by placement.
     pub(super) async fn start_node(&mut self, node_id: u64) {
         self.start_meta(node_id).await;
-        self.data.start_node(node_id).await;
+        if self.placed.is_some() {
+            self.start_host(node_id);
+        } else {
+            self.data.start_node(node_id).await;
+        }
     }
 
     async fn start_meta(&mut self, node_id: u64) {
@@ -259,7 +284,12 @@ impl MetaCluster {
         if let Some(runtime) = self.runtimes.remove(&node_id) {
             runtime.shutdown().await.expect("stop the meta runtime");
         }
-        self.data.stop_node(node_id).await;
+        if self.placed.is_some() {
+            self.stop_host(node_id).await;
+            self.data.new_process(node_id);
+        } else {
+            self.data.stop_node(node_id).await;
+        }
     }
 
     /// Shuts `node_id` down cleanly and removes every file of its meta
@@ -286,11 +316,19 @@ impl MetaCluster {
     /// Stops `node_id` and gives it an empty disk, data and meta journals
     /// alike.
     pub(super) async fn wipe(&mut self, node_id: u64, name: &str) {
-        if let Some(runtime) = self.runtimes.remove(&node_id) {
-            runtime.shutdown().await.expect("stop the meta runtime");
-        }
+        self.stop_replicas(node_id).await;
         let tuning = JournalTuning::new(ursula_config::WalFsync::Always);
-        self.data.wipe_node(node_id, name, tuning).await;
+        self.data.new_disk(node_id, name, tuning);
+    }
+
+    /// Appends `count` payloads to `group` through its leader, and answers
+    /// `false` at the first one it does not take.
+    pub(super) async fn try_append(&mut self, group: u32, count: usize) -> bool {
+        if self.placed.is_some() {
+            self.placed_append(group, count).await
+        } else {
+            self.data.try_append(group, count).await
+        }
     }
 
     /// `node_id`'s registry: its process's, which its meta runtime publishes
@@ -348,34 +386,35 @@ impl MetaCluster {
         nodes: &[u64],
     ) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
         let members = self.plan_members(nodes);
-        match next_step(state, &members, MAX_META_PLANS)? {
-            Step::Done(RecoverOutcome::Satisfied { plan, .. }) => Ok(Some(plan)),
-            Step::Done(outcome) => Err(MetaRecoverFailed::NoPlan { outcome }),
-            Step::Wait => Ok(None),
-            Step::Plan(plan) => {
-                state.plans_sent = state.plans_sent.saturating_add(1);
-                let sent = send_plan(
-                    &mut MetaPlanTransport { cluster: self },
-                    plan,
-                    PlanFloor::Meta,
-                    &members,
-                )
-                .await;
-                plan_sent(state, plan, sent, &electorate(&plan, &members))?;
-                Ok(None)
-            }
-            Step::Resume { plan, leader_term } => {
-                let sent = send_follows(
-                    &mut MetaPlanTransport { cluster: self },
-                    plan,
-                    PlanFloor::Meta,
-                    leader_term,
-                    &members,
-                )
-                .await;
-                plan_sent(state, plan, Ok(sent), &electorate(&plan, &members))?;
-                Ok(None)
-            }
+        let mut transport = MetaPlanTransport { cluster: self };
+        recover_round(state, &members, &mut transport, PlanFloor::Meta).await
+    }
+}
+
+/// One round of `ursulactl recover-group --accept-loss` over `members`:
+/// the shipped planning step (`next_step`), planner and sender over
+/// `transport`, as the tool's loop drives them. Answers the plan once it is
+/// satisfied, and `None` while the tool would observe again.
+pub(super) async fn recover_round<T: PlanTransport>(
+    state: &mut LoopState,
+    members: &[PlanMember],
+    transport: &mut T,
+    floor: PlanFloor,
+) -> Result<Option<GroupPlan>, MetaRecoverFailed> {
+    match next_step(state, members, MAX_META_PLANS)? {
+        Step::Done(RecoverOutcome::Satisfied { plan, .. }) => Ok(Some(plan)),
+        Step::Done(outcome) => Err(MetaRecoverFailed::NoPlan { outcome }),
+        Step::Wait => Ok(None),
+        Step::Plan(plan) => {
+            state.plans_sent = state.plans_sent.saturating_add(1);
+            let sent = send_plan(transport, plan, floor, members).await;
+            plan_sent(state, plan, sent, &electorate(&plan, members))?;
+            Ok(None)
+        }
+        Step::Resume { plan, leader_term } => {
+            let sent = send_follows(transport, plan, floor, leader_term, members).await;
+            plan_sent(state, plan, Ok(sent), &electorate(&plan, members))?;
+            Ok(None)
         }
     }
 }

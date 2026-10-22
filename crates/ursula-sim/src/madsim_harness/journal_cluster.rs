@@ -165,6 +165,23 @@ impl SnapshotObjects {
     }
 }
 
+/// What starting one node's replica reads of its cluster, cloned so that
+/// the node's hosting driver starts replicas while the scenario runs
+/// ([`JournalCluster::replica_parts`]).
+#[derive(Clone)]
+pub(super) struct ReplicaParts {
+    pub(super) node_id: u64,
+    pub(super) config: Arc<Config>,
+    pub(super) policy: InProcessRaftNetworkPolicy,
+    /// The in-process network of each group.
+    pub(super) registries: BTreeMap<u32, InProcessRaftRegistry>,
+    pub(super) wal: SimNodeWal,
+    pub(super) metrics: RuntimeMetrics,
+    /// The node process's registry, which its meta runtime publishes its
+    /// views in and its replicas register in.
+    pub(super) registry: ursula_raft::RaftGroupHandleRegistry,
+}
+
 /// A replica that did not start: its engine refused to open.
 #[derive(Debug)]
 pub(super) struct ReplicaStartRefused {
@@ -742,14 +759,39 @@ impl JournalCluster {
                 }
             }
         }
-        // The next start is a new process, with nothing of this one's
-        // build coordinator, gauges, holds or snapshot store gates.
+        self.new_process(node_id);
+    }
+
+    /// Readies `node_id`'s next start as a new process, with nothing of the
+    /// stopped one's build coordinator, gauges, holds or snapshot store
+    /// gates.
+    pub(super) fn new_process(&mut self, node_id: u64) {
         let install_timeout = self.snapshot_objects.as_mut().map(|objects| {
             objects.processes.remove(&node_id);
             objects.install_timeout
         });
         self.node_registries
             .insert(node_id, node_registry(install_timeout));
+    }
+
+    /// What starting `node_id`'s replicas reads of the cluster, for a node
+    /// whose hosting driver starts them (the placement family). A cluster
+    /// with snapshot drivers, a snapshot store or faulty code starts its
+    /// replicas itself.
+    pub(super) fn replica_parts(&self, node_id: u64) -> ReplicaParts {
+        assert!(
+            self.drivers.is_none() && self.snapshot_objects.is_none() && self.faulty.is_none(),
+            "a hosted replica runs without snapshot drivers, a snapshot store or faulty code"
+        );
+        ReplicaParts {
+            node_id,
+            config: Arc::clone(&self.config),
+            policy: self.policy.clone(),
+            registries: self.registries.clone(),
+            wal: self.wals[&node_id].clone(),
+            metrics: self.metrics[&node_id].clone(),
+            registry: self.node_registries[&node_id].clone(),
+        }
     }
 
     /// What each node's durable snapshot records name, read from the
@@ -1069,6 +1111,11 @@ impl JournalCluster {
     /// disk would: it rejoins as a wiped node when it starts again.
     pub(super) async fn wipe_node(&mut self, node_id: u64, name: &str, tuning: JournalTuning) {
         self.stop_node(node_id).await;
+        self.new_disk(node_id, name, tuning);
+    }
+
+    /// Gives the stopped `node_id` an empty WAL named `name`.
+    pub(super) fn new_disk(&mut self, node_id: u64, name: &str, tuning: JournalTuning) {
         // The lost disk held the node's snapshot records.
         if let Some(objects) = &mut self.snapshot_objects {
             objects.records.retain(|(_, node), _| *node != node_id);

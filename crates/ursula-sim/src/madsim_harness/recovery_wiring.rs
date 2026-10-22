@@ -1,6 +1,7 @@
 //! Recovery gates of simulated nodes over the in-process network: the
 //! production gate, barrier driver and heal driver, wired the way the
-//! placed engine factory wires them, over a [`FixedPlacement`].
+//! placed engine factory wires them, over a [`FixedPlacement`] or, in the
+//! placement family, a node's `MetaPlacement`.
 
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -16,6 +17,7 @@ use ursula_raft::InProcessRaftNetworkEvent;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::PeerGroupLog;
+use ursula_raft::PlacementInputs;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftTarget;
@@ -126,7 +128,7 @@ pub(super) fn wire_recovery(
     rejoin: &Arc<GroupRejoin>,
     registry: &InProcessRaftRegistry,
     policy: &InProcessRaftNetworkPolicy,
-    inputs: &FixedPlacement,
+    inputs: &dyn PlacementInputs,
     recovery_registry: &RaftGroupHandleRegistry,
 ) {
     engine

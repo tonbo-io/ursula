@@ -50,9 +50,15 @@ pub trait PlacementInputs: Send + Sync + 'static {
 
 /// A replica's seed role in its group.
 pub trait SeedRole: Send + Sync + 'static {
-    /// The role the local placement shows, unconfirmed: a replica runs the
-    /// bootstrap driver only while it shows `Initializer`.
+    /// The role the local placement shows, unconfirmed. The bootstrap
+    /// driver probes and initializes only while it shows `Initializer`
+    /// ([`Self::may_change`] says when the driver runs).
     fn local_role(&self) -> Option<SeedRoleOf>;
+    /// Whether [`Self::local_role`] may change while the replica runs. A
+    /// replica whose role may change runs the bootstrap driver until its
+    /// group holds history, and the driver probes only while the role shows
+    /// `Initializer`. A fixed role decides once, when the replica opens.
+    fn may_change(&self) -> bool;
     /// The role from a confirmed placement. `Ok(None)` stops the driver
     /// that asks, and `Err` makes it retry.
     fn confirmed_role(&self) -> BoxFuture<'_, Result<Option<SeedRoleOf>, MetaBarrierError>>;
@@ -81,6 +87,10 @@ pub struct FixedRole(pub Option<SeedRoleOf>);
 impl SeedRole for FixedRole {
     fn local_role(&self) -> Option<SeedRoleOf> {
         self.0
+    }
+
+    fn may_change(&self) -> bool {
+        false
     }
 
     fn confirmed_role(&self) -> BoxFuture<'_, Result<Option<SeedRoleOf>, MetaBarrierError>> {
@@ -175,8 +185,26 @@ struct MetaSeedRole {
     group: RaftGroupId,
 }
 
+/// Whether a negative control turned off the rule that the seed role comes
+/// from the placement view (`Defence::InitializeOnlySeeded`): the role is
+/// then `Initializer` for any view.
+fn any_view_initializes() -> bool {
+    let off = ursula_stream::sim_controls::off(
+        ursula_stream::sim_controls::Defence::InitializeOnlySeeded,
+    );
+    if off {
+        ursula_stream::sim_controls::note_fired(
+            ursula_stream::sim_controls::Defence::InitializeOnlySeeded,
+        );
+    }
+    off
+}
+
 impl SeedRole for MetaSeedRole {
     fn local_role(&self) -> Option<SeedRoleOf> {
+        if any_view_initializes() {
+            return Some(SeedRoleOf::Initializer);
+        }
         ursula_control::shown_seed_role(
             &self.meta.registry().placement_watch().current(),
             self.meta.node(),
@@ -184,8 +212,17 @@ impl SeedRole for MetaSeedRole {
         )
     }
 
+    /// A view that regressed or has not reached the bootstrap yet shows no
+    /// role, and a later one shows it.
+    fn may_change(&self) -> bool {
+        true
+    }
+
     fn confirmed_role(&self) -> BoxFuture<'_, Result<Option<SeedRoleOf>, MetaBarrierError>> {
         Box::pin(async move {
+            if any_view_initializes() {
+                return Ok(Some(SeedRoleOf::Initializer));
+            }
             let confirmed = self.meta.confirm_view().await?;
             Ok(ursula_control::seed_role(
                 &confirmed,

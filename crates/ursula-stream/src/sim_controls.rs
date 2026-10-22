@@ -176,6 +176,13 @@ pub enum Defence {
     /// Off, it runs the data journals' policy, so a power loss under `never`
     /// loses acknowledged meta writes.
     MetaAlwaysSync,
+    /// A data replica's seed role comes from its placement view: the
+    /// bootstrap driver probes and initializes only while the view shows
+    /// the replica as its `Seeded` group's initializer, and it initializes
+    /// only on a confirmed view (N3 of design 15.2). Off, the
+    /// seed role answers `Initializer` for any view, so every seed voter
+    /// races to initialize its group.
+    InitializeOnlySeeded,
 }
 
 #[cfg(madsim)]
@@ -185,8 +192,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 36]> = const { Cell::new([false; 36]) };
-        static FIRED: Cell<[u64; 36]> = const { Cell::new([0; 36]) };
+        static OFF: Cell<[bool; 37]> = const { Cell::new([false; 37]) };
+        static FIRED: Cell<[u64; 37]> = const { Cell::new([0; 37]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -227,6 +234,7 @@ mod switches {
             Defence::GenesisEveryPeer => 33,
             Defence::MetaOverDataHistory => 34,
             Defence::MetaAlwaysSync => 35,
+            Defence::InitializeOnlySeeded => 36,
         }
     }
 
@@ -249,7 +257,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 36]));
+        FIRED.with(|fired| fired.set([0; 37]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {
