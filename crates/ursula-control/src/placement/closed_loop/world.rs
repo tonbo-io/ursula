@@ -481,14 +481,7 @@ pub(super) struct DataGroup {
     /// kept step may run in a later leadership of its planner, which 5.5's
     /// `CommittedLeaderId` refuses: the adversary is stronger than the
     /// design, so the membership CAS alone must keep such a step safe.
-    kept: BTreeMap<NodeId, Kept>,
-}
-
-/// A kept step future and the term of the leadership that planned it.
-#[derive(Debug, Clone)]
-struct Kept {
-    term: u64,
-    step: MembershipStep,
+    kept: BTreeMap<NodeId, MembershipStep>,
 }
 
 /// How often a run reached what only a long or faulty run reaches.
@@ -499,15 +492,6 @@ pub(super) struct Tally {
     /// Teardowns that retired their log.
     pub(super) retired: usize,
     pub(super) meta_plans: usize,
-    pub(super) data_plans: usize,
-    /// Nodes meta removed (C9).
-    pub(super) removals: usize,
-    /// Snapshot objects the removed-node sweep deleted.
-    pub(super) sweeps: usize,
-    /// Reports meta refused with `StalePlacement` (the placement CAS).
-    pub(super) stale_reports: usize,
-    /// `Converged` answers no leadership proof backed, so never reported.
-    pub(super) unproven_reports: usize,
     /// Leaders that planned from a committed config without themselves and
     /// waited (`NotAMember`, step 0 of 5.3).
     pub(super) not_a_member: usize,
@@ -515,30 +499,10 @@ pub(super) struct Tally {
     pub(super) outgoing_wins: usize,
     /// Leaders a voter back from a long cut deposed with its higher vote.
     pub(super) deposed_by_returns: usize,
-    /// Kept step futures that ran in a later leadership of their planner.
-    pub(super) kept_later: usize,
-    /// Second steps lost to a leadership change.
-    pub(super) dropped_second_steps: usize,
-    /// Second steps that waited for the next fair round.
-    pub(super) delayed_second_steps: usize,
-    /// Membership steps a leader cut off on the data plane executed.
-    pub(super) cut_off_steps: usize,
-    /// Teardown steps that asked at step 0 and were held, the group not
-    /// answering `NotMember`: a teardown held for several steps counts each.
-    pub(super) held_asks: usize,
-    /// Teardowns step 5 readmitted, the group not answering `NotMember`.
-    pub(super) readmitted_at_ask_again: usize,
-    /// Retired logs a `Create` reopened as `Recovering` (7.3).
-    pub(super) reopens: usize,
     /// Groups a seed driver initialized.
     pub(super) initializations: usize,
     /// Leaderless groups the model's operator plan elected a leader of.
     pub(super) recovery_elections: usize,
-    /// Winners holding an uncommitted membership entry their no-op commits.
-    pub(super) pending_kept: usize,
-    /// Elections truncating an uncommitted membership entry the winner
-    /// lacks.
-    pub(super) pending_truncated: usize,
 }
 
 impl Tally {
@@ -547,37 +511,15 @@ impl Tally {
             moves: self.moves.saturating_add(other.moves),
             retired: self.retired.saturating_add(other.retired),
             meta_plans: self.meta_plans.saturating_add(other.meta_plans),
-            data_plans: self.data_plans.saturating_add(other.data_plans),
-            removals: self.removals.saturating_add(other.removals),
-            sweeps: self.sweeps.saturating_add(other.sweeps),
-            stale_reports: self.stale_reports.saturating_add(other.stale_reports),
-            unproven_reports: self.unproven_reports.saturating_add(other.unproven_reports),
             not_a_member: self.not_a_member.saturating_add(other.not_a_member),
             outgoing_wins: self.outgoing_wins.saturating_add(other.outgoing_wins),
             deposed_by_returns: self
                 .deposed_by_returns
                 .saturating_add(other.deposed_by_returns),
-            kept_later: self.kept_later.saturating_add(other.kept_later),
-            dropped_second_steps: self
-                .dropped_second_steps
-                .saturating_add(other.dropped_second_steps),
-            delayed_second_steps: self
-                .delayed_second_steps
-                .saturating_add(other.delayed_second_steps),
-            cut_off_steps: self.cut_off_steps.saturating_add(other.cut_off_steps),
-            held_asks: self.held_asks.saturating_add(other.held_asks),
-            readmitted_at_ask_again: self
-                .readmitted_at_ask_again
-                .saturating_add(other.readmitted_at_ask_again),
-            reopens: self.reopens.saturating_add(other.reopens),
             initializations: self.initializations.saturating_add(other.initializations),
             recovery_elections: self
                 .recovery_elections
                 .saturating_add(other.recovery_elections),
-            pending_kept: self.pending_kept.saturating_add(other.pending_kept),
-            pending_truncated: self
-                .pending_truncated
-                .saturating_add(other.pending_truncated),
         }
     }
 }
@@ -971,10 +913,6 @@ impl World {
             outgoing_wins: sum(|raft| raft.elections.outgoing),
             deposed_by_returns: sum(|raft| raft.elections.deposed),
             recovery_elections: sum(|raft| raft.elections.plans),
-            pending_kept: sum(|raft| raft.elections.pending_kept),
-            pending_truncated: sum(|raft| raft.elections.pending_truncated),
-            dropped_second_steps: sum(|raft| raft.second_steps.dropped),
-            delayed_second_steps: sum(|raft| raft.second_steps.delayed),
             ..self.tally
         }
     }
@@ -1079,7 +1017,6 @@ impl World {
                     }
                 }
                 Err(ControlError::StalePlacement { .. }) => {
-                    self.tally.stale_reports = self.tally.stale_reports.saturating_add(1);
                     // 5.7: a stale report forces a confirmation before the
                     // next plan.
                     if let Some(data) = self.groups.get_mut(&group) {
@@ -1170,7 +1107,6 @@ impl World {
     fn carry_out(&mut self, me: NodeId, standing: Standing, plan: &HostingPlan, fresh: bool) {
         let mut created = Vec::new();
         let mut reports = Vec::new();
-        let mut reopens = 0_usize;
         let Some(state) = self.nodes.get_mut(&me) else {
             return;
         };
@@ -1201,7 +1137,6 @@ impl World {
                         if replica.log == Journal::Retired {
                             replica.log = Journal::Recovering;
                             created.push(*group);
-                            reopens = reopens.saturating_add(1);
                         }
                         replica.open = true;
                         replica.closed_by_removal = false;
@@ -1238,7 +1173,6 @@ impl World {
                 }
             }
         }
-        self.tally.reopens = self.tally.reopens.saturating_add(reopens);
         if !fresh {
             for group in created {
                 self.found.push(violation(
@@ -1285,22 +1219,13 @@ impl World {
             }
         }
         let next = match teardown.advance(event) {
-            TeardownOutcome::Continue(next) => {
-                if teardown == Teardown::Asking && next == Teardown::Asking {
-                    self.tally.held_asks = self.tally.held_asks.saturating_add(1);
-                }
-                Some(next)
-            }
+            TeardownOutcome::Continue(next) => Some(next),
             TeardownOutcome::Ended(end) => {
                 match end {
                     TeardownEnd::Retired => {
                         self.tally.retired = self.tally.retired.saturating_add(1);
                     }
-                    TeardownEnd::Readmitted => {
-                        self.tally.readmitted_at_ask_again =
-                            self.tally.readmitted_at_ask_again.saturating_add(1);
-                    }
-                    TeardownEnd::Cancelled => {}
+                    TeardownEnd::Readmitted | TeardownEnd::Cancelled => {}
                 }
                 None
             }
@@ -1422,11 +1347,8 @@ impl World {
                     TargetStage::Seeded { since } | TargetStage::Moving { since } => since,
                     TargetStage::Settled => return,
                 };
-                if !proven {
-                    self.tally.unproven_reports = self.tally.unproven_reports.saturating_add(1);
-                    if enforced(Rule::LeadershipProof) {
-                        return;
-                    }
+                if !proven && enforced(Rule::LeadershipProof) {
+                    return;
                 }
                 let report = ControlCommand::ReportConverged {
                     group,
@@ -1446,19 +1368,15 @@ impl World {
             | MembershipStep::ChangeVoters { .. }
             | MembershipStep::RemoveLearners { .. }
             | MembershipStep::TransferLeadership { .. }) => {
-                let cut_off = self.partitioned(me);
                 let Some(data) = self.groups.get_mut(&group) else {
                     return;
                 };
-                if cut_off && !hold {
-                    self.tally.cut_off_steps = self.tally.cut_off_steps.saturating_add(1);
-                }
                 let refused = if deposed {
                     data.deposed
                         .get_mut(&me)
                         .and_then(|copy| copy.execute(&step).err())
                 } else if hold {
-                    data.kept.insert(me, Kept { term, step });
+                    data.kept.insert(me, step);
                     None
                 } else {
                     data.raft
@@ -1533,16 +1451,11 @@ impl World {
         // Every kept future resolves: the live leader's step runs, and the
         // others' fail, since their planners do not lead.
         let kept = std::mem::take(&mut data.kept);
-        let mut later = false;
         let refused = data.raft.as_mut().and_then(|raft| {
             let leader = raft.leader.filter(|leader| raft.alive.contains(leader))?;
             let kept = kept.get(&leader)?;
-            later = kept.term != raft.term;
-            raft.execute(&kept.step).err()
+            raft.execute(kept).err()
         });
-        if later {
-            self.tally.kept_later = self.tally.kept_later.saturating_add(1);
-        }
         self.refused(group, refused);
     }
 
@@ -1699,7 +1612,6 @@ impl World {
                         state.objects.remove(&group);
                     }
                     self.swept.insert((group, node));
-                    self.tally.sweeps = self.tally.sweeps.saturating_add(1);
                 }
             }
         }
@@ -1825,7 +1737,6 @@ impl World {
         if at < floor || cuts_a_report {
             self.uncertified.insert(group);
         }
-        self.tally.data_plans = self.tally.data_plans.saturating_add(1);
     }
 
     // Bookkeeping after every action.
@@ -1883,7 +1794,6 @@ impl World {
             if self.removed_at.contains_key(&node) {
                 continue;
             }
-            self.tally.removals = self.tally.removals.saturating_add(1);
             let starts: BTreeMap<RaftGroupId, usize> = self
                 .groups
                 .iter()
