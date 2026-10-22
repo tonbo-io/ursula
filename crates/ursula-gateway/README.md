@@ -54,9 +54,14 @@ identifies the Raft leader.
   for 10 s. Each failure after a window ejects it again for twice as long,
   up to 60 s. Failures of requests that were already in flight do not
   lengthen a window. An upstream that sends no response headers within
-  `--response-header-timeout` is not ejected, because one slow Raft group on
-  a live node does the same. A node that vanished fails within
-  `--upstream-tcp-user-timeout` instead.
+  `--response-header-timeout` is ejected too: a leader that lost its quorum
+  answers a write within its leader lease, so a missing answer mostly marks
+  a node that does not answer at all, such as a stopped process. A live node
+  can still hold a request longer (a write waiting for its group's first
+  open, a read forwarded to an unreachable leader, a snapshot commit of many
+  parts) and is then ejected although it is healthy. It comes back with its
+  next answer. A node that vanished fails within
+  `--upstream-tcp-user-timeout`.
 - **Probe.** When a window expires, the next request that selects the
   upstream, along a cached route, at random, or as a search hop after a
   leader redirect, probes it. The other requests
@@ -153,6 +158,19 @@ alone in `x-ursula-raft-group`:
 - When no upstream answers without redirecting within these limits, the
   client gets `503` with `Retry-After: 1`, as from a node whose group has no
   known leader.
+- A hop that gets no response headers within `--response-header-timeout` may
+  have delivered the request to a node that accepted it and never answers. A
+  read (`GET`, `HEAD`) and a producer append (a `POST` to a stream with
+  `Producer-Id`, `Producer-Epoch` and `Producer-Seq`) go on, once, to an
+  upstream the request has not tried and that is not ejected, which answers
+  or redirects to the current leader. That search starts its own 5 s
+  redirect deadline. A producer append's key applies it at most once, but
+  the first node may still apply it, so only a `2xx` receipt of the repeat
+  reaches the client, and any other ending is the `504 UPSTREAM_TIMEOUT` of
+  the first hop. The repeat never goes back to the upstream that answered
+  nothing, though a redirect names it, as a stopped leader's peers do until
+  they elect another. Any other write, a keyed `DELETE` included, gets the
+  `504` at once: sent again, it could apply twice.
 
 Gateways before 0.7.3 followed one redirect, to a configured upstream only,
 and passed any other on to the client with a path-only `Location`.
@@ -489,8 +507,11 @@ curl -N 'http://127.0.0.1:8080/demo/hello?offset=-1&live=sse'
 
 --response-header-timeout <SECONDS>
     Timeout for sending the upstream request and receiving response headers.
-    Streamed response bodies such as SSE live reads are not covered.
-    Defaults to 30.
+    Streamed response bodies such as SSE live reads are not covered, and a
+    long-poll gets its own timeout plus 2 s. An upstream that answers nothing
+    within it is ejected, and a read or a producer append goes on to another
+    upstream (see Redirects). Keep it under the clients' timeouts and above
+    a node's 3 s leader lease. Defaults to 5. 0.9 used 30.
 
 --connect-timeout <SECONDS>
     TCP connect timeout per upstream request attempt. Defaults to 5.

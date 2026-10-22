@@ -114,6 +114,19 @@ pub(crate) fn write_answer_lost() -> GroupEngineError {
     GroupEngineError::Infra(GroupInfraError::OutcomeUnknown)
 }
 
+/// A write RaftCore took while this replica led, whose leadership lapsed
+/// before the write was answered ([`crate::leadership::until_lapsed`]): the
+/// entry may be in the log of a quorum and commit through a newer leader, or
+/// commit here once the leader hears from its peers again, so its outcome is
+/// unknown and its key resolves it.
+pub(crate) fn write_outlived_leadership<T>() -> Result<T, GroupEngineError> {
+    tracing::debug!("a lapsed leader stopped waiting for a write it proposed");
+    Err(unknown_leader(
+        LeadershipReason::QuorumUnconfirmed,
+        Proposal::MayHaveCommitted,
+    ))
+}
+
 /// Map OpenRaft's refusal of a proposed write (RT1). OpenRaft forwards a
 /// write only before it appends the entry: on a replica that does not lead,
 /// a leader whose quorum lease expired, or one that is handing its

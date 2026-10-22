@@ -1127,10 +1127,16 @@ impl RaftGroupEngine {
         // message back unsent: nothing was proposed.
         request.await.map_err(openraft_error::write_not_submitted)?;
         // RaftCore took the command: a group that stops now may already
-        // have committed it, and applies it after repair.
-        let answer = complete
-            .await
-            .map_err(|_closed| openraft_error::write_answer_lost())?;
+        // have committed it, and applies it after repair. A leader that
+        // lapses meanwhile may never answer it.
+        let lease = crate::leadership::leader_lease(self.raft.config());
+        let answer = crate::rt::select! {
+            biased;
+            answer = complete => answer.map_err(|_closed| openraft_error::write_answer_lost())?,
+            () = crate::leadership::until_lapsed(self.raft.metrics(), self.fence(), lease) => {
+                return openraft_error::write_outlived_leadership();
+            }
+        };
         match answer {
             Ok(response) => write_result_from_raft_response(response.data, expected)?,
             Err(refusal) => Err(openraft_error::client_write_refusal(
@@ -1323,7 +1329,7 @@ impl RaftGroupEngine {
         tracing::debug!(operation, "OpenRaft read has to run on the leader");
         let leadership = self.leadership();
         leadership_refusal(
-            LeadershipReason::Follower,
+            leadership.refusal_reason(),
             Proposal::NotProposed,
             self.raft.current_leader().await,
             &leadership,
@@ -1398,9 +1404,18 @@ impl RaftGroupEngine {
 
     /// Where this follower forwards a leader RPC, when it knows the leader
     /// and `raft.peers` lists it. A leader that `raft.peers` does not list
-    /// gets nothing forwarded and no redirect.
+    /// gets nothing forwarded and no redirect. A replica that names itself
+    /// leader but does not lead, a lapsed leader ([`LeaderRole::Lapsed`]),
+    /// forwards nowhere: the RPC would come back to it.
+    ///
+    /// [`LeaderRole::Lapsed`]: crate::LeaderRole::Lapsed
     pub(crate) async fn leader_route(&self) -> Option<LeaderRoute> {
-        let leader_id = self.raft.current_leader().await?;
+        let own = self.raft.metrics().borrow_watched().id;
+        let leader_id = self
+            .raft
+            .current_leader()
+            .await
+            .filter(|leader_id| *leader_id != own)?;
         let peer_cluster = self.peer_cluster.clone()?;
         let address = peer_cluster.cluster_url(leader_id)?;
         Some(LeaderRoute {

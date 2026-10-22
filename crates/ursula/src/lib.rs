@@ -531,12 +531,9 @@ impl HttpState {
                 };
                 let seen = raft.leadership();
                 let mut metrics = raft.metrics();
-                let fence = raft.fence().clone();
                 changes.push(Box::pin(async move {
                     while metrics.changed().await.is_ok() {
-                        if ursula_raft::GroupLeadership::of(&metrics.borrow_watched(), &fence)
-                            != seen
-                        {
+                        if raft.leadership() != seen {
                             return;
                         }
                     }

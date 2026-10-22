@@ -1581,9 +1581,14 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
     for service in [&cluster.services[0], &cluster.services[2]] {
         service.pause_replication.store(false, Ordering::SeqCst);
     }
-    // With a quorum again, the same reads answer.
+    // With a quorum again, the same reads answer. The fixture runs no ticks,
+    // so the leader sends a heartbeat only when asked, and a leader whose
+    // lease lapsed starts no read round that would send one: it regains its
+    // lease from the heartbeat asked for here.
     let mut gone = None;
+    let mut last = None;
     for _ in 0..50 {
+        cluster.engines[1].raft.trigger().heartbeat().await.unwrap();
         match cluster.engines[1]
             .read_stream(read_req(stream_id.clone(), 4), placement())
             .await
@@ -1592,11 +1597,17 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
                 gone = Some(error);
                 break;
             }
-            Err(_transient) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(transient) => {
+                last = Some(transient);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             Ok(read) => panic!("a read below the retained offset answered {read:?}"),
         }
     }
-    assert!(gone.is_some(), "the leader's 410 once it reaches a quorum");
+    assert!(
+        gone.is_some(),
+        "the leader's 410 once it reaches a quorum, last {last:?}"
+    );
     cluster.shutdown().await;
 }
 

@@ -297,8 +297,11 @@ pub struct GatewayArgs {
     upstream: Vec<String>,
 
     /// Timeout for sending the upstream request and receiving response headers, in seconds.
-    /// Streamed response bodies such as SSE live reads are not covered by this timeout.
-    #[arg(long, default_value_t = 30)]
+    /// Streamed response bodies such as SSE live reads are not covered by this timeout. An
+    /// upstream that answers nothing within it leaves selection for a while; a read or a
+    /// producer append then goes to another upstream, and any other write is answered `504`.
+    /// Keep it under the clients' own timeouts and above a node's leader lease (3 s).
+    #[arg(long, default_value_t = 5)]
     response_header_timeout: u64,
 
     /// TCP connect timeout per upstream attempt in seconds.

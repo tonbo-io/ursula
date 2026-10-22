@@ -419,10 +419,10 @@ async fn gateway_sends_one_probe_at_a_time() {
     let _frozen = FrozenClock::hold();
     let (silent, mut arrivals) = silent_upstream().await;
     let live = answering_upstream().await;
-    let gateway = Arc::new(Gateway::new(test_config(vec![
-        silent.url.clone(),
-        live.url.clone(),
-    ])));
+    // A header timeout past the probe deadline, as a long-poll's is.
+    let mut config = test_config(vec![silent.url.clone(), live.url.clone()]);
+    config.response_header_timeout = Duration::from_secs(60);
+    let gateway = Arc::new(Gateway::new(config));
     gateway.ejections.failed(&silent.url, Instant::now());
     tokio::time::advance(EJECTION_BASE).await;
     assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
@@ -446,14 +446,19 @@ async fn gateway_sends_one_probe_at_a_time() {
     assert_eq!(gateway.metrics_snapshot().upstream_ejected, 1);
 
     // The probe deadline is the 1 s connect timeout plus the 5 s user
-    // timeout. Past it, the probe no longer holds the others back. The probe
-    // itself gets a 504 at the 5 s header timeout, which ejects nothing.
+    // timeout. Past it, the probe no longer holds the others back.
     tokio::time::advance(Duration::from_secs(6)).await;
     assert_eq!(gateway.metrics_snapshot().upstream_ejected, 0);
+    // At its header timeout the probe ejects the silent upstream again, and
+    // the read goes on to the live one.
+    tokio::time::advance(Duration::from_secs(54)).await;
     let probed = probe.await.expect("probe task");
-    assert_eq!(probed.status(), StatusCode::GATEWAY_TIMEOUT);
-    // The request reached the upstream, which may have applied it.
-    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 0);
+    assert_eq!(probed.status(), StatusCode::OK);
+    let metrics = gateway.metrics_snapshot();
+    assert_eq!(
+        (metrics.upstream_ejections, metrics.upstream_ejected),
+        (1, 1)
+    );
     assert!(arrivals.try_recv().is_err(), "one probe only");
 }
 
@@ -619,9 +624,9 @@ async fn gateway_does_not_eject_an_upstream_for_a_request_it_could_not_build() {
 }
 
 /// A cached leader that accepts the request and never answers is dropped
-/// too. The request may have reached it, so the answer is a 504, not a
-/// retry invitation. The upstream stays in selection: one slow group on a
-/// live node looks the same.
+/// too, and leaves selection as a node that does not answer. The request
+/// may have reached it, and no other upstream is left to send it to, so the
+/// answer is a 504, not a retry invitation.
 #[tokio::test]
 async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let silent = spawn_upstream(
@@ -637,8 +642,204 @@ async fn gateway_drops_a_silent_cached_leader_and_answers_gateway_timeout() {
     let metrics = gateway.metrics_snapshot();
     assert_eq!(metrics.leader_cache_evictions, 1);
     assert_eq!(metrics.leader_cache_entries, 0);
-    assert_eq!(metrics.upstream_ejections, 0);
-    assert_eq!(metrics.upstream_ejected, 0);
+    assert_eq!(metrics.upstream_ejections, 1);
+    assert_eq!(metrics.upstream_ejected, 1);
+}
+
+/// `POST /bucket/stream` with a producer key.
+fn producer_post() -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/bucket/stream")
+        .header(names::PRODUCER_ID, "p")
+        .header(names::PRODUCER_EPOCH, "0")
+        .header(names::PRODUCER_SEQ, "0")
+        .body(Body::from("abc"))
+        .expect("request")
+}
+
+/// Sends `request` through `gateway` and moves the paused clock past one
+/// header timeout of `timeout` once the silent upstream got it.
+async fn through_one_timeout(
+    gateway: &Arc<Gateway>,
+    request: Request<Body>,
+    arrivals: &mut tokio::sync::mpsc::UnboundedReceiver<()>,
+    timeout: Duration,
+) -> AxumResponse {
+    let mut sent = send(gateway, request);
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut sent,
+    )
+    .await;
+    tokio::time::advance(timeout).await;
+    sent.await.expect("request task")
+}
+
+/// A cached leader that accepts a request and never answers, as a stopped
+/// process does: a read and a producer write go on to an upstream they have
+/// not tried, which answers them and becomes the cached route. The silent
+/// one leaves selection. A write without a key may have reached it and
+/// applies twice if sent again, so it gets the `504`, reaches no other
+/// upstream and teaches no route.
+#[tokio::test(start_paused = true)]
+async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() {
+    let _frozen = FrozenClock::hold();
+    let timeout = Duration::from_secs(5);
+    let (silent, mut arrivals) = silent_upstream().await;
+    let live = Scripted::spawn().await;
+    let config = test_config(vec![silent.url.clone(), live.url()]);
+    for (request, status, hits, route) in [
+        (get_stream(), StatusCode::OK, 1, Some(live.url())),
+        (producer_post(), StatusCode::OK, 1, Some(live.url())),
+        (
+            post_path("/bucket/stream"),
+            StatusCode::GATEWAY_TIMEOUT,
+            0,
+            None,
+        ),
+        // A node reads a producer key on an append alone, so a keyed
+        // `DELETE` is a keyless write: a repeat could delete a stream
+        // created again meanwhile.
+        (
+            keyed(Method::DELETE, "/bucket/stream"),
+            StatusCode::GATEWAY_TIMEOUT,
+            0,
+            None,
+        ),
+    ] {
+        let gateway = Arc::new(Gateway::new(config.clone()));
+        gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+        let before = live.hits();
+        let method = request.method().clone();
+
+        let response = through_one_timeout(&gateway, request, &mut arrivals, timeout).await;
+
+        assert_eq!(response.status(), status, "{method}");
+        if status == StatusCode::GATEWAY_TIMEOUT {
+            assert_eq!(
+                error_code_of(response).await,
+                ErrorCode::UpstreamTimeout,
+                "{method}"
+            );
+        }
+        assert_eq!(live.hits().saturating_sub(before), hits, "{method}");
+        let metrics = gateway.metrics_snapshot();
+        assert_eq!(metrics.upstream_ejections, 1, "{method}");
+        assert_eq!(cached_route(&gateway), route, "{method}");
+    }
+}
+
+/// A producer write is sent again once at most, and only a `2xx` receipt of
+/// the repeat answers it: the first upstream may still apply it, so a
+/// refusal of the repeat or a second silent upstream leave its outcome
+/// unknown, a `504`.
+#[tokio::test(start_paused = true)]
+async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
+    let _frozen = FrozenClock::hold();
+    let timeout = Duration::from_secs(5);
+    let (silent, mut arrivals) = silent_upstream().await;
+    let refusing = Scripted::spawn().await;
+    refusing.answers(refusal());
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        silent.url.clone(),
+        refusing.url(),
+    ])));
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+    let response = through_one_timeout(&gateway, producer_post(), &mut arrivals, timeout).await;
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
+    assert_eq!(refusing.hits(), 1);
+
+    let (second, mut second_arrivals) = silent_upstream().await;
+    let live = Scripted::spawn().await;
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        silent.url.clone(),
+        second.url.clone(),
+        live.url(),
+    ])));
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+    let mut sent = send(&gateway, producer_post());
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut sent,
+    )
+    .await;
+    tokio::time::advance(timeout).await;
+    until_reached(
+        async {
+            second_arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut sent,
+    )
+    .await;
+    tokio::time::advance(timeout).await;
+    let response = sent.await.expect("request task");
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
+    assert_eq!(live.hits(), 0);
+    assert_eq!(gateway.metrics_snapshot().upstream_ejections, 2);
+}
+
+/// A keyed write sent again to a node that still names the silent upstream
+/// as leader, as a stopped leader's peers do until they elect another, ends
+/// with the first hop's `504` at once. Following the redirect back would
+/// only wait out the header timeout a second time.
+#[tokio::test(start_paused = true)]
+async fn a_repeat_redirected_back_to_the_silent_upstream_ends_unknown_at_once() {
+    let _frozen = FrozenClock::hold();
+    let timeout = Duration::from_secs(5);
+    let (silent, mut arrivals) = silent_upstream().await;
+    let follower = Scripted::spawn().await;
+    follower.answers(raft_redirect(
+        &format!("{}/bucket/stream", silent.url),
+        HeaderMap::new(),
+    ));
+    let gateway = Arc::new(Gateway::new(test_config(vec![
+        silent.url.clone(),
+        follower.url(),
+    ])));
+    gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
+    let mut sent = send(&gateway, producer_post());
+    until_reached(
+        async {
+            arrivals.recv().await.expect("the upstream is up");
+        },
+        &mut sent,
+    )
+    .await;
+    tokio::time::advance(timeout).await;
+    let response = tokio::select! {
+        response = &mut sent => response.expect("request task"),
+        _again = arrivals.recv() => panic!("the repeat went back to the silent upstream"),
+    };
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
+    assert_eq!(follower.hits(), 1);
+}
+
+/// A `method` request to `path` with a producer key.
+fn keyed(method: Method, path: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header(names::PRODUCER_ID, "p")
+        .header(names::PRODUCER_EPOCH, "0")
+        .header(names::PRODUCER_SEQ, "0")
+        .body(Body::empty())
+        .expect("request")
+}
+
+/// The code of the error answer `response`.
+async fn error_code_of(response: AxumResponse) -> ErrorCode {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the answer's body");
+    ErrorBody::parse(&body).expect("an error body").code
 }
 
 #[test]

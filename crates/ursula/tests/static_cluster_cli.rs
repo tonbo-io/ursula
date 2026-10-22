@@ -5516,6 +5516,14 @@ async fn create_stream(client: &reqwest::Client, procs: &mut Processes, url: &st
 /// Starts `ursula gateway` in front of every node of `nodes`, and answers
 /// it with its URL.
 fn spawn_gateway(binary: &str, nodes: &[MetaNode]) -> (ChildGuard, String) {
+    let upstreams: Vec<String> = nodes.iter().map(MetaNode::url).collect();
+    spawn_gateway_over(binary, &upstreams)
+}
+
+/// Starts `ursula gateway`, with its default timeouts, in front of
+/// `upstreams`, the client URLs of a cluster of [`META_TEST_GROUPS`] groups,
+/// and answers it with its URL.
+fn spawn_gateway_over(binary: &str, upstreams: &[String]) -> (ChildGuard, String) {
     let port = free_port();
     let mut command = Command::new(binary);
     command
@@ -5524,8 +5532,8 @@ fn spawn_gateway(binary: &str, nodes: &[MetaNode]) -> (ChildGuard, String) {
         .arg(format!("127.0.0.1:{port}"))
         .arg("--raft-group-count")
         .arg(META_TEST_GROUPS.to_string());
-    for node in nodes {
-        command.arg("--upstream").arg(node.url());
+    for upstream in upstreams {
+        command.arg("--upstream").arg(upstream);
     }
     let gateway = spawn_child(command, format!("gateway-{port}"));
     (gateway, format!("http://127.0.0.1:{port}"))
@@ -5537,6 +5545,10 @@ enum LoadAnswer {
     Acknowledged,
     /// `503` with `Retry-After`, and the code its error body names.
     Retryable(Option<ursula_headers::ErrorCode>),
+    /// The gateway's `504` `UPSTREAM_TIMEOUT`: the node it sent the write to
+    /// answered nothing within its header timeout, so the write may have
+    /// applied.
+    TimedOut,
     /// Any other status.
     Failed(u16),
     /// No answer within the client's 10 s, or no connection to the gateway.
@@ -5549,14 +5561,16 @@ struct LoadWrite {
     stream: String,
     payload: String,
     answer: LoadAnswer,
+    /// When the write was sent, and how long its answer took.
+    sent: tokio::time::Instant,
+    took: Duration,
 }
 
 /// Appends `{prefix}-{n};` to its streams in turn every 20 ms until
 /// stopped, and keeps every write with how it was answered. Each write
 /// waits at most 10 s for its answer. Once stopped it goes on until it has
-/// an acknowledged write, at most [`LOAD_ACK_GRACE`] longer: a write the
-/// gateway forwarded to a stopped (blackholed) node waits out the client's
-/// timeout, and a move can converge within it.
+/// an acknowledged write, at most [`LOAD_ACK_GRACE`] longer: a move can
+/// converge within it.
 /// How long a stopped [`GatewayLoad`] goes on for its first acknowledged
 /// write: three of the client's 10 s timeouts.
 const LOAD_ACK_GRACE: Duration = Duration::from_secs(30);
@@ -5587,6 +5601,7 @@ impl GatewayLoad {
                         }
                     }
                     let payload = format!("{prefix}-{write};");
+                    let sent_at = tokio::time::Instant::now();
                     let sent = client
                         .post(stream)
                         .header("content-type", "text/plain")
@@ -5595,27 +5610,35 @@ impl GatewayLoad {
                         .await;
                     let answer = match sent {
                         Err(_unanswered) => LoadAnswer::Unanswered,
-                        Ok(response) => match response.status() {
-                            reqwest::StatusCode::NO_CONTENT => LoadAnswer::Acknowledged,
-                            reqwest::StatusCode::SERVICE_UNAVAILABLE
-                                if response
-                                    .headers()
-                                    .contains_key(reqwest::header::RETRY_AFTER) =>
-                            {
-                                let body = response.bytes().await.unwrap_or_default();
-                                LoadAnswer::Retryable(
-                                    ursula_headers::ErrorBody::parse(&body)
-                                        .ok()
-                                        .map(|body| body.code),
-                                )
+                        Ok(response) => {
+                            let status = response.status();
+                            let retry = response
+                                .headers()
+                                .contains_key(reqwest::header::RETRY_AFTER);
+                            let body = response.bytes().await.unwrap_or_default();
+                            let code = ursula_headers::ErrorBody::parse(&body)
+                                .ok()
+                                .map(|body| body.code);
+                            match status {
+                                reqwest::StatusCode::NO_CONTENT => LoadAnswer::Acknowledged,
+                                reqwest::StatusCode::SERVICE_UNAVAILABLE if retry => {
+                                    LoadAnswer::Retryable(code)
+                                }
+                                reqwest::StatusCode::GATEWAY_TIMEOUT
+                                    if code == Some(ursula_headers::ErrorCode::UpstreamTimeout) =>
+                                {
+                                    LoadAnswer::TimedOut
+                                }
+                                status => LoadAnswer::Failed(status.as_u16()),
                             }
-                            status => LoadAnswer::Failed(status.as_u16()),
-                        },
+                        }
                     };
                     writes.push(LoadWrite {
                         stream: stream.clone(),
                         payload,
                         answer,
+                        sent: sent_at,
+                        took: sent_at.elapsed(),
                     });
                     tokio::time::sleep(Duration::from_millis(20)).await;
                 }
@@ -5634,16 +5657,16 @@ impl GatewayLoad {
     }
 }
 
-/// Asserts that the gateway answered each of `writes` with `204` or with a
-/// `503` and `Retry-After`, or left it unanswered when `unanswered` allows
-/// that, and acknowledged some.
-fn assert_only_retryable(writes: &[LoadWrite], unanswered: bool) {
+/// Asserts that the gateway answered each of `writes` within the client's
+/// timeout, with `204` or with a `503` and `Retry-After`, or with its `504`
+/// when `timed_out` allows that, and acknowledged some.
+fn assert_only_retryable(writes: &[LoadWrite], timed_out: bool) {
     let failed: Vec<&LoadWrite> = writes
         .iter()
         .filter(|write| match write.answer {
             LoadAnswer::Acknowledged | LoadAnswer::Retryable(_) => false,
-            LoadAnswer::Unanswered => !unanswered,
-            LoadAnswer::Failed(_) => true,
+            LoadAnswer::TimedOut => !timed_out,
+            LoadAnswer::Failed(_) | LoadAnswer::Unanswered => true,
         })
         .collect();
     assert!(
@@ -5702,7 +5725,7 @@ async fn check_load_read(client: &reqwest::Client, stream: &str, writes: &[LoadW
                     .is_some_and(|code| ursula_headers::write_outcome::proves_refusal(503, code)),
                 "{stream} holds {token:?}, whose {code:?} proves it applied nothing"
             ),
-            LoadAnswer::Failed(_) | LoadAnswer::Unanswered => {}
+            LoadAnswer::TimedOut | LoadAnswer::Failed(_) | LoadAnswer::Unanswered => {}
         }
     }
     assert_eq!(
@@ -5794,10 +5817,11 @@ async fn wait_leaders_settle(
 ///    killed for the first group and stopped (`SIGSTOP`, a blackhole) for
 ///    the second, before the load starts. With it dead, the gateway answers
 ///    every write `204` or a `503` with `Retry-After`. With it stopped, a
-///    write the gateway sends it waits longer than the load's 10 s, which
-///    the test allows, so that leg claims only that no write gets another
-///    status. Each stream holds every acknowledged write once, in order, and
-///    no write whose `503` code proves it applied nothing. A leader that
+///    write the gateway sends it gets the gateway's `504` at its header
+///    timeout, well within the load's 10 s, and its outcome is unknown: no
+///    write goes unanswered. Each stream holds every acknowledged write
+///    once, in order, and no write whose `503` code proves it applied
+///    nothing. A leader that
 ///    hands off only to the dead or stopped voter, or a proven refusal that
 ///    applied, fails it.
 /// 5. Node 4, a meta learner, restarts with its meta snapshot record
@@ -9470,6 +9494,412 @@ impl Drop for Relay {
     }
 }
 
+/// A port that accepts every connection and never answers on it, as a peer
+/// behind a blackhole does.
+struct Sink {
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Sink {
+    async fn start() -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the sink");
+        let port = listener.local_addr().expect("sink address").port();
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        Self { port, task }
+    }
+}
+
+impl Drop for Sink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The relays of a split-plane cluster: each node dials each peer's cluster
+/// plane through a relay of its own, keyed by `(from, to)`, so one node can
+/// be cut off from its peers, both ways, while its client plane serves.
+struct PeerRelays(BTreeMap<(u64, u64), Relay>);
+
+impl PeerRelays {
+    async fn start(planes: &[SplitPlanePorts]) -> Self {
+        let mut relays = BTreeMap::new();
+        for from in planes {
+            for to in planes.iter().filter(|to| to.node_id != from.node_id) {
+                relays.insert((from.node_id, to.node_id), Relay::start(to.cluster).await);
+            }
+        }
+        Self(relays)
+    }
+
+    /// The URL node `from` dials node `to`'s cluster plane at.
+    fn url(&self, from: u64, to: u64) -> String {
+        self.0
+            .get(&(from, to))
+            .unwrap_or_else(|| panic!("a relay from node {from} to node {to}"))
+            .url()
+    }
+
+    /// Cuts node `id` off from its peers: its relays and theirs to it go to
+    /// `sink`, and their open connections close.
+    fn cut(&self, id: u64, sink: &Sink) {
+        for ((from, to), relay) in &self.0 {
+            if *from == id || *to == id {
+                relay.point(sink.port, Open::Closed);
+            }
+        }
+    }
+
+    /// Reconnects every node to its peers.
+    fn heal(&self, planes: &[SplitPlanePorts]) {
+        for ((_, to), relay) in &self.0 {
+            let plane = planes
+                .iter()
+                .find(|plane| plane.node_id == *to)
+                .expect("the relay's node");
+            relay.point(plane.cluster, Open::Closed);
+        }
+    }
+}
+
+/// The node among `among` of `planes` whose replica of `group` leads it with
+/// a quorum that acknowledged it within the last 3 s.
+async fn live_leader(
+    client: &reqwest::Client,
+    planes: &[SplitPlanePorts],
+    among: &[u64],
+    group: u64,
+) -> Result<u64, String> {
+    let mut seen = Vec::new();
+    for plane in planes.iter().filter(|plane| among.contains(&plane.node_id)) {
+        let replica = try_node_metrics(client, &plane.client_url())
+            .await?
+            .groups
+            .into_iter()
+            .find(|replica| replica.raft_group_id == group);
+        match replica {
+            Some(replica)
+                if replica.current_leader == Some(plane.node_id) && replica.leads_live =>
+            {
+                return Ok(plane.node_id);
+            }
+            other => seen.push(format!("node {}: {other:?}", plane.node_id)),
+        }
+    }
+    Err(format!("no live leader of group {group}: {seen:?}"))
+}
+
+/// The longest a node takes to answer a write while it cannot reach a
+/// quorum: its leader lease (3 s), the wake-up after it and a margin for a
+/// loaded runner, well within the client's 10 s.
+const LAPSED_LEADER_ANSWERS_WITHIN: Duration = Duration::from_secs(6);
+
+/// The longest a write takes through the gateway when the node it sends the
+/// write to is stopped: the gateway's 5 s header timeout, the repeat on
+/// another node and a margin, within the client's 10 s.
+const STOPPED_LEADER_ANSWERS_WITHIN: Duration = Duration::from_secs(8);
+
+/// One attempt of a [`ProducerLoad`].
+#[derive(Debug, Clone)]
+struct ProducerAttempt {
+    seq: u64,
+    sent: tokio::time::Instant,
+    took: Duration,
+    outcome: ursula_headers::write_outcome::WriteOutcome,
+}
+
+/// Appends `{prefix}-{seq};` to a stream as producer `prefix` at epoch 0,
+/// one write at a time, every 20 ms until stopped. A write whose answer does
+/// not say that it holds is sent again with the same seq and payload, as a
+/// producer client does, so the stream holds each seq once and in order.
+struct ProducerLoad {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<ProducerAttempt>>,
+}
+
+impl ProducerLoad {
+    fn start(stream: String, prefix: &'static str) -> Self {
+        use ursula_headers::names;
+        use ursula_headers::write_outcome::WriteKind;
+        use ursula_headers::write_outcome::WriteOutcome;
+        use ursula_headers::write_outcome::classify;
+
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let client = bounded_client();
+                let mut attempts: Vec<ProducerAttempt> = Vec::new();
+                let mut seq = 0_u64;
+                while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                    let sent = tokio::time::Instant::now();
+                    let answer = client
+                        .post(&stream)
+                        .header("content-type", "text/plain")
+                        .header(names::PRODUCER_ID, prefix)
+                        .header(names::PRODUCER_EPOCH, "0")
+                        .header(names::PRODUCER_SEQ, seq.to_string())
+                        .body(format!("{prefix}-{seq};"))
+                        .send()
+                        .await;
+                    let outcome = match answer {
+                        Err(_unanswered) => WriteOutcome::NO_ANSWER,
+                        Ok(response) => {
+                            let status = response.status().as_u16();
+                            let headers = response.headers().clone();
+                            let body = response.bytes().await.unwrap_or_default();
+                            classify(
+                                WriteKind::Producer,
+                                status,
+                                headers
+                                    .iter()
+                                    .map(|(name, value)| (name.as_str(), value.as_bytes())),
+                                &body,
+                            )
+                        }
+                    };
+                    let holds = outcome.holds();
+                    attempts.push(ProducerAttempt {
+                        seq,
+                        sent,
+                        took: sent.elapsed(),
+                        outcome,
+                    });
+                    if holds {
+                        seq = seq.saturating_add(1);
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                attempts
+            })
+        };
+        Self { stop, task }
+    }
+
+    /// Stops the load once its write in flight answered, and answers every
+    /// attempt.
+    async fn stop(self) -> Vec<ProducerAttempt> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.task.await.expect("the producer load ends")
+    }
+}
+
+/// A group's leader that its peers cannot reach, or that answers nothing at
+/// all, holds no write until the client gives up. Three nodes split their
+/// planes, and each reaches each peer's cluster plane through a relay of its
+/// own ([`PeerRelays`]).
+///
+/// 1. The leader of a group is cut off from its peers, both ways, into a
+///    port that never answers, while its client plane serves. Under a load
+///    sent to it and one through a gateway, its peers elect a new leader.
+///    It answers every write within [`LAPSED_LEADER_ANSWERS_WITHIN`]: a
+///    write it proposed before the cut, which may still commit, `503
+///    OUTCOME_UNKNOWN` once its leader lease ends, and later ones `503
+///    NO_LEADER`. Through the gateway every write is answered as promptly,
+///    and the new leader acknowledges writes while the cut lasts. Once it
+///    heals, each stream holds every acknowledged write once, in order, and
+///    no write whose `503` proves it applied nothing. A leader that holds
+///    writes for as long as it cannot reach a quorum fails it.
+/// 2. The group's leader is stopped (`SIGSTOP`) under a producer load
+///    through the gateway. A write sent to it gets no answer within the
+///    gateway's 5 s header timeout, and the gateway sends it again, with
+///    its key, to another node, which answers it from the new leader, or,
+///    while its peers still name the stopped node, ends with the `504` of
+///    the first hop without going back to it. Every attempt is answered
+///    within [`STOPPED_LEADER_ANSWERS_WITHIN`], a write after the stop
+///    holds, and the stream holds each seq once, in order. A gateway that
+///    waits out the client's timeout on the stopped node fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_timeout() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the cut-off leader test");
+        return;
+    };
+    let planes: Vec<SplitPlanePorts> = (1_u64..=3)
+        .map(|node_id| SplitPlanePorts {
+            node_id,
+            client: free_port(),
+            cluster: free_port(),
+            admin: free_port(),
+        })
+        .collect();
+    let relays = PeerRelays::start(&planes).await;
+    let sink = Sink::start().await;
+    let wal_root = tempfile::tempdir().expect("WAL root");
+    let mut procs = Processes::default();
+    for plane in &planes {
+        let id = plane.node_id;
+        let child = spawn_split_plane_node_dialing(binary, &planes, id, wal_root.path(), |peer| {
+            relays.url(id, peer.node_id)
+        });
+        procs.0.insert(id, child);
+    }
+    let client = bounded_client();
+    let all: Vec<u64> = planes.iter().map(|plane| plane.node_id).collect();
+    let upstreams: Vec<String> = planes.iter().map(SplitPlanePorts::client_url).collect();
+    let (_gateway, gateway) = spawn_gateway_over(binary, &upstreams);
+    let group = 0_usize;
+    let group_id = u64::try_from(group).unwrap();
+    let client_url = |id: u64| {
+        planes
+            .iter()
+            .find(|plane| plane.node_id == id)
+            .expect("a node of the cluster")
+            .client_url()
+    };
+
+    // 1. The group's leader is cut off from its peers.
+    let leader = eventually(&mut procs, "the group has a live leader", async || {
+        live_leader(&client, &planes, &all, group_id).await
+    })
+    .await;
+    let direct = format!(
+        "{}/cutdirect/{}",
+        client_url(leader),
+        stream_per_group("cutdirect")[group]
+    );
+    let through = format!(
+        "{gateway}/cutgateway/{}",
+        stream_per_group("cutgateway")[group]
+    );
+    create_stream(&client, &mut procs, &direct).await;
+    create_stream(&client, &mut procs, &through).await;
+    let direct_load = GatewayLoad::start(vec![direct.clone()], "direct");
+    let gateway_load = GatewayLoad::start(vec![through.clone()], "gateway");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let cut = tokio::time::Instant::now();
+    relays.cut(leader, &sink);
+    let others: Vec<u64> = all.iter().copied().filter(|id| *id != leader).collect();
+    let successor = eventually(&mut procs, "the other nodes elect a leader", async || {
+        live_leader(&client, &planes, &others, group_id).await
+    })
+    .await;
+    let elected = tokio::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    let healed = tokio::time::Instant::now();
+    relays.heal(&planes);
+    let direct_writes = direct_load.stop().await;
+    let gateway_writes = gateway_load.stop().await;
+    for (writes, via) in [
+        (&direct_writes, "the cut-off leader"),
+        (&gateway_writes, "the gateway"),
+    ] {
+        assert_only_retryable(writes, false);
+        let slow: Vec<&LoadWrite> = writes
+            .iter()
+            .filter(|write| write.took >= LAPSED_LEADER_ANSWERS_WITHIN)
+            .collect();
+        assert!(slow.is_empty(), "{via} answered writes late: {slow:?}");
+    }
+    // A write the cut-off leader proposed in the cut, sent to it directly or
+    // through the gateway, ends `OUTCOME_UNKNOWN` once its lease ends
+    // (`until_lapsed` of ursula-raft), before the heal. A write queued behind
+    // it was never proposed and ends `NO_LEADER`, and so does every later
+    // one, at the front door before its body.
+    let answered_at = |write: &LoadWrite| write.sent.checked_add(write.took);
+    let in_cut = |write: &&LoadWrite| {
+        write.sent < healed && answered_at(write).is_some_and(|answered| answered >= cut)
+    };
+    let unknown = LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::OutcomeUnknown));
+    let refused = LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::NoLeader));
+    assert!(
+        direct_writes
+            .iter()
+            .chain(gateway_writes.iter())
+            .filter(in_cut)
+            .any(|write| write.answer == unknown
+                && answered_at(write).is_some_and(|answered| answered < healed)),
+        "node {leader} ended no write it proposed in the cut as unknown before the heal: \
+         {direct_writes:?} {gateway_writes:?}"
+    );
+    let mut direct_in_cut = direct_writes
+        .iter()
+        .filter(in_cut)
+        .skip_while(|write| write.answer == LoadAnswer::Acknowledged);
+    let held = direct_in_cut.next().unwrap_or_else(|| {
+        panic!("node {leader} refused no write while cut off: {direct_writes:?}")
+    });
+    assert!(
+        (held.answer == unknown || held.answer == refused)
+            && answered_at(held).is_some_and(|answered| answered < healed),
+        "node {leader}'s first unacknowledged write in the cut: {held:?}"
+    );
+    let not_refused: Vec<&LoadWrite> = direct_in_cut
+        .filter(|write| write.answer != refused)
+        .collect();
+    assert!(
+        not_refused.is_empty(),
+        "node {leader} answered writes after its lease ended other than NO_LEADER: \
+         {not_refused:?}"
+    );
+    assert!(
+        gateway_writes.iter().any(|write| write.sent >= elected
+            && write.sent < healed
+            && write.answer == LoadAnswer::Acknowledged),
+        "node {successor} acknowledged no write through the gateway while node {leader} was \
+         cut off: {gateway_writes:?}"
+    );
+    check_load_read(&client, &direct, &direct_writes).await;
+    check_load_read(&client, &through, &gateway_writes).await;
+
+    // 2. The group's leader is stopped.
+    let leader = eventually(
+        &mut procs,
+        "the group has a live leader again",
+        async || live_leader(&client, &planes, &all, group_id).await,
+    )
+    .await;
+    let stream = format!("{gateway}/stopped/{}", stream_per_group("stopped")[group]);
+    create_stream(&client, &mut procs, &stream).await;
+    let load = ProducerLoad::start(stream.clone(), "stopped");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let stopped = tokio::time::Instant::now();
+    procs.signal(leader, "-STOP");
+    let others: Vec<u64> = all.iter().copied().filter(|id| *id != leader).collect();
+    eventually(&mut procs, "the other nodes elect a leader", async || {
+        live_leader(&client, &planes, &others, group_id).await
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    let attempts = load.stop().await;
+    procs.signal(leader, "-CONT");
+    let slow: Vec<&ProducerAttempt> = attempts
+        .iter()
+        .filter(|attempt| attempt.took >= STOPPED_LEADER_ANSWERS_WITHIN)
+        .collect();
+    assert!(slow.is_empty(), "writes answered late: {slow:?}");
+    let held = attempts
+        .iter()
+        .find(|attempt| attempt.sent >= stopped && attempt.outcome.holds())
+        .unwrap_or_else(|| panic!("no write after node {leader} stopped holds: {attempts:?}"));
+    let acknowledged: Vec<String> = (0..=held.seq)
+        .map(|seq| format!("stopped-{seq};"))
+        .collect();
+    let read = read_until_holding(
+        &client,
+        &format!("{stream}?offset=0&max_bytes=8388608"),
+        &acknowledged,
+    )
+    .await;
+    let held: Vec<String> = String::from_utf8_lossy(&read)
+        .split(';')
+        .filter(|token| !token.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let in_order: Vec<String> = (0..held.len())
+        .map(|seq| format!("stopped-{seq}"))
+        .collect();
+    assert_eq!(held, in_order, "the stream holds each seq once, in order");
+}
+
 /// Appends to a stream every 20 ms until stopped, keeping each write that
 /// was acknowledged.
 struct WriteLoad {
@@ -9894,6 +10324,20 @@ fn spawn_split_plane_node(
     node_id: u64,
     wal_root: &Path,
 ) -> ChildGuard {
+    spawn_split_plane_node_dialing(binary, planes, node_id, wal_root, |plane| {
+        plane.cluster_url()
+    })
+}
+
+/// [`spawn_split_plane_node`], whose node dials each peer's cluster plane
+/// at `cluster_url(peer)` and its own at its cluster port.
+fn spawn_split_plane_node_dialing(
+    binary: &str,
+    planes: &[SplitPlanePorts],
+    node_id: u64,
+    wal_root: &Path,
+    cluster_url: impl Fn(&SplitPlanePorts) -> String,
+) -> ChildGuard {
     use std::fmt::Write;
 
     let own = planes
@@ -9926,15 +10370,19 @@ backend = "memory"
         wal = node_wal_dir(wal_root, node_id).display(),
     );
     for plane in planes {
+        let url = if plane.node_id == node_id {
+            plane.cluster_url()
+        } else {
+            cluster_url(plane)
+        };
         writeln!(
             config,
             r#"
 [[raft.peers]]
 node_id = {}
-url = "{}"
+url = "{url}"
 client_url = "{}""#,
             plane.node_id,
-            plane.cluster_url(),
             plane.client_url()
         )
         .unwrap();

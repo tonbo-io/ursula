@@ -26,7 +26,6 @@ use openraft::LinearizerOption;
 use openraft::Raft;
 use openraft::ReadPolicy;
 use openraft::alias::LogIdOf;
-use openraft::rt::WatchReceiver;
 use openraft::storage::RaftStateMachine;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::LeadershipReason;
@@ -156,7 +155,7 @@ async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     raft: &Raft<UrsulaRaftTypeConfig, SM>,
     fence: &ursula_runtime::NodeFence,
 ) -> Outcome {
-    if !GroupLeadership::of(&raft.metrics().borrow_watched(), fence).leads() {
+    if !GroupLeadership::of_raft(raft, fence).leads() {
         return Ok(None);
     }
     let budget = Duration::from_millis(raft.config().election_timeout_min);
@@ -168,7 +167,7 @@ async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
             group_engine_linearizable_read_error(
                 err,
                 OPERATION,
-                &GroupLeadership::of(&raft.metrics().borrow_watched(), fence),
+                &GroupLeadership::of_raft(raft, fence),
             )
         })?;
     let read_log_id = *linearizer.read_log_id().log_id();
