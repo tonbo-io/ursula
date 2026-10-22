@@ -1790,26 +1790,42 @@ fn recovery_restores_a_missing_initialized_flag() {
 
         let writer = CoreFileLogWriter::open(core.dir.clone(), core.options(0, node_recovery))
             .expect("open the core writer");
+        // Without metadata every group with a surviving frame recovers, a
+        // group whose only frame is a commit marker too (7.2 of #768).
         assert_eq!(core.store(&writer, 7).log_state(), expected);
-        assert_eq!(core.store(&writer, 9).log_state(), GroupLogState::Empty);
+        assert_eq!(
+            core.store(&writer, 9).log_state(),
+            GroupLogState::Recovering
+        );
         let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
         assert_eq!(metadata.group(7).log, expected);
-        assert_eq!(metadata.group(9).log, GroupLogState::Empty);
+        assert_eq!(metadata.group(9).log, GroupLogState::Recovering);
     }
 }
 
 /// Writes the segment `id` of `core`'s journal holding `records`, each as
 /// `(group, generation, entries)`.
 fn write_generations(core: &Core, id: u64, records: &[(u32, u64, Vec<u64>)]) {
+    let records = records
+        .iter()
+        .map(|(group_id, generation, entries)| {
+            let entries = entries.iter().map(|index| blank_entry(*index)).collect();
+            (*group_id, *generation, RaftGroupLogRecord::Append(entries))
+        })
+        .collect::<Vec<_>>();
+    write_records(core, id, records);
+}
+
+/// Writes the segment `id` of `core`'s journal holding `records`, each as
+/// `(group, generation, record)`.
+fn write_records(core: &Core, id: u64, records: Vec<(u32, u64, RaftGroupLogRecord)>) {
     let mut journal = JournalWriter::open(&core.segment(id), id).expect("segment");
-    for (group_id, generation, entries) in records {
+    for (group_id, generation, record) in records {
         journal
             .append::<WireCodec<CoreJournalRecord>>(&CoreJournalRecord {
-                group_id: *group_id,
-                generation: LogGeneration::new(*generation),
-                record: RaftGroupLogRecord::Append(
-                    entries.iter().map(|index| blank_entry(*index)).collect(),
-                ),
+                group_id,
+                generation: LogGeneration::new(generation),
+                record,
             })
             .expect("append");
     }
@@ -3620,12 +3636,20 @@ fn admission_placement(group: u32) -> ShardPlacement {
 fn write_snapshot_record(wal: &super::RaftWal, group: u32, generation: LogGeneration) {
     let dir = wal.core_dir(admission_placement(group).core_id);
     fs::create_dir_all(&dir).expect("core dir");
+    write_record(
+        &dir.join(super::file::snapshot_record_file(group)),
+        generation,
+    );
+}
+
+/// Writes a snapshot record in `generation` at `path`.
+fn write_record(path: &Path, generation: LogGeneration) {
     let meta = openraft::alias::SnapshotMetaOf::<UrsulaRaftTypeConfig> {
         last_log_id: Some(log_id(4)),
         last_membership: Default::default(),
     };
     fs::write(
-        dir.join(super::file::snapshot_record_file(group)),
+        path,
         crate::state_machine::snapshot_record_bytes(generation, meta, vec![0x91, 0x07]),
     )
     .expect("write the snapshot record");
@@ -3638,13 +3662,13 @@ fn core_metadata(wal: &super::RaftWal, group: u32) -> CoreMetadata {
     .expect("read core metadata")
 }
 
-/// `Open` refuses a group the metadata does not name and a retired log, and
-/// `Create` refuses the retired log too, each before writing anything: the
-/// metadata stays as it was, and an `Open` on core 0, which holds nothing,
-/// leaves no journal there. `Create` of an unknown group opens a fresh log
-/// as before, and `Open` opens a named one. Catches an `Open` that creates,
-/// a refusal that opens (so creates) the core's journal first, or an open
-/// that hands out a retired log.
+/// `Open` refuses a group the metadata does not name and a retired log,
+/// each before writing anything: the metadata stays as it was, and an
+/// `Open` on core 0, which holds nothing, leaves no journal there. `Create`
+/// of an unknown group opens a fresh log as before, and `Open` opens a
+/// named one. Catches an `Open` that creates, a refusal that opens (so
+/// creates) the core's journal first, or an `Open` that hands out a
+/// retired log.
 #[tokio::test]
 async fn an_open_refuses_what_the_journal_does_not_hold() {
     let dir = tempfile::tempdir().unwrap();
@@ -3663,12 +3687,7 @@ async fn an_open_refuses_what_the_journal_does_not_hold() {
         .expect("save a vote");
     drop(named);
     let mut metadata = core_metadata(&wal, 1);
-    metadata.set_group(5, GroupMetadata {
-        vote: None,
-        log: GroupLogState::Retired,
-        recovery: None,
-        generation: LogGeneration::new(1),
-    });
+    metadata.retire(5, LogGeneration::new(1));
     metadata
         .store(&core_metadata_path(&wal.core_dir(CoreId(1))))
         .expect("store metadata");
@@ -3680,7 +3699,6 @@ async fn an_open_refuses_what_the_journal_does_not_hold() {
     let before = core_metadata(&wal, 1);
     for (group, admission) in [
         (5, Admission::Open),
-        (5, Admission::Create),
         (9, Admission::Open),
         (4, Admission::Open),
     ] {
@@ -3717,13 +3735,22 @@ async fn an_open_refuses_what_the_journal_does_not_hold() {
 /// A group the metadata does not name, but whose snapshot record is of its
 /// generation, is held: `Open` opens it, recovering, and the metadata then
 /// names it so. A record of another generation restores nothing and holds
-/// nothing. Catches a repair that ignores the record or its generation.
+/// nothing, and the core's open deletes it. Catches a repair that ignores
+/// the record or its generation, or keeps a record that restores nothing.
 #[tokio::test]
 async fn a_group_known_only_by_its_record_opens_recovering() {
     let dir = tempfile::tempdir().unwrap();
     let wal = admission_wal(dir.path());
+    // Core 2's metadata names group 6 at generation 1 and group 2 at none.
+    let mut metadata = CoreMetadata::default();
+    metadata.adopt_generation(6, LogGeneration::new(1));
+    let core_2 = wal.core_dir(CoreId(2));
+    fs::create_dir_all(&core_2).expect("core dir");
+    metadata
+        .store(&core_metadata_path(&core_2))
+        .expect("store metadata");
     write_snapshot_record(&wal, 2, LogGeneration::FIRST);
-    write_snapshot_record(&wal, 6, LogGeneration::new(1));
+    write_snapshot_record(&wal, 6, LogGeneration::FIRST);
 
     let store = wal
         .open(admission_placement(2), Admission::Open, admission_metrics())
@@ -3733,17 +3760,14 @@ async fn a_group_known_only_by_its_record_opens_recovering() {
         core_metadata(&wal, 2).group(2).log,
         GroupLogState::Recovering
     );
-    assert!(matches!(
-        wal.open(admission_placement(6), Admission::Open, admission_metrics()),
-        Err(super::RaftWalError::NotHeld { .. })
-    ));
+    assert!(
+        !core_2.join(super::file::snapshot_record_file(6)).exists(),
+        "a record of another generation goes at the core's open"
+    );
+    assert!(core_2.join(super::file::snapshot_record_file(2)).exists());
     let other = wal
-        .open(
-            admission_placement(6),
-            Admission::Create,
-            admission_metrics(),
-        )
-        .expect("create over another generation's record");
+        .open(admission_placement(6), Admission::Open, admission_metrics())
+        .expect("open over another generation's record");
     assert_eq!(other.log_state(), GroupLogState::Empty);
 }
 
@@ -3831,4 +3855,428 @@ async fn held_cores_open_and_a_core_that_fails_stays_unknown() {
     assert_eq!(after.get(RaftGroupId(1)), Some(LocalLog::Empty));
     assert_eq!(after.get(RaftGroupId(4)), Some(LocalLog::Empty));
     stop_cleanly(wal).await;
+}
+
+/// A retirement (7.2 of #768) records the group's log retired in the next
+/// generation, with no vote, no log and no plan, and deletes its snapshot
+/// record. It is refused while a store holds the group. The run keeps the
+/// core's writer, so with no store open the group stays listed `Retired`,
+/// an `Open` of it is refused and a second retirement writes nothing. A
+/// `Create` reopens it (7.3) recovering, empty and with no vote in the new
+/// generation, behind a closed gate, and a restart replays none of the
+/// retired frames (`a_reopen_ends_its_batch` in `writer.rs` pins that the
+/// reopen is durable before the new store's first frame). Catches a
+/// retirement that keeps the vote (a removed replica campaigns and deposes
+/// a leader at a re-placement), keeps the log or its record, revives on
+/// restart, or a reopen that opens the gate.
+#[tokio::test]
+async fn a_retired_log_keeps_no_vote_and_reopens_behind_its_gate() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = admission_wal(dir.path());
+    wal.open_held_cores(admission_metrics())
+        .expect("held cores");
+    let placement = admission_placement(1);
+    let group = placement.raft_group_id;
+    let mut store = wal
+        .open(placement, Admission::Create, admission_metrics())
+        .unwrap();
+    append(&mut store, (1..=3).map(blank_entry)).await;
+    store.save_committed(Some(log_id(3))).await.unwrap();
+    store.save_vote(&committed_vote()).await.unwrap();
+    write_snapshot_record(&wal, 1, LogGeneration::FIRST);
+    let record = wal
+        .core_dir(placement.core_id)
+        .join(super::file::snapshot_record_file(1));
+
+    let refused = wal.retire_group(group).await.unwrap_err();
+    assert!(
+        matches!(&refused, super::RetireGroupError::Journal {
+            source: CoreJournalError::GroupAlreadyOpen { .. },
+            ..
+        }),
+        "{refused}"
+    );
+    assert_eq!(
+        core_metadata(&wal, 1).group(1).log,
+        GroupLogState::Initialized
+    );
+    assert!(record.exists());
+    drop(store);
+
+    wal.retire_group(group).await.expect("retire");
+    let retired = GroupMetadata {
+        vote: None,
+        log: GroupLogState::Retired,
+        recovery: None,
+        generation: LogGeneration::new(1),
+    };
+    assert_eq!(core_metadata(&wal, 1).group(1), retired);
+    assert!(!record.exists(), "the retired generation's record goes");
+    assert_eq!(
+        wal.local_groups().unwrap().get(group),
+        Some(LocalLog::Retired)
+    );
+    assert!(matches!(
+        wal.open(placement, Admission::Open, admission_metrics()),
+        Err(super::RaftWalError::NotHeld { .. })
+    ));
+    wal.retire_group(group)
+        .await
+        .expect("a retired log stays as it is");
+    assert_eq!(core_metadata(&wal, 1).group(1), retired);
+
+    let mut reopened = wal
+        .open(placement, Admission::Create, admission_metrics())
+        .expect("reopen the retired log");
+    assert_eq!(reopened.log_state(), GroupLogState::Recovering);
+    assert_eq!(reopened.vote(), None);
+    assert!(log_ids(&reopened).await.is_empty());
+    assert_eq!(
+        reopened.snapshot_record().generation(),
+        LogGeneration::new(1)
+    );
+    let gate = crate::GroupRejoin::durable(1, ursula_shard::RaftTarget::Data(group), &reopened)
+        .await
+        .expect("gate");
+    assert!(!gate.vote_gate_open(), "a reopened log starts gated");
+    let vote = openraft::Vote::new(9, 1);
+    reopened.save_vote(&vote).await.unwrap();
+    assert_eq!(core_metadata(&wal, 1).group(1), GroupMetadata {
+        vote: Some(vote),
+        log: GroupLogState::Recovering,
+        recovery: None,
+        generation: LogGeneration::new(1),
+    });
+    drop((gate, reopened));
+    stop_cleanly(wal).await;
+
+    let wal = admission_wal(dir.path());
+    let mut store = wal
+        .open(placement, Admission::Open, admission_metrics())
+        .expect("open the reopened log");
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+    assert!(log_ids(&store).await.is_empty(), "no retired frame replays");
+    assert_eq!(store.read_committed().await.unwrap(), None);
+    drop(store);
+    stop_cleanly(wal).await;
+}
+
+/// A crash between a retirement and its record's deletion leaves the
+/// retired generation's record: after the reopen it restores nothing, as
+/// the restore reads it, and the core's next open deletes it, while a
+/// record the reopened life wrote stays. Catches a reopen that restores an
+/// earlier life's record, whose objects the owned-object pass may have
+/// deleted, or a core open that deletes the current record.
+#[tokio::test]
+async fn a_record_a_crash_left_after_a_retirement_restores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = admission_wal(dir.path());
+    wal.open_held_cores(admission_metrics())
+        .expect("held cores");
+    let placement = admission_placement(2);
+    let mut store = wal
+        .open(placement, Admission::Create, admission_metrics())
+        .unwrap();
+    append(&mut store, (1..=2).map(blank_entry)).await;
+    drop(store);
+    wal.retire_group(placement.raft_group_id)
+        .await
+        .expect("retire");
+    write_snapshot_record(&wal, 2, LogGeneration::FIRST);
+    let record = wal
+        .core_dir(placement.core_id)
+        .join(super::file::snapshot_record_file(2));
+
+    let reopened = wal
+        .open(placement, Admission::Create, admission_metrics())
+        .expect("reopen");
+    let site = crate::state_machine::RecordSite::Store(reopened.snapshot_record());
+    assert!(
+        crate::state_machine::read_snapshot_record(&site, placement.raft_group_id)
+            .expect("read the record")
+            .is_none(),
+        "the retired generation's record restores nothing"
+    );
+    drop((site, reopened));
+    stop_cleanly(wal).await;
+
+    let wal = admission_wal(dir.path());
+    wal.open_held_cores(admission_metrics())
+        .expect("held cores");
+    assert!(!record.exists(), "the core's open deletes the inert record");
+    write_snapshot_record(&wal, 2, LogGeneration::new(1));
+    stop_cleanly(wal).await;
+    let wal = admission_wal(dir.path());
+    wal.open_held_cores(admission_metrics())
+        .expect("held cores");
+    assert_eq!(
+        crate::state_machine::snapshot_record_generation(&record).expect("the record stays"),
+        LogGeneration::new(1)
+    );
+    stop_cleanly(wal).await;
+}
+
+/// Without metadata each group's generation is the highest among its
+/// frames and its snapshot record (7.2 of #768). Group 7's record of
+/// generation 2, which a reopened life published before `journal.meta` was
+/// lost, makes its frames of generations 0 and 1 dead: the group opens
+/// recovering at generation 2 with an empty log, and its record stays.
+/// Group 5's record of generation 0 is below its frames, restores nothing
+/// and goes. Catches a highest rule that reads frames only, which would
+/// revive a retired life and delete the current record.
+#[tokio::test]
+async fn without_metadata_a_snapshot_record_counts_toward_the_highest_generation() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    write_generations(&core, 1, &[(7, 0, vec![1, 2]), (5, 0, vec![1])]);
+    write_generations(&core, 2, &[(7, 1, vec![3]), (5, 1, vec![1, 2])]);
+    let record = |group| core.dir.join(super::file::snapshot_record_file(group));
+    write_record(&record(7), LogGeneration::new(2));
+    write_record(&record(5), LogGeneration::FIRST);
+    assert!(!core_metadata_path(&core.dir).exists());
+
+    let writer = core.writer();
+    let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
+    assert_eq!(metadata.group(7), GroupMetadata {
+        vote: None,
+        log: GroupLogState::Recovering,
+        recovery: None,
+        generation: LogGeneration::new(2),
+    });
+    assert_eq!(metadata.group(5).generation, LogGeneration::new(1));
+    let seven = core.store(&writer, 7);
+    assert_eq!(seven.log_state(), GroupLogState::Recovering);
+    assert!(log_ids(&seven).await.is_empty());
+    assert_eq!(log_ids(&core.store(&writer, 5)).await, [1, 2]);
+    assert!(record(7).exists());
+    assert!(!record(5).exists(), "a record below the frames goes");
+}
+
+/// A reopened log keeps only its own generation's frames whatever older
+/// frames replay finds: the retired life's segment before it, and that
+/// life's commit, purge and truncate markers after the new life's records,
+/// where reclaim relocates markers (`group_log.rs`). Catches a replay that
+/// applies a dead generation's markers to the live log.
+#[tokio::test]
+async fn a_reopened_log_ignores_the_markers_of_its_retired_life() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    write_records(&core, 1, vec![
+        (
+            7,
+            0,
+            RaftGroupLogRecord::Append((1..=4).map(blank_entry).collect()),
+        ),
+        (7, 0, RaftGroupLogRecord::SaveCommitted(Some(log_id(4)))),
+    ]);
+    write_generations(&core, 2, &[(7, 1, vec![1, 2])]);
+    write_records(&core, 3, vec![
+        (7, 0, RaftGroupLogRecord::Purge(log_id(3))),
+        (7, 0, RaftGroupLogRecord::SaveCommitted(Some(log_id(4)))),
+        (7, 0, RaftGroupLogRecord::TruncateAfter(Some(log_id(1)))),
+    ]);
+    let mut metadata = CoreMetadata::default();
+    assert!(metadata.retire(7, LogGeneration::new(1)));
+    assert!(metadata.reopen(7));
+    metadata
+        .store(&core_metadata_path(&core.dir))
+        .expect("store metadata");
+
+    let writer = core.writer();
+    let mut store = core.store(&writer, 7);
+    assert_eq!(log_ids(&store).await, [1, 2]);
+    assert_eq!(store.read_committed().await.unwrap(), None);
+    assert_eq!(
+        store.get_log_state().await.unwrap().last_purged_log_id,
+        None
+    );
+    assert_eq!(store.log_state(), GroupLogState::Recovering);
+}
+
+/// A retired log keeps no frame, not even one of the generation its
+/// retirement named. Only a reopen whose metadata never became durable
+/// could have written one, before a crash, and no batch replies before its
+/// metadata is durable, so the frame was never acknowledged. The group
+/// opens retired with no log, the segment holding those frames counts as
+/// dead beside the one holding its retired life, and a reopen hands out an
+/// empty log. Catches a replay that keeps them: the group would come back
+/// retired holding a log that pins its segments for good, since a
+/// retirement of a retired log writes nothing, and a reopen would hand the
+/// new store a log it never wrote.
+#[tokio::test]
+async fn a_retired_log_replays_no_frame_of_its_named_generation() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).expect("core dir");
+    write_generations(&core, 1, &[(7, 0, vec![1, 2]), (5, 0, vec![1])]);
+    write_generations(&core, 2, &[(7, 1, vec![1, 2, 3])]);
+    let mut metadata = CoreMetadata::default();
+    assert!(metadata.retire(7, LogGeneration::new(1)));
+    metadata
+        .store(&core_metadata_path(&core.dir))
+        .expect("store metadata");
+
+    let writer = core.writer();
+    assert_eq!(
+        writer.local_logs().unwrap().get(&RaftGroupId(7)),
+        Some(&LocalLog::Retired)
+    );
+    // The writer's thread publishes the dirty segments at the end of each
+    // pass, its startup pass included, so the gauge is read once a pass
+    // answered. Nothing is old enough for this one to rewrite or delete.
+    writer
+        .maintain(
+            crate::rt::time::Instant::now(),
+            std::time::Duration::from_secs(900),
+        )
+        .await
+        .expect("a maintenance pass");
+    assert_eq!(
+        core.metrics.snapshot().wal_dirty_segments,
+        2,
+        "both segments of group 7 hold dead frames"
+    );
+    assert!(matches!(
+        RaftGroupFileLogStore::open(
+            placement(7),
+            core.metrics.group_engine_metrics(),
+            writer.clone(),
+            Admission::Open,
+        ),
+        Err(CoreJournalError::NotHeld { .. })
+    ));
+    let reopened = core.store(&writer, 7);
+    assert_eq!(reopened.log_state(), GroupLogState::Recovering);
+    assert!(log_ids(&reopened).await.is_empty());
+    assert_eq!(log_ids(&core.store(&writer, 5)).await, [1]);
+}
+
+/// A retired generation's frozen archives stay as long as a segment refers
+/// to them, and go with those segments once reclaim deletes them: replay
+/// keeps the archive references of every generation (7.2 of #768). A copy
+/// of the journal that lost `journal.meta` right after the retirement keeps
+/// the retired generation and still finds every archive it refers to.
+/// Catches an archive collected while a segment still refers to it, which
+/// fails the replay that keeps an older generation, or a retired log that
+/// still pins its segments.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_generations_archives_go_with_their_segments() {
+    let core = Core::small(WalFsync::Always);
+    let archives = |dir: &Path| {
+        fs::read_dir(dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("frozen-")
+            })
+            .count()
+    };
+    let churn = async |healthy: &mut Arc<RaftGroupFileLogStore>,
+                       indexes: std::ops::RangeInclusive<u64>| {
+        for index in indexes {
+            append(healthy, [payload_entry(index, 512)]).await;
+            if index % 8 == 0 {
+                healthy
+                    .purge(log_id(index.saturating_sub(4)))
+                    .await
+                    .unwrap();
+            }
+        }
+    };
+    let writer = core.writer();
+    let mut stopped = core.store(&writer, 1);
+    let mut healthy = core.store(&writer, 2);
+    append(&mut stopped, (1..=8).map(|index| payload_entry(index, 700))).await;
+    stopped.save_committed(Some(log_id(8))).await.unwrap();
+    stopped
+        .apply_stop_signal()
+        .store(true, std::sync::atomic::Ordering::Release);
+    churn(&mut healthy, 1..=400).await;
+    assert!(core.metrics.snapshot().wal_stopped_rewritten_bytes > 0);
+    assert!(
+        archives(&core.dir) > 0,
+        "the stopped group's entries are archived"
+    );
+    drop(stopped);
+    writer
+        .retire_group(RaftGroupId(1))
+        .await
+        .expect("retire the stopped group");
+    writer.close().await.unwrap();
+    drop((healthy, writer));
+
+    let copy = Core::small(WalFsync::Always);
+    fs::create_dir_all(&copy.dir).unwrap();
+    for entry in fs::read_dir(&core.dir).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_owned();
+        if name != "journal.meta" && name != "journal.lock" {
+            fs::copy(&path, copy.dir.join(name)).unwrap();
+        }
+    }
+    // The open replays every reference the copy holds of the retired
+    // generation and fails on an archive that is gone.
+    let copied = copy
+        .open_after(PreviousRun::Absent)
+        .expect("every archive a surviving segment refers to is there");
+    drop(copied);
+
+    let writer = core.writer();
+    let mut healthy = core.store(&writer, 2);
+    churn(&mut healthy, 401..=800).await;
+    writer.close().await.unwrap();
+    assert_eq!(
+        archives(&core.dir),
+        0,
+        "the archives went with their segments"
+    );
+    assert_eq!(log_ids(&healthy).await, (797..=800).collect::<Vec<_>>());
+    let metadata = CoreMetadata::load(&core_metadata_path(&core.dir)).expect("metadata");
+    assert_eq!(metadata.group(1).log, GroupLogState::Retired);
+}
+
+/// An archive is read only for a record of its own generation: a reference
+/// from a record of another generation fails the open as a content defect
+/// and never replays an older life's entries into a later one.
+#[test]
+fn an_archive_of_another_generation_is_a_content_defect() {
+    let core = Core::small(WalFsync::Always);
+    fs::create_dir_all(&core.dir).unwrap();
+    let entry = payload_entry(1, 700);
+    let archive = super::frozen::publish(
+        &core.dir,
+        super::frozen::ArchiveId {
+            group_id: 1,
+            segment: 1,
+            offset: 32,
+            first_index: 1,
+            last_index: 1,
+            content_hash: [0; 32],
+        },
+        LogGeneration::FIRST,
+        vec![entry.clone()],
+    )
+    .unwrap();
+    write_records(&core, 1, vec![(
+        1,
+        1,
+        RaftGroupLogRecord::FrozenAppend(Box::new(super::frozen::FrozenAppend {
+            archive,
+            log_ids: vec![entry.log_id],
+        })),
+    )]);
+    let error = core.open_after(PreviousRun::Absent).unwrap_err();
+    assert!(
+        matches!(&error, CoreJournalError::Journal(error) if matches!(
+            error.as_ref(),
+            JournalError::FrozenArchive {
+                defect: super::ArchiveDefect::Content,
+                ..
+            }
+        )),
+        "{error:?}"
+    );
 }

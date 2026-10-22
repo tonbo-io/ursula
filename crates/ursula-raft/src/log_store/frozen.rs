@@ -149,9 +149,13 @@ pub(crate) fn publish(
     Ok(reference)
 }
 
+/// Reads the archive `reference` names for `group`, from a journal record
+/// of `generation`: an archive of another group, range or generation than
+/// the record that references it is refused ([`ArchiveDefect::Content`]).
 pub(crate) fn read(
     dir: &Path,
     group: u32,
+    generation: LogGeneration,
     reference: &ArchiveRef,
 ) -> Result<Vec<Entry>, JournalError> {
     let path = path(dir, reference.id);
@@ -190,11 +194,8 @@ pub(crate) fn read(
     let RaftGroupLogRecord::Append(entries) = record.record else {
         return Err(defect(ArchiveDefect::Content));
     };
-    // The archive's generation is not compared: the content hash checked
-    // above covers the encoded record, generation included, and a reference
-    // is read only from a record of the group's current generation, so an
-    // archive of another generation never matches it.
     if record.group_id != group
+        || record.generation != generation
         || entries.first().map(|entry| entry.log_id.index) != Some(reference.id.first_index)
         || entries.last().map(|entry| entry.log_id.index) != Some(reference.id.last_index)
     {
@@ -213,6 +214,7 @@ pub(crate) fn read(
 pub(crate) fn selected(
     dir: &Path,
     group: u32,
+    generation: LogGeneration,
     frozen: &FrozenAppend,
 ) -> Result<Vec<Entry>, JournalError> {
     let defect = || JournalError::FrozenArchive {
@@ -227,7 +229,9 @@ pub(crate) fn selected(
     {
         return Err(defect());
     }
-    let mut entries = read(dir, group, &frozen.archive)?.into_iter().peekable();
+    let mut entries = read(dir, group, generation, &frozen.archive)?
+        .into_iter()
+        .peekable();
     let mut selected = Vec::with_capacity(frozen.log_ids.len());
     for expected in &frozen.log_ids {
         while entries

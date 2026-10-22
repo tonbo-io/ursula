@@ -49,7 +49,6 @@ use ursula_raft::UrsulaRaftTypeConfig;
 use ursula_raft::apply_failure::ApplyFault;
 #[cfg(test)]
 use ursula_raft::wal::diagnostics::GroupLogState;
-use ursula_raft::wal::diagnostics::SimDisk;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::CreateStreamRequest;
@@ -205,18 +204,14 @@ fn node_registry(install_timeout: Option<Duration>) -> ursula_raft::RaftGroupHan
     }
 }
 
-/// The object key the snapshot record at `path` names, if the record
-/// exists and names one. A record that is missing names nothing, and any
-/// other failure to read it fails the run, so I1 never reads a node as
-/// naming nothing when its record says otherwise.
+/// The object key the snapshot record at `path` names for a restore, if
+/// the record exists, is of the generation its core's metadata names and
+/// names one. A record that is missing or of a retired generation names
+/// nothing, and any other failure to read it fails the run, so I1 never
+/// reads a node as naming nothing when its record says otherwise.
 fn named_key(path: &Path) -> Option<String> {
-    let bytes = match SimDisk::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-        Err(error) => panic!("read the snapshot record {path:?}: {error}"),
-    };
-    let pointer = ursula_raft::persisted_snapshot_pointer(&bytes)
-        .unwrap_or_else(|error| panic!("the snapshot record {path:?} decodes: {error}"));
+    let pointer = ursula_raft::current_snapshot_pointer(path)
+        .unwrap_or_else(|error| panic!("the snapshot record {path:?} reads: {error}"))?;
     match pointer.location {
         SnapshotLocation::S3 { key, .. } => Some(key),
         SnapshotLocation::Inline { .. } | SnapshotLocation::Local { .. } => None,

@@ -110,14 +110,19 @@ fn core_failure(error: &CoreJournalError) -> WalOpenFailureKind {
         CoreJournalError::Journal(source) => journal_failure(source),
         CoreJournalError::Metadata(source) => state_failure(source),
         CoreJournalError::Locked { .. } => WalOpenFailureKind::Locked,
-        CoreJournalError::GroupAlreadyOpen { .. } => WalOpenFailureKind::DuplicateGroup,
+        // A retirement in flight still holds the group, as an open store
+        // would.
+        CoreJournalError::GroupAlreadyOpen { .. } | CoreJournalError::Retiring { .. } => {
+            WalOpenFailureKind::DuplicateGroup
+        }
         CoreJournalError::NotHeld { .. } => WalOpenFailureKind::NotHeld,
         #[cfg(not(madsim))]
         CoreJournalError::SpawnWriter { .. } => WalOpenFailureKind::Io,
         CoreJournalError::RecordTooLarge(_) | CoreJournalError::InvalidRecord { .. } => {
             WalOpenFailureKind::InvalidRecord
         }
-        CoreJournalError::InconsistentLog { .. } => WalOpenFailureKind::Corrupt,
+        CoreJournalError::InconsistentLog { .. }
+        | CoreJournalError::GenerationsExhausted { .. } => WalOpenFailureKind::Corrupt,
         CoreJournalError::WriterPoisoned { .. } | CoreJournalError::LockPoisoned => {
             WalOpenFailureKind::Poisoned
         }
@@ -209,6 +214,13 @@ mod tests {
             ),
             (
                 CoreJournalError::GroupAlreadyOpen {
+                    journal: "journal".into(),
+                    raft_group_id: placement.raft_group_id,
+                },
+                WalOpenFailureKind::DuplicateGroup,
+            ),
+            (
+                CoreJournalError::Retiring {
                     journal: "journal".into(),
                     raft_group_id: placement.raft_group_id,
                 },
