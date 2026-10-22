@@ -1563,7 +1563,15 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
                 && group.last_log_index.unwrap_or(0) == 0),
         "{other_metrics:?}"
     );
-    let read = client
+    // Its own answer is a refusal: without a placement view it names
+    // another `raft.peers` node (`307 NotHosted`, design 9), or answers
+    // `503`. The cluster id fences Raft traffic, not that hint, so the read
+    // must not follow the redirect, whose target serves the stream.
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client without redirects");
+    let read = no_redirect
         .get(format!(
             "{}/benchcmp/cli-cluster-id?offset=0&max_bytes=64",
             peers[2].1
@@ -1572,6 +1580,13 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
         .await
         .expect("read on node 3");
     let read_status = read.status();
+    assert!(
+        matches!(
+            read_status,
+            reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "node 3 answered its read with {read_status}"
+    );
     let body = read.bytes().await.expect("read body on node 3");
     assert!(
         !body
