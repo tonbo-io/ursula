@@ -66,7 +66,7 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | `wal.lock` | Advisory lock held by the node for the whole run. |
 | `run-state.bin` | Boot id, root device and status of the last run, and the `fsync` policy and recovery epoch of each journal class. |
 | `topology.bin` | Core count, group count, cluster id, node id and root id the root was created with. |
-| `identity.bin` | The run counter of the root, and whether a run read a predecessor that may still run. |
+| `identity.bin` | The run counter of the root, whether a run read a predecessor that may still run, and whether the meta group ever bound the root (`unbound` or `bound`). |
 | `lease.probe` | 8 bytes the disk lease's probe rewrites in place and syncs every second. |
 | `core-N/journal-<seq>.seg` | Journal segments, 20-digit consecutive sequences starting at 1. |
 | `core-N/journal.meta` | Every group's vote, log state and log generation, and the core's verified recovery epoch. |
@@ -94,6 +94,12 @@ every earlier one. A node without a WAL draws a root id per start and runs as
 run 0. A root that holds prior state without `identity.bin` refuses startup,
 since a counter that started again would make a later run read as an earlier
 one, and so does a counter at its last value. An empty disk is the way back.
+A new root is `unbound`. The first answer of the meta group to its
+registration records it `bound` in `identity.bin`, synced, before the run acts
+on that answer, and it stays bound across restarts (see Roots in meta and disk
+replacement in cluster-membership.md). An `identity.bin` written by a 0.10
+development build before this field existed does not decode, and the start
+refuses with the file's read error. An empty disk is the way back there too.
 
 Every segment starts with a 32-byte header, and every record is a frame:
 
@@ -322,7 +328,7 @@ run, its predecessor, and reports it as `predecessor` in `wal_recovery` of
 
 | At open | Predecessor |
 | --- | --- |
-| The root is empty: no core or meta journal holds a record, no core or meta metadata holds a vote, and no snapshot record exists | `may_live` |
+| `identity.bin` records the root `unbound` | `may_live` |
 | `identity.bin` records a predecessor that may live | `may_live` |
 | `clean`, `poisoned`, or `running` on the same boot and device | `gone` |
 | Remounted, host crash, no run state | `may_live` |
@@ -386,11 +392,12 @@ once the fence closed.
 vote (the bootstrap probe vote is still answered), campaigns, takes a
 transfer, starts a recovery gate's drivers or writes a snapshot object: 1.1
 times the longest lease allowed, for clock rates that differ by up to 10%,
-plus 1 s between a lease check and its write. A root that held state waits
-from its open. An empty root owes the wait only once the meta group's first
-answer to its registration binds it in a bootstrapped cluster, and an answer
-before Bootstrap settles it at once, since no data group holds data before
-Bootstrap and a forming meta group must elect. Acknowledging appends is not held: under
+plus 1 s between a lease check and its write. A `bound` root waits from its
+open. An `unbound` root owes the wait only once the meta group's first answer
+to its registration binds it in a bootstrapped cluster, and an answer before
+Bootstrap settles it at once, since no data group holds data before Bootstrap
+and a forming meta group must elect. Until that answer its data replicas are
+held out, after a restart too. Acknowledging appends is not held: under
 `always` they are synced first, and a lossy run under `never` is gated anyway.
 At the end the run clears the wait in `identity.bin`, synced. While a wait is
 owed or the lease does not hold, the node sheds leadership for the `fence`

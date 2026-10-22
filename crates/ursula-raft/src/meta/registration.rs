@@ -2,18 +2,20 @@
 //!
 //! A node registers itself at every start, and again after
 //! [`REREGISTER_AFTER`] without a meta leader, naming the root it runs on
-//! and whether that root was empty when it opened. It retries a refusal
-//! that may pass later and every failure to reach the leader with a capped
-//! back-off, and stops at a permanent refusal
+//! and, as `empty`, whether the meta group never bound that root
+//! (`RootStanding::Unbound`). The first answer is recorded as the root's
+//! binding, `fsync`ed, before it is published ([`RootGuard::bind`]). It
+//! retries a refusal that may pass later and every failure to reach the
+//! leader with a capped back-off, and stops at a permanent refusal
 //! (`ursula_control::ControlError::requeue`). Each answer is published as
 //! the node's [`RegistrationStatus`], which status reports read.
 //!
 //! `OtherRoot` is judged by how the run stands on its root
-//! ([`super::root::RootStanding`], [`judge_answer`]): an unbound empty root,
-//! whose data replicas the node fence holds out until it is bound, is held
-//! out of meta votes too and registers until an operator releases the
-//! slot, so it binds within [`RETRY_MAX`] of the release with no restart,
-//! and a bound root, one that holds state, fences itself for good.
+//! ([`RootStanding`], [`judge_answer`]): an unbound root, whose data
+//! replicas the node fence holds out until it is bound, is held out of meta
+//! votes too and registers until an operator releases the slot, so it
+//! binds within [`RETRY_MAX`] of the release with no restart, and a bound
+//! root, one whose replicas may hold state, fences itself for good.
 //! `NodeRemoved` makes the node treat itself as removed until it restarts.
 
 use std::sync::Arc;
@@ -30,6 +32,7 @@ use ursula_proto::placement::NodeId;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::RootId;
 use ursula_proto::placement::RootSlot;
+use ursula_runtime::node_fence::FenceStatus;
 
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
@@ -37,9 +40,10 @@ use super::pause::MetaPausePoint;
 use super::pause::MetaPauses;
 use super::replica::ActiveMeta;
 use super::root::RootGuard;
-use super::root::RootStanding;
 use crate::RaftGroupHandleRegistry;
+use crate::RaftWalError;
 use crate::RecoveryTransport;
+use crate::log_store::RootStanding;
 use crate::peer_cluster::Supersession;
 use crate::rt::sync::watch;
 
@@ -56,13 +60,12 @@ pub(crate) fn back_off(pause: Duration) -> Duration {
     pause.saturating_mul(2).min(RETRY_MAX)
 }
 
-/// What this node registers: its id, the root it runs on, and whether the
-/// root held no journal record, vote or snapshot record when it opened.
+/// What this node registers: its id and the root it runs on. Whether the
+/// root is `empty` is the guard's standing at each send.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Registrant {
     pub(crate) node: NodeId,
     pub(crate) root: RootId,
-    pub(crate) empty: bool,
 }
 
 /// What the registration does with one answer.
@@ -124,15 +127,33 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
     let mut pause = RETRY_MIN;
     while !stopped() {
         pauses.at(MetaPausePoint::Registration).await;
+        let standing = guard.standing();
         let command = ControlCommand::RegisterNode {
             node: me,
             root: registrant.root,
-            empty: registrant.empty,
+            empty: standing == RootStanding::Unbound,
             now_ms: ursula_runtime::unix_time_ms(),
         };
-        match judge_answer(guard.standing(), handle.submit(command).await) {
+        match judge_answer(standing, handle.submit(command).await) {
             Verdict::Registered(registered) => {
-                guard.bind();
+                // Durable before the answer releases the data replicas.
+                match guard.bind().await {
+                    Ok(()) => {}
+                    Err(RaftWalError::Fenced {
+                        status: FenceStatus::Closed | FenceStatus::Superseded,
+                        ..
+                    }) => return,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %ursula_runtime::ErrorChain(&error),
+                            "meta registration: could not record this root bound; its data \
+                             replicas stay held out and it registers again"
+                        );
+                        crate::rt::time::sleep(pause).await;
+                        pause = back_off(pause);
+                        continue;
+                    }
+                }
                 status.send_replace(RegistrationStatus::Answered(registered));
                 pause = RETRY_MIN;
                 wait_without_leader(&registry, REREGISTER_AFTER).await;
@@ -249,11 +270,11 @@ mod tests {
     use super::judge_answer;
 
     /// Each answer, to each standing on the root: only `OtherRoot` depends
-    /// on it, holding an unbound empty root out and superseding a bound
+    /// on it, holding an unbound root out and superseding a bound
     /// one, whichever slot it names. A transient refusal is retried and a
     /// permanent one ends the registration, for both.
     #[test]
-    fn an_other_root_answer_holds_an_empty_root_out_and_supersedes_a_bound_one() {
+    fn an_other_root_answer_holds_an_unbound_root_out_and_supersedes_a_bound_one() {
         let slots = [
             RootSlot::Bound(samples::root(6)),
             RootSlot::Released(samples::root(5)),

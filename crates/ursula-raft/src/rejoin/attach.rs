@@ -255,7 +255,7 @@ impl RecoveryGate {
     ///
     /// Each driver starts once the fence no longer holds the replica out
     /// ([`crate::predecessor_wait::fence_holds`]): no predecessor wait is
-    /// owed and, for a data replica of an empty root, the meta group bound
+    /// owed and, for a data replica of an unbound root, the meta group bound
     /// the root. So a barrier round, a vote floor and an initialization all
     /// come after the predecessor stopped.
     pub(crate) fn spawn_gate_drivers<SM, T>(

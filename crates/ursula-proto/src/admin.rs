@@ -1131,7 +1131,7 @@ pub enum ServingReadinessReason {
     /// No probe of the WAL disk synced within `raft.wal.lease`: the node
     /// takes part in no Raft traffic until one does.
     DiskLeaseLost,
-    /// The meta group binds this node id to another root than the empty
+    /// The meta group binds this node id to another root than the unbound
     /// one this node runs on: its data replicas grant no vote and keep
     /// their recovery gates closed until an operator releases that root
     /// and the predecessor wait from the binding ends. The placement status

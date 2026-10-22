@@ -1587,7 +1587,7 @@ async fn readiness(State(state): State<HttpState>) -> Response {
     let predecessor_wait = fence
         .as_ref()
         .is_some_and(ursula_runtime::NodeFence::owes_wait);
-    // An empty root under a node id that meta binds to another root.
+    // An unbound root under a node id that meta binds to another root.
     let root_refused = state.meta().status_reader().is_some_and(|reader| {
         matches!(
             reader.registration(),

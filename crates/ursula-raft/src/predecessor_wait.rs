@@ -6,21 +6,25 @@
 //! recovery gate or writes a snapshot object. No successor can read its
 //! predecessor's lease, so each waits out the longest one allowed, with
 //! room for clock rates that differ by [`CLOCK_RATE_BOUND`] and a lease
-//! check that precedes its write by [`CHECK_MARGIN`]. A root that held state
-//! waits from its open. An empty root owes the wait from the meta group's
+//! check that precedes its write by [`CHECK_MARGIN`]. A root that the
+//! meta group bound waits from its open. A root its identity file records
+//! unbound (`RootStanding::Unbound`) owes the wait from the meta group's
 //! first answer to its registration on, once a bootstrapped cluster binds
 //! it, and an answer before Bootstrap settles it at once: no data group
 //! holds data before Bootstrap, and a forming cluster's meta group must
-//! elect. At its end the run records the
-//! wait finished, `fsync`ed, so no later run owes it again, and a restart
-//! during it waits again.
+//! elect. The registration records that answer's binding, `fsync`ed,
+//! before it publishes the answer. At its end the run records the wait
+//! finished, `fsync`ed, so no later run owes it again, and a restart during
+//! it waits again.
 //!
-//! An empty root's data replicas are held out from its open until that
-//! answer and then through the wait ([`fence_holds`]): an empty disk under a
+//! An unbound root's data replicas are held out from its open until that
+//! answer and then through the wait ([`fence_holds`]): a new disk under a
 //! live id grants no data vote and opens no data gate while meta refuses
-//! it, and its floors come from barrier rounds after its predecessor
-//! stopped. Its meta replica waits only for an owed wait, so a forming
-//! cluster's meta group elects before any registration is answered.
+//! it, across restarts, and its floors come from barrier rounds after its
+//! predecessor stopped. A run whose meta replica does not open gets no
+//! answer, so an unbound root's data stays held for that whole run. Its
+//! meta replica waits only for an owed wait, so a forming cluster's meta
+//! group elects before any registration is answered.
 //!
 //! While the fence does not admit Raft traffic or a wait is owed, the node
 //! sheds leadership for [`LeadershipShedReason::Fence`]: none of its groups
@@ -123,8 +127,9 @@ pub async fn run_fence_gate(registry: RaftGroupHandleRegistry, fence: NodeFence)
 
 /// Waits out the predecessor of a run that owes it a wait
 /// ([`crate::RaftWal::predecessor_wait`]), then records the wait finished
-/// and lifts the leadership shed. An empty root's wait starts with the
-/// first answer `registration` publishes. The shutdown ends this task
+/// and lifts the leadership shed. An unbound root's wait starts with the
+/// first answer `registration` publishes, which the registration publishes
+/// only once it recorded the root bound. The shutdown ends this task
 /// before it closes the WAL, and a record after the fence closed is
 /// refused, so no end of a wait is written once a successor may run.
 pub async fn run_predecessor_wait(
@@ -143,11 +148,13 @@ pub async fn run_predecessor_wait(
         WaitFrom::Binding => loop {
             match &*registration.borrow() {
                 RegistrationStatus::Answered(Registered::Forming) => {
+                    // The binding is on disk already.
                     fence.bind(false);
                     break None;
                 }
                 RegistrationStatus::Answered(_) => {
-                    // The wait begins before the data hold ends.
+                    // The binding is on disk already, and the wait begins
+                    // before the data hold ends.
                     fence.bind(true);
                     break Some(fence_now());
                 }
@@ -173,7 +180,7 @@ pub async fn run_predecessor_wait(
         let waited = fence_now().saturating_duration_since(started);
         crate::rt::time::sleep(PREDECESSOR_WAIT.saturating_sub(waited)).await;
     }
-    while let Err(error) = wait.finish() {
+    while let Err(error) = wait.finish().await {
         if let RaftWalError::Fenced {
             status: FenceStatus::Closed | FenceStatus::Superseded,
             ..

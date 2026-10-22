@@ -185,7 +185,7 @@ where
         let guard = RootGuard::new(
             me,
             wal.incarnation().root,
-            wal.empty_at_open(),
+            wal.binding(),
             wal.fence(),
             registry.clone(),
         );
@@ -247,7 +247,6 @@ where
         let registrant = Registrant {
             node: me,
             root: wal.incarnation().root,
-            empty: wal.empty_at_open(),
         };
         let replica_config = MetaReplicaConfig {
             node: config.node,

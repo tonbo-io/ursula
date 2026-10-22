@@ -45,17 +45,19 @@ pub struct SpawnedRuntime {
     /// meta runtime starts with, when the node runs Raft. The server
     /// starts it ([`SpawnedMeta::start`]). A caller that does not start it
     /// runs no meta, and the WAL's shutdown closes the journal. Only meta
-    /// binds a root, so the data replicas of a root that was empty at its
-    /// open then stay held out ([`ursula_runtime::NodeFence::awaits_binding`]).
+    /// binds a root, so the data replicas of a root its identity file
+    /// records unbound then stay held out
+    /// ([`ursula_runtime::NodeFence::awaits_binding`]) for the whole run.
     pub meta: Option<SpawnedMeta>,
 }
 
 #[cfg(test)]
 impl SpawnedRuntime {
-    /// For a test that runs no meta: settles the binding of a root that was
-    /// empty at its open as a forming cluster's answer to its registration
-    /// does, so its data replicas take part. A root that held state is not
-    /// held and is left as it is.
+    /// For a test that runs no meta: settles the binding of an unbound root
+    /// on the fence as a forming cluster's answer to its registration does,
+    /// so its data replicas take part. It records nothing, so the root stays
+    /// unbound on disk and every run of such a test settles it again. A
+    /// bound root is not held and is left as it is.
     pub(crate) fn bind_without_meta(&self) {
         if let Some(wal) = &self.raft_wal {
             wal.fence().bind(false);

@@ -79,6 +79,7 @@ pub(crate) use frozen::ArchiveId;
 pub(crate) use frozen::ArchiveRef;
 #[cfg(test)]
 pub(crate) use frozen::FrozenAppend;
+pub use identity::RootStanding;
 pub use journal::FrameDefect;
 pub use journal::HeaderDefect;
 pub use journal::JournalError;
@@ -135,6 +136,7 @@ pub use state_file::StateFileError;
 pub use state_file::StateFileKind;
 pub(crate) use state_file::replace_file;
 pub use topology::generate_cluster_id;
+pub(crate) use wal::BindingRecord;
 pub use wal::LocalGroups;
 pub use wal::MetaOpenError;
 pub use wal::PredecessorWait;

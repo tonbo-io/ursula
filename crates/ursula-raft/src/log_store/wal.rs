@@ -38,6 +38,7 @@ use crate::log_store::Predecessor;
 use crate::log_store::RaftGroupFileLogStore;
 use crate::log_store::RaftWalError;
 use crate::log_store::RecoveryState;
+use crate::log_store::RootStanding;
 use crate::log_store::WaitFrom;
 use crate::log_store::WalOpening;
 use crate::log_store::WriterExited;
@@ -298,10 +299,15 @@ impl RaftWal {
         })
     }
 
-    /// Whether the root held no journal record, no vote and no snapshot
-    /// record, data or meta, when this run opened it.
-    pub fn empty_at_open(&self) -> bool {
-        self.node.empty()
+    /// How the root stood in meta when this run opened it, as its identity
+    /// file recorded, with the record of its first binding
+    /// ([`BindingRecord`]).
+    pub(crate) fn binding(&self) -> BindingRecord {
+        BindingRecord {
+            standing: self.node.standing(),
+            root: self.root().to_owned(),
+            node: Arc::downgrade(&self.node),
+        }
     }
 
     /// The data journals' fsync policy. The meta journal always runs
@@ -846,9 +852,40 @@ impl PredecessorWait {
     /// Refused while the fence does not admit ([`RaftWalError::Fenced`]),
     /// and for good once the run shut down or its WAL is gone, as by a
     /// closed fence.
-    pub fn finish(&self) -> Result<(), RaftWalError> {
+    pub async fn finish(&self) -> Result<(), RaftWalError> {
         match self.node.upgrade() {
-            Some(node) => node.finish_wait(),
+            Some(node) => node.finish_wait().await,
+            None => Err(RaftWalError::Fenced {
+                root: self.root.clone(),
+                status: ursula_runtime::node_fence::FenceStatus::Closed,
+            }),
+        }
+    }
+}
+
+/// How a run's root stands in meta ([`RaftWal::binding`]): as the identity
+/// file recorded it at start, and the durable record of its first binding.
+/// Like [`PredecessorWait`], it holds neither the root's lock nor any
+/// journal, and it records only through a WAL that still runs.
+#[derive(Debug, Clone)]
+pub(crate) struct BindingRecord {
+    standing: RootStanding,
+    root: PathBuf,
+    node: Weak<NodeWal>,
+}
+
+impl BindingRecord {
+    /// How the root stood in meta when the run opened it.
+    pub(crate) fn standing_at_open(&self) -> RootStanding {
+        self.standing
+    }
+
+    /// Records the root bound, `fsync`ed, unless it is already. Refused
+    /// while the fence does not admit ([`RaftWalError::Fenced`]), and for
+    /// good once the run shut down or its WAL is gone.
+    pub(crate) async fn record_bound(&self) -> Result<(), RaftWalError> {
+        match self.node.upgrade() {
+            Some(node) => node.record_bound().await,
             None => Err(RaftWalError::Fenced {
                 root: self.root.clone(),
                 status: ursula_runtime::node_fence::FenceStatus::Closed,
@@ -1353,9 +1390,10 @@ mod tests {
 
     /// A clean end keeps the root locked until the process lets go of it
     /// (`CleanExit`), whatever still holds the run's WAL, and the run's
-    /// predecessor wait records nothing after it: a record after the end
-    /// would rewrite a successor's identity file. Catches a `record_clean`
-    /// that drops the lock or a wait record that skips the fence check.
+    /// predecessor wait and its binding record nothing after it: a record
+    /// after the end would rewrite a successor's identity file. Catches a
+    /// `record_clean` that drops the lock, or a wait or binding record that
+    /// skips the fence check.
     #[cfg(not(madsim))]
     #[tokio::test]
     async fn a_clean_end_keeps_the_root_locked_and_records_no_wait_after_it() {
@@ -1364,6 +1402,7 @@ mod tests {
         let wal = leased_start(dir.path(), &topology).unwrap();
         // A fresh root owes its wait from its binding.
         let wait = wal.predecessor_wait().expect("a fresh root owes a wait");
+        let binding = wal.binding();
         let held = wal.clone();
         let exit = wal.shutdown().await.unwrap();
         drop(wal);
@@ -1373,7 +1412,15 @@ mod tests {
             Err(RaftWalError::Locked { .. })
         ));
         assert!(matches!(
-            wait.finish(),
+            wait.finish().await,
+            Err(RaftWalError::Fenced {
+                status: ursula_runtime::node_fence::FenceStatus::Closed,
+                ..
+            })
+        ));
+        // Nor is a binding recorded after it.
+        assert!(matches!(
+            binding.record_bound().await,
             Err(RaftWalError::Fenced {
                 status: ursula_runtime::node_fence::FenceStatus::Closed,
                 ..
