@@ -110,6 +110,7 @@ use openraft::alias::LogIdOf;
 use openraft::storage::RaftLogReader;
 use openraft::storage::RaftLogStorage;
 use ursula_config::WalFsync;
+use ursula_ctl::recovery::Floor;
 use ursula_ctl::recovery::LoopState;
 use ursula_ctl::recovery::PlanError;
 use ursula_ctl::recovery::PlanMember;
@@ -747,7 +748,7 @@ async fn recover(
         let point = state.sent.map(|sent| sent.plan.point);
         assert_no_unplanned_leader(cluster, group, loss_term, point, trace, "recovery_planning");
         let members = observe(cluster, group, controls, hidden).await;
-        match next_step(&mut state, &members, MAX_PLANS)? {
+        match next_step(&mut state, &members, &Floor::Seeded, MAX_PLANS)? {
             Step::Done(RecoverOutcome::Satisfied {
                 plan,
                 plans_sent,
@@ -806,7 +807,12 @@ async fn recover(
                         });
                     }
                 }
-                plan_sent(&mut state, plan, sent, &electorate(&plan, &members))?;
+                plan_sent(
+                    &mut state,
+                    plan,
+                    sent,
+                    &electorate(&plan, &members, &Floor::Seeded),
+                )?;
                 fence_probes = fence_probes.saturating_add(
                     assert_fences_only_client_reads(cluster, group, plan.point, trace).await,
                 );
@@ -826,7 +832,12 @@ async fn recover(
                     &members,
                 )
                 .await;
-                plan_sent(&mut state, plan, Ok(sent), &electorate(&plan, &members))?;
+                plan_sent(
+                    &mut state,
+                    plan,
+                    Ok(sent),
+                    &electorate(&plan, &members, &Floor::Seeded),
+                )?;
             }
         }
         if madsim::time::Instant::now() >= deadline {

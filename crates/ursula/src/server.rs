@@ -849,7 +849,16 @@ mod tests {
         let answer = refused(post(meta_url.clone(), mismatched(meta, PlanFloor::Meta)).await);
         assert_eq!(answer.refusal, RecoveryPlanRefusal::StepMismatch);
         assert_eq!((answer.raft_group_id, answer.node_id), (0, 7));
-        let answer = refused(post(meta_url, mismatched(meta, PlanFloor::Seeded)).await);
+        let answer = refused(post(meta_url.clone(), mismatched(meta, PlanFloor::Seeded)).await);
+        assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
+        let certified = PlanFloor::Certified(ursula_proto::placement::MembershipLogId::new(
+            ursula_proto::placement::RaftLogId {
+                term: 2,
+                leader: ursula_proto::placement::NodeId::new(7),
+                index: 3,
+            },
+        ));
+        let answer = refused(post(meta_url, mismatched(meta, certified)).await);
         assert_eq!(answer.refusal, RecoveryPlanRefusal::FloorOtherPlane);
 
         // A committed write in group 0 settles its leader and term before

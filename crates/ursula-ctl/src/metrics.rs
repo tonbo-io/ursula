@@ -631,6 +631,7 @@ pub(crate) fn test_group(
         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
         leads_live: false,
         reconcile: None,
+        needs_vote_floor: false,
     }
 }
 
@@ -1054,7 +1055,8 @@ mod tests {
                         "snapshot_term":null,"snapshot_index":null,"purged_term":null,"purged_index":null,
                         "log_bytes_since_snapshot":0,"log_entries_since_snapshot":0,"last_snapshot_bytes":0,"has_snapshot":false,
                         "apply_failure":null,"history":null,"recovery":null,"recovery_gate":"open","leads_live":false,
-                        "reconcile":null
+                        "reconcile":null,
+                        "needs_vote_floor":false
                     }])
                 }
                 _ => {

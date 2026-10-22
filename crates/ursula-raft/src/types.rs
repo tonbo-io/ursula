@@ -221,6 +221,9 @@ pub struct RaftGroupMetricsSnapshot {
     /// What the replica's membership reconcile shell does, `None` for a
     /// replica that runs none.
     pub reconcile: Option<ursula_proto::placement::ReconcileStatus>,
+    /// The replica lost its vote and holds no vote floor yet, so it refuses
+    /// every recovery plan.
+    pub needs_vote_floor: bool,
 }
 
 impl RaftGroupMetricsSnapshot {
@@ -258,6 +261,7 @@ impl RaftGroupMetricsSnapshot {
             recovery_gate: self.recovery_gate,
             leads_live: self.leads_live,
             reconcile: self.reconcile.clone(),
+            needs_vote_floor: self.needs_vote_floor,
         }
     }
 }

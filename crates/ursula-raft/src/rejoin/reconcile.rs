@@ -280,7 +280,8 @@ fn membership_log_id(log_id: &LogIdOf<C>) -> MembershipLogId {
     })
 }
 
-fn openraft_log_id(log_id: MembershipLogId) -> LogIdOf<C> {
+/// The OpenRaft log id of a data group's membership entry as meta names it.
+pub(super) fn openraft_log_id(log_id: MembershipLogId) -> LogIdOf<C> {
     let log_id = log_id.get();
     LogIdOf::<C> {
         leader_id: <C as openraft::RaftTypeConfig>::LeaderId::new(log_id.term, log_id.leader.get()),

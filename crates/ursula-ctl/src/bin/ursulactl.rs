@@ -614,6 +614,21 @@ fn print_plan_explanation(
             member.committed_voter_configs
         );
     }
+    match explained.floor {
+        ursula_proto::admin::PlanFloor::Meta => println!("  plan floor: meta"),
+        ursula_proto::admin::PlanFloor::Seeded => println!("  plan floor: seeded"),
+        ursula_proto::admin::PlanFloor::Certified(entry) => println!(
+            "  plan floor: certified {entry}, the membership entry the group's last convergence \
+             certified; every replica that holds it keeps it, and the plan's leader holds it"
+        ),
+    }
+    if !explained.without_vote_floor.is_empty() {
+        println!(
+            "  replicas without a vote floor, which the plan neither counts nor is sent to: {:?}; \
+             they rejoin through a live leader's barrier",
+            explained.without_vote_floor
+        );
+    }
     if explained.unreached_voters.is_empty() {
         println!("  every voter answered");
     } else {
