@@ -15,7 +15,9 @@
 //! - I3 ([`I3`]), in its S2 form: every membership a running replica holds
 //!   is its group's seed voters, with no learner.
 //! - The hosting check ([`HOSTED`]): a node runs only the groups it is a
-//!   seed voter of, and none before meta bootstrapped.
+//!   seed voter of, and no node runs one before the view of some running
+//!   node bootstrapped. It does not see whether the placement that created
+//!   a replica was confirmed.
 //!
 //! I1 ([`I1`]), I7 ([`I7`]) and I15 ([`I15`]) are waits the family runs
 //! after its faults: every seed voter reads the acknowledged appends, a

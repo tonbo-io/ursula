@@ -50,8 +50,9 @@ pub trait PlacementInputs: Send + Sync + 'static {
 
 /// A replica's seed role in its group.
 pub trait SeedRole: Send + Sync + 'static {
-    /// The role the local placement shows, unconfirmed: a replica runs the
-    /// bootstrap driver only while it shows `Initializer`.
+    /// The role the local placement shows, unconfirmed. The bootstrap
+    /// driver probes and initializes only while it shows `Initializer`
+    /// ([`Self::may_change`] says when the driver runs).
     fn local_role(&self) -> Option<SeedRoleOf>;
     /// Whether [`Self::local_role`] may change while the replica runs. A
     /// replica whose role may change runs the bootstrap driver until its

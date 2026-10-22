@@ -176,9 +176,10 @@ pub enum Defence {
     /// Off, it runs the data journals' policy, so a power loss under `never`
     /// loses acknowledged meta writes.
     MetaAlwaysSync,
-    /// A data replica's seed role comes from its placement view: only the
-    /// initializer a view shows `Seeded` runs the bootstrap driver, and it
-    /// initializes only on a confirmed view (N3 of design 15.2). Off, the
+    /// A data replica's seed role comes from its placement view: the
+    /// bootstrap driver probes and initializes only while the view shows
+    /// the replica as its `Seeded` group's initializer, and it initializes
+    /// only on a confirmed view (N3 of design 15.2). Off, the
     /// seed role answers `Initializer` for any view, so every seed voter
     /// races to initialize its group.
     InitializeOnlySeeded,
