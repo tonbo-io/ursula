@@ -96,7 +96,7 @@ pub enum ReadinessRefusal {
     #[error("node {node_id} lacks complete maintenance evidence: {report:?}")]
     Maintenance {
         node_id: u64,
-        report: Option<ursula_proto::admin::RaftMaintenanceReport>,
+        report: Option<Box<ursula_proto::admin::RaftMaintenanceReport>>,
     },
     #[error("node {node_id} is not serving (HTTP {status}): {reason:?}")]
     Serving {
@@ -128,7 +128,7 @@ pub fn check_maintenance_snapshot(
         {
             return Err(ReadinessRefusal::Maintenance {
                 node_id: view.node.id,
-                report: view.raft_maintenance.clone(),
+                report: view.raft_maintenance.clone().map(Box::new),
             });
         }
     }

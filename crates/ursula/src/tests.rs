@@ -3236,20 +3236,6 @@ async fn start_durable_cluster(
     nodes
 }
 
-/// Polls `url` until it answers 200, and returns the last status.
-async fn poll_status(client: &reqwest::Client, url: &str) -> StatusCode {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(10))
-        .expect("deadline");
-    loop {
-        let status = client.get(url).send().await.expect("request").status();
-        if status == StatusCode::OK || tokio::time::Instant::now() >= deadline {
-            return status;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
 /// Polls a stream's read through `base` until it holds `expected`.
 async fn poll_payload(
     client: &reqwest::Client,
@@ -3379,11 +3365,38 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
         assert_eq!(stopped.index, poison);
     }
     for (base, node_id) in bases.iter().zip(1..=3u64) {
-        assert_eq!(
-            poll_status(&client, &format!("{base}/__ursula/ready")).await,
-            StatusCode::OK,
-            "node {node_id} keeps serving its other group"
-        );
+        // The stop is the stopped group's only issue, which serving
+        // ignores. These nodes run no meta runtime, so readiness itself
+        // answers `placement_unknown`.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("deadline");
+        loop {
+            let ready: ursula_proto::admin::ServingReadiness = client
+                .get(format!("{base}/__ursula/ready"))
+                .send()
+                .await
+                .expect("readiness")
+                .json()
+                .await
+                .expect("readiness JSON");
+            let report = ready.raft_maintenance.expect("a maintenance report");
+            if report.group_issues
+                == BTreeMap::from([(0, vec![
+                    ursula_proto::admin::RaftMaintenanceIssue::ApplyStopped,
+                ])])
+            {
+                assert_eq!(report.node_issues, vec![
+                    ursula_proto::admin::RaftMaintenanceIssue::PlacementUnknown
+                ]);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {node_id} keeps serving its other group: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let appended = client
             .post(format!("{base}/{healthy}"))
             .header(CONTENT_TYPE, "text/plain")
@@ -7035,8 +7048,12 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         engine.shutdown().await.expect("stop the group");
     }
 }
+/// Readiness never takes the inventory from what runs: a Raft node without
+/// a meta runtime knows no placement, so it reports `placement_unknown`,
+/// lists no group and is not ready, although no replica runs to fail a
+/// check (the bug: an empty inventory read as nothing to check).
 #[tokio::test]
-async fn raft_readiness_uses_the_placed_inventory_even_when_every_group_is_missing() {
+async fn a_raft_node_without_a_meta_runtime_reports_its_placement_unknown() {
     let runtime = spawn_runtime(&test_config(1, 2), Topology::Development { group_count: 2 })
         .expect("runtime")
         .runtime;
@@ -7065,14 +7082,13 @@ async fn raft_readiness_uses_the_placed_inventory_even_when_every_group_is_missi
         Some(ursula_proto::admin::ServingReadinessReason::RaftReplicaUnready)
     );
     let body = serde_json::to_value(typed).unwrap();
+    assert_eq!(body["raft_maintenance"]["placement"], json!(null));
+    assert_eq!(body["raft_maintenance"]["expected_groups"], json!({}));
     assert_eq!(
-        body["raft_maintenance"]["expected_groups"],
-        json!({"0": [1, 2, 3], "1": [1, 2, 3]})
+        body["raft_maintenance"]["node_issues"],
+        json!(["placement_unknown"])
     );
-    assert_eq!(
-        body["raft_maintenance"]["group_issues"],
-        json!({"0": ["missing_group"], "1": ["missing_group"]})
-    );
+    assert_eq!(body["raft_maintenance"]["group_issues"], json!({}));
     let response = http_get(&app, "/__ursula/metrics").await;
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
     assert_eq!(body["configured_raft_group_count"], 2);

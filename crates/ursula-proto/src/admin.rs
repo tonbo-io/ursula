@@ -334,13 +334,14 @@ mod tests {
     #[test]
     fn unknown_issues_and_rejections_decode_and_fail_closed() {
         let report: RaftMaintenanceReport = serde_json::from_str(
-            r#"{"version": 1, "node_id": 1, "lag_tolerance": 0,
-                "expected_groups": {"0": [1, 2, 3]},
+            r#"{"version": 2, "node_id": 1, "lag_tolerance": 0, "placement": null,
+                "expected_groups": {}, "unplaced": {},
                 "node_issues": ["a_future_issue"], "group_issues": {}}"#,
         )
         .unwrap();
         assert_eq!(report.node_issues, vec![RaftMaintenanceIssue::Unknown]);
         assert!(!report.ready());
+        assert!(!report.serving_ready());
         let rejection: TransferRejection = serde_json::from_str(r#""a_future_rejection""#).unwrap();
         assert_eq!(rejection, TransferRejection::Unknown);
         assert!(!rejection.should_replan());
@@ -551,12 +552,43 @@ pub struct SelfElectionRequest {
     pub current_term: u64,
 }
 
+/// One reason a node is not ready, in a maintenance report's node or group
+/// issues. Each issue is a unit variant, and its details sit in the report's
+/// maps. Which readiness an issue blocks is [`RaftMaintenanceReport`]'s
+/// rule ([`RaftMaintenanceReport::serving_ready`],
+/// [`RaftMaintenanceReport::ready`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RaftMaintenanceIssue {
-    EmptyExpectedInventory,
+    /// The node does not know its groups: no view was confirmed in this
+    /// run, it holds no replica, its meta replica holds no bootstrapped
+    /// state and no registration was answered `forming` or `unreferenced`,
+    /// as on a wiped voter. A Raft node without a meta runtime reports it
+    /// too.
+    PlacementUnknown,
+    /// The node holds replicas and its view has not bootstrapped. The
+    /// replicas keep their voter checks.
+    PlacementNotBootstrapped,
+    /// A peer's genesis claim differs from this node's.
+    GenesisMismatch,
+    /// The node's meta replica has known no leader for 30 s, while the node
+    /// holds or may hold replicas.
+    MetaUnavailable,
+    /// The node runs no meta replica in this run. It replaces every issue
+    /// the view gives: the replicas keep only their voter checks.
+    MetaDamaged,
+    /// `raft.group_count` differs from the cluster's.
+    GroupCountMismatch,
+    /// The configured effective replication factor, `raft.placement.
+    /// replication_factor` capped at the `raft.peers` count, differs from
+    /// the cluster's.
+    ReplicationFactorMismatch,
+    /// The view gives the node the role `voter` or `incoming` in the group
+    /// and no replica runs.
     MissingGroup,
-    UnexpectedGroup,
+    /// A replica runs or is held while the view gives the node no role in
+    /// the group.
+    UnplacedReplica,
     DuplicateGroup,
     WrongNodeIdentity,
     RaftStopped,
@@ -564,13 +596,13 @@ pub enum RaftMaintenanceIssue {
     RecoveryBarrier,
     StoppedForOperator,
     JointMembership,
+    /// The effective membership is not the placement's target voters with
+    /// no learner.
     IncompleteVoterSet,
-    /// The group's membership names a node that is not one of its
-    /// placed voters. No node dials a member that `raft.peers` does not
-    /// list, and the leader never removes it: an operator lists the node
-    /// again, or replaces the voter set without it through the membership
-    /// endpoint, which also removes every learner outside the new voters.
-    UnconfiguredMember,
+    /// The group's membership names a node that has no role in the group's
+    /// placement, as a voter or a learner. No node dials a member that
+    /// `raft.peers` does not list.
+    UnplacedMember,
     LocalReplicaNotVoter,
     MembershipNotApplied,
     LeaderUnknown,
@@ -578,45 +610,141 @@ pub enum RaftMaintenanceIssue {
     NotApplied,
     ApplyLag,
     /// An issue a newer server of the same minor version reports that this
-    /// build does not know. Like every issue, it makes the report not ready.
+    /// build does not know. It blocks both readinesses.
     #[serde(other)]
     Unknown,
 }
 
+impl RaftMaintenanceIssue {
+    /// Whether the issue keeps the node from serving, on a replica that
+    /// counts as a voter in the role `role`, `None` for a node issue or a
+    /// replica outside the inventory.
+    fn blocks_serving(&self, role: Option<crate::placement::ReplicaRole>) -> bool {
+        match self {
+            Self::PlacementUnknown
+            | Self::GroupCountMismatch
+            | Self::DuplicateGroup
+            | Self::WrongNodeIdentity
+            | Self::RaftStopped
+            | Self::RecoveryBarrier
+            | Self::StoppedForOperator
+            | Self::LocalReplicaNotVoter
+            | Self::MembershipNotApplied
+            | Self::LeaderUnknown
+            | Self::LeaderOutsideVoters
+            | Self::NotApplied
+            | Self::ApplyLag
+            | Self::Unknown => true,
+            // Only a voter's missing replica: an incoming one is a learner.
+            Self::MissingGroup => role != Some(crate::placement::ReplicaRole::Incoming),
+            // A stopped group answers its own requests with a typed 503
+            // while the node serves the others.
+            Self::PlacementNotBootstrapped
+            | Self::GenesisMismatch
+            | Self::MetaUnavailable
+            | Self::MetaDamaged
+            | Self::ReplicationFactorMismatch
+            | Self::UnplacedReplica
+            | Self::JointMembership
+            | Self::IncompleteVoterSet
+            | Self::UnplacedMember
+            | Self::ApplyStopped => false,
+        }
+    }
+
+    /// Whether the issue keeps a second disruption from being safe.
+    fn blocks_ready(&self) -> bool {
+        !matches!(self, Self::MetaUnavailable | Self::MetaDamaged)
+    }
+
+    /// Whether the issue is one a replica that does not count as a voter
+    /// reports: such a replica is checked only for being stopped, and
+    /// those checks block nothing.
+    fn of_a_non_voter(&self) -> bool {
+        matches!(self, Self::RaftStopped | Self::ApplyStopped)
+    }
+}
+
+/// What a maintenance report says of the node's placement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodePlacementReport {
+    /// The stage of the node's latest view.
+    pub view: crate::placement::ClusterStage,
+    /// The last meta entry the view includes, `null` for an empty view.
+    #[serde(deserialize_with = "required_option")]
+    pub applied: Option<crate::placement::MetaLogId>,
+    /// The node's role in meta's effective membership, `null` while no meta
+    /// replica runs.
+    #[serde(deserialize_with = "required_option")]
+    pub meta_role: Option<crate::placement::MetaRole>,
+    /// The meta leader the node's meta replica knows.
+    #[serde(deserialize_with = "required_option")]
+    pub meta_leader: Option<crate::placement::NodeId>,
+    /// The node's lifecycle in the bootstrapped view.
+    #[serde(deserialize_with = "required_option")]
+    pub lifecycle: Option<crate::placement::NodeLifecycle>,
+    /// The meta group's last answer to the node's registration in this
+    /// run, `null` before one or after a refusal.
+    #[serde(deserialize_with = "required_option")]
+    pub registration: Option<crate::placement::Registered>,
+}
+
+/// `raft_maintenance` of readiness and metrics, schema version 2: a node's
+/// replicas checked against its placement view (the inventory) and their
+/// effective memberships (the voter checks).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaftMaintenanceReport {
-    pub version: SchemaVersion<1>,
+    pub version: SchemaVersion<2>,
     pub node_id: u64,
     pub lag_tolerance: u64,
-    pub expected_groups: BTreeMap<u32, BTreeSet<u64>>,
+    /// `null` on a Raft node without a meta runtime.
+    #[serde(deserialize_with = "required_option")]
+    pub placement: Option<NodePlacementReport>,
+    /// The groups in which the bootstrapped view gives the node a role.
+    /// Empty before a bootstrapped view and while meta is damaged.
+    pub expected_groups: BTreeMap<u32, crate::placement::ExpectedReplica>,
+    /// The replicas the node holds or runs that the bootstrapped view gives
+    /// no role.
+    pub unplaced: BTreeMap<u32, crate::placement::UnplacedReplica>,
     pub node_issues: Vec<RaftMaintenanceIssue>,
     pub group_issues: BTreeMap<u32, Vec<RaftMaintenanceIssue>>,
 }
 
 impl RaftMaintenanceReport {
-    /// Local serving eligibility; maintenance additionally requires the full
-    /// voter set, no member outside it, and no stopped group. A group
-    /// stopped by an apply failure answers its own requests with a typed
-    /// 503 while the node serves the others, so it only blocks disruption.
+    /// Local serving eligibility. A node with no group is eligible.
+    /// Maintenance ([`Self::ready`]) also requires the full placed voter
+    /// set, no member outside the placement and no stopped group.
     pub fn serving_ready(&self) -> bool {
-        let local_issue = |issue: &RaftMaintenanceIssue| {
-            !matches!(
-                issue,
-                RaftMaintenanceIssue::IncompleteVoterSet
-                    | RaftMaintenanceIssue::UnconfiguredMember
-                    | RaftMaintenanceIssue::JointMembership
-                    | RaftMaintenanceIssue::ApplyStopped
-            )
-        };
-        !self.expected_groups.is_empty()
-            && !self.node_issues.iter().any(local_issue)
-            && !self.group_issues.values().flatten().any(local_issue)
+        self.eligible(|issue, role| issue.blocks_serving(role))
     }
 
+    /// Whether a second disruption is safe while this node is down: no
+    /// issue blocks it. A node with no group is ready.
     pub fn ready(&self) -> bool {
-        !self.expected_groups.is_empty()
-            && self.node_issues.is_empty()
-            && self.group_issues.is_empty()
+        self.eligible(|issue, _role| issue.blocks_ready())
+    }
+
+    fn eligible(
+        &self,
+        blocks: impl Fn(&RaftMaintenanceIssue, Option<crate::placement::ReplicaRole>) -> bool,
+    ) -> bool {
+        !self.node_issues.iter().any(|issue| blocks(issue, None))
+            && !self.group_issues.iter().any(|(group, issues)| {
+                let (role, counts) = self.replica(*group);
+                issues
+                    .iter()
+                    .any(|issue| blocks(issue, role) && (counts || !issue.of_a_non_voter()))
+            })
+    }
+
+    /// The node's role in `group` and whether its replica counts as a
+    /// voter. A replica in neither map counts, so its issues block.
+    fn replica(&self, group: u32) -> (Option<crate::placement::ReplicaRole>, bool) {
+        match (self.expected_groups.get(&group), self.unplaced.get(&group)) {
+            (Some(expected), _) => (Some(expected.role), expected.counts_as_voter),
+            (None, Some(unplaced)) => (None, unplaced.counts_as_voter),
+            (None, None) => (None, true),
+        }
     }
 }
 
@@ -983,14 +1111,7 @@ mod metrics_contract_tests {
             },
             process_node_id: Some(1),
             meta: None,
-            raft_maintenance: Some(RaftMaintenanceReport {
-                version: SchemaVersion,
-                node_id: 1,
-                lag_tolerance: 0,
-                expected_groups: BTreeMap::from([(0, BTreeSet::from([1]))]),
-                node_issues: vec![],
-                group_issues: BTreeMap::new(),
-            }),
+            raft_maintenance: Some(super::serving_readiness_tests::report()),
             groups: vec![RaftGroupMetrics {
                 raft_group_id: 0,
                 node_id: 1,
@@ -1103,14 +1224,14 @@ mod metrics_contract_tests {
     #[test]
     fn schema_versions_are_validated_at_the_wire_boundary() {
         assert_eq!(
-            SchemaVersion::<1>::try_from(2),
+            SchemaVersion::<2>::try_from(1),
             Err(UnsupportedSchemaVersion {
-                expected: 1,
-                observed: 2
+                expected: 2,
+                observed: 1
             })
         );
         let mut wire = serde_json::to_value(complete()).unwrap();
-        wire["raft_maintenance"]["version"] = serde_json::json!(2);
+        wire["raft_maintenance"]["version"] = serde_json::json!(1);
         assert!(
             serde_json::from_value::<NodeMetrics>(wire)
                 .unwrap_err()
@@ -1220,41 +1341,225 @@ mod serving_readiness_tests {
         assert_eq!(newer, ServingReadinessReason::Unknown);
     }
 
-    #[test]
-    fn only_membership_completeness_is_relaxed_for_serving() {
-        let mut report = RaftMaintenanceReport {
+    use crate::placement::ClusterStage;
+    use crate::placement::ExpectedReplica;
+    use crate::placement::MetaLogId;
+    use crate::placement::MetaRole;
+    use crate::placement::NodeId;
+    use crate::placement::NodeLifecycle;
+    use crate::placement::NodeRecord;
+    use crate::placement::PlacementEpoch;
+    use crate::placement::RaftLogId;
+    use crate::placement::Registered;
+    use crate::placement::ReplicaRole;
+    use crate::placement::RootId;
+    use crate::placement::RootSlot;
+    use crate::placement::UnplacedReplica;
+    use crate::placement::VoterSet;
+
+    /// A ready report of node 1, whose every field has a distinct value:
+    /// group 0 placed on {1, 2, 3} and group 5 held without a role.
+    pub(super) fn report() -> RaftMaintenanceReport {
+        let log = |term, index| RaftLogId {
+            term,
+            leader: NodeId::new(2),
+            index,
+        };
+        RaftMaintenanceReport {
             version: SchemaVersion,
             node_id: 1,
             lag_tolerance: 16,
-            expected_groups: BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
+            placement: Some(NodePlacementReport {
+                view: ClusterStage::Bootstrapped,
+                applied: Some(MetaLogId::new(log(3, 40))),
+                meta_role: Some(MetaRole::Learner),
+                meta_leader: Some(NodeId::new(2)),
+                lifecycle: Some(NodeLifecycle::Cordoned),
+                registration: Some(Registered::Referenced(NodeRecord {
+                    lifecycle: NodeLifecycle::Active,
+                    since_ms: 7,
+                    root: RootSlot::Bound(RootId::new(std::num::NonZeroU64::MIN)),
+                })),
+            }),
+            expected_groups: BTreeMap::from([(0, ExpectedReplica {
+                role: ReplicaRole::Voter,
+                since: PlacementEpoch::new(MetaLogId::new(log(1, 9))),
+                target: VoterSet::new(BTreeSet::from([1, 2, 3].map(NodeId::new))).unwrap(),
+                counts_as_voter: true,
+            })]),
+            unplaced: BTreeMap::from([(5, UnplacedReplica {
+                counts_as_voter: false,
+            })]),
             node_issues: vec![],
             group_issues: BTreeMap::new(),
-        };
-        for issue in [
-            RaftMaintenanceIssue::IncompleteVoterSet,
-            RaftMaintenanceIssue::UnconfiguredMember,
-            RaftMaintenanceIssue::JointMembership,
-        ] {
-            report.group_issues.insert(0, vec![issue]);
-            assert!(report.serving_ready());
-            assert!(!report.ready());
         }
-        for issue in [
-            RaftMaintenanceIssue::LocalReplicaNotVoter,
-            RaftMaintenanceIssue::RecoveryBarrier,
-            RaftMaintenanceIssue::RaftStopped,
-            RaftMaintenanceIssue::ApplyLag,
-            RaftMaintenanceIssue::MembershipNotApplied,
-            RaftMaintenanceIssue::MissingGroup,
-            RaftMaintenanceIssue::LeaderUnknown,
-            RaftMaintenanceIssue::LeaderOutsideVoters,
+    }
+
+    /// Report v2 is admin JSON: its golden form pins every field's name and
+    /// encoding, and every `Option` field is required, also when `null`.
+    #[test]
+    fn report_v2_keeps_its_wire_form_and_refuses_a_missing_field() {
+        let report = report();
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "version": 2, "node_id": 1, "lag_tolerance": 16,
+                "placement": {
+                    "view": "bootstrapped",
+                    "applied": {"term": 3, "leader": 2, "index": 40},
+                    "meta_role": "learner",
+                    "meta_leader": 2,
+                    "lifecycle": "cordoned",
+                    "registration": {"referenced": {
+                        "lifecycle": "active", "since_ms": 7,
+                        "root": {"bound": "0000000000000001"}
+                    }}
+                },
+                "expected_groups": {"0": {
+                    "role": "voter",
+                    "since": {"term": 1, "leader": 2, "index": 9},
+                    "target": [1, 2, 3],
+                    "counts_as_voter": true
+                }},
+                "unplaced": {"5": {"counts_as_voter": false}},
+                "node_issues": [], "group_issues": {}
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<RaftMaintenanceReport>(wire.clone()).unwrap(),
+            report
+        );
+        for (path, field) in [
+            ("", "placement"),
+            ("", "expected_groups"),
+            ("", "unplaced"),
+            ("/placement", "view"),
+            ("/placement", "applied"),
+            ("/placement", "meta_role"),
+            ("/placement", "meta_leader"),
+            ("/placement", "lifecycle"),
+            ("/placement", "registration"),
+            ("/expected_groups/0", "role"),
+            ("/expected_groups/0", "since"),
+            ("/expected_groups/0", "target"),
+            ("/expected_groups/0", "counts_as_voter"),
+            ("/unplaced/5", "counts_as_voter"),
         ] {
-            report.group_issues.insert(0, vec![issue]);
-            assert!(!report.serving_ready());
+            let mut missing = wire.clone();
+            missing
+                .pointer_mut(path)
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap()
+                .remove(field)
+                .unwrap();
+            assert!(
+                serde_json::from_value::<RaftMaintenanceReport>(missing)
+                    .unwrap_err()
+                    .is_data(),
+                "{path}/{field}"
+            );
         }
-        report.group_issues.clear();
-        report.expected_groups.clear();
-        assert!(!report.serving_ready());
+        for (stage, name) in [
+            (ClusterStage::MetaGenesis, "meta_genesis"),
+            (ClusterStage::MetaCatchingUp, "meta_catching_up"),
+            (ClusterStage::Registering, "registering"),
+            (ClusterStage::FormationCut, "formation_cut"),
+            (ClusterStage::Bootstrapped, "bootstrapped"),
+        ] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), name);
+        }
+        for (role, name) in [
+            (MetaRole::Voter, "voter"),
+            (MetaRole::Learner, "learner"),
+            (MetaRole::NotMember, "not_member"),
+        ] {
+            assert_eq!(serde_json::to_value(role).unwrap(), name);
+        }
+    }
+
+    /// Which readiness each issue blocks (design 10's table): the bug each
+    /// case catches is an issue that blocks the wrong readiness.
+    #[test]
+    fn each_issue_blocks_the_readiness_its_row_names() {
+        use RaftMaintenanceIssue as Issue;
+        // (issue, blocks serving, blocks ready) as a node issue.
+        for (issue, serving, ready) in [
+            (Issue::PlacementUnknown, true, true),
+            (Issue::PlacementNotBootstrapped, false, true),
+            (Issue::GenesisMismatch, false, true),
+            (Issue::MetaUnavailable, false, false),
+            (Issue::MetaDamaged, false, false),
+            (Issue::GroupCountMismatch, true, true),
+            (Issue::ReplicationFactorMismatch, false, true),
+            (Issue::Unknown, true, true),
+        ] {
+            let mut report = report();
+            report.node_issues = vec![issue.clone()];
+            assert_eq!(report.serving_ready(), !serving, "{issue:?}");
+            assert_eq!(report.ready(), !ready, "{issue:?}");
+        }
+        // As an issue of group 0, whose replica counts as a voter.
+        for (issue, serving) in [
+            (Issue::IncompleteVoterSet, false),
+            (Issue::UnplacedMember, false),
+            (Issue::JointMembership, false),
+            (Issue::ApplyStopped, false),
+            (Issue::UnplacedReplica, false),
+            (Issue::LocalReplicaNotVoter, true),
+            (Issue::RecoveryBarrier, true),
+            (Issue::RaftStopped, true),
+            (Issue::ApplyLag, true),
+            (Issue::MembershipNotApplied, true),
+            (Issue::MissingGroup, true),
+            (Issue::LeaderUnknown, true),
+            (Issue::LeaderOutsideVoters, true),
+            (Issue::NotApplied, true),
+            (Issue::DuplicateGroup, true),
+            (Issue::WrongNodeIdentity, true),
+            (Issue::StoppedForOperator, true),
+            (Issue::Unknown, true),
+        ] {
+            let mut report = report();
+            report.group_issues.insert(0, vec![issue.clone()]);
+            assert_eq!(report.serving_ready(), !serving, "{issue:?}");
+            assert!(!report.ready(), "{issue:?}");
+        }
+        // An incoming replica's absence blocks only maintenance.
+        let mut incoming = report();
+        incoming.expected_groups.get_mut(&0).unwrap().role = ReplicaRole::Incoming;
+        incoming.group_issues.insert(0, vec![Issue::MissingGroup]);
+        assert!(incoming.serving_ready());
+        assert!(!incoming.ready());
+        // A replica that does not count blocks nothing by being stopped,
+        // while an inventory issue of it still blocks maintenance.
+        for group in [0, 5] {
+            let mut non_voter = report();
+            if let Some(expected) = non_voter.expected_groups.get_mut(&0) {
+                expected.counts_as_voter = false;
+            }
+            for issue in [Issue::RaftStopped, Issue::ApplyStopped] {
+                non_voter.group_issues.insert(group, vec![issue]);
+                assert!(non_voter.serving_ready());
+                assert!(non_voter.ready());
+            }
+            non_voter
+                .group_issues
+                .insert(group, vec![Issue::UnplacedReplica]);
+            assert!(!non_voter.ready());
+            non_voter.group_issues.insert(group, vec![Issue::Unknown]);
+            assert!(!non_voter.serving_ready());
+        }
+        // A replica in neither map counts: its stop blocks.
+        let mut outside = report();
+        outside.group_issues.insert(9, vec![Issue::RaftStopped]);
+        assert!(!outside.serving_ready());
+        // A node with no group is ready.
+        let mut empty = report();
+        empty.expected_groups.clear();
+        empty.unplaced.clear();
+        assert!(empty.serving_ready());
+        assert!(empty.ready());
     }
 }
 

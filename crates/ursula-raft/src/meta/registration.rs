@@ -46,6 +46,7 @@ use crate::RecoveryTransport;
 use crate::log_store::RootStanding;
 use crate::peer_cluster::Supersession;
 use crate::rt::sync::watch;
+use crate::rt::time::Instant;
 
 /// How long a registered node goes without a meta leader before it
 /// registers again.
@@ -118,7 +119,7 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
     handle: MetaHandle<T>,
     registrant: Registrant,
     guard: RootGuard,
-    registry: RaftGroupHandleRegistry,
+    mut leaderless: watch::Receiver<MetaLeaderless>,
     status: watch::Sender<RegistrationStatus>,
     pauses: MetaPauses,
     stopped: impl Fn() -> bool,
@@ -156,7 +157,7 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
                 }
                 status.send_replace(RegistrationStatus::Answered(registered));
                 pause = RETRY_MIN;
-                wait_without_leader(&registry, REREGISTER_AFTER).await;
+                wait_without_leader(&mut leaderless, REREGISTER_AFTER).await;
                 continue;
             }
             Verdict::RootRefused(slot) => {
@@ -205,54 +206,99 @@ pub(crate) async fn run_registration<T: RecoveryTransport>(
     }
 }
 
-/// Waits until this node's meta replica has gone `window` without a
-/// leader. A node without a meta replica waits `window`, and so does one
-/// whose replica stopped while it is still published, whose metrics close
-/// at once: the wait then always awaits something that pends.
-async fn wait_without_leader(registry: &RaftGroupHandleRegistry, window: Duration) {
-    // The replica whose metrics closed, held weakly so the wait keeps no
-    // replica alive and its address cannot name another.
+/// Since when this node has known no meta leader, `None` while its meta
+/// replica knows one, as the meta leader's tracker publishes it.
+pub type MetaLeaderless = Option<Instant>;
+
+/// Follows this node's running meta replica and publishes on `leaderless`
+/// since when it has known no meta leader. A node without a running meta
+/// replica knows none, and so does one whose replica stopped while it is
+/// still published, whose metrics close at once. Runs until its task is
+/// aborted.
+pub(crate) async fn track_meta_leader(
+    registry: RaftGroupHandleRegistry,
+    leaderless: watch::Sender<MetaLeaderless>,
+) {
+    let mark_leaderless = || {
+        leaderless.send_if_modified(|since| {
+            let unset = since.is_none();
+            if unset {
+                *since = Some(Instant::now());
+            }
+            unset
+        });
+    };
+    let mut changes = registry.subscribe_meta_changes();
+    // The replica whose metrics closed, held weakly so the tracker keeps
+    // no replica alive and its address cannot name another.
     let mut stopped: Option<Weak<ActiveMeta>> = None;
     loop {
-        let Some(active) = registry.meta() else {
-            crate::rt::time::sleep(window).await;
-            return;
-        };
-        let current = Arc::downgrade(&active);
-        if stopped
-            .as_ref()
-            .is_some_and(|stopped| Weak::ptr_eq(stopped, &current))
-        {
-            // The replica whose metrics closed is still the published one.
-            // It names no leader, so the node goes `window` without one.
-            drop(active);
-            crate::rt::time::sleep(window).await;
-            return;
-        }
-        let mut metrics = active.core.owner().metrics();
-        drop(active);
-        let mut leaderless_since = None;
-        loop {
-            if metrics.borrow_watched().current_leader.is_some() {
-                leaderless_since = None;
-                if metrics.changed().await.is_err() {
-                    break;
-                }
-                continue;
-            }
-            let since = *leaderless_since.get_or_insert_with(crate::rt::time::Instant::now);
-            let remaining = window.saturating_sub(since.elapsed());
-            if remaining.is_zero() {
+        changes.borrow_and_update();
+        let running = registry.meta().filter(|active| {
+            !stopped
+                .as_ref()
+                .is_some_and(|stopped| Weak::ptr_eq(stopped, &Arc::downgrade(active)))
+        });
+        let Some(active) = running else {
+            mark_leaderless();
+            if changes.changed().await.is_err() {
                 return;
             }
-            match crate::rt::time::timeout(remaining, metrics.changed()).await {
-                Err(_elapsed) => return,
-                Ok(Err(_closed)) => break,
-                Ok(Ok(())) => {}
+            continue;
+        };
+        let current = Arc::downgrade(&active);
+        let mut metrics = active.core.owner().metrics();
+        drop(active);
+        loop {
+            if metrics.borrow_watched().current_leader.is_some() {
+                leaderless.send_if_modified(|since| since.take().is_some());
+            } else {
+                mark_leaderless();
+            }
+            crate::rt::select! {
+                biased;
+                changed = metrics.changed() => {
+                    if changed.is_err() {
+                        stopped = Some(current);
+                        break;
+                    }
+                }
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                    // Another replica may run now: follow the one published.
+                    break;
+                }
             }
         }
-        // The replica stopped: watch the one that replaced it, if one did.
-        stopped = Some(current);
+    }
+}
+
+/// Waits until this node has gone `window` without a meta leader, counted
+/// from the call at the earliest, as [`track_meta_leader`] publishes it on
+/// `leaderless`. If the tracker stopped, waits `window`.
+async fn wait_without_leader(leaderless: &mut watch::Receiver<MetaLeaderless>, window: Duration) {
+    let called = Instant::now();
+    loop {
+        let since = *leaderless.borrow_and_update();
+        let changed = match since {
+            None => leaderless.changed().await,
+            Some(since) => {
+                let remaining = window.saturating_sub(since.max(called).elapsed());
+                if remaining.is_zero() {
+                    return;
+                }
+                match crate::rt::time::timeout(remaining, leaderless.changed()).await {
+                    Err(_elapsed) => return,
+                    Ok(changed) => changed,
+                }
+            }
+        };
+        if changed.is_err() {
+            crate::rt::time::sleep(window).await;
+            return;
+        }
     }
 }
 

@@ -13,6 +13,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_proto::admin::QuorumPrefix;
+use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ProcessIncarnation;
 
 use crate::MetricsClient;
@@ -97,10 +98,13 @@ fn validate_observed_inventory(
                     .copied()
                     .collect::<BTreeSet<_>>()
                     != (0..group_count).collect()
-                || report
-                    .expected_groups
-                    .values()
-                    .any(|expected| expected != voters)
+                || report.expected_groups.values().any(|expected| {
+                    expected
+                        .target
+                        .iter()
+                        .map(NodeId::get)
+                        .ne(voters.iter().copied())
+                })
             {
                 bail!(
                     "node {} maintenance report is ineligible or misconfigured",

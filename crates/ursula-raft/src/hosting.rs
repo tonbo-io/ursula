@@ -127,16 +127,25 @@ impl HostingSet {
     }
 }
 
-/// What the hosting driver did last, for readiness.
+/// What the hosting driver did last, for readiness. Before its first pass
+/// it is the default: nothing held, admitted or confirmed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HostingStatus {
+    /// The groups the journals held at the last pass
+    /// ([`LocalLog::is_held`](ursula_control::LocalLog::is_held)).
+    pub held: BTreeSet<RaftGroupId>,
     /// The hosting set the last pass published.
     pub admitted: BTreeMap<RaftGroupId, Admission>,
     /// The last plan's held replicas without a role in the bootstrapped
     /// view, or, on a removed node, the replicas it keeps open.
     pub unplaced: BTreeSet<RaftGroupId>,
-    /// The view of the last plan made from a confirmed view, `None` before
-    /// the first.
+    /// The stamp of the driver's latest confirmation in this run, `None`
+    /// before the first. The last plan may be older or newer than it:
+    /// `admitted` comes from an unconfirmed view whenever the plan needed
+    /// no confirmation or its confirmation failed, and then holds only
+    /// `Open` admissions of what the journals held. So the stamp says only
+    /// that a view was confirmed in this run, never that `admitted` was
+    /// planned from it.
     pub last_confirmed: Option<ConfirmedStamp>,
 }
 
@@ -165,6 +174,7 @@ pub struct HostingTask {
 }
 
 impl HostingTask {
+    /// A reader of the status each pass publishes.
     pub fn status(&self) -> HostingStatusWatch {
         self.status.clone()
     }
@@ -310,12 +320,23 @@ impl<H: GroupHost> HostingDriver<H> {
             }
         }
         let confirmed = confirms.last.map(|last| last.stamp);
-        self.act(plan, actions, confirmed);
+        let held = local
+            .iter()
+            .filter(|(_, replica)| replica.log.is_held())
+            .map(|(group, _)| *group)
+            .collect();
+        self.act(plan, actions, held, confirmed);
     }
 
     /// Publishes the plan's admissions, opens what the node does not run
     /// and closes what it may no longer run.
-    fn act(&self, plan: HostingPlan, actions: &mut Actions, confirmed: Option<ConfirmedStamp>) {
+    fn act(
+        &self,
+        plan: HostingPlan,
+        actions: &mut Actions,
+        held: BTreeSet<RaftGroupId>,
+        confirmed: Option<ConfirmedStamp>,
+    ) {
         for step in &plan.steps {
             match *step {
                 HostingStep::ConfirmView | HostingStep::CancelTeardown { .. } => {}
@@ -388,6 +409,7 @@ impl<H: GroupHost> HostingDriver<H> {
             });
         }
         let status = HostingStatus {
+            held,
             admitted,
             unplaced: plan.unplaced,
             last_confirmed: confirmed,

@@ -194,11 +194,14 @@ pub fn check_readiness(
         let peer_max_committed = peers.values().filter_map(|v| v.committed_index).max();
         let expected_voters = u32::try_from(group_id)
             .ok()
-            .and_then(|group| maintenance.and_then(|report| report.expected_groups.get(&group)));
+            .and_then(|group| maintenance.and_then(|report| report.expected_groups.get(&group)))
+            .map(|expected| &expected.target);
         let only_target_votes = target_group
             .is_some_and(|group| group.voter_ids.as_slice() == [target_node_id])
-            && expected_voters
-                .is_some_and(|voters| voters.len() == 1 && voters.contains(&target_node_id));
+            && expected_voters.is_some_and(|voters| {
+                voters.len() == 1
+                    && voters.contains(ursula_proto::placement::NodeId::new(target_node_id))
+            });
         // A sole voter has no peer observation. Its own committed prefix is
         // the reference only when both membership and expected inventory agree.
         let reference_committed = if only_target_votes {
@@ -263,7 +266,6 @@ fn group_is_initialized(group: &RaftGroupView) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
 
     use url::Url;
 
@@ -395,10 +397,12 @@ mod tests {
             version: ursula_proto::admin::SchemaVersion,
             node_id: 1,
             lag_tolerance: 16,
+            placement: None,
             expected_groups: BTreeMap::from([
-                (7, BTreeSet::from([1, 2, 3])),
-                (8, BTreeSet::from([1, 2, 3])),
+                (7, crate::metrics::test_expected(&[1, 2, 3])),
+                (8, crate::metrics::test_expected(&[1, 2, 3])),
             ]),
+            unplaced: BTreeMap::new(),
             node_issues: vec![],
             group_issues: BTreeMap::from([(8, vec![
                 ursula_proto::admin::RaftMaintenanceIssue::MissingGroup,

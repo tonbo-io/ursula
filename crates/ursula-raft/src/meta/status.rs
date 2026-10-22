@@ -133,6 +133,18 @@ impl MetaStatusReader {
         Ok(self.status_of(confirmed.view()))
     }
 
+    /// What this node claims at genesis: its configured group count and
+    /// effective replication factor among them.
+    pub fn claim(&self) -> &GenesisClaim {
+        &self.claim
+    }
+
+    /// How long this node has known no meta leader, `None` while its meta
+    /// replica knows one.
+    pub fn meta_leaderless_for(&self) -> Option<std::time::Duration> {
+        self.status.leaderless.borrow().map(|since| since.elapsed())
+    }
+
     /// Where this node's registration stands.
     pub fn registration(&self) -> RegistrationStatus {
         self.status.registration.borrow().clone()

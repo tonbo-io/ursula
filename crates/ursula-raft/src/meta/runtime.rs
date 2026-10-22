@@ -56,8 +56,10 @@ use super::genesis_driver::GenesisStatus;
 use super::genesis_driver::genesis_gate_probe;
 use super::handle::MetaHandle;
 use super::pause::MetaPauses;
+use super::registration::MetaLeaderless;
 use super::registration::Registrant;
 use super::registration::run_registration;
+use super::registration::track_meta_leader;
 use super::replica::MetaDriverContext;
 use super::replica::MetaDrivers;
 use super::replica::MetaReplicaConfig;
@@ -131,6 +133,9 @@ pub struct MetaRuntimeStatus {
     /// Why the last `Bootstrap` this node submitted was refused.
     pub bootstrap_refusal: watch::Receiver<Option<ControlError>>,
     pub reconcile: watch::Receiver<ReconcileStatus>,
+    /// Since when this node has known no meta leader, as the meta leader's
+    /// tracker publishes it, counted from the start until the tracker runs.
+    pub leaderless: watch::Receiver<MetaLeaderless>,
 }
 
 /// This node's meta runtime (see the module docs).
@@ -175,12 +180,14 @@ where
         let (reconcile, reconcile_rx) =
             watch::channel(crate::rejoin::initial_status(ursula_runtime::unix_time_ms()));
         let (damage, damage_rx) = watch::channel(None);
+        let (leaderless, leaderless_rx) = watch::channel(Some(crate::rt::time::Instant::now()));
         let status = MetaRuntimeStatus {
             state: state_rx,
             genesis: genesis_rx,
             registration: registration_rx,
             bootstrap_refusal: refusal_rx,
             reconcile: reconcile_rx,
+            leaderless: leaderless_rx,
         };
         let guard = RootGuard::new(
             me,
@@ -284,11 +291,15 @@ where
                 guard.clone(),
                 registry.placement_watch(),
             )));
+        runtime.tasks.push(crate::rt::spawn(track_meta_leader(
+            registry.clone(),
+            leaderless,
+        )));
         runtime.tasks.push(crate::rt::spawn(run_registration(
             handle.clone(),
             registrant,
             guard,
-            registry.clone(),
+            runtime.status.leaderless.clone(),
             registration,
             pauses.clone(),
             stopped.clone(),

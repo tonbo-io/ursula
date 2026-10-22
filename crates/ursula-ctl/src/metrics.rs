@@ -530,17 +530,40 @@ pub(crate) fn test_maintenance_report(
         version: ursula_proto::admin::SchemaVersion,
         node_id,
         lag_tolerance: 16,
+        placement: None,
         expected_groups: groups
             .iter()
             .map(|group| {
                 (
                     u32::try_from(group.raft_group_id).expect("fixture group fits u32"),
-                    group.voter_ids.iter().copied().collect(),
+                    test_expected(&group.voter_ids),
                 )
             })
             .collect(),
+        unplaced: Default::default(),
         node_issues: vec![],
         group_issues: Default::default(),
+    }
+}
+
+/// A seeded voter's expected replica of a group placed on `voters`.
+#[cfg(test)]
+pub(crate) fn test_expected(voters: &[u64]) -> ursula_proto::placement::ExpectedReplica {
+    use ursula_proto::placement::NodeId;
+    ursula_proto::placement::ExpectedReplica {
+        role: ursula_proto::placement::ReplicaRole::Voter,
+        since: ursula_proto::placement::PlacementEpoch::new(
+            ursula_proto::placement::MetaLogId::new(ursula_proto::placement::RaftLogId {
+                term: 1,
+                leader: NodeId::new(1),
+                index: 1,
+            }),
+        ),
+        target: ursula_proto::placement::VoterSet::new(
+            voters.iter().copied().map(NodeId::new).collect(),
+        )
+        .expect("fixture voters"),
+        counts_as_voter: true,
     }
 }
 
@@ -701,8 +724,8 @@ mod tests {
                 wire.as_object_mut().unwrap().remove(field);
             } else {
                 wire["raft_maintenance"] = serde_json::json!({
-                    "version": 2, "node_id": 1, "lag_tolerance": 0,
-                    "expected_groups": {"0": [1]}, "node_issues": [], "group_issues": {}
+                    "version": 3, "node_id": 1, "lag_tolerance": 0, "placement": null,
+                    "expected_groups": {}, "unplaced": {}, "node_issues": [], "group_issues": {}
                 });
             }
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

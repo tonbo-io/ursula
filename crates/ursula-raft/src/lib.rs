@@ -36,7 +36,8 @@
 //! - [`owner`]: mailbox dispatch onto each group owner runtime.
 //! - [`leadership`]: one replica's view of its group's leadership, which
 //!   routing and forward hints share.
-//! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
+//! - [`maintenance`]: local Raft maintenance eligibility, against the node's
+//!   placement view and each replica's effective membership.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
 //! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the placed
 //!   engine factory under `engine::factory`.
@@ -240,9 +241,14 @@ pub use log_store::WaitFrom;
 pub use log_store::WalMaintenance;
 pub use log_store::WalOpening;
 pub use log_store::generate_cluster_id;
+pub use maintenance::LAG_TOLERANCE;
+pub use maintenance::META_UNAVAILABLE_AFTER;
+pub use maintenance::MaintenanceInputs;
+pub use maintenance::NodePlacement;
 pub use maintenance::RaftMaintenanceIssue;
 pub use maintenance::RaftMaintenanceReport;
 pub use maintenance::check_raft_maintenance;
+pub use maintenance::raft_maintenance_report;
 pub use memberships::BarrierAnswer;
 pub use memberships::BarrierAnswerRefusal;
 pub use memberships::EchoedTarget;

@@ -416,26 +416,20 @@ impl HttpState {
         Arc::make_mut(&mut self.0)
     }
 
-    /// The placement is the expected inventory: the voters this node's
-    /// placement inputs give each group, which are meta's seeds in the
-    /// node's latest view on a server node. Observed metrics cannot
-    /// establish which groups or voters are missing after a restart. Before
-    /// a bootstrapped view the node expects no group.
+    /// This node's maintenance report (report v2, design 10): its data
+    /// replicas against its placement view, its meta replica's status and
+    /// its hosting driver's, and each replica's effective membership. A
+    /// Raft node that knows no node id of its own reports none.
     fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
         let registry = self.raft_registry()?;
-        let router = self.client_write_router.as_ref()?;
-        let snapshots = registry.metrics_snapshot();
-        let node_id = router
-            .node_id()
-            .or_else(|| snapshots.first().map(|group| group.node_id))?;
-        let expected = (0..self.runtime.raft_group_count())
-            .filter_map(|id| {
-                let voters = router.placed_voters(RaftGroupId(id));
-                voters.contains(&node_id).then_some((id, voters))
-            })
-            .collect();
-        Some(ursula_raft::check_raft_maintenance(
-            &snapshots, node_id, expected, 16,
+        let node_id = self.node_id()?;
+        let reader = self.meta.status_reader();
+        let hosting = self.meta.hosting_status();
+        Some(ursula_raft::raft_maintenance_report(
+            registry,
+            node_id,
+            reader.as_ref(),
+            hosting.as_deref(),
         ))
     }
 
@@ -598,8 +592,8 @@ impl HttpState {
     /// A Raft node of a cluster. Its redirects read the peers
     /// `raft_registry`'s peer cluster binds, and its `NotHosted` hints the
     /// registry's placement views ([`ClientWriteLeaderRouter`]). Its
-    /// maintenance inventory reads the voters `placement`, the node's
-    /// placement inputs, gives each group.
+    /// maintenance inventory reads the node's meta runtime, which the server
+    /// sets: without one the node reports its placement unknown.
     pub fn with_raft_cluster(
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,

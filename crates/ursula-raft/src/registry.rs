@@ -231,6 +231,10 @@ pub struct RaftGroupHandleRegistry {
     /// Changes whenever a data group's entry is published or removed, so
     /// the hosting driver plans again ([`crate::hosting`]).
     group_changes: Arc<crate::rt::sync::watch::Sender<()>>,
+    /// Changes whenever the meta slot is published or emptied, so the meta
+    /// leader's tracker follows the replica that runs
+    /// ([`crate::meta::registration::track_meta_leader`]).
+    meta_changes: Arc<crate::rt::sync::watch::Sender<()>>,
     /// Each data group's left mark, for the run (`crate::voter`).
     left_marks: crate::LeftMarks,
 }
@@ -260,6 +264,7 @@ impl Default for RaftGroupHandleRegistry {
             follower_log_reversions: Default::default(),
             meta: Arc::default(),
             group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
+            meta_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
             left_marks: crate::LeftMarks::default(),
         }
     }
@@ -903,10 +908,12 @@ impl RaftGroupHandleRegistry {
         ursula_proto::admin::RecoveryGatesReport::new(self.recovery_gates())
     }
 
-    /// The data groups of [`Self::recovery_report`] that stalled, which
-    /// readiness reports. The meta replica's gate never makes the node
-    /// unready, as in [`Self::recovery_barriers_ready`]: readiness gates
-    /// the data plane's serving.
+    /// The data groups of [`Self::recovery_report`] that stalled on a
+    /// replica that counts as a voter ([`Self::counts_as_voter`]), which
+    /// readiness reports. A replica that does not count never makes the
+    /// node unready, nor does the meta replica's gate, as in
+    /// [`Self::recovery_barriers_ready`]: readiness gates the data plane's
+    /// serving.
     pub fn stalled_recovery_groups(&self) -> Vec<u32> {
         self.recovery_report()
             .stalled
@@ -914,6 +921,9 @@ impl RaftGroupHandleRegistry {
             .filter_map(|group| match group {
                 RaftTargetKey::Data(group) => Some(group),
                 RaftTargetKey::Meta => None,
+            })
+            .filter(|group| {
+                self.counts_as_voter(RaftGroupId(*group)) == ursula_control::Counts::Voter
             })
             .collect()
     }
@@ -1135,6 +1145,12 @@ impl RaftGroupHandleRegistry {
     /// Publishes `meta` as this node's running meta replica.
     pub(crate) fn publish_meta(&self, meta: Option<Arc<crate::meta::replica::ActiveMeta>>) {
         self.meta.store(meta);
+        self.meta_changes.send_replace(());
+    }
+
+    /// A watch that changes whenever the meta slot is published or emptied.
+    pub(crate) fn subscribe_meta_changes(&self) -> crate::rt::sync::watch::Receiver<()> {
+        self.meta_changes.subscribe()
     }
 
     /// Removes `meta` from the slot, if it still holds it: a replica that
@@ -1144,6 +1160,7 @@ impl RaftGroupHandleRegistry {
             Some(current) if Arc::ptr_eq(current, meta) => None,
             other => other.clone(),
         });
+        self.meta_changes.send_replace(());
     }
 
     /// A recovery plan on this node's meta replica, as

@@ -15,8 +15,10 @@ use std::collections::BTreeSet;
 use serde::Deserialize;
 use serde::Serialize;
 use ursula_proto::admin::required_option;
+use ursula_proto::placement::ClusterStage;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::MetaLogId;
+pub use ursula_proto::placement::MetaRole;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
@@ -58,6 +60,19 @@ pub enum ClusterView {
     /// A meta recovery plan ended the formation.
     FormationCut,
     Bootstrapped(Cluster),
+}
+
+impl ClusterView {
+    /// The view's stage, without its details.
+    pub fn stage(&self) -> ClusterStage {
+        match self {
+            Self::MetaGenesis { .. } => ClusterStage::MetaGenesis,
+            Self::MetaCatchingUp => ClusterStage::MetaCatchingUp,
+            Self::Registering { .. } => ClusterStage::Registering,
+            Self::FormationCut => ClusterStage::FormationCut,
+            Self::Bootstrapped(_) => ClusterStage::Bootstrapped,
+        }
+    }
 }
 
 /// What only the meta leader knows, filled by the meta leader alone. A
@@ -141,15 +156,6 @@ pub enum MetaReplicaStatus {
     /// No replica is published at the moment: a recovery plan restarts it,
     /// or the node stops.
     Absent,
-}
-
-/// A node's role in meta's effective membership.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MetaRole {
-    Voter,
-    Learner,
-    NotMember,
 }
 
 /// Where this node's registration with the meta group stands in this run.
