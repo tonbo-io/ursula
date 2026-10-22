@@ -68,9 +68,10 @@
 //!   snapshot driver over the in-memory snapshot store (#687), each process
 //!   behind its node fence. A follower snapshots a group twice, so a GC pass
 //!   of its own directory is owed, and the pass begins inside its lease,
-//!   its LIST held at the store's gate. Then its volume moves while the old
-//!   process runs on, and the gate holds the LIST until the new process
-//!   wrote and named a snapshot object of the group.
+//!   its LIST held at the store's gate. Each snapshot follows an append the
+//!   follower applied, so it builds. Then its volume moves while the old
+//!   process runs on, cut off from every node, and the gate holds the LIST
+//!   until the new process wrote and named a snapshot object of the group.
 //!
 //! Its checks:
 //!
@@ -150,7 +151,9 @@ use ursula_runtime::ReadStreamRequest;
 use ursula_runtime::node_fence::FenceStatus;
 use ursula_runtime::node_fence::fence_now;
 use ursula_runtime::snapshot_harness::Gate;
+use ursula_runtime::snapshot_harness::GatePass;
 use ursula_runtime::snapshot_harness::SnapshotStoreFaults;
+use ursula_runtime::snapshot_harness::SnapshotStoreGates;
 use ursula_runtime::snapshot_harness::StoreOp;
 use ursula_shard::RaftGroupId;
 use ursula_stream::sim_controls::Defence;
@@ -1999,8 +2002,76 @@ impl Run {
             .unwrap_or_default()
     }
 
-    /// An operator's snapshot of `group` on `node_id` within the bound.
+    /// Whether `node_id`'s current replica of `group` applied an entry
+    /// past its published snapshot.
+    fn applied_past_snapshot(&self, group: u32, node_id: u64) -> bool {
+        self.cluster
+            .hosted_replicas(node_id)
+            .into_iter()
+            .find(|replica| replica.group == group)
+            .is_some_and(|replica| {
+                let watched = replica.raft.metrics();
+                let metrics = openraft::rt::WatchReceiver::borrow_watched(&watched);
+                match (
+                    metrics.last_applied.map(|id| id.index),
+                    metrics.snapshot.map(|id| id.index),
+                ) {
+                    (Some(applied), Some(snapshot)) => applied > snapshot,
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                }
+            })
+    }
+
+    /// Appends to `group` through its leader among the running nodes, if
+    /// needed, until `node_id`'s replica applied an entry past its
+    /// published snapshot, within the bound. An operator's snapshot counts
+    /// as covered once the published snapshot reaches the replica's last
+    /// applied index, as `POST /snapshot` does, so with nothing applied
+    /// past it the request builds nothing. A held replica applies appends
+    /// during its wait under `always`.
+    async fn apply_past_snapshot(&mut self, group: u32, node_id: u64, phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        let mut acknowledged = false;
+        while !self.applied_past_snapshot(group, node_id) {
+            if madsim::time::Instant::now() >= deadline {
+                let nodes = self.describe(group);
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!(
+                        "node {node_id} applied nothing of group {group} past its snapshot: \
+                         {nodes}"
+                    ),
+                );
+            }
+            if !acknowledged {
+                let running = self.cluster.running();
+                acknowledged = self.append_through_leader(group, &running).await;
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
+        }
+    }
+
+    /// How many LISTs of `group`'s objects arrived at `node_id`'s held
+    /// `list` gate.
+    fn lists_of(gates: &SnapshotStoreGates, list: Gate, node_id: u64, group: u32) -> usize {
+        let subject = format!("node-{node_id}/group-{group}");
+        gates
+            .log()
+            .iter()
+            .filter(|event| {
+                event.gate == list && event.pass == GatePass::Arrived && event.subject == subject
+            })
+            .count()
+    }
+
+    /// An operator's snapshot of `group` on `node_id` within the bound,
+    /// after its replica applied an entry past its last snapshot.
     async fn snapshot_on(&mut self, group: u32, node_id: u64, phase: &str) {
+        self.apply_past_snapshot(group, node_id, phase).await;
         let deadline = madsim::time::Instant::now() + BOUND;
         loop {
             match self
@@ -2046,10 +2117,10 @@ impl Run {
         let gates = self.cluster.data.snapshot_gates(moved);
         let list = Gate::before(moved, StoreOp::ListOwn);
         gates.hold(list);
-        let arrived = gates.arrived(list);
+        let arrived = Self::lists_of(&gates, list, moved, group);
         self.snapshot_on(group, moved, PHASE).await;
         let deadline = madsim::time::Instant::now() + BOUND;
-        while gates.arrived(list) <= arrived {
+        while Self::lists_of(&gates, list, moved, group) <= arrived {
             if madsim::time::Instant::now() >= deadline {
                 fail(
                     &mut self.trace,
@@ -2068,10 +2139,17 @@ impl Run {
             &format!("identity-fence-{}-moved-{moved}", self.seed),
             &[],
         );
+        // No one reaches the old process, and it reaches no one, so no
+        // peer's answer supersedes it: only its lease and the new
+        // process's wait decide its pass's DELETEs.
+        for node_id in 1..=NODES {
+            self.cluster.cut_route(zombie.process, node_id);
+        }
         self.cluster.start_node(moved).await;
         self.step(PHASE);
         // The new process restored what its records named, and snapshots
-        // the group as soon as its fence lets it write the object.
+        // the group as soon as its fence lets it write the object. Each
+        // request follows an append it applied, so it builds.
         let restored = self.named_by(moved);
         let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
         while self.named_by(moved).is_subset(&restored) {
@@ -2083,6 +2161,7 @@ impl Run {
                     format!("node {moved}'s new process named no object of its own"),
                 );
             }
+            self.apply_past_snapshot(group, moved, PHASE).await;
             if let Err(error) = self.cluster.placed_snapshot(group, moved, STEP * 4).await {
                 tracing::info!(error, group, moved, "the new process built no snapshot yet");
             }
