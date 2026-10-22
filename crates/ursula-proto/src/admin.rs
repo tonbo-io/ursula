@@ -1430,6 +1430,7 @@ mod serving_readiness_tests {
     use crate::placement::ReplicaRole;
     use crate::placement::RootId;
     use crate::placement::RootSlot;
+    use crate::placement::TeardownStage;
     use crate::placement::UnplacedReplica;
     use crate::placement::VoterSet;
 
@@ -1466,6 +1467,7 @@ mod serving_readiness_tests {
             unplaced: BTreeMap::from([(5, UnplacedReplica {
                 counts_as_voter: false,
                 last_answer: Some(MembershipAnswer::NotMember),
+                stage: Some(TeardownStage::Fence),
             })]),
             node_issues: vec![],
             group_issues: BTreeMap::new(),
@@ -1499,7 +1501,9 @@ mod serving_readiness_tests {
                     "target": [1, 2, 3],
                     "counts_as_voter": true
                 }},
-                "unplaced": {"5": {"counts_as_voter": false, "last_answer": "not_member"}},
+                "unplaced": {"5": {
+                    "counts_as_voter": false, "last_answer": "not_member", "stage": "fence"
+                }},
                 "node_issues": [], "group_issues": {}
             })
         );
@@ -1523,6 +1527,7 @@ mod serving_readiness_tests {
             ("/expected_groups/0", "counts_as_voter"),
             ("/unplaced/5", "counts_as_voter"),
             ("/unplaced/5", "last_answer"),
+            ("/unplaced/5", "stage"),
         ] {
             let mut missing = wire.clone();
             missing

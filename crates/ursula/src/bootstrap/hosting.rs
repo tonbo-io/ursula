@@ -83,7 +83,12 @@ impl GroupHost for ServerHost {
         Box::pin(async move {
             let placement = self.runtime.placement_for_group(group)?;
             self.registry.unregister_group(group);
-            self.runtime.shutdown_group_engine(placement).await
+            let stopped = self.runtime.shutdown_group_engine(placement).await;
+            // An open that ran during the stop, such as a recovery plan's
+            // restart, registered its engine before the core shut it down.
+            // The group is not admitted, so no later open registers one.
+            self.registry.unregister_group(group);
+            stopped
         })
     }
 

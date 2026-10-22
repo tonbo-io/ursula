@@ -34,6 +34,28 @@ stays closed under its open back-off, and the driver opens it again. A node
 that `raft.peers` gained after genesis is in no group's seeds, so it hosts
 nothing.
 
+A node tears a replica down when a confirmed view gives it no role in the
+group (`crates/ursula-raft/src/hosting/teardown.rs`, over the kernel's
+`Teardown`). Local Raft state never starts a teardown, and the group decides
+it. The teardown first asks the group's leader whether the node is still a
+member, through the node's membership asker, and goes on only on a live
+leader's `not_member`. Until then nothing is fenced, and a view that gives
+the node a role again cancels it. Then the hosting set drops the group, the
+replica closes, its engine's OpenRaft work ends, and the node asks again. A
+second `not_member` retires the log ([Raft WAL](raft-wal.md)). Any other
+answer, or none, admits the replica again with its log intact. Last the node
+forgets the group's gauges, its snapshot coordinators' entries, so its log
+leaves the hard limit, and its left mark, and reports the retirement to the
+meta group (`ReportTornDown`). A node runs at most 8 teardowns at once and
+none while its fence refuses. The snapshot objects under
+`node-{id}/group-{gid}/` of a group whose log the node no longer holds, or
+retired, go by a pass that lists them and deletes every one: at startup, for
+each group the node's directory names, after each retirement, and again one
+`raft.install_snapshot_timeout` later of each, since a failed PUT may still
+land. A pass runs only while the node admits no open of the group, as an
+action of the group, so a replica placed back on the node opens after it
+ends. Cold objects belong to the group and stay.
+
 The voters each group's placement gives are also what the node's maintenance
 inventory expects, none before a bootstrapped view. A node that hosts no
 replica of a group, or whose replica knows no leader and does not count as a
@@ -383,7 +405,7 @@ the view gives, a configured group count or replication factor the cluster
 does not share, and a removed node (`node_removed`), which replaces every
 other node issue while its replicas keep their group checks. Group issues name a missing placed replica, a replica
 held without a role (`unplaced_replica`, listed with the last answer the
-node's membership asker got about it), an incomplete voter set, a member
+node's membership asker got about it and the stage of its teardown), an incomplete voter set, a member
 without a role (`unplaced_member`: the leader removes such a learner once the
 group is seeded or its voters equal the target, and such a voter only by a
 move or by leaving a joint configuration; nothing restores a missing voter),

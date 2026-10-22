@@ -75,6 +75,15 @@ impl LeftMarks {
         )
     }
 
+    /// Forgets the mark of `group`, whose log the node tore down: a later
+    /// replica of it starts unmarked.
+    pub(crate) fn forget(&self, group: RaftGroupId) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&group);
+    }
+
     /// Records that a membership question about `group` goes out now, for
     /// the mark its answer may set ([`LeftMark::ask`]).
     pub(crate) fn ask(&self, group: RaftGroupId) -> Asked {

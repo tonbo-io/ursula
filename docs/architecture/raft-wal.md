@@ -161,8 +161,10 @@ keeps the archive references of every generation, so a retired generation's
 archives go only once reclaim deletes the segments that refer to them.
 
 `RaftWal::retire_group` tears a group's log down, refused while a store holds
-the group. One synced replacement of `journal.meta` records it `retired` in
-the next generation, with no vote, no log and no recovery plan, and writes no
+the group. The hosting driver calls it in a replica's teardown, once the
+engine's work ended ([Cluster membership](cluster-membership.md)). One
+synced replacement of `journal.meta` records it `retired` in the next
+generation, with no vote, no log and no recovery plan, and writes no
 frame. The vote goes because a removed replica campaigns and would depose a
 leader once the group is placed on it again. Until `journal.meta` is durable
 the log keeps pinning its segments, and no open or second retirement of the

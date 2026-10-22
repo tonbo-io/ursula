@@ -21,7 +21,9 @@
 //! classified for this node by the kernel's one classifier
 //! ([`crate::LeaderMemberships::answer`]) and reaches the group's left mark
 //! ([`crate::LeftMarks`]), as the gate driver's answers do. The latest
-//! answer per group goes into the driver's status ([`GroupAnswer`]).
+//! answer per group goes into the driver's status ([`GroupAnswer`]), and a
+//! teardown's first step takes the first answer that came after it started
+//! (`hosting::teardown`). Its second step asks for itself, through [`ask`].
 
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -32,7 +34,6 @@ use ursula_proto::placement::NodeId;
 use ursula_shard::RaftGroupId;
 use ursula_shard::RaftTarget;
 
-use super::ActionEnd;
 use crate::LeftMarks;
 use crate::meta::status::MetaStatusReader;
 use crate::rt::time::Instant;
@@ -71,6 +72,9 @@ struct Asking {
     checked: Option<Checked>,
     /// The latest answer a live leader gave.
     last: Option<GroupAnswer>,
+    /// How many answers live leaders gave, so a teardown takes only one
+    /// that came after it started.
+    answers: u64,
 }
 
 /// The questions of every held replica, by group.
@@ -125,7 +129,32 @@ impl Askers {
     /// none, which keeps the last answer.
     pub(super) fn ended(&mut self, group: RaftGroupId, answer: Option<GroupAnswer>) {
         if let Some(answer) = answer {
-            self.0.entry(group).or_default().last = Some(answer);
+            let asking = self.0.entry(group).or_default();
+            asking.last = Some(answer);
+            asking.answers = asking.answers.saturating_add(1);
+        }
+    }
+
+    /// Makes the replica of `group` ask at its next check, as a replica
+    /// never checked does: a teardown starts.
+    pub(super) fn rearm(&mut self, group: RaftGroupId) {
+        if let Some(asking) = self.0.get_mut(&group) {
+            asking.checked = None;
+        }
+    }
+
+    /// How many answers about `group` live leaders gave.
+    pub(super) fn answer_count(&self, group: RaftGroupId) -> u64 {
+        self.0.get(&group).map_or(0, |asking| asking.answers)
+    }
+
+    /// The latest answer about `group`, if it came after the first `count`.
+    pub(super) fn answer_since(&self, group: RaftGroupId, count: u64) -> Option<GroupAnswer> {
+        let asking = self.0.get(&group)?;
+        if asking.answers > count {
+            asking.last
+        } else {
+            None
         }
     }
 
@@ -156,14 +185,15 @@ impl Checked {
 
 /// Asks `candidates` in order for a fresh quorum barrier of `group`, until
 /// one answers as a live leader, and records the answer, classified for
-/// `me`, in the group's left mark.
+/// `me`, in the group's left mark. `None` when no candidate answered as a
+/// live leader.
 pub(super) async fn ask(
     meta: MetaStatusReader,
     marks: LeftMarks,
     me: NodeId,
     group: RaftGroupId,
     candidates: Vec<NodeId>,
-) -> ActionEnd {
+) -> Option<GroupAnswer> {
     for leader in candidates {
         let asked = marks.ask(group);
         let barrier = meta.barrier(leader, RaftTarget::Data(group));
@@ -195,11 +225,11 @@ pub(super) async fn ask(
         match answer.memberships.answer(me) {
             Ok(classified) => {
                 marks.answered(group, asked, classified, answer.vote);
-                return ActionEnd::Asked(Some(GroupAnswer {
+                return Some(GroupAnswer {
                     leader,
                     vote: answer.vote,
                     answer: classified,
-                }));
+                });
             }
             // Checked on arrival, so this is no live leader's answer.
             Err(error) => tracing::debug!(
@@ -210,5 +240,5 @@ pub(super) async fn ask(
             ),
         }
     }
-    ActionEnd::Asked(None)
+    None
 }

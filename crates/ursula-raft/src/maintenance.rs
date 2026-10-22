@@ -307,6 +307,7 @@ fn read_placement<'a>(
                         .answers
                         .get(&RaftGroupId(group))
                         .map(|answer| answer.answer),
+                    stage: hosting.teardowns.get(&RaftGroupId(group)).copied(),
                 });
             }
         }

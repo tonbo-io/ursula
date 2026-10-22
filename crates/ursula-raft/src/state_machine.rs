@@ -1182,6 +1182,23 @@ impl SnapshotBuildCoordinator {
         }
     }
 
+    /// Forgets everything the node keeps of `raft_group_id`'s snapshots: its
+    /// log gauge, a hand-off parked under it, its latest build and a purge
+    /// hold (step 6 of a teardown, design 7.3). A group whose log the node
+    /// tore down holds nothing more, so its log no longer counts toward the
+    /// node's hard limit. Its engine stopped first.
+    pub(crate) fn forget_group(&self, raft_group_id: u32) {
+        self.log_gauges().remove(&raft_group_id);
+        self.built().remove(&raft_group_id);
+        self.purges().remove(&raft_group_id);
+        let handed = self.handoffs().remove(&raft_group_id);
+        // The permit goes back before the waits on hand-offs wake.
+        if handed.is_some() {
+            drop(handed);
+            self.inner.builds.send_modify(|_builds| {});
+        }
+    }
+
     fn built(&self) -> std::sync::MutexGuard<'_, BTreeMap<u32, BuiltSnapshot>> {
         self.inner
             .built
@@ -1319,6 +1336,16 @@ impl SnapshotInstallCoordinator {
             .acquire_owned()
             .await
             .map_err(|_closed| SnapshotInstallError::GateClosed { group })
+    }
+
+    /// Forgets `group`'s install lock, once the node tore its replica of
+    /// the group down (design 7.3, step 6).
+    pub(crate) fn forget_group(&self, group: u32) {
+        self.inner
+            .installs
+            .lock()
+            .expect("snapshot install mutex")
+            .remove(&group);
     }
 
     pub(crate) fn install_lock(&self, group: u32) -> Arc<crate::rt::sync::Mutex<()>> {

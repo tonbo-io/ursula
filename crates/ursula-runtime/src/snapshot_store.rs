@@ -15,12 +15,16 @@
 //! name, and only that node deletes them. [`SnapshotStore::stage`] draws the
 //! name without I/O, [`SnapshotStore::write_staged`] creates the object only
 //! if no object has the name, and [`SnapshotStore::list_own`] and
-//! [`SnapshotStore::delete_own`] serve the owner's GC. [`OwnedPointer`] is a
+//! [`SnapshotStore::delete_own`] serve the owner's GC.
+//! [`SnapshotStore::list_node_groups`] names the groups a node's directory
+//! holds objects of, for the objects of a replica the node tore down or
+//! never ran (design 7.3). [`OwnedPointer`] is a
 //! pointer this node may commit. Nothing else lives in the store: no
 //! reference or pin records, and no object any node shares. A node that
 //! installs a peer's snapshot writes its own copy before it commits it, and
 //! what a node may still use is held in its memory, never in the store.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Debug;
 use std::future::Future;
@@ -304,6 +308,19 @@ impl OwnedKey {
             nonce,
         })
     }
+}
+
+/// The groups of which `paths` hold one of `node`'s keys under `prefix`.
+pub(crate) fn node_groups<'a>(
+    prefix: &SnapshotPrefix,
+    node: u64,
+    paths: impl Iterator<Item = &'a str>,
+) -> BTreeSet<RaftGroupId> {
+    paths
+        .filter_map(|path| OwnedKey::parse(prefix, path).ok())
+        .filter(|key| key.owner.node_id == node)
+        .map(|key| key.owner.raft_group_id)
+        .collect()
 }
 
 /// `text` as a decimal number written without sign or leading zeros.
@@ -901,6 +918,17 @@ pub trait SnapshotStore: Send + Sync + Debug {
     /// an error.
     fn delete_own<'a>(&'a self, object: OwnedObject) -> SnapshotStoreFuture<'a, ()>;
 
+    /// The groups whose directory under `node`'s holds an object that
+    /// parses as one of `node`'s keys ([`OwnedKey`]), so a pass over each
+    /// with [`Self::list_own`] finds every object `node` wrote. The default
+    /// is a store that holds no object: it names no group.
+    fn list_node_groups<'a>(
+        &'a self,
+        _node: u64,
+    ) -> SnapshotStoreFuture<'a, BTreeSet<RaftGroupId>> {
+        Box::pin(async move { Ok(BTreeSet::new()) })
+    }
+
     /// Reads the stored body at `location`, checked against its stored
     /// size.
     fn read_stored<'a>(
@@ -1008,6 +1036,10 @@ impl SnapshotStore for FencedSnapshotStore {
             self.check("DELETE", object.path())?;
             self.inner.delete_own(object).await
         })
+    }
+
+    fn list_node_groups<'a>(&'a self, node: u64) -> SnapshotStoreFuture<'a, BTreeSet<RaftGroupId>> {
+        self.inner.list_node_groups(node)
     }
 
     fn read_stored<'a>(
@@ -1179,6 +1211,7 @@ fn collect_snapshot_chunks(chunks: SnapshotBytesIterator) -> Result<Vec<u8>, Sna
 
 #[cfg(not(madsim))]
 mod s3 {
+    use std::collections::BTreeSet;
     use std::io::Write;
 
     use bytes::Bytes;
@@ -1206,6 +1239,7 @@ mod s3 {
     use super::StagedObject;
     use super::StagedSnapshot;
     use super::StoredSnapshot;
+    use super::node_groups;
     use crate::SnapshotStoreOperation;
 
     const S3_SNAPSHOT_ZSTD_LEVEL: i32 = 3;
@@ -1620,6 +1654,31 @@ mod s3 {
                         err,
                     )),
                 }
+            })
+        }
+
+        fn list_node_groups<'a>(
+            &'a self,
+            node: u64,
+        ) -> SnapshotStoreFuture<'a, BTreeSet<RaftGroupId>> {
+            Box::pin(async move {
+                let directory = format!("{}/node-{node}/", self.prefix);
+                let entries = self
+                    .operator
+                    .list_with(&directory)
+                    .recursive(true)
+                    .await
+                    .map_err(|err| {
+                        SnapshotStoreError::backend(SnapshotStoreOperation::List, &directory, err)
+                    })?;
+                Ok(node_groups(
+                    &self.prefix,
+                    node,
+                    entries
+                        .iter()
+                        .filter(|entry| entry.metadata().mode().is_file())
+                        .map(|entry| entry.path()),
+                ))
             })
         }
 

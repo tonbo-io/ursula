@@ -250,7 +250,6 @@ impl WorkEnded {
     }
 
     /// Waits until the work ended.
-    #[cfg(test)]
     pub(crate) async fn ended(&self) {
         self.0.closed().await;
     }
@@ -420,7 +419,6 @@ impl EngineWorkLedger {
     }
 
     /// Waits until the work of `raft_group_id`'s latest engine ended.
-    #[cfg(test)]
     pub(crate) async fn ended(&self, raft_group_id: RaftGroupId) {
         let latest = self
             .slots()

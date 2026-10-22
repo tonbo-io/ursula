@@ -12,7 +12,8 @@
 //! ([`MetaStatusReader::release_root`], [`MetaStatusReader::request_move`],
 //! [`MetaStatusReader::set_lifecycle`], [`MetaStatusReader::set_move_limit`])
 //! and the data group leaders' reports
-//! ([`MetaStatusReader::report_converged`]) to the meta group, and the
+//! ([`MetaStatusReader::report_converged`]) and this node's teardowns
+//! (`MetaStatusReader::report_torn_down`) to the meta group, and the
 //! barriers that ask a group's leader about its memberships
 //! (`MetaStatusReader::barrier`).
 
@@ -36,6 +37,7 @@ use ursula_control::PlacementStatus;
 use ursula_control::PlacementView;
 use ursula_control::RegistrationStatus;
 use ursula_proto::placement::GenesisClaim;
+use ursula_proto::placement::MetaLogId;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::RootId;
@@ -314,6 +316,23 @@ impl MetaStatusReader {
                 voters,
                 membership,
                 now_ms: ursula_runtime::unix_time_ms(),
+            })
+            .await
+    }
+
+    /// Reports through the meta leader that this node tore down its
+    /// replica of `group`, which the retirement created at `created_at`
+    /// named (`ControlCommand::ReportTornDown`).
+    pub(crate) async fn report_torn_down(
+        &self,
+        group: RaftGroupId,
+        created_at: MetaLogId,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.meta
+            .submit(ControlCommand::ReportTornDown {
+                group,
+                node: self.node,
+                created_at,
             })
             .await
     }
