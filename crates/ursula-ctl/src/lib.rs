@@ -16,7 +16,9 @@
 //!   its target voters, which `wait`, `wait-ready` and the verifications
 //!   read.
 //! - [`placement`]: placement views, `placement status`, `move`, `cancel`
-//!   and `set-move-limit`, and `node replace-disk`.
+//!   and `set-move-limit`, the node lifecycle verbs (`node cordon`,
+//!   `uncordon`, `decommission`, `verify-removed`, `verify-not-removed`),
+//!   and `node replace-disk`.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait).

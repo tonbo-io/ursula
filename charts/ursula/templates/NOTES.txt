@@ -38,4 +38,12 @@ Rollouts and scaling:
   by each pod's readiness probe. Start an upgrade only once
   `ursulactl verify-cluster` passes.
   Raising server.replicaCount from 3 or more adds nodes that register and hold
-  no group. Lowering it, or growing a single node, is not supported.
+  no group: move groups onto them with `ursulactl placement move`.
+  Lowering it removes the highest node ids for good. First run
+  `ursulactl node decommission --node <id> ... --wait` for every id above
+  the new count, which must keep the meta voters (ids 1 to 3), then lower
+  the count and delete the dropped pods' PVCs. A single node never grows.
+{{- if .Values.server.scaleCheck.enabled }}
+  A pre-upgrade and pre-rollback hook refuses a change of the count that
+  breaks these rules.
+{{- end }}

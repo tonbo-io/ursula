@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import json
+import os
 import re
 import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -170,7 +172,8 @@ class HelmTemplateConfigTest(unittest.TestCase):
 
     def test_chart_renders_no_startup_ownership_or_rollout_machinery(self) -> None:
         rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "gateway.enabled=true",
-                                "--set", "server.networkPolicy.enabled=true")
+                                "--set", "server.networkPolicy.enabled=true",
+                                "--set", "server.scaleCheck.enabled=false")
         # No hook, Job, RBAC or ConfigMap besides the entrypoint's.
         self.assertEqual(hook_annotations(rendered).keys(), {("Pod", "test-ursula-wait-ready")})
         for kind in ("Job", "Role", "RoleBinding", "ClusterRole", "ClusterRoleBinding"):
@@ -190,6 +193,91 @@ class HelmTemplateConfigTest(unittest.TestCase):
         ):
             with self.subTest(removed=removed):
                 self.assertNotIn(removed, rendered)
+
+    def test_scale_check_hook_renders_before_upgrades_and_rollbacks(self) -> None:
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.replicaCount=5",
+                                "--set", "server.scaleCheck.kubectlImage.tag=9.9.9")
+        name = "test-ursula-scale-check"
+        hooks = hook_annotations(rendered)
+        for kind in ("ServiceAccount", "Role", "RoleBinding", "ConfigMap", "Job"):
+            with self.subTest(kind=kind):
+                self.assertEqual(hooks[(kind, name)]["helm.sh/hook"], "pre-upgrade,pre-rollback")
+        self.assertEqual(hooks[("Job", name)]["helm.sh/hook-weight"], '"0"')
+        self.assertEqual(hooks[("Role", name)]["helm.sh/hook-weight"], '"-10"')
+        # The one permission: get this release's StatefulSet.
+        role = documents(rendered, "Role")[name]
+        self.assertIn(
+            "rules:\n  # The live replica count, of this release's StatefulSet only.\n"
+            '  - apiGroups: ["apps"]\n    resources: ["statefulsets"]\n'
+            '    resourceNames: ["test-ursula"]\n    verbs: ["get"]\n',
+            role,
+        )
+        self.assertEqual(role.count("verbs:"), 1)
+        job = documents(rendered, "Job")[name]
+        self.assertIn('image: "alpine/k8s:9.9.9"', job)
+        self.assertIn(f"serviceAccountName: {name}\n", job)
+        self.assertIn(
+            "      labels:\n        app.kubernetes.io/name: ursula-scale-check\n"
+            "        app.kubernetes.io/instance: test\n        app.kubernetes.io/component: scale-check\n",
+            job,
+        )
+        # The hook's manifest lists the new count's nodes on their client plane.
+        manifest = json.loads(re.search(
+            r"  cluster-manifest\.json: \|\n(?P<json>(?: {4}.*\n)+)", documents(rendered, "ConfigMap")[name]
+        ).group("json"))
+        self.assertEqual([node["id"] for node in manifest["nodes"]], [1, 2, 3, 4, 5])
+        self.assertTrue(manifest["nodes"][4]["client_url"].endswith(":4437"))
+        self.assertNotIn(name, render_chart(*NAMED, "--set", "s3.bucket=bkt",
+                                            "--set", "server.scaleCheck.enabled=false"))
+
+    def run_scale_check(self, desired: int, live: str) -> tuple[subprocess.CompletedProcess, str]:
+        """Runs the hook's script with a kubectl that answers `live` replicas
+        (empty: no StatefulSet) and an ursulactl that records its arguments."""
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", f"server.replicaCount={desired}")
+        configmap = documents(rendered, "ConfigMap")["test-ursula-scale-check"]
+        body = re.search(r"  scale-check\.sh: \|\n(?P<script>(?: {4}.*\n)+)", configmap).group("script")
+        script = "".join(line[4:] + "\n" for line in body.splitlines())
+        with tempfile.TemporaryDirectory() as tools:
+            calls = os.path.join(tools, "calls")
+            for tool, text in (
+                ("kubectl", f"#!/bin/sh\nprintf '%s' '{live}'\n"),
+                ("ursulactl", f'#!/bin/sh\necho "$@" > "{calls}"\n'),
+            ):
+                path = os.path.join(tools, tool)
+                with open(path, "w") as stub:
+                    stub.write(text)
+                os.chmod(path, 0o755)
+            result = subprocess.run(
+                ["/bin/sh", "-c", script],
+                env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}"},
+                capture_output=True,
+                text=True,
+            )
+            called = ""
+            if os.path.exists(calls):
+                with open(calls) as recorded:
+                    called = recorded.read().strip()
+        return result, called
+
+    def test_scale_check_passes_an_unchanged_count_and_refuses_a_raise_from_one(self) -> None:
+        for desired, live in ((3, ""), (3, "3"), (5, "5"), (1, "1")):
+            with self.subTest(desired=desired, live=live):
+                result, called = self.run_scale_check(desired, live)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(called, "")
+        result, called = self.run_scale_check(3, "1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("never grows", result.stderr)
+        self.assertEqual(called, "")
+
+    def test_scale_check_verifies_every_id_a_count_change_drops_or_starts(self) -> None:
+        manifest = "--config /etc/ursula/scale-check/cluster-manifest.json"
+        result, called = self.run_scale_check(3, "5")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(called, f"node verify-removed {manifest} --node 4 --node 5")
+        result, called = self.run_scale_check(5, "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(called, f"node verify-not-removed {manifest} --node 4 --node 5")
 
     def test_removed_rollout_values_are_refused(self) -> None:
         # The schema refuses every removed value, so an old values file fails
@@ -521,6 +609,13 @@ class HelmTemplateConfigTest(unittest.TestCase):
             "              app.kubernetes.io/component: helm-test\n",
             policy,
         )
+        self.assertIn(
+            "              app.kubernetes.io/component: helm-test\n"
+            "        - podSelector:\n            matchLabels:\n"
+            "              app.kubernetes.io/name: ursula-scale-check\n              app.kubernetes.io/instance: test\n"
+            "              app.kubernetes.io/component: scale-check\n",
+            policy,
+        )
         # The test pod's own labels match that selector, and not the
         # server Services' selector.
         test_pod = documents(rendered, "Pod")["test-ursula-wait-ready"]
@@ -537,6 +632,7 @@ class HelmTemplateConfigTest(unittest.TestCase):
         ), "NetworkPolicy")["test-ursula"]
         self.assertNotIn("ursula-gateway", bare)
         self.assertNotIn("helm-test", bare)
+        self.assertIn("scale-check", bare)
 
     def test_network_policy_refuses_an_admin_plane_off_loopback(self) -> None:
         result = subprocess.run(

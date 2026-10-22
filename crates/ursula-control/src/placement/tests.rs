@@ -26,6 +26,7 @@ use super::GroupPlacement;
 use super::HistoryBegun;
 use super::HistoryCause;
 use super::LifecycleChange;
+use super::LifecycleResponse;
 use super::MetaDamageKind;
 use super::MetaLeaderReport;
 use super::MetaReplicaStatus;
@@ -1000,6 +1001,13 @@ fn every_root_round_trips_through_messagepack_and_json() {
     round_trip(&MoveResponse {
         since: PlacementEpoch::new(meta(4, 5)),
     });
+    assert_eq!(
+        serde_json::to_string(&LifecycleResponse {
+            lifecycle: NodeLifecycle::Decommissioning,
+        })
+        .unwrap(),
+        r#"{"lifecycle":"decommissioning"}"#
+    );
     // A replica's metrics round-trip in `ursula-proto` and through the
     // route's end-to-end test.
     round_trip(&PlacementGroupStatus {

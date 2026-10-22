@@ -206,8 +206,8 @@ server:
 ```
 
 The policy admits only this release's server pods to the cluster port. The
-client port admits `clientIngressFrom`, plus this release's gateway and Helm
-test pods. List every other client there, including metrics pollers
+client port admits `clientIngressFrom`, plus this release's gateway, Helm
+test and scale-check pods. List every other client there, including metrics pollers
 and an `ipBlock` for traffic through a `LoadBalancer` or `NodePort` Service.
 The chart refuses to render the policy while `server.adminListen` is off
 loopback, since the policy would cut that admin plane off. It selects only
@@ -234,7 +234,34 @@ would need both pods. Production clusters should use `3` or more.
 
 Raising `server.replicaCount` on a cluster of three or more pods adds pods that
 register with the meta group and hold no group: the placement keeps every
-group on its voters. Lowering it, or growing a single pod, is not supported.
+group on its voters. Move groups onto them with `ursulactl placement move`.
+
+A scale-down is permanent. Node ids are the pod ordinal plus one, so a lower
+count drops the highest ids, and a dropped id never holds a group again. The
+meta voters (ids 1 to 3) are never decommissioned. To lower the count:
+
+1. Decommission every id above the new count, from a manifest that reaches
+   the admin plane (see [Access Locally](#access-locally)):
+   `ursulactl node decommission --config manifest.json --node 4 --node 5 --wait`.
+   It cordons every named node first, so no group moves onto a node that
+   leaves too, and returns once the meta leader moved every group away and
+   removed each node.
+2. Lower `server.replicaCount` with `helm upgrade`.
+3. Delete the PVCs of the dropped pods.
+
+A single pod never grows: its replication factor of 1 and its one meta voter
+stay as its bootstrap fixed them. Grow it by installing a new release and
+restoring a backup into it.
+
+Before every upgrade and rollback the `scale-check` hook compares the live
+StatefulSet's replicas with the new count. No StatefulSet and an unchanged
+count pass, so an image-only upgrade always proceeds. A raise from 1 is
+refused. A lower count runs `ursulactl node verify-removed` for every dropped
+id, and a higher count runs `ursulactl node verify-not-removed` for every
+added id. The hook reads the live count with `kubectl`, through a
+ServiceAccount allowed only to `get` this release's StatefulSet, and reaches
+the pods' client plane, which the NetworkPolicy admits it to. Set
+`server.scaleCheck.enabled=false` to skip it.
 
 ## S3 Object Storage
 
@@ -418,7 +445,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `server.replicaCount` | `3` | Server pod count: `1`, or `3` and more (`2` is refused). Raising it from `3` or more adds pods that hold no group. Lowering it, or growing a single pod, is not supported. |
+| `server.replicaCount` | `3` | Server pod count: `1`, or `3` and more (`2` is refused). Raising it from `3` or more adds pods that hold no group. Lowering it needs every dropped id decommissioned first and is permanent, and a single pod never grows ([Scaling](#scaling-and-serverreplicacount)). |
 | `server.terminationGracePeriodSeconds` | `30` | Must exceed the server's overall 20-second shutdown budget, including up to 5 seconds for leadership handoff before Raft transport closes. |
 | `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, the headless peer Service, the gateway upstreams and leader redirects (each peer's `client_url`) target this port. With `server.clusterListen=false` the generated Raft peer URLs target it too. |
 | `server.ports.cluster` | `4439` | Cluster-plane (Raft gRPC) process port, used when `server.clusterListen=true`. The generated Raft peer URLs and the headless peer Service target it. The client Service never exposes it. Must differ from `server.ports.client` and the `server.adminListen` port. |
@@ -431,7 +458,11 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 | `server.service.annotations` | `{}` | Client Service annotations. |
 | `server.headlessService.annotations` | `{}` | Headless peer Service annotations. The headless Service targets `server.ports.client` and, with `server.clusterListen=true`, `server.ports.cluster`. It uses `publishNotReadyAddresses: true` for stable peer DNS during bootstrap. |
 | `server.networkPolicy.enabled` | `false` | Render an ingress NetworkPolicy for the server pods. The cluster port admits only this release's server pods. The admin plane stays on loopback and needs no rule, and rendering fails when `server.adminListen` is off loopback. Needs a CNI that enforces NetworkPolicy. |
-| `server.networkPolicy.clientIngressFrom` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector`, `ipBlock`) admitted to the client port. Empty admits every source. This release's gateway and Helm test pods are always admitted when enabled. List every other client, including metrics pollers and an `ipBlock` for `LoadBalancer` or `NodePort` traffic. |
+| `server.networkPolicy.clientIngressFrom` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector`, `ipBlock`) admitted to the client port. Empty admits every source. This release's gateway, Helm test and scale-check pods are always admitted when enabled. List every other client, including metrics pollers and an `ipBlock` for `LoadBalancer` or `NodePort` traffic. |
+| `server.scaleCheck.enabled` | `true` | Render the `pre-upgrade,pre-rollback` hook that checks a change of `server.replicaCount` ([Scaling](#scaling-and-serverreplicacount)): a ServiceAccount, a Role allowed to `get` this release's StatefulSet, a ConfigMap and a Job. |
+| `server.scaleCheck.activeDeadlineSeconds` | `300` | Deadline of the hook's Job. |
+| `server.scaleCheck.kubectlImage` | `alpine/k8s:1.33.3` | `repository`, `tag` and `pullPolicy` of the image `kubectl` is copied from into the hook's Ursula container. |
+| `server.scaleCheck.resources` | `{}` | Resources of the hook's container. |
 | `server.podAnnotations` | `{}` | Extra annotations applied to Ursula server pods. |
 | `server.podLabels` | `{}` | Extra labels applied to Ursula server pods. Must not set selector labels `app.kubernetes.io/name` or `app.kubernetes.io/instance`; the chart fails rendering if those keys are used. |
 | `server.rustLog` | `ursula=info,ursula_runtime=info,ursula_raft=info` | `RUST_LOG` tracing filter. |

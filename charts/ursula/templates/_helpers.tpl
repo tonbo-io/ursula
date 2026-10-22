@@ -380,3 +380,32 @@ cluster plane listens apart (server.clusterListen), else server.ports.client.
 {{- .Values.server.ports.client | int -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+The ursulactl manifest of the server pods: node id ordinal + 1, at the peer
+host. http_url is the Raft address. ursulactl reads metrics, readiness and
+placement at client_url.
+*/}}
+{{- define "ursula.clusterManifest" -}}
+{{- $fullname := include "ursula.fullname" . -}}
+{{- $headless := include "ursula.headlessServiceName" . -}}
+{{- $clientPort := .Values.server.ports.client | int -}}
+{{- $clusterPort := include "ursula.clusterPort" . | int -}}
+{{- $nodes := list -}}
+{{- range $i := until (.Values.server.replicaCount | int) -}}
+{{- $podName := printf "%s-%d" $fullname $i -}}
+{{- $host := printf "%s.%s.%s.svc.%s" $podName $headless $.Release.Namespace ($.Values.global.clusterDomain | toString) -}}
+{{- $nodes = append $nodes (dict "id" (add1 $i) "http_url" (printf "http://%s:%d" $host $clusterPort) "client_url" (printf "http://%s:%d" $host $clientPort) "host" $host "name" $podName) -}}
+{{- end -}}
+{{- dict "nodes" $nodes | toPrettyJson -}}
+{{- end -}}
+
+{{/*
+Selector labels of the scale-check hook's pod, which the NetworkPolicy
+admits to the client plane as it admits the Helm test pod.
+*/}}
+{{- define "ursula.scaleCheckSelectorLabels" -}}
+app.kubernetes.io/name: {{ include "ursula.name" . | trunc 50 | trimSuffix "-" }}-scale-check
+app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/component: scale-check
+{{- end -}}

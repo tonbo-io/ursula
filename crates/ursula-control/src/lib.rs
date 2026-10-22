@@ -52,6 +52,7 @@ pub use placement::LeaderView;
 pub use placement::Leadership;
 pub use placement::LeftMark;
 pub use placement::LifecycleChange;
+pub use placement::LifecycleResponse;
 pub use placement::LocalLog;
 pub use placement::LocalReplica;
 pub use placement::MembershipConfig;

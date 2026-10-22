@@ -10,6 +10,9 @@
 //! - a request the kernel would refuse now and may take later, such as one
 //!   over the move limit ([`Requeue::Retry`]), stays queued for the next
 //!   pass, and every other refusal is reported for its group.
+//! - a node the move adds must be live in the meta leader's report
+//!   ([`Live`]), the rule the decommission driver moves by, unless the
+//!   operator passes `--allow-not-live`. A cancel adds none.
 //!
 //! An accepted request is applied to the pass's view at the entry that
 //! answered it, so the next check of the pass counts its move against the
@@ -31,17 +34,20 @@ use ursula_control::ControlCommand;
 use ursula_control::ControlError;
 use ursula_control::ControlPlaneState;
 use ursula_control::GroupPlacement;
+use ursula_control::MetaLeaderReport;
 use ursula_control::MoveLimit;
 use ursula_control::MoveLimitRequest;
 use ursula_control::MoveLimitResponse;
 use ursula_control::MoveRequest;
 use ursula_control::MoveResponse;
+use ursula_control::NodeEligibility;
 use ursula_control::PlacementApiError;
 use ursula_control::PlacementApiReason;
 use ursula_control::Requeue;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::PlacementEpoch;
+use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WriteEffect;
 use ursula_shard::RaftGroupId;
@@ -106,7 +112,7 @@ impl FromStr for Replacement {
 pub enum MoveRefusal {
     /// The meta state machine refuses the request, on the confirmed view or
     /// in its answer.
-    #[error("{0}")]
+    #[error(transparent)]
     Kernel(ControlError),
     #[error(
         "group {} is moving to {}: pass --retarget to change its target",
@@ -116,6 +122,23 @@ pub enum MoveRefusal {
     Moving { group: RaftGroupId, to: VoterSet },
     #[error("node {node} is not a voter of group {}'s target", .group.0)]
     NotAVoter { group: RaftGroupId, node: NodeId },
+    #[error(
+        "node {node} is not live as a move target of group {} (the meta leader reports {}): \
+         pass --allow-not-live to move onto it anyway",
+        .group.0,
+        .eligibility.map_or("no answer from it".to_owned(), |eligibility| format!("{eligibility:?}"))
+    )]
+    NotLive {
+        group: RaftGroupId,
+        node: NodeId,
+        eligibility: Option<NodeEligibility>,
+    },
+    #[error(
+        "no meta leader report tells whether group {}'s new voters are live: pass \
+         --allow-not-live to move without it",
+        .group.0
+    )]
+    NoLeaderReport { group: RaftGroupId },
     #[error("group {} now targets {}: another request changed its placement", .group.0, join(.current.target_voters().iter()))]
     Superseded {
         group: RaftGroupId,
@@ -155,16 +178,66 @@ pub enum Decision {
     Refuse(MoveRefusal),
 }
 
+/// Which nodes a move may add to a group.
+#[derive(Debug, Clone, Copy)]
+pub enum Live<'a> {
+    /// Any node the meta state machine takes (`--allow-not-live`).
+    Any,
+    /// Only the nodes the meta leader's report lists `Eligible`: a node it
+    /// leaves out is not live. `None` when no report was reachable.
+    Eligible(Option<&'a MetaLeaderReport>),
+}
+
+impl Live<'_> {
+    /// Refuses the first node of `to` without a voter role in `placement`
+    /// that is not live.
+    fn check(
+        self,
+        group: RaftGroupId,
+        placement: &GroupPlacement,
+        to: &VoterSet,
+    ) -> Result<(), MoveRefusal> {
+        let Self::Eligible(report) = self else {
+            return Ok(());
+        };
+        let mut added = to.iter().filter(|node| {
+            !matches!(
+                placement.role(*node),
+                Some(ReplicaRole::Voter | ReplicaRole::Outgoing)
+            )
+        });
+        let Some(report) = report else {
+            return match added.next() {
+                Some(_) => Err(MoveRefusal::NoLeaderReport { group }),
+                None => Ok(()),
+            };
+        };
+        match added.find_map(|node| {
+            let eligibility = report.eligibility.get(&node).copied();
+            (eligibility != Some(NodeEligibility::Eligible)).then_some((node, eligibility))
+        }) {
+            Some((node, eligibility)) => Err(MoveRefusal::NotLive {
+                group,
+                node,
+                eligibility,
+            }),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Decides `intent` for `group` on `state`, a confirmed view. `expect`
 /// replaces the placement key the view shows, and a moving group takes
 /// another target only with `retarget` or under the `expect` the operator
-/// read from it.
+/// read from it. A request the kernel takes is sent only when every node
+/// it adds is `live`.
 pub fn decide(
     state: &ControlPlaneState,
     group: RaftGroupId,
     intent: &Intent,
     expect: Option<PlacementEpoch>,
     retarget: bool,
+    live: Live<'_>,
 ) -> Decision {
     let cluster = match state {
         ControlPlaneState::Bootstrapped(cluster) => cluster,
@@ -215,7 +288,10 @@ pub fn decide(
         to,
     };
     match state.check(&request_move(group, &request, 0)) {
-        Ok(()) => Decision::Submit(request),
+        Ok(()) => match live.check(group, placement, &request.to) {
+            Ok(()) => Decision::Submit(request),
+            Err(refusal) => Decision::Refuse(refusal),
+        },
         Err(error) => match error.requeue() {
             Requeue::Retry => Decision::Queue(error),
             Requeue::ConfirmView | Requeue::Permanent => {
@@ -319,6 +395,8 @@ pub struct MoveOptions {
     /// Let a moving group take the new target. Naming its key with
     /// `expect` does too.
     pub retarget: bool,
+    /// Let a move add nodes the meta leader's report does not list live.
+    pub allow_not_live: bool,
     /// Wait until every group is stable at its target.
     pub wait: bool,
     /// Bounds the whole command: queued groups and, with `wait`, the moves.
@@ -399,8 +477,17 @@ pub async fn run_moves(
                     ControlPlaneState::default()
                 }
             };
+            let report = if options.allow_not_live || options.intent == Intent::Cancel {
+                None
+            } else {
+                leader_report(client, nodes).await
+            };
+            let live = match (options.allow_not_live, &report) {
+                (true, _) => Live::Any,
+                (false, report) => Live::Eligible(report.as_ref()),
+            };
             for (group, stage) in &mut stages {
-                pass_group(client, via, &mut state, *group, stage, options, out).await?;
+                pass_group(client, via, &mut state, *group, stage, options, live, out).await?;
             }
             if options.wait {
                 for (group, stage) in &mut stages {
@@ -443,6 +530,22 @@ pub async fn run_moves(
         .collect())
 }
 
+/// The meta leader's report, `None` when no node names a leader that
+/// answers with one.
+async fn leader_report(client: &MetricsClient, nodes: &[NodeInfo]) -> Option<MetaLeaderReport> {
+    match crate::view::leader_status(client, nodes).await {
+        Ok(Ok(status)) => status.leader_report,
+        Ok(Err(refusal)) => {
+            tracing::warn!(%refusal, "placement: no meta leader report");
+            None
+        }
+        Err(error) => {
+            tracing::warn!(%error, "placement: no meta leader report");
+            None
+        }
+    }
+}
+
 /// Decides and, when it must, sends one pending group of a pass.
 async fn pass_group(
     client: &MetricsClient,
@@ -451,6 +554,7 @@ async fn pass_group(
     group: RaftGroupId,
     stage: &mut Stage,
     options: &MoveOptions,
+    live: Live<'_>,
     out: &mut impl Write,
 ) -> Result<()> {
     let Stage::Pending(waiting) = stage else {
@@ -463,6 +567,7 @@ async fn pass_group(
         &options.intent,
         options.expect,
         options.retarget,
+        live,
     );
     if after_lost {
         let took = matches!(decision, Decision::Done { .. });

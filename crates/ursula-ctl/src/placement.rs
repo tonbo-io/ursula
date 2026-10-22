@@ -1,10 +1,12 @@
-//! Placement verbs over the nodes' admin planes: placement views, moves
-//! and `node replace-disk`.
+//! Placement verbs over the nodes' admin planes: placement views, moves,
+//! node lifecycles and `node replace-disk`.
 //!
 //! - [`status`]: `placement status`, the view and each moving group's
 //!   leader.
 //! - [`moves`]: `placement move`, `cancel` and `set-move-limit`, pre-checked
 //!   with the kernel's own `check` on a confirmed view.
+//! - [`lifecycle`]: `node cordon`, `uncordon` and `decommission`, pre-checked
+//!   the same way, and `node verify-removed` and `verify-not-removed`.
 //!
 //! `node replace-disk` releases the root (the WAL disk) a node id is bound
 //! to in meta, so an empty disk under that id binds. It reads the node's
@@ -15,6 +17,7 @@
 //! never binds again, and the release is safe only once its disk is
 //! revoked ([`RELEASE_RULE`]).
 
+pub mod lifecycle;
 pub mod moves;
 pub mod status;
 
@@ -184,18 +187,36 @@ pub async fn post_write<B: serde::Serialize, T: serde::de::DeserializeOwned>(
     path: &str,
     body: &B,
 ) -> WriteAnswer<T> {
+    send_write(client, via, path, Some(body)).await
+}
+
+/// Sends a write without a body, such as a lifecycle change, to `path` on
+/// `via`'s admin plane, with the incarnation the client pinned for it.
+pub async fn post_empty<T: serde::de::DeserializeOwned>(
+    client: &MetricsClient,
+    via: &NodeInfo,
+    path: &str,
+) -> WriteAnswer<T> {
+    send_write::<(), T>(client, via, path, None).await
+}
+
+async fn send_write<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    client: &MetricsClient,
+    via: &NodeInfo,
+    path: &str,
+    body: Option<&B>,
+) -> WriteAnswer<T> {
     let sent = async {
         let url = via
             .admin_url
             .join(path)
             .context("compose the placement url")?;
-        client
-            .admin_request(via, Method::POST, url.clone())
-            .await?
-            .json(body)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))
+        let request = client.admin_request(via, Method::POST, url.clone()).await?;
+        let request = match body {
+            Some(body) => request.json(body),
+            None => request,
+        };
+        request.send().await.with_context(|| format!("POST {url}"))
     };
     let response = match sent.await {
         Ok(response) => response,

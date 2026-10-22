@@ -204,7 +204,7 @@
         "replicaCount": {
           "type": "integer",
           "minimum": 1,
-          "description": "Ursula server pod count: 1, or 3 and more (2 is refused). Raising it from 3 or more adds nodes that register and hold no group. Lowering it, or growing a single node, is not supported."
+          "description": "Ursula server pod count: 1, or 3 and more (2 is refused). Raising it from 3 or more adds nodes that register and hold no group. Lowering it is permanent and needs every dropped id decommissioned first, which the scale-check hook verifies. A single pod never grows."
         },
         "terminationGracePeriodSeconds": {
           "type": "integer",
@@ -314,6 +314,60 @@
           "required": [
             "enabled",
             "clientIngressFrom"
+          ]
+        },
+        "scaleCheck": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The pre-upgrade,pre-rollback hook that checks a change of replicaCount against the meta leader's view.",
+          "properties": {
+            "enabled": {
+              "type": "boolean",
+              "description": "Render the scale-check hook."
+            },
+            "activeDeadlineSeconds": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "Deadline of the check's Job."
+            },
+            "kubectlImage": {
+              "type": "object",
+              "additionalProperties": false,
+              "description": "The image kubectl is copied from.",
+              "properties": {
+                "repository": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "tag": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "pullPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "Always",
+                    "IfNotPresent",
+                    "Never"
+                  ]
+                }
+              },
+              "required": [
+                "repository",
+                "tag",
+                "pullPolicy"
+              ]
+            },
+            "resources": {
+              "type": "object",
+              "description": "Resources of the check's container."
+            }
+          },
+          "required": [
+            "enabled",
+            "activeDeadlineSeconds",
+            "kubectlImage",
+            "resources"
           ]
         },
         "podAnnotations": {
@@ -518,7 +572,8 @@
         "podDisruptionBudget",
         "scheduling",
         "clusterListen",
-        "networkPolicy"
+        "networkPolicy",
+        "scaleCheck"
       ]
     },
     "gateway": {
@@ -1028,7 +1083,7 @@
     },
     "raft": {
       "type": "object",
-      "description": "Static Raft cluster settings.",
+      "description": "Raft settings: the group count, the WAL, and snapshot and recovery limits. The meta group places every group.",
       "properties": {
         "groupCount": {
           "type": "integer",

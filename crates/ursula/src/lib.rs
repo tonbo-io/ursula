@@ -1324,6 +1324,18 @@ fn admin_ops_router(state: HttpState) -> Router {
             post(placement_status::replace_disk),
         )
         .route(
+            placement_status::CORDON_ROUTE,
+            post(placement_status::cordon),
+        )
+        .route(
+            placement_status::UNCORDON_ROUTE,
+            post(placement_status::uncordon),
+        )
+        .route(
+            placement_status::DECOMMISSION_ROUTE,
+            post(placement_status::decommission),
+        )
+        .route(
             placement_status::MOVE_ROUTE,
             post(placement_status::request_move),
         )

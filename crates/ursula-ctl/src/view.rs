@@ -15,6 +15,10 @@
 //! placement the replicas' memberships still show: a group whose replicas
 //! report other voters fails [`check_groups`].
 //!
+//! The verbs that walk the manifest skip the nodes the view shows removed
+//! ([`MetaLeaderView::members`]): a removed node has no role and may already
+//! be stopped.
+//!
 //! A node that gives no status, through a transport failure or a `503` (it
 //! runs no meta runtime yet), is skipped. Any other failed answer, a body
 //! that does not decode included, is an [`UnreadableStatus`]: polling again
@@ -31,6 +35,7 @@ use ursula_control::PlacementStatus;
 use ursula_control::Target;
 use ursula_proto::placement::ClusterStage;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
 use ursula_shard::RaftGroupId;
 
@@ -104,6 +109,21 @@ impl MetaLeaderView {
         settled_targets(self.cluster.groups().iter())
     }
 
+    /// The nodes of `nodes` that the view does not show removed. A removed
+    /// node holds no role and may be stopped, so the verbs that walk the
+    /// manifest skip it. A node the view does not list yet stays.
+    pub fn members(&self, nodes: &[NodeInfo]) -> Vec<NodeInfo> {
+        nodes
+            .iter()
+            .filter(|node| {
+                self.cluster
+                    .node(NodeId::new(node.id))
+                    .is_none_or(|record| record.lifecycle != NodeLifecycle::Removed)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// The groups whose current voters the view places node `node` among:
     /// it is a voter, or an outgoing one of a move.
     pub fn voter_groups(&self, node: u64) -> BTreeSet<u64> {
@@ -129,6 +149,25 @@ pub async fn read_view(
     client: &MetricsClient,
     nodes: &[NodeInfo],
 ) -> Result<Result<MetaLeaderView, ViewRefusal>, UnreadableStatus> {
+    Ok(leader_status(client, nodes).await?.and_then(|own| {
+        let leader = own.node.get();
+        match own.view {
+            ClusterView::Bootstrapped(cluster) => Ok(MetaLeaderView { leader, cluster }),
+            other => Err(ViewRefusal::NotBootstrapped {
+                leader,
+                stage: other.stage(),
+            }),
+        }
+    }))
+}
+
+/// The meta leader's own placement status, which carries its
+/// `leader_report`: the leader the first answering node of `nodes` names,
+/// once its own status names itself.
+pub async fn leader_status(
+    client: &MetricsClient,
+    nodes: &[NodeInfo],
+) -> Result<Result<PlacementStatus, ViewRefusal>, UnreadableStatus> {
     for node in nodes {
         let Some(status) = status_of(client, node).await? else {
             continue;
@@ -144,20 +183,26 @@ pub async fn read_view(
                 None => None,
             }
         };
-        let Some(own) =
+        if let Some(own) =
             own.filter(|own| own.node == NodeId::new(leader) && named_leader(own) == Some(leader))
-        else {
-            continue;
-        };
-        return Ok(match own.view {
-            ClusterView::Bootstrapped(cluster) => Ok(MetaLeaderView { leader, cluster }),
-            other => Err(ViewRefusal::NotBootstrapped {
-                leader,
-                stage: other.stage(),
-            }),
-        });
+        {
+            return Ok(Ok(own));
+        }
     }
     Ok(Err(ViewRefusal::NoMetaLeader))
+}
+
+/// The nodes of `nodes` that the meta leader's view does not show removed,
+/// all of them when no view can be read: what a verb that walks the
+/// manifest checks.
+pub async fn without_removed(
+    client: &MetricsClient,
+    nodes: &[NodeInfo],
+) -> Result<Vec<NodeInfo>, UnreadableStatus> {
+    Ok(match read_view(client, nodes).await? {
+        Ok(view) => view.members(nodes),
+        Err(_no_view) => nodes.to_vec(),
+    })
 }
 
 /// Node `node`'s placement status, `None` when it gives none for now.

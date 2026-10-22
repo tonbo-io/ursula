@@ -162,6 +162,11 @@ struct MoveArgs {
     /// Let a moving group take the new target.
     #[arg(long, default_value_t = false)]
     retarget: bool,
+    /// Move onto nodes the meta leader's report does not list live, or with
+    /// no report reachable. A group whose new voter is down waits until it
+    /// is back.
+    #[arg(long, default_value_t = false)]
+    allow_not_live: bool,
     #[command(flatten)]
     wait: MoveWaitArgs,
 }
@@ -200,6 +205,82 @@ enum NodeCommand {
     /// old disk is revoked: the release cannot be undone. The release goes
     /// to another node's admin plane.
     ReplaceDisk(ReplaceDiskArgs),
+    /// Cordon nodes: they keep their replicas and take no new one. Exits 2
+    /// when a node was refused or the timeout passed.
+    Cordon(LifecycleArgs),
+    /// Return cordoned or decommissioning nodes to active, which aborts a
+    /// decommission while the node still has a role. Exits 2 when a node was
+    /// refused or the timeout passed.
+    Uncordon(LifecycleArgs),
+    /// Decommission nodes: checks every named node first (a meta voter is
+    /// refused with nothing sent), cordons every active one, then
+    /// decommissions each. The meta leader moves their groups away, and a
+    /// node is removed for good once it has no role. With `--wait` it waits
+    /// until every node is removed. Exits 2 when a node was refused or the
+    /// timeout passed.
+    Decommission(DecommissionArgs),
+    /// Verify that every named node is removed, or never registered, so it
+    /// may leave. Reads the meta leader's view over the read URLs. Exits 2
+    /// when a node is not removed.
+    VerifyRemoved(VerifyRemovalArgs),
+    /// Verify that no named node is removed, so it may start: a removed id
+    /// never holds a group again. Exits 2 when a node is removed.
+    VerifyNotRemoved(VerifyRemovalArgs),
+}
+
+#[derive(Args, Debug)]
+struct LifecycleArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// A node id. Repeat it for several nodes.
+    #[arg(long = "node", required = true)]
+    nodes: Vec<u64>,
+    /// Bounds the command.
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct DecommissionArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// A node id. Repeat it for several nodes.
+    #[arg(long = "node", required = true)]
+    nodes: Vec<u64>,
+    /// Wait until every node is removed, printing how many groups each
+    /// still has a role in.
+    #[arg(long, default_value_t = false)]
+    wait: bool,
+    /// Bounds the command, with `--wait` the moves of every group away.
+    #[arg(long, default_value_t = 3600)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct VerifyRemovalArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// A node id. Repeat it for several nodes.
+    #[arg(long = "node", required = true)]
+    nodes: Vec<u64>,
+    /// How long to read again while no node names a meta leader.
+    #[arg(long, default_value_t = 60)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 1)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 5)]
+    http_timeout_secs: u64,
 }
 
 #[derive(Args, Debug)]
@@ -417,7 +498,7 @@ async fn main() -> Result<()> {
         Command::Status(args) => run_status_subcommand(args).await,
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::RecoverGroup(args) => run_recover_group_subcommand(args).await,
-        Command::Node(NodeCommand::ReplaceDisk(args)) => run_replace_disk_subcommand(args).await,
+        Command::Node(command) => run_lifecycle_subcommand(command).await,
         Command::Placement(command) => run_placement_subcommand(command).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
@@ -815,6 +896,7 @@ async fn run_placement_subcommand(command: PlacementCommand) -> Result<()> {
                 intent,
                 args.expect,
                 args.retarget,
+                args.allow_not_live,
                 &args.wait,
             )
             .await
@@ -826,6 +908,7 @@ async fn run_placement_subcommand(command: PlacementCommand) -> Result<()> {
                 groups,
                 moves::Intent::Cancel,
                 args.expect,
+                false,
                 false,
                 &args.wait,
             )
@@ -867,6 +950,7 @@ async fn run_moves(
     intent: ursula_ctl::placement::moves::Intent,
     expect: Option<ursula_proto::placement::PlacementEpoch>,
     retarget: bool,
+    allow_not_live: bool,
     wait: &MoveWaitArgs,
 ) -> Result<()> {
     use ursula_ctl::placement::moves;
@@ -877,6 +961,7 @@ async fn run_moves(
         intent,
         expect,
         retarget,
+        allow_not_live,
         wait: wait.wait,
         timeout: Duration::from_secs(wait.timeout_secs),
         poll_interval: Duration::from_secs(wait.poll_interval_secs),
@@ -904,6 +989,121 @@ async fn run_moves(
         std::process::exit(2);
     }
     Ok(())
+}
+
+fn lifecycle_options(
+    nodes: &[u64],
+    wait: bool,
+    timeout_secs: u64,
+    poll_interval_secs: u64,
+) -> ursula_ctl::placement::lifecycle::LifecycleOptions {
+    ursula_ctl::placement::lifecycle::LifecycleOptions {
+        nodes: nodes
+            .iter()
+            .copied()
+            .map(ursula_proto::placement::NodeId::new)
+            .collect(),
+        wait,
+        timeout: Duration::from_secs(timeout_secs),
+        poll_interval: Duration::from_secs(poll_interval_secs),
+    }
+}
+
+/// `node cordon`, `uncordon`, `decommission`, `verify-removed` and
+/// `verify-not-removed`. A refusal or a check that fails exits 2.
+async fn run_lifecycle_subcommand(command: NodeCommand) -> Result<()> {
+    use ursula_control::LifecycleChange;
+    use ursula_ctl::placement::lifecycle;
+    let ended = match command {
+        NodeCommand::ReplaceDisk(args) => return run_replace_disk_subcommand(args).await,
+        NodeCommand::Cordon(args) => run_set_lifecycle(&args, LifecycleChange::Cordon).await,
+        NodeCommand::Uncordon(args) => run_set_lifecycle(&args, LifecycleChange::Uncordon).await,
+        NodeCommand::Decommission(args) => {
+            let nodes = load_nodes(&args.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+            let options = lifecycle_options(
+                &args.nodes,
+                args.wait,
+                args.timeout_secs,
+                args.poll_interval_secs,
+            );
+            let mut stdout = std::io::stdout().lock();
+            lifecycle::decommission(&client, &nodes, &options, &mut stdout).await
+        }
+        NodeCommand::VerifyRemoved(args) => {
+            run_verify_removal(&args, lifecycle::Removal::Removed).await
+        }
+        NodeCommand::VerifyNotRemoved(args) => {
+            run_verify_removal(&args, lifecycle::Removal::NotRemoved).await
+        }
+    };
+    let refused = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<lifecycle::LifecycleRefusal>()
+            .is_some()
+            || error.downcast_ref::<lifecycle::RemovalRefusal>().is_some()
+    };
+    match ended {
+        Ok(lifecycle::LifecycleEnd::Done) => Ok(()),
+        Ok(lifecycle::LifecycleEnd::Leaving(leaving)) => {
+            println!(
+                "nodes {leaving:?} are decommissioning: the meta leader moves their groups away, \
+                 and `node verify-removed` passes once they are removed"
+            );
+            Ok(())
+        }
+        Ok(lifecycle::LifecycleEnd::TimedOut(open)) => {
+            println!("timed out, nodes {open:?} are not there yet");
+            std::process::exit(2);
+        }
+        Err(error) if refused(&error) => {
+            println!("refused: {error}");
+            std::process::exit(2);
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn run_set_lifecycle(
+    args: &LifecycleArgs,
+    change: ursula_control::LifecycleChange,
+) -> Result<ursula_ctl::placement::lifecycle::LifecycleEnd> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let options = lifecycle_options(
+        &args.nodes,
+        false,
+        args.timeout_secs,
+        args.poll_interval_secs,
+    );
+    let mut stdout = std::io::stdout().lock();
+    ursula_ctl::placement::lifecycle::set_lifecycles(&client, &nodes, change, &options, &mut stdout)
+        .await
+}
+
+async fn run_verify_removal(
+    args: &VerifyRemovalArgs,
+    removal: ursula_ctl::placement::lifecycle::Removal,
+) -> Result<ursula_ctl::placement::lifecycle::LifecycleEnd> {
+    let nodes = load_nodes(&args.config).await?;
+    let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+    let ids = args
+        .nodes
+        .iter()
+        .copied()
+        .map(ursula_proto::placement::NodeId::new)
+        .collect();
+    ursula_ctl::placement::lifecycle::verify_removal(
+        &client,
+        &nodes,
+        &ids,
+        removal,
+        Duration::from_secs(args.timeout_secs),
+        Duration::from_secs(args.poll_interval_secs),
+    )
+    .await?;
+    println!("verified: nodes {:?} are {removal:?}", args.nodes);
+    Ok(ursula_ctl::placement::lifecycle::LifecycleEnd::Done)
 }
 
 async fn run_undrain_subcommand(args: NodeArgs) -> Result<()> {

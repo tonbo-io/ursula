@@ -133,7 +133,8 @@ pub fn check_maintenance_snapshot(
     Ok(())
 }
 
-/// Wait until every node's maintenance report is ready and it serves, the
+/// Wait until every node's maintenance report is ready and it serves, but
+/// the nodes the meta leader's view shows removed, the
 /// meta leader's view shows the cluster bootstrapped with every group live
 /// and no move, and every group runs on exactly its target voters with a
 /// leader among them ([`crate::view::check_groups`]). Transport failures,
@@ -154,9 +155,15 @@ pub async fn wait_ready(
     loop {
         let poll = MetricsClient::new(client.timeout())?;
         let observation: Result<(ClusterSnapshot, MetaLeaderView)> = async {
-            let snapshot = poll.fetch_cluster(nodes).await?;
+            // A node the view shows removed is skipped: it may be stopped.
+            let view = crate::view::read_view(&poll, nodes).await?;
+            let members = match &view {
+                Ok(view) => view.members(nodes),
+                Err(_no_view) => nodes.to_vec(),
+            };
+            let snapshot = poll.fetch_cluster(&members).await?;
             check_maintenance_snapshot(&snapshot)?;
-            for node in nodes {
+            for node in &members {
                 let (status, report) = poll.serving_readiness(node).await?;
                 if status != reqwest::StatusCode::OK || !report.ready {
                     return Err(ReadinessRefusal::Serving {
@@ -167,9 +174,7 @@ pub async fn wait_ready(
                     .into());
                 }
             }
-            let view = crate::view::read_view(&poll, nodes)
-                .await?
-                .map_err(ReadinessRefusal::from)?;
+            let view = view.map_err(ReadinessRefusal::from)?;
             let targets = view.targets().map_err(ReadinessRefusal::from)?;
             crate::view::check_groups(&targets, &snapshot, None).map_err(ReadinessRefusal::from)?;
             Ok((snapshot, view))

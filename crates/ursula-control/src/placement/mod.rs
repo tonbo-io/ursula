@@ -35,6 +35,7 @@ mod state;
 mod view;
 
 pub use admin::ClusterView;
+pub use admin::LifecycleResponse;
 pub use admin::MetaDamageKind;
 pub use admin::MetaLeaderReport;
 pub use admin::MetaReplicaStatus;
