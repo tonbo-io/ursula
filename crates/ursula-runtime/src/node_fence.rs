@@ -70,6 +70,18 @@ fn lease_ends() -> bool {
     true
 }
 
+/// Whether a held process's snapshot object writes are refused, read only
+/// when one would be. A negative control turns it off
+/// (`Defence::WaitCoversObjects`), and the lease alone then decides.
+fn wait_covers_objects() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::WaitCoversObjects) {
+        ursula_stream::sim_controls::note_fired(Defence::WaitCoversObjects);
+        return false;
+    }
+    true
+}
+
 /// A probe's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -365,7 +377,11 @@ impl NodeFence {
         path: &str,
     ) -> Result<(), FencedWrite> {
         let refusal = match self.status(fence_now()) {
-            FenceStatus::Admits if object == FencedObject::Snapshot && self.holds_data() => {
+            FenceStatus::Admits
+                if object == FencedObject::Snapshot
+                    && self.holds_data()
+                    && wait_covers_objects() =>
+            {
                 WriteRefusal::PredecessorWait
             }
             FenceStatus::Admits => return Ok(()),

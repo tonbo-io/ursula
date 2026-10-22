@@ -251,6 +251,16 @@ pub enum Defence {
     /// fence). Off, it reads OpenRaft's server state alone, so a fenced
     /// leader starts linearizable reads and leader-gated jobs.
     FencedLeadership,
+    /// A process that owes its predecessor wait, or whose unbound root
+    /// awaits its binding, sends no snapshot object PUT or DELETE (N15 of
+    /// the identity fence). Off, only the disk lease decides, so a
+    /// successor builds and installs during its wait.
+    WaitCoversObjects,
+    /// A snapshot GC pass checks the node fence before each DELETE, after
+    /// its LIST returned (N25 of the identity fence). Off, each DELETE
+    /// reads the fence as it was when the pass's LIST began, so a pass that
+    /// began inside the lease deletes after it ended.
+    ObjectWriteCheck,
 }
 
 #[cfg(madsim)]
@@ -260,8 +270,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 50]> = const { Cell::new([false; 50]) };
-        static FIRED: Cell<[u64; 50]> = const { Cell::new([0; 50]) };
+        static OFF: Cell<[bool; 52]> = const { Cell::new([false; 52]) };
+        static FIRED: Cell<[u64; 52]> = const { Cell::new([0; 52]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -316,6 +326,8 @@ mod switches {
             Defence::CrashedLeaderDemotion => 47,
             Defence::SendLease => 48,
             Defence::FencedLeadership => 49,
+            Defence::WaitCoversObjects => 50,
+            Defence::ObjectWriteCheck => 51,
         }
     }
 
@@ -338,7 +350,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 50]));
+        FIRED.with(|fired| fired.set([0; 52]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {
