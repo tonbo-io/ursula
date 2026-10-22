@@ -8728,11 +8728,18 @@ async fn cli_a_wiped_voter_is_not_ready_before_its_groups() {
     }
 }
 
-/// One-way delay of every link in
-/// [`cli_writes_commit_over_round_trips_longer_than_the_heartbeat_interval`].
-const SLOW_LINK_ONE_WAY: Duration = Duration::from_millis(200);
-/// The round trip [`SLOW_LINK_ONE_WAY`] makes.
-const SLOW_LINK_ROUND_TRIP: Duration = Duration::from_millis(400);
+/// One-way delay of every link in the first phase of
+/// [`cli_slow_links_slow_writes_instead_of_stopping_them`]: a round trip of
+/// 400 ms, longer than 0.9's 250 ms heartbeat interval and shorter than the
+/// 600 ms one.
+const SLOW_LINK_IDLE_ONE_WAY: Duration = Duration::from_millis(200);
+/// One-way delay of every link in the second phase: a round trip of 800 ms,
+/// longer than the 600 ms heartbeat interval, which OpenRaft passes each
+/// Append call as its option, and shorter than the 1.5 s minimum election
+/// timeout.
+const SLOW_LINK_BUSY_ONE_WAY: Duration = Duration::from_millis(400);
+/// A cluster group's leader lease, its `election_timeout_max`.
+const SLOW_LINK_LEADER_LEASE: Duration = Duration::from_secs(3);
 
 /// A TCP link in front of a node's listener that holds every byte it
 /// carries for the same one-way delay in each direction, as a `netem delay`
@@ -8757,9 +8764,11 @@ impl DelayedLink {
             // Dropped with the task, which aborts every connection.
             let mut connections = tokio::task::JoinSet::new();
             loop {
+                // A listener that fails to accept ends the link.
                 let Ok((inbound, _peer)) = listener.accept().await else {
-                    continue;
+                    return;
                 };
+                while connections.try_join_next().is_some() {}
                 let target = target.clone();
                 let delays = delays.clone();
                 connections.spawn(async move {
@@ -8854,17 +8863,67 @@ async fn group_leaders_and_terms(
     views
 }
 
-/// Replication slows with a slow link instead of stopping. Once every
-/// group's leadership settled, every node's Raft traffic passes a link that
-/// holds each byte [`SLOW_LINK_ONE_WAY`] each way, a round trip longer than
-/// the heartbeat interval OpenRaft gives each Append call as its timeout.
-/// Every write to every group is still acknowledged at its first attempt,
-/// each after at least one round trip, no group changes its leader or term,
-/// and linearizable reads return every write. A transport that waits only
-/// the heartbeat interval for an Append's answer fails every append over
-/// such links and commits nothing.
+/// Appends `payload` to `url` once: how long its `204` took, or why the
+/// append was not acknowledged.
+async fn append_once(
+    client: &reqwest::Client,
+    url: &str,
+    payload: &'static str,
+) -> Result<Duration, String> {
+    let started = std::time::Instant::now();
+    let response = client
+        .post(url)
+        .header("content-type", "text/plain")
+        .body(payload)
+        .send()
+        .await
+        .map_err(|err| format!("append {payload} to {url} failed: {err}"))?;
+    let status = response.status();
+    if status != reqwest::StatusCode::NO_CONTENT {
+        return Err(format!(
+            "append {payload} to {url}: {status} {:?}",
+            response.text().await
+        ));
+    }
+    Ok(started.elapsed())
+}
+
+/// Checks `appended`, the outcome of one append of `payload` to `url`: it
+/// was acknowledged, and after at least `round_trip`.
+fn check_slow_append(
+    url: &str,
+    payload: &str,
+    round_trip: Duration,
+    appended: Result<Duration, String>,
+) -> Result<(), String> {
+    let took = appended?;
+    if took < round_trip {
+        return Err(format!(
+            "append {payload} to {url} took {took:?}, less than a round trip of {round_trip:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// A slow link slows replication instead of stopping it. Once every group's
+/// leadership settled, every node's Raft traffic passes a link that holds
+/// each byte for a one-way delay, in two phases, and no group changes its
+/// leader or term in either.
+///
+/// - At [`SLOW_LINK_IDLE_ONE_WAY`] every group stays idle for longer than
+///   [`SLOW_LINK_LEADER_LEASE`], so only heartbeat answers keep a leader's
+///   lease. The first write to each group is then acknowledged. With a
+///   heartbeat interval shorter than the round trip, every heartbeat goes
+///   unanswered in time, the lease lapses and the write is refused.
+/// - At [`SLOW_LINK_BUSY_ONE_WAY`] one writer per group appends back to back,
+///   and every append is acknowledged at its first attempt. A transport that
+///   waits for an Append's answer only the heartbeat interval OpenRaft gives
+///   the call as its option fails every append over such links. This also
+///   pins that OpenRaft puts no timeout of its own on replication calls.
+///
+/// Linearizable reads, back at the first delay, return every write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn cli_writes_commit_over_round_trips_longer_than_the_heartbeat_interval() {
+async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     let _guard = static_cluster_cli_test_guard().await;
     let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
         tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the slow-link test");
@@ -8905,36 +8964,46 @@ async fn cli_writes_commit_over_round_trips_longer_than_the_heartbeat_interval()
         "{settled_leaders:?}"
     );
 
+    // Idle groups: only heartbeats renew the leases.
     for link in &links {
-        link.set_delay(SLOW_LINK_ONE_WAY);
+        link.set_delay(SLOW_LINK_IDLE_ONE_WAY);
     }
-    for payload in ["slow-1;", "slow-2;", "slow-3;"] {
-        for stream in &streams {
-            let started = std::time::Instant::now();
-            let response = client
-                .post(url(stream))
-                .header("content-type", "text/plain")
-                .body(payload)
-                .send()
-                .await
-                .unwrap_or_else(|err| {
-                    panic!(
-                        "append {payload} to {stream} failed: {err}\n{}",
-                        procs.reports()
-                    )
-                });
-            let status = response.status();
-            assert_eq!(
-                status,
-                reqwest::StatusCode::NO_CONTENT,
-                "append {payload} to {stream}: {:?}",
-                response.text().await
-            );
-            let took = started.elapsed();
-            assert!(
-                took >= SLOW_LINK_ROUND_TRIP,
-                "append {payload} to {stream} took {took:?}, less than a round trip"
-            );
+    tokio::time::sleep(
+        SLOW_LINK_LEADER_LEASE
+            .checked_add(Duration::from_secs(1))
+            .unwrap(),
+    )
+    .await;
+    let idle_round_trip = SLOW_LINK_IDLE_ONE_WAY.checked_mul(2).unwrap();
+    for stream in &streams {
+        let url = url(stream);
+        let appended = append_once(&client, &url, "idle;").await;
+        if let Err(err) = check_slow_append(&url, "idle;", idle_round_trip, appended) {
+            panic!("{err}\n{}", procs.reports());
+        }
+    }
+
+    // Busy groups: append answers renew the leases, and heartbeats go
+    // unanswered in time.
+    for link in &links {
+        link.set_delay(SLOW_LINK_BUSY_ONE_WAY);
+    }
+    let busy_round_trip = SLOW_LINK_BUSY_ONE_WAY.checked_mul(2).unwrap();
+    let mut writers = tokio::task::JoinSet::new();
+    for stream in &streams {
+        let client = client.clone();
+        let url = url(stream);
+        writers.spawn(async move {
+            for payload in ["busy-1;", "busy-2;", "busy-3;"] {
+                let appended = append_once(&client, &url, payload).await;
+                check_slow_append(&url, payload, busy_round_trip, appended)?;
+            }
+            Ok::<(), String>(())
+        });
+    }
+    while let Some(writer) = writers.join_next().await {
+        if let Err(err) = writer.expect("a writer task") {
+            panic!("{err}\n{}", procs.reports());
         }
     }
     assert_eq!(
@@ -8942,11 +9011,16 @@ async fn cli_writes_commit_over_round_trips_longer_than_the_heartbeat_interval()
         settled_leaders,
         "a group changed its leader or term over the slow links"
     );
+
+    // A ReadIndex read needs heartbeat answers within the heartbeat interval.
+    for link in &links {
+        link.set_delay(SLOW_LINK_IDLE_ONE_WAY);
+    }
     for stream in &streams {
         read_until_matches(
             &client,
             &format!("{}?offset=0&max_bytes=64", url(stream)),
-            b"fast;slow-1;slow-2;slow-3;",
+            b"fast;idle;busy-1;busy-2;busy-3;",
         )
         .await;
     }

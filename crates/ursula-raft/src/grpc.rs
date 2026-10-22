@@ -244,8 +244,8 @@ pub(crate) enum AppendCallError {
     /// replication backs off.
     #[error("raft append stream backlog full: {queued} of {budget} bytes queued")]
     BacklogFull { queued: usize, budget: usize },
-    /// The call was sent and got no answer within its timeout: a slow peer
-    /// or link, not a broken channel. A broken one fails the call as
+    /// The call was queued or sent and got no answer within its timeout: a
+    /// slow peer or link, not a broken channel. A broken one fails the call as
     /// `Unavailable` (the session closes), so a rebuild would not speed the
     /// answer. To OpenRaft the call failed, and replication resends from
     /// the peer's progress.
@@ -253,6 +253,19 @@ pub(crate) enum AppendCallError {
     Unanswered { waited: Duration },
     #[error(transparent)]
     Status(#[from] tonic::Status),
+}
+
+impl AppendCallError {
+    /// Whether the failure counts toward rebuilding the channel: only a
+    /// failed status does. A full queue and an unanswered call happen on a
+    /// live session, and a rebuild would neither drain the queue nor speed
+    /// the answer.
+    fn breaks_channel(&self) -> bool {
+        match self {
+            Self::BacklogFull { .. } | Self::Unanswered { .. } => false,
+            Self::Status(_) => true,
+        }
+    }
 }
 
 impl From<AppendCallError> for tonic::Status {
@@ -806,7 +819,7 @@ const RAFT_GRPC_APPEND_STREAM_MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 /// Leader side, per peer: bytes of Append calls queued (not yet taken by the HTTP/2 encoder).
 /// Beyond it a call fails fast as `Unavailable`, which OpenRaft treats as an unreachable peer and
 /// backs off on. Before this bound a lagging peer's queue grew without limit: every replication
-/// retry after a 250 ms RPC timeout queued another copy of the same entries while the timed-out
+/// retry after a call's timeout queued another copy of the same entries while the timed-out
 /// copies were still sent (EKS, 128 SQLite-VFS owners: ~0.7 GB/min per node to OOM).
 const RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
 const RAFT_GRPC_APPEND_STREAM_MIN_CHARGE_BYTES: usize = 1024;
@@ -1923,11 +1936,13 @@ pub struct GrpcRaftNetwork {
     /// The node every request is for.
     target: u64,
     channel: Result<PeerChannel, RaftChannelError>,
-    /// Streak of consecutive RPC failures on this channel. Reset to 0 on the
-    /// next successful RPC. When it crosses `reconnect_threshold` we replace
-    /// the owner-core HTTP/2 channel generation — tonic's `connect_lazy`
-    /// keeps a stuck channel forever otherwise (the TCP socket stays open, the
-    /// HTTP/2 streams stay borked, no auto-heal).
+    /// Streak of consecutive RPC failures on this channel: calls that failed
+    /// with a status, not Append calls that went unanswered or were refused
+    /// as backpressure ([`AppendCallError::breaks_channel`]). Reset to 0 on
+    /// the next successful RPC. When it crosses `reconnect_threshold` we
+    /// replace the owner-core HTTP/2 channel generation — tonic's
+    /// `connect_lazy` keeps a stuck channel forever otherwise (the TCP socket
+    /// stays open, the HTTP/2 streams stay borked, no auto-heal).
     consecutive_failures: u32,
     reconnect_threshold: u32,
 }
@@ -2380,10 +2395,7 @@ impl GrpcRaftNetwork {
                 Ok(ack)
             }
             Err(error) => {
-                // A full queue is congestion on a live stream, and an unanswered call a slow
-                // peer: neither is a broken channel, and rebuilding the channel would neither
-                // drain the queue nor speed the answer.
-                let broken = matches!(error, AppendCallError::Status(_));
+                let broken = error.breaks_channel();
                 let (mapped, refusal) = self.map_tonic_status("AppendStream", error.into());
                 // An item refused as meant for another node: the session
                 // streams to the wrong node, so the channel is dialed again.

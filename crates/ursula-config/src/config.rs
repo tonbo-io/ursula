@@ -213,6 +213,9 @@ pub struct RaftConfig {
     /// a write of its own that failed, for a PUT that lands late.
     pub install_snapshot_timeout: HumanDuration,
     /// Consecutive gRPC RPC failures before forcing a transport reconnect.
+    /// Only calls that failed with a status count: an Append call that went
+    /// unanswered in time, or was refused because the peer's queue is full,
+    /// does not.
     pub grpc_reconnect_after_failures: usize,
     /// Max concurrent snapshot builds across all groups on this node. Each
     /// build holds a copy of its group's state and runs its snapshot-store
