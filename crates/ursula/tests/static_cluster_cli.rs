@@ -3129,12 +3129,15 @@ async fn cli_static_grpc_raft_log_dir_recovers_replicated_s3_cold_manifest_after
 }
 
 /// Stands in front of node 3's Raft endpoint and preserves HTTP/2 bodies and
-/// trailers. It can delay only snapshot transfer. Metrics and readiness use
-/// the server's real listeners directly.
+/// trailers. It can delay snapshot transfer, and refuse every other request
+/// as a peer it cannot reach. Metrics and readiness use the server's real
+/// listeners directly.
 struct RaftProxy {
     url: String,
     release: tokio::sync::watch::Sender<bool>,
     blocked: tokio::sync::watch::Receiver<bool>,
+    /// While `true`, every request but a snapshot transfer answers `502`.
+    refuse: tokio::sync::watch::Sender<bool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -3152,23 +3155,30 @@ impl RaftProxy {
             .connect_lazy();
         let (release, released) = tokio::sync::watch::channel(true);
         let (blocked_tx, blocked) = tokio::sync::watch::channel(false);
+        let (refuse, refused) = tokio::sync::watch::channel(false);
+        let bad_gateway = || {
+            axum::http::Response::builder()
+                .status(axum::http::StatusCode::BAD_GATEWAY)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
         let proxy = tower::service_fn(move |request: axum::http::Request<axum::body::Body>| {
             let channel = channel.clone();
             let mut released = released.clone();
             let blocked_tx = blocked_tx.clone();
+            let refused = *refused.borrow();
             async move {
                 if request.uri().path() == ursula_raft::RAFT_GRPC_FULL_SNAPSHOT_PATH {
                     if !*released.borrow() {
                         blocked_tx.send_replace(true);
                     }
                     released.wait_for(|ready| *ready).await.unwrap();
+                } else if refused {
+                    return Ok::<_, std::convert::Infallible>(bad_gateway());
                 }
                 let response = match channel.oneshot(request.map(tonic::body::boxed)).await {
                     Ok(response) => response.map(axum::body::Body::new),
-                    Err(_transport) => axum::http::Response::builder()
-                        .status(axum::http::StatusCode::BAD_GATEWAY)
-                        .body(axum::body::Body::empty())
-                        .unwrap(),
+                    Err(_transport) => bad_gateway(),
                 };
                 Ok::<_, std::convert::Infallible>(response)
             }
@@ -3182,6 +3192,7 @@ impl RaftProxy {
             url,
             release,
             blocked,
+            refuse,
             task,
         }
     }
@@ -4108,6 +4119,24 @@ fn node_ids(ids: impl Iterator<Item = NodeId>) -> BTreeSet<u64> {
     ids.map(NodeId::get).collect()
 }
 
+/// Every group's current voters.
+fn current_voters(cluster: &Cluster) -> BTreeMap<RaftGroupId, BTreeSet<u64>> {
+    cluster
+        .groups()
+        .iter()
+        .map(|(group, placement)| (group, node_ids(placement.current_voters().iter())))
+        .collect()
+}
+
+/// The groups whose current voters list node `node`.
+fn placed_on(cluster: &Cluster, node: u64) -> BTreeSet<u64> {
+    current_voters(cluster)
+        .into_iter()
+        .filter(|(_, voters)| voters.contains(&node))
+        .map(|(group, _)| u64::from(group.0))
+        .collect()
+}
+
 /// How many data groups node `node_id` leads with a live quorum, by its
 /// own metrics.
 fn leads(metrics: &ursula_proto::admin::NodeMetrics, node_id: u64) -> usize {
@@ -4383,9 +4412,10 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
 /// meta leader replicates to nodes 4 and 5 as meta learners, and their
 /// views reach the bootstrapped cluster. Placement decides what each node
 /// hosts: every group stays on the genesis peers it was seeded on, though
-/// `raft.peers` grew, and nodes 4 and 5, in no group's seeds, host nothing
-/// and route a write to a node that hosts its group, naming each of its
-/// voters in turn.
+/// `raft.peers` grew, and nodes 4 and 5, in no group's seeds, host nothing,
+/// are ready with no group, and route a write to a node that hosts its
+/// group, naming each of its voters in turn. A seed rule read over the
+/// grown `raft.peers`, or a readiness that needs a replica, fails it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_learn() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -4507,6 +4537,36 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
         let metrics = node_metrics(&client, &node.url()).await;
         assert!(metrics.groups.is_empty(), "node {}: {metrics:?}", node.id);
     }
+    // Node 1's view, read after `raft.peers` grew, keeps every group on the
+    // genesis peers.
+    let grown = wait_placement(
+        &client,
+        &mut procs,
+        &nodes[0],
+        "shows every group live",
+        |status| settled(status).is_some(),
+    )
+    .await;
+    for (group, voters) in current_voters(settled(&grown).unwrap()) {
+        assert_eq!(
+            voters,
+            BTreeSet::from([1, 2, 3]),
+            "group {group:?}: {grown:?}"
+        );
+    }
+    // The late nodes are ready, and their reports place them in no group.
+    for node in &nodes[3..] {
+        let ready = wait_readiness_reason(&client, &mut procs, node, None).await;
+        let report = ready.raft_maintenance.expect("a maintenance report");
+        assert!(report.ready(), "node {}: {report:?}", node.id);
+        assert!(
+            report.expected_groups.is_empty()
+                && report.unplaced.is_empty()
+                && report.group_issues.is_empty(),
+            "node {}: {report:?}",
+            node.id
+        );
+    }
     // A write to a late node redirects to a node its view places the
     // group on, typed as `NotHosted`, and lands there.
     let no_redirect = reqwest::Client::builder()
@@ -4627,6 +4687,171 @@ async fn cli_four_nodes_host_only_the_groups_meta_seeds_on_them() {
         nodes[0].url()
     );
     read_until_matches(&client, &read, b"placed;").await;
+}
+
+/// Integrations 2 and 6 (#768, design 15.3), on five nodes at replication
+/// factor 3 with meta voters 1 to 3, so each node hosts some of the groups.
+/// After every process is killed and started again, every node's view keeps
+/// each group's voters and placement key, each node runs exactly the groups
+/// placed on it, and every node reads every write. Then meta voters 1 and 2
+/// are killed, which leaves meta no quorum: the group seeded on {3, 4, 5}
+/// keeps taking writes, and node 4, killed and started again while meta
+/// stays down, runs exactly the groups its journal holds, takes a write and
+/// reads every write of that group. A restart that hosts by anything but
+/// the placement its journal and view hold fails it, and so does a data
+/// group, or a restarted node's open, that needs meta to serve (G2).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_five_nodes_keep_their_placement_across_a_full_restart_and_serve_without_meta() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the meta test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 5);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = settled(&formed[0]).expect("settled").clone();
+    for node in &nodes {
+        runs_exactly(&client, &mut procs, node, &placed_on(&cluster, node.id)).await;
+    }
+    let streams = stream_per_group("placed");
+    let url = |node: &MetaNode, stream: &str| format!("{}/placed/{stream}", node.url());
+    let read =
+        |node: &MetaNode, stream: &str| format!("{}?offset=0&max_bytes=256", url(node, stream));
+    for stream in &streams {
+        put_until_created(&client, &url(&nodes[0], stream)).await;
+        post_until_no_content(&client, &url(&nodes[0], stream), "before-the-restart;").await;
+    }
+
+    // 1. Every process is killed and started again. The placement, the
+    // hosting and the data are as before.
+    for node in &nodes {
+        procs.kill(node.id);
+    }
+    for node in &nodes {
+        procs.start(binary, node);
+    }
+    for status in wait_settled(&client, &mut procs, &nodes).await {
+        let restarted = settled(&status).unwrap();
+        assert_eq!(restarted.params(), cluster.params(), "{status:?}");
+        assert_eq!(sinces(restarted), sinces(&cluster), "{status:?}");
+        assert_eq!(
+            current_voters(restarted),
+            current_voters(&cluster),
+            "{status:?}"
+        );
+    }
+    for node in &nodes {
+        runs_exactly(&client, &mut procs, node, &placed_on(&cluster, node.id)).await;
+    }
+    for node in &nodes {
+        for stream in &streams {
+            read_until_matches(&client, &read(node, stream), b"before-the-restart;").await;
+        }
+    }
+
+    // 2. Meta voters 1 and 2 die, and meta keeps no quorum. The group
+    // seeded on {3, 4, 5} keeps taking writes.
+    let (group, _) = current_voters(&cluster)
+        .into_iter()
+        .find(|(_, voters)| *voters == BTreeSet::from([3, 4, 5]))
+        .unwrap_or_else(|| panic!("a group is seeded on 3, 4 and 5: {cluster:?}"));
+    let stream = &streams[usize::try_from(group.0).unwrap()];
+    procs.kill(1);
+    procs.kill(2);
+    post_until_no_content(&client, &url(&nodes[2], stream), "while-meta-is-down;").await;
+
+    // 3. Node 4 restarts while meta stays down: it opens what its journal
+    // holds, and serves once the group has a leader.
+    procs.kill(4);
+    procs.start(binary, &nodes[3]);
+    runs_exactly(&client, &mut procs, &nodes[3], &placed_on(&cluster, 4)).await;
+    let what = format!("node 4 knows the leader of group {}", group.0);
+    eventually(&mut procs, &what, async || {
+        let metrics = try_node_metrics(&client, &nodes[3].url()).await?;
+        metrics
+            .groups
+            .iter()
+            .find(|metrics| metrics.raft_group_id == u64::from(group.0))
+            .and_then(|metrics| metrics.current_leader)
+            .ok_or_else(|| format!("{:?}", metrics.groups))
+    })
+    .await;
+    post_until_no_content(&client, &url(&nodes[3], stream), "after-node-4-restarted;").await;
+    read_until_matches(
+        &client,
+        &read(&nodes[3], stream),
+        b"before-the-restart;while-meta-is-down;after-node-4-restarted;",
+    )
+    .await;
+}
+
+/// Integration 7's single-node part (#768, design 12.1): a durable single
+/// node resolves an unset `raft.wal.fsync` to `always` and reports it, and a
+/// kill restarts it unattended: it becomes ready with no recovery plan,
+/// opens normally and reads its acknowledged write. Set to `never`, it
+/// reports `never`. A kernel that reports a boot id reads the kill as a
+/// process crash, so the host-crash behaviour of each policy stays with the
+/// power-loss DST.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_durable_single_node_reports_its_fsync_and_restarts_unattended() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the single-node test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 1);
+    let node = &nodes[0];
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    node.write(&peers_of(&nodes), MetaToml::default());
+    procs.start(binary, node);
+    wait_readiness_reason(&client, &mut procs, node, None).await;
+    let recovery = wal_recovery(&client, &node.url()).await;
+    assert_eq!(recovery["fsync"], "always", "{recovery}");
+    let stream = format!("{}/single/durable", node.url());
+    let read = format!("{stream}?offset=0&max_bytes=64");
+    put_until_created(&client, &stream).await;
+    post_until_no_content(&client, &stream, "before-the-kill;").await;
+
+    // 1. A kill, and a restart no operator attends.
+    procs.kill(1);
+    procs.start(binary, node);
+    wait_readiness_reason(&client, &mut procs, node, None).await;
+    let recovery = wal_recovery(&client, &node.url()).await;
+    let crash = if cfg!(target_os = "linux") {
+        "process_crash"
+    } else {
+        "host_crash"
+    };
+    assert_eq!(recovery["previous_run"]["kind"], crash, "{recovery}");
+    assert_eq!(recovery["recovery"]["state"], "normal", "{recovery}");
+    assert_eq!(recovery["fsync"], "always", "{recovery}");
+    read_until_matches(&client, &read, b"before-the-kill;").await;
+
+    // 2. An explicit `never` is what the node reports.
+    procs.stop(1).await;
+    set_wal_fsync(&node.config, "never");
+    procs.start(binary, node);
+    wait_readiness_reason(&client, &mut procs, node, None).await;
+    let recovery = wal_recovery(&client, &node.url()).await;
+    assert_eq!(recovery["fsync"], "never", "{recovery}");
+    assert_eq!(recovery["previous_run"]["kind"], "clean", "{recovery}");
+    post_until_no_content(&client, &stream, "under-never;").await;
+    read_until_matches(&client, &read, b"before-the-kill;under-never;").await;
 }
 
 /// S2(n) (#768): at replication factor 3 each of five nodes hosts only
@@ -5798,6 +6023,218 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
         ),
         "{stale:?}"
     );
+}
+
+/// Integration 12 (#768, design 10): a wiped voter is not ready before its
+/// groups. Node 3's Raft traffic goes through a proxy, and every group's
+/// leaders purge their logs through a snapshot, so a wiped replica catches
+/// up only by an install. Node 3 loses its disk while it is down,
+/// `ursulactl node replace-disk` releases the lost root, and node 3 starts
+/// on an empty WAL while the proxy refuses every Raft request to it. It
+/// binds its new root through its own registration, but no meta entry
+/// reaches it: its report names `placement_unknown` and places it in no
+/// group. The proxy then passes everything but the installs. From the
+/// first report that places a group on node 3 until the installs pass,
+/// every such group is listed with `missing_group` or `recovery_barrier`,
+/// never `missing_group` after `recovery_barrier`, the report is not
+/// serving-ready and the node answers `503`, and every group reaches
+/// `recovery_barrier` while its install waits. Once the installs pass,
+/// node 3 becomes ready with each group a voter that counts and no group
+/// issue, and reads every write. A report keyed by the replicas a node
+/// runs, under which a wiped voter is a node with no group, fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_wiped_voter_is_not_ready_before_its_groups() {
+    use ursula_proto::admin::RaftMaintenanceIssue as Issue;
+    use ursula_proto::placement::ReplicaRole;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the wiped-voter test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let proxy = RaftProxy::start(&nodes[2].url()).await;
+    let peers = nodes
+        .iter()
+        .map(|node| match node.id {
+            3 => (3, proxy.url.clone()),
+            _ => node.peer(),
+        })
+        .collect::<Vec<_>>();
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = reqwest::Client::new();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    let formed = wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = settled(&formed[0]).expect("settled").clone();
+    let placed: BTreeSet<u32> = placed_on(&cluster, 3)
+        .into_iter()
+        .map(|group| u32::try_from(group).unwrap())
+        .collect();
+    assert_eq!(placed.len(), META_TEST_GROUPS, "{cluster:?}");
+    let lost = bound_root(&cluster, 3);
+    let streams = stream_per_group("wiped");
+    let url = |node: &MetaNode, stream: &str| format!("{}/wiped/{stream}", node.url());
+    for stream in &streams {
+        put_until_created(&client, &url(&nodes[0], stream)).await;
+        post_until_no_content(&client, &url(&nodes[0], stream), "before-the-loss;").await;
+    }
+    for node in &nodes[..2] {
+        for group in &placed {
+            let raft = format!("{}/__ursula/raft/{group}", node.admin());
+            let response = admin_test_post(&client, format!("{raft}/snapshot"))
+                .await
+                .send()
+                .await
+                .expect("snapshot the group");
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let snapshot: ursula_proto::admin::SnapshotResponse =
+                response.json().await.expect("snapshot JSON");
+            let index = snapshot.snapshot_index.expect("a snapshot index");
+            let response = admin_purge(&client, format!("{raft}/purge?upto={index}")).await;
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+        }
+    }
+    for stream in &streams {
+        post_until_no_content(&client, &url(&nodes[0], stream), "after-the-purge;").await;
+    }
+
+    // 1. Node 3 loses its disk while it is down, and the lost root is
+    // released.
+    procs.kill(3);
+    remove_test_path(&nodes[2].wal);
+    let ctl_nodes = nodes.iter().map(MetaNode::ctl).collect::<Vec<_>>();
+    replace_lost_disk(&ctl_nodes, 3, lost).await;
+
+    // 2. No Raft request reaches node 3 on its empty WAL. It binds its new
+    // root, and knows no placement.
+    proxy.release.send_replace(false);
+    proxy.refuse.send_replace(true);
+    procs.start(binary, &nodes[2]);
+    wait_placement(
+        &client,
+        &mut procs,
+        &nodes[2],
+        "binds its new root",
+        |status| {
+            matches!(
+                status.registration,
+                RegistrationStatus::Answered(Registered::Referenced(_))
+            )
+        },
+    )
+    .await;
+    let (status, ready) = readiness(&client, &nodes[2])
+        .await
+        .expect("node 3's readiness");
+    assert_eq!(
+        status,
+        reqwest::StatusCode::SERVICE_UNAVAILABLE,
+        "{ready:?}"
+    );
+    let report = ready.raft_maintenance.expect("a maintenance report");
+    assert!(
+        report.node_issues.contains(&Issue::PlacementUnknown),
+        "{report:?}"
+    );
+    assert!(report.expected_groups.is_empty(), "{report:?}");
+    assert!(!report.serving_ready(), "{report:?}");
+
+    // 3. Raft requests pass again, but installs wait. Each group placed on
+    // node 3 blocks until its install passes.
+    proxy.refuse.send_replace(false);
+    let mut barriers = BTreeSet::new();
+    eventually(
+        &mut procs,
+        "every group of node 3 reports recovery_barrier",
+        async || {
+            let (status, ready) = readiness(&client, &nodes[2]).await?;
+            let report = ready
+                .raft_maintenance
+                .ok_or_else(|| "no maintenance report".to_owned())?;
+            assert_eq!(
+                status,
+                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                "node 3 is ready before its groups: {report:?}"
+            );
+            assert!(!report.serving_ready(), "{report:?}");
+            for group in report.expected_groups.keys() {
+                let issues = report
+                    .group_issues
+                    .get(group)
+                    .map_or(&[][..], Vec::as_slice);
+                let missing = issues.contains(&Issue::MissingGroup);
+                let barrier = issues.contains(&Issue::RecoveryBarrier);
+                assert!(
+                    missing || barrier,
+                    "group {group} blocks nothing on node 3: {report:?}"
+                );
+                assert!(
+                    !(missing && barriers.contains(group)),
+                    "group {group} is missing after its replica ran: {report:?}"
+                );
+                if barrier {
+                    barriers.insert(*group);
+                }
+            }
+            let waiting = placed
+                .iter()
+                .filter(|group| {
+                    !report
+                        .group_issues
+                        .get(*group)
+                        .is_some_and(|issues| issues.contains(&Issue::RecoveryBarrier))
+                })
+                .collect::<Vec<_>>();
+            if waiting.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "groups without recovery_barrier {waiting:?}: {report:?}"
+                ))
+            }
+        },
+    )
+    .await;
+    assert!(*proxy.blocked.borrow(), "an install waited");
+
+    // 4. The installs pass: node 3 catches up and becomes ready.
+    proxy.release.send_replace(true);
+    let ready = wait_readiness_reason(&client, &mut procs, &nodes[2], None).await;
+    let report = ready.raft_maintenance.expect("a maintenance report");
+    assert!(report.ready(), "{report:?}");
+    assert_eq!(
+        report
+            .expected_groups
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>(),
+        placed,
+        "{report:?}"
+    );
+    assert!(
+        report
+            .expected_groups
+            .values()
+            .all(|expected| expected.role == ReplicaRole::Voter && expected.counts_as_voter),
+        "{report:?}"
+    );
+    assert!(report.group_issues.is_empty(), "{report:?}");
+    for stream in &streams {
+        read_until_matches(
+            &client,
+            &format!("{}?offset=0&max_bytes=64", url(&nodes[2], stream)),
+            b"before-the-loss;after-the-purge;",
+        )
+        .await;
+    }
 }
 
 /// IT-4 (#768): a WAL root opens only under the node id that created it.
