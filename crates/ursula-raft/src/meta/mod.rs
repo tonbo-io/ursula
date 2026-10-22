@@ -50,7 +50,9 @@
 //! - [`liveness`]: which nodes the meta leader takes as live move targets,
 //!   from its heartbeat acknowledgements and the peers' WAL-disk sheds
 //!   ([`liveness::WalDiskSheds`]).
-//! - [`pause`]: the pause points tests stop the meta runtime at.
+//! - [`pause`]: the node's one pause registry, whose points tests and
+//!   simulations stop the meta runtime, the reconcile shells and the hosting
+//!   driver's teardowns at.
 //! - [`registration`]: this node's registration with the meta group.
 //! - [`replica`]: this node's meta replica ([`replica::MetaReplica`]): its
 //!   Raft over the meta journal, the tasks it owns, its registry slot

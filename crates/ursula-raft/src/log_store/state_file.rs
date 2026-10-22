@@ -40,7 +40,8 @@ const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
 /// Which state file a file is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateFileKind {
-    /// The votes and `initialized` flags of one core's raft groups.
+    /// The votes, log states, log generations and pending recovery plans of
+    /// one core's raft groups, and the core's verified recovery epoch.
     CoreMetadata,
     /// The node's run state.
     RunState,

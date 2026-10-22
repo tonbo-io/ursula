@@ -78,7 +78,8 @@ as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 | `identity.bin` | The run counter of the root, whether a run read a predecessor that may still run, and whether the meta group ever bound the root (`unbound` or `bound`). |
 | `lease.probe` | 8 bytes the disk lease's probe rewrites in place and syncs every second. |
 | `core-N/journal-<seq>.seg` | Journal segments, 20-digit consecutive sequences starting at 1. |
-| `core-N/journal.meta` | Every group's vote, log state and log generation, and the core's verified recovery epoch. |
+| `core-N/journal.meta` | Every group's vote, log state, log generation and pending recovery plan, and the core's verified recovery epoch. |
+| `core-N/group-<G>.snapshot.json` | The group's snapshot record: the log generation it was written in, the snapshot's metadata and its pointer (the inline snapshot or the key of the node's own snapshot object), as compact MessagePack in the snapshot envelope. |
 | `core-N/journal.lock` | Advisory lock held by the core's writer. |
 | `core-N/frozen-<group>-<seg>-<offset>-<first>-<last>-<hash>.seg` | Entry archives of apply-stopped groups (see Reclaim). |
 | `meta/` | The meta group's journal, laid out as a core's, with its snapshot record `group-0.snapshot.json`. |
@@ -193,8 +194,10 @@ in the generation the retirement named, so its recovery gate starts closed.
 The reopen ends its writer batch, so it is durable before the new store's
 first frame is written. Every other open is refused before anything
 is written for the group. An `Open` never creates a core's journal: on a core
-that holds nothing it is refused before the core opens. The engine factories
-open with `Create` until placement decides what a node hosts.
+that holds nothing it is refused before the core opens. The engine factory
+opens a group with the admission the hosting driver published for it
+(`PlacementInputs::admission`): `Create` only from a confirmed placement
+that gives the node a role, `Open` for a group the journals hold.
 
 `RaftWal::open_held_cores` opens the writer of every core whose directory
 holds `journal.meta`, a segment record or a snapshot record, and the run keeps
@@ -202,8 +205,10 @@ each of those writers until it shuts down. A core that does not open stops
 nothing: its groups read as unknown until an open of one of them opens the
 writer. From then on the run also keeps every core writer it opens, so
 `RaftWal::local_groups` lists every group a journal names. Before it runs, a
-core opens on its first group and closes with its last store. The server does
-not call it yet.
+core opens on its first group and closes with its last store. The server
+calls it once the meta runtime has published its first view, before the
+hosting driver's first pass (`crates/ursula/src/bootstrap/hosting.rs`), so
+that pass reopens every group a journal holds.
 
 `run-state.bin` holds one record per journal class, each with the class's
 `fsync` policy and recovery epoch, beside the node-wide boot id, root device and
@@ -579,7 +584,7 @@ timeouts (6 s), the leader steps down and campaigns.
 apply for 30 s reports its group stalled: a majority may be gated, so the group
 has no leader. Readiness answers `503` with reason `recovery_stalled`. The
 operator ranks gated replicas by `last_log_term` and `last_log_index` from the
-metrics and calls `POST /__ursula/raft/{group}/recovery/accept-unsynced-loss` on
+metrics and calls `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` on
 the longest ones until the open replicas are a majority. The body names
 `expected_last_log_index` and `expected_current_term` as seen. The replica
 answers `409 Conflict` and changes nothing unless it has a durable vote floor,
@@ -752,7 +757,7 @@ The data-group engine owns its recovery tasks and exposes the runtime's
 | Component | Responsibility and public seam |
 | --- | --- |
 | `RaftWal` | Node run state, per-core writer lifetime, group log stores and shutdown. Exported from `ursula_raft::wal`, with format inspection types under `wal::diagnostics`. |
-| `RecoveryGate::attach` | Binds the gate, publishes the group's resources, starts the bootstrap, heal and barrier drivers and keeps their handles. Engine shutdown aborts and joins them. gRPC and simulation inject a `RecoveryTransport`. |
+| `RecoveryGate::attach` | Binds the gate, publishes the group's resources, starts the membership reconcile shell, the barrier driver, the genesis vote floor task and, for a replica that is or may become its group's initializer, the bootstrap driver, and keeps their handles. Engine shutdown aborts and joins them. gRPC and simulation inject a `RecoveryTransport`. |
 | `ElectionPolicy` | Combines node leadership shedding with per-group recovery eligibility, drives OpenRaft's election switch and validates handoff targets and incoming transfers. Cold-health pressure alone leaves a node electable, and a node without a meta replica stays electable but takes no transfer. |
 | `GroupEntry` | Registry entry per group. `Active` holds the Raft handle, read barrier, recovery gate, apply health and cold-index cache. `ApplyStopped` holds the apply failure and last applied log id and refuses requests. Each RPC keeps one entry through dispatch, and a gate cannot be removed by republication. |
 | `ursula-proto` | Shared admin requests, responses and recovery status. WAL metric samples live in `ursula-runtime`. |
@@ -763,13 +768,13 @@ vote, because OpenRaft would start that election while still holding its old
 leader state. The check reads only the request's vote, and OpenRaft acts on a
 transfer only while the node holds that vote, so nothing slips in between.
 
-Bootstrap waits on server-state and gate notifications, heal on every metrics
-change, so it sees a rewound follower's matched index drop, and the barrier
-driver also watches apply progress. They keep deadlines for retries and stall
+The bootstrap driver waits on server-state and gate notifications, the
+reconcile shell on every metrics change, so it sees a rewound follower's
+matched index drop, and the barrier driver also watches apply progress. They keep deadlines for retries and stall
 reporting and rate-limit repeated steps. Segment pressure reaches the snapshot
 driver through `LaggingGroups`.
 
-`GET /__ursula/raft/{group}/quorum`, which requires the incarnation header,
+`GET /__ursula/raft/{target}/quorum`, which requires the incarnation header,
 confirms a fresh ReadIndex round with an unchanged committed leader vote and
 returns the group, leader, term and required applied index, the higher of the
 read index and the leader's last log index. It is an
@@ -805,5 +810,6 @@ device. Simulation therefore runs the production journal.
   the shared per-core writer with a file per group and an upstream `raft-log`
   adapter per group, and `scripts/summarize_raft_wal.py` summarizes runs.
 - `scripts/soak_raft_wal.sh` repeats real-process three-voter replication, a
-  voter healed from an empty WAL, and durable restart,
+  voter on an empty WAL that rejoins once `replace-disk` released its lost
+  disk, and durable restart,
   recording its environment and output under `target/raft-wal-soak`.

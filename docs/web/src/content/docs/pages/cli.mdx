@@ -214,7 +214,7 @@ ursulactl verify-quorum --config cluster.json --timeout-secs 120
 The command requires every group to be `live` with no move, a ready maintenance report from every node it reaches, and on every target voter of each group a replica whose voters are exactly the target, with no learner and an eligible participation report. A target voter that gives no metrics refuses the observation. A node outside a group's target is not asked for that group. It confirms each group's leader through a new outbound ReadIndex probe, then waits for all replicas to apply the captured prefix under that leader's term. Continuous writes can advance without moving this target. One absolute deadline covers metrics requests, RPCs and waits. The JSON output includes the observation start/end times, each group's leader/term/prefix and every replica's applied index.
 
 The prefix is confirmed through the incarnation-bound admin route
-`GET /__ursula/raft/{group}/quorum`. The CLI uses shared admin protocol types
+`GET /__ursula/raft/{target}/quorum`. The CLI uses shared admin protocol types
 and has no dependency on `ursula-raft`. Quorum proof and self-election requests
 require process identity; servers without the admin protocol are unsupported.
 
