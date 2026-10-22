@@ -101,8 +101,9 @@ pub(crate) fn runtime_error_answer(err: &RuntimeError) -> (StatusCode, ErrorCode
             StatusCode::SERVICE_UNAVAILABLE,
             ErrorCode::LiveReadBackpressure,
         ),
-        // Normal static-cluster path redirects GroupNotHosted to a voter. This is the
-        // fallback when no routing target is available.
+        // The client plane redirects a group this node does not host to a
+        // node its placement view gives the group (`NotHosted`). This is the
+        // answer when no such node has an address, and the admin plane's.
         RuntimeError::GroupNotHosted { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, ErrorCode::NoLeader)
         }

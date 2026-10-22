@@ -362,7 +362,9 @@ these refusals. See the gateway's
 
 A `503` also answers a write while the group has no known leader, for example
 during an election, and on a node that does not host the stream's group and
-knows no node that does.
+knows no address of a node that does. A node whose replica of the group is no
+voter and knows no leader redirects (`307`) instead, as a node that does not
+host the group does.
 
 A client resolves a `503` like any unknown outcome: it repeats the write with
 its producer key. See [write outcomes](/docs/api/overview#write-outcomes).

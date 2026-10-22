@@ -25,8 +25,12 @@ pub struct MetricsClient {
 }
 
 impl MetricsClient {
+    /// A client that follows no redirect: a node's admin answer is its
+    /// own, and a `307` names a client-plane URL, so a command that tries
+    /// several nodes asks the next one instead.
     pub fn new(timeout: Duration) -> Result<Self> {
         let client = Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()
             .context("build reqwest client")?;

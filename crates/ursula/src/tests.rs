@@ -305,13 +305,14 @@ fn group_engine_leadership_refusal_is_detected_without_matching_message() {
 
 // A refusal naming this node (a read bounced back during a leadership
 // transfer) must not redirect the client to itself, and one naming no
-// leader must not redirect: no 307, so the caller answers the
+// leader from a replica that counts as a voter (here a closed one, not
+// marked left) must not redirect: no 307, so the caller answers the
 // leader-unknown 503. A refusal naming a peer in its term redirects there,
 // typed.
 #[test]
 fn leader_redirect_never_points_at_this_node() {
     let router = ClientWriteLeaderRouter::new(
-        bound_peer_cluster(
+        bound_registry(
             2,
             crate::shared_peers([
                 (1, "http://node-1/".to_owned()),
@@ -333,12 +334,16 @@ fn leader_redirect_never_points_at_this_node() {
 
     assert!(
         router
-            .redirect_response(&forward(known(2)), "/b/s")
+            .redirect_response(&forward(known(2)), "/b/s", super::Plane::Client)
             .is_none()
     );
-    assert!(router.redirect_response(&forward(None), "/b/s").is_none());
+    assert!(
+        router
+            .redirect_response(&forward(None), "/b/s", super::Plane::Client)
+            .is_none()
+    );
     let redirect = router
-        .redirect_response(&forward(known(1)), "/b/s")
+        .redirect_response(&forward(known(1)), "/b/s", super::Plane::Client)
         .expect("a refusal naming a peer in its term redirects");
     assert_eq!(redirect.status(), StatusCode::TEMPORARY_REDIRECT);
     assert_eq!(redirect.headers()[LOCATION], "http://node-1/b/s");
@@ -358,7 +363,7 @@ fn leader_redirect_never_points_at_this_node() {
 #[test]
 fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
     let router = ClientWriteLeaderRouter::new(
-        bound_peer_cluster(
+        bound_registry(
             2,
             crate::shared_peers([
                 (1, "http://node-1:4437".to_owned()),
@@ -380,7 +385,11 @@ fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
         }),
     };
 
-    assert!(router.redirect_response(&unlisted, "/b/s").is_none());
+    assert!(
+        router
+            .redirect_response(&unlisted, "/b/s", super::Plane::Client)
+            .is_none()
+    );
     assert!(router.leader_url(9, "/b/s").is_none());
     assert_eq!(
         router.leader_url(1, "/b/s"),
@@ -701,18 +710,18 @@ fn static_test_cluster_id() -> ursula_headers::ClusterId {
     ursula_headers::ClusterId::new("static-grpc-test").expect("a valid cluster id")
 }
 
-/// The peer cluster of node `node_id` of the static gRPC test cluster, with
+/// A registry of node `node_id` of the static gRPC test cluster, with
 /// `peers` bound as its `raft.peers`.
-pub(crate) fn bound_peer_cluster(
+pub(crate) fn bound_registry(
     node_id: u64,
     peers: ursula_raft::PeerDirectory,
-) -> ursula_raft::PeerCluster {
-    let cluster = ursula_raft::PeerCluster::default();
-    cluster.bind(
+) -> RaftGroupHandleRegistry {
+    let registry = RaftGroupHandleRegistry::default();
+    registry.peer_cluster().bind(
         ursula_raft::PeerIdentity::new(node_id, static_test_cluster_id()),
         peers,
     );
-    cluster
+    registry
 }
 
 async fn spawn_static_grpc_test_node(

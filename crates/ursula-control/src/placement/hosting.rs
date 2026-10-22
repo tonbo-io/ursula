@@ -530,9 +530,25 @@ impl LeaderCandidates {
         &self.tiers
     }
 
-    /// The tier a `NotHosted` answer names a node from.
-    pub fn first_tier(&self) -> Option<&BTreeSet<NodeId>> {
-        self.tiers.first()
+    /// The node a `NotHosted` answer names on its `turn`-th answer: one of
+    /// the first tier that holds a node `reachable` admits, taken round
+    /// robin by `turn`, so successive answers name different nodes of that
+    /// tier. Without a view that is the last tier, every other peer. `None`
+    /// when no tier holds a reachable node.
+    pub fn not_hosted_hint(
+        &self,
+        turn: usize,
+        reachable: impl Fn(NodeId) -> bool,
+    ) -> Option<NodeId> {
+        self.tiers.iter().find_map(|tier| {
+            let reachable: Vec<NodeId> = tier
+                .iter()
+                .copied()
+                .filter(|node| reachable(*node))
+                .collect();
+            let index = turn.checked_rem(reachable.len())?;
+            reachable.get(index).copied()
+        })
     }
 
     /// Every candidate in asking order.

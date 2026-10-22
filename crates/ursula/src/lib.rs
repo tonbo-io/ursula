@@ -57,6 +57,7 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 #[cfg(not(madsim))]
@@ -594,9 +595,10 @@ impl HttpState {
         .into()
     }
 
-    /// A Raft node of a cluster. Its leader redirects read the peers
-    /// `raft_registry`'s peer cluster binds, and its `NotHosted` hints and
-    /// its maintenance inventory read the voters `placement`, the node's
+    /// A Raft node of a cluster. Its redirects read the peers
+    /// `raft_registry`'s peer cluster binds, and its `NotHosted` hints the
+    /// registry's placement views ([`ClientWriteLeaderRouter`]). Its
+    /// maintenance inventory reads the voters `placement`, the node's
     /// placement inputs, gives each group.
     pub fn with_raft_cluster(
         runtime: ShardRuntime,
@@ -605,7 +607,7 @@ impl HttpState {
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
-        let router = ClientWriteLeaderRouter::new(raft_registry.peer_cluster().clone(), placement);
+        let router = ClientWriteLeaderRouter::new(raft_registry.clone(), placement);
         HttpStateFields {
             process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
@@ -818,33 +820,56 @@ impl Drop for AbortOnDrop {
     }
 }
 
-/// Resolves the current leader of a raft group to a client-reachable base URL
-/// so a write/read that lands on a non-leader can be answered with a 307
-/// redirect. `peers` is the node's peer cluster, whose bound `raft.peers`,
-/// read at each redirect, gives each node's client URL
-/// ([`ursula_raft::PeerDirectory::client_url`]): its `client_url`, or its
-/// Raft `url` when the node serves both planes on `server.listen`. Clients
-/// and gateways must be able to reach these URLs. A leader that `raft.peers`
-/// does not list is never a redirect target. A group this node does not
-/// host redirects to a voter its placement gives the group, read at each
-/// redirect: none before a bootstrapped view.
+/// Resolves where a request for a group this node cannot serve goes, as a
+/// client-reachable base URL for a `307` (design 9):
+///
+/// - a leadership refusal that names a leader goes to that leader
+///   ([`RoutingAnswer::NotLeader`]);
+/// - a node that hosts no replica of the group, and a replica that names
+///   no leader while it does not count as a voter (S10), go to a node of
+///   the first tier of `ursula_control::leader_candidates` in this node's
+///   latest placement view, rotating per answer
+///   ([`RoutingAnswer::NotHosted`]). Without a view that tier is every
+///   other `raft.peers` node;
+/// - a replica that counts as a voter and names no leader gets no redirect:
+///   its "no leader" holds for the group, and the caller answers a
+///   retryable `503`.
+///
+/// Every URL is the one the bound `raft.peers` lists, read at each answer
+/// ([`ursula_raft::PeerCluster::client_url`]): a peer's `client_url`, or
+/// its Raft `url` when it serves both planes on `server.listen`. A node
+/// `raft.peers` does not list is never a redirect target. This node's id is
+/// the one its peer cluster binds.
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
-    peers: ursula_raft::PeerCluster,
+    registry: RaftGroupHandleRegistry,
     placement: Arc<dyn ursula_raft::PlacementInputs>,
+    /// The `NotHosted` answers given, which rotate the node each names.
+    not_hosted_turns: Arc<AtomicUsize>,
 }
 
 impl ClientWriteLeaderRouter {
+    /// Routes over `registry`'s peers, placement views and voter
+    /// predicate. `placement`, the node's placement inputs, gives the
+    /// maintenance inventory.
     pub fn new(
-        peers: ursula_raft::PeerCluster,
+        registry: RaftGroupHandleRegistry,
         placement: Arc<dyn ursula_raft::PlacementInputs>,
     ) -> Self {
-        Self { peers, placement }
+        Self {
+            registry,
+            placement,
+            not_hosted_turns: Arc::default(),
+        }
+    }
+
+    fn peers(&self) -> &ursula_raft::PeerCluster {
+        self.registry.peer_cluster()
     }
 
     /// This node's id, as its peer cluster binds it.
     fn node_id(&self) -> Option<u64> {
-        self.peers.identity().map(|identity| identity.node_id())
+        self.peers().identity().map(|identity| identity.node_id())
     }
 
     /// The voters this node's placement gives `group`.
@@ -859,10 +884,7 @@ impl ClientWriteLeaderRouter {
         if Some(leader_id) == self.node_id() {
             return None;
         }
-        self.peers
-            .directory()
-            .client_url(leader_id)
-            .map(str::to_owned)
+        self.peers().client_url(leader_id)
     }
 
     /// The URL of `request_target` on `leader_id`, the target of a routing
@@ -872,29 +894,73 @@ impl ClientWriteLeaderRouter {
             .map(|base| format!("{base}{request_target}"))
     }
 
-    /// A voter this node's placement gives `raft_group_id`, other than this
-    /// node, that `raft.peers` lists.
-    fn hosted_group_base(&self, raft_group_id: RaftGroupId) -> Option<String> {
-        let me = self.node_id();
-        let peers = self.peers.directory();
-        self.placed_voters(raft_group_id)
-            .into_iter()
-            .filter(|node_id| Some(*node_id) != me)
-            .find_map(|node_id| peers.client_url(node_id).map(str::to_owned))
+    /// The one answer of a node that cannot name `group`'s leader: the
+    /// base URL a `NotHosted` redirect names, or `None` for a retryable
+    /// `503`. `None` when `replica` counts as a voter, and on the admin
+    /// plane, whose redirect would name a client-plane URL.
+    fn unhosted_answer(
+        &self,
+        group: RaftGroupId,
+        replica: Replica,
+        plane: Plane,
+    ) -> Option<String> {
+        if plane == Plane::Admin {
+            return None;
+        }
+        if replica == Replica::Hosted
+            && self.registry.counts_as_voter(group) == ursula_control::Counts::Voter
+        {
+            return None;
+        }
+        let me = ursula_proto::placement::NodeId::new(self.node_id()?);
+        let peers = self.peers().directory();
+        let ids = peers
+            .node_ids()
+            .map(ursula_proto::placement::NodeId::new)
+            .collect();
+        let view = self.registry.placement_watch().current();
+        let candidates = ursula_control::leader_candidates(
+            me,
+            ursula_control::CandidatesOf::Group(group),
+            &view,
+            None,
+            &ids,
+        );
+        let turn = self.not_hosted_turns.fetch_add(1, Ordering::Relaxed);
+        let hint = candidates.not_hosted_hint(turn, |node| peers.contains(node.get()))?;
+        peers.client_url(hint.get()).map(str::to_owned)
     }
 
-    /// The redirect for `err`, typed through `ursula-headers`: to the
-    /// leader its leadership refusal names, in the term it leads in
-    /// ([`RoutingAnswer::NotLeader`]), or, from a node that hosts no replica
-    /// of the group, to one that does ([`RoutingAnswer::NotHosted`]). `None`
-    /// for a refusal that names no leader, or one with no address: the
-    /// caller answers a retryable `503` instead, so no redirect lacks the
-    /// group, or the leader and its term. A leader that `raft.peers` does
-    /// not list has no address.
-    fn redirect_response(&self, err: &RuntimeError, request_target: &str) -> Option<Response> {
+    /// The `307` for `group` that names no leader, of a replica this node
+    /// hosts: [`Self::unhosted_answer`] on the client plane.
+    pub(crate) fn no_leader_redirect(
+        &self,
+        group: RaftGroupId,
+        request_target: &str,
+    ) -> Option<Response> {
+        let base = self.unhosted_answer(group, Replica::Hosted, Plane::Client)?;
+        redirect(
+            &base,
+            RoutingAnswer::NotHosted {
+                group: ursula_headers::RaftGroup::from_u32(group.0),
+            },
+            request_target,
+        )
+    }
+
+    /// The redirect for `err`, typed through `ursula-headers`, as the type
+    /// docs route it. `None` for a refusal that gets no redirect, or one
+    /// with no address: the caller answers a retryable `503` instead, so no
+    /// redirect lacks the group, or the leader and its term.
+    fn redirect_response(
+        &self,
+        err: &RuntimeError,
+        request_target: &str,
+        plane: Plane,
+    ) -> Option<Response> {
         let (base, answer) = match err {
             RuntimeError::GroupNotHosted { raft_group_id, .. } => (
-                self.hosted_group_base(*raft_group_id)?,
+                self.unhosted_answer(*raft_group_id, Replica::Absent, plane)?,
                 RoutingAnswer::NotHosted {
                     group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
                 },
@@ -903,30 +969,57 @@ impl ClientWriteLeaderRouter {
                 raft_group_id,
                 error,
                 ..
-            } => {
-                let leader = error.not_leader()?.leader.as_ref()?;
-                (self.peer_base(leader.node_id)?, RoutingAnswer::NotLeader {
+            } => match &error.not_leader()?.leader {
+                Some(leader) => (self.peer_base(leader.node_id)?, RoutingAnswer::NotLeader {
                     leader: ursula_headers::NodeId::from_u64(leader.node_id),
                     group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
                     term: ursula_headers::RaftTerm::from_u64(leader.term),
-                })
-            }
+                }),
+                None => (
+                    self.unhosted_answer(*raft_group_id, Replica::Hosted, plane)?,
+                    RoutingAnswer::NotHosted {
+                        group: ursula_headers::RaftGroup::from_u32(raft_group_id.0),
+                    },
+                ),
+            },
             _ => return None,
         };
-        let mut headers = HeaderMap::new();
-        insert_default_response_headers(&mut headers);
-        let location = HeaderValue::from_str(&format!("{base}{request_target}")).ok()?;
-        headers.insert(LOCATION, location);
-        answer.render(|name, value| insert_header_str(&mut headers, name, value));
-        Some(
-            (
-                StatusCode::TEMPORARY_REDIRECT,
-                headers,
-                "this node does not lead the stream's group",
-            )
-                .into_response(),
-        )
+        redirect(&base, answer, request_target)
     }
+}
+
+/// Whether the node that answers holds a replica of the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Replica {
+    /// It hosts none ([`RuntimeError::GroupNotHosted`]).
+    Absent,
+    /// Its replica refused: the voter predicate decides its answer.
+    Hosted,
+}
+
+/// The plane a request came in on. A `Location` always names a
+/// client-plane URL, so only the client plane answers `NotHosted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Plane {
+    Client,
+    Admin,
+}
+
+/// The `307` of `answer` to `request_target` on `base`.
+fn redirect(base: &str, answer: RoutingAnswer, request_target: &str) -> Option<Response> {
+    let mut headers = HeaderMap::new();
+    insert_default_response_headers(&mut headers);
+    let location = HeaderValue::from_str(&format!("{base}{request_target}")).ok()?;
+    headers.insert(LOCATION, location);
+    answer.render(|name, value| insert_header_str(&mut headers, name, value));
+    Some(
+        (
+            StatusCode::TEMPORARY_REDIRECT,
+            headers,
+            "this node does not lead the stream's group",
+        )
+            .into_response(),
+    )
 }
 
 /// Process-wide RSS monitor. It reports RSS in `/__ursula/metrics` and exits
@@ -2416,7 +2509,9 @@ pub(crate) async fn flush_cold_stream(
             .to_string(),
         ),
         Ok(None) => StatusCode::NO_CONTENT.into_response(),
-        Err(err) => write_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await,
+        Err(err) => {
+            admin_error_or_leader_redirect(&state, err, &request_target(&uri), Access::Write)
+        }
     }
 }
 
@@ -2462,7 +2557,12 @@ pub(crate) async fn export_backup_group(
     let snapshot = match state.runtime.snapshot_group(raft_group_id).await {
         Ok(snapshot) => snapshot,
         Err(err) => {
-            return read_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await;
+            return admin_error_or_leader_redirect(
+                &state,
+                err,
+                &request_target(&uri),
+                Access::Read,
+            );
         }
     };
     let body = match ursula_stream::msgpack::encode(&snapshot.stream_snapshot) {
@@ -2590,7 +2690,9 @@ pub(crate) async fn import_backup_group(
             }),
         )
             .into_response(),
-        Err(err) => write_error_or_leader_redirect_async(&state, err, &request_target(&uri)).await,
+        Err(err) => {
+            admin_error_or_leader_redirect(&state, err, &request_target(&uri), Access::Write)
+        }
     }
 }
 
@@ -5481,7 +5583,7 @@ pub(crate) async fn read_error_or_leader_redirect_async(
     err: RuntimeError,
     request_target: &str,
 ) -> Response {
-    leadership_or_runtime_answer(state, err, request_target, Access::Read)
+    leadership_or_runtime_answer(state, err, request_target, Access::Read, Plane::Client)
 }
 
 /// The answer to a failed write before its body was read: a redirect only
@@ -5492,7 +5594,21 @@ pub(crate) async fn write_error_or_leader_redirect_async(
     err: RuntimeError,
     request_target: &str,
 ) -> Response {
-    leadership_or_runtime_answer(state, err, request_target, Access::Write)
+    leadership_or_runtime_answer(state, err, request_target, Access::Write, Plane::Client)
+}
+
+/// The answer of an admin route to a failed `access`: the client plane's,
+/// without `NotHosted`. A node that hosts no replica of the group, or whose
+/// replica names no leader, answers a retryable `503` with no `Location`,
+/// so an operator tool, which follows no redirect, asks its next node
+/// (design 9).
+pub(crate) fn admin_error_or_leader_redirect(
+    state: &HttpState,
+    err: RuntimeError,
+    request_target: &str,
+    access: Access,
+) -> Response {
+    leadership_or_runtime_answer(state, err, request_target, access, Plane::Admin)
 }
 
 fn leadership_or_runtime_answer(
@@ -5500,6 +5616,7 @@ fn leadership_or_runtime_answer(
     err: RuntimeError,
     request_target: &str,
     access: Access,
+    plane: Plane,
 ) -> Response {
     count_refusal(state, &err);
     let Some(router) = state.client_write_router() else {
@@ -5517,7 +5634,7 @@ fn leadership_or_runtime_answer(
         Access::Read => true,
         Access::Write => refused_before_proposal(&err),
     };
-    if redirects && let Some(redirect) = router.redirect_response(&err, request_target) {
+    if redirects && let Some(redirect) = router.redirect_response(&err, request_target, plane) {
         return redirect;
     }
     // Forward-to-leader error whose leader or term is currently unknown
@@ -5543,7 +5660,7 @@ pub(crate) fn runtime_error_after_body(state: &HttpState, err: RuntimeError) -> 
     if ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::NoRedirectAfterBody)
         && let Some(redirect) = state
             .client_write_router()
-            .and_then(|router| router.redirect_response(&err, ""))
+            .and_then(|router| router.redirect_response(&err, "", Plane::Client))
     {
         return redirect;
     }
