@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use openraft::Config;
 use openraft::error::ClientWriteError;
+#[cfg(all(test, not(madsim)))]
 use openraft::error::InitializeError;
 use openraft::error::LinearizableReadError;
 use openraft::error::RaftError;
@@ -25,6 +26,7 @@ use openraft::raft::WriteResult;
 use ursula_runtime::GroupEngineError;
 use ursula_runtime::GroupInfraError;
 use ursula_runtime::LeadershipReason;
+#[cfg(all(test, not(madsim)))]
 use ursula_runtime::MembershipInitRefusal;
 use ursula_runtime::Proposal;
 use ursula_runtime::ResponseKind;
@@ -55,7 +57,10 @@ pub(crate) fn validated_config(config: Config) -> Result<Config, GroupEngineErro
     })
 }
 
-/// OpenRaft's refusal to initialize the membership of `raft_group_id`.
+/// OpenRaft's refusal to initialize the membership of `raft_group_id`, for
+/// the unit tests that initialize a group by hand
+/// ([`crate::RaftGroupEngine::initialize_membership`]).
+#[cfg(all(test, not(madsim)))]
 pub(crate) fn initialize_error(
     raft_group_id: RaftGroupId,
     error: RaftError<C, InitializeError<C>>,

@@ -10,7 +10,6 @@
 //! built over it routes writes through the production leadership view.
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -19,7 +18,6 @@ use openraft::Config;
 use openraft::SnapshotPolicy;
 use openraft::metrics::WaitError;
 use openraft::storage::RaftLogStorage;
-use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::MadsimOpenRaftRuntime;
@@ -40,13 +38,14 @@ use ursula_shard::ShardPlacement;
 use super::MadsimScopedGroupEngine;
 use super::SimNodeWal;
 
-/// The options of node `node_id`'s simulated engine with `metrics` and
+/// `options` of node `node_id`'s simulated engine, with `metrics` and
 /// `cold_store`. Its `raft.peers` lists the three nodes at the addresses
 /// their membership names, as a production node's `raft.peers` does.
 fn runtime_engine_options(
     node_id: u64,
-    metrics: Option<GroupEngineMetrics>,
+    metrics: GroupEngineMetrics,
     cold_store: Option<ColdStoreHandle>,
+    mut options: ursula_raft::RaftGroupEngineOptions,
 ) -> ursula_raft::RaftGroupEngineOptions {
     let peer_cluster = ursula_raft::PeerCluster::default();
     peer_cluster.bind(
@@ -61,7 +60,8 @@ fn runtime_engine_options(
             )
         })),
     );
-    let mut options = super::sim_wal::engine_options(metrics, cold_store);
+    options.metrics = Some(metrics);
+    options.cold_store = cold_store;
     options.peer_cluster = Some(peer_cluster);
     options
 }
@@ -380,19 +380,22 @@ impl MadsimRuntimeRaftNetworkFactory {
             .cloned()
             .ok_or(RuntimeNetworkError::NoLogStore { node_id })?;
         let log_store = wal.open(control.placement, control.metrics.clone()).await;
-        let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
-            control.placement,
+        let engine = super::recovery_wiring::start_gated_replica(
             node_id,
-            control.config,
-            InProcessRaftNetworkFactory::new(control.registry.clone())
-                .with_source(node_id)
-                .with_policy(self.policy.clone()),
+            control.placement,
+            &control.config,
             log_store,
-            wal.recording_work(runtime_engine_options(
-                node_id,
-                Some(control.metrics),
-                self.cold_store.clone(),
-            )),
+            |options| {
+                wal.recording_work(runtime_engine_options(
+                    node_id,
+                    control.metrics,
+                    self.cold_store.clone(),
+                    options,
+                ))
+            },
+            &control.registry,
+            &self.policy,
+            &super::recovery_wiring::fixed_placement(node_id, 1..=3),
         )
         .await?;
         control.registry.register(node_id, &engine);
@@ -443,8 +446,6 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 tracing::error!(error = %err, "OpenRaft refused the group's Raft config");
                 GroupEngineError::Infra(invalid_config)
             })?);
-            let nodes = BTreeSet::from([1, 2, 3]);
-
             let mut engines = Vec::new();
             let mut wals = BTreeMap::new();
             for node_id in 1..=3 {
@@ -458,26 +459,29 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                     .clone();
                 let log_store = wal.open(placement, metrics.clone()).await;
                 wals.insert(node_id, wal);
-                let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
-                    placement,
+                let engine = super::recovery_wiring::start_gated_replica(
                     node_id,
-                    config.clone(),
-                    InProcessRaftNetworkFactory::new(registry.clone())
-                        .with_source(node_id)
-                        .with_policy(policy.clone()),
+                    placement,
+                    &config,
                     log_store,
-                    wals[&node_id].recording_work(runtime_engine_options(
-                        node_id,
-                        Some(metrics.clone()),
-                        cold_store.clone(),
-                    )),
+                    |options| {
+                        wals[&node_id].recording_work(runtime_engine_options(
+                            node_id,
+                            metrics.clone(),
+                            cold_store.clone(),
+                            options,
+                        ))
+                    },
+                    &registry,
+                    &policy,
+                    &super::recovery_wiring::fixed_placement(node_id, 1..=3),
                 )
                 .await?;
                 registry.register(node_id, &engine);
                 engines.push((node_id, engine));
             }
 
-            engines[0].1.initialize_membership(nodes).await?;
+            // Node 1's bootstrap driver initializes the group.
             let leader_metrics = engines[0]
                 .1
                 .raft_handle()
@@ -486,6 +490,7 @@ impl GroupEngineFactory for MadsimRuntimeRaftNetworkFactory {
                 .await
                 .map_err(|err| leader_wait_error(placement.raft_group_id, err))?;
             let leader_id = leader_metrics.current_leader.expect("leader id");
+            super::recovery_wiring::wait_gates_open(&registry, 1..=3, LEADER_WAIT).await;
             leaders
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())

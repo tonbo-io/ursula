@@ -13672,7 +13672,5 @@ fn readiness_reason_keeps_its_order_and_ignores_peers_of_another_cluster() {
 fn gated_engine_options(
     gate: &Arc<ursula_raft::GroupRejoin>,
 ) -> ursula_raft::RaftGroupEngineOptions {
-    let mut options = ursula_raft::RaftGroupEngineOptions::default();
-    options.recovery = Some(gate.clone());
-    options
+    ursula_raft::RaftGroupEngineOptions::gated(gate.clone())
 }

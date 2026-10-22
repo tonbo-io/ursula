@@ -237,22 +237,25 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
         &topology,
     )
     .unwrap();
+    let repeated_log = wal
+        .open(
+            placement(0),
+            ursula_control::Admission::Create,
+            metrics.group_engine_metrics(),
+        )
+        .unwrap();
+    let repeated_options = RaftGroupEngineOptions::gated_on(1, placement(0), &repeated_log).await;
     let repeated = RaftGroupEngine::new_node(
         placement(0),
         1,
         config.clone(),
         crate::registry::SingleNodeRaftNetworkFactory,
-        wal.open(
-            placement(0),
-            ursula_control::Admission::Create,
-            metrics.group_engine_metrics(),
-        )
-        .unwrap(),
+        repeated_log,
         RaftGroupEngineOptions {
             apply_fault: Some(crate::apply_failure::ApplyFault::PanicAfterMutation {
                 index: poison_index,
             }),
-            ..Default::default()
+            ..repeated_options
         },
     )
     .await;
@@ -715,6 +718,7 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
                     metrics.group_engine_metrics(),
                 )
                 .unwrap();
+            let options = RaftGroupEngineOptions::gated_on(id, placement(0), &log).await;
             let engine = RaftGroupEngine::new_node(
                 placement(0),
                 id,
@@ -722,7 +726,7 @@ async fn three_replica_poison_drill_replays_every_payload_without_skipping_drill
                 crate::in_process::InProcessRaftNetworkFactory::new(network.clone())
                     .with_source(id),
                 log.clone(),
-                RaftGroupEngineOptions::default(),
+                options,
             )
             .await
             .unwrap();

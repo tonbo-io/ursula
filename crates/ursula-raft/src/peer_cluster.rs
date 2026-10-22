@@ -956,12 +956,12 @@ fn url_ip(url: &str) -> Option<IpAddr> {
     authority.parse::<IpAddr>().ok()
 }
 
-/// The cluster every in-crate test and simulation node is in.
-#[cfg(any(test, madsim))]
+/// The cluster every in-crate test node is in.
+#[cfg(test)]
 pub(crate) const TEST_CLUSTER_ID: &str = "ursula-test";
 
 /// Node `node_id` of the test cluster.
-#[cfg(any(test, madsim))]
+#[cfg(test)]
 pub(crate) fn test_identity(node_id: u64) -> PeerIdentity {
     PeerIdentity::new(
         node_id,
@@ -970,13 +970,13 @@ pub(crate) fn test_identity(node_id: u64) -> PeerIdentity {
 }
 
 /// A node of the test cluster with no configured peers.
-#[cfg(any(test, madsim))]
+#[cfg(test)]
 pub(crate) fn test_peer_cluster(node_id: u64) -> PeerCluster {
     test_peer_cluster_with(node_id, PeerDirectory::default())
 }
 
 /// A node of the test cluster whose `raft.peers` is `peers`.
-#[cfg(any(test, madsim))]
+#[cfg(test)]
 pub(crate) fn test_peer_cluster_with(node_id: u64, peers: PeerDirectory) -> PeerCluster {
     let peer_cluster = PeerCluster::default();
     peer_cluster.bind(test_identity(node_id), peers);

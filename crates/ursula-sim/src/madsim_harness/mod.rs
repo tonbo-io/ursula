@@ -22,7 +22,6 @@ use ursula::router_with_http_state;
 use ursula_raft::InProcessRaftFaultAction;
 use ursula_raft::InProcessRaftFaultScript;
 use ursula_raft::InProcessRaftNetworkEvent;
-use ursula_raft::InProcessRaftNetworkFactory;
 use ursula_raft::InProcessRaftNetworkPolicy;
 use ursula_raft::InProcessRaftNetworkPolicyEvent;
 use ursula_raft::InProcessRaftRegistry;
@@ -1906,23 +1905,23 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         .validate()
         .expect("valid raft config"),
     );
-    let nodes = BTreeSet::from([1, 2, 3]);
-
     let mut engines = Vec::new();
     let mut wals = Vec::new();
     for node_id in 1..=3 {
         let wal = SimNodeWal::provision(&format!("three-node-{node_id}"));
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
-            placement(),
+        let engine = recovery_wiring::start_gated_replica(
             node_id,
-            config.clone(),
-            InProcessRaftNetworkFactory::new(registry.clone())
-                .with_source(node_id)
-                .with_policy(policy.clone()),
+            placement(),
+            &config,
             wal.open(placement(), standalone_wal_metrics(placement()))
                 .await,
-            None,
-            cold_store.clone(),
+            |mut options| {
+                options.cold_store = cold_store.clone();
+                options
+            },
+            &registry,
+            &policy,
+            &recovery_wiring::fixed_placement(node_id, 1..=3),
         )
         .await
         .expect("create simulated raft group node");
@@ -1931,10 +1930,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         wals.push(wal);
     }
 
-    engines[0]
-        .initialize_membership(nodes)
-        .await
-        .expect("initialize simulated raft group");
+    // Node 1's bootstrap driver initializes the group.
     let leader_metrics = engines[0]
         .raft_handle()
         .wait(Some(Duration::from_secs(5)))
@@ -1942,6 +1938,7 @@ async fn build_restartable_three_node_cluster_with_cold_store(
         .await
         .expect("wait for simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
+    recovery_wiring::wait_gates_open(&registry, 1..=3, Duration::from_secs(5)).await;
     (registry, engines, wals, config, leader_id)
 }
 
@@ -1974,18 +1971,22 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
 
     let mut engines = Vec::new();
     for node_id in 1..=3 {
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
-            placement(),
+        // The group's voters are nodes 1 and 2. Node 3 waits outside it
+        // until a scenario adds it as a learner.
+        let engine = recovery_wiring::start_gated_replica(
             node_id,
-            config.clone(),
-            InProcessRaftNetworkFactory::new(registry.clone())
-                .with_source(node_id)
-                .with_policy(policy.clone()),
+            placement(),
+            &config,
             SimNodeWal::provision(&format!("lagging-learner-{node_id}"))
                 .open(placement(), standalone_wal_metrics(placement()))
                 .await,
-            None,
-            cold_store.clone(),
+            |mut options| {
+                options.cold_store = cold_store.clone();
+                options
+            },
+            &registry,
+            &policy,
+            &recovery_wiring::fixed_placement(node_id, [1, 2]),
         )
         .await
         .expect("create simulated raft group node");
@@ -1995,10 +1996,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
         engines.push(engine);
     }
 
-    engines[0]
-        .initialize_membership(BTreeSet::from([1, 2]))
-        .await
-        .expect("initialize simulated two-voter raft group");
+    // Node 1's bootstrap driver initializes the two-voter group.
     let leader_metrics = engines[0]
         .raft_handle()
         .wait(Some(Duration::from_secs(5)))
@@ -2014,6 +2012,7 @@ pub(super) async fn build_lagging_learner_snapshot_cluster_with_cold_store(
             .await
             .expect("wait for shared leader");
     }
+    recovery_wiring::wait_gates_open(&registry, [1, 2], Duration::from_secs(5)).await;
     (registry, engines, leader_id)
 }
 
@@ -2042,23 +2041,20 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .validate()
         .expect("valid raft config"),
     );
-    let nodes = BTreeSet::from([1, 2, 3]);
-
     let mut engines = Vec::new();
     let mut wals = Vec::new();
     for node_id in 1..=3 {
         let wal = SimNodeWal::provision(&format!("snapshot-purge-{node_id}"));
-        let engine = RaftGroupEngine::new_node_with_log_store_and_network(
-            placement(),
+        let engine = recovery_wiring::start_gated_replica(
             node_id,
-            config.clone(),
-            InProcessRaftNetworkFactory::new(registry.clone())
-                .with_source(node_id)
-                .with_policy(policy.clone()),
+            placement(),
+            &config,
             wal.open(placement(), standalone_wal_metrics(placement()))
                 .await,
-            None,
-            None,
+            |options| options,
+            &registry,
+            &policy,
+            &recovery_wiring::fixed_placement(node_id, 1..=3),
         )
         .await
         .expect("create snapshot-purge simulated raft group node");
@@ -2067,10 +2063,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         wals.push(wal);
     }
 
-    engines[0]
-        .initialize_membership(nodes)
-        .await
-        .expect("initialize snapshot-purge simulated raft group");
+    // Node 1's bootstrap driver initializes the group.
     let leader_metrics = engines[0]
         .raft_handle()
         .wait(Some(Duration::from_secs(5)))
@@ -2078,6 +2071,7 @@ pub(super) async fn build_three_node_snapshot_purge_cluster(
         .await
         .expect("wait for snapshot-purge simulated leader");
     let leader_id = leader_metrics.current_leader.expect("leader id");
+    recovery_wiring::wait_gates_open(&registry, 1..=3, Duration::from_secs(5)).await;
     (registry, engines, wals, leader_id)
 }
 

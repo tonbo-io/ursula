@@ -202,9 +202,8 @@ impl SimHost {
         let network = self.parts.registries[&group].clone();
         let mut config = (*self.parts.config).clone();
         config.enable_elect = registry.election_policy().may_campaign(Some(&rejoin));
-        let mut options = RaftGroupEngineOptions::default();
+        let mut options = RaftGroupEngineOptions::gated(Arc::clone(&rejoin));
         options.metrics = Some(self.parts.metrics.group_engine_metrics());
-        options.recovery = Some(Arc::clone(&rejoin));
         options.peer_cluster = Some(registry.peer_cluster().clone());
         options.fence = Some(wal.raft_wal().fence());
         // The driver's tasks run outside the simulation's OpenRaft seed

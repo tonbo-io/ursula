@@ -2213,29 +2213,35 @@ mod tests {
             .validate()
             .unwrap(),
         );
+        let log_store = crate::log_store::RaftWal::start(
+            wal_root.path(),
+            ursula_config::WalFsync::Never,
+            &ursula_shard::StaticShardMap::new(1, 8).expect("valid topology"),
+        )
+        .unwrap()
+        .open(
+            placement,
+            ursula_control::Admission::Create,
+            ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
+        )
+        .unwrap();
+        // Without a gate of the test's own, the one the engine factories
+        // open from the log store.
+        let options = match recovery {
+            Some(recovery) => crate::RaftGroupEngineOptions::gated(recovery),
+            None => crate::RaftGroupEngineOptions::gated_on(1, placement, &log_store).await,
+        };
         let engine = crate::RaftGroupEngine::new_node(
             placement,
             1,
             config,
             SingleNodeRaftNetworkFactory,
-            crate::log_store::RaftWal::start(
-                wal_root.path(),
-                ursula_config::WalFsync::Never,
-                &ursula_shard::StaticShardMap::new(1, 8).expect("valid topology"),
-            )
-            .unwrap()
-            .open(
-                placement,
-                ursula_control::Admission::Create,
-                ursula_runtime::RuntimeMetrics::new(1, 8).group_engine_metrics(),
-            )
-            .unwrap(),
+            log_store,
             crate::RaftGroupEngineOptions {
                 snapshot_store: Some(store),
                 snapshot_install: Some(registry.snapshot_install_coordinator()),
                 cold_store: Some(Arc::new(ursula_runtime::ColdStore::memory().unwrap())),
-                recovery,
-                ..Default::default()
+                ..options
             },
         )
         .await

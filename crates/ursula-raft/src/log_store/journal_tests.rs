@@ -2277,14 +2277,17 @@ async fn replication_reaches_followers_while_the_leader_journal_is_paused() {
     for (index, (core, writer)) in cores.iter().zip(&writers).enumerate() {
         let id = u64::try_from(index).unwrap().saturating_add(1);
         members.insert(id);
+        let store = core.store(writer, 0);
+        let gate = crate::RaftGroupEngineOptions::gated_on(id, placement(0), &store)
+            .await
+            .recovery;
         let engine = RaftGroupEngine::new_node_with_log_store_and_network(
             placement(0),
             id,
             config.clone(),
             InProcessRaftNetworkFactory::new(network.clone()).with_source(id),
-            core.store(writer, 0),
-            None,
-            None,
+            store,
+            gate,
         )
         .await
         .unwrap();
