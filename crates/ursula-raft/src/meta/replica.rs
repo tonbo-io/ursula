@@ -260,6 +260,12 @@ impl ActiveMeta {
         self.core.history.applied()
     }
 
+    /// The replica's recovery gate, which tests and simulations read.
+    #[cfg(any(test, madsim))]
+    pub fn recovery_gate(&self) -> Option<&Arc<GroupRejoin>> {
+        self.core.recovery.as_ref()
+    }
+
     /// Reports the commit screen's `refusal` of a `screened` request that
     /// carried `vote` when it damaged this replica for good
     /// ([`super::damage`]).

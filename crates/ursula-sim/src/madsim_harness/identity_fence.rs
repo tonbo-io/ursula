@@ -2,10 +2,11 @@
 //! identity fence over a [`MetaCluster`] of three placed nodes whose runs
 //! start as servers' do ([`MetaCluster::start_fenced`]): each behind a disk
 //! lease of [`LEASE`], as its node of one cluster, its Raft RPCs of both
-//! planes stamped with its process's incarnation and gated by its fence. The
-//! in-process recovery transport is not: the rejoin barriers, the genesis
-//! probe and `write_meta` carry no incarnation, are keyed by node and ignore
-//! routes, so no check here covers a barrier or counts answers.
+//! planes stamped with its process's incarnation and gated by its fence.
+//! The recovery calls (the rejoin barriers, the probes, the genesis probe
+//! and the forwarded control commands) are each process's own too: they
+//! carry its incarnation, follow its routes and meet the fences at both
+//! ends, as over gRPC (`ursula_raft::InProcessCaller`).
 //!
 //! A family run forms the cluster, appends to both data groups, and then,
 //! by its seed, one of:
@@ -21,24 +22,50 @@
 //!   crashing during its wait and restarting on the same boot.
 //! - **remount under never** (T4, D23): a follower's volume moves under
 //!   `never`, and its new process runs beside the old one, with the leader
-//!   and the third node up.
+//!   and the third node up, under a write load that the old process acks
+//!   from its page cache until its lease ends.
 //! - **lost acknowledgements under never**: the leader and a follower take
 //!   appends while the third node is cut off, the follower's volume moves,
 //!   and the leader is killed. The third node and the new process meet,
 //!   then the leader restarts.
 //! - **correlated power loss** under `always`: every node loses its power,
 //!   waits out its predecessor and recovers.
+//! - **the release rule broken**: a node gets a new disk while its old
+//!   process keeps its own, and the operator releases the old root. Every
+//!   peer reaches meta, the old process reaches no one, and one group's
+//!   leader keeps reaching the old process over a pinned route while the
+//!   new root binds, waits and takes part in the other group.
+//! - **a new disk** (D1, D15): a node's new disk is refused while its old
+//!   process runs on its own disk, for longer than a predecessor wait. Then
+//!   the old disk detaches, the operator releases its root, and the new
+//!   disk becomes the node, binds and waits from its binding.
+//! - **replacements**: a new disk under a live id while that node's old
+//!   process leads meta, then the old disk detaches while it leads, the new
+//!   disk takes the id after the release, and the released disk is swapped
+//!   back in and fences itself, with meta writes throughout.
+//! - **a crash between meta's answer and its record** (S7(d2)): a new disk's
+//!   first binding answer arrives, the process stops at the step before it
+//!   records the binding and is killed there, and its next run binds again.
 //!
 //! Its checks:
 //!
 //! - I16 ([`I16`]): no data replica of a process whose fence holds it out (a
-//!   predecessor wait it owes, or a binding its unbound root awaits) opens
-//!   its gate, writes a vote floor, or shows at a step an uncommitted vote
-//!   other than the one it opened with. It reads each replica at every step,
-//!   and reads neither meta replicas nor snapshot objects. It does not see a
-//!   granted vote: a candidate that wins commits the vote with its first
-//!   heartbeat, well inside a step, and the vote then reads as a leader's.
-//!   No control exercises the vote clause.
+//!   predecessor wait it owes, or a binding its unbound root awaits), or
+//!   whose unbound root was bound less than a predecessor wait ago by the
+//!   harness's clock, opens its gate, writes a vote floor, or shows at a
+//!   step an uncommitted vote other than the one it opened with. It reads
+//!   each replica at every step, and reads neither meta replicas nor
+//!   snapshot objects. It does not see a granted vote: a candidate that wins
+//!   commits the vote with its first heartbeat, well inside a step, and the
+//!   vote then reads as a leader's. No control exercises the vote clause.
+//!   Under `always` a moved volume's replicas open with their gates open
+//!   and need no floor, so there the gate and floor clauses judge only the
+//!   empty replicas of a new disk.
+//! - I17 ([`I17`]): no process counts an answer of a process of a node
+//!   given after a later process of that node made a promise (granted a
+//!   vote, acknowledged entries or installed a snapshot). It reads every
+//!   answer a process counted, the recovery calls' included, and runs at
+//!   the end of a run.
 //! - I18 ([`I18`]): no linearizable read invoked after a write was
 //!   acknowledged misses that write. It compares each read with its
 //!   invocation, so a read invoked before a write is free to miss it.
@@ -46,14 +73,19 @@
 //!   the end.
 //! - Liveness ([`RESUME`]): after the faults heal, every group takes a write
 //!   within a predecessor wait and a bound.
+//! - In **replacements** also the meta invariants of `placement-move` (I12
+//!   and the hosting checks at every step, I10 at the end), that the node's
+//!   healthy process is never refused while a new disk under its id is,
+//!   and that the refused root takes no meta vote floor.
 //!
-//! The family checks neither the meta invariants nor the hosting check of
-//! `placement-move`: after a correlated power loss every node hosts what its
-//! journals hold while no view shows a bootstrap. The negative controls
+//! The other scripts check neither the meta invariants nor the hosting
+//! check: after a correlated power loss every node hosts what its journals
+//! hold while no view shows a bootstrap. The negative controls
 //! ([`Controls`]) each run one script with one defence off and fail inside
 //! it.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -61,14 +93,23 @@ use std::time::Duration;
 use futures_util::lock::Mutex as AsyncMutex;
 use openraft::ServerState;
 use ursula_config::WalFsync;
+use ursula_control::ControlApplied;
+use ursula_control::ControlCommand;
+use ursula_control::RegistrationStatus;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::Registered;
+use ursula_proto::placement::RootId;
+use ursula_proto::placement::RootSlot;
 use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupEngine;
+use ursula_raft::meta::pause::MetaPausePoint;
 use ursula_raft::predecessor_wait::PREDECESSOR_WAIT;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::node_fence::FenceStatus;
 use ursula_stream::sim_controls::Defence;
 use ursula_stream::sim_controls::set_off;
 
@@ -91,8 +132,12 @@ use super::placed_hosting::ReplicaMarks;
 
 pub(super) const I1: &str = "acknowledged_writes_read_back";
 pub(super) const I16: &str = "held_replicas_take_no_part";
+pub(super) const I17: &str = "no_answer_counted_after_a_successor_promised";
 pub(super) const I18: &str = "linearizable_reads_see_acknowledged_writes";
 pub(super) const RESUME: &str = "fenced_cluster_writes_resume";
+/// The replacements' own check: the node's healthy process is never
+/// refused, and a refused root takes no meta floor.
+pub(super) const REFUSED: &str = "only_the_new_root_is_refused";
 
 /// `raft.wal.lease` of every node.
 const LEASE: Duration = Duration::from_secs(5);
@@ -106,6 +151,10 @@ const READ_TIMEOUT: Duration = Duration::from_millis(300);
 const APPEND_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long a split keeps reading after the first write on the far side.
 const READ_ON: Duration = Duration::from_secs(2);
+/// How much earlier than a predecessor wait after its binding I16's clock
+/// clause ends: the harness sees an answer up to a step after the node
+/// does.
+const BINDING_MARGIN: Duration = Duration::from_millis(100);
 /// Mixed into the seed of a run's draws.
 const SALT: u64 = 0x6964_656e_7469_7479;
 
@@ -128,17 +177,25 @@ pub(super) enum Controls {
     /// The lost acknowledgements under `never`, with a run on another
     /// device read as a moved volume (`true`) or as a process crash (N20).
     RemountedRun { defended: bool },
+    /// The broken release rule, with each answer's stamp judged (`true`)
+    /// or every answer counted unchecked (N10).
+    ResponderBinding { defended: bool },
+    /// The new disk refused for longer than a wait, with its wait from its
+    /// binding (`true`) or from the start of its run (N23).
+    WaitFromBinding { defended: bool },
 }
 
 /// The run's defences, reset when the run ends.
 struct Switched;
 
-const SWITCHED: [Defence; 5] = [
+const SWITCHED: [Defence; 7] = [
     Defence::SuccessorWait,
     Defence::DiskLease,
     Defence::OwedWait,
     Defence::GateAfterWait,
     Defence::RemountedRun,
+    Defence::ResponderBinding,
+    Defence::WaitFromBinding,
 ];
 
 impl Switched {
@@ -163,6 +220,14 @@ impl Switched {
             Defence::RemountedRun,
             controls == Controls::RemountedRun { defended: false },
         );
+        set_off(
+            Defence::ResponderBinding,
+            controls == Controls::ResponderBinding { defended: false },
+        );
+        set_off(
+            Defence::WaitFromBinding,
+            controls == Controls::WaitFromBinding { defended: false },
+        );
         Self
     }
 }
@@ -183,7 +248,7 @@ struct Read {
     payload: Vec<u8>,
 }
 
-/// I16's and I18's records across a run.
+/// I16's, I17's and I18's records across a run.
 #[derive(Default)]
 struct FenceChecks {
     /// How many observations saw a held replica.
@@ -192,6 +257,16 @@ struct FenceChecks {
     acknowledged: BTreeMap<u32, Vec<(madsim::time::Instant, Vec<u8>)>>,
     /// How many linearizable reads I18 compared.
     reads: u64,
+    /// The processes seen awaiting their root's binding.
+    unbound: BTreeSet<u64>,
+    /// For each of them whose hold for the binding ended, when the harness
+    /// first saw that: the binding answer of a bootstrapped cluster, or
+    /// `None` for an answer before Bootstrap, which owes no wait.
+    bindings: BTreeMap<u64, Option<madsim::time::Instant>>,
+    /// The first promise of each process, by tag, read from the answers
+    /// before `read_answers`.
+    promised: BTreeMap<u64, madsim::time::Instant>,
+    read_answers: usize,
 }
 
 impl FenceChecks {
@@ -200,24 +275,36 @@ impl FenceChecks {
     /// either that vote or a committed one. A vote it granted to a candidate
     /// that won is committed by then, so the vote clause sees only an
     /// uncommitted vote at the step. A held process opens its replicas while
-    /// held, since a hold begins at the start of its run.
+    /// held, since a hold begins at the start of its run or, for a new
+    /// disk's, their creation follows the binding. A process is held while
+    /// its fence holds it out, and for a predecessor wait after the harness
+    /// first saw its unbound root bound.
     fn observe(&mut self, cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
+        let now = madsim::time::Instant::now();
         for node_id in cluster.running() {
             let Some(process) = cluster.process(node_id) else {
                 continue;
             };
-            if !cluster.data.wals[&node_id].raft_wal().fence().holds_data() {
+            let fence = cluster.data.wals[&node_id].raft_wal().fence();
+            let awaits = fence.awaits_binding();
+            if awaits {
+                self.unbound.insert(process);
+            }
+            let bound_at = self.binding(cluster, node_id, process, awaits, now);
+            let by_clock = bound_at.is_some_and(|at| now + BINDING_MARGIN < at + PREDECESSOR_WAIT);
+            let by_fence = fence.holds_data();
+            if !by_fence && !by_clock {
                 continue;
             }
             for replica in cluster.hosted_replicas(node_id) {
-                let now = ReplicaMarks::of(&replica.raft, &replica.rejoin);
+                let now_marks = ReplicaMarks::of(&replica.raft, &replica.rejoin);
                 let opened = replica.opened;
                 self.held_observations = self.held_observations.saturating_add(1);
-                let broke = if now.gate_open && !opened.gate_open {
+                let broke = if now_marks.gate_open && !opened.gate_open {
                     Some("opened its gate")
-                } else if now.floor && !opened.floor {
+                } else if now_marks.floor && !opened.floor {
                     Some("wrote a vote floor")
-                } else if now.vote != opened.vote && !now.vote.is_committed() {
+                } else if now_marks.vote != opened.vote && !now_marks.vote.is_committed() {
                     Some("granted a vote or campaigned")
                 } else {
                     None
@@ -228,14 +315,59 @@ impl FenceChecks {
                         I16,
                         after_event,
                         format!(
-                            "node {node_id}'s process {process} {broke} in group {} while its \
-                             fence held it out: opened {opened:?}, now {now:?}",
+                            "node {node_id}'s process {process} {broke} in group {} while held \
+                             (by its fence: {by_fence}, within the wait after its binding at \
+                             {bound_at:?}: {by_clock}): opened {opened:?}, now {now_marks:?}",
                             replica.group
                         ),
                     );
                 }
             }
         }
+    }
+
+    /// When the harness first saw the hold of `process`, a process of
+    /// `node_id` whose unbound root it saw await its binding, end on a
+    /// binding answer of a bootstrapped cluster. `awaits` is whether the
+    /// hold stands now.
+    fn binding(
+        &mut self,
+        cluster: &MetaCluster,
+        node_id: u64,
+        process: u64,
+        awaits: bool,
+        now: madsim::time::Instant,
+    ) -> Option<madsim::time::Instant> {
+        if let Some(at) = self.bindings.get(&process) {
+            return *at;
+        }
+        if awaits || !self.unbound.contains(&process) {
+            return None;
+        }
+        let bootstrapped = matches!(
+            cluster.runtimes[&node_id]
+                .status_reader()
+                .placement_status()
+                .registration,
+            RegistrationStatus::Answered(Registered::Referenced(_) | Registered::Unreferenced(_))
+        );
+        let at = bootstrapped.then_some(now);
+        self.bindings.insert(process, at);
+        at
+    }
+
+    /// Whether `process` made a promise a peer counted, reading the answers
+    /// counted since the last call.
+    fn promised(&mut self, cluster: &MetaCluster, process: u64) -> bool {
+        let started = cluster.started_processes();
+        let answers = cluster.data.answers.since(self.read_answers);
+        self.read_answers = self.read_answers.saturating_add(answers.len());
+        for answer in answers.iter().filter(|answer| answer.promise) {
+            if let Some((tag, _)) = process_of(&started, &answer.responder) {
+                self.promised.entry(tag).or_insert(answer.at);
+            }
+        }
+        self.promised.contains_key(&process)
     }
 
     /// I18 over `reads` of `group`: each holds every write acknowledged
@@ -267,6 +399,62 @@ impl FenceChecks {
                     ),
                 );
             }
+        }
+    }
+}
+
+/// The tag and node of the process whose incarnation is `incarnation`,
+/// among the processes `started` names.
+fn process_of(
+    started: &BTreeMap<u64, (u64, ursula_proto::placement::ProcessIncarnation)>,
+    incarnation: &ursula_proto::placement::ProcessIncarnation,
+) -> Option<(u64, u64)> {
+    started
+        .iter()
+        .find(|(_, (_, seen))| seen == incarnation)
+        .map(|(tag, (node, _))| (*tag, *node))
+}
+
+/// When each process first made a promise a peer counted, by tag.
+fn promises(cluster: &MetaCluster) -> BTreeMap<u64, madsim::time::Instant> {
+    let started = cluster.started_processes();
+    let mut promised = BTreeMap::new();
+    for answer in cluster.data.answers.answers() {
+        if !answer.promise {
+            continue;
+        }
+        if let Some((tag, _)) = process_of(&started, &answer.responder) {
+            promised.entry(tag).or_insert(answer.at);
+        }
+    }
+    promised
+}
+
+/// I17 over every answer a process counted: none came from a process of a
+/// node after a later process of the node had made a promise.
+fn answers_after_promises(cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
+    let started = cluster.started_processes();
+    let promised = promises(cluster);
+    for answer in cluster.data.answers.answers() {
+        let Some((tag, node)) = process_of(&started, &answer.responder) else {
+            continue;
+        };
+        let successor = promised.iter().find(|(later, at)| {
+            **later > tag
+                && answer.at > **at
+                && started.get(later).is_some_and(|(of, _)| *of == node)
+        });
+        if let Some((later, at)) = successor {
+            fail(
+                trace,
+                I17,
+                after_event,
+                format!(
+                    "node {:?} counted an answer of node {node}'s process {tag} at {:?}, after its \
+                     successor process {later} made a promise at {at:?}",
+                    answer.source, answer.at
+                ),
+            );
         }
     }
 }
@@ -340,6 +528,14 @@ fn spawn_reader(
     })
 }
 
+/// The reads a reader completed.
+fn completed(reads: &Arc<Mutex<Vec<Read>>>) -> Vec<Read> {
+    reads
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone()
+}
+
 /// The three nodes of a split: `leader` led the group, `moved`'s volume
 /// moves, `far` is the third.
 #[derive(Debug, Clone, Copy)]
@@ -360,6 +556,8 @@ struct Run {
     /// Each payload appended, by group, of which the acknowledged ones are
     /// in `fence.acknowledged`.
     appended: BTreeMap<u32, u64>,
+    /// Whether every step also runs the meta checks ([`MetaChecks::observe`]).
+    meta_checked: bool,
 }
 
 impl Run {
@@ -385,6 +583,7 @@ impl Run {
             draws: SplitMix64::new(seed ^ SALT),
             seed,
             appended: BTreeMap::new(),
+            meta_checked: false,
         };
         run.step("cluster_started");
         run.cluster.groups_form(&mut run.trace, "formed").await;
@@ -411,6 +610,9 @@ impl Run {
 
     fn observe(&mut self, phase: &str) {
         self.fence.observe(&self.cluster, &mut self.trace, phase);
+        if self.meta_checked {
+            self.meta.observe(&self.cluster, &mut self.trace, phase);
+        }
     }
 
     /// Waits `wait`, running the checks every step.
@@ -470,15 +672,22 @@ impl Run {
         true
     }
 
+    /// Appends one payload to `group` through whichever of `among` leads it,
+    /// if one does.
+    async fn append_through_leader(&mut self, group: u32, among: &[u64]) -> bool {
+        match self.leader(group, among) {
+            Some(leader) => self.append_on(group, leader).await,
+            None => false,
+        }
+    }
+
     /// Liveness: `group` takes a write through a leader among the running
     /// nodes within a predecessor wait and the bound.
     async fn resume(&mut self, group: u32, phase: &str) {
         let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
         loop {
             let running = self.cluster.running();
-            if let Some(leader) = self.leader(group, &running)
-                && self.append_on(group, leader).await
-            {
+            if self.append_through_leader(group, &running).await {
                 return;
             }
             if madsim::time::Instant::now() >= deadline {
@@ -598,17 +807,21 @@ impl Run {
             .join("; ")
     }
 
-    /// The roles of a split of a drawn group, by who leads it now.
-    async fn roles(&mut self, phase: &str) -> Roles {
-        let group = JOURNAL_GROUPS
+    /// A drawn group.
+    fn draw_group(&mut self) -> u32 {
+        JOURNAL_GROUPS
             .get(usize::try_from(self.draws.next_bounded(2)).unwrap_or(0))
             .copied()
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    /// The node whose replica of `group` leads within the bound.
+    async fn wait_leader(&mut self, group: u32, phase: &str) -> u64 {
         let nodes: Vec<u64> = (1..=NODES).collect();
         let deadline = madsim::time::Instant::now() + BOUND;
-        let leader = loop {
+        loop {
             if let Some(leader) = self.leader(group, &nodes) {
-                break leader;
+                return leader;
             }
             if madsim::time::Instant::now() >= deadline {
                 fail(
@@ -619,8 +832,14 @@ impl Run {
                 );
             }
             madsim::time::sleep(STEP).await;
-        };
-        let others: Vec<u64> = nodes.into_iter().filter(|node| *node != leader).collect();
+        }
+    }
+
+    /// The roles of a split of a drawn group, by who leads it now.
+    async fn roles(&mut self, phase: &str) -> Roles {
+        let group = self.draw_group();
+        let leader = self.wait_leader(group, phase).await;
+        let others: Vec<u64> = (1..=NODES).filter(|node| *node != leader).collect();
         let pick = usize::try_from(self.draws.next_bounded(2)).unwrap_or(0);
         let moved = others.get(pick).copied().unwrap_or(leader);
         let far = others
@@ -636,19 +855,137 @@ impl Run {
         }
     }
 
-    /// Sleeps until `offset` after the next probe of `node_id`'s current
-    /// run, so a volume that moves then leaves its old process `PROBE`
-    /// less `offset` until its next probe fails.
-    async fn after_probe(&mut self, node_id: u64, offset: Duration) {
-        let started = self.cluster.data.wals[&node_id]
-            .started_at()
-            .expect("the node runs");
-        let now = madsim::time::Instant::now();
-        let mut tick = started + PROBE;
-        while tick <= now {
-            tick += PROBE;
+    /// Moves `group`'s leadership to `to` within the bound.
+    async fn lead(&mut self, group: u32, to: u64, phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            let leader = self.wait_leader(group, phase).await;
+            if leader == to {
+                return;
+            }
+            if let Some(replica) = self
+                .cluster
+                .hosted_replicas(leader)
+                .into_iter()
+                .find(|replica| replica.group == group)
+                && let Err(error) = replica.raft.trigger().transfer_leader(to).await
+            {
+                tracing::info!(%error, group, to, "a leadership transfer did not start");
+            }
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!("group {group}'s leadership never moved to node {to}"),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
         }
-        madsim::time::sleep_until(tick + offset).await;
+    }
+
+    /// The node whose meta replica leads, within the bound.
+    async fn wait_meta_leader(&mut self, phase: &str) -> u64 {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            if let Some(leader) = self.cluster.meta_leader() {
+                return leader;
+            }
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    "the meta group has no leader".to_owned(),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
+        }
+    }
+
+    /// The operator releases `node_id`'s root `root` through `via`'s meta
+    /// handle (`ursulactl node replace-disk`), within the bound.
+    async fn release(&mut self, node_id: u64, root: RootId, via: u64, phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            let answer = self
+                .cluster
+                .handle(via)
+                .submit(ControlCommand::ReleaseRoot {
+                    node: NodeId::new(node_id),
+                    root,
+                })
+                .await;
+            match answer {
+                Ok(ControlApplied::RootReleased(_)) => break,
+                Ok(other) => fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!("releasing node {node_id}'s root answered {other:?}"),
+                ),
+                Err(error) if madsim::time::Instant::now() >= deadline => fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!("node {node_id}'s root was not released within the bound: {error}"),
+                ),
+                Err(_retried) => {
+                    madsim::time::sleep(STEP).await;
+                    self.observe(phase);
+                }
+            }
+        }
+        self.step(phase);
+    }
+
+    /// Waits until the view of every node of `viewers` gives `node_id` the
+    /// slot `slot`, within the bound.
+    async fn views_show(&mut self, viewers: &[u64], node_id: u64, slot: RootSlot, phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            let lagging: Vec<u64> = viewers
+                .iter()
+                .copied()
+                .filter(|viewer| self.cluster.slot_in_view(*viewer, node_id) != Some(slot))
+                .collect();
+            if lagging.is_empty() {
+                return;
+            }
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!(
+                        "the views of nodes {lagging:?} do not give node {node_id} the slot \
+                         {slot:?}"
+                    ),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
+        }
+    }
+
+    /// Sleeps until `offset` after the next successful probe of `node_id`'s
+    /// current run, read from its fence, so a volume that moves then leaves
+    /// its old process `PROBE` less `offset` until its next probe fails.
+    async fn after_probe(&mut self, node_id: u64, offset: Duration) {
+        let fence = self.cluster.data.wals[&node_id].raft_wal().fence();
+        let last = fence.last_success_start();
+        let deadline = madsim::time::Instant::now() + PROBE * 3;
+        while fence.last_success_start() == last {
+            assert!(
+                madsim::time::Instant::now() < deadline,
+                "node {node_id}'s disk lease probe did not succeed within {:?}",
+                PROBE * 3
+            );
+            madsim::time::sleep(Duration::from_millis(1)).await;
+        }
+        madsim::time::sleep(offset).await;
     }
 
     /// The split (T2): see the module docs. `crash` restarts the new
@@ -697,26 +1034,9 @@ impl Run {
         let reader = spawn_reader(engine, leader, group, Arc::clone(&reads));
         // The far side elects once the new process waited out its
         // predecessor, and takes writes.
-        let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
-        let mut written_at = None;
-        loop {
-            let now = madsim::time::Instant::now();
-            if written_at.is_some_and(|at| now >= at + READ_ON) || now >= deadline {
-                break;
-            }
-            if let Some(far_leader) = self.leader(group, &[far, moved])
-                && self.append_on(group, far_leader).await
-            {
-                written_at.get_or_insert(now);
-            }
-            madsim::time::sleep(STEP).await;
-            self.observe(PHASE);
-        }
+        self.far_side_writes(group, &[far, moved], PHASE).await;
         reader.abort();
-        let reads = reads
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .clone();
+        let reads = completed(&reads);
         if reads.is_empty() {
             fail(
                 &mut self.trace,
@@ -730,9 +1050,27 @@ impl Run {
         }
         self.fence
             .reads_see_writes(&mut self.trace, PHASE, group, &reads);
-        self.heal(zombie).await;
+        self.heal(vec![zombie]).await;
         self.resume(group, "split_healed").await;
         self.reads_back("split_reads").await;
+    }
+
+    /// Writes to `group` through a leader among `far` until [`READ_ON`]
+    /// after the first write it took, or a predecessor wait and the bound.
+    async fn far_side_writes(&mut self, group: u32, far: &[u64], phase: &str) {
+        let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
+        let mut written_at = None;
+        loop {
+            let now = madsim::time::Instant::now();
+            if written_at.is_some_and(|at| now >= at + READ_ON) || now >= deadline {
+                break;
+            }
+            if self.append_through_leader(group, far).await {
+                written_at.get_or_insert(now);
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
+        }
     }
 
     /// Starts `node_id`'s next process, whose RPCs to `cut_from` are cut.
@@ -742,18 +1080,31 @@ impl Run {
         self.cluster.start_node(node_id).await;
     }
 
-    /// Ends every partition and route, and kills `zombie`.
-    async fn heal(&mut self, zombie: Zombie) {
+    /// Starts `node_id`'s next process on a root the meta group never bound
+    /// it to, which I16's clock clause holds from its binding.
+    async fn start_unbound(&mut self, node_id: u64) {
+        self.cluster.start_node(node_id).await;
+        if let Some(process) = self.cluster.process(node_id) {
+            self.fence.unbound.insert(process);
+        }
+    }
+
+    /// Ends every partition and route, and kills `zombies`.
+    async fn heal(&mut self, zombies: Vec<Zombie>) {
         self.cluster.clear_routes();
         self.cluster.data.policy.clear();
-        zombie.kill().await;
+        for zombie in zombies {
+            drop(zombie.kill().await);
+        }
         self.step("healed");
     }
 
     /// The remount under `never` (T4, D23): a follower's volume moves and
     /// its new process opens `Recovering` beside the old one, whose disk
-    /// lease ends at its next probe. The new process writes no floor and
-    /// opens no gate during its wait (I16), then rejoins.
+    /// lease ends at its next probe. The leader takes writes all along, so
+    /// the old process acks appends from its page cache until its lease
+    /// ends. The new process writes no floor and opens no gate during its
+    /// wait (I16), then rejoins with every acknowledged write (I1).
     async fn remount(&mut self) {
         const PHASE: &str = "remount";
         let Roles {
@@ -773,8 +1124,13 @@ impl Run {
         );
         self.cluster.start_node(moved).await;
         self.step(PHASE);
-        self.watch(PHASE, PREDECESSOR_WAIT / 2).await;
-        self.heal(zombie).await;
+        let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT / 2;
+        while madsim::time::Instant::now() < deadline {
+            self.append_on(group, leader).await;
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        self.heal(vec![zombie]).await;
         self.watch("remount_waited", PREDECESSOR_WAIT).await;
         for group in JOURNAL_GROUPS {
             self.resume(group, "remount_healed").await;
@@ -810,18 +1166,16 @@ impl Run {
             &format!("identity-fence-{}-moved-{moved}", self.seed),
             &[],
         );
-        zombie.kill().await;
+        drop(zombie.kill().await);
         self.cluster.stop_node(leader).await;
         self.cluster.data.policy.clear();
         self.cluster.start_node(moved).await;
         self.step(PHASE);
         let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT / 3;
         while madsim::time::Instant::now() < deadline {
-            if let Some(far_leader) = self.leader(group, &[far, moved]) {
-                // A write the far side takes now replaces what the killed
-                // leader holds.
-                self.append_on(group, far_leader).await;
-            }
+            // A write the far side takes now replaces what the killed
+            // leader holds.
+            self.append_through_leader(group, &[far, moved]).await;
             madsim::time::sleep(STEP).await;
             self.observe(PHASE);
         }
@@ -857,9 +1211,408 @@ impl Run {
         self.reads_back("power_loss_reads").await;
     }
 
-    /// Ends the run, which fails I16 when no step saw a held replica, so
-    /// that every run's I16 judged something.
+    /// The release rule broken, every peer reaching meta (I17): see the
+    /// module docs. `meta` leads the meta group and `group_b`, `leader`
+    /// leads `group_a`, and `replaced` gets a new disk while its old process
+    /// keeps its own. `leader` keeps reaching the old process in `group_a`
+    /// and reaches the new root nowhere, and the new root never reaches
+    /// `leader`, so `leader` learns of the replacement only from its view.
+    async fn release_broken(&mut self) {
+        const PHASE: &str = "release_broken";
+        let meta = self.wait_meta_leader(PHASE).await;
+        let others: Vec<u64> = (1..=NODES).filter(|node| *node != meta).collect();
+        let pick = usize::try_from(self.draws.next_bounded(2)).unwrap_or(0);
+        let leader = others.get(pick).copied().unwrap_or(meta);
+        let replaced = others
+            .iter()
+            .copied()
+            .find(|node| *node != leader)
+            .unwrap_or(meta);
+        let group_a = self.draw_group();
+        let group_b = JOURNAL_GROUPS
+            .iter()
+            .copied()
+            .find(|group| *group != group_a)
+            .unwrap_or(group_a);
+        self.trace.push(SimEvent::FaultApplied {
+            phase: format!(
+                "{PHASE}: meta {meta}, leader {leader} of {group_a}, replaced {replaced}, {group_b} \
+                 led by meta"
+            ),
+        });
+        self.lead(group_a, leader, PHASE).await;
+        self.lead(group_b, meta, PHASE).await;
+        let leader_process = self.cluster.process(leader).expect("the leader runs");
+        // The leader's group_a RPCs to the replaced node keep reaching its old
+        // process, and its other RPCs there reach no process of it.
+        self.cluster
+            .pin_group_route(group_a, leader_process, replaced);
+        self.cluster
+            .cut_group_route(group_b, leader_process, replaced);
+        self.cluster.cut_meta_route(leader_process, replaced);
+        let zombie = self.cluster.replace_disk(
+            replaced,
+            &format!("identity-fence-{}-replaced-{replaced}", self.seed),
+        );
+        let old_root = zombie.fence_root();
+        // The old process reaches no one, so it never learns of the release.
+        for peer in [leader, meta] {
+            self.cluster.cut_route(zombie.process, peer);
+        }
+        // The new root never reaches the leader, so the leader never hears
+        // of it but through its view.
+        let new_process = self.cluster.next_process().expect("a fenced cluster");
+        self.cluster.cut_route(new_process, leader);
+        self.step(PHASE);
+        self.release(replaced, old_root, meta, PHASE).await;
+        self.cluster.start_node(replaced).await;
+        self.step(PHASE);
+        // The new root binds, waits out its predecessor and joins group_b
+        // through the meta node, which counts its promises. The leader keeps
+        // writing to group_a all along, its RPCs to the replaced node
+        // reaching the old process.
+        let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
+        loop {
+            self.append_on(group_a, leader).await;
+            self.append_through_leader(group_b, &[meta, replaced]).await;
+            if self.fence.promised(&self.cluster, new_process) {
+                break;
+            }
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    I17,
+                    PHASE,
+                    format!(
+                        "node {replaced}'s new process {new_process} made no promise within the \
+                         bound, so I17 judged nothing"
+                    ),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        let deadline = madsim::time::Instant::now() + READ_ON;
+        while madsim::time::Instant::now() < deadline {
+            self.append_on(group_a, leader).await;
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        answers_after_promises(&self.cluster, &mut self.trace, PHASE);
+        self.heal(vec![zombie]).await;
+        for group in JOURNAL_GROUPS {
+            self.resume(group, "release_broken_healed").await;
+        }
+        self.reads_back("release_broken_reads").await;
+    }
+
+    /// Waits until `stranger`'s registration is refused for the slot of
+    /// its node's running process, within the bound, checking that the
+    /// running process is never refused.
+    async fn refused(&mut self, stranger: &Zombie, node_id: u64, phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        while !matches!(
+            stranger.registration(),
+            RegistrationStatus::RootRefused { .. }
+        ) {
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    REFUSED,
+                    phase,
+                    format!(
+                        "node {node_id}'s new disk was not refused within the bound: {:?}",
+                        stranger.registration()
+                    ),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
+            self.healthy(phase);
+        }
+    }
+
+    /// The healthy processes are never refused: every running node's
+    /// registration stands answered and its fence admits.
+    fn healthy(&mut self, phase: &str) {
+        for node_id in self.cluster.running() {
+            let registration = self.cluster.runtimes[&node_id]
+                .status_reader()
+                .placement_status()
+                .registration;
+            let status = self.cluster.data.wals[&node_id]
+                .raft_wal()
+                .fence()
+                .status(ursula_runtime::node_fence::fence_now());
+            let refused = matches!(
+                registration,
+                RegistrationStatus::RootRefused { .. } | RegistrationStatus::Refused(_)
+            );
+            if refused || status == FenceStatus::Superseded {
+                fail(
+                    &mut self.trace,
+                    REFUSED,
+                    phase,
+                    format!(
+                        "node {node_id}'s running process was refused beside a new disk under \
+                         its id: {registration:?}, fence {status:?}"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// A refused root's meta replica holds no vote floor
+    /// (`fence_holds_barrier`): it takes no meta floor before meta answered
+    /// its registration, and none while refused.
+    fn no_meta_floor(&mut self, stranger: &Zombie, node_id: u64, phase: &str) {
+        let floor = stranger
+            .registry()
+            .meta()
+            .and_then(|meta| meta.recovery_gate().map(|gate| gate.holds_vote_floor()));
+        if floor == Some(true) {
+            fail(
+                &mut self.trace,
+                REFUSED,
+                phase,
+                format!(
+                    "node {node_id}'s new disk took a meta vote floor while its registration was \
+                     {:?}",
+                    stranger.registration()
+                ),
+            );
+        }
+    }
+
+    /// A new disk (D1, D15, N23): see the module docs. The old process's
+    /// disk detaches only once the new root was refused for longer than a
+    /// predecessor wait, the operator releases the old root at once, and
+    /// the new root takes part only a predecessor wait after its binding
+    /// (I16).
+    async fn new_disk(&mut self) {
+        const PHASE: &str = "new_disk";
+        let Roles {
+            group,
+            leader,
+            moved,
+            ..
+        } = self.roles(PHASE).await;
+        if !self.append_on(group, leader).await {
+            self.resume(group, PHASE).await;
+        }
+        let stranger = self
+            .cluster
+            .start_stranger(moved, &format!("identity-fence-{}-new-{moved}", self.seed))
+            .await;
+        self.fence.unbound.insert(stranger.process);
+        self.refused(&stranger, moved, PHASE).await;
+        let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + PROBE;
+        while madsim::time::Instant::now() < deadline {
+            self.append_on(group, leader).await;
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+            self.healthy(PHASE);
+        }
+        let leader_process = self.cluster.process(leader).expect("the leader runs");
+        let zombie = self.cluster.move_volume(
+            moved,
+            &format!("identity-fence-{}-moved-{moved}", self.seed),
+            &[leader_process],
+        );
+        let old_root = zombie.fence_root();
+        // Reachable from now on, and still refused until the release.
+        self.cluster.promote(moved, stranger);
+        self.step(PHASE);
+        self.release(moved, old_root, leader, PHASE).await;
+        self.watch(PHASE, PREDECESSOR_WAIT + PROBE).await;
+        self.heal(vec![zombie]).await;
+        for group in JOURNAL_GROUPS {
+            self.resume(group, "new_disk_healed").await;
+        }
+        self.reads_back("new_disk_reads").await;
+    }
+
+    /// Replacements, with meta writes throughout: see the module docs.
+    async fn replacements(&mut self) {
+        const PHASE: &str = "replacements";
+        self.meta_checked = true;
+        let replaced = self.wait_meta_leader(PHASE).await;
+        let others: Vec<u64> = (1..=NODES).filter(|node| *node != replaced).collect();
+        self.meta.write_limits(&self.cluster, &others, 2).await;
+        self.step(PHASE);
+        // An empty disk under a live id, which leads meta: refused, and
+        // refused again after a restart, while the node's process is never
+        // refused.
+        let stranger = self
+            .cluster
+            .start_stranger(
+                replaced,
+                &format!("identity-fence-{}-new-{replaced}", self.seed),
+            )
+            .await;
+        self.refused(&stranger, replaced, PHASE).await;
+        self.no_meta_floor(&stranger, replaced, PHASE);
+        let disk = stranger.kill().await;
+        let stranger = self.cluster.start_stranger_on(replaced, disk).await;
+        self.refused(&stranger, replaced, PHASE).await;
+        let deadline = madsim::time::Instant::now() + BOUND / 4;
+        while madsim::time::Instant::now() < deadline {
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+            self.healthy(PHASE);
+            self.no_meta_floor(&stranger, replaced, PHASE);
+        }
+        // The meta leader's disk detaches while it leads, meta elects
+        // another leader and takes writes, and the operator releases the
+        // old root.
+        let zombie = self.cluster.move_volume(
+            replaced,
+            &format!("identity-fence-{}-moved-{replaced}", self.seed),
+            &[],
+        );
+        let old_root = zombie.fence_root();
+        let old_disk = self.cluster.data.wals[&replaced].clone();
+        self.meta.write_limits(&self.cluster, &others, 2).await;
+        self.fence.unbound.insert(stranger.process);
+        self.cluster.promote(replaced, stranger);
+        self.step(PHASE);
+        let via = others.first().copied().unwrap_or(replaced);
+        self.release(replaced, old_root, via, PHASE).await;
+        for group in JOURNAL_GROUPS {
+            self.resume(group, PHASE).await;
+        }
+        self.meta.write_limits(&self.cluster, &others, 2).await;
+        drop(zombie.kill().await);
+        // The released disk swapped back in: its root holds state, so the
+        // release fences it, and the other nodes are never refused.
+        self.cluster.stop_node(replaced).await;
+        let new_disk = self.cluster.data.wals[&replaced].clone();
+        self.cluster.data.wals.insert(replaced, old_disk);
+        self.cluster.start_node(replaced).await;
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            let status = self.cluster.data.wals[&replaced]
+                .raft_wal()
+                .fence()
+                .status(ursula_runtime::node_fence::fence_now());
+            if status == FenceStatus::Superseded {
+                break;
+            }
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    REFUSED,
+                    PHASE,
+                    format!(
+                        "node {replaced}'s released disk, swapped back in, did not fence itself: \
+                         {status:?}"
+                    ),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        let swapped = self.cluster.retire(replaced);
+        drop(swapped.kill().await);
+        for node_id in &others {
+            let registration = self.cluster.runtimes[node_id]
+                .status_reader()
+                .placement_status()
+                .registration;
+            if !matches!(registration, RegistrationStatus::Answered(_)) {
+                fail(
+                    &mut self.trace,
+                    REFUSED,
+                    PHASE,
+                    format!("node {node_id} was refused beside the swapped disk: {registration:?}"),
+                );
+            }
+        }
+        self.cluster.data.wals.insert(replaced, new_disk);
+        self.cluster.start_node(replaced).await;
+        self.step("replacements_restored");
+        for group in JOURNAL_GROUPS {
+            self.resume(group, "replacements_restored").await;
+        }
+        let nodes: Vec<u64> = (1..=NODES).collect();
+        self.meta
+            .acknowledged_writes_survive(
+                &self.cluster,
+                &mut self.trace,
+                "replacements_restored",
+                &nodes,
+            )
+            .await;
+        self.reads_back("replacements_reads").await;
+    }
+
+    /// A crash between meta's answer and its record (S7(d2)): see the
+    /// module docs. The first run's binding is never recorded, so its next
+    /// run is unbound again, is answered again and waits from that answer
+    /// (I16).
+    async fn registration_crash(&mut self) {
+        const PHASE: &str = "registration_crash";
+        let Roles {
+            group,
+            leader,
+            moved,
+            far,
+        } = self.roles(PHASE).await;
+        if !self.append_on(group, leader).await {
+            self.resume(group, PHASE).await;
+        }
+        let zombie = self.cluster.move_volume(
+            moved,
+            &format!("identity-fence-{}-moved-{moved}", self.seed),
+            &[],
+        );
+        let old_root = zombie.fence_root();
+        drop(zombie.kill().await);
+        self.release(moved, old_root, leader, PHASE).await;
+        self.cluster
+            .new_fenced_disk(moved, &format!("identity-fence-{}-new-{moved}", self.seed));
+        self.cluster
+            .pause_next_start(MetaPausePoint::RegistrationAnswered);
+        self.start_unbound(moved).await;
+        let new_root = self.cluster.data.wals[&moved].raft_wal().incarnation().root;
+        self.step(PHASE);
+        // Meta bound the new root, and the process stopped before it
+        // recorded the binding: its data stays held.
+        self.views_show(&[leader, far], moved, RootSlot::Bound(new_root), PHASE)
+            .await;
+        self.watch(PHASE, STEP * 10).await;
+        let registration = self.cluster.runtimes[&moved]
+            .status_reader()
+            .placement_status()
+            .registration;
+        let fence = self.cluster.data.wals[&moved].raft_wal().fence();
+        if matches!(registration, RegistrationStatus::Answered(_)) || !fence.awaits_binding() {
+            fail(
+                &mut self.trace,
+                I16,
+                PHASE,
+                format!(
+                    "node {moved}'s new root was released before it recorded its binding: \
+                     {registration:?}, awaits binding {}",
+                    fence.awaits_binding()
+                ),
+            );
+        }
+        self.cluster.stop_node(moved).await;
+        self.start_unbound(moved).await;
+        self.step("registration_crash_restarted");
+        self.watch("registration_crash_restarted", PREDECESSOR_WAIT + PROBE)
+            .await;
+        for group in JOURNAL_GROUPS {
+            self.resume(group, "registration_crash_restarted").await;
+        }
+        self.reads_back("registration_crash_reads").await;
+    }
+
+    /// Ends the run: I17 over the whole run, and I16 fails when no step
+    /// saw a held replica, so that every run's I16 judged something.
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
+        answers_after_promises(&self.cluster, &mut self.trace, "finished");
         if self.fence.held_observations == 0 {
             fail(
                 &mut self.trace,
@@ -914,39 +1667,41 @@ pub(super) async fn run_identity_fence_inner(
             run.lost_acknowledgements().await;
             run.finish()
         }
+        Controls::ResponderBinding { .. } => {
+            let mut run = Run::start(seed, WalFsync::Always).await;
+            run.release_broken().await;
+            run.finish()
+        }
+        Controls::WaitFromBinding { .. } => {
+            let mut run = Run::start(seed, WalFsync::Always).await;
+            run.new_disk().await;
+            run.finish()
+        }
     }
 }
 
+/// The family run of `seed`: one script per seed of the family's ten.
 async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
     let mut draws = SplitMix64::new(seed ^ SALT ^ 1);
     let offset = Duration::from_millis(draws.next_bounded(1000));
-    match seed % 5 {
-        0 => {
-            let mut run = Run::start(seed, WalFsync::Always).await;
-            run.split(offset, false).await;
-            run.finish()
-        }
-        1 => {
-            let mut run = Run::start(seed, WalFsync::Always).await;
-            run.split(offset, true).await;
-            run.finish()
-        }
-        2 => {
-            let mut run = Run::start(seed, WalFsync::Never).await;
-            run.remount().await;
-            run.finish()
-        }
-        3 => {
-            let mut run = Run::start(seed, WalFsync::Never).await;
-            run.lost_acknowledgements().await;
-            run.finish()
-        }
-        _ => {
-            let mut run = Run::start(seed, WalFsync::Always).await;
-            run.power_loss().await;
-            run.finish()
-        }
+    let fsync = match seed % 10 {
+        2 | 3 => WalFsync::Never,
+        _ => WalFsync::Always,
+    };
+    let mut run = Run::start(seed, fsync).await;
+    match seed % 10 {
+        0 => run.split(offset, false).await,
+        1 => run.split(offset, true).await,
+        2 => run.remount().await,
+        3 => run.lost_acknowledgements().await,
+        4 => run.power_loss().await,
+        5 => run.release_broken().await,
+        6 => run.new_disk().await,
+        7 => run.replacements().await,
+        8 => run.registration_crash().await,
+        _ => run.split(offset, false).await,
     }
+    run.finish()
 }
 
 #[cfg(test)]
@@ -954,6 +1709,7 @@ mod tests {
     use super::Controls;
     use super::I1;
     use super::I16;
+    use super::I17;
     use super::I18;
     use crate::madsim_harness::SimEvent;
     use crate::madsim_harness::SimReport;
@@ -1097,7 +1853,7 @@ mod tests {
             I16,
             "remount",
         );
-        assert!(message.contains("while its fence held it out"), "{message}");
+        assert!(message.contains("while held"), "{message}");
     }
 
     /// A moved volume read as a process crash under `never` votes with
@@ -1113,5 +1869,36 @@ mod tests {
             "lost_acknowledgements_reads",
         );
         assert!(message.contains("acknowledged"), "{message}");
+    }
+
+    /// A leader that counts answers unchecked keeps counting the old
+    /// process of a replaced node after the new root made promises (N10).
+    #[test]
+    fn negative_control_responder_binding() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ResponderBinding { defended: true },
+            Controls::ResponderBinding { defended: false },
+            I17,
+            "release_broken",
+        );
+        assert!(message.contains("made a promise"), "{message}");
+    }
+
+    /// A new disk refused for longer than a wait, whose wait runs from the
+    /// start of its run, takes part at once when it binds (N23).
+    #[test]
+    fn negative_control_wait_from_binding() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::WaitFromBinding { defended: true },
+            Controls::WaitFromBinding { defended: false },
+            I16,
+            "new_disk",
+        );
+        assert!(
+            message.contains("within the wait after its binding"),
+            "{message}"
+        );
     }
 }

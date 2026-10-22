@@ -272,8 +272,11 @@ impl RecoveryGate {
     /// Each driver starts once the fence no longer holds the replica out
     /// ([`crate::predecessor_wait::fence_holds`]): no predecessor wait is
     /// owed and, for a data replica of an unbound root, the meta group bound
-    /// the root. So a barrier round, a vote floor and an initialization all
-    /// come after the predecessor stopped.
+    /// the root. The barrier driver of a meta replica also waits for that
+    /// binding ([`crate::predecessor_wait::fence_holds_barrier`]), while its
+    /// genesis floor and bootstrap drivers do not, so a forming cluster's
+    /// meta group still forms. So a barrier round, a vote floor and an
+    /// initialization all come after the predecessor stopped.
     pub(crate) fn spawn_gate_drivers<SM, T>(
         &self,
         raft: openraft::Raft<crate::UrsulaRaftTypeConfig, SM>,
@@ -308,7 +311,7 @@ impl RecoveryGate {
         );
         let waited = fence.clone();
         self.push(crate::rt::spawn(async move {
-            crate::predecessor_wait::barrier_released(&waited, target).await;
+            crate::predecessor_wait::barrier_released(&waited).await;
             barrier.await;
         }));
         if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {

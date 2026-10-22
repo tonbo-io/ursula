@@ -156,16 +156,221 @@ pub enum InProcessBarrierError {
     /// Its answer failed the check every seam runs.
     #[error(transparent)]
     Answer(#[from] crate::BarrierAnswerRefusal),
+    /// The ask did not reach the leader's handler, or its answer was lost.
+    #[error(transparent)]
+    Lost(#[from] InProcessCallLost),
 }
 
-/// Classified as the same failure over gRPC is.
+/// Classified as the same failure over gRPC is: a call the process fence
+/// lost, or one that reached nobody, is unreachable
+/// (`RecoveryProbeError::OtherIncarnation` over gRPC).
 impl From<InProcessBarrierError> for crate::meta::confirm::BarrierFailure {
     fn from(error: InProcessBarrierError) -> Self {
         match error {
             InProcessBarrierError::Refused(error) => error.into(),
             InProcessBarrierError::Answer(refusal) => refusal.failure(),
+            InProcessBarrierError::Lost(_) => Self::Unreachable,
         }
     }
+}
+
+/// How the process fence lost an in-process call, as the gRPC plane loses
+/// it.
+#[derive(Debug, thiserror::Error)]
+pub enum FenceLoss {
+    /// The sending process is fenced: nothing was sent.
+    #[error("its sender is fenced")]
+    SenderFenced,
+    /// The receiving process refused the request, or is fenced and sends
+    /// no answer.
+    #[error(transparent)]
+    Refused(crate::PeerClusterError),
+    /// The sender discarded the answer unread.
+    #[error("its answer was discarded: {0}")]
+    Discarded(crate::incarnation::Discarded),
+}
+
+/// Why an in-process recovery call (a barrier, a probe, a forwarded control
+/// command) got no answer.
+#[derive(Debug, thiserror::Error)]
+pub enum InProcessCallLost {
+    /// The target node registered nothing to answer it.
+    #[error("node {node} is not registered")]
+    NotRegistered { node: u64 },
+    /// The caller's route to the target node is cut.
+    #[error("the route to node {node} is cut")]
+    Cut { node: u64 },
+    /// The process fence lost the request or its answer.
+    #[error("node {node}: {loss}")]
+    Fence { node: u64, loss: FenceLoss },
+}
+
+/// The process an in-process recovery call comes from: its node and, for a
+/// node that runs behind the process fence, the simulation's tag for the
+/// process and its peer cluster. A call of such a process carries the
+/// process's fence and incarnation, follows the routes the simulation set
+/// for it ([`InProcessRegistry::pin_route`]), meets the target process's
+/// fence and judges the answer's stamp, as the gRPC recovery transport
+/// does. A call without a process reaches the process the target node
+/// registered last and checks nothing.
+#[derive(Clone)]
+pub struct InProcessCaller {
+    node: u64,
+    process: Option<(u64, crate::PeerCluster)>,
+    policy: Option<InProcessRaftNetworkPolicy>,
+}
+
+impl Debug for InProcessCaller {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InProcessCaller")
+            .field("node", &self.node)
+            .field(
+                "process",
+                &self.process.as_ref().map(|(process, _)| *process),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl InProcessCaller {
+    /// A call from `node`, as the process it registered last.
+    pub fn node(node: u64) -> Self {
+        Self {
+            node,
+            process: None,
+            policy: None,
+        }
+    }
+
+    /// A call from `node`'s process tagged `process`, whose peer cluster is
+    /// `cluster`.
+    pub fn process(node: u64, process: u64, cluster: crate::PeerCluster) -> Self {
+        Self {
+            node,
+            process: Some((process, cluster)),
+            policy: None,
+        }
+    }
+
+    /// Reports each answer the caller accepts to `policy`'s observer
+    /// ([`InProcessRaftNetworkEvent::AnswerAccepted`]).
+    pub fn with_policy(mut self, policy: InProcessRaftNetworkPolicy) -> Self {
+        self.policy = Some(policy);
+        self
+    }
+
+    /// The caller's node.
+    pub fn node_id(&self) -> u64 {
+        self.node
+    }
+
+    fn sender(&self) -> Option<&crate::PeerCluster> {
+        self.process.as_ref().map(|(_, cluster)| cluster)
+    }
+
+    /// The request's fence, sent to node `target`'s process `receiver` as
+    /// a call of kind `rpc` ([`fence_request`]).
+    fn request(
+        &self,
+        target: u64,
+        receiver: &crate::PeerCluster,
+        rpc: crate::incarnation::Rpc,
+    ) -> Result<(), InProcessCallLost> {
+        if self.process.is_none() {
+            return Ok(());
+        }
+        fence_request(Some(self.node), self.sender(), target, Some(receiver), rpc)
+            .map_err(|loss| InProcessCallLost::Fence { node: target, loss })
+    }
+
+    /// The answer's fence, from node `target`'s process `receiver`
+    /// ([`fence_answer`]): reported to the policy's observer when accepted.
+    fn answer(&self, target: u64, receiver: &crate::PeerCluster) -> Result<(), InProcessCallLost> {
+        if self.process.is_none() {
+            return Ok(());
+        }
+        let responder = fence_answer(self.sender(), target, Some(receiver))
+            .map_err(|loss| InProcessCallLost::Fence { node: target, loss })?;
+        if let (Some(policy), Some(responder)) = (&self.policy, responder) {
+            policy.notify(InProcessRaftNetworkEvent::AnswerAccepted {
+                source: Some(self.node),
+                target,
+                responder,
+                promise: false,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// The process fence of a request from node `source`, sent by the process
+/// whose peer cluster is `sender`, to node `target`'s process `receiver`,
+/// as the gRPC plane runs it: the sender's fence before it sends, then the
+/// target's check of the sender and target processes the request names
+/// ([`crate::PeerCluster::receive`]). A refusal from the process the sender
+/// accepts takes its effect on the sender.
+fn fence_request(
+    source: Option<u64>,
+    sender: Option<&crate::PeerCluster>,
+    target: u64,
+    receiver: Option<&crate::PeerCluster>,
+    rpc: crate::incarnation::Rpc,
+) -> Result<(), FenceLoss> {
+    if let Some(sender) = sender {
+        crate::peer_cluster::check_sender_fence(&sender.fence())
+            .map_err(|_fenced| FenceLoss::SenderFenced)?;
+    }
+    let Some(receiver) = receiver else {
+        return Ok(());
+    };
+    let admitted = source
+        .zip(sender)
+        .map(|(node, sender)| crate::peer_cluster::AdmittedPeer {
+            node,
+            sender: sender
+                .identity()
+                .and_then(|identity| identity.incarnation()),
+            target: sender.target_incarnation(target),
+        });
+    let Err(refused) = receiver.receive(admitted.as_ref(), rpc) else {
+        return Ok(());
+    };
+    if let (Some(sender), crate::PeerClusterError::Fence { refusal, .. }) = (sender, &refused)
+        && sender.accept_responder(target, receiver.stamp()).is_ok()
+    {
+        sender.observe_fence_refusal(target, *refusal);
+    }
+    Err(FenceLoss::Refused(refused))
+}
+
+/// The process fence of an answer from node `target`'s process `receiver`
+/// to the process whose peer cluster is `sender`: the receiver's fence
+/// before the answer leaves, then the sender's reading of its stamp at the
+/// arrival ([`crate::PeerCluster::accept_responder`]). Answers the
+/// responder's incarnation when the sender, a process with an incarnation
+/// of its own, accepted a stamp naming one.
+fn fence_answer(
+    sender: Option<&crate::PeerCluster>,
+    target: u64,
+    receiver: Option<&crate::PeerCluster>,
+) -> Result<Option<ursula_proto::placement::ProcessIncarnation>, FenceLoss> {
+    if let Some(receiver) = receiver {
+        receiver
+            .check_receiver_fence()
+            .map_err(FenceLoss::Refused)?;
+    }
+    let Some(sender) = sender else {
+        return Ok(None);
+    };
+    let stamp = receiver.map(crate::PeerCluster::stamp).unwrap_or_default();
+    sender
+        .accept_responder(target, stamp)
+        .map_err(FenceLoss::Discarded)?;
+    let judged = sender
+        .identity()
+        .and_then(|identity| identity.incarnation())
+        .is_some();
+    Ok(stamp.incarnation.filter(|_| judged))
 }
 
 /// The in-process registry of one plane's replicas, by node id.
@@ -341,6 +546,27 @@ impl<SM: InProcessEndpoint> InProcessRegistry<SM> {
             .cloned()
     }
 
+    /// The process of node `target` a recovery call of `caller` reaches:
+    /// the one its process's route pins, else the one the node registered
+    /// last.
+    fn reached(
+        &self,
+        caller: &InProcessCaller,
+        target: u64,
+    ) -> Result<SM::Endpoint, InProcessCallLost> {
+        let route = caller
+            .process
+            .as_ref()
+            .and_then(|(process, _)| self.route(*process, target));
+        match route {
+            Some(Route::To { endpoint, .. }) => Ok(endpoint),
+            Some(Route::Cut) => Err(InProcessCallLost::Cut { node: target }),
+            None => self
+                .endpoint(target)
+                .ok_or(InProcessCallLost::NotRegistered { node: target }),
+        }
+    }
+
     fn record_full_snapshot(&self, node_id: u64) {
         let mut calls = self
             .full_snapshot_calls
@@ -408,53 +634,78 @@ impl InProcessRegistry<RaftGroupStateMachine> {
         let (_, endpoint) = self
             .endpoint(node_id)
             .ok_or(crate::QuorumProofError::NotRegistered { group })?;
-        match target {
-            crate::RaftTarget::Data(group) => endpoint.confirm_recovery_barrier(group).await,
-            crate::RaftTarget::Meta => match endpoint.meta() {
-                Some(meta) => meta.confirm_recovery_barrier().await,
-                None => Err(crate::QuorumProofError::NotRegistered { group }),
-            },
-        }
+        confirm_barrier_on(&endpoint, target).await
     }
 
-    /// The barrier `leader` answers about `target` on the in-process seam:
-    /// the RPC's server side ([`Self::confirm_recovery_barrier`]), which
-    /// answers about the target it served, then the check every seam runs
+    /// The barrier `leader` answers `caller` about `target` on the
+    /// in-process seam: the request's fence, the RPC's server side
+    /// ([`Self::confirm_recovery_barrier`]) on the process `caller`
+    /// reaches, the answer's fence, then the check every seam runs
     /// ([`crate::BarrierAnswer::accept`]).
     pub async fn barrier(
         &self,
+        caller: &InProcessCaller,
         leader: u64,
         target: crate::RaftTarget,
     ) -> Result<crate::BarrierAnswer, InProcessBarrierError> {
-        let answer = self.confirm_recovery_barrier(leader, target).await?;
+        let (_, endpoint) = self.reached(caller, leader)?;
+        let receiver = endpoint.peer_cluster();
+        caller.request(leader, receiver, crate::incarnation::Rpc::Raft)?;
+        let answer = confirm_barrier_on(&endpoint, target).await?;
+        caller.answer(leader, receiver)?;
         Ok(answer.accept(leader, target, target.into())?)
     }
 
-    /// The genesis probe RPC on `node_id`, through the node's production
-    /// registry ([`genesis_probe_in_process`]).
+    /// The genesis probe RPC of `caller` on `node_id`, through the
+    /// production registry of the process it reaches
+    /// ([`genesis_probe_in_process`]), fenced as the barrier is. A lost
+    /// call is no answer.
     pub async fn genesis_probe(
         &self,
+        caller: &InProcessCaller,
         node_id: u64,
         probe: crate::meta::genesis::GenesisProbe,
     ) -> Option<crate::PeerGroupLog> {
-        let (_, endpoint) = self.endpoint(node_id)?;
-        genesis_probe_in_process(&endpoint, probe).await
+        let (_, endpoint) = self.reached(caller, node_id).ok()?;
+        genesis_probe_fenced(caller, node_id, &endpoint, probe).await
     }
 
-    /// A control command `sender` forwards to the meta leader `node_id`,
-    /// through the node's production registry
-    /// ([`forward_control_in_process`]). A node that is not registered is a
+    /// The bootstrap probe vote of `caller` on `node_id`, screened by the
+    /// gate of the replica it reaches and fenced as the barrier is. A lost
+    /// call is no answer.
+    pub async fn probe(
+        &self,
+        caller: &InProcessCaller,
+        node_id: u64,
+    ) -> Option<crate::PeerGroupLog> {
+        let (group, endpoint) = self.reached(caller, node_id).ok()?;
+        let receiver = endpoint.peer_cluster();
+        caller
+            .request(node_id, receiver, crate::incarnation::Rpc::Raft)
+            .ok()?;
+        let response = endpoint
+            .vote(group, crate::bootstrap_probe_vote())
+            .await
+            .ok()?;
+        caller.answer(node_id, receiver).ok()?;
+        Some(crate::PeerGroupLog::from_vote_response(&response))
+    }
+
+    /// A control command `caller` forwards to the meta leader `node_id`,
+    /// through the production registry of the process it reaches
+    /// ([`forward_control_in_process`]), fenced as a forwarded `GroupWrite`
+    /// is ([`forward_control_fenced`]). A node that is not registered is a
     /// leader that cannot be reached.
     pub async fn write_meta(
         &self,
+        caller: &InProcessCaller,
         node_id: u64,
         command: ursula_control::ControlCommand,
-        sender: ursula_proto::placement::NodeId,
     ) -> Result<ursula_control::ControlResponse, crate::meta::MetaForwardError> {
-        let Some((_, endpoint)) = self.endpoint(node_id) else {
+        let Ok((_, endpoint)) = self.reached(caller, node_id) else {
             return Err(crate::meta::MetaForwardError::leader_unreachable());
         };
-        forward_control_in_process(&endpoint, node_id, command, sender).await
+        forward_control_fenced(caller, node_id, &endpoint, command).await
     }
 
     /// The `accept-unsynced-loss` admin route on `node_id`, through the
@@ -604,24 +855,35 @@ impl InProcessRegistry<crate::meta::MetaStateMachine> {
             .insert(node_id, registry.clone());
     }
 
-    /// The genesis probe RPC on `node_id` ([`genesis_probe_in_process`]).
+    /// The genesis probe RPC of `caller` on `node_id`
+    /// ([`genesis_probe_in_process`]), fenced as the barrier is.
     pub async fn genesis_probe(
         &self,
+        caller: &InProcessCaller,
         node_id: u64,
         probe: crate::meta::genesis::GenesisProbe,
     ) -> Option<crate::PeerGroupLog> {
-        let endpoint = self.endpoint(node_id)?;
-        genesis_probe_in_process(&endpoint, probe).await
+        let endpoint = self.reached(caller, node_id).ok()?;
+        genesis_probe_fenced(caller, node_id, &endpoint, probe).await
     }
 
-    /// The bootstrap probe vote on `node_id`'s meta replica, screened by its
-    /// gate: no answer from a node that runs none.
-    pub async fn probe(&self, node_id: u64) -> Option<crate::PeerGroupLog> {
-        let meta = self.endpoint(node_id)?.meta()?;
-        meta.vote(crate::bootstrap_probe_vote())
-            .await
-            .ok()
-            .map(|response| crate::PeerGroupLog::from_vote_response(&response))
+    /// The bootstrap probe vote of `caller` on `node_id`'s meta replica,
+    /// screened by its gate and fenced as the barrier is: no answer from a
+    /// node that runs none.
+    pub async fn probe(
+        &self,
+        caller: &InProcessCaller,
+        node_id: u64,
+    ) -> Option<crate::PeerGroupLog> {
+        let endpoint = self.reached(caller, node_id).ok()?;
+        let meta = endpoint.meta()?;
+        let receiver = endpoint.peer_cluster();
+        caller
+            .request(node_id, receiver, crate::incarnation::Rpc::Raft)
+            .ok()?;
+        let response = meta.vote(crate::bootstrap_probe_vote()).await.ok()?;
+        caller.answer(node_id, receiver).ok()?;
+        Some(crate::PeerGroupLog::from_vote_response(&response))
     }
 
     /// The meta barrier RPC's server side on `node_id`: a node that runs no
@@ -640,30 +902,143 @@ impl InProcessRegistry<crate::meta::MetaStateMachine> {
         meta.confirm_recovery_barrier().await
     }
 
-    /// The meta barrier `leader` answers on the in-process seam, checked as
-    /// a data barrier is ([`InProcessRaftRegistry::barrier`]).
+    /// The meta barrier `leader` answers `caller` on the in-process seam,
+    /// fenced and checked as a data barrier is
+    /// ([`InProcessRaftRegistry::barrier`]).
     pub async fn barrier(
         &self,
+        caller: &InProcessCaller,
         leader: u64,
     ) -> Result<crate::BarrierAnswer, InProcessBarrierError> {
-        let answer = self.confirm_recovery_barrier(leader).await?;
+        let endpoint = self.reached(caller, leader)?;
+        let receiver = endpoint.peer_cluster();
+        caller.request(leader, receiver, crate::incarnation::Rpc::Raft)?;
         let target = crate::RaftTarget::Meta;
+        let answer = confirm_barrier_on(&endpoint, target).await?;
+        caller.answer(leader, receiver)?;
         Ok(answer.accept(leader, target, target.into())?)
     }
 
-    /// A control command `sender` forwards to the meta leader `node_id`
-    /// ([`forward_control_in_process`]). A node that is not registered is a
+    /// A control command `caller` forwards to the meta leader `node_id`
+    /// ([`forward_control_fenced`]). A node that is not registered is a
     /// leader that cannot be reached.
     pub async fn write_meta(
         &self,
+        caller: &InProcessCaller,
         node_id: u64,
         command: ursula_control::ControlCommand,
-        sender: ursula_proto::placement::NodeId,
     ) -> Result<ursula_control::ControlResponse, crate::meta::MetaForwardError> {
-        let Some(endpoint) = self.endpoint(node_id) else {
+        let Ok(endpoint) = self.reached(caller, node_id) else {
             return Err(crate::meta::MetaForwardError::leader_unreachable());
         };
-        forward_control_in_process(&endpoint, node_id, command, sender).await
+        forward_control_fenced(caller, node_id, &endpoint, command).await
+    }
+}
+
+/// The barrier RPC's server side on the node whose production registry is
+/// `registry`, for `target`: a leader whose history is pending confirms
+/// none, and a node that runs no meta replica confirms no meta barrier.
+async fn confirm_barrier_on(
+    registry: &crate::RaftGroupHandleRegistry,
+    target: crate::RaftTarget,
+) -> Result<crate::BarrierAnswer, crate::QuorumProofError> {
+    match target {
+        crate::RaftTarget::Data(group) => registry.confirm_recovery_barrier(group).await,
+        crate::RaftTarget::Meta => match registry.meta() {
+            Some(meta) => meta.confirm_recovery_barrier().await,
+            None => Err(crate::QuorumProofError::NotRegistered {
+                group: crate::meta::state_machine::META_GROUP,
+            }),
+        },
+    }
+}
+
+/// The genesis probe of `caller` on node `node_id`, whose reached process's
+/// registry is `registry`: the request's fence (a Raft RPC), the answer
+/// ([`genesis_probe_in_process`]), then the answer's fence. A lost call is
+/// no answer, as over gRPC.
+async fn genesis_probe_fenced(
+    caller: &InProcessCaller,
+    node_id: u64,
+    registry: &crate::RaftGroupHandleRegistry,
+    probe: crate::meta::genesis::GenesisProbe,
+) -> Option<crate::PeerGroupLog> {
+    let receiver = registry.peer_cluster();
+    caller
+        .request(node_id, receiver, crate::incarnation::Rpc::Raft)
+        .ok()?;
+    let answer = genesis_probe_in_process(registry, probe).await;
+    caller.answer(node_id, receiver).ok()?;
+    answer
+}
+
+/// A control command `caller` forwards to the meta leader `leader`, whose
+/// reached process's registry is `registry`, fenced as the gRPC sender
+/// fences a forwarded `GroupWrite` (design 2.8 of the identity fence): the
+/// leader never refuses a forward for its sender, a refusal before the
+/// handler is not applied, and an answer discarded after the handler may
+/// have run may have applied.
+async fn forward_control_fenced(
+    caller: &InProcessCaller,
+    leader: u64,
+    registry: &crate::RaftGroupHandleRegistry,
+    command: ursula_control::ControlCommand,
+) -> Result<ursula_control::ControlResponse, crate::meta::MetaForwardError> {
+    let rpc = ursula_runtime::ForwardedRpc::GroupWrite;
+    let address = || format!("in-process node {leader}");
+    let receiver = registry.peer_cluster();
+    match caller.request(leader, receiver, crate::incarnation::Rpc::Forward) {
+        Ok(()) => {}
+        Err(InProcessCallLost::Fence {
+            loss: FenceLoss::SenderFenced,
+            ..
+        }) => {
+            return Err(crate::meta::MetaForwardError::Transport(
+                crate::forward::ForwardError::Fenced { rpc },
+            ));
+        }
+        Err(InProcessCallLost::Fence {
+            loss: FenceLoss::Refused(crate::PeerClusterError::Fence { refusal, .. }),
+            ..
+        }) => {
+            return Err(crate::meta::MetaForwardError::Transport(
+                crate::forward::ForwardError::OtherIncarnation {
+                    rpc,
+                    address: address(),
+                    refusal,
+                },
+            ));
+        }
+        Err(_lost) => return Err(crate::meta::MetaForwardError::leader_unreachable()),
+    }
+    let answered = forward_control_in_process(
+        registry,
+        leader,
+        command,
+        ursula_proto::placement::NodeId::new(caller.node),
+    )
+    .await;
+    match caller.answer(leader, receiver) {
+        Ok(()) => answered,
+        Err(InProcessCallLost::Fence {
+            loss: FenceLoss::Discarded(discarded),
+            ..
+        }) => Err(crate::meta::MetaForwardError::Transport(
+            crate::forward::ForwardError::Discarded {
+                rpc,
+                address: address(),
+                discarded,
+            },
+        )),
+        // The leader fenced itself while it answered: its answer never
+        // left, after its handler may have run.
+        Err(_lost) => Err(crate::meta::MetaForwardError::Transport(
+            crate::forward::ForwardError::Discarded {
+                rpc,
+                address: address(),
+                discarded: crate::incarnation::Discarded::Fenced,
+            },
+        )),
     }
 }
 
@@ -880,6 +1255,17 @@ pub enum InProcessRaftNetworkEvent {
         source: Option<u64>,
         target: u64,
         key: Option<String>,
+    },
+    /// A sender with a process incarnation of its own counted an answer of
+    /// the target's process `responder`: its stamp passed the sender's
+    /// table. A `promise` grants a vote, acknowledges entries or installs a
+    /// snapshot. Recovery answers (barriers, probes, forwards) are no
+    /// promise.
+    AnswerAccepted {
+        source: Option<u64>,
+        target: u64,
+        responder: ursula_proto::placement::ProcessIncarnation,
+        promise: bool,
     },
 }
 
@@ -1341,69 +1727,44 @@ impl<SM: InProcessEndpoint> InProcessNetwork<SM> {
         ))
     }
 
-    /// The process fence of a request, as the gRPC plane runs it: the
-    /// sender's fence before it sends, then the target's check of the
-    /// sender and target processes the request names
-    /// ([`crate::PeerCluster::receive`]). A refusal from the process the
-    /// sender accepts takes its effect on the sender. A refused request is
-    /// lost, as to an unreachable peer.
+    /// The process fence of a request ([`fence_request`]). A refused
+    /// request is lost, as to an unreachable peer.
     fn deliver(
         &self,
         target: Option<&SM::Endpoint>,
     ) -> Result<(), Unreachable<UrsulaRaftTypeConfig>> {
         let sender = self.sender();
-        if let Some(sender) = &sender
-            && !sender.fence().admits_now()
-        {
-            return Err(self.lost("its sender is fenced"));
-        }
-        let Some(receiver) = target.map(SM::peer_cluster) else {
-            return Ok(());
-        };
-        let admitted = self.source.zip(sender.as_ref()).map(|(node, sender)| {
-            crate::peer_cluster::AdmittedPeer {
-                node,
-                sender: sender
-                    .identity()
-                    .and_then(|identity| identity.incarnation()),
-                target: sender.target_incarnation(self.target),
-            }
-        });
-        let Err(refused) = receiver.receive(admitted.as_ref(), crate::incarnation::Rpc::Raft)
-        else {
-            return Ok(());
-        };
-        if let (Some(sender), crate::PeerClusterError::Fence { refusal, .. }) = (&sender, &refused)
-            && sender
-                .accept_responder(self.target, receiver.stamp())
-                .is_ok()
-        {
-            sender.observe_fence_refusal(self.target, *refusal);
-        }
-        Err(self.lost(refused))
+        let receiver = target.map(SM::peer_cluster);
+        fence_request(
+            self.source,
+            sender.as_ref(),
+            self.target,
+            receiver.as_ref(),
+            crate::incarnation::Rpc::Raft,
+        )
+        .map_err(|loss| self.lost(loss))
     }
 
-    /// The process fence of an answer: the target's fence before it
-    /// leaves, then the sender's reading of the target's stamp at its
-    /// arrival ([`crate::PeerCluster::accept_responder`]). A discarded
-    /// answer is lost.
+    /// The process fence of an answer ([`fence_answer`]). A discarded
+    /// answer is lost. An accepted one is reported to the policy's observer
+    /// ([`InProcessRaftNetworkEvent::AnswerAccepted`]), as a `promise` when
+    /// it grants a vote, acknowledges entries or installs a snapshot.
     fn answer(
         &self,
         target: Option<&SM::Endpoint>,
+        promise: bool,
     ) -> Result<(), Unreachable<UrsulaRaftTypeConfig>> {
         let receiver = target.map(SM::peer_cluster);
-        if let Some(receiver) = &receiver {
-            receiver
-                .check_receiver_fence()
-                .map_err(|refused| self.lost(refused))?;
-        }
-        if let Some(sender) = self.sender() {
-            let stamp = receiver
-                .map(|receiver| receiver.stamp())
-                .unwrap_or_default();
-            sender
-                .accept_responder(self.target, stamp)
-                .map_err(|discarded| self.lost(discarded))?;
+        let responder = fence_answer(self.sender().as_ref(), self.target, receiver.as_ref())
+            .map_err(|loss| self.lost(loss))?;
+        if let Some(responder) = responder {
+            self.policy
+                .notify(InProcessRaftNetworkEvent::AnswerAccepted {
+                    source: self.source,
+                    target: self.target,
+                    responder,
+                    promise,
+                });
         }
         Ok(())
     }
@@ -1454,7 +1815,12 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                 RPCError::Network(NetworkError::from_string(message))
             }
         })?;
-        self.answer(Some(&target)).map_err(RPCError::Unreachable)?;
+        let acked = matches!(
+            response,
+            AppendEntriesResponse::Success | AppendEntriesResponse::PartialSuccess(_)
+        );
+        self.answer(Some(&target), acked)
+            .map_err(RPCError::Unreachable)?;
         if matches!(response, AppendEntriesResponse::Conflict) {
             if let (Some(conflict_index), Some(matched_index)) = (conflict_index, matched)
                 && conflict_index <= matched_index
@@ -1508,7 +1874,8 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
         let response = SM::vote(&target, rpc).await.map_err(|err| {
             RPCError::Network(NetworkError::from_string(format!("remote vote: {err}")))
         })?;
-        self.answer(Some(&target)).map_err(RPCError::Unreachable)?;
+        self.answer(Some(&target), response.vote_granted)
+            .map_err(RPCError::Unreachable)?;
         self.policy.notify(InProcessRaftNetworkEvent::VoteAnswered {
             source: self.source,
             target: self.target,
@@ -1582,7 +1949,7 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                 return Err(StreamingError::Closed(closed));
             }
         };
-        self.answer(Some(&target))
+        self.answer(Some(&target), installed.is_ok())
             .map_err(StreamingError::Unreachable)?;
         installed.map_err(|err| {
             let message = format!(
@@ -1640,7 +2007,7 @@ impl<SM: InProcessEndpoint> RaftNetworkV2<UrsulaRaftTypeConfig> for InProcessNet
                 self.target
             )))
         })?;
-        self.answer(endpoint.as_ref())
+        self.answer(endpoint.as_ref(), false)
             .map_err(RPCError::Unreachable)?;
         Ok(response)
     }

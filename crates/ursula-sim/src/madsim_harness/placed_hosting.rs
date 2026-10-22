@@ -276,10 +276,21 @@ impl SimHost {
         )
         .await
         .map_err(|source| SimHostError::Engine { group, source })?;
+        // The process's recovery calls carry its fence and incarnation and
+        // follow its routes, as its Raft RPCs do.
+        let caller = match self.parts.process {
+            Some(process) => ursula_raft::InProcessCaller::process(
+                node_id,
+                process,
+                registry.peer_cluster().clone(),
+            )
+            .with_policy(self.parts.policy.clone()),
+            None => ursula_raft::InProcessCaller::node(node_id),
+        };
         // Nothing below awaits, so a stopped driver never leaves a replica
         // half published.
         recovery_wiring::wire_recovery(
-            node_id,
+            caller,
             placement,
             &engine,
             &rejoin,
@@ -309,8 +320,9 @@ impl SimHost {
     }
 
     /// Steps 2 and 3 of a close (design 7.3): the handle goes, then the
-    /// engine stops and releases its store. A detached process leaves the in-process network as it is: its node
-    /// answers through its next process there.
+    /// engine stops and releases its store. A detached process leaves the
+    /// in-process network as it is: its node answers through its next
+    /// process there.
     async fn stop(&self, group: u32) -> Result<(), SimHostError> {
         let hosted = self.lock().remove(&group);
         self.parts.registry.unregister_group(RaftGroupId(group));
@@ -507,6 +519,16 @@ impl MetaCluster {
         self.placed_mut()
             .hosts
             .insert(node_id, NodeHost { host, driver });
+    }
+
+    /// Puts `host`, taken out by [`Self::take_host`], back as `node_id`'s
+    /// running host.
+    pub(super) fn put_host(&mut self, node_id: u64, host: DetachedHost) {
+        let DetachedHost(node) = host;
+        node.host
+            .detached
+            .store(false, std::sync::atomic::Ordering::Release);
+        self.placed_mut().hosts.insert(node_id, node);
     }
 
     /// Takes `node_id`'s running host and driver out of the cluster, which

@@ -23,6 +23,9 @@ use crate::rt::sync::Semaphore;
 pub enum MetaPausePoint {
     /// Before the node submits its registration.
     Registration,
+    /// Once the meta group answered the node's registration, before the
+    /// node records its root bound and publishes the answer.
+    RegistrationAnswered,
     /// Before the meta leader submits `Bootstrap`.
     Bootstrap,
     /// In a recovery plan's restart, once the old replica stopped and

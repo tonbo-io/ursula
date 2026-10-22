@@ -23,8 +23,13 @@
 //! it, across restarts, and its floors come from barrier rounds after its
 //! predecessor stopped. A run whose meta replica does not open gets no
 //! answer, so an unbound root's data stays held for that whole run. Its
-//! meta replica waits only for an owed wait, so a forming cluster's meta
-//! group elects before any registration is answered.
+//! meta replica's votes and genesis floor wait only for an owed wait, so a
+//! forming cluster's meta group elects before any registration is
+//! answered. Its meta barrier rounds, and the floor they write, wait for
+//! the binding too ([`fence_holds_barrier`]): a barrier answers only once
+//! a meta leader exists, which then answers the registration as well, so
+//! a new disk under a live meta voter takes no meta floor, and so no meta
+//! vote, beside the old process before meta refused or bound it.
 //!
 //! While the fence does not admit Raft traffic or a wait is owed, the node
 //! sheds leadership for [`LeadershipShedReason::Fence`]: none of its groups
@@ -80,12 +85,14 @@ pub(crate) async fn fence_released(fence: &NodeFence, target: RaftTarget) {
     }
 }
 
-/// Whether `fence` holds the barrier rounds of a replica of `target` and
-/// the floor they write ([`fence_holds`]). A negative control turns it off
-/// (`Defence::GateAfterWait`), and they then run during the hold.
-pub(crate) fn fence_holds_barrier(fence: &NodeFence, target: RaftTarget) -> bool {
+/// Whether `fence` holds the barrier rounds of a replica of either plane
+/// and the floor they write: while a wait is owed, or the unbound root
+/// awaits its binding, meta's replica included (see the module docs). A
+/// negative control turns it off (`Defence::GateAfterWait`), and they then
+/// run during the hold.
+pub(crate) fn fence_holds_barrier(fence: &NodeFence) -> bool {
     use ursula_stream::sim_controls::Defence;
-    if !fence_holds(fence, target) {
+    if !fence.holds_data() {
         return false;
     }
     if ursula_stream::sim_controls::off(Defence::GateAfterWait) {
@@ -95,12 +102,28 @@ pub(crate) fn fence_holds_barrier(fence: &NodeFence, target: RaftTarget) -> bool
     true
 }
 
-/// Returns once `fence` no longer holds the barrier rounds of a replica of
-/// `target` ([`fence_holds_barrier`]).
-pub(crate) async fn barrier_released(fence: &NodeFence, target: RaftTarget) {
-    if fence_holds_barrier(fence, target) {
-        fence_released(fence, target).await;
+/// Returns once `fence` no longer holds the barrier rounds of a replica
+/// ([`fence_holds_barrier`]).
+pub(crate) async fn barrier_released(fence: &NodeFence) {
+    if fence_holds_barrier(fence) {
+        fence.bound_and_waited().await;
     }
+}
+
+/// When an unbound root's wait begins: at the meta group's answer that
+/// bound it, now. A negative control turns it off
+/// (`Defence::WaitFromBinding`), and the wait is measured from the start of
+/// the run, `run_started`, so a root refused for longer than the wait
+/// takes part at its binding.
+fn binding_wait_start(
+    run_started: ursula_runtime::node_fence::FenceInstant,
+) -> ursula_runtime::node_fence::FenceInstant {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::WaitFromBinding) {
+        ursula_stream::sim_controls::note_fired(Defence::WaitFromBinding);
+        return run_started;
+    }
+    fence_now()
 }
 
 /// Marks [`LeadershipShedReason::Fence`] while `fence` does not admit or a
@@ -165,6 +188,7 @@ pub async fn run_predecessor_wait(
     };
     let from = wait.from();
     let fence = wait.fence().clone();
+    let run_started = fence_now();
     sync_fence_shed(&registry, &fence);
     let started = match from {
         WaitFrom::Open(opened) => Some(opened),
@@ -179,7 +203,7 @@ pub async fn run_predecessor_wait(
                     // The binding is on disk already, and the wait begins
                     // before the data hold ends.
                     fence.bind(true);
-                    break Some(fence_now());
+                    break Some(binding_wait_start(run_started));
                 }
                 RegistrationStatus::Pending
                 | RegistrationStatus::RootRefused { .. }

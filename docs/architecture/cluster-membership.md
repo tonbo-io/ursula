@@ -187,8 +187,12 @@ but are held out from its open until meta binds the root and then through
 the predecessor wait (`crates/ursula-raft/src/predecessor_wait.rs`): they
 grant no vote, run no gate driver, write no vote floor and no snapshot
 object, so their gates stay closed and they take no replication. Its meta
-replica is not held before an answer, so a forming cluster's meta group
-elects. A fresh cluster's data groups therefore form only once meta
+replica's votes and genesis vote floor are not held before an answer, so a
+forming cluster's meta group elects. Its meta barrier rounds are held until
+the binding, as the data replicas are: a barrier needs a meta leader, which
+answers the registration too, so a new disk under a live meta voter takes no
+meta floor before meta refused or bound it, and with no floor its closed
+gate grants no meta vote and takes no replication. A fresh cluster's data groups therefore form only once meta
 answered its nodes' registrations, and genesis values that disagree, which
 keep meta from forming, keep the data groups from forming too. A run of an
 unbound root whose meta journal or meta replica does not open gets no
@@ -197,8 +201,7 @@ it is the one meta failure that stops a node from serving data. A bound root
 does not wait for meta. A refusal for another root makes the run owe the
 predecessor wait:
 from then on its meta replica grants no vote and writes no floor, and the
-node sheds every leadership. Its meta replica is held only while a wait is
-owed, so after a restart it may vote again until the first refusal. Its registration status is `root_refused` with
+node sheds every leadership. Its registration status is `root_refused` with
 the slot, readiness reports `root_refused`, and it registers again at most
 5 seconds apart. Once an operator released the old root it binds with no
 restart, waits out its predecessor (readiness `predecessor_wait`), and its

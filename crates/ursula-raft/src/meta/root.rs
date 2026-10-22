@@ -12,7 +12,9 @@
 //! restart while it is refused changes nothing, whatever its meta replica
 //! wrote. Its data replicas are held out from its open until the binding
 //! and then through the predecessor wait (`NodeFence::awaits_binding`), and
-//! a refusal holds its meta replica's votes too ([`RootGuard::hold_out`]).
+//! so are its meta replica's barrier rounds, so it takes no meta floor
+//! before meta answered it. A refusal holds its meta replica's votes too
+//! ([`RootGuard::hold_out`]).
 //! A bound root fences itself for good ([`RootGuard::supersede`]) on a
 //! registration refused for another root, on any view that shows its root
 //! released, and on a view a meta read barrier confirmed that binds its id
@@ -131,9 +133,8 @@ impl RootGuard {
     /// (`NodeFence::awaits_binding`). The refusal also makes it owe the
     /// predecessor wait, so its meta replica grants no vote and takes no
     /// transfer from now on, and the node sheds every leadership. Its meta
-    /// barrier writes no floor while the wait is owed, but a meta floor
-    /// written before the refusal stays. The wait runs once meta binds the
-    /// root.
+    /// barrier writes no floor while the root awaits its binding or owes
+    /// the wait. The wait runs once meta binds the root.
     pub(crate) fn hold_out(&self) {
         self.0.fence.begin_wait();
         crate::predecessor_wait::sync_fence_shed(&self.0.registry, &self.0.fence);

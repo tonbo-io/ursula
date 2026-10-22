@@ -227,6 +227,18 @@ pub(crate) fn check_sender_fence(fence: &NodeFence) -> Result<(), SenderFenced> 
     }
 }
 
+/// Whether a sender judges an answer's stamp before it counts the answer
+/// ([`PeerCluster::accept_responder`]). A negative control turns it off
+/// (`Defence::ResponderBinding`), and every answer then counts unchecked.
+fn responder_binding() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::ResponderBinding) {
+        ursula_stream::sim_controls::note_fired(Defence::ResponderBinding);
+        return false;
+    }
+    true
+}
+
 /// A cluster id as a metadata value. Its grammar (`[A-Za-z0-9._-]`) is
 /// visible ASCII, which every metadata value accepts.
 fn cluster_id_value(cluster_id: &ClusterId) -> AsciiMetadataValue {
@@ -595,6 +607,8 @@ impl PeerCluster {
             Err(Discarded::Fenced)
         } else if bound.identity.incarnation().is_none() {
             return Ok(());
+        } else if !responder_binding() {
+            Ok(())
         } else {
             match (stamp.node, stamp.incarnation) {
                 (Some(node), _) if node != target => Err(Discarded::OtherNode { node }),
