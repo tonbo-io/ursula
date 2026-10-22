@@ -4120,6 +4120,16 @@ async fn a_retired_log_replays_no_frame_of_its_named_generation() {
         writer.local_logs().unwrap().get(&RaftGroupId(7)),
         Some(&LocalLog::Retired)
     );
+    // The writer's thread publishes the dirty segments at the end of each
+    // pass, its startup pass included, so the gauge is read once a pass
+    // answered. Nothing is old enough for this one to rewrite or delete.
+    writer
+        .maintain(
+            crate::rt::time::Instant::now(),
+            std::time::Duration::from_secs(900),
+        )
+        .await
+        .expect("a maintenance pass");
     assert_eq!(
         core.metrics.snapshot().wal_dirty_segments,
         2,
