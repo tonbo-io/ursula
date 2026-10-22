@@ -109,6 +109,26 @@ impl MetricsClient {
         Ok((response.status(), response.json().await?))
     }
 
+    /// The node's placement status, `GET /__ursula/placement`, read from
+    /// the same address as its metrics. It is the node's latest view, not
+    /// one a meta read barrier confirmed.
+    pub async fn placement_status(
+        &self,
+        node: &NodeInfo,
+    ) -> Result<ursula_control::PlacementStatus> {
+        let url = metrics_base_url(node)
+            .join("/__ursula/placement")
+            .with_context(|| format!("compose placement url for node {}", node.id))?;
+        Ok(self
+            .client
+            .get(url)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?)
+    }
+
     pub async fn fetch_node(&self, node: &NodeInfo) -> Result<NodeMetricsView> {
         let url = metrics_base_url(node)
             .join("/__ursula/metrics")

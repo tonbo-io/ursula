@@ -259,6 +259,30 @@ class HelmTemplateConfigTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("maxUnavailable", result.stderr)
 
+    def test_replica_count_is_one_or_three_and_more(self) -> None:
+        # The meta group places every group, so any count from 3 renders:
+        # four pods list four peers and the readiness test names no group
+        # count. Two pods tolerate no node loss and are refused.
+        rendered = render_chart(*NAMED, "--set", "s3.bucket=bkt", "--set", "server.replicaCount=4")
+        config = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt",
+                                             "--set", "server.replicaCount=4"))
+        self.assertEqual([peer["node_id"] for peer in config["raft"]["peers"]], [1, 2, 3, 4])
+        self.assertIn("  maxUnavailable: 1\n", documents(rendered, "PodDisruptionBudget")["test-ursula"])
+        test_pod = documents(rendered, "Pod")["test-ursula-wait-ready"]
+        self.assertIn("        - wait-ready\n", test_pod)
+        self.assertNotIn("expected-groups", test_pod)
+        for replicas, reason in (("2", "tolerates no node loss"), ("0", "replicaCount")):
+            with self.subTest(replicas=replicas):
+                result = subprocess.run(
+                    ["helm", "template", "test", "charts/ursula", *NAMED, "--set", "s3.bucket=bkt",
+                     "--set", f"server.replicaCount={replicas}"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(reason, result.stderr)
+
     def test_every_deployment_role_uses_the_unified_ursula_binary(self) -> None:
         rendered = render_chart(*NAMED, 
             "--set",

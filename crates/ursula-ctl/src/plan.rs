@@ -149,7 +149,9 @@ pub struct GroupReadiness {
     pub ready: bool,
 }
 
-/// A target node is ready when, in every raft group that any peer reports:
+/// A target node is ready when its own maintenance report is ready and, in
+/// every group of `placed` (those whose current voters its placement view
+/// places it among) and every group its report lists as counting as a voter:
 ///   1. The target is listed in voter_ids (membership intact).
 ///   2. The target's last_applied_index >= max peer committed_index - lag_tolerance.
 ///      For an expected single-voter group, use its own committed prefix.
@@ -158,31 +160,38 @@ pub struct GroupReadiness {
 ///      and has not caught up yet) is never ready, whatever the lag
 ///      tolerance: counting it ready leaves the group on two real copies.
 ///
-/// Groups invisible to the target (e.g. because it just restarted and hasn't
-/// caught up enough to know about them) are treated as not-ready.
+/// Whether a replica counts comes from the report, never from here. A
+/// group placed on the target that it does not report is not ready, and a
+/// group it neither is placed in nor counts in is not checked: a node that
+/// holds no group is ready by its report alone.
 pub fn check_readiness(
     snapshot: &ClusterSnapshot,
+    placed: &std::collections::BTreeSet<u64>,
     target_node_id: u64,
     lag_tolerance: u64,
 ) -> ReadinessReport {
     let target_view = snapshot.node(target_node_id);
-    let mut all_group_ids: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
     let maintenance = target_view.and_then(|view| view.raft_maintenance.as_ref());
+    let mut all_group_ids = placed.clone();
     if let Some(report) = maintenance {
-        all_group_ids.extend(report.expected_groups.keys().copied().map(u64::from));
-    }
-    for view in &snapshot.per_node {
-        for g in &view.groups {
-            if !group_is_initialized(g) {
-                continue;
-            }
-            all_group_ids.insert(g.raft_group_id);
-        }
+        let expected = report
+            .expected_groups
+            .iter()
+            .map(|(group, expected)| (*group, expected.counts_as_voter));
+        let unplaced = report
+            .unplaced
+            .iter()
+            .map(|(group, unplaced)| (*group, unplaced.counts_as_voter));
+        all_group_ids.extend(
+            expected
+                .chain(unplaced)
+                .filter(|(_, counts)| *counts)
+                .map(|(group, _)| u64::from(group)),
+        );
     }
 
     let mut per_group = BTreeMap::new();
-    let mut all_ready = !all_group_ids.is_empty()
-        && target_view.is_some()
+    let mut all_ready = target_view.is_some()
         && maintenance.is_some_and(|report| report.node_id == target_node_id && report.ready());
     for group_id in all_group_ids {
         let peers = snapshot.peer_views(group_id, target_node_id);
@@ -260,12 +269,10 @@ pub fn check_readiness(
     }
 }
 
-fn group_is_initialized(group: &RaftGroupView) -> bool {
-    !group.voter_ids.is_empty()
-}
-
 #[cfg(test)]
 mod tests {
+
+    use std::collections::BTreeSet;
 
     use url::Url;
 
@@ -408,7 +415,7 @@ mod tests {
                 ursula_proto::admin::RaftMaintenanceIssue::MissingGroup,
             ])]),
         });
-        let report = check_readiness(&snapshot, 1, 16);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 16);
         assert!(!report.all_ready);
         assert!(!report.per_group[&8].ready);
         assert!(
@@ -422,7 +429,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .node_id = 2;
-        assert!(!check_readiness(&snapshot, 1, 16).all_ready);
+        assert!(!check_readiness(&snapshot, &BTreeSet::new(), 1, 16).all_ready);
     }
 
     #[test]
@@ -481,7 +488,7 @@ mod tests {
                 ])]),
             ],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 5);
         assert!(report.all_ready, "{:?}", report);
 
         // Same snapshot but target is missing from voter_ids on every peer.
@@ -495,7 +502,7 @@ mod tests {
                 ])]),
             ],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 5);
         assert!(!report.all_ready);
     }
 
@@ -511,7 +518,7 @@ mod tests {
                 ])]),
             ],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 5);
         assert!(!report.all_ready);
         let g = &report.per_group[&7];
         assert_eq!(g.catch_up_gap, Some(50));
@@ -529,13 +536,13 @@ mod tests {
                 vec![1],
             )])],
         };
-        let lagging = check_readiness(&snapshot, 1, 0);
+        let lagging = check_readiness(&snapshot, &BTreeSet::new(), 1, 0);
         assert!(!lagging.all_ready);
         assert_eq!(lagging.per_group[&7].catch_up_gap, Some(1));
         snapshot.per_node[0].metrics.groups[0].last_applied_index = Some(10);
-        assert!(check_readiness(&snapshot, 1, 0).all_ready);
+        assert!(check_readiness(&snapshot, &BTreeSet::new(), 1, 0).all_ready);
         snapshot.per_node[0].metrics.groups[0].committed_index = None;
-        assert!(!check_readiness(&snapshot, 1, 0).all_ready);
+        assert!(!check_readiness(&snapshot, &BTreeSet::new(), 1, 0).all_ready);
     }
 
     #[test]
@@ -550,12 +557,12 @@ mod tests {
                 vec![1, 2, 3],
             )])],
         };
-        let report = check_readiness(&snapshot, 1, 0);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 0);
         assert!(!report.all_ready);
         assert_eq!(report.per_group[&7].catch_up_gap, None);
         // An incomplete local membership cannot override the expected voters.
         snapshot.per_node[0].metrics.groups[0].voter_ids = vec![1];
-        assert!(!check_readiness(&snapshot, 1, 0).all_ready);
+        assert!(!check_readiness(&snapshot, &BTreeSet::new(), 1, 0).all_ready);
     }
 
     #[test]
@@ -570,7 +577,7 @@ mod tests {
                 ])]),
             ],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 5);
         assert!(!report.all_ready);
         assert_eq!(report.per_group[&7].catch_up_gap, None);
     }
@@ -589,7 +596,7 @@ mod tests {
                 ]),
             ],
         };
-        let report = check_readiness(&snapshot, 1, 5);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 1, 5);
         assert!(!report.all_ready, "{report:?}");
         assert!(!report.per_group[&8].ready);
     }
@@ -604,8 +611,44 @@ mod tests {
                 ])]),
             ],
         };
-        let report = check_readiness(&snapshot, 3, 16);
+        let report = check_readiness(&snapshot, &BTreeSet::new(), 3, 16);
         assert!(!report.all_ready, "{report:?}");
         assert!(!report.per_group[&5].ready);
+    }
+
+    /// `wait --node` checks the groups the view places the node in and the
+    /// replicas its report counts, never every group a peer reports: node
+    /// 1 holds no replica of group 8, which runs on nodes 2 to 4. A wiped
+    /// voter whose replica counts for nothing is held by the view alone.
+    #[test]
+    fn readiness_checks_the_placed_and_counted_groups_only() {
+        let snapshot = ClusterSnapshot {
+            per_node: vec![
+                view(1, vec![group(7, 1, Some(2), Some(100), Some(100), vec![
+                    1, 2, 3,
+                ])]),
+                view(2, vec![
+                    group(7, 2, Some(2), Some(100), Some(100), vec![1, 2, 3]),
+                    group(8, 2, Some(2), Some(100), Some(100), vec![2, 3, 4]),
+                ]),
+            ],
+        };
+        let report = check_readiness(&snapshot, &BTreeSet::from([7]), 1, 0);
+        assert!(report.all_ready, "{report:?}");
+        assert_eq!(report.per_group.keys().copied().collect::<Vec<_>>(), [7]);
+
+        let mut wiped = snapshot;
+        wiped.per_node[0]
+            .raft_maintenance
+            .as_mut()
+            .unwrap()
+            .expected_groups
+            .get_mut(&7)
+            .unwrap()
+            .counts_as_voter = false;
+        wiped.per_node[0].metrics.groups[0].last_applied_index = None;
+        assert!(check_readiness(&wiped, &BTreeSet::new(), 1, 0).all_ready);
+        let held = check_readiness(&wiped, &BTreeSet::from([7]), 1, 0);
+        assert!(!held.all_ready && !held.per_group[&7].ready, "{held:?}");
     }
 }

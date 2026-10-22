@@ -31,7 +31,9 @@ struct Cli {
 enum Command {
     /// Print per-node raft group count and leadership distribution from /__ursula/metrics.
     Status(ObserveArgs),
-    /// Block until every node reports the expected number of raft groups and initialized groups have leaders.
+    /// Block until every node is ready and serves, and the meta leader's
+    /// placement view shows the cluster bootstrapped with every group live,
+    /// no move, and running on exactly its target voters with a leader.
     WaitReady(WaitReadyArgs),
     /// Mark one node as draining and transfer away every leadership it holds.
     /// The mark persists until `undrain` so the node does not re-acquire
@@ -39,17 +41,21 @@ enum Command {
     Drain(DrainArgs),
     /// Clear a node's maintenance-drain mark so it can hold leaderships again.
     Undrain(NodeArgs),
-    /// Block until one node is back as a voter in every group and caught up.
-    /// Progress-gated: a node that keeps advancing is never timed out. A
-    /// node that lost entries is caught up by its groups' leaders meanwhile.
+    /// Block until one node is a caught-up voter again in every group the
+    /// meta leader's placement view places it among and every group its own
+    /// report counts it a voter of. Progress-gated: a node that keeps
+    /// advancing is never timed out. A node that lost entries is caught up
+    /// by its groups' leaders meanwhile.
     Wait(WaitArgs),
-    /// Strictly verify that every configured node is a voter in every group,
-    /// caught up, and observes a usable leader.
+    /// Strictly verify, in two samples in a row, that every group of the meta
+    /// leader's placement view is live and runs on exactly its target
+    /// voters, each caught up, with a usable leader.
     VerifyCluster(VerifyClusterArgs),
-    /// Capture fresh quorum prefixes and verify every configured replica.
+    /// Capture fresh quorum prefixes and verify every target voter of every
+    /// group of the meta leader's placement view.
     VerifyQuorum(VerifyQuorumArgs),
-    /// Verify fresh prefixes on two survivors without claiming restored
-    /// redundancy.
+    /// Verify fresh prefixes on every target voter but one excluded node,
+    /// without claiming restored redundancy.
     VerifySurvivors(VerifySurvivorsArgs),
     /// Create a verifiable backup of every raft group into a local directory
     /// or `s3://bucket/prefix`.
@@ -169,10 +175,6 @@ struct WaitReadyArgs {
     /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    /// Number of raft groups each node must report
-    /// (the cluster's `raft.group_count`).
-    #[arg(long)]
-    expected_groups: usize,
     #[arg(long, default_value_t = 120)]
     timeout_secs: u64,
     #[arg(long, default_value_t = 1)]
@@ -261,10 +263,9 @@ struct VerifyClusterArgs {
 
 #[derive(Args, Debug)]
 struct VerifyQuorumArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
     #[arg(long, value_name = "PATH")]
     config: PathBuf,
-    #[arg(long)]
-    expected_groups: u32,
     #[arg(long, default_value_t = 120)]
     timeout_secs: u64,
     #[arg(long, default_value_t = 1)]
@@ -276,7 +277,6 @@ struct VerifyQuorumArgs {
 impl VerifyQuorumArgs {
     fn options(&self) -> ursula_ctl::quorum::QuorumVerificationOptions {
         ursula_ctl::quorum::QuorumVerificationOptions {
-            group_count: self.expected_groups,
             timeout: Duration::from_secs(self.timeout_secs),
             poll_interval: Duration::from_secs(self.poll_interval_secs),
         }
@@ -287,7 +287,7 @@ impl VerifyQuorumArgs {
 struct VerifySurvivorsArgs {
     #[command(flatten)]
     quorum: VerifyQuorumArgs,
-    /// Exactly one configured voter to omit from observation. This option
+    /// The one node of the manifest to omit from observation. This option
     /// does not establish that its old process or host cannot return.
     #[arg(long)]
     excluded_node_id: u64,
@@ -455,23 +455,20 @@ async fn run_status_subcommand(args: ObserveArgs) -> Result<()> {
 }
 
 async fn run_wait_ready_subcommand(args: WaitReadyArgs) -> Result<()> {
-    if args.expected_groups == 0 {
-        bail!("--expected-groups must be positive");
-    }
     let nodes = load_nodes(&args.config).await?;
     let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
-    let snapshot = wait_ready(
+    let (snapshot, view) = wait_ready(
         &client,
         &nodes,
-        args.expected_groups,
         Duration::from_secs(args.timeout_secs),
         Duration::from_secs(args.poll_interval_secs),
     )
     .await?;
     println!(
-        "ready: {} node(s), {} groups each",
+        "ready: {} node(s), {} group(s) live on their target voters (meta leader: node {})",
         snapshot.per_node.len(),
-        args.expected_groups
+        view.cluster.groups().len(),
+        view.leader
     );
     Ok(())
 }
@@ -707,7 +704,10 @@ async fn run_verify_cluster_subcommand(args: VerifyClusterArgs) -> Result<()> {
         args.lag_tolerance,
     )
     .await?;
-    println!("cluster verified: {} node(s) fully ready", nodes.len());
+    println!(
+        "cluster verified: {} node(s) ready, every group on its target voters",
+        nodes.len()
+    );
     Ok(())
 }
 
@@ -751,5 +751,28 @@ mod cli_tests {
         ])
         .expect_err("--dry-run is gone: a run without --accept-loss is the dry run");
         assert_eq!(removed.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// The groups come from the meta leader's view, so no verb takes a
+    /// group count.
+    #[test]
+    fn no_verb_takes_an_expected_group_count() {
+        for verb in [&["wait-ready"][..], &["verify-quorum"], &[
+            "verify-survivors",
+            "--excluded-node-id",
+            "3",
+        ]] {
+            let mut args = vec!["ursulactl"];
+            args.extend_from_slice(verb);
+            args.extend_from_slice(&["--config", "cluster.toml"]);
+            super::Cli::try_parse_from(&args).unwrap_or_else(|error| panic!("{verb:?}: {error}"));
+            args.extend_from_slice(&["--expected-groups", "4"]);
+            let removed = super::Cli::try_parse_from(&args).expect_err("--expected-groups is gone");
+            assert_eq!(
+                removed.kind(),
+                clap::error::ErrorKind::UnknownArgument,
+                "{verb:?}"
+            );
+        }
     }
 }

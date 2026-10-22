@@ -1,17 +1,17 @@
 # Ursula Helm Chart
 
-This chart installs Ursula as a static-membership Raft cluster on Kubernetes. The default install starts three voter pods, 64 Raft groups, durable per-pod Raft log PVCs, a headless peer Service, an internal client/admin ClusterIP Service, a quorum-protecting PodDisruptionBudget, default multi-pod spread hints, an optional stateless gateway Deployment, and a Helm test that verifies cluster readiness with `ursulactl wait-ready`.
+This chart installs Ursula as a Raft cluster on Kubernetes whose meta group places every Raft group. The default install starts three server pods, 64 Raft groups, durable per-pod Raft log PVCs, a headless peer Service, an internal client/admin ClusterIP Service, a quorum-protecting PodDisruptionBudget, default multi-pod spread hints, an optional stateless gateway Deployment, and a Helm test that verifies cluster readiness with `ursulactl wait-ready`.
 
-The chart uses a fixed configured voter set. The StatefulSet updates by `RollingUpdate`, one pod at a time, each waiting for serving readiness, and every voter hands off its leaderships on `SIGTERM`. A replica that lost Raft log entries is gated, stays a voter, and is caught up by its group leaders without an operator. Online changes to the configured voter count still require a future Ursula operator workflow.
+The meta group seeds each Raft group once, at bootstrap, on up to three pods. The StatefulSet updates by `RollingUpdate`, one pod at a time, each waiting for serving readiness, and every voter hands off its leaderships on `SIGTERM`. A replica that lost Raft log entries is gated, stays a voter, and is caught up by its group leaders without an operator. Raising `server.replicaCount` adds pods that hold no group (see [Scaling](#scaling-and-serverreplicacount)).
 
 ## Recommended Production Topology
 
-- Run three Ursula voter pods across three availability zones for the normal production profile; use five voters only when tolerating two simultaneous voter failures is worth the additional write quorum cost.
+- Run three Ursula server pods across three availability zones for the normal production profile. Each Raft group has at most three voters whatever the pod count, so more pods do not tolerate more simultaneous failures.
 - Every voter gets its own zonal persistent volume for the Raft log, and the cluster uses shared S3 for cold chunks and externalized snapshots.
 - Run at least two stateless gateway replicas behind an authenticated TLS ingress or load balancer. Keep the server and peer Services private.
 - Give Ursula a workload identity with least-privilege access to its S3 prefix. Enable bucket versioning, encryption, lifecycle policy, access logging, and alerts for S3 errors, storage growth, and pod restarts.
 
-This topology removes single-pod compute failures from the normal request path. Persistent Raft groups make membership initialization idempotent across restarts, but voter count must not be changed in place. `helm upgrade` rolls the voters with `RollingUpdate`: the controller replaces the highest ordinal first and moves to the next pod only once the replaced one passes its readiness probe, which waits until the pod's voter replicas caught up. Each replaced voter hands off its leaderships on `SIGTERM` before it stops. The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
+This topology removes single-pod compute failures from the normal request path. Persistent Raft groups make membership initialization idempotent across restarts. `helm upgrade` rolls the voters with `RollingUpdate`: the controller replaces the highest ordinal first and moves to the next pod only once the replaced one passes its readiness probe, which waits until the pod's voter replicas caught up. Each replaced voter hands off its leaderships on `SIGTERM` before it stops. The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
 
 [`examples/production-eks.yaml`](examples/production-eks.yaml) is a concrete three-AZ starting point with durable gp3 volumes, S3 cold storage and snapshots, three gateways, and an IRSA workload identity. It needs the AWS resources listed under [Prerequisites](#prerequisites).
 
@@ -85,13 +85,13 @@ The test mounts the chart-generated `cluster-manifest.json` and runs:
 ```bash
 ursulactl wait-ready \
   --config /etc/ursula/test/cluster-manifest.json \
-  --expected-groups 64 \
   --timeout-secs 120
 ```
 
-`wait-ready` succeeds only when every configured node reports the expected Raft
-group count and leaders, its metrics certify the complete configured voter set,
-and `GET /__ursula/ready` returns 200.
+`wait-ready` succeeds only when every node's maintenance report is ready and
+`GET /__ursula/ready` returns 200, and the meta leader's placement view shows
+the cluster bootstrapped with every Raft group live, no move, and running on
+exactly its target voters with a leader among them.
 
 ## Access Locally
 
@@ -216,7 +216,7 @@ node, which most CNIs admit whatever the policy says.
 
 ## Bootstrap Behavior
 
-Each Raft group runs on three consecutive pods in node id order, starting at the pod of index `group mod replicaCount`, so a three-pod cluster runs every group on every pod. The first pod of a group's window initializes it, and only once every voter of the group reports it empty and no leader. A replica that ever held its group never initializes it again, so restarts and upgrades need no setting. Keep `server.replicaCount` fixed for the life of a cluster: the pods' node ids decide every group's voters.
+At bootstrap the meta group seeds each Raft group on three consecutive pods in node id order, starting at the pod of index `group mod replicaCount`, so a three-pod cluster runs every group on every pod. The first pod of a group's window initializes it, and only once every voter of the group reports it empty and no leader. A replica that ever held its group never initializes it again, so restarts and upgrades need no setting. The placement lives in the meta group from then on, so a later `server.replicaCount` changes no group's voters.
 
 ### Raft WAL fsync policy and recovery
 
@@ -224,18 +224,17 @@ Each Raft group runs on three consecutive pods in node id order, starting at the
 
 If a majority of a group's voters lose their tail at once, the group has no leader and refuses writes, and the gated replicas report it stalled (readiness reason `recovery_stalled`). It resumes only after an operator accepts the loss of writes acknowledged after the last `fsync` with a recovery plan, sent with `ursulactl recover-group --accept-loss` or through `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` to the plan's leader first and then to the other voters. Recover the meta group first (`--target meta`), then the data groups. Set `raft.walFsync=always` to acknowledge every batch after `fsync` instead. See the [operations guide](https://ursula.tonbo.io/docs/operations#recovering-after-a-host-crash).
 
-These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Serving readiness (`/__ursula/ready`) checks the configured group inventory, running local voter replicas, recovery gates, applied membership and bounded local lag. While a voter that lost entries catches up, healthy surviving voters remain Service endpoints, while the catching-up voter stays NotReady. With three pods and the default PDB, that unavailable voter consumes the one allowed disruption, and a `RollingUpdate` does not move past it. `ursulactl wait-ready` combines the existing serving probe with strict metrics evidence for complete uniform voter sets. Serving readiness does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes.
+These recovery mechanisms do not by themselves establish production qualification: test the chosen topology under single-voter loss, host crashes, delayed replication, snapshot-store failures, and production memory limits. Serving readiness (`/__ursula/ready`) checks the groups the node's placement view gives it, running local voter replicas, recovery gates, applied membership and bounded local lag. While a voter that lost entries catches up, healthy surviving voters remain Service endpoints, while the catching-up voter stays NotReady. With three pods and the default PDB, that unavailable voter consumes the one allowed disruption, and a `RollingUpdate` does not move past it. `ursulactl wait-ready` combines the serving probe with each node's maintenance report and every group checked on its target voters in the meta leader's view. Serving readiness does not continuously prove quorum availability or serialize separate maintenance workflows. `ursulactl verify-quorum` obtains fresh per-group confirmations and verifies application through their fixed prefixes.
 
-## Static Membership And `server.replicaCount`
+## Scaling And `server.replicaCount`
 
-`server.replicaCount` is the initial voter count for a fresh static-membership
-cluster. Supported fresh-install values are `1`, `3`, and `5`; production
-clusters should use `3` or `5`.
+`server.replicaCount` is the server pod count: `1`, or `3` and more. The chart
+refuses `2`, which tolerates no node loss: every group and the meta group
+would need both pods. Production clusters should use `3` or more.
 
-Changing `server.replicaCount` on an initialized cluster is not safe Raft voter
-reconfiguration. It can make Kubernetes pods, PVCs, and the persisted Raft
-membership disagree. Safe scaling is reserved for the future operator, which
-will add learners, wait for catch-up, promote voters, and remove old voters.
+Raising `server.replicaCount` on a cluster of three or more pods adds pods that
+register with the meta group and hold no group: the placement keeps every
+group on its voters. Lowering it, or growing a single pod, is not supported.
 
 ## S3 Object Storage
 
@@ -419,7 +418,7 @@ restart the pod, then `ursulactl wait` and `ursulactl undrain` before the next v
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `server.replicaCount` | `3` | Fresh-cluster static voter pod count. Supported values are `1`, `3`, and `5`. Changing this on an initialized cluster is unsafe without the future operator workflow. |
+| `server.replicaCount` | `3` | Server pod count: `1`, or `3` and more (`2` is refused). Raising it from `3` or more adds pods that hold no group. Lowering it, or growing a single pod, is not supported. |
 | `server.terminationGracePeriodSeconds` | `30` | Must exceed the server's overall 20-second shutdown budget, including up to 5 seconds for leadership handoff before Raft transport closes. |
 | `server.ports.client` | `4437` | Ursula client-plane process port. The client Service, the headless peer Service, the gateway upstreams and leader redirects (each peer's `client_url`) target this port. With `server.clusterListen=false` the generated Raft peer URLs target it too. |
 | `server.ports.cluster` | `4439` | Cluster-plane (Raft gRPC) process port, used when `server.clusterListen=true`. The generated Raft peer URLs and the headless peer Service target it. The client Service never exposes it. Must differ from `server.ports.client` and the `server.adminListen` port. |

@@ -3334,7 +3334,6 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
     let refusal = ursula_ctl::observe::wait_ready(
         &ctl,
         &manifest,
-        2,
         Duration::from_secs(1),
         Duration::from_millis(50),
     )

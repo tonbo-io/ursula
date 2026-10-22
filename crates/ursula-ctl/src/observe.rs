@@ -1,6 +1,5 @@
-//! Read-only verbs that operate on `/__ursula/metrics` and `/__ursula/ready`.
-//! These are direct ports of the retired `ursula_ec2.py` `status` and
-//! `wait-ready`, without the SSH dependency.
+//! Read-only verbs over `/__ursula/metrics`, `/__ursula/ready` and the
+//! meta leader's placement view: `status` and `wait-ready`.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -12,6 +11,9 @@ use anyhow::Result;
 use crate::metrics::ClusterSnapshot;
 use crate::metrics::MetricsClient;
 use crate::provider::NodeInfo;
+use crate::view::GroupRefusal;
+use crate::view::MetaLeaderView;
+use crate::view::ViewRefusal;
 
 #[derive(Debug, Clone)]
 pub struct StatusReport {
@@ -90,7 +92,8 @@ fn format_leaders(counts: &BTreeMap<u64, usize>) -> String {
     format!("{{{}}}", entries.join(", "))
 }
 
-/// A refusal retains the report or serving reason that prevents maintenance.
+/// A refusal retains the report, serving reason or placement check that
+/// prevents maintenance.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadinessRefusal {
     #[error("node {node_id} lacks complete maintenance evidence: {report:?}")]
@@ -104,21 +107,16 @@ pub enum ReadinessRefusal {
         status: u16,
         reason: Option<ursula_proto::admin::ServingReadinessReason>,
     },
-    #[error(
-        "cluster inventory is incomplete: {observed_nodes}/{expected_nodes} nodes, expecting {expected_groups} initialized groups with leaders per node"
-    )]
-    Inventory {
-        expected_nodes: usize,
-        observed_nodes: usize,
-        expected_groups: usize,
-    },
+    #[error(transparent)]
+    View(#[from] ViewRefusal),
+    #[error(transparent)]
+    Group(#[from] GroupRefusal),
 }
 
-/// Check maintenance eligibility from complete metrics evidence.
+/// Checks that every node of `snapshot` gave its own maintenance report and
+/// that the report is ready.
 pub fn check_maintenance_snapshot(
     snapshot: &ClusterSnapshot,
-    expected_nodes: usize,
-    expected_groups: usize,
 ) -> std::result::Result<(), ReadinessRefusal> {
     for view in &snapshot.per_node {
         if !view
@@ -132,36 +130,30 @@ pub fn check_maintenance_snapshot(
             });
         }
     }
-    let mut detail = String::new();
-    if !cluster_ready(snapshot, expected_nodes, expected_groups, &mut detail) {
-        return Err(ReadinessRefusal::Inventory {
-            expected_nodes,
-            observed_nodes: snapshot.per_node.len(),
-            expected_groups,
-        });
-    }
     Ok(())
 }
 
-/// Wait for complete metrics evidence and the local serving probe. Transport
-/// failures are retried until the deadline. Decoding failures are terminal.
-/// Every error retains its original source.
+/// Wait until every node's maintenance report is ready and it serves, the
+/// meta leader's view shows the cluster bootstrapped with every group live
+/// and no move, and every group runs on exactly its target voters with a
+/// leader among them ([`crate::view::check_groups`]). Transport failures
+/// and refusals are retried until the deadline. Decoding failures are
+/// terminal. Every error retains its original source.
 ///
 /// Each poll observes the processes afresh with `client`'s HTTP settings, so
 /// a node may restart during the wait.
 pub async fn wait_ready(
     client: &MetricsClient,
     nodes: &[NodeInfo],
-    expected_groups: usize,
     timeout: Duration,
     poll_interval: Duration,
-) -> Result<ClusterSnapshot> {
+) -> Result<(ClusterSnapshot, MetaLeaderView)> {
     let started = Instant::now();
     loop {
         let poll = MetricsClient::new(client.timeout())?;
-        let observation: Result<ClusterSnapshot> = async {
+        let observation: Result<(ClusterSnapshot, MetaLeaderView)> = async {
             let snapshot = poll.fetch_cluster(nodes).await?;
-            check_maintenance_snapshot(&snapshot, nodes.len(), expected_groups)?;
+            check_maintenance_snapshot(&snapshot)?;
             for node in nodes {
                 let (status, report) = poll.serving_readiness(node).await?;
                 if status != reqwest::StatusCode::OK || !report.ready {
@@ -173,11 +165,16 @@ pub async fn wait_ready(
                     .into());
                 }
             }
-            Ok(snapshot)
+            let view = crate::view::read_view(&poll, nodes)
+                .await
+                .map_err(ReadinessRefusal::from)?;
+            let targets = view.targets().map_err(ReadinessRefusal::from)?;
+            crate::view::check_groups(&targets, &snapshot, None).map_err(ReadinessRefusal::from)?;
+            Ok((snapshot, view))
         }
         .await;
         match observation {
-            Ok(snapshot) => return Ok(snapshot),
+            Ok(ready) => return Ok(ready),
             Err(error) => {
                 let retryable = error.downcast_ref::<ReadinessRefusal>().is_some()
                     || error
@@ -195,59 +192,6 @@ pub async fn wait_ready(
         }
         tokio::time::sleep(poll_interval.min(timeout.saturating_sub(started.elapsed()))).await;
     }
-}
-
-fn cluster_ready(
-    snapshot: &ClusterSnapshot,
-    expected_nodes: usize,
-    expected_groups: usize,
-    summary: &mut String,
-) -> bool {
-    if snapshot.per_node.len() != expected_nodes {
-        *summary = format!(
-            "only {}/{expected_nodes} nodes reported metrics",
-            snapshot.per_node.len()
-        );
-        return false;
-    }
-    for view in &snapshot.per_node {
-        if view.groups.len() != expected_groups {
-            *summary = format!(
-                "node {} reports {} groups, expected {expected_groups}",
-                view.node.id,
-                view.groups.len()
-            );
-            return false;
-        }
-        let uninitialized_groups = view
-            .groups
-            .iter()
-            .filter(|g| !group_is_initialized(g))
-            .count();
-        if uninitialized_groups > 0 {
-            *summary = format!(
-                "node {} has {uninitialized_groups} uninitialized group(s)",
-                view.node.id
-            );
-            return false;
-        }
-        let groups_without_leader = view
-            .groups
-            .iter()
-            .filter(|g| g.current_leader.is_none())
-            .count();
-        if groups_without_leader > 0 {
-            *summary = format!(
-                "node {} has {groups_without_leader} group(s) without a leader",
-                view.node.id
-            );
-            return false;
-        }
-    }
-    *summary = format!(
-        "all {expected_nodes} nodes report {expected_groups} initialized groups with leaders"
-    );
-    true
 }
 
 fn group_is_initialized(group: &crate::metrics::RaftGroupView) -> bool {
@@ -386,13 +330,17 @@ mod tests {
             let result = wait_ready(
                 &MetricsClient::new(Duration::from_secs(1)).unwrap(),
                 &[node],
-                1,
                 timeout,
                 Duration::from_millis(1),
             )
             .await;
             if mode == 0 {
-                assert_eq!(result.unwrap().per_node.len(), 1);
+                // A ready, serving node that answers no placement status
+                // names no meta leader.
+                assert!(matches!(
+                    result.unwrap_err().downcast_ref::<ReadinessRefusal>(),
+                    Some(ReadinessRefusal::View(ViewRefusal::NoMetaLeader))
+                ));
             } else {
                 let error = result.unwrap_err();
                 match mode {
@@ -496,21 +444,24 @@ mod tests {
         node.http_url = Some(base.clone());
         node.admin_url = base;
         let client = MetricsClient::new(Duration::from_secs(1)).unwrap();
-        let timeout = Duration::from_secs(5);
+        let timeout = Duration::from_millis(300);
 
-        let snapshot = wait_ready(
+        // The replacement passes the maintenance and serving checks, so the
+        // wait gets as far as the placement view, which this node does not
+        // serve: no poll was refused for the changed incarnation.
+        let refusal = wait_ready(
             &client,
             std::slice::from_ref(&node),
-            1,
             timeout,
             Duration::from_millis(1),
         )
         .await
-        .unwrap();
-        assert_eq!(
-            snapshot.per_node[0].process_incarnation,
-            crate::metrics::test_incarnation(2)
-        );
+        .unwrap_err();
+        assert!(matches!(
+            refusal.downcast_ref::<ReadinessRefusal>(),
+            Some(ReadinessRefusal::View(ViewRefusal::NoMetaLeader))
+        ));
+        assert!(polls.load(Ordering::SeqCst) >= 2);
 
         task.abort();
     }
@@ -528,45 +479,6 @@ mod tests {
 
     fn group(raft_group_id: u64, leader: Option<u64>) -> RaftGroupView {
         crate::metrics::test_group(raft_group_id, 0, 1, leader, Some(1), Some(1), vec![1, 2, 3])
-    }
-
-    fn empty_group(raft_group_id: u64) -> RaftGroupView {
-        crate::metrics::test_group(raft_group_id, 0, 0, None, None, None, vec![])
-    }
-
-    #[test]
-    fn cluster_ready_requires_every_node_and_leader_per_group() {
-        let snapshot = ClusterSnapshot {
-            per_node: vec![
-                crate::metrics::test_view(node(1), vec![group(7, Some(1)), group(8, Some(2))]),
-                crate::metrics::test_view(node(2), vec![group(7, Some(1)), group(8, Some(2))]),
-            ],
-        };
-        let mut summary = String::new();
-        assert!(cluster_ready(&snapshot, 2, 2, &mut summary));
-    }
-
-    #[test]
-    fn cluster_ready_false_when_group_lacks_leader() {
-        let snapshot = ClusterSnapshot {
-            per_node: vec![crate::metrics::test_view(node(1), vec![group(7, None)])],
-        };
-        let mut summary = String::new();
-        assert!(!cluster_ready(&snapshot, 1, 1, &mut summary));
-        assert!(summary.contains("without a leader"));
-    }
-
-    #[test]
-    fn cluster_ready_false_when_group_is_uninitialized() {
-        let snapshot = ClusterSnapshot {
-            per_node: vec![crate::metrics::test_view(node(1), vec![
-                group(7, Some(1)),
-                empty_group(8),
-            ])],
-        };
-        let mut summary = String::new();
-        assert!(!cluster_ready(&snapshot, 1, 2, &mut summary));
-        assert!(summary.contains("uninitialized"));
     }
 
     #[test]

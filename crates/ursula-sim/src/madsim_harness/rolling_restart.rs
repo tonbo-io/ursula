@@ -143,7 +143,14 @@ impl RollingRestartValidator {
         let ready_deadline = madsim::time::Instant::now() + self.options.ready_timeout;
         loop {
             let snap = self.snapshot();
-            let report = check_readiness(&snap, target_node_id, self.options.lag_tolerance);
+            // The simulation runs no meta, so no view places the node: its
+            // report's counted replicas are what it waits for.
+            let report = check_readiness(
+                &snap,
+                &std::collections::BTreeSet::new(),
+                target_node_id,
+                self.options.lag_tolerance,
+            );
             if report.all_ready {
                 return RestartStepOutcome::Restarted;
             }
