@@ -9798,11 +9798,33 @@ async fn cli_a_leader_cut_off_or_stopped_answers_writes_well_within_the_client_t
             .collect();
         assert!(slow.is_empty(), "{via} answered writes late: {slow:?}");
     }
+    // The cut-off leader holds the write it proposed first until its lease
+    // ends (`until_lapsed` of ursula-raft), and refuses every later one at its front
+    // door, before the body.
+    let mut in_cut = direct_writes
+        .iter()
+        .filter(|write| {
+            write.sent < healed
+                && write
+                    .sent
+                    .checked_add(write.took)
+                    .is_some_and(|answered| answered >= cut)
+        })
+        .skip_while(|write| write.answer == LoadAnswer::Acknowledged);
+    let held = in_cut.next().unwrap_or_else(|| {
+        panic!("node {leader} refused no write while cut off: {direct_writes:?}")
+    });
+    assert_eq!(
+        held.answer,
+        LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::OutcomeUnknown)),
+        "node {leader}'s first unacknowledged write in the cut: {held:?}"
+    );
+    let refused = LoadAnswer::Retryable(Some(ursula_headers::ErrorCode::NoLeader));
+    let not_refused: Vec<&LoadWrite> = in_cut.filter(|write| write.answer != refused).collect();
     assert!(
-        direct_writes
-            .iter()
-            .any(|write| write.sent >= cut && matches!(write.answer, LoadAnswer::Retryable(_))),
-        "node {leader} refused no write while cut off: {direct_writes:?}"
+        not_refused.is_empty(),
+        "node {leader} answered writes after its lease ended other than NO_LEADER: \
+         {not_refused:?}"
     );
     assert!(
         gateway_writes.iter().any(|write| write.sent >= elected

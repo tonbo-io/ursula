@@ -369,7 +369,7 @@ gateway:
   # TCP connect timeout per upstream attempt in seconds.
   connectTimeoutSeconds: 5
   # Timeout for upstream response headers in seconds. An upstream that answers
-  # nothing within it is ejected, and a read or a producer write goes on to
+  # nothing within it is ejected, and a read or a producer append goes on to
   # another upstream. Keep it under the clients' timeouts and above a node's
   # 3 s leader lease.
   responseHeaderTimeoutSeconds: 5

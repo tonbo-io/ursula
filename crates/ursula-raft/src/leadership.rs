@@ -92,9 +92,9 @@ impl GroupLeadership {
             let since_lift = fence
                 .lifted_at()
                 .map(|lifted| now.saturating_duration_since(lifted));
-            let fence_lets =
-                fence_lets_lead(own_quorum, acked_age, since_lift) || !fence_rules_leadership();
-            if fence_lets && lease_holds(own_quorum, acked_age, lease) {
+            let confirmed = fence_lets_lead(own_quorum, acked_age, since_lift)
+                && lease_holds(own_quorum, acked_age, lease);
+            if confirmed || !fence_rules_leadership() {
                 LeaderRole::Leads
             } else {
                 LeaderRole::Lapsed
@@ -110,6 +110,19 @@ impl GroupLeadership {
             term: metrics.current_term,
             role,
         }
+    }
+
+    /// The view of the replica that runs `raft`, behind `fence`, with its
+    /// group's lease taken from the Raft's own config.
+    pub(crate) fn of_raft<SM: openraft::storage::RaftStateMachine<UrsulaRaftTypeConfig>>(
+        raft: &openraft::Raft<UrsulaRaftTypeConfig, SM>,
+        fence: &NodeFence,
+    ) -> Self {
+        Self::of(
+            &raft.metrics().borrow_watched(),
+            fence,
+            leader_lease(raft.config()),
+        )
     }
 
     /// Where this view sends a write: here when this replica leads (with
@@ -185,7 +198,11 @@ pub(crate) fn leader_lease(config: &openraft::Config) -> Duration {
 /// `last_quorum_acked`). A leader no follower answered yet (`acked_age` is
 /// `None`) was just elected and keeps it: OpenRaft refuses its writes until
 /// the first answer, and a write waits for that answer before it proposes
-/// ([`crate::forward::await_first_quorum_ack`]).
+/// ([`crate::forward::await_first_quorum_ack`]). Unlike OpenRaft, which
+/// counts such a lease as ended, this keeps a leader cut off before its
+/// first answer leading: its leader-gated jobs keep running, and a write
+/// there is refused by OpenRaft (`LeaseExpired`) once its wait for that
+/// answer ends, `election_timeout_min` later.
 fn lease_holds(own_quorum: bool, acked_age: Option<Duration>, lease: Duration) -> bool {
     own_quorum || acked_age.is_none_or(|age| age < lease)
 }
@@ -202,27 +219,33 @@ fn lease_holds(own_quorum: bool, acked_age: Option<Duration>, lease: Duration) -
 /// A lease ends by time, not by a metrics change, so the wait looks again
 /// when the lease of the last quorum acknowledgement would end, which a
 /// later acknowledgement moves on: a write that commits within its lease
-/// never wakes it. A fence that closes while a quorum still acknowledges is
-/// seen by the next look, at most one lease later.
+/// never wakes it. A leader that is its own quorum, or that no follower
+/// answered yet, has no such end, and looks again one full lease later. No
+/// look comes sooner than [`MIN_LOOK`], so the wait never spins on a lease
+/// that ends as it looks. A fence that closes while a quorum still
+/// acknowledges is seen by the next look, at most one lease later.
 pub(crate) async fn until_lapsed(
     metrics: WatchReceiverOf<UrsulaRaftTypeConfig, RaftMetrics<UrsulaRaftTypeConfig>>,
     fence: &NodeFence,
     lease: Duration,
 ) {
     loop {
-        let lease_left = {
+        let look_again = {
             let current = metrics.borrow_watched();
             if GroupLeadership::of(&current, fence, lease).role == LeaderRole::Lapsed {
                 return;
             }
-            current
-                .last_quorum_acked
-                .as_ref()
-                .map_or(lease, |acked| lease.saturating_sub(acked.elapsed()))
+            match current.last_quorum_acked.as_ref() {
+                Some(acked) if !own_quorum(&current) => lease.saturating_sub(acked.elapsed()),
+                _ => lease,
+            }
         };
-        crate::rt::time::sleep(lease_left).await;
+        crate::rt::time::sleep(look_again.max(MIN_LOOK)).await;
     }
 }
+
+/// The shortest wait between two looks of [`until_lapsed`].
+const MIN_LOOK: Duration = Duration::from_millis(1);
 
 /// Whether the replica whose metrics are `metrics` is the only voter of its
 /// effective membership, joint configs included, and so its own quorum.
@@ -237,10 +260,10 @@ pub(crate) fn own_quorum(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
         .all(|voter| voter == metrics.id)
 }
 
-/// Whether the node fence takes part in the leader predicate, read only
-/// where it decides the role. A negative control turns it off
-/// (`Defence::FencedLeadership`), and the predicate then reads OpenRaft's
-/// server state alone.
+/// Whether the node fence and the leader lease take part in the leader
+/// predicate, read only where they decide the role. A negative control
+/// turns them off (`Defence::FencedLeadership`), and the predicate then
+/// reads OpenRaft's server state alone.
 fn fence_rules_leadership() -> bool {
     use ursula_stream::sim_controls::Defence;
     if ursula_stream::sim_controls::off(Defence::FencedLeadership) {

@@ -1058,7 +1058,7 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
             .map(|(result, expected)| {
                 result.map(|result| {
                     crate::openraft_error::batch_write_result::<SM>(result, expected, || {
-                        GroupLeadership::of(&raft.metrics().borrow_watched(), fence, lease)
+                        GroupLeadership::of_raft(&raft, fence)
                     })
                 })
             });

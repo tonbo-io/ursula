@@ -952,7 +952,7 @@ impl Gateway {
     /// Each hop sends the request again. A node redirects a write only when
     /// it refused the write before proposing it, so no hop after a redirect
     /// meets a write an earlier hop applied, and a `503 NO_LEADER` after the
-    /// hops is a refusal too. Only a producer write goes on after a hop that
+    /// hops is a refusal too. Only a producer append goes on after a hop that
     /// answered nothing, and its key keeps the earlier hop's apply from
     /// applying it twice.
     async fn forward(
@@ -1240,7 +1240,7 @@ impl Gateway {
                 upstream,
                 window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
                 failures,
-                "upstream failed at the transport; leaving it out of selection"
+                "upstream failed at the transport or sent no headers in time; leaving it out of selection"
             );
         }
     }
@@ -1592,10 +1592,12 @@ impl Lead {
 enum Replay {
     /// A `GET` or a `HEAD`: a repeat changes nothing.
     Read,
-    /// A producer write, keyed by `Producer-Id`, `Producer-Epoch` and
-    /// `Producer-Seq`: the key applies it at most once however often it is
-    /// sent, and a `2xx` receipt says that it holds. Any other answer to the
-    /// repeat leaves the outcome of the earlier hop unknown.
+    /// An append (a `POST` to a stream) keyed by `Producer-Id`,
+    /// `Producer-Epoch` and `Producer-Seq`: the key applies it at most once
+    /// however often it is sent, and a `2xx` receipt says that it holds. Any
+    /// other answer to the repeat leaves the outcome of the earlier hop
+    /// unknown. A node reads the key on an append alone, so producer headers
+    /// on any other request key nothing.
     Keyed,
     /// Any other request: a repeat may apply a write twice.
     Never,
@@ -1605,6 +1607,13 @@ impl Replay {
     fn of(parts: &axum::http::request::Parts) -> Self {
         if matches!(parts.method, Method::GET | Method::HEAD) {
             return Self::Read;
+        }
+        let append =
+            classify_request(&parts.method, &parts.uri, &parts.headers).is_some_and(|request| {
+                matches!(request.action, Action::Append | Action::AppendAndClose)
+            });
+        if !append {
+            return Self::Never;
         }
         let keyed = ursula_headers::ProducerRequestHeaders::parse(
             parts
@@ -2539,11 +2548,14 @@ pub enum GatewayError {
 impl GatewayError {
     /// Whether the upstream failed at the transport, or answered nothing
     /// within the response header timeout, so selection should leave it out
-    /// for a while (#454). A node answers a write it cannot finish within its
-    /// leader lease, so a missing answer marks a node that does not answer at
-    /// all, such as a stopped process. A live node whose request was only
-    /// slow comes back with its next answer, a redirect's included. A request
-    /// that could not be built never left the gateway.
+    /// for a while (#454). A leader that lost its quorum answers a write
+    /// within its leader lease, so a missing answer mostly marks a node that
+    /// does not answer at all, such as a stopped process. A live node can
+    /// still hold a request longer (a write waiting for its group's first
+    /// open, a read forwarded to an unreachable leader, a snapshot commit of
+    /// many parts), and is then left out for one window although it is
+    /// healthy: it comes back with its next answer, a redirect's included. A
+    /// request that could not be built never left the gateway.
     fn ejects_upstream(&self) -> bool {
         match self {
             Self::UpstreamUnreachable { .. }

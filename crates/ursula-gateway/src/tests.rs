@@ -700,6 +700,15 @@ async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() 
             0,
             None,
         ),
+        // A node reads a producer key on an append alone, so a keyed
+        // `DELETE` is a keyless write: a repeat could delete a stream
+        // created again meanwhile.
+        (
+            keyed(Method::DELETE, "/bucket/stream"),
+            StatusCode::GATEWAY_TIMEOUT,
+            0,
+            None,
+        ),
     ] {
         let gateway = Arc::new(Gateway::new(config.clone()));
         gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
@@ -709,6 +718,13 @@ async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() 
         let response = through_one_timeout(&gateway, request, &mut arrivals, timeout).await;
 
         assert_eq!(response.status(), status, "{method}");
+        if status == StatusCode::GATEWAY_TIMEOUT {
+            assert_eq!(
+                error_code_of(response).await,
+                ErrorCode::UpstreamTimeout,
+                "{method}"
+            );
+        }
         assert_eq!(live.hits().saturating_sub(before), hits, "{method}");
         let metrics = gateway.metrics_snapshot();
         assert_eq!(metrics.upstream_ejections, 1, "{method}");
@@ -734,6 +750,7 @@ async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
     gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
     let response = through_one_timeout(&gateway, producer_post(), &mut arrivals, timeout).await;
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
     assert_eq!(refusing.hits(), 1);
 
     let (second, mut second_arrivals) = silent_upstream().await;
@@ -763,8 +780,29 @@ async fn a_keyed_write_sent_again_ends_unknown_unless_the_repeat_holds() {
     tokio::time::advance(timeout).await;
     let response = sent.await.expect("request task");
     assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    assert_eq!(error_code_of(response).await, ErrorCode::UpstreamTimeout);
     assert_eq!(live.hits(), 0);
     assert_eq!(gateway.metrics_snapshot().upstream_ejections, 2);
+}
+
+/// A `method` request to `path` with a producer key.
+fn keyed(method: Method, path: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header(names::PRODUCER_ID, "p")
+        .header(names::PRODUCER_EPOCH, "0")
+        .header(names::PRODUCER_SEQ, "0")
+        .body(Body::empty())
+        .expect("request")
+}
+
+/// The code of the error answer `response`.
+async fn error_code_of(response: AxumResponse) -> ErrorCode {
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("the answer's body");
+    ErrorBody::parse(&body).expect("an error body").code
 }
 
 #[test]

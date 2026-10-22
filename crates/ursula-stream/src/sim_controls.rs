@@ -246,10 +246,12 @@ pub enum Defence {
     /// keeps sending heartbeats and appends and counts their answers.
     SendLease,
     /// The one leader predicate (`GroupLeadership::of`) reads the node
-    /// fence: a replica leads nothing while the fence does not admit, and
-    /// after a lift only once a quorum acknowledged it (N24 of the identity
-    /// fence). Off, it reads OpenRaft's server state alone, so a fenced
-    /// leader starts linearizable reads and leader-gated jobs.
+    /// fence and the leader lease: a replica leads nothing while the fence
+    /// does not admit, after a lift only once a quorum acknowledged it, and
+    /// never once no quorum acknowledged it within its lease (N24 of the
+    /// identity fence). Off, it reads OpenRaft's server state alone, so a
+    /// fenced or cut-off leader starts linearizable reads and leader-gated
+    /// jobs.
     FencedLeadership,
     /// A process that owes its predecessor wait, or whose unbound root
     /// awaits its binding, sends no snapshot object PUT or DELETE (N15 of
