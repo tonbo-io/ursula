@@ -53,9 +53,18 @@
 //! voter (two at RF 2 on four nodes), its outgoing voter the leader on some
 //! seeds, and on some seeds the leader cut off on the data plane while it
 //! moves, or the move cancelled or retargeted at a drawn time or while the
-//! leader's shell holds a drawn step at its pause point. Every group then
-//! settles live on its placement (I3), a settled five-node cluster keeps
-//! its leaderships (I14, narrowed: the balancer runs in crate `ursula`), and
+//! leader's shell holds a drawn step at its pause point. On some seeds the
+//! node a converging move drops crashes while its teardown holds a drawn
+//! step at its pause point: its process crashes, its power is cut, or (at
+//! RF 3) its process crashes and its core journal's `journal.meta` is lost,
+//! and the restarted node tears the replica down again or reports the log
+//! it retired. After each move, on some seeds the group moves back onto the
+//! voters it left (A to B to A), each returning node reopening its retired
+//! log behind its gate, on half of those with the power of a returning node
+//! cut once it runs the group again. Every group then settles live on its
+//! placement, every replica without a role is torn down and every
+//! retirement reported (I3, I5), a settled five-node cluster keeps its
+//! leaderships (I14, narrowed: the balancer runs in crate `ursula`), and
 //! every voter reads every acknowledged append back (I1). A run that moved
 //! a group fails a check that judged nothing of it.
 //!
@@ -64,9 +73,10 @@
 //! hosting checks (I2 to I4, I8, I9) are checked after each phase and at
 //! every poll of the waits. The negative controls ([`Controls`]) each run a
 //! script of their own with one defence off: the three meta ones over
-//! static data groups, N3 and the reconciler's N1, N5 and N9 over placed
-//! ones. N5 and N9 turn theirs off inside the script, at the step it
-//! judges, so their setup runs defended.
+//! static data groups, N3, the reconciler's N1, N5 and N9 and the
+//! teardown's N4 and N6 over placed ones. N4, N5 and N9 turn theirs off
+//! inside the script, at the step they judge, so their setup runs
+//! defended.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -75,6 +85,7 @@ use std::time::Duration;
 use ursula_config::WalFsync;
 use ursula_control::ControlApplied;
 use ursula_control::ControlError;
+use ursula_control::TeardownStep;
 use ursula_proto::placement::GroupCount;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::StepKind;
@@ -98,6 +109,7 @@ use super::meta_cluster::claim;
 use super::meta_cluster::claim_with_factor;
 use super::placed_hosting;
 use super::placed_hosting::I3;
+use super::placed_hosting::I5;
 
 /// The most nodes a run starts, and the meta voters.
 const NODES: u64 = 5;
@@ -120,6 +132,12 @@ const HELD_BOUND: Duration = Duration::from_secs(10);
 const CUT: Duration = Duration::from_secs(2);
 /// How long a settled cluster is watched for a leadership change (I14).
 const SETTLED: Duration = Duration::from_secs(3);
+/// How long the teardowns of a settled group may take: each of its two
+/// asks may wait one ask interval for the next answer.
+const TEARDOWN_BOUND: Duration = Duration::from_secs(100);
+/// How long N4's script watches for the teardown it released to retire
+/// the log of a voter.
+const RETIRE_WATCH: Duration = Duration::from_secs(20);
 
 /// Which run a scenario makes, and which meta defence it turns off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -152,6 +170,16 @@ pub(super) enum Controls {
     /// data plane, and its successor, whose meta replica lags, changes the
     /// membership, with the leadership proof (N9) on (`true`) or off.
     DeposedReport { defended: bool },
+    /// A dropped voter whose teardown holds before it closes the replica,
+    /// while a meta loss is accepted and the group makes the node its voter
+    /// again, with retirements waiting for the group's answers (N4) on
+    /// (`true`) or off.
+    ReplacedMidTeardown { defended: bool },
+    /// A group moved off a node and back onto it (A to B to A), the node
+    /// cut off on the data plane and its power cut before its reopened log
+    /// took an entry, with each retirement in a new log generation (N6) on
+    /// (`true`) or off.
+    ReopenedRetiredLog { defended: bool },
 }
 
 /// The run's defences, reset when the run ends.
@@ -179,10 +207,15 @@ impl Switched {
             Defence::MembershipCas,
             controls == Controls::StaleStep { defended: false },
         );
-        // These two go off inside their scripts, at the step they judge
+        set_off(
+            Defence::LogGeneration,
+            controls == Controls::ReopenedRetiredLog { defended: false },
+        );
+        // These go off inside their scripts, at the step they judge
         // ([`defence_off_from_here`]), so the setup runs defended.
         set_off(Defence::PlacementBarrier, false);
         set_off(Defence::ConvergeLeadershipProof, false);
+        set_off(Defence::RetireAnswer, false);
         Self
     }
 }
@@ -203,6 +236,8 @@ impl Drop for Switched {
         set_off(Defence::MembershipCas, false);
         set_off(Defence::PlacementBarrier, false);
         set_off(Defence::ConvergeLeadershipProof, false);
+        set_off(Defence::RetireAnswer, false);
+        set_off(Defence::LogGeneration, false);
     }
 }
 
@@ -262,6 +297,60 @@ enum Ending {
     Retarget(At),
 }
 
+/// How a family run crashes a node whose teardown holds a step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownCrash {
+    /// Its process crashes.
+    Process,
+    /// Its power is cut, under the run's data policy.
+    Power,
+    /// Its process crashes and its core journal's metadata file
+    /// (`journal.meta`) is lost.
+    MetadataLost,
+}
+
+/// A crash of the node a converging move drops, while its teardown of the
+/// group holds `step`: its restart starts the teardown again from its
+/// first ask, or reports a log it retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TeardownFault {
+    step: TeardownStep,
+    crash: TeardownCrash,
+}
+
+impl TeardownFault {
+    /// On a third of the draws, a fault at a drawn step, with a lost
+    /// `journal.meta` among the crashes only when `metadata_loss`: a node
+    /// that loses it opens the group's other replicas `Recovering`, which
+    /// an RF 2 group cannot spare.
+    fn drawn(draws: &mut SplitMix64, metadata_loss: bool) -> Option<Self> {
+        if draws.next_bounded(3) != 0 {
+            return None;
+        }
+        let steps = [
+            TeardownStep::Unregister,
+            TeardownStep::AwaitIdle,
+            TeardownStep::AskAgain,
+            TeardownStep::Retire,
+            TeardownStep::ForgetMetrics,
+        ];
+        let index = usize::try_from(draws.next_bounded(5)).unwrap_or(0);
+        let crash = match draws.next_bounded(3) {
+            0 => TeardownCrash::Process,
+            1 => TeardownCrash::Power,
+            _ if metadata_loss => TeardownCrash::MetadataLost,
+            _ => TeardownCrash::Process,
+        };
+        Some(Self {
+            step: steps
+                .get(index)
+                .copied()
+                .unwrap_or(TeardownStep::Unregister),
+            crash,
+        })
+    }
+}
+
 /// One move of a group's voters to fresh nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MoveDraw {
@@ -272,6 +361,8 @@ struct MoveDraw {
     /// The leader is cut off on the data plane while it moves.
     partition: bool,
     ending: Ending,
+    /// A crash of the node a converging move drops, mid-teardown.
+    teardown: Option<TeardownFault>,
 }
 
 impl MoveDraw {
@@ -281,11 +372,13 @@ impl MoveDraw {
         outgoing_leader: false,
         partition: false,
         ending: Ending::Converges,
+        teardown: None,
     };
 
     /// A move with every option drawn, for a group with `fresh` fresh
-    /// nodes.
-    fn drawn(draws: &mut SplitMix64, fresh: usize) -> Self {
+    /// nodes, a lost `journal.meta` among its teardown crashes only when
+    /// `metadata_loss`.
+    fn drawn(draws: &mut SplitMix64, fresh: usize, metadata_loss: bool) -> Self {
         let partition = draws.next_bounded(4) == 0;
         let outgoing_leader = draws.next_bounded(2) == 0;
         let at = if partition || draws.next_bounded(2) == 0 {
@@ -322,6 +415,7 @@ impl MoveDraw {
             outgoing_leader,
             partition,
             ending,
+            teardown: TeardownFault::drawn(draws, metadata_loss),
         }
     }
 }
@@ -619,6 +713,27 @@ impl Run {
             .expect("a surviving meta voter");
         let before = meta_checks::history_of(&self.cluster, survivor)
             .expect("the surviving meta voter applied a history");
+        self.accept_meta_loss(victims, &JOURNAL_GROUPS).await;
+        let nodes = self.nodes();
+        self.checks
+            .plan_applied(&self.cluster, &mut self.trace, "meta_plan", &nodes, before)
+            .await;
+        // I11 after the plan. Whether the plan restarted a replica, and
+        // whether its drivers and shell then still act (D11), is not
+        // checked here.
+        self.learned("meta_plan_applied").await;
+        self.formed("meta_plan_applied").await;
+        self.write(2).await;
+        self.append_data("meta_plan_applied").await;
+    }
+
+    /// The meta leader and one more meta voter, `victims`, lose their run
+    /// state, so their meta gates open `Recovering` and stall, and meta
+    /// recovers by a plan through `ursulactl recover-group --target meta
+    /// --accept-loss`: a meta loss accepted, whose history event drops every
+    /// retirement. Then each data group of `stalled` that the loss stalled
+    /// recovers by a data plan through the same tool.
+    async fn accept_meta_loss(&mut self, victims: [u64; 2], stalled: &[u32]) {
         for victim in victims {
             self.cluster.lose_run_state(victim).await;
         }
@@ -629,20 +744,10 @@ impl Run {
         let nodes = self.nodes();
         self.recover_meta(&nodes).await;
         self.step("meta_plan");
-        self.checks
-            .plan_applied(&self.cluster, &mut self.trace, "meta_plan", &nodes, before)
-            .await;
         self.cluster
-            .recover_data(&mut self.trace, "data_plans")
+            .recover_data(&mut self.trace, "data_plans", stalled)
             .await;
         self.step("data_plans");
-        // I11 after the plan. Whether the plan restarted a replica, and
-        // whether its drivers and shell then still act (D11), is not
-        // checked here.
-        self.learned("meta_plan_applied").await;
-        self.formed("meta_plan_applied").await;
-        self.write(2).await;
-        self.append_data("meta_plan_applied").await;
     }
 
     /// `ursulactl recover-group --target meta --accept-loss` over `nodes`:
@@ -841,7 +946,8 @@ impl Run {
         }
     }
 
-    /// I3 for one group: it settles live on `voters` within the move bound.
+    /// I3 for one group: it settles live on `voters` within the move bound,
+    /// and its replicas without a role are torn down.
     async fn settled(&mut self, phase: &str, group: u32, voters: &BTreeSet<u64>) {
         let voters = voters.clone();
         self.until(phase, I3, MOVE_BOUND, move |cluster| {
@@ -852,6 +958,83 @@ impl Run {
             })
         })
         .await;
+        self.torn_down(phase, group).await;
+    }
+
+    /// I3's teardown half and I5's record half for one group: no running
+    /// node holds a log of it without a role, and every retirement of it
+    /// is reported.
+    async fn torn_down(&mut self, phase: &str, group: u32) {
+        self.until(phase, I3, TEARDOWN_BOUND, move |cluster| {
+            cluster.unplaced_replica(group)
+        })
+        .await;
+        self.until(phase, I5, TEARDOWN_BOUND, move |cluster| {
+            cluster.unreported(group)
+        })
+        .await;
+    }
+
+    /// Waits until `node_id`'s teardown of `group` holds its step `step`,
+    /// then crashes the node as `crash` has it. A teardown that does not
+    /// reach the step is released, and the settle that follows judges it.
+    async fn crash_mid_teardown(&mut self, group: u32, node_id: u64, fault: TeardownFault) {
+        const PHASE: &str = "teardown_crash";
+        let TeardownFault { step, crash } = fault;
+        let held = self
+            .within(PHASE, TEARDOWN_BOUND, move |cluster| {
+                cluster.teardown_held(node_id, group, step)
+            })
+            .await;
+        if !held {
+            self.cluster.release_teardown(node_id, group, step);
+            return;
+        }
+        self.trace.push(SimEvent::FaultApplied {
+            phase: format!(
+                "node {node_id} crashes ({crash:?}) while its teardown of group {group} holds \
+                 {step:?}"
+            ),
+        });
+        match crash {
+            TeardownCrash::Process => {
+                self.cluster.stop_node(node_id).await;
+                self.cluster.start_node(node_id).await;
+            }
+            TeardownCrash::Power => self.power_loss_of(&[node_id]).await,
+            TeardownCrash::MetadataLost => {
+                self.cluster.lose_core_metadata(node_id).await;
+                self.cluster.start_node(node_id).await;
+            }
+        }
+        self.step("teardown_crashed");
+    }
+
+    /// Moves `group` back onto `from`, the voters it moved off (A to B to
+    /// A), once its last move settled: each node it returns to reopens its
+    /// retired log behind its gate. With `power`, the first returning node
+    /// loses its power once it runs the group again.
+    async fn move_back(&mut self, group: u32, from: &BTreeSet<u64>, power: bool) {
+        const PHASE: &str = "move_back";
+        let to = self.cluster.placed_voters(group);
+        let Some(returning) = from.difference(&to).copied().min() else {
+            return;
+        };
+        self.trace.push(SimEvent::FaultApplied {
+            phase: format!("move group {group} from {to:?} back to {from:?}"),
+        });
+        self.accepted(PHASE, group, from, None).await;
+        if power
+            && self
+                .within(PHASE, MOVE_BOUND, move |cluster| {
+                    cluster.hosted_raft(returning, group).is_some()
+                })
+                .await
+        {
+            self.power_loss_of(&[returning]).await;
+        }
+        self.settled(PHASE, group, from).await;
+        self.append_data(PHASE).await;
     }
 
     /// The running leader of `group`, once it has one.
@@ -932,6 +1115,19 @@ impl Run {
         if to.len() != from.len() || to == from {
             return;
         }
+        // The node a converging move drops, crashed while its teardown
+        // holds the drawn step.
+        let crashed = match (draw.ending, draw.teardown) {
+            (Ending::Converges, Some(fault)) => from
+                .difference(&to)
+                .copied()
+                .min()
+                .map(|node_id| (node_id, fault)),
+            _ => None,
+        };
+        if let Some((node_id, fault)) = crashed {
+            self.cluster.hold_teardown(node_id, group, fault.step);
+        }
         let held = match draw.ending {
             Ending::Cancel(At::Held(step)) | Ending::Retarget(At::Held(step)) => Some(step),
             Ending::Converges | Ending::Cancel(At::After(_)) | Ending::Retarget(At::After(_)) => {
@@ -996,6 +1192,9 @@ impl Run {
         if let Some(step) = held {
             self.cluster.release(leader, group, step);
         }
+        if let Some((node_id, fault)) = crashed {
+            self.crash_mid_teardown(group, node_id, fault).await;
+        }
         self.settled(PHASE, group, &to).await;
         self.append_data(PHASE).await;
     }
@@ -1038,6 +1237,18 @@ impl Run {
         self.set_limit(2).await;
     }
 
+    /// [`Self::move_group`], then on a third of the draws the move back
+    /// onto the voters it left ([`Self::move_back`]), with a power loss of a
+    /// returning node on half of those.
+    async fn move_and_back(&mut self, group: u32, draw: MoveDraw, draws: &mut SplitMix64) {
+        let from = self.cluster.placed_voters(group);
+        self.move_group(group, draw).await;
+        if draws.next_bounded(3) == 0 {
+            let power = draws.next_bounded(2) == 0;
+            self.move_back(group, &from, power).await;
+        }
+    }
+
     /// The moves of `shape`, drawn.
     async fn moves(&mut self, shape: Shape, draws: &mut SplitMix64) {
         match shape {
@@ -1049,18 +1260,18 @@ impl Run {
                 for group in JOURNAL_GROUPS {
                     let fresh = self.fresh(group).len();
                     if fresh > 0 {
-                        let draw = MoveDraw::drawn(draws, fresh);
-                        self.move_group(group, draw).await;
+                        let draw = MoveDraw::drawn(draws, fresh, true);
+                        self.move_and_back(group, draw, draws).await;
                     }
                 }
             }
             Shape::Rf2 => {
                 for group in JOURNAL_GROUPS {
-                    let mut draw = MoveDraw::drawn(draws, 1);
+                    let mut draw = MoveDraw::drawn(draws, 1, false);
                     if draws.next_bounded(3) != 0 {
                         draw.partition = false;
                     }
-                    self.move_group(group, draw).await;
+                    self.move_and_back(group, draw, draws).await;
                 }
             }
             Shape::FullReplacement => {
@@ -1068,9 +1279,9 @@ impl Run {
                     full: true,
                     ..MoveDraw::ONE
                 };
-                self.move_group(0, full).await;
-                let draw = MoveDraw::drawn(draws, 1);
-                self.move_group(1, draw).await;
+                self.move_and_back(0, full, draws).await;
+                let draw = MoveDraw::drawn(draws, 1, false);
+                self.move_and_back(1, draw, draws).await;
             }
             Shape::Rf1 => {
                 self.cluster.drain(1);
@@ -1135,13 +1346,16 @@ impl Run {
     }
 
     /// The end of every placed run: every group settles live on its
-    /// placement (I3), and every voter reads every acknowledged append
-    /// (I1).
+    /// placement and its replicas without a role are torn down (I3, I5),
+    /// and every voter reads every acknowledged append (I1).
     async fn settle_and_read(&mut self) {
         self.cluster
             .groups_live(&mut self.trace, "groups_live")
             .await;
         self.step("groups_live");
+        for group in JOURNAL_GROUPS {
+            self.torn_down("groups_live", group).await;
+        }
         for group in JOURNAL_GROUPS {
             self.cluster
                 .placed_reads(&mut self.trace, "final_reads", group)
@@ -1184,6 +1398,8 @@ pub(super) async fn run_placement_move_inner(
         Controls::StaleStep { .. } => stale_step(seed).await,
         Controls::LaggingLeader { .. } => lagging_leader(seed, controls).await,
         Controls::DeposedReport { .. } => deposed_report(seed, controls).await,
+        Controls::ReplacedMidTeardown { .. } => replaced_mid_teardown(seed, controls).await,
+        Controls::ReopenedRetiredLog { .. } => reopened_retired_log(seed).await,
     }
 }
 
@@ -1563,6 +1779,144 @@ async fn deposed_report(seed: u64, controls: Controls) -> ThreeNodeRaftSimOutcom
     run.finish()
 }
 
+/// `negative_control_retire_answer` (N4): group 0's voter z, a node outside
+/// the meta voters, is moved off the group (by way of a first move that
+/// makes a spare its voter, when no voter but the leader is outside them),
+/// and its teardown holds before it closes the replica. Group 0's
+/// leadership goes to a voter the meta loss spares, and the meta leader and
+/// one more meta voter lose their run state: meta recovers by a plan, whose
+/// history event drops z's retirement. The group moves back onto z, whose
+/// replica still runs, and its leader makes z a voter again. z's teardown
+/// then asks again and finds itself a voter, so its log stays. With the
+/// defence off from the release on, z retires the log of a voter (I8). z's
+/// teardown also holds before it forgets the retired replica, for the rest
+/// of the run, which only the undefended run reaches: otherwise the next
+/// driver pass would reopen the retired log as the voter's
+/// (`Admission::Create`), and the retired log would show for one pass only.
+async fn replaced_mid_teardown(seed: u64, controls: Controls) -> ThreeNodeRaftSimOutcome {
+    const PHASE: &str = "replaced_mid_teardown";
+    const GROUP: u32 = 0;
+    const HELD: TeardownStep = TeardownStep::Unregister;
+    const RETIRED: TeardownStep = TeardownStep::ForgetMetrics;
+    let (mut run, roles) = placed_five(seed).await;
+    let outside_meta = |nodes: &[u64]| {
+        nodes
+            .iter()
+            .copied()
+            .find(|node_id| !META_VOTERS.contains(node_id))
+    };
+    let (z, voters) = match outside_meta(&roles.others) {
+        Some(z) => (z, roles.voters.clone()),
+        None => {
+            let z = outside_meta(&roles.spares).expect("a node outside the meta voters");
+            let voters = roles.with(roles.others[1], z);
+            run.accepted(PHASE, GROUP, &voters, None).await;
+            run.settled(PHASE, GROUP, &voters).await;
+            (z, voters)
+        }
+    };
+    let x = run
+        .fresh(GROUP)
+        .first()
+        .copied()
+        .expect("a node outside the group");
+    let mut dropped = voters.clone();
+    dropped.remove(&z);
+    dropped.insert(x);
+    run.cluster.hold_teardown(z, GROUP, HELD);
+    run.accepted(PHASE, GROUP, &dropped, None).await;
+    assert!(
+        run.within(PHASE, TEARDOWN_BOUND, move |cluster| {
+            cluster.teardown_held(z, GROUP, HELD)
+        })
+        .await,
+        "node {z} never held its teardown of group {GROUP}"
+    );
+    let victims = run.leader_and_one_voter();
+    let keeper = dropped
+        .iter()
+        .copied()
+        .find(|node_id| !victims.contains(node_id))
+        .expect("a voter the meta loss spares");
+    let leader = run.leader(PHASE, GROUP).await;
+    if leader != keeper {
+        run.transfer(PHASE, GROUP, leader, keeper).await;
+    }
+    run.accept_meta_loss(victims, &[1]).await;
+    run.learned(PHASE).await;
+    run.accepted(PHASE, GROUP, &voters, None).await;
+    let back = voters.clone();
+    run.until(PHASE, I3, MOVE_BOUND, move |cluster| {
+        (cluster.committed_voters(GROUP).as_ref() != Some(&back)).then(|| {
+            format!("group {GROUP}'s committed membership is not {back:?} with node {z} a voter")
+        })
+    })
+    .await;
+    defence_off_from_here(
+        Defence::RetireAnswer,
+        controls == Controls::ReplacedMidTeardown { defended: false },
+    );
+    run.cluster.hold_teardown(z, GROUP, RETIRED);
+    run.cluster.release_teardown(z, GROUP, HELD);
+    // Defended, z's second ask hears that it is a voter, so its teardown
+    // ends before it retires and the watch runs out. Undefended, the poll
+    // that sees z hold before it forgets has already failed I8.
+    let retired = run
+        .within(PHASE, RETIRE_WATCH, move |cluster| {
+            cluster.teardown_held(z, GROUP, RETIRED)
+        })
+        .await;
+    assert!(
+        !retired,
+        "node {z} retired its log of group {GROUP}, a voter's, and I8 passed"
+    );
+    run.settled(PHASE, GROUP, &voters).await;
+    run.settle_and_read().await;
+    run.finish()
+}
+
+/// `negative_control_log_generation` (N6): group 0 moves voter c off and
+/// back onto it (A to B to A), c cut off on the data plane before the move
+/// back, so its reopened log takes nothing. c's power is cut, and its log
+/// opens again empty, its retired life's frames of an older generation.
+/// With the defence off the retirement keeps the generation, and the
+/// reopened log replays the retired life (I5).
+async fn reopened_retired_log(seed: u64) -> ThreeNodeRaftSimOutcome {
+    const PHASE: &str = "reopened_retired_log";
+    const GROUP: u32 = 0;
+    let (mut run, roles) = placed_five(seed).await;
+    let [_, c] = roles.others;
+    let [x, _] = roles.spares;
+    let away = roles.with(c, x);
+    run.accepted(PHASE, GROUP, &away, None).await;
+    run.append_data(PHASE).await;
+    run.settled(PHASE, GROUP, &away).await;
+    run.cluster.cut_data(c);
+    run.accepted(PHASE, GROUP, &roles.voters, None).await;
+    run.until(PHASE, I3, MOVE_BOUND, move |cluster| {
+        cluster
+            .hosted_raft(c, GROUP)
+            .is_none()
+            .then(|| format!("node {c} did not reopen its retired log of group {GROUP}"))
+    })
+    .await;
+    run.power_loss_of(&[c]).await;
+    run.until(PHASE, I5, MOVE_BOUND, move |cluster| {
+        cluster.hosted_raft(c, GROUP).is_none().then(|| {
+            format!("node {c}'s reopened log of group {GROUP} does not open after its power loss")
+        })
+    })
+    .await;
+    if let Some(replayed) = run.cluster.replayed_life(c, GROUP).await {
+        meta_checks::fail(&mut run.trace, I5, PHASE, replayed);
+    }
+    run.cluster.heal_data(c);
+    run.step(PHASE);
+    run.settled(PHASE, GROUP, &roles.voters).await;
+    run.settle_and_read().await;
+    run.finish()
+}
+
 /// `negative_control_genesis_probes_every_peer`: the meta voters lose their
 /// disks while nodes 4 and 5 keep meta history. Their genesis node asks
 /// every peer, and the learners' answers hold the genesis back. With the
@@ -1644,6 +1998,7 @@ mod tests {
     use crate::madsim_harness::meta_checks::I10;
     use crate::madsim_harness::meta_checks::I12;
     use crate::madsim_harness::placed_hosting::I2;
+    use crate::madsim_harness::placed_hosting::I5;
     use crate::madsim_harness::placed_hosting::I8;
     use crate::madsim_harness::placed_hosting::I9;
     use crate::madsim_harness::tests::sim_test_guard;
@@ -1804,6 +2159,35 @@ mod tests {
             "deposed_report",
         );
         assert!(message.contains("were committed before"), "{message}");
+    }
+
+    /// A replica its group made a voter again while its teardown ran retires
+    /// the voter's log when the teardown goes on without the group's
+    /// answers.
+    #[test]
+    fn negative_control_retire_answer() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ReplacedMidTeardown { defended: true },
+            Controls::ReplacedMidTeardown { defended: false },
+            I8,
+            "replaced_mid_teardown",
+        );
+        assert!(message.contains("retired its log"), "{message}");
+    }
+
+    /// A log retired in the generation it lived in replays its retired life
+    /// once it reopened and opens again.
+    #[test]
+    fn negative_control_log_generation() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ReopenedRetiredLog { defended: true },
+            Controls::ReopenedRetiredLog { defended: false },
+            I5,
+            "reopened_retired_log",
+        );
+        assert!(message.contains("reopened log"), "{message}");
     }
 
     /// A meta journal under the data policy `never` loses acknowledged

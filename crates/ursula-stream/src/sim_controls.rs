@@ -265,6 +265,16 @@ pub enum Defence {
     /// sent (N24 of the identity fence, with `FencedLeadership`). Off, a
     /// fenced process's cold writes are sent.
     ColdWriteCheck,
+    /// A teardown passes its first step and retires the log only on a live
+    /// leader's `NotMember` answer (N4 of design 15.2). Off, every ask
+    /// hears `NotMember`, so a replica whose group made it a voter again
+    /// while its teardown ran retires its log.
+    RetireAnswer,
+    /// A retirement records the group's log in its next generation, so
+    /// replay keeps no frame of the retired life (N6). Off, the retirement
+    /// keeps the generation, and a reopened log replays its retired life's
+    /// frames at its next start.
+    LogGeneration,
 }
 
 #[cfg(madsim)]
@@ -274,8 +284,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 53]> = const { Cell::new([false; 53]) };
-        static FIRED: Cell<[u64; 53]> = const { Cell::new([0; 53]) };
+        static OFF: Cell<[bool; 55]> = const { Cell::new([false; 55]) };
+        static FIRED: Cell<[u64; 55]> = const { Cell::new([0; 55]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -333,6 +343,8 @@ mod switches {
             Defence::WaitCoversObjects => 50,
             Defence::ObjectWriteCheck => 51,
             Defence::ColdWriteCheck => 52,
+            Defence::RetireAnswer => 53,
+            Defence::LogGeneration => 54,
         }
     }
 
@@ -355,7 +367,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 53]));
+        FIRED.with(|fired| fired.set([0; 55]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

@@ -753,6 +753,21 @@ impl MetaCluster {
         SimDisk::sync_dir(&root).expect("sync the node's root");
     }
 
+    /// Kills `node_id`'s process and removes the metadata file
+    /// (`journal.meta`) of the core journal its data groups share, as a host
+    /// that lost it does: the core's next open finds each group's
+    /// generation and state from its frames and snapshot records alone.
+    pub(super) async fn lose_core_metadata(&mut self, node_id: u64) {
+        let record = self.data.wals[&node_id]
+            .snapshot_metadata_path(super::journal_cluster::group_placement(0));
+        self.stop_node(node_id).await;
+        let core = record
+            .parent()
+            .expect("a snapshot record lies in its core's journal");
+        SimDisk::remove_file(&core.join("journal.meta")).expect("remove the core's metadata");
+        SimDisk::sync_dir(core).expect("sync the core journal's directory");
+    }
+
     /// Stops `node_id` and gives it an empty disk, data and meta journals
     /// alike.
     pub(super) async fn wipe(&mut self, node_id: u64, name: &str) {

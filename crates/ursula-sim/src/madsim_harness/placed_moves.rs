@@ -1,8 +1,9 @@
 //! What the `placement-move` family does to a placed [`MetaCluster`] to
 //! move its groups (design 15.2): control commands through a node's meta
 //! handle, as `ursulactl` sends them to the admin plane, held reconcile
-//! steps through the node's one pause registry
-//! ([`MetaPausePoint::ShellStep`]), leadership transfers through OpenRaft,
+//! and teardown steps through the node's one pause registry
+//! ([`MetaPausePoint::ShellStep`], [`MetaPausePoint::Teardown`]),
+//! leadership transfers through OpenRaft,
 //! partitions of one plane, and a drained node. The family's runs
 //! ([`super::placement_move`]) wait on the results with their checks.
 
@@ -11,6 +12,7 @@ use std::collections::BTreeSet;
 use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
 use ursula_control::MoveLimit;
+use ursula_control::TeardownStep;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::ReconcileState;
 use ursula_proto::placement::StepKind;
@@ -32,6 +34,14 @@ pub(super) fn voter_set(nodes: &BTreeSet<u64>) -> VoterSet {
 fn shell_step(group: u32, step: StepKind) -> MetaPausePoint {
     MetaPausePoint::ShellStep {
         target: RaftTarget::Data(RaftGroupId(group)),
+        step,
+    }
+}
+
+/// The pause point of a teardown step of `group`.
+fn teardown_step(group: u32, step: TeardownStep) -> MetaPausePoint {
+    MetaPausePoint::Teardown {
+        group: RaftGroupId(group),
         step,
     }
 }
@@ -132,6 +142,34 @@ impl MetaCluster {
             .find(|snapshot| snapshot.raft_group_id == group)
             .and_then(|snapshot| snapshot.reconcile)
             .is_some_and(|status| status.state == published)
+    }
+
+    /// Closes `node_id`'s pause point before its teardown of `group` runs
+    /// step `step`, until [`Self::release_teardown`].
+    pub(super) fn hold_teardown(&self, node_id: u64, group: u32, step: TeardownStep) {
+        drop(
+            self.registry(node_id)
+                .pauses()
+                .pause(teardown_step(group, step)),
+        );
+    }
+
+    /// Opens what [`Self::hold_teardown`] closed on `node_id`, if its
+    /// process still runs.
+    pub(super) fn release_teardown(&self, node_id: u64, group: u32, step: TeardownStep) {
+        self.registry(node_id)
+            .pauses()
+            .release(teardown_step(group, step));
+    }
+
+    /// Whether `node_id`'s teardown of `group` waits at its held step
+    /// `step`.
+    pub(super) fn teardown_held(&self, node_id: u64, group: u32, step: TeardownStep) -> bool {
+        self.runtimes.contains_key(&node_id)
+            && self
+                .registry(node_id)
+                .pauses()
+                .waiting(teardown_step(group, step))
     }
 
     /// Asks `from`'s replica of `group` to hand its leadership to `to`,

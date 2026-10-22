@@ -1266,6 +1266,15 @@ impl CoreFileLogWriter {
                     raft_group_id,
                 }
             })?;
+            // With `Defence::LogGeneration` off the retirement keeps the
+            // generation, so a reopen of the group replays its retired life.
+            let generation = if ursula_stream::sim_controls::off(
+                ursula_stream::sim_controls::Defence::LogGeneration,
+            ) {
+                recorded.generation
+            } else {
+                generation
+            };
             // The group's log stays in `logs`, pinning its segments, and
             // its entry in `recorded`, until the writer made the retirement
             // durable.
