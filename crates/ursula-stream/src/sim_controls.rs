@@ -234,6 +234,23 @@ pub enum Defence {
     /// convergence (N9). Off, a deposed leader reports the membership it
     /// last committed after a later leader changed it.
     ConvergeLeadershipProof,
+    /// A replica whose last run did not end cleanly replaces a committed
+    /// vote for itself with the same vote uncommitted before its group
+    /// starts, so it starts as a follower (N16 of the identity fence, T3).
+    /// Off, OpenRaft restores it as the leader of that term, and it appends
+    /// under the log ids of entries it lost while a follower keeps them.
+    CrashedLeaderDemotion,
+    /// A process whose fence does not admit sends no Raft request and
+    /// counts no answer that reaches it (the sender and arrival lease
+    /// checks, item 20(a) of the identity fence). Off, a fenced leader
+    /// keeps sending heartbeats and appends and counts their answers.
+    SendLease,
+    /// The one leader predicate (`GroupLeadership::of`) reads the node
+    /// fence: a replica leads nothing while the fence does not admit, and
+    /// after a lift only once a quorum acknowledged it (N24 of the identity
+    /// fence). Off, it reads OpenRaft's server state alone, so a fenced
+    /// leader starts linearizable reads and leader-gated jobs.
+    FencedLeadership,
 }
 
 #[cfg(madsim)]
@@ -243,8 +260,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 47]> = const { Cell::new([false; 47]) };
-        static FIRED: Cell<[u64; 47]> = const { Cell::new([0; 47]) };
+        static OFF: Cell<[bool; 50]> = const { Cell::new([false; 50]) };
+        static FIRED: Cell<[u64; 50]> = const { Cell::new([0; 50]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -296,6 +313,9 @@ mod switches {
             Defence::MembershipCas => 44,
             Defence::PlacementBarrier => 45,
             Defence::ConvergeLeadershipProof => 46,
+            Defence::CrashedLeaderDemotion => 47,
+            Defence::SendLease => 48,
+            Defence::FencedLeadership => 49,
         }
     }
 
@@ -318,7 +338,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 47]));
+        FIRED.with(|fired| fired.set([0; 50]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

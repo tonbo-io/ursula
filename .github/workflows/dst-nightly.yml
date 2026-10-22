@@ -183,7 +183,8 @@ jobs:
             --seed-family snapshot-objects-stay-owned-extended \
             --seed-family placement-move \
             --seed-family placement-move-extended \
-            --seed-family identity-fence
+            --seed-family identity-fence \
+            --seed-family identity-fence-extended
 
       # Bounded-state DST default seeds (bounded-stream-state DST invariants): producer
       # state across a mid-stream snapshot install (F3, Invariant 12; fixed seed), external

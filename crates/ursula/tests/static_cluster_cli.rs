@@ -6397,17 +6397,20 @@ async fn cli_restarts_on_the_same_boot_owe_no_predecessor_wait() {
     expected.extend(loaded);
     // What node 3 applies reaches each group's committed index within the
     // bound, through the leaders that streamed to its old process. A node
-    // whose metrics fail reports nothing, so the check waits until some
-    // leader reported, rather than pass with nothing to compare.
+    // whose metrics fail reports nothing, so the check waits until a leader
+    // reported every group, rather than pass with a group left out.
     let committed = eventually(
         &mut procs,
-        "a leader reports its committed index",
+        "every group's leader reports its committed index",
         async || {
             let committed = leaders_committed(&client, &nodes).await;
-            if committed.is_empty() {
-                Err("no leader reported a committed index".to_owned())
-            } else {
+            if committed.len() == META_TEST_GROUPS {
                 Ok(committed)
+            } else {
+                Err(format!(
+                    "leaders reported the committed index of groups {:?}, of {META_TEST_GROUPS}",
+                    committed.keys().collect::<Vec<_>>()
+                ))
             }
         },
     )

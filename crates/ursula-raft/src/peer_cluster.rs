@@ -220,11 +220,24 @@ impl From<SenderFenced> for tonic::Status {
 /// The sender's fence check before a Raft request leaves this node, and
 /// at an answer's arrival.
 pub(crate) fn check_sender_fence(fence: &NodeFence) -> Result<(), SenderFenced> {
-    if fence.admits_now() {
+    if fence.admits_now() || !send_lease() {
         Ok(())
     } else {
         Err(SenderFenced)
     }
+}
+
+/// Whether a fence that does not admit stops this node's Raft requests and
+/// the answers that reach it, read only when it would. A negative control
+/// turns it off (`Defence::SendLease`), and a fenced process then sends and
+/// counts as an admitted one does.
+fn send_lease() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::SendLease) {
+        ursula_stream::sim_controls::note_fired(Defence::SendLease);
+        return false;
+    }
+    true
 }
 
 /// Whether a sender judges an answer's stamp before it counts the answer
@@ -617,7 +630,7 @@ impl PeerCluster {
         let Some(bound) = bound.as_deref() else {
             return Ok(());
         };
-        let judged = if !bound.identity.fence().admits_now() {
+        let judged = if !bound.identity.fence().admits_now() && send_lease() {
             Err(Discarded::Fenced)
         } else if bound.identity.incarnation().is_none() {
             return Ok(());
