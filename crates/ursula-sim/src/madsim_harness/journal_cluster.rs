@@ -626,7 +626,7 @@ impl JournalCluster {
         let registry = self.registries[&group].clone();
         let mut config = (*self.config).clone();
         config.enable_elect = ursula_raft::ElectionPolicy::default().may_campaign(Some(&rejoin));
-        let mut options = RaftGroupEngineOptions::default();
+        let mut options = RaftGroupEngineOptions::gated(rejoin.clone());
         if self.drivers.is_some() {
             options.snapshot_build = Some(self.coordinator(node_id));
             // A node whose driver purges its log through snapshots restores
@@ -637,7 +637,6 @@ impl JournalCluster {
             .faulty
             .filter(|(faulty, _)| *faulty == group)
             .map(|(_, fault)| fault);
-        options.recovery = Some(rejoin.clone());
         if let Some(objects) = &mut self.snapshot_objects {
             // The node process's store, and the install coordinator its
             // replicas share, as the node's engine factory wires them.

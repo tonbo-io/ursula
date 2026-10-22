@@ -268,9 +268,8 @@ async fn new_recovery_engine(
         GrpcRaftNetworkFactory::new(transport, data_target()),
         store.clone(),
         RaftGroupEngineOptions {
-            recovery: Some(gate.clone()),
             peer_cluster: Some(peer_cluster),
-            ..Default::default()
+            ..RaftGroupEngineOptions::gated(gate.clone())
         },
     )
     .await

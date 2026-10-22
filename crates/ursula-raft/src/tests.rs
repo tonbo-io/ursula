@@ -229,6 +229,14 @@ fn sim_journal_store(name: &str) -> Arc<RaftGroupFileLogStore> {
         .expect("open the log store")
 }
 
+/// The recovery gate of `node_id`'s replica of [`placement`]'s group on
+/// `store`, opened as the engine factories open one.
+async fn gate_of(node_id: u64, store: &Arc<RaftGroupFileLogStore>) -> Arc<GroupRejoin> {
+    RaftGroupEngineOptions::gated_on(node_id, placement(), store)
+        .await
+        .recovery
+}
+
 /// A fresh WAL on the simulated disk.
 #[cfg(madsim)]
 fn sim_wal(name: &str) -> RaftWal {
@@ -824,19 +832,15 @@ async fn build_three_node_cluster_gating(
             network = network.with_policy(policy.clone());
         }
         let (wal_root, log_store) = fresh_journal_store();
-        let node_gate = if gated == Some(node_id) {
-            Some(Arc::new(
-                GroupRejoin::durable(
-                    node_id,
-                    ursula_shard::RaftTarget::Data(placement().raft_group_id),
-                    &log_store,
-                )
-                .await
-                .expect("open the gate"),
-            ))
-        } else {
-            None
-        };
+        let node_gate = Arc::new(
+            GroupRejoin::durable(
+                node_id,
+                ursula_shard::RaftTarget::Data(placement().raft_group_id),
+                &log_store,
+            )
+            .await
+            .expect("open the gate"),
+        );
         let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             placement(),
             node_id,
@@ -844,17 +848,16 @@ async fn build_three_node_cluster_gating(
             network,
             log_store,
             RaftGroupEngineOptions {
-                recovery: node_gate.clone(),
                 peer_cluster: Some(crate::peer_cluster::test_peer_cluster_with(
                     node_id,
                     peers.clone(),
                 )),
-                ..Default::default()
+                ..RaftGroupEngineOptions::gated(node_gate.clone())
             },
         )
         .await
         .expect("create cluster raft group node");
-        if let Some(node_gate) = node_gate {
+        if gated == Some(node_id) {
             // Bound before the node is reachable, so it never campaigns.
             engine
                 .publish_recovery(node_gate.clone(), &RaftGroupHandleRegistry::default())
@@ -2935,6 +2938,8 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
         node.spawn(crate::sim_runtime::MadsimOpenRaftRuntime::scope(
             node_seed,
             async move {
+                let store = sim_journal_store(&format!("raft-node-{node_id}"));
+                let gate = gate_of(node_id, &store).await;
                 let engine = RaftGroupEngine::new_node_with_log_store_and_network(
                     placement(),
                     node_id,
@@ -2942,9 +2947,8 @@ async fn build_madsim_three_node_raft_cluster_with_policy(
                     InProcessRaftNetworkFactory::new(registry_for_node)
                         .with_source(node_id)
                         .with_policy(policy_for_node),
-                    sim_journal_store(&format!("raft-node-{node_id}")),
-                    None,
-                    None,
+                    store,
+                    gate,
                 )
                 .await
                 .expect("create simulated raft group node");
@@ -2997,14 +3001,14 @@ async fn openraft_installs_snapshot_for_lagging_learner() {
     for node_id in 1..=3 {
         let (wal_root, log_store) = fresh_journal_store();
         wal_roots.push(wal_root);
+        let gate = gate_of(node_id, &log_store).await;
         let engine = RaftGroupEngine::new_node_with_log_store_and_network(
             placement(),
             node_id,
             config.clone(),
             InProcessRaftNetworkFactory::new(registry.clone()).with_source(node_id),
             log_store,
-            None,
-            None,
+            gate,
         )
         .await
         .expect("create cluster raft group node");
@@ -4279,44 +4283,30 @@ async fn registry_handoff_rejects_invalid_targets_and_transfers_to_a_healthy_vot
     shutdown_all(&engines).await;
 }
 
-/// A group with a recovery gate runs with OpenRaft's log reversion allowed,
-/// so its leader rewinds a follower that lost entries in place. A group
-/// without one keeps OpenRaft's default, which refuses it.
+/// Every replica runs behind its recovery gate, so with OpenRaft's log
+/// reversion allowed: its leader rewinds a follower that lost entries in
+/// place. The config the engine was given is left as it was.
 #[cfg(not(madsim))]
 #[tokio::test]
-async fn only_a_gated_group_allows_follower_log_reversion() {
+async fn every_replica_allows_follower_log_reversion() {
     let config = raft_config("log-reversion", 30, 60);
-    for gated in [true, false] {
-        let (_root, store) = fresh_journal_store();
-        let mut options = RaftGroupEngineOptions::default();
-        if gated {
-            options.recovery = Some(Arc::new(
-                GroupRejoin::durable(
-                    1,
-                    ursula_shard::RaftTarget::Data(placement().raft_group_id),
-                    &store,
-                )
-                .await
-                .expect("open the gate"),
-            ));
-        }
-        let engine = RaftGroupEngine::new_node(
-            placement(),
-            1,
-            config.clone(),
-            SingleNodeRaftNetworkFactory,
-            store,
-            options,
-        )
-        .await
-        .expect("start the replica");
-        assert_eq!(
-            engine.raft_handle().config().allow_log_reversion,
-            gated.then_some(true),
-            "gated: {gated}"
-        );
-        engine.shutdown().await.expect("stop the replica");
-    }
+    let (_root, store) = fresh_journal_store();
+    let options = RaftGroupEngineOptions::gated_on(1, placement(), &store).await;
+    let engine = RaftGroupEngine::new_node(
+        placement(),
+        1,
+        config.clone(),
+        SingleNodeRaftNetworkFactory,
+        store,
+        options,
+    )
+    .await
+    .expect("start the replica");
+    assert_eq!(
+        engine.raft_handle().config().allow_log_reversion,
+        Some(true)
+    );
+    engine.shutdown().await.expect("stop the replica");
     assert_eq!(
         config.allow_log_reversion, None,
         "the shared config is unchanged"
@@ -5391,6 +5381,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
 
     let store = reopen_journal_store(&wal);
     let snapshot_record = store.snapshot_record();
+    let options = RaftGroupEngineOptions::gated_on(1, placement(), &store).await;
     let opened = RaftGroupEngine::new_node(
         placement(),
         1,
@@ -5400,7 +5391,7 @@ async fn a_log_below_its_restored_snapshot_refuses_to_open() {
         RaftGroupEngineOptions {
             snapshot_record: Some(snapshot_record),
             peer_cluster: Some(crate::peer_cluster::test_peer_cluster(1)),
-            ..Default::default()
+            ..options
         },
     )
     .await;
@@ -6179,6 +6170,7 @@ async fn the_in_process_network_holds_a_sent_object_until_its_rpc_returns() {
     for node_id in 1..=3_u64 {
         let (wal_root, log_store) = fresh_journal_store();
         wal_roots.push(wal_root);
+        let options = RaftGroupEngineOptions::gated_on(node_id, placement(), &log_store).await;
         let engine = RaftGroupEngine::new_node_with_log_store_network_and_options(
             placement(),
             node_id,
@@ -6187,7 +6179,7 @@ async fn the_in_process_network_holds_a_sent_object_until_its_rpc_returns() {
             log_store,
             RaftGroupEngineOptions {
                 snapshot_store: Some(stores[usize::try_from(node_id - 1).unwrap()].clone()),
-                ..RaftGroupEngineOptions::default()
+                ..options
             },
         )
         .await

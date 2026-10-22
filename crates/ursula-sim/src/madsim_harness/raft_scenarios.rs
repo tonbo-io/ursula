@@ -11,7 +11,6 @@ use super::Duration;
 use super::GroupEngine;
 use super::InProcessRaftFaultAction;
 use super::InProcessRaftFaultScript;
-use super::InProcessRaftNetworkFactory;
 #[cfg(test)]
 use super::RaftCommand;
 use super::RaftGroupEngine;
@@ -790,18 +789,17 @@ pub(super) async fn run_restart_follower_inner(
         log_index: appended_log_index,
     });
 
-    let restarted = RaftGroupEngine::new_node_with_log_store_and_network(
-        placement(),
+    let restarted = super::recovery_wiring::start_gated_replica(
         restarted_id,
-        raft_config,
-        InProcessRaftNetworkFactory::new(registry.clone())
-            .with_source(restarted_id)
-            .with_policy(policy),
+        placement(),
+        &raft_config,
         wals[restarted_index]
             .open(placement(), standalone_wal_metrics(placement()))
             .await,
-        None,
-        None,
+        |options| options,
+        &registry,
+        &policy,
+        &super::recovery_wiring::fixed_placement(restarted_id, 1..=3),
     )
     .await
     .expect("restart follower from its journal");
@@ -995,18 +993,17 @@ pub(super) async fn run_leader_failover_inner(
         log_index: after.group_commit_index,
     });
 
-    let restarted = RaftGroupEngine::new_node_with_log_store_and_network(
-        placement(),
+    let restarted = super::recovery_wiring::start_gated_replica(
         old_leader_id,
-        raft_config,
-        InProcessRaftNetworkFactory::new(registry.clone())
-            .with_source(old_leader_id)
-            .with_policy(policy),
+        placement(),
+        &raft_config,
         wals[old_leader_index]
             .open(placement(), standalone_wal_metrics(placement()))
             .await,
-        None,
-        None,
+        |options| options,
+        &registry,
+        &policy,
+        &super::recovery_wiring::fixed_placement(old_leader_id, 1..=3),
     )
     .await
     .expect("restart old leader from its journal");

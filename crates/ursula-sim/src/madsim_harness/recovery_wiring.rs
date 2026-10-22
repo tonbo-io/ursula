@@ -152,6 +152,64 @@ pub(super) fn wire_recovery(
         .expect("bind and publish recovery before network registration");
 }
 
+/// Starts `node_id`'s replica of `placement` on `store` over the group's
+/// in-process network, as the placed engine factory starts one: the
+/// recovery gate from the store first, then the Raft core, which campaigns
+/// only once the gate lets it, then the node's recovery drivers over
+/// `inputs` ([`wire_recovery`]). The bootstrap driver of `inputs`'
+/// initializer forms a fresh group once every voter reported it empty, so
+/// nothing initializes it by hand. `options` adds the engine's other
+/// capabilities to the gated ones. The drivers are the engine's and stop
+/// with it, and each start is a process of its own, with a registry of its
+/// own. The caller registers the engine on the network.
+pub(super) async fn start_gated_replica(
+    node_id: u64,
+    placement: ShardPlacement,
+    config: &openraft::Config,
+    store: Arc<ursula_raft::RaftGroupFileLogStore>,
+    options: impl FnOnce(ursula_raft::RaftGroupEngineOptions) -> ursula_raft::RaftGroupEngineOptions,
+    registry: &InProcessRaftRegistry,
+    policy: &InProcessRaftNetworkPolicy,
+    inputs: &FixedPlacement,
+) -> Result<RaftGroupEngine, ursula_runtime::GroupEngineError> {
+    let rejoin = Arc::new(
+        GroupRejoin::durable(node_id, RaftTarget::Data(placement.raft_group_id), &store)
+            .await
+            .expect("open the recovery gate"),
+    );
+    let recovery_registry = RaftGroupHandleRegistry::default();
+    let config = openraft::Config {
+        enable_elect: recovery_registry
+            .election_policy()
+            .may_campaign(Some(&rejoin)),
+        ..config.clone()
+    };
+    let engine = RaftGroupEngine::new_node(
+        placement,
+        node_id,
+        Arc::new(config),
+        ursula_raft::InProcessRaftNetworkFactory::new(registry.clone())
+            .with_source(node_id)
+            .with_policy(policy.clone()),
+        store,
+        options(ursula_raft::RaftGroupEngineOptions::gated(Arc::clone(
+            &rejoin,
+        ))),
+    )
+    .await?;
+    wire_recovery(
+        node_id,
+        placement,
+        &engine,
+        &rejoin,
+        registry,
+        policy,
+        inputs,
+        &recovery_registry,
+    );
+    Ok(engine)
+}
+
 #[derive(Clone)]
 struct InProcessRecoveryTransport {
     registry: InProcessRaftRegistry,

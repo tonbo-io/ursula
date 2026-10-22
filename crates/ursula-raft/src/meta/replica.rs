@@ -568,7 +568,7 @@ impl MetaReplica {
                 election.may_campaign(Some(&gate)),
             ))
             .map_err(MetaReplicaError::Config)?;
-        let raft_config = crate::engine::config_for_recovery(Arc::new(raft_config), true);
+        let raft_config = crate::engine::config_for_recovery(Arc::new(raft_config));
         let raft = Raft::new(config.node, raft_config, network, store, state_machine)
             .await
             .map_err(MetaReplicaError::Raft)?;

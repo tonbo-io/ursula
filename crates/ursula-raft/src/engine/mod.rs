@@ -156,8 +156,9 @@ use crate::types::RaftCommand;
 use crate::types::SnapshotData;
 use crate::types::UrsulaRaftTypeConfig;
 
-/// Optional capabilities of a group engine, independent of its transport and log store.
-#[derive(Default)]
+/// The capabilities of a group engine, independent of its transport and
+/// log store: its recovery gate, which every engine carries, and the
+/// optional rest ([`Self::gated`]).
 pub struct RaftGroupEngineOptions {
     pub(crate) apply_stop_signal: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Faulty code for tests and simulations; production has none.
@@ -175,13 +176,14 @@ pub struct RaftGroupEngineOptions {
     ///
     /// [`RaftGroupFileLogStore::snapshot_record`]: crate::RaftGroupFileLogStore::snapshot_record
     pub snapshot_record: Option<crate::SnapshotRecord>,
-    /// The replica's recovery gate. Its recovery plan fences the history
-    /// before the Raft core starts, so a plan's leader that restarts never
-    /// leads without it (N1, #581 review). A gated engine runs OpenRaft with
-    /// log reversion allowed, so its leader rewinds a follower that lost
-    /// entries in place (`config_for_recovery`). The gate is bound later by
+    /// The replica's recovery gate, which every engine carries. Its
+    /// recovery plan fences the history before the Raft core starts, so a
+    /// plan's leader that restarts never leads without it (N1, #581
+    /// review). The engine runs OpenRaft with log reversion allowed, so its
+    /// leader rewinds a follower that lost entries in place
+    /// (`config_for_recovery`). The gate is bound later by
     /// [`RaftGroupEngine::publish_recovery`], which binds no other gate.
-    pub recovery: Option<Arc<crate::GroupRejoin>>,
+    pub recovery: Arc<crate::GroupRejoin>,
     /// This node's side of the cluster-id check: its identity, stamped on
     /// the reads and purges it forwards to a leader, and where a leader's
     /// refusal is recorded. `None` for a replica without a gRPC transport.
@@ -202,6 +204,44 @@ pub struct RaftGroupEngineOptions {
 }
 
 impl RaftGroupEngineOptions {
+    /// The options of an engine behind `recovery`, with none of the
+    /// optional capabilities.
+    pub fn gated(recovery: Arc<crate::GroupRejoin>) -> Self {
+        Self {
+            apply_stop_signal: None,
+            #[cfg(any(test, madsim, feature = "fault-injection"))]
+            apply_fault: None,
+            metrics: None,
+            cold_store: None,
+            snapshot_store: None,
+            snapshot_build: None,
+            snapshot_install: None,
+            snapshot_record: None,
+            recovery,
+            peer_cluster: None,
+            fence: None,
+            #[cfg(test)]
+            work_stop_timeout: None,
+            engine_work: None,
+        }
+    }
+
+    /// The options of `node_id`'s engine of `placement`'s group on `store`,
+    /// behind the recovery gate the engine factories open from the store,
+    /// for a test that starts the engine below the recovery drivers.
+    #[cfg(test)]
+    pub(crate) async fn gated_on(
+        node_id: u64,
+        placement: ShardPlacement,
+        store: &Arc<crate::RaftGroupFileLogStore>,
+    ) -> Self {
+        Self::gated(Arc::new(
+            crate::GroupRejoin::durable(node_id, RaftTarget::Data(placement.raft_group_id), store)
+                .await
+                .expect("open the recovery gate"),
+        ))
+    }
+
     /// These options, with the engine recording its OpenRaft work in
     /// `wal`'s ledger as the node's engine factories record theirs (#709),
     /// for simulations that build their engines themselves.
@@ -226,8 +266,8 @@ pub(crate) struct StartupFault {
 pub struct RaftGroupEngine {
     /// The recovery gate the engine started with
     /// ([`RaftGroupEngineOptions::recovery`]), the only one
-    /// [`Self::publish_recovery`] binds: its Raft allows log reversion only
-    /// if it started gated.
+    /// [`Self::publish_recovery`] binds. `None` only for a forwarded read's
+    /// engine, which binds none.
     pub(crate) built_with_gate: Option<Arc<crate::GroupRejoin>>,
     pub(crate) rejoin: std::sync::Mutex<Option<Arc<crate::GroupRejoin>>>,
     /// The group's history on this replica, and the leader's fence while it
@@ -451,19 +491,15 @@ pub(crate) fn may_hold_only_for_a_lagging_state(error: &GroupEngineError) -> boo
     )
 }
 
-/// The OpenRaft config a group runs with. A group with a recovery gate
-/// (`gated`) allows log reversion: a follower that lost entries it had
-/// acknowledged answers a conflict below the index its leader saw it match,
-/// and the leader rewinds its progress for that follower and replicates its
-/// log to it again, in place. The gate is what makes that safe. A replica
-/// that may have lost acknowledged entries starts gated, votes for no
+/// The OpenRaft config a replica runs with behind its recovery gate: it
+/// allows log reversion. A follower that lost entries it had acknowledged
+/// answers a conflict below the index its leader saw it match, and the
+/// leader rewinds its progress for that follower and replicates its log to
+/// it again, in place. The gate is what makes that safe. A replica that may
+/// have lost acknowledged entries starts with its gate closed, votes for no
 /// candidate until it applied a fresh leader barrier, and the leader holds
-/// every committed entry. Without a gate OpenRaft keeps its default, under
-/// which such a conflict is a bug its debug assertion reports.
-pub(crate) fn config_for_recovery(config: Arc<Config>, gated: bool) -> Arc<Config> {
-    if !gated {
-        return config;
-    }
+/// every committed entry. Every replica, data or meta, runs behind a gate.
+pub(crate) fn config_for_recovery(config: Arc<Config>) -> Arc<Config> {
     let rewind =
         !ursula_stream::sim_controls::off(ursula_stream::sim_controls::Defence::FollowerRewind);
     Arc::new(Config {
@@ -511,15 +547,18 @@ impl RaftGroupEngine {
         })
     }
 
-    #[cfg(any(test, madsim))]
-    pub async fn new_node_with_log_store_and_network<NF, LS>(
+    /// An engine behind `recovery` on a node of the test cluster with no
+    /// configured peers, for a test of the engine and its gate below the
+    /// recovery drivers: it starts no driver, so the test binds the gate
+    /// and initializes the group itself.
+    #[cfg(test)]
+    pub(crate) async fn new_node_with_log_store_and_network<NF, LS>(
         placement: ShardPlacement,
         node_id: u64,
         config: Arc<Config>,
         network_factory: NF,
         log_store: LS,
-        metrics: Option<GroupEngineMetrics>,
-        cold_store: Option<ColdStoreHandle>,
+        recovery: Arc<crate::GroupRejoin>,
     ) -> Result<Self, GroupEngineError>
     where
         NF: RaftNetworkFactory<UrsulaRaftTypeConfig>,
@@ -532,11 +571,7 @@ impl RaftGroupEngine {
             config,
             network_factory,
             log_store,
-            RaftGroupEngineOptions {
-                metrics,
-                cold_store,
-                ..Default::default()
-            },
+            RaftGroupEngineOptions::gated(recovery),
         )
         .await
     }
@@ -544,8 +579,8 @@ impl RaftGroupEngine {
     /// [`Self::new_node_with_log_store_and_network`] with `options`, on a
     /// node of the test cluster with no configured peers unless `options`
     /// names its peer cluster.
-    #[cfg(any(test, madsim))]
-    pub async fn new_node_with_log_store_network_and_options<NF, LS>(
+    #[cfg(test)]
+    pub(crate) async fn new_node_with_log_store_network_and_options<NF, LS>(
         placement: ShardPlacement,
         node_id: u64,
         config: Arc<Config>,
@@ -680,9 +715,7 @@ impl RaftGroupEngine {
             RaftTarget::Data(placement.raft_group_id),
             state_machine.engine.subscribe_history(),
         );
-        if let Some(gate) = &recovery {
-            history.set_plan(gate.recovery_record());
-        }
+        history.set_plan(recovery.recovery_record());
         let metadata_serial = state_machine.metadata_serial.clone();
         let apply_health = state_machine.apply_health.clone();
         // Everything OpenRaft runs the engine's work with holds the
@@ -703,7 +736,7 @@ impl RaftGroupEngine {
             work.as_kind(crate::openraft_work::WorkKind::Reader),
         );
         state_machine.work = work;
-        let config = config_for_recovery(config, recovery.is_some());
+        let config = config_for_recovery(config);
         let raft = Raft::<UrsulaRaftTypeConfig, RaftGroupStateMachine>::new(
             node_id,
             config,
@@ -740,7 +773,7 @@ impl RaftGroupEngine {
             history.clone(),
         )));
         Ok(Self {
-            built_with_gate: recovery,
+            built_with_gate: Some(recovery),
             rejoin: Default::default(),
             history,
             apply_health,
@@ -785,7 +818,11 @@ impl RaftGroupEngine {
         .clone()
     }
 
-    pub async fn initialize_membership(
+    /// Initializes the group with the voters `nodes`, for a unit test that
+    /// runs no bootstrap driver. Everywhere else the replica's bootstrap
+    /// driver initializes a fresh group, once every voter reported it empty.
+    #[cfg(all(test, not(madsim)))]
+    pub(crate) async fn initialize_membership(
         &self,
         nodes: BTreeSet<u64>,
     ) -> Result<(), GroupEngineError> {

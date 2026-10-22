@@ -17,6 +17,7 @@ use openraft::Raft;
 use openraft::RaftMetrics;
 use openraft::error::ClientWriteError;
 use openraft::error::Fatal;
+#[cfg(all(test, not(madsim)))]
 use openraft::error::InitializeError;
 use openraft::error::RaftError;
 use openraft::metrics::RaftDataMetrics;
@@ -429,7 +430,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         self.call(move |raft| async move { raft.change_membership(change, false).await })
             .await?
     }
-    pub async fn initialize(
+    /// Initializes the group with the voters `members`, for a unit test
+    /// that runs no bootstrap driver.
+    #[cfg(all(test, not(madsim)))]
+    pub(crate) async fn initialize(
         &self,
         members: BTreeSet<u64>,
     ) -> Result<(), RaftError<C, InitializeError<C>>> {

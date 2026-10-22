@@ -406,7 +406,7 @@ impl PlacedRaftGroupEngineFactory {
                     .filter(|(faulty, _)| *faulty == group)
                     .map(|(_, fault)| fault),
                 snapshot_record: Some(snapshot_record),
-                recovery: Some(rejoin.clone()),
+                recovery: rejoin.clone(),
                 peer_cluster: Some(self.registry.peer_cluster().clone()),
                 fence: Some(self.log_stores.fence()),
                 #[cfg(test)]
