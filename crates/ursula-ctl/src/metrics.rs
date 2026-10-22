@@ -521,6 +521,14 @@ pub(crate) fn test_metrics(
     }
 }
 
+/// The voters a fixture places a group on when its replica reports no
+/// membership yet. A placement always names voters, even before the replica
+/// initializes, so the expectation cannot come from the empty membership.
+#[cfg(test)]
+pub(crate) const TEST_SEED_VOTERS: [u64; 3] = [1, 2, 3];
+
+/// A maintenance report that expects each reported group on the voters its
+/// replica reports, or on [`TEST_SEED_VOTERS`] while it is uninitialized.
 #[cfg(test)]
 pub(crate) fn test_maintenance_report(
     node_id: u64,
@@ -534,9 +542,14 @@ pub(crate) fn test_maintenance_report(
         expected_groups: groups
             .iter()
             .map(|group| {
+                let placed = if group.voter_ids.is_empty() {
+                    TEST_SEED_VOTERS.as_slice()
+                } else {
+                    group.voter_ids.as_slice()
+                };
                 (
                     u32::try_from(group.raft_group_id).expect("fixture group fits u32"),
-                    test_expected(&group.voter_ids),
+                    test_expected(placed),
                 )
             })
             .collect(),
