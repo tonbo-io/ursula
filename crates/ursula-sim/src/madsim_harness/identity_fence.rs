@@ -76,7 +76,9 @@
 //! - In **replacements** also the meta invariants of `placement-move` (I12
 //!   and the hosting checks at every step, I10 at the end), that the node's
 //!   healthy process is never refused while a new disk under its id is,
-//!   and that the refused root takes no meta vote floor.
+//!   and that the refused root's meta replica runs and holds no meta vote
+//!   floor. The meta leader refuses that root's barrier as well as the
+//!   root's own fence holding it, so no control isolates the hold.
 //!
 //! The other scripts check neither the meta invariants nor the hosting
 //! check: after a correlated power loss every node hosts what its journals
@@ -1362,26 +1364,29 @@ impl Run {
         }
     }
 
-    /// A refused root's meta replica holds no vote floor
-    /// (`fence_holds_barrier`): it takes no meta floor before meta answered
-    /// its registration, and none while refused.
+    /// A refused root's meta replica holds no vote floor while refused. It
+    /// checks the outcome, not one defence: the meta leader refuses the
+    /// stranger's barrier for its root (`FenceRefusal::UnboundRoot`), and
+    /// the stranger's own fence holds its barrier rounds
+    /// (`fence_holds_barrier`), so either one alone keeps this true.
     fn no_meta_floor(&mut self, stranger: &Zombie, node_id: u64, phase: &str) {
         let floor = stranger
             .registry()
             .meta()
             .and_then(|meta| meta.recovery_gate().map(|gate| gate.holds_vote_floor()));
-        if floor == Some(true) {
-            fail(
-                &mut self.trace,
-                REFUSED,
-                phase,
-                format!(
-                    "node {node_id}'s new disk took a meta vote floor while its registration was \
-                     {:?}",
-                    stranger.registration()
-                ),
-            );
-        }
+        let message = match floor {
+            Some(false) => return,
+            Some(true) => format!(
+                "node {node_id}'s new disk took a meta vote floor while its registration was {:?}",
+                stranger.registration()
+            ),
+            None => format!(
+                "node {node_id}'s new disk shows no meta replica with a recovery gate to read, \
+                 registration {:?}",
+                stranger.registration()
+            ),
+        };
+        fail(&mut self.trace, REFUSED, phase, message);
     }
 
     /// A new disk (D1, D15, N23): see the module docs. The old process's

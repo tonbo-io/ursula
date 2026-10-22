@@ -26,10 +26,12 @@
 //! meta replica's votes and genesis floor wait only for an owed wait, so a
 //! forming cluster's meta group elects before any registration is
 //! answered. Its meta barrier rounds, and the floor they write, wait for
-//! the binding too ([`fence_holds_barrier`]): a barrier answers only once
-//! a meta leader exists, which then answers the registration as well, so
-//! a new disk under a live meta voter takes no meta floor, and so no meta
-//! vote, beside the old process before meta refused or bound it.
+//! the binding too ([`fence_holds_barrier`]), as design 2.3 has it. A meta
+//! leader whose peer table binds the id to another root already refuses
+//! such a barrier (`FenceRefusal::UnboundRoot`) and drops its answer. The
+//! local hold also covers a meta leader with no slot or entry for the id
+//! yet. A barrier answers only once a meta leader exists, which then
+//! answers the registration as well, so a forming cluster still forms.
 //!
 //! While the fence does not admit Raft traffic or a wait is owed, the node
 //! sheds leadership for [`LeadershipShedReason::Fence`]: none of its groups
@@ -67,8 +69,10 @@ pub const PREDECESSOR_WAIT: Duration = Duration::from_secs(12);
 const RECORD_RETRY: Duration = Duration::from_secs(1);
 
 /// Whether `fence` holds a replica of `target` out now: no vote but the
-/// bootstrap probe's, no gate driver and no vote floor. The one policy the
-/// vote screen, the gate drivers and the barrier read.
+/// bootstrap probe's, no genesis vote floor and no initialization. The
+/// policy the vote screen and the genesis floor and bootstrap drivers
+/// read. The barrier rounds read [`fence_holds_barrier`] instead, which
+/// holds a replica of either plane as this holds a data replica.
 pub(crate) fn fence_holds(fence: &NodeFence, target: RaftTarget) -> bool {
     match target {
         RaftTarget::Meta => fence.owes_wait(),

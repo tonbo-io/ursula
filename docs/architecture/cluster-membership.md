@@ -189,12 +189,15 @@ grant no vote, run no gate driver, write no vote floor and no snapshot
 object, so their gates stay closed and they take no replication. Its meta
 replica's votes and genesis vote floor are not held before an answer, so a
 forming cluster's meta group elects. Its meta barrier rounds are held until
-the binding, as the data replicas are: a barrier needs a meta leader, which
-answers the registration too, so a new disk under a live meta voter takes no
-meta floor before meta refused or bound it, and with no floor its closed
-gate grants no meta vote and takes no replication. A fresh cluster's data groups therefore form only once meta
-answered its nodes' registrations, and genesis values that disagree, which
-keep meta from forming, keep the data groups from forming too. A run of an
+the binding and through the wait, as the data replicas are. A meta leader
+whose peer table binds the id to another root refuses such a barrier
+anyway, and the hold also covers a meta leader with no slot or entry for
+the id yet. A barrier needs a meta leader, which answers the registration
+too, so a forming cluster still forms. A new node of a bootstrapped cluster
+joins meta's barrier rounds a predecessor wait after its binding. A fresh
+cluster's data groups therefore form only once meta answered its nodes'
+registrations, and genesis values that disagree, which keep meta from
+forming, keep the data groups from forming too. A run of an
 unbound root whose meta journal or meta replica does not open gets no
 answer, so its data replicas stay held for that whole run. That is safe, and
 it is the one meta failure that stops a node from serving data. A bound root

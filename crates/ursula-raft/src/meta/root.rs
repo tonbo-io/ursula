@@ -12,9 +12,9 @@
 //! restart while it is refused changes nothing, whatever its meta replica
 //! wrote. Its data replicas are held out from its open until the binding
 //! and then through the predecessor wait (`NodeFence::awaits_binding`), and
-//! so are its meta replica's barrier rounds, so it takes no meta floor
-//! before meta answered it. A refusal holds its meta replica's votes too
-//! ([`RootGuard::hold_out`]).
+//! so are its meta replica's barrier rounds, which a meta leader that
+//! binds the id to another root refuses anyway. A refusal holds its meta
+//! replica's votes too ([`RootGuard::hold_out`]).
 //! A bound root fences itself for good ([`RootGuard::supersede`]) on a
 //! registration refused for another root, on any view that shows its root
 //! released, and on a view a meta read barrier confirmed that binds its id
