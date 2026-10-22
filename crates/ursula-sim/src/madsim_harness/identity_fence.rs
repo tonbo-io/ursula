@@ -1,8 +1,11 @@
 //! Scenario `identity-fence` (#768 addendum, section 7): the process
 //! identity fence over a [`MetaCluster`] of three placed nodes whose runs
 //! start as servers' do ([`MetaCluster::start_fenced`]): each behind a disk
-//! lease of [`LEASE`], as its node of one cluster, its RPCs on both planes
-//! stamped with its process's incarnation and gated by its fence.
+//! lease of [`LEASE`], as its node of one cluster, its Raft RPCs of both
+//! planes stamped with its process's incarnation and gated by its fence. The
+//! in-process recovery transport is not: the rejoin barriers, the genesis
+//! probe and `write_meta` carry no incarnation, are keyed by node and ignore
+//! routes, so no check here covers a barrier or counts answers.
 //!
 //! A family run forms the cluster, appends to both data groups, and then,
 //! by its seed, one of:
@@ -29,11 +32,13 @@
 //! Its checks:
 //!
 //! - I16 ([`I16`]): no data replica of a process whose fence holds it out (a
-//!   predecessor wait it owes, or a binding its unbound root awaits) grants
-//!   a vote, opens its gate or writes a vote floor. A transfer taken shows
-//!   as a vote. It reads each replica's gate and vote at every step, so a
-//!   vote granted and then given up between two steps goes unseen, and it
-//!   reads neither meta replicas nor snapshot objects.
+//!   predecessor wait it owes, or a binding its unbound root awaits) opens
+//!   its gate, writes a vote floor, or shows at a step an uncommitted vote
+//!   other than the one it opened with. It reads each replica at every step,
+//!   and reads neither meta replicas nor snapshot objects. It does not see a
+//!   granted vote: a candidate that wins commits the vote with its first
+//!   heartbeat, well inside a step, and the vote then reads as a leader's.
+//!   No control exercises the vote clause.
 //! - I18 ([`I18`]): no linearizable read invoked after a write was
 //!   acknowledged misses that write. It compares each read with its
 //!   invocation, so a read invoked before a write is free to miss it.
@@ -191,9 +196,11 @@ struct FenceChecks {
 
 impl FenceChecks {
     /// I16 at one step: every data replica of a held process shows the
-    /// gate, floor and vote it showed when it opened, before its drivers
-    /// ran, or a vote a leader's append gave it. A held process opens its
-    /// replicas while held, since a hold begins at the start of its run.
+    /// gate and floor it showed when it opened, before its drivers ran, and
+    /// either that vote or a committed one. A vote it granted to a candidate
+    /// that won is committed by then, so the vote clause sees only an
+    /// uncommitted vote at the step. A held process opens its replicas while
+    /// held, since a hold begins at the start of its run.
     fn observe(&mut self, cluster: &MetaCluster, trace: &mut SimTrace, after_event: &str) {
         for node_id in cluster.running() {
             let Some(process) = cluster.process(node_id) else {
@@ -710,6 +717,17 @@ impl Run {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
             .clone();
+        if reads.is_empty() {
+            fail(
+                &mut self.trace,
+                I18,
+                PHASE,
+                format!(
+                    "the old leader {leader} completed no linearizable read of group {group} \
+                     during the split, so I18 judged nothing"
+                ),
+            );
+        }
         self.fence
             .reads_see_writes(&mut self.trace, PHASE, group, &reads);
         self.heal(zombie).await;
@@ -839,7 +857,17 @@ impl Run {
         self.reads_back("power_loss_reads").await;
     }
 
+    /// Ends the run, which fails I16 when no step saw a held replica, so
+    /// that every run's I16 judged something.
     fn finish(mut self) -> ThreeNodeRaftSimOutcome {
+        if self.fence.held_observations == 0 {
+            fail(
+                &mut self.trace,
+                I16,
+                "finished",
+                "no step saw a held replica, so I16 judged nothing".to_owned(),
+            );
+        }
         self.trace.push(SimEvent::IdentityFenceHeld {
             held_observations: self.fence.held_observations,
             linearizable_reads: self.fence.reads,
@@ -965,8 +993,8 @@ mod tests {
             })
     }
 
-    /// The family's seeds hold, the same way twice per seed, and each saw
-    /// a held replica.
+    /// The family's seeds hold the same way twice per seed. Each saw a
+    /// held replica, which every run's end checks too.
     #[test]
     fn identity_fence_seeds_replay() {
         let _guard = sim_test_guard();

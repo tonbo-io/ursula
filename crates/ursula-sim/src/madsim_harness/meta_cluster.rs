@@ -254,8 +254,9 @@ impl MetaCluster {
     /// [`Self::start`] for nodes hosting by placement behind the identity
     /// fence, as servers run: each node's runs start as their node of the
     /// cluster `cluster_id` behind a disk lease of `lease`, and each process
-    /// binds its incarnation and fence, so the RPCs of both planes carry
-    /// them.
+    /// binds its incarnation and fence, so the Raft RPCs of both planes
+    /// carry them. The recovery transport's barriers, genesis probe and
+    /// `write_meta` carry no incarnation and meet no fence.
     pub(super) async fn start_fenced(
         name: &str,
         tuning: JournalTuning,
