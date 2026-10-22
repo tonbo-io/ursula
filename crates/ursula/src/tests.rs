@@ -6048,14 +6048,15 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
 }
 
 /// A shed exempts only a group whose placement makes this node its only
-/// voter. A drained node that initializes a fresh three-voter group joins
-/// it and still does not campaign, so the group, whose other voters know
-/// no membership yet, elects nobody until the drain ends. The bug this
-/// catches: an exemption read from the replica's own membership, which is
-/// empty when its gate opens just before it initializes the group, and
-/// which nothing read again once the group had three voters.
+/// voter. Nodes 1 and 2 are drained. Node 1, group 0's initializer, still
+/// leads once: OpenRaft campaigns as it initializes, and the other voters
+/// learn the membership only from that leader. Once node 3 took the
+/// leadership and stopped, neither drained voter campaigns, so the group
+/// elects nobody until a drain ends. The bug this catches: an exemption
+/// read from the replica's own membership, which is empty when its gate
+/// opens, and which nothing read again once the group had three voters.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_drained_initializer_of_a_three_voter_group_does_not_campaign() {
+async fn drained_voters_of_a_three_voter_group_do_not_campaign() {
     let mut listeners = Vec::new();
     let mut peers = Vec::new();
     for node_id in 1..=3u64 {
@@ -6079,7 +6080,7 @@ async fn a_drained_initializer_of_a_three_voter_group_does_not_campaign() {
                 1,
                 StaticGrpcTestNodeStorage {
                     // Node 1 is group 0's initializer.
-                    start_maintenance_drained: index == 0,
+                    start_maintenance_drained: index < 2,
                     ..Default::default()
                 },
             )
@@ -6092,51 +6093,51 @@ async fn a_drained_initializer_of_a_three_voter_group_does_not_campaign() {
             .await
             .expect("warm raft group");
     }
-    let initializer = nodes[0]
-        .registry
-        .get(RaftGroupId(0))
-        .expect("the drained initializer's group");
-    initializer
+    let group = RaftGroupId(0);
+    let rafts = nodes
+        .iter()
+        .map(|node| node.registry.get(group).expect("registered group"))
+        .collect::<Vec<_>>();
+    rafts[0]
         .wait(Some(Duration::from_secs(10)))
-        .metrics(
-            |metrics| {
-                metrics
-                    .membership_config
-                    .membership()
-                    .voter_ids()
-                    .collect::<BTreeSet<_>>()
-                    == BTreeSet::from([1, 2, 3])
-            },
-            "the drained initializer initializes the group with its three voters",
-        )
+        .current_leader(1, "the drained initializer leads as it initializes")
         .await
         .expect("the group initializes");
-    // Several maximum election timeouts (3 s) with nobody else able to
-    // campaign: only the initializer knows the membership.
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(30))
+        .expect("deadline");
+    while rafts[2].metrics().borrow_watched().current_leader != Some(3) {
+        if let Err(err) = nodes[0].registry.transfer_leader(group, 3).await {
+            tracing::debug!(%err, "transfer to node 3 refused");
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node 3 never takes group 0's leadership"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    nodes.pop().expect("node 3").shutdown().await;
+    let term = rafts[0].metrics().borrow_watched().current_term;
+    // Several maximum election timeouts (3 s) with only drained voters
+    // left.
     tokio::time::sleep(Duration::from_secs(10)).await;
-    for node in &nodes {
-        let metrics = node
-            .registry
-            .get(RaftGroupId(0))
-            .expect("registered group")
-            .metrics()
-            .borrow_watched()
-            .clone();
-        assert_eq!(
-            metrics.current_term, 0,
-            "no replica campaigns while the only one that could is drained: {metrics:?}"
+    for drained in rafts.iter().take(2) {
+        let metrics = drained.metrics().borrow_watched().clone();
+        assert!(
+            metrics.current_term <= term && metrics.vote.leader_id.term <= term,
+            "no drained voter campaigns once the leader left: {metrics:?}"
         );
         assert_ne!(metrics.state, openraft::ServerState::Leader, "{metrics:?}");
     }
-    // The scenario can elect: once the drain ends, the initializer leads.
-    nodes[0]
+    // The scenario can elect: once node 2's drain ends, it leads.
+    nodes[1]
         .registry
         .clear_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
-    initializer
+    rafts[1]
         .wait(Some(Duration::from_secs(15)))
-        .current_leader(1, "the undrained initializer elects itself")
+        .current_leader(2, "the undrained voter elects itself")
         .await
-        .expect("the group elects once the drain ends");
+        .expect("the group elects once a drain ends");
     for node in nodes {
         node.shutdown().await;
     }
