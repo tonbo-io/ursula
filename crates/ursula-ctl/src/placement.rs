@@ -1,5 +1,10 @@
-//! Placement verbs over the nodes' admin planes: confirmed placement views
+//! Placement verbs over the nodes' admin planes: placement views, moves
 //! and `node replace-disk`.
+//!
+//! - [`status`]: `placement status`, the view and each moving group's
+//!   leader.
+//! - [`moves`]: `placement move`, `cancel` and `set-move-limit`, pre-checked
+//!   with the kernel's own `check` on a confirmed view.
 //!
 //! `node replace-disk` releases the root (the WAL disk) a node id is bound
 //! to in meta, so an empty disk under that id binds. It reads the node's
@@ -10,19 +15,26 @@
 //! never binds again, and the release is safe only once its disk is
 //! revoked ([`RELEASE_RULE`]).
 
+pub mod moves;
+pub mod status;
+
 use anyhow::Context;
 use anyhow::Result;
 use reqwest::Method;
+use reqwest::StatusCode;
 use ursula_control::ClusterView;
 use ursula_control::PlacementApiError;
+use ursula_control::PlacementGroupStatus;
 use ursula_control::PlacementStatus;
 use ursula_control::ReplaceDiskRequest;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeRecord;
 use ursula_proto::placement::RootId;
 use ursula_proto::placement::RootSlot;
+use ursula_shard::RaftGroupId;
 
 use crate::metrics::MetricsClient;
+use crate::metrics::metrics_base_url;
 use crate::provider::NodeInfo;
 
 /// What `node replace-disk` prints before and after the release.
@@ -87,35 +99,125 @@ pub async fn confirmed_status<'a>(
     client: &MetricsClient,
     nodes: impl IntoIterator<Item = &'a NodeInfo>,
 ) -> Option<(&'a NodeInfo, PlacementStatus)> {
+    first_status(client, nodes, true).await
+}
+
+/// The placement status of the first node of `nodes` that answers one:
+/// confirmed by a meta read barrier on its admin plane when `confirmed`,
+/// else its current view over its read URL.
+pub async fn first_status<'a>(
+    client: &MetricsClient,
+    nodes: impl IntoIterator<Item = &'a NodeInfo>,
+    confirmed: bool,
+) -> Option<(&'a NodeInfo, PlacementStatus)> {
     for node in nodes {
-        let url = match node.admin_url.join("/__ursula/placement?confirmed=true") {
-            Ok(url) => url,
-            Err(error) => {
-                tracing::warn!(node_id = node.id, %error, "placement: no placement url");
-                continue;
-            }
+        let url = if confirmed {
+            node.admin_url.join("/__ursula/placement?confirmed=true")
+        } else {
+            metrics_base_url(node).join("/__ursula/placement")
         };
-        let response = match client.http_client().get(url).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                tracing::warn!(node_id = node.id, %error, "placement: node did not answer a confirmed view");
-                continue;
-            }
-        };
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            tracing::warn!(node_id = node.id, %status, body, "placement: node refused a confirmed view");
-            continue;
-        }
-        match response.json::<PlacementStatus>().await {
+        match read_json(client, url).await {
             Ok(placement) => return Some((node, placement)),
             Err(error) => {
-                tracing::warn!(node_id = node.id, %error, "placement: undecodable placement status");
+                tracing::warn!(node_id = node.id, confirmed, %error, "placement: no placement status");
             }
         }
     }
     None
+}
+
+/// `GET /__ursula/placement/groups/{group}` over `node`'s read URL: the
+/// group's placement in its current view and its replica of the group.
+pub async fn group_status(
+    client: &MetricsClient,
+    node: &NodeInfo,
+    group: RaftGroupId,
+) -> Result<PlacementGroupStatus> {
+    let url = metrics_base_url(node).join(&format!("/__ursula/placement/groups/{}", group.0));
+    read_json(client, url).await
+}
+
+async fn read_json<T: serde::de::DeserializeOwned>(
+    client: &MetricsClient,
+    url: Result<url::Url, url::ParseError>,
+) -> Result<T> {
+    let url = url.context("compose the placement url")?;
+    let response = client
+        .http_client()
+        .get(url.clone())
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!("GET {url} answered {status}: {body}");
+    }
+    response
+        .json()
+        .await
+        .with_context(|| format!("decode GET {url}"))
+}
+
+/// What a node answered to a placement write.
+#[derive(Debug)]
+pub enum WriteAnswer<T> {
+    /// The write applied, with its answer.
+    Applied(T),
+    /// The node refused it with a placement refusal.
+    Refused {
+        status: StatusCode,
+        refusal: Box<PlacementApiError>,
+    },
+    /// The node answered something that is no placement refusal, such as a
+    /// stale process incarnation (`412`).
+    Unexpected { status: StatusCode, body: String },
+    /// No answer arrived: the write may have applied.
+    Lost(anyhow::Error),
+}
+
+/// Sends `body` to `path` on `via`'s admin plane, with the incarnation the
+/// client pinned for it.
+pub async fn post_write<B: serde::Serialize, T: serde::de::DeserializeOwned>(
+    client: &MetricsClient,
+    via: &NodeInfo,
+    path: &str,
+    body: &B,
+) -> WriteAnswer<T> {
+    let sent = async {
+        let url = via
+            .admin_url
+            .join(path)
+            .context("compose the placement url")?;
+        client
+            .admin_request(via, Method::POST, url.clone())
+            .await?
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("POST {url}"))
+    };
+    let response = match sent.await {
+        Ok(response) => response,
+        Err(error) => return WriteAnswer::Lost(error),
+    };
+    let status = response.status();
+    if status.is_success() {
+        return match response.json().await {
+            Ok(answer) => WriteAnswer::Applied(answer),
+            Err(error) => WriteAnswer::Lost(
+                anyhow::Error::new(error).context(format!("decode the answer to POST {path}")),
+            ),
+        };
+    }
+    let body = response.text().await.unwrap_or_default();
+    match serde_json::from_str::<PlacementApiError>(&body) {
+        Ok(refusal) => WriteAnswer::Refused {
+            status,
+            refusal: Box::new(refusal),
+        },
+        Err(_not_a_refusal) => WriteAnswer::Unexpected { status, body },
+    }
 }
 
 /// Node `node`'s slot in `view`, `None` when the view holds none.
@@ -193,33 +295,20 @@ pub async fn release_root(
     node: u64,
     root: RootId,
 ) -> Result<NodeRecord> {
-    let url = via
-        .admin_url
-        .join(&format!("/__ursula/placement/nodes/{node}/replace-disk"))
-        .context("compose the replace-disk url")?;
-    let response = client
-        .admin_request(via, Method::POST, url.clone())
-        .await?
-        .json(&ReplaceDiskRequest { expect_root: root })
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
-    let status = response.status();
-    if status.is_success() {
-        return response
-            .json()
-            .await
-            .with_context(|| format!("decode the record of node {node}"));
-    }
-    let body = response.text().await.unwrap_or_default();
-    match serde_json::from_str::<PlacementApiError>(&body) {
-        Ok(refusal) => Err(ReplaceDiskRefusal::Refused {
+    let path = format!("/__ursula/placement/nodes/{node}/replace-disk");
+    let request = ReplaceDiskRequest { expect_root: root };
+    match post_write(client, via, &path, &request).await {
+        WriteAnswer::Applied(record) => Ok(record),
+        WriteAnswer::Refused { status, refusal } => Err(ReplaceDiskRefusal::Refused {
             via: via.id,
             status,
-            refusal: Box::new(refusal),
+            refusal,
         }
         .into()),
-        Err(_not_a_refusal) => anyhow::bail!("POST {url} answered {status}: {body}"),
+        WriteAnswer::Unexpected { status, body } => {
+            anyhow::bail!("POST {path} on node {} answered {status}: {body}", via.id)
+        }
+        WriteAnswer::Lost(error) => Err(error),
     }
 }
 

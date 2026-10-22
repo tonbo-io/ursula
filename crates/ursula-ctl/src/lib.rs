@@ -15,7 +15,8 @@
 //! - [`view`]: the meta leader's placement view and each group checked on
 //!   its target voters, which `wait`, `wait-ready` and the verifications
 //!   read.
-//! - [`placement`]: confirmed placement views and `node replace-disk`.
+//! - [`placement`]: placement views, `placement status`, `move`, `cancel`
+//!   and `set-move-limit`, and `node replace-disk`.
 //! - [`plan`]: pure drain planning and per-node readiness checks.
 //! - [`backup`]: verifiable cluster backup, verification, and restore.
 //! - [`maintenance`]: node-maintenance verbs (drain, undrain, catch-up wait).

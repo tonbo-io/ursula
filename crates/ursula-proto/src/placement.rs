@@ -153,6 +153,41 @@ impl fmt::Display for RaftLogId {
     }
 }
 
+/// A log id that is not `term-leader-index` in decimal, as [`RaftLogId`]
+/// displays it.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("a log id is term-leader-index in decimal, such as 3-1-57, not '{found}'")]
+pub struct InvalidRaftLogId {
+    pub found: String,
+}
+
+impl std::str::FromStr for RaftLogId {
+    type Err = InvalidRaftLogId;
+
+    /// Parses what [`fmt::Display`] writes, so an operator pastes a log id
+    /// a status printed.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidRaftLogId {
+            found: value.to_owned(),
+        };
+        let mut parts = value.split('-').map(|part| {
+            if !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()) {
+                part.parse::<u64>().ok()
+            } else {
+                None
+            }
+        });
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(Some(term)), Some(Some(leader)), Some(Some(index)), None) => Ok(Self {
+                term,
+                leader: NodeId(leader),
+                index,
+            }),
+            _ => Err(invalid()),
+        }
+    }
+}
+
 /// An entry of the meta group's log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -215,6 +250,15 @@ impl PlacementEpoch {
 impl fmt::Display for PlacementEpoch {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::str::FromStr for PlacementEpoch {
+    type Err = InvalidRaftLogId;
+
+    /// Parses what [`fmt::Display`] writes, `term-leader-index`.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        value.parse().map(|id| Self(MetaLogId(id)))
     }
 }
 
@@ -936,6 +980,7 @@ mod tests {
     use super::GenesisClaim;
     use super::GroupCount;
     use super::InvalidProcessIncarnation;
+    use super::InvalidRaftLogId;
     use super::InvalidRootId;
     use super::LearnerLag;
     use super::MetaLogId;
@@ -1141,6 +1186,25 @@ mod tests {
 
     fn root(id: u64) -> RootId {
         RootId::new(std::num::NonZeroU64::new(id).unwrap())
+    }
+
+    #[test]
+    fn a_placement_key_parses_what_it_displays() {
+        let since = PlacementEpoch::new(MetaLogId::new(RaftLogId {
+            term: 3,
+            leader: NodeId::new(1),
+            index: 57,
+        }));
+        assert_eq!(since.to_string(), "3-1-57");
+        assert_eq!("3-1-57".parse::<PlacementEpoch>(), Ok(since));
+        for invalid in [
+            "", "3-1", "3-1-57-2", "3--57", "3-1-+57", "-3-1-57", "3-1-x",
+        ] {
+            assert!(
+                matches!(invalid.parse::<PlacementEpoch>(), Err(InvalidRaftLogId { found }) if found == invalid),
+                "{invalid:?} parsed"
+            );
+        }
     }
 
     #[test]

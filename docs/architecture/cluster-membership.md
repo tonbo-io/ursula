@@ -312,6 +312,20 @@ shows its recovery gate open (section 2). The shells count their steps in
 `ursula.placement.oldest_move_age_seconds` show why replicas wait and how
 long the oldest move runs.
 
+`ursulactl placement move` and `cancel` (`crates/ursula-ctl/src/placement/moves.rs`)
+send these moves. Each pass reads a confirmed view and decides every group
+with the kernel's own `ControlPlaneState::check`, so the tool holds no copy
+of a rule. A group already stable at or moving to its target counts as done,
+a moving group keeps its target unless the move retargets, cancels or names
+the move's key, and a refusal that `ControlError::requeue` classes as retry,
+such as `move_limit`, queues the group for the next pass. An accepted move is
+applied to the pass's view at the entry that answered it, so the pass counts
+it against the limit. A write that may have applied is decided again from
+the next confirmed view. `ursulactl placement status` finds each moving
+group's leader by asking every node the group moves from or to for its
+replica, and flags a leader whose `target_since` trails the view's
+placement.
+
 Every server generates a fresh process incarnation at startup and publishes
 it on all listeners. Every mutating admin request, and the quorum proof, must
 carry it in `x-ursula-process-incarnation`. A missing header answers

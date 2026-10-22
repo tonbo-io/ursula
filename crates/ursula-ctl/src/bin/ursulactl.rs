@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use ursula_ctl::backup;
 use ursula_ctl::observe::collect_status;
 use ursula_ctl::wait_ready;
 use ursula_ctl::write_status;
+use ursula_shard::RaftGroupId;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -77,6 +79,118 @@ enum Command {
     /// Operations on one node id in the meta group.
     #[command(subcommand)]
     Node(NodeCommand),
+    /// Where groups live and how their moves go.
+    #[command(subcommand)]
+    Placement(PlacementCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum PlacementCommand {
+    /// Print a node's placement view, and for each moving group (or the
+    /// group asked for) what its leader's reconcile shell does.
+    Status(PlacementStatusArgs),
+    /// Move groups to other voters. Groups queue under the move limit, a
+    /// group already stable at or moving to its target counts as done, so a
+    /// rerun finishes an interrupted batch, and other refusals are reported
+    /// per group. Exits 2 when a group was refused or timed out.
+    Move(MoveArgs),
+    /// Move a moving group back to its source. Exits 2 when it was refused
+    /// or timed out.
+    Cancel(CancelArgs),
+    /// Set how many groups may move at once. Exits 2 when the limit was
+    /// refused or did not take effect.
+    SetMoveLimit(SetMoveLimitArgs),
+}
+
+#[derive(Args, Debug)]
+struct PlacementStatusArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// List every group this node has a role in, not only moving ones.
+    #[arg(long, conflicts_with = "group")]
+    node: Option<u64>,
+    /// List this group and ask for its leader, moving or not.
+    #[arg(long)]
+    group: Option<u32>,
+    /// Read a view a meta read barrier confirmed, on an admin plane.
+    #[arg(long, default_value_t = false)]
+    confirmed: bool,
+    /// Print the report as JSON.
+    #[arg(long, default_value_t = false)]
+    json: bool,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+struct MoveWaitArgs {
+    /// Wait until every group is stable at its target, printing each
+    /// leader's state as it changes.
+    #[arg(long, default_value_t = false)]
+    wait: bool,
+    /// Bounds the command: groups queued under the move limit and, with
+    /// `--wait`, the moves.
+    #[arg(long, default_value_t = 600)]
+    timeout_secs: u64,
+    #[arg(long, default_value_t = 2)]
+    poll_interval_secs: u64,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("target").required(true).args(["to", "replace"])))]
+struct MoveArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// A group to move. Repeat it for a batch.
+    #[arg(long = "group", required = true)]
+    groups: Vec<u32>,
+    /// The voters to move to, as many as the group has: `2,3,4`.
+    #[arg(long, value_delimiter = ',')]
+    to: Vec<u64>,
+    /// Replace node OLD by node NEW in each group's target: `3=4`.
+    #[arg(long, value_name = "OLD=NEW")]
+    replace: Option<ursula_ctl::placement::moves::Replacement>,
+    /// The placement key to move from, `term-leader-index` as the status
+    /// prints it, in place of the confirmed view's. One group only. A
+    /// moving group named by its key takes the new target.
+    #[arg(long, value_name = "SINCE", conflicts_with = "retarget")]
+    expect: Option<ursula_proto::placement::PlacementEpoch>,
+    /// Let a moving group take the new target.
+    #[arg(long, default_value_t = false)]
+    retarget: bool,
+    #[command(flatten)]
+    wait: MoveWaitArgs,
+}
+
+#[derive(Args, Debug)]
+struct CancelArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    #[arg(long)]
+    group: u32,
+    /// The placement key of the move, `term-leader-index` as the status
+    /// prints it, in place of the confirmed view's.
+    #[arg(long, value_name = "SINCE")]
+    expect: Option<ursula_proto::placement::PlacementEpoch>,
+    #[command(flatten)]
+    wait: MoveWaitArgs,
+}
+
+#[derive(Args, Debug)]
+struct SetMoveLimitArgs {
+    /// Cluster manifest (TOML/JSON/YAML by extension, `-` for stdin).
+    #[arg(long, value_name = "PATH")]
+    config: PathBuf,
+    /// The most groups that may move at once. 0 stops new moves.
+    #[arg(long)]
+    limit: u32,
+    #[arg(long, default_value_t = 10)]
+    http_timeout_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -304,6 +418,7 @@ async fn main() -> Result<()> {
         Command::WaitReady(args) => run_wait_ready_subcommand(args).await,
         Command::RecoverGroup(args) => run_recover_group_subcommand(args).await,
         Command::Node(NodeCommand::ReplaceDisk(args)) => run_replace_disk_subcommand(args).await,
+        Command::Placement(command) => run_placement_subcommand(command).await,
         Command::Drain(args) => run_drain_subcommand(args).await,
         Command::Undrain(args) => run_undrain_subcommand(args).await,
         Command::Wait(args) => run_wait_subcommand(args).await,
@@ -658,6 +773,136 @@ async fn run_replace_disk_subcommand(args: ReplaceDiskArgs) -> Result<()> {
         "node {}: slot {}, released through node {}",
         args.node, record.root, before.via.id
     );
+    Ok(())
+}
+
+async fn run_placement_subcommand(command: PlacementCommand) -> Result<()> {
+    use ursula_ctl::placement::moves;
+    use ursula_ctl::placement::status;
+    match command {
+        PlacementCommand::Status(args) => {
+            let nodes = load_nodes(&args.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+            let filter = match (args.node, args.group) {
+                (Some(node), _) => status::StatusFilter::Node(node.into()),
+                (None, Some(group)) => status::StatusFilter::Group(RaftGroupId(group)),
+                (None, None) => status::StatusFilter::Moving,
+            };
+            let report = status::placement_status(&client, &nodes, filter, args.confirmed).await?;
+            let mut stdout = std::io::stdout().lock();
+            if args.json {
+                serde_json::to_writer_pretty(&mut stdout, &report)?;
+                writeln!(stdout)?;
+            } else {
+                status::write_report(&mut stdout, &report)?;
+            }
+            Ok(())
+        }
+        PlacementCommand::Move(args) => {
+            let intent = match args.replace {
+                Some(replacement) => moves::Intent::Replace(replacement),
+                None => moves::Intent::To(
+                    ursula_proto::placement::VoterSet::new(
+                        args.to.iter().copied().map(Into::into).collect(),
+                    )
+                    .context("--to names at least one node")?,
+                ),
+            };
+            let groups = args.groups.iter().copied().map(RaftGroupId).collect();
+            run_moves(
+                &args.config,
+                groups,
+                intent,
+                args.expect,
+                args.retarget,
+                &args.wait,
+            )
+            .await
+        }
+        PlacementCommand::Cancel(args) => {
+            let groups = vec![RaftGroupId(args.group)];
+            run_moves(
+                &args.config,
+                groups,
+                moves::Intent::Cancel,
+                args.expect,
+                false,
+                &args.wait,
+            )
+            .await
+        }
+        PlacementCommand::SetMoveLimit(args) => {
+            let nodes = load_nodes(&args.config).await?;
+            let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
+            let limit = ursula_control::MoveLimit::new(args.limit);
+            let end = moves::set_move_limit(&client, &nodes, limit).await?;
+            match &end {
+                moves::MoveLimitEnd::Applied(applied) => {
+                    println!("move limit: {}", applied.get());
+                }
+                moves::MoveLimitEnd::Resolved { current, .. } => {
+                    let took = if end.took_effect() {
+                        "took effect"
+                    } else {
+                        "did not take effect, send it again"
+                    };
+                    println!(
+                        "the confirmed view shows move limit {}: the request {took}",
+                        current.get()
+                    );
+                }
+                moves::MoveLimitEnd::Refused(refusal) => println!("{refusal}"),
+            }
+            if !end.took_effect() {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn run_moves(
+    config: &std::path::Path,
+    groups: Vec<RaftGroupId>,
+    intent: ursula_ctl::placement::moves::Intent,
+    expect: Option<ursula_proto::placement::PlacementEpoch>,
+    retarget: bool,
+    wait: &MoveWaitArgs,
+) -> Result<()> {
+    use ursula_ctl::placement::moves;
+    let nodes = load_nodes(config).await?;
+    let client = MetricsClient::new(Duration::from_secs(wait.http_timeout_secs))?;
+    let options = moves::MoveOptions {
+        groups,
+        intent,
+        expect,
+        retarget,
+        wait: wait.wait,
+        timeout: Duration::from_secs(wait.timeout_secs),
+        poll_interval: Duration::from_secs(wait.poll_interval_secs),
+    };
+    let mut stdout = std::io::stdout().lock();
+    let ends = moves::run_moves(&client, &nodes, &options, &mut stdout).await?;
+    let failed: Vec<u32> = ends
+        .iter()
+        .filter(|(_, end)| end.is_failure())
+        .map(|(group, _)| group.0)
+        .collect();
+    for (group, end) in &ends {
+        if let moves::GroupEnd::TimedOut { waiting } = end {
+            writeln!(stdout, "group {}: timed out, waiting {waiting:?}", group.0)?;
+        }
+    }
+    if !failed.is_empty() {
+        writeln!(
+            stdout,
+            "{} of {} groups did not move: {failed:?}",
+            failed.len(),
+            ends.len()
+        )?;
+        stdout.flush()?;
+        std::process::exit(2);
+    }
     Ok(())
 }
 
