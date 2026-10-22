@@ -37,7 +37,8 @@ pub enum MetaBarrierError {
     },
 }
 
-/// How a meta leader's barrier failed, as the transport classifies it.
+/// How a leader's barrier failed, as the transport classifies it: a meta
+/// read barrier's, or a data group's that the membership asker asked for.
 /// Every recovery transport's error converts into it
 /// ([`crate::RecoveryTransport::Error`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -48,8 +49,8 @@ pub enum BarrierFailure {
     /// The leader's address serves another node now.
     #[error("its address serves node {node}")]
     OtherNode { node: NodeId },
-    /// The node asked no longer leads the meta group.
-    #[error("it does not lead the meta group")]
+    /// The node asked no longer leads the group.
+    #[error("it does not lead the group")]
     NotLeader,
     /// The answer did not decode.
     #[error("its answer is malformed")]

@@ -30,7 +30,11 @@
 //!   A failed close is retried likewise.
 //! - closes every running replica the plan does not admit (7.3's steps 1
 //!   to 3), then forgets its gauges and its open back-off.
-//! - publishes a [`HostingStatus`] for readiness.
+//! - asks, for each held replica that may have left its group, the
+//!   group's leader whether the node is still a member (`hosting::asker`),
+//!   with the room the opens and closes leave in each core's budget.
+//! - publishes a [`HostingStatus`] for readiness, with the latest answer
+//!   of each group.
 //! - refreshes the elections of every running replica whose placed voters
 //!   made it its group's only voter and no longer do, or the reverse
 //!   ([`RaftGroupHandleRegistry::refresh_only_voter_elections`]): the shed
@@ -56,7 +60,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
+use openraft::rt::WatchReceiver;
 use ursula_control::Admission;
+use ursula_control::CandidatesOf;
 use ursula_control::ConfirmedStamp;
 use ursula_control::ConfirmedView;
 use ursula_control::HostingInput;
@@ -67,8 +73,10 @@ use ursula_control::PlacementView;
 use ursula_control::RegistrationStatus;
 use ursula_control::Standing;
 use ursula_control::ViewInput;
+use ursula_control::leader_candidates;
 use ursula_control::plan_hosting;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::ReplicaRole;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 
@@ -79,6 +87,12 @@ use crate::rt::sync::mpsc;
 use crate::rt::sync::watch;
 use crate::rt::task::JoinHandle;
 use crate::rt::time::Instant;
+
+mod asker;
+
+pub use asker::ASK_INTERVAL;
+use asker::Askers;
+pub use asker::GroupAnswer;
 
 /// How often the driver plans without a trigger, and the least time
 /// between two of its confirmations.
@@ -147,6 +161,9 @@ pub struct HostingStatus {
     /// that a view was confirmed in this run, never that `admitted` was
     /// planned from it.
     pub last_confirmed: Option<ConfirmedStamp>,
+    /// The latest live leader's answer about each held replica the
+    /// membership asker asked for (`hosting::asker`).
+    pub answers: BTreeMap<RaftGroupId, GroupAnswer>,
 }
 
 /// A reader of the hosting driver's status.
@@ -235,10 +252,11 @@ impl<H: GroupHost> HostingDriver<H> {
         let (mut views_open, mut groups_open, mut answers_open) = (true, true, true);
         let mut actions = Actions::new();
         let mut confirms = Confirms::default();
+        let mut askers = Askers::default();
         let mut only_voter = BTreeSet::new();
         loop {
-            actions.reap();
-            self.pass(&mut actions, &mut confirms).await;
+            actions.reap(&mut askers);
+            self.pass(&mut actions, &mut confirms, &mut askers).await;
             self.registry.refresh_only_voter_elections(&mut only_voter);
             let ended = crate::rt::select! {
                 biased;
@@ -258,14 +276,15 @@ impl<H: GroupHost> HostingDriver<H> {
                 () = crate::rt::time::sleep(PLAN_INTERVAL) => None,
             };
             if let Some((group, end)) = ended {
-                actions.end(group, end);
+                actions.end(group, end, &mut askers);
             }
         }
     }
 
     /// One pass: read the journals, confirm when the plan asks for it and
-    /// the interval allows, plan, and act on the plan.
-    async fn pass(&self, actions: &mut Actions, confirms: &mut Confirms) {
+    /// the interval allows, plan, act on the plan, then ask about the held
+    /// replicas that may have left their groups.
+    async fn pass(&self, actions: &mut Actions, confirms: &mut Confirms, askers: &mut Askers) {
         let local = match self.wal.local_groups() {
             Ok(local) => local,
             Err(error) => {
@@ -320,12 +339,14 @@ impl<H: GroupHost> HostingDriver<H> {
             }
         }
         let confirmed = confirms.last.map(|last| last.stamp);
-        let held = local
+        let held: BTreeSet<RaftGroupId> = local
             .iter()
             .filter(|(_, replica)| replica.log.is_held())
             .map(|(group, _)| *group)
             .collect();
-        self.act(plan, actions, held, confirmed);
+        askers.retain(|group| held.contains(&group));
+        self.act(plan, actions, held, confirmed, askers.answers());
+        self.ask(&local, &view, actions, askers);
     }
 
     /// Publishes the plan's admissions, opens what the node does not run
@@ -336,6 +357,7 @@ impl<H: GroupHost> HostingDriver<H> {
         actions: &mut Actions,
         held: BTreeSet<RaftGroupId>,
         confirmed: Option<ConfirmedStamp>,
+        answers: BTreeMap<RaftGroupId, GroupAnswer>,
     ) {
         for step in &plan.steps {
             match *step {
@@ -413,6 +435,7 @@ impl<H: GroupHost> HostingDriver<H> {
             admitted,
             unplaced: plan.unplaced,
             last_confirmed: confirmed,
+            answers,
         };
         self.status.send_if_modified(|current| {
             let modified = **current != status;
@@ -423,27 +446,105 @@ impl<H: GroupHost> HostingDriver<H> {
         });
     }
 
+    /// Asks, for each held replica that may have left its group and is due
+    /// ([`Askers::due`]), the group's leader candidates whether the node is
+    /// still a member: a closed replica, and an open one that does not lead
+    /// and whose bootstrapped view gives the node the role `Outgoing`,
+    /// `Abandoned` or none. An open replica adds its effective membership to
+    /// the candidates. While the node fence refuses, nothing is asked.
+    fn ask(
+        &self,
+        local: &BTreeMap<RaftGroupId, LocalReplica>,
+        view: &PlacementView,
+        actions: &mut Actions,
+        askers: &mut Askers,
+    ) {
+        if !self.wal.fence().admits_now() {
+            return;
+        }
+        let peers: BTreeSet<NodeId> = self
+            .registry
+            .peer_cluster()
+            .directory()
+            .node_ids()
+            .map(NodeId::new)
+            .collect();
+        let marks = self.registry.left_marks();
+        for (group, replica) in local {
+            if !replica.log.is_held() {
+                continue;
+            }
+            let raft = self.registry.get(*group);
+            let metrics = raft.as_ref().map(|raft| raft.metrics());
+            let metrics = metrics.as_ref().map(|metrics| metrics.borrow_watched());
+            if let Some(metrics) = &metrics {
+                // Without a bootstrapped view an open replica counts by its
+                // membership, and a leader knows its own: nothing says it
+                // may have left.
+                let placed = view.cluster().map(|cluster| cluster.role(*group, self.me));
+                let may_have_left = matches!(
+                    placed,
+                    Some(None | Some(ReplicaRole::Outgoing | ReplicaRole::Abandoned))
+                ) && metrics.current_leader != Some(self.me.get());
+                if !may_have_left {
+                    continue;
+                }
+            }
+            let vote = metrics.as_ref().map(|metrics| metrics.vote);
+            if !askers.due(*group, vote, marks) {
+                continue;
+            }
+            let membership = metrics.as_ref().and_then(|metrics| {
+                crate::memberships::membership_config(
+                    &metrics.membership_config,
+                    crate::MembershipKind::Effective,
+                )
+                .ok()
+            });
+            drop(metrics);
+            let candidates: Vec<NodeId> = leader_candidates(
+                self.me,
+                CandidatesOf::Group(*group),
+                view,
+                membership.as_ref(),
+                &peers,
+            )
+            .iter()
+            .collect();
+            let work = asker::ask(
+                self.meta.clone(),
+                marks.clone(),
+                self.me,
+                *group,
+                candidates,
+            );
+            if self.begin(actions, *group, work) {
+                askers.started(*group, vote, marks);
+            }
+        }
+    }
+
     /// Starts `work` on `group` unless an action of the group runs, the
     /// group's last action failed less than [`PLAN_INTERVAL`] ago or its
-    /// core runs [`ACTIONS_PER_CORE`] already.
+    /// core runs [`ACTIONS_PER_CORE`] already. Whether it started.
     fn begin(
         &self,
         actions: &mut Actions,
         group: RaftGroupId,
         work: impl Future<Output = ActionEnd> + Send + 'static,
-    ) {
+    ) -> bool {
         let Some(core) = self.wal.placement(group).map(|placement| placement.core_id) else {
             tracing::debug!(
                 group = group.0,
                 "hosting: the group is not in the shard map"
             );
-            return;
+            return false;
         };
         if actions.running.contains_key(&group)
             || actions.failed.contains_key(&group)
             || !actions.room(core)
         {
-            return;
+            return false;
         }
         let done = actions.done_tx.clone();
         let task = crate::rt::spawn(async move {
@@ -452,6 +553,7 @@ impl<H: GroupHost> HostingDriver<H> {
             let _closed = done.send((group, end));
         });
         actions.running.insert(group, Action { core, task });
+        true
     }
 }
 
@@ -487,21 +589,23 @@ impl Confirms {
     }
 }
 
-/// How an open or close ended.
+/// How an open, close or ask ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionEnd {
     Done,
     /// The group is not acted on again for one [`PLAN_INTERVAL`].
     Failed,
+    /// An ask ended, with a live leader's answer or none.
+    Asked(Option<GroupAnswer>),
 }
 
-/// One open or close the driver runs.
+/// One open, close or ask the driver runs.
 struct Action {
     core: CoreId,
     task: JoinHandle<()>,
 }
 
-/// The opens and closes the driver runs, one per group at a time.
+/// The opens, closes and asks the driver runs, one per group at a time.
 struct Actions {
     running: BTreeMap<RaftGroupId, Action>,
     /// The groups whose last action failed less than [`PLAN_INTERVAL`]
@@ -524,16 +628,17 @@ impl Actions {
 
     /// Forgets every action that ended, and every failure older than
     /// [`PLAN_INTERVAL`].
-    fn reap(&mut self) {
+    fn reap(&mut self, askers: &mut Askers) {
         while let Ok((group, end)) = self.done.try_recv() {
-            self.end(group, end);
+            self.end(group, end, askers);
         }
         self.failed
             .retain(|_, failed| failed.elapsed() < PLAN_INTERVAL);
     }
 
-    /// Forgets the action of `group`, which ended by `end`.
-    fn end(&mut self, group: RaftGroupId, end: ActionEnd) {
+    /// Forgets the action of `group`, which ended by `end`, and records an
+    /// ask's answer in `askers`.
+    fn end(&mut self, group: RaftGroupId, end: ActionEnd, askers: &mut Askers) {
         self.running.remove(&group);
         match end {
             ActionEnd::Done => {
@@ -542,6 +647,7 @@ impl Actions {
             ActionEnd::Failed => {
                 self.failed.insert(group, Instant::now());
             }
+            ActionEnd::Asked(answered) => askers.ended(group, answered),
         }
     }
 

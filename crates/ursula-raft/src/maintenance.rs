@@ -94,7 +94,8 @@ pub struct MaintenanceInputs<'a, C> {
 /// is `unplaced_replica`, a counting replica whose membership is not the
 /// placement's target is `incomplete_voter_set`, and one whose membership
 /// names a node without a role is `unplaced_member`. A `voter` or
-/// `incoming` role without a running replica is `missing_group`.
+/// `incoming` role without a running replica is `missing_group`, and any
+/// role in a group the view shows moving is `move_in_progress`.
 pub fn check_raft_maintenance(
     inputs: MaintenanceInputs<'_, impl Fn(RaftGroupId) -> Counts>,
 ) -> RaftMaintenanceReport {
@@ -166,6 +167,16 @@ pub fn check_raft_maintenance(
                 .entry(*group)
                 .or_default()
                 .push(Issue::MissingGroup);
+        }
+        let moving = cluster
+            .and_then(|cluster| cluster.group(RaftGroupId(*group)))
+            .is_some_and(|placed| placed.moving().is_some());
+        if moving {
+            report
+                .group_issues
+                .entry(*group)
+                .or_default()
+                .push(Issue::MoveInProgress);
         }
     }
     // A held replica that does not run is unplaced all the same.
@@ -258,6 +269,10 @@ fn read_placement<'a>(
             for group in unplaced {
                 report.unplaced.insert(group, UnplacedReplica {
                     counts_as_voter: counts(group),
+                    last_answer: hosting
+                        .answers
+                        .get(&RaftGroupId(group))
+                        .map(|answer| answer.answer),
                 });
             }
         }

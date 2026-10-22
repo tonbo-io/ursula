@@ -812,6 +812,11 @@ impl JournalCluster {
         self.registries.values()
     }
 
+    /// The in-process network of each data group, by group.
+    pub(super) fn group_registry_map(&self) -> BTreeMap<u32, InProcessRaftRegistry> {
+        self.registries.clone()
+    }
+
     /// What each node's durable snapshot records name, read from the
     /// simulated disk in one step: the object keys of the records of every
     /// group, for every node, a stopped one included. Empty without a

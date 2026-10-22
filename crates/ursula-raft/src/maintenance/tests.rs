@@ -19,6 +19,7 @@ use ursula_control::RegistrationStatus;
 use ursula_control::samples;
 use ursula_proto::placement::ClusterStage;
 use ursula_proto::placement::GenesisClaim;
+use ursula_proto::placement::MembershipAnswer;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::Registered;
 use ursula_proto::placement::ReplicaRole;
@@ -469,6 +470,101 @@ fn a_replica_without_a_role_is_unplaced() {
         Issue::UnplacedReplica,
         Issue::LeaderUnknown
     ]);
+}
+
+/// A held replica without a role reports what its group's leader last
+/// answered the membership asker, `null` before an answer. The bug it
+/// catches: an answer the asker got that the report drops or misplaces.
+#[test]
+fn an_unplaced_replica_reports_the_last_answer_of_its_group() {
+    let mut node = Node::three();
+    node.hosting
+        .unplaced
+        .extend([RaftGroupId(7), RaftGroupId(9)]);
+    node.hosting
+        .answers
+        .insert(RaftGroupId(9), crate::GroupAnswer {
+            leader: NodeId::new(3),
+            vote: crate::types::UrsulaVote::new_committed(4, 3),
+            answer: MembershipAnswer::NotMember,
+        });
+    let report = node.report();
+    assert_eq!(report.unplaced[&7].last_answer, None);
+    assert_eq!(
+        report.unplaced[&9].last_answer,
+        Some(MembershipAnswer::NotMember)
+    );
+}
+
+/// Every role in a group the view shows moving raises `move_in_progress`,
+/// also on a replica that does not count as a voter, and a settled group
+/// does not (which readiness it blocks is the issue's row, pinned in
+/// `ursula-proto`). The bug it catches: a node taken down while a group it
+/// hosts changes its voters.
+#[test]
+fn a_move_in_progress_is_reported_on_every_replica_of_the_group() {
+    let mut cluster = bootstrapped(&[1, 2, 3, 4], 2, 3);
+    let placed = cluster.group(RaftGroupId(0)).unwrap().clone();
+    let mut state = ControlPlaneState::Bootstrapped(cluster);
+    state
+        .apply(samples::meta(1, 20), ControlCommand::ReportConverged {
+            group: RaftGroupId(0),
+            since: placed.since(),
+            voters: placed.target_voters().clone(),
+            membership: samples::membership(1, 5),
+            now_ms: 30,
+        })
+        .unwrap();
+    let since = state
+        .cluster()
+        .unwrap()
+        .group(RaftGroupId(0))
+        .unwrap()
+        .since();
+    let mut voters = placed.target_voters().iter().collect::<BTreeSet<_>>();
+    let outgoing = *voters.iter().next().unwrap();
+    voters.remove(&outgoing);
+    let incoming = [1, 2, 3, 4]
+        .map(NodeId::new)
+        .into_iter()
+        .find(|node| !placed.target_voters().contains(*node))
+        .unwrap();
+    voters.insert(incoming);
+    state
+        .apply(samples::meta(1, 21), ControlCommand::RequestMove {
+            group: RaftGroupId(0),
+            expected: since,
+            to: ursula_proto::placement::VoterSet::new(voters).unwrap(),
+            now_ms: 40,
+        })
+        .unwrap();
+    cluster = state.cluster().unwrap().clone();
+    assert!(cluster.group(RaftGroupId(0)).unwrap().moving().is_some());
+    for (id, counts) in [(outgoing, true), (incoming, false)] {
+        let mut node = Node::placed(cluster.clone(), id.get());
+        if !counts {
+            node.not_voters.insert(0);
+        }
+        let report = node.report();
+        assert_eq!(
+            report.expected_groups[&0].counts_as_voter, counts,
+            "{report:?}"
+        );
+        assert!(
+            report.group_issues[&0].contains(&Issue::MoveInProgress),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .group_issues
+                .values()
+                .flatten()
+                .filter(|issue| **issue == Issue::MoveInProgress)
+                .count()
+                == 1,
+            "{report:?}"
+        );
+    }
 }
 
 /// A member without a role blocks maintenance but not serving, and nothing

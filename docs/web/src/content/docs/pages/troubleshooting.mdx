@@ -58,7 +58,7 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
 
 ### Maintenance report
 
-`raft_maintenance` (schema version 2) checks this node's replicas against its placement view and their effective memberships. `placement` names the view's stage, the applied meta entry, the node's meta role and the meta leader it knows, its lifecycle and the last registration answer. `expected_groups` lists the groups in which the bootstrapped view gives the node a role, with the role, the placement key, the target voters and whether the replica counts as a voter. `unplaced` lists the replicas the node holds without a role. A node with no group is ready.
+`raft_maintenance` (schema version 2) checks this node's replicas against its placement view and their effective memberships. `placement` names the view's stage, the applied meta entry, the node's meta role and the meta leader it knows, its lifecycle and the last registration answer. `expected_groups` lists the groups in which the bootstrapped view gives the node a role, with the role, the placement key, the target voters and whether the replica counts as a voter. `unplaced` lists the replicas the node holds without a role, with whether each counts as a voter and `last_answer`, what a live leader of the group last answered this node's membership asker about it (`voter`, `learner` or `not_member`, `null` before an answer). A node with no group is ready.
 
 `serving_ready` decides `/__ursula/ready`, and `ready` decides whether a second disruption is safe (`ursulactl wait`, `wait-ready` and the quorum checks). A replica that does not count as a voter, such as an incoming learner or a replica its group answered is no voter, is checked only for `raft_stopped` and `apply_stopped`. Neither blocks anything while `expected_groups` or `unplaced` lists the replica. Before a bootstrapped view and while meta is damaged the report lists no replica, so a stopped replica blocks as a voter's would: `raft_stopped` blocks both, and `apply_stopped` blocks maintenance. Node issues:
 
@@ -72,7 +72,7 @@ Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
 | `group_count_mismatch` | blocks | blocks | `raft.group_count` differs from the cluster's |
 | `replication_factor_mismatch` | | blocks | `raft.placement.replication_factor`, capped at the `[[raft.peers]]` count, differs from the cluster's |
 
-Group issues against the placement: `missing_group` (a `voter` or `incoming` role and no replica, blocking serving for a `voter`), `unplaced_replica` (a replica held without a role), `incomplete_voter_set` (the membership is not the target voters with no learner) and [`unplaced_member`](#unplaced_member) block maintenance. The voter checks against the effective membership, such as `local_replica_not_voter`, `recovery_barrier`, `leader_unknown` or `apply_lag`, block both.
+Group issues against the placement: `missing_group` (a `voter` or `incoming` role and no replica, blocking serving for a `voter`), `unplaced_replica` (a replica held without a role), `incomplete_voter_set` (the membership is not the target voters with no learner), [`unplaced_member`](#unplaced_member) and `move_in_progress` (the view shows a move of the group, reported for every role in it, a replica that does not count as a voter included) block maintenance. The voter checks against the effective membership, such as `local_replica_not_voter`, `recovery_barrier`, `leader_unknown` or `apply_lag`, block both.
 
 ### Serving while a replica catches up
 

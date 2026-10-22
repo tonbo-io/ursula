@@ -532,6 +532,15 @@ impl RaftGroupEngine {
         self.leadership().leads()
     }
 
+    /// Whether this replica counts as a voter, by the one voter predicate
+    /// ([`crate::GroupRejoin::counts`]). A forwarded read's engine binds no
+    /// gate and reads as one that counts, as it did before placement.
+    fn counts_as_voter(&self) -> bool {
+        self.built_with_gate
+            .as_ref()
+            .is_none_or(|gate| gate.counts() == ursula_control::Counts::Voter)
+    }
+
     /// Fails a start once its Raft runs, for tests: the state-machine
     /// worker runs an external function that waits for `fault.release`
     /// first, so the failed engine's work outlives its start.
@@ -1523,6 +1532,9 @@ impl GroupEngine for RaftGroupEngine {
             // #613: a replica holding an unsatisfied plan serves no client read.
             self.history
                 .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
+            // A follower never answers a HEAD itself, so a replica that does
+            // not count as a voter already reads like a leader-only read
+            // here (design 9).
             if !self.leads()
                 && let Some(route) = self.leader_route().await
             {
@@ -1608,6 +1620,20 @@ impl GroupEngine for RaftGroupEngine {
             // #613: a replica holding an unsatisfied plan serves no client read.
             self.history
                 .refuse_planned_read(&self.raft.metrics().borrow_watched())?;
+            // A replica that does not count as a voter, such as an incoming
+            // learner or a voter its group dropped, answers every client
+            // read like a leader-only read (design 9): it forwards to a
+            // known leader or refuses as a follower that knows none. A live
+            // read pinned to its owner's read index keeps its own rule
+            // below: every follower refuses it, and none forwards it.
+            let mut request = request;
+            if !request.leader_only
+                && request.read_index.is_none()
+                && !self.leads()
+                && !self.counts_as_voter()
+            {
+                request.leader_only = true;
+            }
             let original_request = request.clone();
             // A live read pinned to its owner's confirmed read index is
             // served only here, while this replica leads and has applied

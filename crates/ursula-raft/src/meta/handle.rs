@@ -42,6 +42,7 @@ use ursula_runtime::GroupEngineError;
 
 use super::MetaCommand;
 use super::MetaForwardError;
+use super::confirm::BarrierFailure;
 use super::confirm::MetaBarrierError;
 use super::replica::ActiveMeta;
 use super::replica::WriteOrigin;
@@ -265,6 +266,20 @@ impl<T: RecoveryTransport> MetaHandle<T> {
         answer.map_err(MetaWriteError::Refused)
     }
 
+    /// Asks `leader` for a fresh quorum barrier of `target` over this
+    /// node's recovery transport, the one seam every asker of a group's
+    /// memberships uses.
+    pub(crate) async fn barrier(
+        &self,
+        leader: NodeId,
+        target: RaftTarget,
+    ) -> Result<BarrierAnswer, BarrierFailure> {
+        self.transport
+            .barrier(leader.get(), target)
+            .await
+            .map_err(Into::into)
+    }
+
     /// Confirms this node's placement view by a meta read barrier (see the
     /// module docs).
     pub async fn confirm_view(&self) -> Result<ConfirmedView, MetaBarrierError> {
@@ -286,13 +301,9 @@ impl<T: RecoveryTransport> MetaHandle<T> {
                     failure: error.into(),
                 })?
         } else {
-            self.transport
-                .barrier(leader.get(), RaftTarget::Meta)
+            self.barrier(leader, RaftTarget::Meta)
                 .await
-                .map_err(|error| MetaBarrierError::Barrier {
-                    leader,
-                    failure: error.into(),
-                })?
+                .map_err(|failure| MetaBarrierError::Barrier { leader, failure })?
         };
         drop(active);
         let bound = barrier_bound(&answer);

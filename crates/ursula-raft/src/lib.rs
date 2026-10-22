@@ -70,8 +70,9 @@
 //!   deletes every other object in the node's directory (#687, #669).
 //! - [`hosting`]: the hosting driver, the one owner of what a node runs:
 //!   it plans over the journals and the placement view, writes the
-//!   [`HostingSet`] every open is admitted by, and opens and closes
-//!   replicas through a [`GroupHost`].
+//!   [`HostingSet`] every open is admitted by, opens and closes replicas
+//!   through a [`GroupHost`], and asks a group's leader about a held
+//!   replica that may have left it.
 //! - [`history`]: history identity on a group: the leader's fence while
 //!   the group's history is pending and its obligation to propose the
 //!   history event (genesis, recovery plans).
@@ -181,6 +182,7 @@ pub use grpc::raft_grpc_metrics_snapshot;
 pub use grpc::raft_grpc_server;
 pub use grpc::raft_grpc_service;
 pub use history::GroupHistory;
+pub use hosting::GroupAnswer;
 pub use hosting::GroupHost;
 pub use hosting::HostingDriver;
 pub use hosting::HostingSet;

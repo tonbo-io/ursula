@@ -707,6 +707,10 @@ pub struct ExpectedReplica {
 pub struct UnplacedReplica {
     /// Whether the replica counts as a voter, by the one voter predicate.
     pub counts_as_voter: bool,
+    /// What a live leader of the group last answered the node's membership
+    /// asker about it in this run, `null` before an answer.
+    #[serde(deserialize_with = "crate::admin::required_option")]
+    pub last_answer: Option<MembershipAnswer>,
 }
 
 /// What the meta group answered a node's registration.
@@ -735,8 +739,11 @@ pub enum ViewStage {
 }
 
 /// A live group leader's answer about one node, from its committed and its
-/// effective memberships.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// effective memberships. Admin JSON in a maintenance report's
+/// [`UnplacedReplica::last_answer`]. No reply names it: every asker
+/// classifies the memberships a barrier answers with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MembershipAnswer {
     /// A voter of a config of either membership.
     Voter,

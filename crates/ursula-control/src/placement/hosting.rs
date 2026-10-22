@@ -214,6 +214,17 @@ impl<V: PartialOrd> LeftMark<V> {
         }
     }
 
+    /// Whether an append with a vote of at least `vote` arrived after the
+    /// question asked at `asked`. Comparing the highest append vote alone
+    /// suffices by quorum intersection: an append at a vote `h` above `v`
+    /// came from a leader a quorum elected at `h`, after which no leader at
+    /// `v` proves a quorum, so its answer is older than that append.
+    pub fn followed(&self, asked: Asked, vote: &V) -> bool {
+        self.highest
+            .as_ref()
+            .is_some_and(|(highest, at)| *at > asked.0 && at_least(highest, vote))
+    }
+
     /// Records a live leader's answer, with its vote, to the question
     /// asked at `asked`.
     pub fn answered(&mut self, asked: Asked, answer: MembershipAnswer, vote: V) {
@@ -223,13 +234,7 @@ impl<V: PartialOrd> LeftMark<V> {
         }
         // An append at least as new as the answer arrived after the
         // question: the answer is older than what the node already knows.
-        // The highest append vote is the one to compare, as a follower
-        // takes appends only at or above the vote it saved, which grows.
-        let overtaken = self
-            .highest
-            .as_ref()
-            .is_some_and(|(highest, at)| *at > asked.0 && at_least(highest, &vote));
-        if overtaken {
+        if self.followed(asked, &vote) {
             return;
         }
         let newer = match &self.left {

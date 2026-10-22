@@ -51,6 +51,7 @@ use ursula_raft::InProcessCaller;
 use ursula_raft::InProcessMetaNetworkFactory;
 use ursula_raft::InProcessMetaRegistry;
 use ursula_raft::InProcessRaftNetworkPolicy;
+use ursula_raft::InProcessRaftRegistry;
 use ursula_raft::JournalTuning;
 use ursula_raft::PeerDirectory;
 use ursula_raft::PeerEndpoints;
@@ -77,6 +78,7 @@ use super::journal_cluster::JournalCluster;
 use super::placed_hosting::DetachedHost;
 use super::placed_hosting::Placed;
 use super::recovery_wiring::RecoveryProbeError;
+use super::recovery_wiring::in_process_barrier;
 use super::sim_wal::FencedRuns;
 use super::sim_wal::SimNodeWal;
 
@@ -122,11 +124,15 @@ pub(super) fn claim(nodes: u64, meta_voters: &[u64]) -> GenesisClaim {
 
 /// The meta recovery transport of one node process: the genesis probe,
 /// meta barriers and forwarded control commands over the meta plane's
-/// in-process registry, cut off by the network policy. A fenced cluster's
-/// process makes every call as itself ([`InProcessCaller`]).
+/// in-process registry, and the data barriers its hosting driver's
+/// membership asker sends over each data group's, cut off by the network
+/// policy. A fenced cluster's process makes every call as itself
+/// ([`InProcessCaller`]).
 #[derive(Clone)]
 pub(super) struct MetaTransport {
     registry: InProcessMetaRegistry,
+    /// The in-process network of each data group.
+    data: BTreeMap<u32, InProcessRaftRegistry>,
     policy: InProcessRaftNetworkPolicy,
     caller: InProcessCaller,
 }
@@ -157,7 +163,14 @@ impl ursula_raft::RecoveryTransport for MetaTransport {
     }
 
     async fn barrier(&self, leader: u64, target: RaftTarget) -> Result<BarrierAnswer, Self::Error> {
-        assert_eq!(target, RaftTarget::Meta, "the meta transport asks meta");
+        if let RaftTarget::Data(group) = target {
+            // The simulation's groups are fixed: no network reaches another.
+            let registry = self
+                .data
+                .get(&group.0)
+                .ok_or(RecoveryProbeError::Partitioned)?;
+            return in_process_barrier(registry, &self.policy, &self.caller, leader, target).await;
+        }
         if self.policy.partitioned(self.node_id(), leader) {
             return Err(RecoveryProbeError::Partitioned);
         }
@@ -757,6 +770,7 @@ impl MetaCluster {
         };
         MetaTransport {
             registry: self.meta.clone(),
+            data: self.data.group_registry_map(),
             policy: self.data.policy.clone(),
             caller,
         }
