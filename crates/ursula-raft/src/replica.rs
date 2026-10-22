@@ -253,7 +253,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
     /// ([`crate::predecessor_wait::fence_holds`]) it grants no vote: in any
     /// group or meta while this run owes its predecessor wait, whose
     /// predecessor may still vote as this node, and in a data group while
-    /// this run's empty root awaits its binding. The bootstrap probe vote
+    /// this run's unbound root awaits its binding. The bootstrap probe vote
     /// is still answered, as the gate answers it.
     pub(crate) async fn vote(
         &self,
@@ -272,7 +272,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                     node_id = metrics.id,
                     candidate = %request.vote,
                     "refusing a vote while the node fence holds this replica out: a predecessor that \
-                     may still run is waited out, or this empty root awaits its binding"
+                     may still run is waited out, or this unbound root awaits its binding"
                 );
                 return Ok(VoteResponse::new(metrics.vote, last_log, false));
             }

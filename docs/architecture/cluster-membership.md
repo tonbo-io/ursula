@@ -111,19 +111,25 @@ ever held the group never initializes it again.
 
 Each node id's record in meta holds a root slot: the root (the WAL disk,
 named by the id `topology.bin` drew) the id is bound to, `bound` or
-`released`. A node registers its root at every start, and says whether the
-root was empty when it opened. The first registration of an id binds its
-root, and a registration of the bound root changes nothing. A released slot
-binds only an empty root other than the released one, and the released root
-never binds again (`crates/ursula-control/src/placement/apply.rs`). The
+`released`. A node registers its root at every start, and says whether meta
+never bound that root (`empty`). The root's identity file records how it
+stands: `unbound` from its creation until meta first answers a
+registration of it, and `bound` from then on. The run records the binding,
+synced, before it acts on the answer, so a root whose data replicas took
+part is always recorded bound. What the root's journals hold decides
+nothing. The first registration of an id binds its root, and a registration
+of the bound root changes nothing. A released slot binds only an `empty`
+root other than the released one, and the released root never binds again
+(`crates/ursula-control/src/placement/apply.rs`). The
 placement status shows every slot: the bootstrapped cluster's node records,
 and before Bootstrap the `registering` view's map from each registered id to
 its slot.
 
 The registration judges a refusal for another root by how the run stands on
 its root (`crates/ursula-raft/src/meta/registration.rs`,
-`crates/ursula-raft/src/meta/root.rs`). An empty root that meta has not
-bound in this run never fences itself. Its data replicas open with the run
+`crates/ursula-raft/src/meta/root.rs`). An unbound root never fences
+itself, and a restart keeps it unbound whatever its meta replica wrote
+before, a vote floor for example. Its data replicas open with the run
 but are held out from its open until meta binds the root and then through
 the predecessor wait (`crates/ursula-raft/src/predecessor_wait.rs`): they
 grant no vote, run no gate driver, write no vote floor and no snapshot
@@ -131,16 +137,22 @@ object, so their gates stay closed and they take no replication. Its meta
 replica is not held before an answer, so a forming cluster's meta group
 elects. A fresh cluster's data groups therefore form only once meta
 answered its nodes' registrations, and genesis values that disagree, which
-keep meta from forming, keep the data groups from forming too. A refusal for another root makes the run owe the predecessor wait:
+keep meta from forming, keep the data groups from forming too. A run of an
+unbound root whose meta journal or meta replica does not open gets no
+answer, so its data replicas stay held for that whole run. That is safe, and
+it is the one meta failure that stops a node from serving data. A bound root
+does not wait for meta. A refusal for another root makes the run owe the
+predecessor wait:
 from then on its meta replica grants no vote and writes no floor, and the
-node sheds every leadership. Its registration status is `root_refused` with
+node sheds every leadership. Its meta replica is held only while a wait is
+owed, so after a restart it may vote again until the first refusal. Its registration status is `root_refused` with
 the slot, readiness reports `root_refused`, and it registers again at most
 5 seconds apart. Once an operator released the old root it binds with no
 restart, waits out its predecessor (readiness `predecessor_wait`), and its
 replicas rejoin through their gates as in the rest of this section.
 
-A root that holds state, or that meta bound in this run, is superseded for
-good on a registration refused for another root, on any applied view that
+A bound root is superseded for good on a registration refused for another
+root, on any applied view that
 shows its root released, and on a view a meta read barrier confirmed that
 binds its id to another root. An unconfirmed view may show the slot of a
 replica still applying history, so only a release counts there. A

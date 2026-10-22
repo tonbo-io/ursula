@@ -185,7 +185,7 @@ where
         let guard = RootGuard::new(
             me,
             wal.incarnation().root,
-            wal.empty_at_open(),
+            wal.binding(),
             wal.fence(),
             registry.clone(),
         );
@@ -208,7 +208,8 @@ where
             tasks: Vec::new(),
         };
         // Before the meta replica opens, and whether it opens or not: a
-        // root that held state ends its wait without meta.
+        // bound root ends its wait without meta, and an unbound root waits
+        // for its binding, holding its data until meta answers.
         runtime.tasks.push(crate::rt::spawn(
             crate::predecessor_wait::run_predecessor_wait(
                 wal.predecessor_wait(),
@@ -247,7 +248,6 @@ where
         let registrant = Registrant {
             node: me,
             root: wal.incarnation().root,
-            empty: wal.empty_at_open(),
         };
         let replica_config = MetaReplicaConfig {
             node: config.node,

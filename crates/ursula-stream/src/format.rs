@@ -69,9 +69,13 @@
 //!   the meta group never reads as one of data group 0;
 //! - the identity of a WAL root and of each process on it: `topology.bin`
 //!   records the node id and a root id the root draws, and a root opens only
-//!   under its node id; `identity.bin` counts the runs of the root and
+//!   under its node id; `identity.bin` counts the runs of the root,
 //!   records whether a run read a predecessor that may still run, which an
-//!   empty root, a remount, a host crash or a lost run state reads; the run
+//!   unbound root, a remount, a host crash or a lost run state reads, and
+//!   records whether the meta group ever bound the root (`unbound` until
+//!   the first answer to its registration, `bound` from then on), which
+//!   alone decides whether a start holds its data replicas until a binding
+//!   and what `RegisterNode` says as `empty`; the run
 //!   state records the device the root is mounted from, and a run that did
 //!   not end cleanly reads as `Remounted` on the same boot from another
 //!   device, replayed and gated as a host crash; a process incarnation is
@@ -79,8 +83,8 @@
 //!   lowercase hex digits in every encoding, never a number;
 //! - root slots in the placement kernel: every node record and every
 //!   registration before Bootstrap binds a root (`RootSlot`), `RegisterNode`
-//!   names the root and whether it was `empty` at open (no journal record,
-//!   vote or snapshot record, data or meta), `ReleaseRoot` releases a bound
+//!   names the root and whether it is `empty` (its identity file records
+//!   that meta never bound it), `ReleaseRoot` releases a bound
 //!   root by compare-and-set, a slot changes only as its table says, a root
 //!   registered as holding state never takes a released slot, the root a
 //!   released slot names never binds again (the release rule, a disk

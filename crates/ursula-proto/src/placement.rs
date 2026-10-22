@@ -430,10 +430,11 @@ pub enum RootSlot {
     /// The node id runs on this root.
     Bound(RootId),
     /// An operator released this root (`replace-disk`): it never binds
-    /// again while the slot names it, and an empty root of the node id
-    /// takes the slot. The slot remembers only the latest release: the
-    /// release rule (a root is released only once its disk is revoked)
-    /// keeps a root released earlier out.
+    /// again while the slot names it, and a root of the node id that meta
+    /// never bound (`empty`) takes the slot. The slot remembers only the
+    /// latest release: a root released earlier registers as not `empty`
+    /// once its data replicas took part, and the release rule (a root is
+    /// released only once its disk is revoked) keeps it out otherwise.
     Released(RootId),
 }
 

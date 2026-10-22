@@ -76,6 +76,8 @@ use super::disk::DiskLock;
 use super::disk::JournalDisk;
 use super::disk::LockAttempt;
 use super::disk::create_dir_all_durable;
+use super::identity::IdentityFile;
+use super::identity::RootStanding;
 use super::journal::JournalError;
 use super::journal::JournalReplayMode;
 use super::segment;
@@ -307,13 +309,12 @@ pub enum Predecessor {
 }
 
 impl Predecessor {
-    /// The predecessor of a run whose root was `empty` when it opened (no
-    /// core or meta journal held a record, no core or meta metadata held a
-    /// vote, and no snapshot record existed), after `previous_run` and with
-    /// `predecessor_wait`, the wait the identity file says is owed. The
-    /// first matching row decides:
+    /// The predecessor of a run whose root stands as `standing` in meta,
+    /// after `previous_run` and with `predecessor_wait`, the wait the
+    /// identity file says is owed, both as the identity file records them.
+    /// The first matching row decides:
     ///
-    /// - an empty root may live: a fresh root of a node id whose old
+    /// - an unbound root may live: a fresh root of a node id whose old
     ///   process may still run;
     /// - an owed wait may live: a restart never shortens one;
     /// - `Clean`, `Poisoned` and `ProcessCrash` are gone: the run recorded
@@ -323,9 +324,9 @@ impl Predecessor {
     /// - `Remounted`, `HostCrash`, `Unrecorded` and `Absent` may live:
     ///   without a host identity a reboot and a moved volume look alike,
     ///   and a lost run state proves nothing.
-    pub fn of(previous_run: PreviousRun, predecessor_wait: bool, empty: bool) -> Self {
+    pub fn of(previous_run: PreviousRun, predecessor_wait: bool, standing: RootStanding) -> Self {
         match previous_run {
-            _ if empty => Self::MayLive,
+            _ if standing == RootStanding::Unbound => Self::MayLive,
             _ if predecessor_wait => Self::MayLive,
             PreviousRun::Clean | PreviousRun::Poisoned | PreviousRun::ProcessCrash => Self::Gone,
             PreviousRun::Remounted { .. }
@@ -429,15 +430,10 @@ pub(crate) enum MetaAtStart {
 /// What the start read of the meta journal.
 #[derive(Debug)]
 enum MetaRead {
-    /// No meta journal ([`MetaAtStart::Absent`]), and whether the meta
-    /// group's snapshot record remains without it.
-    Absent { snapshot_records: bool },
-    /// The meta journal, what it holds, and whether it holds a record, a
-    /// vote or a snapshot record (`state`).
-    Read {
-        history: JournalHistory,
-        state: bool,
-    },
+    /// No meta journal ([`MetaAtStart::Absent`]).
+    Absent,
+    /// The meta journal and what it holds.
+    Read { history: JournalHistory },
     /// The meta journal could not be read.
     Unread(MetaJournalDamage),
 }
@@ -449,12 +445,10 @@ impl MetaRead {
             Ok(JournalRead {
                 records: false,
                 metadata: false,
-                snapshot_records,
                 ..
-            }) => Self::Absent { snapshot_records },
+            }) => Self::Absent,
             Ok(read) => Self::Read {
                 history: JournalHistory::of(read.records, read.verified_epoch),
-                state: read.state(),
             },
             Err(unread) => Self::Unread(unread.into()),
         }
@@ -462,18 +456,8 @@ impl MetaRead {
 
     fn at_start(&self) -> MetaAtStart {
         match self {
-            Self::Absent { .. } => MetaAtStart::Absent,
+            Self::Absent => MetaAtStart::Absent,
             Self::Read { .. } | Self::Unread(_) => MetaAtStart::Present,
-        }
-    }
-
-    /// Whether the meta journal holds a record, a vote or a snapshot
-    /// record. A journal that could not be read counts as holding them.
-    fn holds_state(&self) -> bool {
-        match self {
-            Self::Absent { snapshot_records } => *snapshot_records,
-            Self::Read { state, .. } => *state,
-            Self::Unread(_) => true,
         }
     }
 }
@@ -864,9 +848,12 @@ pub(crate) struct NodeWal {
     incarnation: ProcessIncarnation,
     /// Whether the process of an earlier run of the root may still run.
     predecessor: Predecessor,
-    /// Whether the root held no journal record, vote or snapshot record at
-    /// start.
-    empty: bool,
+    /// How the root stood in meta at start, as its identity file recorded.
+    standing: RootStanding,
+    /// The identity file as this run last recorded it. Each write of the
+    /// run holds it, so a recorded binding and a finished wait never write
+    /// over each other.
+    identity: crate::rt::sync::Mutex<IdentityFile>,
     /// The wait this run owes its predecessor, if it owes one.
     wait: Option<WaitFrom>,
     /// This process's fence, whose lease the probe keeps.
@@ -904,13 +891,16 @@ impl CleanExit {
 /// Where the predecessor wait of a run is measured from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WaitFrom {
-    /// The open of the run, for a root that held state.
+    /// The open of the run, for a root the meta group bound
+    /// (`RootStanding::Bound`).
     Open(FenceInstant),
-    /// The first answer of the meta group that binds the root, for an
-    /// empty root: a fresh root of a node id whose old process may still
-    /// run. The wait is owed from that answer on, and an answer before
-    /// Bootstrap settles it at once. Until the answer the run's data
-    /// replicas are held out ([`ursula_runtime::NodeFence::awaits_binding`]).
+    /// The first answer of the meta group that binds the root, for a root
+    /// the identity file records unbound (`RootStanding::Unbound`): a
+    /// fresh root of a node id whose old process may still run, or one the
+    /// meta group refused so far. The wait is owed from that answer on, and
+    /// an answer before Bootstrap settles it at once. Until the answer the
+    /// run's data replicas are held out
+    /// ([`ursula_runtime::NodeFence::awaits_binding`]).
     Binding,
 }
 
@@ -952,7 +942,6 @@ impl NodeWal {
         let meta = meta_dir(&root);
         let meta_read = MetaRead::of(&meta);
         let meta_at_start = meta_read.at_start();
-        let meta_state = meta_read.holds_state();
         // Even metadata-only cores are prior state: votes must not be
         // forgotten. So is a meta journal.
         let has_prior_state =
@@ -960,8 +949,8 @@ impl NodeWal {
         let bound =
             super::topology::check_or_create(&root, topology, cluster_id, node, has_prior_state)?;
         let identity = super::identity::read(&root, has_prior_state)?;
-        let (journals, data_state) = journal_history(&cores)?;
-        let empty = !data_state && !meta_state;
+        let journals = journal_history(&cores)?;
+        let standing = identity.standing();
         let boot_id = Disk::boot_id(&root).map(BootId);
         let device = Disk::device(&root).map_err(|source| RaftWalError::Device {
             path: root.clone(),
@@ -1032,7 +1021,8 @@ impl NodeWal {
         // Before this run records itself, so a crash in between never
         // reads the next start's predecessor as gone without the wait this
         // one owes: the identity file keeps it.
-        let predecessor = Predecessor::of(opening.previous_run, identity.predecessor_wait(), empty);
+        let predecessor =
+            Predecessor::of(opening.previous_run, identity.predecessor_wait(), standing);
         // The lease's probe file, opened here under the root's lock and
         // never again by path: a probe that reopened it after the disk went
         // away could open a later attachment's file at the same path, and
@@ -1046,20 +1036,21 @@ impl NodeWal {
                 source,
             })?;
         let opened = fence_now();
-        let (_, incarnation) = super::identity::advance(&root, bound.root, identity, predecessor)?;
+        let (identity, incarnation) =
+            super::identity::advance(&root, bound.root, identity, predecessor)?;
         // The synced identity write is the lease's first success.
         fence.record_probe(opened, ProbeOutcome::Synced, fence_now());
         let wait = (predecessor == Predecessor::MayLive && fence.lease_length().is_some())
-            .then_some(if empty {
-                WaitFrom::Binding
-            } else {
-                WaitFrom::Open(opened)
+            .then_some(match standing {
+                RootStanding::Unbound => WaitFrom::Binding,
+                RootStanding::Bound => WaitFrom::Open(opened),
             });
-        // An empty root owes its wait only once a bootstrapped cluster binds
-        // it (`WaitFrom::Binding`), so a forming cluster's meta group still
-        // elects. Until that binding its data replicas take part in
-        // nothing: an empty disk under a live id must neither vote nor take
-        // a floor beside the old process.
+        // An unbound root owes its wait only once a bootstrapped cluster
+        // binds it (`WaitFrom::Binding`), so a forming cluster's meta group
+        // still elects. Until that binding its data replicas take part in
+        // nothing: a new disk under a live id must neither vote nor take a
+        // floor beside the old process, whatever its meta replica took
+        // before a restart.
         match wait {
             Some(WaitFrom::Open(_)) => fence.begin_wait(),
             Some(WaitFrom::Binding) => fence.await_binding(),
@@ -1069,7 +1060,7 @@ impl NodeWal {
             root = %root.display(),
             %incarnation,
             ?predecessor,
-            empty,
+            ?standing,
             "counted this run of the Raft WAL root"
         );
         let run_state = RunStateFile::new(path, RunState {
@@ -1105,7 +1096,8 @@ impl NodeWal {
             run_state: Arc::new(run_state),
             incarnation,
             predecessor,
-            empty,
+            standing,
+            identity: crate::rt::sync::Mutex::new(identity),
             wait,
             fence,
             _probe: probe,
@@ -1129,19 +1121,53 @@ impl NodeWal {
     /// a run whose lease lapsed writes nothing by path, where another
     /// attachment of the volume may be mounted now, and a run that shut
     /// down writes nothing after its clean end.
-    pub(crate) fn finish_wait(&self) -> Result<(), RaftWalError> {
-        match self.fence.status(fence_now()) {
-            FenceStatus::Admits => {}
-            status => {
-                return Err(RaftWalError::Fenced {
-                    root: self.root.clone(),
-                    status,
-                });
-            }
-        }
-        super::identity::finish_wait(&self.root, self.incarnation.run)?;
+    pub(crate) async fn finish_wait(&self) -> Result<(), RaftWalError> {
+        let mut identity = self.identity.lock().await;
+        self.admits_writes()?;
+        let file = IdentityFile {
+            predecessor_wait: false,
+            ..*identity
+        };
+        super::identity::write(&self.root, &file)?;
+        *identity = file;
+        drop(identity);
         self.fence.end_wait();
         Ok(())
+    }
+
+    /// Records the root bound by the meta group, `fsync`ed, unless the
+    /// identity file records it so already. The caller releases the
+    /// binding's hold on the data replicas only after this returned `Ok`,
+    /// so a root whose replicas took part is always recorded bound and
+    /// registers as one after any restart. Refused, as a finished wait is,
+    /// while the fence does not admit ([`RaftWalError::Fenced`]).
+    pub(crate) async fn record_bound(&self) -> Result<(), RaftWalError> {
+        let mut identity = self.identity.lock().await;
+        if identity.standing == RootStanding::Bound {
+            return Ok(());
+        }
+        self.admits_writes()?;
+        let file = IdentityFile {
+            standing: RootStanding::Bound,
+            ..*identity
+        };
+        super::identity::write(&self.root, &file)?;
+        *identity = file;
+        Ok(())
+    }
+
+    /// Refuses a write by path while the fence does not admit: a run whose
+    /// lease lapsed writes nothing where another attachment of the volume
+    /// may be mounted now, and a run that shut down or was superseded
+    /// writes nothing more.
+    fn admits_writes(&self) -> Result<(), RaftWalError> {
+        match self.fence.status(fence_now()) {
+            FenceStatus::Admits => Ok(()),
+            status => Err(RaftWalError::Fenced {
+                root: self.root.clone(),
+                status,
+            }),
+        }
     }
 
     /// This process's incarnation: its root, the run this start counted
@@ -1155,10 +1181,9 @@ impl NodeWal {
         self.predecessor
     }
 
-    /// Whether the root held no journal record, vote or snapshot record at
-    /// start.
-    pub(crate) fn empty(&self) -> bool {
-        self.empty
+    /// How the root stood in meta at start.
+    pub(crate) fn standing(&self) -> RootStanding {
+        self.standing
     }
 
     pub(crate) fn root(&self) -> &Path {
@@ -1370,7 +1395,7 @@ fn open_meta_class(
         )
     };
     let history = match read {
-        MetaRead::Absent { .. } => {
+        MetaRead::Absent => {
             return Ok(MetaOpening::Decided(decide(JournalHistory::Empty {
                 verified_epoch: 0,
             })?));
@@ -1381,7 +1406,7 @@ fn open_meta_class(
                 damage,
             });
         }
-        MetaRead::Read { history, .. } => history,
+        MetaRead::Read { history } => history,
     };
     let opening = decide(history)?;
     // Before this run records itself, as for the cores. The policy of meta
@@ -1441,19 +1466,15 @@ impl From<HistoryReadError> for MetaJournalDamage {
 /// Gather journal records and the greatest surviving verification epoch of
 /// the journals in `dirs`. This performs I/O only; `WalOpening::decide` owns
 /// the recovery policy.
-/// Whether a journal of the class holds a record, a vote or a snapshot record
-/// (`state`), with the journals' history.
-fn journal_history(dirs: &[PathBuf]) -> Result<(JournalHistory, bool), HistoryReadError> {
+fn journal_history(dirs: &[PathBuf]) -> Result<JournalHistory, HistoryReadError> {
     let mut records = false;
-    let mut state = false;
     let mut verified_epoch = 0;
     for dir in dirs {
         let read = read_journal(dir)?;
         records |= read.records;
-        state |= read.state();
         verified_epoch = verified_epoch.max(read.verified_epoch);
     }
-    Ok((JournalHistory::of(records, verified_epoch), state))
+    Ok(JournalHistory::of(records, verified_epoch))
 }
 
 /// What one journal directory holds, as a start reads it.
@@ -1465,18 +1486,8 @@ struct JournalRead {
     metadata: bool,
     /// The epoch the metadata file records, 0 without one.
     verified_epoch: u64,
-    /// Whether the metadata file holds a vote of any group.
-    votes: bool,
     /// Whether a group's snapshot record (`group-N.snapshot.json`) exists.
     snapshot_records: bool,
-}
-
-impl JournalRead {
-    /// Whether the journal holds a record, a vote or a snapshot record: the
-    /// state an `empty` root holds none of.
-    fn state(&self) -> bool {
-        self.records || self.votes || self.snapshot_records
-    }
 }
 
 /// Whether the core journal in `dir` holds metadata, a segment record or a
@@ -1519,7 +1530,6 @@ fn read_journal(dir: &Path) -> Result<JournalRead, HistoryReadError> {
         records,
         metadata: !missing,
         verified_epoch: metadata.verified_epoch(),
-        votes: metadata.groups().any(|(_, group)| group.vote.is_some()),
         snapshot_records,
     })
 }
@@ -1938,18 +1948,21 @@ mod tests {
     }
 
     /// Every row of the predecessor table, first matching row first: an
-    /// empty root and an owed wait may live whatever ended, a recorded end,
-    /// a poisoned writer and a process crash are gone, and a remount, a
-    /// host crash and a lost or absent run state may live. Under either
+    /// unbound root and an owed wait may live whatever ended, a recorded
+    /// end, a poisoned writer and a process crash are gone, and a remount,
+    /// a host crash and a lost or absent run state may live. Under either
     /// policy alike.
     #[test]
     fn predecessor_of_follows_its_table_over_every_previous_run() {
+        use super::RootStanding::Bound;
+        use super::RootStanding::Unbound;
+
         for run in every_previous_run() {
-            for (empty, predecessor_wait) in [(true, false), (true, true), (false, true)] {
+            for (standing, predecessor_wait) in [(Unbound, false), (Unbound, true), (Bound, true)] {
                 assert_eq!(
-                    Predecessor::of(run, predecessor_wait, empty),
+                    Predecessor::of(run, predecessor_wait, standing),
                     Predecessor::MayLive,
-                    "{run:?} empty={empty} wait={predecessor_wait}"
+                    "{run:?} {standing:?} wait={predecessor_wait}"
                 );
             }
             let expected = match run {
@@ -1961,13 +1974,13 @@ mod tests {
                 | PreviousRun::Remounted { .. }
                 | PreviousRun::HostCrash { .. } => Predecessor::MayLive,
             };
-            assert_eq!(Predecessor::of(run, false, false), expected, "{run:?}");
+            assert_eq!(Predecessor::of(run, false, Bound), expected, "{run:?}");
         }
         for fsync in [WalFsync::Never, WalFsync::Always] {
             for run in [PreviousRun::Remounted { fsync }, PreviousRun::HostCrash {
                 fsync,
             }] {
-                assert_eq!(Predecessor::of(run, false, false), Predecessor::MayLive);
+                assert_eq!(Predecessor::of(run, false, Bound), Predecessor::MayLive);
             }
         }
         // The admin JSON names.

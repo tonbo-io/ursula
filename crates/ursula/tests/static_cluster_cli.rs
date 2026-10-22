@@ -5058,7 +5058,10 @@ fn bound_root(cluster: &Cluster, node: u64) -> ursula_proto::placement::RootId {
 /// floor (its term stays 0, the term a barrier would adopt is the leader's),
 /// none holds a log entry, and every data gate stays closed. Its meta
 /// replica is not held before the refusal, and the test claims nothing
-/// about it. `ursulactl node replace-disk`
+/// about it. A crash and restart of node 3 while it is refused changes
+/// nothing: its identity file still records the root unbound, so it is
+/// refused, not superseded, and its data stays held, whatever its meta
+/// replica wrote in the first run. `ursulactl node replace-disk`
 /// refuses a node that still runs on the root it names, then releases the
 /// old root through another node's admin plane. Node 3 binds its new root
 /// with no restart, reports `predecessor_wait`, and rejoins: it becomes
@@ -5094,7 +5097,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     put_until_created(&client, &stream).await;
     post_until_no_content(&client, &stream, "before-the-loss;").await;
     let read =
-        |node: &MetaNode| format!("{}/replace-disk/served?offset=0&max_bytes=64", node.url());
+        |node: &MetaNode| format!("{}/replace-disk/served?offset=0&max_bytes=128", node.url());
 
     // 1. Node 3 loses its disk and starts on an empty WAL.
     procs.kill(3);
@@ -5128,6 +5131,34 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     let held = try_node_metrics(&client, &nodes[2].url())
         .await
         .expect("node 3 reports its replicas");
+    assert_data_held(&held, 3);
+    // A restart while refused: still refused and held, never superseded.
+    procs.kill(3);
+    procs.start(binary, &nodes[2]);
+    wait_placement(
+        &client,
+        &mut procs,
+        &nodes[2],
+        "is still refused after a restart",
+        |status| {
+            status.registration
+                == RegistrationStatus::RootRefused {
+                    slot: RootSlot::Bound(old),
+                }
+        },
+    )
+    .await;
+    wait_readiness_reason(
+        &client,
+        &mut procs,
+        &nodes[2],
+        Some(ServingReadinessReason::RootRefused),
+    )
+    .await;
+    post_until_no_content(&client, &stream, "while-restarted;").await;
+    let held = try_node_metrics(&client, &nodes[2].url())
+        .await
+        .expect("node 3 reports its replicas after the restart");
     assert_data_held(&held, 3);
 
     // 2. The guard refuses a node that still runs on the root it names.
@@ -5181,7 +5212,7 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     read_until_matches(
         &client,
         &read(&nodes[2]),
-        b"before-the-loss;while-refused;after-the-replacement;",
+        b"before-the-loss;while-refused;while-restarted;after-the-replacement;",
     )
     .await;
 

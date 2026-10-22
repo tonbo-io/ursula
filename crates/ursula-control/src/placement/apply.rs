@@ -787,9 +787,10 @@ impl Cluster {
 /// root changes nothing, and only an `empty` root other than the released
 /// one takes a released slot (K18). The root a released slot names never
 /// binds again (K19), and neither does a root while another holds the slot.
-/// One slot per id remembers only the latest release: the release rule (a
-/// root is released only once its disk is revoked) keeps a root released
-/// earlier out, since such a root, empty, would bind again here.
+/// One slot per id remembers only the latest release: a root released
+/// earlier registers as not `empty` once its data replicas took part, and
+/// the release rule (a root is released only once its disk is revoked)
+/// keeps it out otherwise.
 fn register_slot(
     node: NodeId,
     slot: Option<RootSlot>,

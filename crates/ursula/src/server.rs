@@ -1008,7 +1008,9 @@ mod tests {
                 super::WalShutdown::Clean(_)
             ));
         };
-        // The first run creates the meta journal.
+        // The first run creates the meta journal, and meta binds its root.
+        // A root meta never bound holds its data for any run whose meta does
+        // not open, so the run records the binding before it stops.
         let state = start().await;
         assert_eq!(
             state
@@ -1016,6 +1018,19 @@ mod tests {
                 .with(ursula_raft::meta::runtime::MetaRuntime::state),
             Some(ursula_raft::meta::runtime::MetaRuntimeState::Running)
         );
+        let mut registration = state
+            .meta()
+            .with(|meta| meta.status().registration.clone())
+            .expect("a meta runtime");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            registration.wait_for(|status| {
+                matches!(status, ursula_control::RegistrationStatus::Answered(_))
+            }),
+        )
+        .await
+        .expect("meta answers the registration")
+        .expect("the registration runs");
         stop(state).await;
         std::fs::write(
             log_dir.join("meta").join("journal.meta"),
@@ -1048,9 +1063,9 @@ mod tests {
             }
         ));
         assert_eq!(placement.applied, None);
-        // The first run started on an empty root and may stop before the
-        // meta group answers its registration, which leaves its predecessor
-        // wait owed: this run then waits it out from its open, without
+        // The first run started on a fresh root and may stop before its
+        // predecessor wait from the binding ends, which leaves the wait
+        // owed: this bound run then waits it out from its open, without
         // meta, and campaigns only after it. The wait's end clears the
         // fence's shed in the same step.
         let fence = state.raft_wal().expect("a disk WAL starts").fence();

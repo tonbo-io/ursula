@@ -30,9 +30,10 @@ use super::state::MoveLimit;
 #[serde(rename_all = "snake_case")]
 pub enum ControlCommand {
     /// A node announces itself and the root it runs on, at every start.
-    /// `empty` says that the root held no journal record, no vote and no
-    /// snapshot record when it opened: only an empty root takes a released
-    /// slot.
+    /// `empty` says that the meta group never bound the root, as its WAL
+    /// identity file records: its data replicas took part in nothing, so it
+    /// holds nothing a bound process left, whatever its meta replica holds.
+    /// Only an empty root takes a released slot.
     RegisterNode {
         node: NodeId,
         root: RootId,
@@ -275,7 +276,7 @@ impl ControlError {
     /// exhaustive match, so a new refusal names its class.
     pub fn requeue(&self) -> Requeue {
         match self {
-            // An empty root registers until an operator releases the slot.
+            // An unbound root registers until an operator releases the slot.
             Self::NotBootstrapped
             | Self::RetirementPending { .. }
             | Self::MoveLimit { .. }

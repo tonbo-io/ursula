@@ -162,7 +162,7 @@ pub enum RegistrationStatus {
     /// The meta group's last answer.
     Answered(Registered),
     /// The meta group binds this node id to `slot`'s root, not to the
-    /// empty root this node runs on: the node's data replicas grant no
+    /// unbound root this node runs on: the node's data replicas grant no
     /// vote and keep their recovery gates closed, and the node registers
     /// again until an operator releases that root
     /// (`ursulactl node replace-disk`).
