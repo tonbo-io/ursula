@@ -278,7 +278,9 @@ without a leader for 30 s, a damaged meta replica, which replaces every issue
 the view gives, and a configured group count or replication factor the
 cluster does not share. Group issues name a missing placed replica, a replica
 held without a role (`unplaced_replica`), an incomplete voter set, a member
-without a role (`unplaced_member`, which the leader never removes),
+without a role (`unplaced_member`: the leader removes such a learner once the
+group is seeded or its voters equal the target, and such a voter only by a
+move or by leaving a joint configuration; nothing restores a missing voter),
 `joint_membership`, `apply_lag` or `apply_stopped`. A node with no group is
 ready. `GET /__ursula/ready` uses `serving_ready()`, which ignores incomplete
 voter sets, members and replicas without a role, joint membership and stopped

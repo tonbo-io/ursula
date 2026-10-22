@@ -544,11 +544,19 @@ async fn run_recover_group_subcommand(args: RecoverGroupArgs) -> Result<()> {
                 plan.leader, plan.point, plan.cut
             );
             if !outside.is_empty() {
+                let readmission = match target {
+                    ursula_ctl::recovery::RecoverTarget::Meta => {
+                        "the meta leader adds a registered node back as a learner"
+                    }
+                    ursula_ctl::recovery::RecoverTarget::Group(_) => {
+                        "the group's leader does not add a node back"
+                    }
+                };
                 println!(
                     "{target}: nodes {outside:?} are outside the leader's membership: they answer reads \
-                     of the group with 503 while they hold the plan; a configured voter is added \
-                     back as a learner, and one whose log is ahead of the plan's point must rejoin \
-                     as a wiped node (operations guide, Rejoining a wiped node)"
+                     of the group with 503 while they hold the plan; {readmission}, and one whose log \
+                     is ahead of the plan's point must rejoin as a wiped node (operations guide, \
+                     Rejoining a wiped node)"
                 );
             }
             if !stopped.is_empty() {

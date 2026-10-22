@@ -601,7 +601,9 @@ pub enum RaftMaintenanceIssue {
     IncompleteVoterSet,
     /// The group's membership names a node that has no role in the group's
     /// placement, as a voter or a learner. No node dials a member that
-    /// `raft.peers` does not list.
+    /// `raft.peers` does not list. The leader removes such a learner once
+    /// the group is seeded or its voters equal the target, and such a voter
+    /// only by a move or by leaving a joint configuration.
     UnplacedMember,
     LocalReplicaNotVoter,
     MembershipNotApplied,
