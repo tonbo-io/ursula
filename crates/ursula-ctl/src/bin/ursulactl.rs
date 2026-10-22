@@ -92,11 +92,13 @@ enum PlacementCommand {
     /// Move groups to other voters. Groups queue under the move limit, a
     /// group already stable at or moving to its target counts as done, so a
     /// rerun finishes an interrupted batch, and other refusals are reported
-    /// per group with a non-zero exit.
+    /// per group. Exits 2 when a group was refused or timed out.
     Move(MoveArgs),
-    /// Move a moving group back to its source.
+    /// Move a moving group back to its source. Exits 2 when it was refused
+    /// or timed out.
     Cancel(CancelArgs),
-    /// Set how many groups may move at once.
+    /// Set how many groups may move at once. Exits 2 when the limit was
+    /// refused or did not take effect.
     SetMoveLimit(SetMoveLimitArgs),
 }
 
@@ -833,8 +835,27 @@ async fn run_placement_subcommand(command: PlacementCommand) -> Result<()> {
             let nodes = load_nodes(&args.config).await?;
             let client = MetricsClient::new(Duration::from_secs(args.http_timeout_secs))?;
             let limit = ursula_control::MoveLimit::new(args.limit);
-            let applied = moves::set_move_limit(&client, &nodes, limit).await?;
-            println!("move limit: {}", applied.get());
+            let end = moves::set_move_limit(&client, &nodes, limit).await?;
+            match &end {
+                moves::MoveLimitEnd::Applied(applied) => {
+                    println!("move limit: {}", applied.get());
+                }
+                moves::MoveLimitEnd::Resolved { current, .. } => {
+                    let took = if end.took_effect() {
+                        "took effect"
+                    } else {
+                        "did not take effect, send it again"
+                    };
+                    println!(
+                        "the confirmed view shows move limit {}: the request {took}",
+                        current.get()
+                    );
+                }
+                moves::MoveLimitEnd::Refused(refusal) => println!("{refusal}"),
+            }
+            if !end.took_effect() {
+                std::process::exit(2);
+            }
             Ok(())
         }
     }
@@ -873,11 +894,14 @@ async fn run_moves(
         }
     }
     if !failed.is_empty() {
-        bail!(
+        writeln!(
+            stdout,
             "{} of {} groups did not move: {failed:?}",
             failed.len(),
             ends.len()
-        );
+        )?;
+        stdout.flush()?;
+        std::process::exit(2);
     }
     Ok(())
 }

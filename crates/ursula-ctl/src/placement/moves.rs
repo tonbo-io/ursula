@@ -121,8 +121,10 @@ pub enum MoveRefusal {
         group: RaftGroupId,
         current: Box<GroupPlacement>,
     },
-    /// A refusal that is not the meta state machine's, such as no meta
-    /// leader, which the batch does not retry under `--expect`.
+    /// A refusal of `set-move-limit`, with the node that answered it. A
+    /// move never reports one: it plans a group again after a refusal that
+    /// is not the meta state machine's, such as no meta leader, and reports
+    /// the meta state machine's own as [`Self::Kernel`].
     #[error("node {via} refused ({status}): {}", .refusal.message)]
     Api {
         via: u64,
@@ -628,35 +630,95 @@ fn warn_decommissioning(
     Ok(())
 }
 
+/// How `set-move-limit` ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MoveLimitEnd {
+    /// The meta group answered that it applied this limit.
+    Applied(MoveLimit),
+    /// The write may have applied (a `504` or a lost answer), and the next
+    /// confirmed view shows the limit `current`: the request took effect
+    /// when it is the limit asked for.
+    Resolved {
+        asked: MoveLimit,
+        current: MoveLimit,
+    },
+    Refused(MoveRefusal),
+}
+
+impl MoveLimitEnd {
+    /// Whether the move limit is the one asked for.
+    pub fn took_effect(&self) -> bool {
+        match self {
+            Self::Applied(_) => true,
+            Self::Resolved { asked, current } => asked == current,
+            Self::Refused(_) => false,
+        }
+    }
+}
+
 /// `set-move-limit`: sets the move limit through the node that confirmed a
-/// view, and returns the limit the meta group applied.
+/// view. When the write may have applied, it reads the next confirmed view
+/// and reports the limit it shows. Setting a limit is idempotent, so a
+/// request that did not take effect can be sent again.
 pub async fn set_move_limit(
     client: &MetricsClient,
     nodes: &[NodeInfo],
     limit: MoveLimit,
-) -> Result<MoveLimit> {
+) -> Result<MoveLimitEnd> {
     let (via, _status) = confirmed_status(client, nodes)
         .await
         .ok_or_else(|| anyhow::anyhow!("no node answered a confirmed placement view"))?;
     let request = MoveLimitRequest { limit };
     match post_write(client, via, "/__ursula/placement/move-limit", &request).await {
-        WriteAnswer::Applied(MoveLimitResponse { limit }) => Ok(limit),
-        WriteAnswer::Refused { status, refusal } => Err(MoveRefusal::Api {
-            via: via.id,
-            status,
-            refusal,
+        WriteAnswer::Applied(MoveLimitResponse { limit }) => Ok(MoveLimitEnd::Applied(limit)),
+        WriteAnswer::Refused { status, refusal } => {
+            if refusal.write_effect == WriteEffect::MayHaveApplied {
+                tracing::warn!(node_id = via.id, %status, message = %refusal.message, "placement: the move limit may have been set");
+                return confirmed_limit(client, nodes, limit).await;
+            }
+            Ok(MoveLimitEnd::Refused(MoveRefusal::Api {
+                via: via.id,
+                status,
+                refusal,
+            }))
         }
-        .into()),
-        WriteAnswer::Unexpected { status, body } => Err(MoveRefusal::Unexpected {
-            via: via.id,
-            status,
-            body,
+        WriteAnswer::Unexpected { status, body } => {
+            Ok(MoveLimitEnd::Refused(MoveRefusal::Unexpected {
+                via: via.id,
+                status,
+                body,
+            }))
         }
-        .into()),
-        WriteAnswer::Lost(error) => Err(error.context(
-            "the move limit may have been set: read `placement status --confirmed` to learn \
-             whether",
-        )),
+        WriteAnswer::Lost(error) => {
+            tracing::warn!(node_id = via.id, %error, "placement: no answer to the move limit");
+            confirmed_limit(client, nodes, limit).await
+        }
+    }
+}
+
+/// The move limit a confirmed view shows, against the limit `asked` for.
+async fn confirmed_limit(
+    client: &MetricsClient,
+    nodes: &[NodeInfo],
+    asked: MoveLimit,
+) -> Result<MoveLimitEnd> {
+    let may_have = "the move limit may have been set";
+    let (via, status) = confirmed_status(client, nodes).await.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{may_have}, and no node answered a confirmed placement view to tell: read \
+             `placement status --confirmed` to learn whether"
+        )
+    })?;
+    match status.view {
+        ClusterView::Bootstrapped(cluster) => Ok(MoveLimitEnd::Resolved {
+            asked,
+            current: cluster.params().max_concurrent_moves,
+        }),
+        other => anyhow::bail!(
+            "{may_have}, and node {}'s confirmed view is {:?}, with no move limit",
+            via.id,
+            other.stage()
+        ),
     }
 }
 
