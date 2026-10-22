@@ -680,9 +680,10 @@ async fn through_one_timeout(
 
 /// A cached leader that accepts a request and never answers, as a stopped
 /// process does: a read and a producer write go on to an upstream they have
-/// not tried, which answers them. The silent one leaves selection. A write
-/// without a key may have reached it and applies twice if sent again, so it
-/// gets the `504` and reaches no other upstream.
+/// not tried, which answers them and becomes the cached route. The silent
+/// one leaves selection. A write without a key may have reached it and
+/// applies twice if sent again, so it gets the `504`, reaches no other
+/// upstream and teaches no route.
 #[tokio::test(start_paused = true)]
 async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() {
     let _frozen = FrozenClock::hold();
@@ -690,10 +691,15 @@ async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() 
     let (silent, mut arrivals) = silent_upstream().await;
     let live = Scripted::spawn().await;
     let config = test_config(vec![silent.url.clone(), live.url()]);
-    for (request, status, hits) in [
-        (get_stream(), StatusCode::OK, 1),
-        (producer_post(), StatusCode::OK, 1),
-        (post_path("/bucket/stream"), StatusCode::GATEWAY_TIMEOUT, 0),
+    for (request, status, hits, route) in [
+        (get_stream(), StatusCode::OK, 1, Some(live.url())),
+        (producer_post(), StatusCode::OK, 1, Some(live.url())),
+        (
+            post_path("/bucket/stream"),
+            StatusCode::GATEWAY_TIMEOUT,
+            0,
+            None,
+        ),
     ] {
         let gateway = Arc::new(Gateway::new(config.clone()));
         gateway.remember_leader("/bucket/stream".to_owned(), silent.url.clone());
@@ -706,7 +712,7 @@ async fn a_read_or_a_keyed_write_that_gets_no_answer_goes_to_another_upstream() 
         assert_eq!(live.hits().saturating_sub(before), hits, "{method}");
         let metrics = gateway.metrics_snapshot();
         assert_eq!(metrics.upstream_ejections, 1, "{method}");
-        assert_eq!(cached_route(&gateway), None, "{method}");
+        assert_eq!(cached_route(&gateway), route, "{method}");
     }
 }
 
