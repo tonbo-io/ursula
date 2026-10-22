@@ -135,6 +135,9 @@ const SETTLED: Duration = Duration::from_secs(3);
 /// How long the teardowns of a settled group may take: each of its two
 /// asks may wait one ask interval for the next answer.
 const TEARDOWN_BOUND: Duration = Duration::from_secs(100);
+/// How long N4's script watches for the teardown it released to retire
+/// the log of a voter.
+const RETIRE_WATCH: Duration = Duration::from_secs(20);
 
 /// Which run a scenario makes, and which meta defence it turns off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1785,11 +1788,16 @@ async fn deposed_report(seed: u64, controls: Controls) -> ThreeNodeRaftSimOutcom
 /// history event drops z's retirement. The group moves back onto z, whose
 /// replica still runs, and its leader makes z a voter again. z's teardown
 /// then asks again and finds itself a voter, so its log stays. With the
-/// defence off from the release on, z retires the log of a voter (I8).
+/// defence off from the release on, z retires the log of a voter (I8). z's
+/// teardown also holds before it forgets the retired replica, for the rest
+/// of the run, which only the undefended run reaches: otherwise the next
+/// driver pass would reopen the retired log as the voter's
+/// (`Admission::Create`), and the retired log would show for one pass only.
 async fn replaced_mid_teardown(seed: u64, controls: Controls) -> ThreeNodeRaftSimOutcome {
     const PHASE: &str = "replaced_mid_teardown";
     const GROUP: u32 = 0;
     const HELD: TeardownStep = TeardownStep::Unregister;
+    const RETIRED: TeardownStep = TeardownStep::ForgetMetrics;
     let (mut run, roles) = placed_five(seed).await;
     let outside_meta = |nodes: &[u64]| {
         nodes
@@ -1848,8 +1856,20 @@ async fn replaced_mid_teardown(seed: u64, controls: Controls) -> ThreeNodeRaftSi
         Defence::RetireAnswer,
         controls == Controls::ReplacedMidTeardown { defended: false },
     );
+    run.cluster.hold_teardown(z, GROUP, RETIRED);
     run.cluster.release_teardown(z, GROUP, HELD);
-    run.watch(PHASE, Duration::from_secs(5)).await;
+    // Defended, z's second ask hears that it is a voter, so its teardown
+    // ends before it retires and the watch runs out. Undefended, the poll
+    // that sees z hold before it forgets has already failed I8.
+    let retired = run
+        .within(PHASE, RETIRE_WATCH, move |cluster| {
+            cluster.teardown_held(z, GROUP, RETIRED)
+        })
+        .await;
+    assert!(
+        !retired,
+        "node {z} retired its log of group {GROUP}, a voter's, and I8 passed"
+    );
     run.settled(PHASE, GROUP, &voters).await;
     run.settle_and_read().await;
     run.finish()

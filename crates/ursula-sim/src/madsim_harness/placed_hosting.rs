@@ -52,9 +52,10 @@
 //!   only while its own view is bootstrapped. It does not see whether the
 //!   placement that created a replica was confirmed.
 //!
-//! A run that moved a group fails when I4, I8, I9 or the creation rule
-//! judged nothing of that group ([`HostingChecks::judged_the_moves`]), so a
-//! check that never saw the move cannot pass it.
+//! A run that moved a group fails when I4, I5's record half, either half
+//! of I8, I9 or the creation rule judged nothing of that group
+//! ([`HostingChecks::judged_the_moves`]), so a check that never saw the
+//! move cannot pass it.
 //!
 //! I1 ([`I1`]), I7 ([`I7`]), I14 ([`I14`]) and I15 ([`I15`]) are waits:
 //! every voter reads the acknowledged appends, a node restarted without
@@ -1594,34 +1595,6 @@ impl MetaCluster {
     }
 }
 
-/// I8's teardown half: no running node has retired its log of `group`
-/// while the group's latest committed membership lists it as a voter. A
-/// teardown retires a log only once a live leader answered that the node
-/// is no member, after the replica stopped.
-fn voters_keep_their_logs(
-    cluster: &MetaCluster,
-    group: u32,
-    trace: &mut SimTrace,
-    after_event: &str,
-) {
-    let Some((index, configs, _)) = cluster.latest_committed(group) else {
-        return;
-    };
-    for node_id in configs.iter().flatten() {
-        if cluster.local_log(*node_id, group) == Some(LocalLog::Retired) {
-            fail(
-                trace,
-                I8,
-                after_event,
-                format!(
-                    "node {node_id} retired its log of group {group}, whose latest committed \
-                     membership {configs:?} (index {index}) lists it as a voter"
-                ),
-            );
-        }
-    }
-}
-
 /// What the hosting checks keep across a run.
 #[derive(Debug, Default)]
 pub(super) struct HostingChecks {
@@ -1635,18 +1608,27 @@ pub(super) struct HostingChecks {
     /// The placement of each group in the latest view at the last
     /// observation.
     last: BTreeMap<u32, ursula_control::GroupPlacement>,
-    /// What I4, I8 and I9 judged.
+    /// The nodes whose retirement records of each group the latest view
+    /// kept at the last observation.
+    kept: BTreeMap<u32, BTreeSet<u64>>,
+    /// What I4, I5, I8 and I9 judged.
     judged: Judged,
 }
 
-/// What I4, I8 and I9 judged across a run, by group.
+/// What I4, I5, I8 and I9 judged across a run, by group.
 #[derive(Debug, Default)]
 struct Judged {
     /// I4: the membership entries whose leader it checked, by index and
     /// term.
     entries: BTreeMap<u32, BTreeSet<(u64, u64)>>,
+    /// I5's record half: how many retirement records it saw the latest
+    /// view keep and a later latest view drop.
+    dropped_records: BTreeMap<u32, u64>,
     /// I8: the voter changes among the entries, by index and term.
     voter_changes: BTreeMap<u32, BTreeSet<(u64, u64)>>,
+    /// I8's teardown half: the nodes whose `Retired` log it checked
+    /// against a committed membership.
+    retired_logs: BTreeMap<u32, BTreeSet<u64>>,
     /// I9: how many moves it saw converge.
     convergences: BTreeMap<u32, u64>,
 }
@@ -1660,7 +1642,8 @@ pub(super) fn node_ids(
 
 impl HostingChecks {
     /// I2, I3, I4, I8, I9 and the hosting check, over every running placed
-    /// replica and every membership entry the run's replicas showed.
+    /// replica and every membership entry the run's replicas showed, and
+    /// what I5's record half judges.
     pub(super) fn observe(
         &mut self,
         cluster: &MetaCluster,
@@ -1685,7 +1668,66 @@ impl HostingChecks {
         for group in JOURNAL_GROUPS {
             self.entries(placed, group, trace, after_event);
             self.reports(cluster, placed, group, trace, after_event);
-            voters_keep_their_logs(cluster, group, trace, after_event);
+            self.voters_keep_their_logs(cluster, group, trace, after_event);
+            self.records_dropped(cluster, group);
+        }
+    }
+
+    /// I8's teardown half: no running node has retired its log of `group`
+    /// while the group's latest committed membership lists it as a voter.
+    /// A teardown retires a log only once a live leader answered that the
+    /// node is no member, after the replica stopped.
+    fn voters_keep_their_logs(
+        &mut self,
+        cluster: &MetaCluster,
+        group: u32,
+        trace: &mut SimTrace,
+        after_event: &str,
+    ) {
+        let Some((index, configs, _)) = cluster.latest_committed(group) else {
+            return;
+        };
+        for node_id in cluster.running() {
+            if cluster.local_log(node_id, group) != Some(LocalLog::Retired) {
+                continue;
+            }
+            self.judged
+                .retired_logs
+                .entry(group)
+                .or_default()
+                .insert(node_id);
+            if configs.iter().any(|voters| voters.contains(&node_id)) {
+                fail(
+                    trace,
+                    I8,
+                    after_event,
+                    format!(
+                        "node {node_id} retired its log of group {group}, whose latest committed \
+                         membership {configs:?} (index {index}) lists it as a voter"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// Counts the retirement records of `group` that an earlier latest
+    /// view kept and the latest view no longer keeps, so a moved group's
+    /// I5 wait shows that it saw a record go.
+    fn records_dropped(&mut self, cluster: &MetaCluster, group: u32) {
+        let latest = cluster.latest_view();
+        let Some(bootstrapped) = latest.cluster() else {
+            return;
+        };
+        let kept = bootstrapped
+            .retirements()
+            .get(&RaftGroupId(group))
+            .map(|records| node_ids(records.keys().copied()))
+            .unwrap_or_default();
+        let previous = self.kept.insert(group, kept.clone()).unwrap_or_default();
+        let dropped = u64::try_from(previous.difference(&kept).count()).unwrap_or(u64::MAX);
+        if dropped > 0 {
+            let count = self.judged.dropped_records.entry(group).or_insert(0);
+            *count = count.saturating_add(dropped);
         }
     }
 
@@ -1963,10 +2005,12 @@ impl HostingChecks {
 
     /// At a run's end, for each group whose voters are no longer its seed
     /// voters: I4 checked some entry's leader (unless the group has one
-    /// voter, whose entries I4 exempts), I8 saw a voter change, I9 saw the
-    /// move converge, and the creation rule judged a node outside the seed
-    /// voters creating the group's log. A check that judged nothing of a
-    /// moved group fails, so a vacuous pass shows.
+    /// voter, whose entries I4 exempts), I5 saw a retirement record of the
+    /// group dropped, I8 saw a voter change and checked a `Retired` log of
+    /// the group against a committed membership, I9 saw the move converge,
+    /// and the creation rule judged a node outside the seed voters creating
+    /// the group's log. A check that judged nothing of a moved group fails,
+    /// so a vacuous pass shows.
     pub(super) fn judged_the_moves(
         &self,
         cluster: &MetaCluster,
@@ -1994,12 +2038,40 @@ impl HostingChecks {
                     format!("{moved}, but I4 judged no membership entry of it"),
                 );
             }
+            if self
+                .judged
+                .dropped_records
+                .get(&group)
+                .copied()
+                .unwrap_or(0)
+                == 0
+            {
+                fail(
+                    trace,
+                    I5,
+                    after_event,
+                    format!("{moved}, but I5 saw no retirement record of it dropped"),
+                );
+            }
             if judged(&self.judged.voter_changes) == 0 {
                 fail(
                     trace,
                     I8,
                     after_event,
                     format!("{moved}, but I8 judged no voter change of it"),
+                );
+            }
+            if self
+                .judged
+                .retired_logs
+                .get(&group)
+                .is_none_or(BTreeSet::is_empty)
+            {
+                fail(
+                    trace,
+                    I8,
+                    after_event,
+                    format!("{moved}, but I8 saw no node's log of it retired"),
                 );
             }
             if self.judged.convergences.get(&group).copied().unwrap_or(0) == 0 {
