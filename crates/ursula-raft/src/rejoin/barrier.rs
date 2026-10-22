@@ -112,7 +112,7 @@ pub async fn run_rejoin_vote_barrier<SM, P, F, E>(
                             // written: a floor taken while the fence holds
                             // the replica out could come from a round its
                             // predecessor still took part in.
-                            if crate::predecessor_wait::fence_holds(raft.fence(), group) {
+                            if crate::predecessor_wait::fence_holds_barrier(raft.fence(), group) {
                                 tracing::debug!(
                                     plane = group.plane().as_str_name(),
                                     raft_group_id = group.wire_group_id(),

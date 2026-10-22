@@ -56,6 +56,18 @@ pub fn fence_now() -> FenceInstant {
     FenceInstant::now()
 }
 
+/// Whether a lease that does not hold ends the fence's admission. A
+/// negative control turns it off (`Defence::DiskLease`), and the lease then
+/// never ends.
+fn lease_ends() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::DiskLease) {
+        ursula_stream::sim_controls::note_fired(Defence::DiskLease);
+        return false;
+    }
+    true
+}
+
 /// A probe's outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProbeOutcome {
@@ -309,7 +321,10 @@ impl NodeFence {
         if self.0.closed.load(Ordering::Acquire) {
             return FenceStatus::Closed;
         }
-        if self.0.lease.is_some() && self.nanos(now) >= self.0.until.load(Ordering::Acquire) {
+        if self.0.lease.is_some()
+            && self.nanos(now) >= self.0.until.load(Ordering::Acquire)
+            && lease_ends()
+        {
             return FenceStatus::DiskLeaseLost;
         }
         FenceStatus::Admits

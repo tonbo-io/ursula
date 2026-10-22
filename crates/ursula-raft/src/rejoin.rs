@@ -1362,6 +1362,12 @@ impl GroupRejoin {
         self.gate().is_open() && !self.needs_vote_floor()
     }
 
+    /// Whether the replica holds a vote floor, as a barrier round or a
+    /// genesis writes one.
+    pub fn holds_vote_floor(&self) -> bool {
+        !self.needs_vote_floor()
+    }
+
     /// The gate as status reports show it.
     pub fn status(&self) -> RecoveryGateStatus {
         self.gate().status()

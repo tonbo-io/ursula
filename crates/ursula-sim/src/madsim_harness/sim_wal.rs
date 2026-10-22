@@ -59,14 +59,28 @@ pub(super) const SINGLE_VOTER: u64 = 1;
 const RELEASE_YIELDS: usize = 64;
 const RELEASE_SLEEPS: usize = 1_000;
 
+/// How a fenced node's runs start: as node `node` of the cluster
+/// `cluster_id`, behind a disk lease of `lease`, as a server's runs start.
+#[derive(Debug, Clone)]
+pub(super) struct FencedRuns {
+    pub(super) node: u64,
+    pub(super) cluster_id: ursula_headers::ClusterId,
+    pub(super) lease: Duration,
+}
+
 /// One simulated node's journals.
 #[derive(Clone)]
 pub(crate) struct SimNodeWal {
     root: PathBuf,
     tuning: JournalTuning,
     topology: ursula_shard::StaticShardMap,
+    /// How the node's runs start, when they run behind a disk lease. Else
+    /// each run starts as node 1 of a cluster of its own, unleased.
+    fenced: Option<FencedRuns>,
     /// The node's current run of the WAL; `None` while the node is down.
     run: Arc<Mutex<Option<RaftWal>>>,
+    /// When the current run started.
+    started: Arc<Mutex<Option<madsim::time::Instant>>>,
     /// The data groups' stores the node handed out.
     stores: Arc<Mutex<BTreeMap<RaftGroupId, Weak<RaftGroupFileLogStore>>>>,
     /// The meta group's store the node handed out last.
@@ -93,10 +107,41 @@ impl SimNodeWal {
             root,
             tuning,
             topology: ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
+            fenced: None,
             run: Arc::new(Mutex::new(None)),
+            started: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
             meta: Arc::new(Mutex::new(Weak::new())),
         }
+    }
+
+    /// Makes every run of this node start as `runs` says.
+    pub(super) fn with_fenced_runs(mut self, runs: FencedRuns) -> Self {
+        self.fenced = Some(runs);
+        self
+    }
+
+    /// The node's journals on the volume that moved to `root`, whose next
+    /// run starts there. This value keeps the run on the old root.
+    pub(super) fn moved_to(&self, root: PathBuf) -> Self {
+        Self {
+            root,
+            tuning: self.tuning,
+            topology: self.topology.clone(),
+            fenced: self.fenced.clone(),
+            run: Arc::new(Mutex::new(None)),
+            started: Arc::new(Mutex::new(None)),
+            stores: Arc::new(Mutex::new(BTreeMap::new())),
+            meta: Arc::new(Mutex::new(Weak::new())),
+        }
+    }
+
+    /// When the node's current run started, if it runs.
+    pub(super) fn started_at(&self) -> Option<madsim::time::Instant> {
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     /// Sets the number of groups before this simulated node first starts.
@@ -113,7 +158,9 @@ impl SimNodeWal {
             root: self.root.clone(),
             tuning: JournalTuning::new(fsync),
             topology: self.topology.clone(),
+            fenced: self.fenced.clone(),
             run: Arc::new(Mutex::new(None)),
+            started: Arc::new(Mutex::new(None)),
             stores: Arc::new(Mutex::new(BTreeMap::new())),
             meta: Arc::new(Mutex::new(Weak::new())),
         }
@@ -130,8 +177,22 @@ impl SimNodeWal {
         if let Some(run) = run.as_ref() {
             return Ok(run.clone());
         }
-        let started = RaftWal::start_with(&self.root, self.tuning, &self.topology)?;
+        let started = match &self.fenced {
+            Some(runs) => RaftWal::start_in_cluster(
+                &self.root,
+                self.tuning,
+                &self.topology,
+                ursula_proto::placement::NodeId::new(runs.node),
+                Some(&runs.cluster_id),
+                ursula_runtime::NodeFence::leased(runs.lease),
+            )?,
+            None => RaftWal::start_with(&self.root, self.tuning, &self.topology)?,
+        };
         *run = Some(started.clone());
+        *self
+            .started
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner()) = Some(madsim::time::Instant::now());
         Ok(started)
     }
 
@@ -317,6 +378,17 @@ impl SimNodeWal {
         }
         drop(held);
         self.wait_stopped().await;
+    }
+
+    /// Drops the node's run at once, as a killed process ends, whatever its
+    /// stores still hold.
+    pub(super) fn end_run(&self) {
+        drop(
+            self.run
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .take(),
+        );
     }
 
     /// Ends the node's run without a clean shutdown, as a stopped process

@@ -296,7 +296,7 @@ impl RecoveryGate {
         );
         let waited = fence.clone();
         self.push(crate::rt::spawn(async move {
-            crate::predecessor_wait::fence_released(&waited, target).await;
+            crate::predecessor_wait::barrier_released(&waited, target).await;
             barrier.await;
         }));
         if rejoin.needs_vote_floor() && !rejoin.holds_group_history() {

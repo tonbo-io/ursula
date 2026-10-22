@@ -164,6 +164,7 @@ pub enum SimScenario {
     EngineRestartLeavesNoWork,
     SnapshotObjectsStayOwned,
     PlacementMove,
+    IdentityFence,
 }
 
 #[derive(Clone)]
@@ -218,6 +219,7 @@ impl SimScenario {
             Self::EngineRestartLeavesNoWork => "engine-restart-leaves-no-work",
             Self::SnapshotObjectsStayOwned => "snapshot-objects-stay-owned",
             Self::PlacementMove => "placement-move",
+            Self::IdentityFence => "identity-fence",
         }
     }
 }
@@ -304,6 +306,9 @@ impl SimSchedule {
         if PLACEMENT_MOVE_SEEDS.contains(&seed) {
             return Self::for_scenario(seed, SimScenario::PlacementMove);
         }
+        if IDENTITY_FENCE_SEEDS.contains(&seed) {
+            return Self::for_scenario(seed, SimScenario::IdentityFence);
+        }
         let scenario = match seed % 12 {
             0 => SimScenario::NoFaultBaseline,
             1 => SimScenario::PartitionHeal,
@@ -366,6 +371,7 @@ pub const HTTP_PROTOCOL_SURFACE_RANDOMIZED_SEEDS: std::ops::RangeInclusive<u64> 
 pub const ROUTING_BEFORE_BODY_SEEDS: std::ops::RangeInclusive<u64> = 500..=504;
 pub const SNAPSHOT_OBJECTS_SEEDS: std::ops::RangeInclusive<u64> = 546..=549;
 pub const PLACEMENT_MOVE_SEEDS: std::ops::RangeInclusive<u64> = 1100..=1109;
+pub const IDENTITY_FENCE_SEEDS: std::ops::RangeInclusive<u64> = 1110..=1119;
 pub const RUNTIME_RAFT_NETWORK_PARTITION_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 212..=216;
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_COLD_READ_FAILURE_SEEDS: std::ops::RangeInclusive<u64> =
     322..=326;
@@ -574,6 +580,7 @@ mod deleted_data;
 mod engine_restart;
 mod history;
 mod http;
+mod identity_fence;
 mod immutable_reads;
 mod immutable_reads_loss;
 mod journal_cluster;

@@ -70,8 +70,11 @@ use ursula_runtime::RuntimeMetrics;
 
 use super::journal_cluster::JOURNAL_GROUPS;
 use super::journal_cluster::JournalCluster;
+use super::placed_hosting::DetachedHost;
 use super::placed_hosting::Placed;
 use super::recovery_wiring::RecoveryProbeError;
+use super::sim_wal::FencedRuns;
+use super::sim_wal::SimNodeWal;
 
 /// A node's meta runtime in the simulation.
 pub(super) type SimMetaRuntime = MetaRuntime<InProcessMetaNetworkFactory>;
@@ -187,6 +190,41 @@ pub(super) struct MetaCluster {
     pub(super) runtimes: BTreeMap<u64, SimMetaRuntime>,
     /// The placed data plane, when the nodes host by placement.
     pub(super) placed: Option<Placed>,
+    /// The processes of a cluster whose nodes run behind the identity
+    /// fence ([`Self::start_fenced`]).
+    fenced: Option<Processes>,
+}
+
+/// The processes of a fenced cluster: each node's runs start behind a disk
+/// lease as their node of one cluster, and each process stamps its RPCs
+/// with its fence and incarnation and follows its own routes.
+struct Processes {
+    /// The tag of each node's current process.
+    current: BTreeMap<u64, u64>,
+    next: u64,
+}
+
+/// A node process that no longer answers for its node: its volume moved
+/// away ([`MetaCluster::move_volume`]), and it runs on, as a process the
+/// operator cannot reach does, until [`Self::kill`].
+pub(super) struct Zombie {
+    /// The simulation's tag of the process.
+    pub(super) process: u64,
+    runtime: SimMetaRuntime,
+    host: DetachedHost,
+    wal: SimNodeWal,
+}
+
+impl Zombie {
+    /// Kills the process: its meta runtime, driver and replicas stop, and
+    /// its run ends without a record, as a killed process's does.
+    pub(super) async fn kill(self) {
+        if let Err(error) = self.runtime.shutdown().await {
+            tracing::info!(%error, "a detached process's meta runtime stopped with an error");
+        }
+        self.host.kill().await;
+        self.wal.end_run();
+    }
 }
 
 impl MetaCluster {
@@ -207,14 +245,128 @@ impl MetaCluster {
             claims,
             runtimes: BTreeMap::new(),
             placed: (hosting == Hosting::Placed).then(Placed::default),
+            fenced: None,
         };
+        cluster.start_nodes(nodes, hosting).await;
+        cluster
+    }
+
+    /// [`Self::start`] for nodes hosting by placement behind the identity
+    /// fence, as servers run: each node's runs start as their node of the
+    /// cluster `cluster_id` behind a disk lease of `lease`, and each process
+    /// binds its incarnation and fence, so the Raft RPCs of both planes
+    /// carry them. The recovery transport's barriers, genesis probe and
+    /// `write_meta` carry no incarnation and meet no fence.
+    pub(super) async fn start_fenced(
+        name: &str,
+        tuning: JournalTuning,
+        nodes: u64,
+        claims: BTreeMap<u64, GenesisClaim>,
+        lease: Duration,
+    ) -> Self {
+        let cluster_id = ursula_headers::ClusterId::new("sim-fence").expect("a valid cluster id");
+        let mut data = JournalCluster::provisioned(name, tuning, nodes);
+        for (node_id, wal) in &mut data.wals {
+            *wal = wal.clone().with_fenced_runs(FencedRuns {
+                node: *node_id,
+                cluster_id: cluster_id.clone(),
+                lease,
+            });
+        }
+        let mut cluster = Self {
+            data,
+            meta: InProcessMetaRegistry::default(),
+            claims,
+            runtimes: BTreeMap::new(),
+            placed: Some(Placed::default()),
+            fenced: Some(Processes {
+                current: BTreeMap::new(),
+                next: 1,
+            }),
+        };
+        cluster.start_nodes(nodes, Hosting::Placed).await;
+        cluster
+    }
+
+    async fn start_nodes(&mut self, nodes: u64, hosting: Hosting) {
         for node_id in 1..=nodes {
-            cluster.start_node(node_id).await;
+            self.start_node(node_id).await;
         }
         if hosting == Hosting::Static {
-            cluster.data.form_groups().await;
+            self.data.form_groups().await;
         }
-        cluster
+    }
+
+    /// The tag the next process a fenced cluster starts gets.
+    pub(super) fn next_process(&self) -> Option<u64> {
+        self.fenced.as_ref().map(|fenced| fenced.next)
+    }
+
+    /// The tag of `node_id`'s current process in a fenced cluster.
+    pub(super) fn process(&self, node_id: u64) -> Option<u64> {
+        self.fenced.as_ref()?.current.get(&node_id).copied()
+    }
+
+    /// Moves `node_id`'s volume away from its running process to a new
+    /// root named after `name` ([`SimDisk::move_volume`]). The process runs
+    /// on as the returned [`Zombie`], which the RPCs of the processes in
+    /// `reaching` keep reaching ([`Self::pin_route`]). The node answers no
+    /// other RPC until its next start, which runs on the moved volume as a
+    /// new process. A fenced cluster only.
+    pub(super) fn move_volume(&mut self, node_id: u64, name: &str, reaching: &[u64]) -> Zombie {
+        for sender in reaching {
+            self.pin_route(*sender, node_id);
+        }
+        let process = self.process(node_id).expect("a fenced cluster's node runs");
+        let runtime = self
+            .runtimes
+            .remove(&node_id)
+            .expect("the node's meta runtime runs");
+        let host = self.take_host(node_id).expect("the node's host runs");
+        let wal = self.data.wals[&node_id].clone();
+        let root = SimDisk::move_volume(wal.root(), name).expect("move the node's volume");
+        self.data.wals.insert(node_id, wal.moved_to(root));
+        self.data.new_process(node_id);
+        // The node answers nothing until its next process registers, but
+        // a route pinned to the old process still reaches it.
+        self.meta.unregister(node_id);
+        for registry in self.data.group_registries() {
+            registry.unregister(node_id);
+        }
+        Zombie {
+            process,
+            runtime,
+            host,
+            wal,
+        }
+    }
+
+    /// Pins the RPCs that `process` sends to `target`, on both planes, to
+    /// the process `target` runs now ([`InProcessRaftRegistry::pin_route`]).
+    pub(super) fn pin_route(&self, process: u64, target: u64) {
+        assert!(
+            self.meta.pin_route(process, target),
+            "node {target}'s meta plane is registered"
+        );
+        for registry in self.data.group_registries() {
+            registry.pin_route(process, target);
+        }
+    }
+
+    /// Drops the RPCs that `process` sends to `target`, on both planes.
+    pub(super) fn cut_route(&self, process: u64, target: u64) {
+        self.meta.cut_route(process, target);
+        for registry in self.data.group_registries() {
+            registry.cut_route(process, target);
+        }
+    }
+
+    /// Forgets every route, on both planes.
+    pub(super) fn clear_routes(&self) {
+        self.meta.clear_routes();
+        for registry in self.data.group_registries() {
+            registry.clear_routes();
+        }
     }
 
     /// Starts `node_id`'s meta runtime on its meta journal, then its data
@@ -229,6 +381,12 @@ impl MetaCluster {
     }
 
     async fn start_meta(&mut self, node_id: u64) {
+        let process = self.fenced.as_mut().map(|fenced| {
+            let process = fenced.next;
+            fenced.next = fenced.next.saturating_add(1);
+            fenced.current.insert(node_id, process);
+            process
+        });
         let wal = self.data.wals[&node_id].clone();
         let raft_wal = wal.raft_wal();
         let metrics = RuntimeMetrics::new(1, 1).group_engine_metrics();
@@ -238,15 +396,34 @@ impl MetaCluster {
         };
         let registry = self.registry(node_id);
         let claim = self.claims[&node_id].clone();
+        let identity = match process {
+            // As a server binds its node: its process, behind its fence.
+            Some(_) => PeerIdentity::of_process(
+                node_id,
+                raft_wal.cluster_id().clone(),
+                raft_wal.fence(),
+                raft_wal.incarnation(),
+            ),
+            None => PeerIdentity::new(node_id, raft_wal.cluster_id().clone()),
+        };
         registry.peer_cluster().bind(
-            PeerIdentity::new(node_id, raft_wal.cluster_id().clone()),
+            identity,
             PeerDirectory::new(claim.peers.iter().map(|peer| {
                 let url = format!("http://sim-node-{}", peer.get());
                 (peer.get(), PeerEndpoints::new(url.clone(), url))
             })),
         );
+        if process.is_some() {
+            // Before any group opens, so none campaigns while a wait is owed.
+            ursula_raft::predecessor_wait::sync_fence_shed(&registry, &raft_wal.fence());
+        }
         self.meta.register(node_id, &registry);
-        let policy = self.data.policy.clone();
+        let mut network = InProcessMetaNetworkFactory::new(self.meta.clone())
+            .with_source(node_id)
+            .with_policy(self.data.policy.clone());
+        if let Some(process) = process {
+            network = network.with_process(process, registry.clone());
+        }
         let runtime = MetaRuntime::start(
             MetaRuntimeConfig {
                 node: node_id,
@@ -260,9 +437,7 @@ impl MetaCluster {
             journal,
             raft_wal,
             registry,
-            InProcessMetaNetworkFactory::new(self.meta.clone())
-                .with_source(node_id)
-                .with_policy(policy.clone()),
+            network,
             self.transport(node_id),
         )
         .await;

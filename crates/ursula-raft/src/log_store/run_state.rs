@@ -485,6 +485,30 @@ impl MetaRead {
     }
 }
 
+/// Whether a run whose predecessor may live owes it the wait. A negative
+/// control turns it off (`Defence::SuccessorWait`), and the run then owes
+/// none.
+fn owes_wait() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::SuccessorWait) {
+        ursula_stream::sim_controls::note_fired(Defence::SuccessorWait);
+        return false;
+    }
+    true
+}
+
+/// Whether a run on another device of the same boot reads as a moved
+/// volume. A negative control turns it off (`Defence::RemountedRun`), and
+/// it then reads as a process crash on the same mount.
+fn reads_remounts() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::RemountedRun) {
+        ursula_stream::sim_controls::note_fired(Defence::RemountedRun);
+        return false;
+    }
+    true
+}
+
 impl PreviousRun {
     /// Reads `previous`, the run state the previous run left, for the
     /// journals of `class`, given what they hold, the current `boot_id` and
@@ -508,7 +532,9 @@ impl PreviousRun {
             RunStatus::Clean => Self::Clean,
             RunStatus::Poisoned => Self::Poisoned,
             RunStatus::Running => match (previous.boot_id.as_ref(), boot_id) {
-                (Some(before), Some(now)) if before == now && previous.device == device => {
+                (Some(before), Some(now))
+                    if before == now && (previous.device == device || !reads_remounts()) =>
+                {
                     Self::ProcessCrash
                 }
                 (Some(before), Some(now)) if before == now => Self::Remounted {
@@ -1062,11 +1088,12 @@ impl NodeWal {
             super::identity::advance(&root, bound.root, identity, predecessor)?;
         // The synced identity write is the lease's first success.
         fence.record_probe(opened, ProbeOutcome::Synced, fence_now());
-        let wait = (predecessor == Predecessor::MayLive && fence.lease_length().is_some())
-            .then_some(match standing {
-                RootStanding::Unbound => WaitFrom::Binding,
-                RootStanding::Bound => WaitFrom::Open(opened),
-            });
+        let wait =
+            (predecessor == Predecessor::MayLive && fence.lease_length().is_some() && owes_wait())
+                .then_some(match standing {
+                    RootStanding::Unbound => WaitFrom::Binding,
+                    RootStanding::Bound => WaitFrom::Open(opened),
+                });
         // An unbound root owes its wait only once a bootstrapped cluster
         // binds it (`WaitFrom::Binding`), so a forming cluster's meta group
         // still elects. Until that binding its data replicas take part in

@@ -80,6 +80,29 @@ pub(crate) async fn fence_released(fence: &NodeFence, target: RaftTarget) {
     }
 }
 
+/// Whether `fence` holds the barrier rounds of a replica of `target` and
+/// the floor they write ([`fence_holds`]). A negative control turns it off
+/// (`Defence::GateAfterWait`), and they then run during the hold.
+pub(crate) fn fence_holds_barrier(fence: &NodeFence, target: RaftTarget) -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if !fence_holds(fence, target) {
+        return false;
+    }
+    if ursula_stream::sim_controls::off(Defence::GateAfterWait) {
+        ursula_stream::sim_controls::note_fired(Defence::GateAfterWait);
+        return false;
+    }
+    true
+}
+
+/// Returns once `fence` no longer holds the barrier rounds of a replica of
+/// `target` ([`fence_holds_barrier`]).
+pub(crate) async fn barrier_released(fence: &NodeFence, target: RaftTarget) {
+    if fence_holds_barrier(fence, target) {
+        fence_released(fence, target).await;
+    }
+}
+
 /// Marks [`LeadershipShedReason::Fence`] while `fence` does not admit or a
 /// wait is owed, and clears it otherwise. Returns whether it is marked.
 pub fn sync_fence_shed(registry: &RaftGroupHandleRegistry, fence: &NodeFence) -> bool {

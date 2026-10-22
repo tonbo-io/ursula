@@ -810,6 +810,13 @@ pub enum SimEvent {
         genesis: u64,
         nodes: Vec<u64>,
     },
+    /// The identity-fence family's invariants held through the run, which
+    /// saw a replica held out `held_observations` times and compared
+    /// `linearizable_reads` reads with the writes before them.
+    IdentityFenceHeld {
+        held_observations: u64,
+        linearizable_reads: u64,
+    },
     InvariantFailed {
         invariant: String,
         after_event: String,

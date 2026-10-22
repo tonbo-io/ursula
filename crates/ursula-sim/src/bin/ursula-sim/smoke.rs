@@ -352,6 +352,11 @@ fn generate_placement_move(seed: u64) -> SimSchedule {
     SimSchedule::for_scenario(seed, SimScenario::PlacementMove)
 }
 
+/// The identity-fence family: the run draws its scenario from the seed.
+fn generate_identity_fence(seed: u64) -> SimSchedule {
+    SimSchedule::for_scenario(seed, SimScenario::IdentityFence)
+}
+
 /// A named contiguous seed range bound to one schedule generator.
 struct SeedFamily {
     name: &'static str,
@@ -512,6 +517,13 @@ const SEED_FAMILIES: &[SeedFamily] = &[
         end: 1109,
         kind: "placement-move",
         generate: generate_placement_move,
+    },
+    SeedFamily {
+        name: "identity-fence",
+        start: 1110,
+        end: 1119,
+        kind: "identity-fence",
+        generate: generate_identity_fence,
     },
     SeedFamily {
         name: "deleted-data-after-expiry",

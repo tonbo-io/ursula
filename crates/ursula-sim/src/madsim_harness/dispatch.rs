@@ -41,6 +41,8 @@ use super::history::Controls as HistoryControls;
 use super::history::run_rewind_applies_exactly_once_inner;
 use super::history::run_stale_writers_never_apply_after_restore_inner;
 use super::http_protocol_surface_plan_from_fault_plan;
+use super::identity_fence::Controls as IdentityFenceControls;
+use super::identity_fence::run_identity_fence_inner;
 use super::immutable_reads::Controls as ImmutableReadControls;
 use super::immutable_reads::run_marked_chunks_never_contradict_inner;
 use super::introspect::cold_read_delay_ms_from_fault_plan;
@@ -327,6 +329,10 @@ impl ThreeNodeRaftSim {
                 config,
                 PlacementMoveControls::default(),
             ),
+            SimScenario::IdentityFence => Self::run_identity_fence_with_controls_report(
+                config,
+                IdentityFenceControls::default(),
+            ),
         }
     }
 
@@ -341,6 +347,21 @@ impl ThreeNodeRaftSim {
             SimReport {
                 scenario: SimScenario::PlacementMove,
                 outcome: run_placement_move_inner(config, controls).await,
+            }
+        })
+    }
+
+    /// Runs the identity-fence family with `controls`, with room for its
+    /// predecessor waits (12 s each) and elections in every phase.
+    pub(super) fn run_identity_fence_with_controls_report(
+        config: ThreeNodeRaftSimConfig,
+        controls: IdentityFenceControls,
+    ) -> SimReport {
+        let seed = config.seed;
+        run_with_madsim_for(seed, PLACEMENT_MOVE_LIMIT, async move {
+            SimReport {
+                scenario: SimScenario::IdentityFence,
+                outcome: run_identity_fence_inner(config, controls).await,
             }
         })
     }

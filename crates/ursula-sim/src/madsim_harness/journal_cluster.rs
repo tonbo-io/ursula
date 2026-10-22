@@ -180,6 +180,10 @@ pub(super) struct ReplicaParts {
     /// The node process's registry, which its meta runtime publishes its
     /// views in and its replicas register in.
     pub(super) registry: ursula_raft::RaftGroupHandleRegistry,
+    /// The simulation's tag of the node's process, when its RPCs carry the
+    /// process's fence and incarnation and follow its routes
+    /// ([`InProcessRaftRegistry::pin_route`]). `None` sends as the node.
+    pub(super) process: Option<u64>,
 }
 
 /// A replica that did not start: its engine refused to open.
@@ -790,7 +794,13 @@ impl JournalCluster {
             wal: self.wals[&node_id].clone(),
             metrics: self.metrics[&node_id].clone(),
             registry: self.node_registries[&node_id].clone(),
+            process: None,
         }
+    }
+
+    /// The in-process network of each data group.
+    pub(super) fn group_registries(&self) -> impl Iterator<Item = &InProcessRaftRegistry> {
+        self.registries.values()
     }
 
     /// What each node's durable snapshot records name, read from the
