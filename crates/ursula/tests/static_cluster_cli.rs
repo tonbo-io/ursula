@@ -5272,6 +5272,14 @@ fn ctl_client() -> ursula_ctl::MetricsClient {
     ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client")
 }
 
+/// Whether a [`placement_move`] may add a node the meta leader does not
+/// report live (`--allow-not-live`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewVoters {
+    Live,
+    MayBeDown,
+}
+
 /// `ursulactl placement move` of `group` by `intent` (a cancel with
 /// [`Intent::Cancel`]) over the nodes of `nodes` but `skip`, with `--wait`
 /// when `wait`. Answers how the group ended and what the command printed.
@@ -5280,6 +5288,7 @@ async fn placement_move(
     skip: &[u64],
     group: RaftGroupId,
     intent: Intent,
+    new_voters: NewVoters,
     wait: bool,
 ) -> (GroupEnd, String) {
     let options = MoveOptions {
@@ -5287,6 +5296,7 @@ async fn placement_move(
         intent,
         expect: None,
         retarget: false,
+        allow_not_live: new_voters == NewVoters::MayBeDown,
         wait,
         timeout: META_WAIT,
         poll_interval: Duration::from_millis(500),
@@ -5317,7 +5327,7 @@ async fn move_converges(
     intent: Intent,
     to: &BTreeSet<u64>,
 ) {
-    let (end, out) = placement_move(nodes, skip, group, intent, true).await;
+    let (end, out) = placement_move(nodes, skip, group, intent, NewVoters::Live, true).await;
     assert_eq!(end, GroupEnd::Converged { to: voter_set(to) }, "{out}");
 }
 
@@ -5590,8 +5600,9 @@ fn assert_only_retryable(writes: &[LoadWrite], unanswered: bool) {
 /// Reads `stream` once its load stopped, until it holds every write the
 /// load acknowledged, and checks it against the load's `writes`: it holds
 /// nothing the load did not send, nothing twice, every acknowledged write in
-/// the order sent, and no write refused before it applied (a `503` whose
-/// code is not `OUTCOME_UNKNOWN`).
+/// the order sent, and no write whose `503` proves it applied nothing
+/// ([`ursula_headers::write_outcome::proves_refusal`]). A `503` whose body
+/// names no code proves nothing, so such a write may be held.
 async fn check_load_read(client: &reqwest::Client, stream: &str, writes: &[LoadWrite]) {
     let writes: Vec<&LoadWrite> = writes
         .iter()
@@ -5622,10 +5633,11 @@ async fn check_load_read(client: &reqwest::Client, stream: &str, writes: &[LoadW
         assert!(held.insert(token), "{stream} holds {token:?} twice");
         match answer {
             LoadAnswer::Acknowledged => in_order.push(format!("{token};")),
-            LoadAnswer::Retryable(code) => assert_eq!(
-                *code,
-                Some(ursula_headers::ErrorCode::OutcomeUnknown),
-                "{stream} holds {token:?}, which was refused before it applied"
+            LoadAnswer::Retryable(code) => assert!(
+                !code
+                    .as_ref()
+                    .is_some_and(|code| ursula_headers::write_outcome::proves_refusal(503, code)),
+                "{stream} holds {token:?}, whose {code:?} proves it applied nothing"
             ),
             LoadAnswer::Failed(_) | LoadAnswer::Unanswered => {}
         }
@@ -5692,22 +5704,28 @@ async fn wait_leaders_settle(
 /// rolling `raft.peers` update. Every move and cancel goes through
 /// `ursula_ctl::placement` calls.
 ///
-/// 1. With node 5 stopped, `move --replace` puts node 5 in place of a meta
-///    voter of the group placed off the meta leader. The group's leader adds
-///    node 5 as a learner and waits. The meta leader is killed there, node 5
-///    continues, and the move converges under the next meta leader: the
-///    placement is stable at the target with a new `converged_at`, and node
-///    5 serves the group as a voter. A move that needs the meta leader it
-///    was requested under fails it.
+/// 1. With node 5 stopped, `move --replace --allow-not-live` puts node 5 in
+///    place of a meta voter of the group placed off the meta leader (the
+///    other moves onto a live node leave the liveness check on). The
+///    group's leader adds node 5 as a learner and waits. The meta leader is
+///    killed there, node 5 continues, and the move converges under the next
+///    meta leader: the placement is stable at the target with a new
+///    `converged_at`, and node 5 serves the group as a voter. A move that
+///    needs the meta leader it was requested under fails it.
 /// 2. Once the moved-off source no longer counts its replica as a voter,
-///    every read it answers holds the write made after the move. A dropped
-///    voter that answers a read from its own stale state fails it. Refusals
-///    pass: a dropped voter that campaigns knows no leader.
-/// 3. The group placed on {1, 2, 3} moves to {1, 4, 5} with node 5 stopped,
-///    so its leader promotes node 4 and waits for node 5. Node 4 is killed
-///    once a uniform membership lists it, and a cancel converges back on
-///    {1, 2, 3} with nodes 4 and 5 down. A cancel that needs its dead target
-///    or the learner that never caught up fails it.
+///    a read sent to it is answered with a `2xx` at least once, and every
+///    `2xx` holds the write made after the move. A dropped voter that
+///    answers a read from its own stale state fails it. Refusals pass: a
+///    dropped voter that campaigns knows no leader. The client follows
+///    redirects, so once the source tore its replica down, the `2xx` comes
+///    from a node its `307` names: the phase shows that no read sent to the
+///    source is stale, not which path answered it.
+/// 3. The group placed on {1, 2, 3} moves to {1, 4, 5} with node 5 stopped
+///    (`--allow-not-live`), so its leader promotes node 4 and waits for
+///    node 5. Node 4 is killed once a uniform membership lists it, and a
+///    cancel converges back on {1, 2, 3} with nodes 4 and 5 down. A cancel
+///    that needs its dead target or the learner that never caught up fails
+///    it.
 /// 4. Through a gateway, each of the two groups not moved yet replaces its
 ///    leader by node 5 under write load. The lowest-id voter that stays is
 ///    killed for the first group and stopped (`SIGSTOP`, a blackhole) for
@@ -5716,8 +5734,9 @@ async fn wait_leaders_settle(
 ///    write the gateway sends it waits longer than the load's 10 s, which
 ///    the test allows, so that leg claims only that no write gets another
 ///    status. Each stream holds every acknowledged write once, in order, and
-///    no write refused before it applied. A leader that hands off only to
-///    the dead or stopped voter, or a refusal that applied, fails it.
+///    no write whose `503` code proves it applied nothing. A leader that
+///    hands off only to the dead or stopped voter, or a proven refusal that
+///    applied, fails it.
 /// 5. Node 4, a meta learner, restarts with its meta snapshot record
 ///    corrupted and reports its meta damaged. The moved group's staying meta
 ///    voter is drained and node 5 killed, which leaves node 4 the group's
@@ -5811,7 +5830,15 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
         other => panic!("group {moved:?} is not live: {other:?}"),
     };
     procs.signal(5, "-STOP");
-    let (end, out) = placement_move(&nodes, &[5], moved, replace(source, 5), false).await;
+    let (end, out) = placement_move(
+        &nodes,
+        &[5],
+        moved,
+        replace(source, 5),
+        NewVoters::MayBeDown,
+        false,
+    )
+    .await;
     assert!(matches!(end, GroupEnd::Accepted { .. }), "{end:?}\n{out}");
     let what = format!("group {} adds node 5 as a learner", moved.0);
     eventually(&mut procs, &what, async || {
@@ -5896,6 +5923,27 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
         }
     })
     .await;
+    let fresh = b"before-the-moves;after-the-move;";
+    let what = format!("node {source} answers a read of group {}", moved.0);
+    eventually(&mut procs, &what, async || {
+        let response = client
+            .get(read(source_node, moved))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("{}", response.status()));
+        }
+        let body = response.bytes().await.map_err(|err| err.to_string())?;
+        assert_eq!(
+            body.as_ref(),
+            fresh,
+            "node {source} answered a stale read of group {}",
+            moved.0
+        );
+        Ok(())
+    })
+    .await;
     for _ in 0..20 {
         if let Ok(response) = client.get(read(source_node, moved)).send().await
             && response.status().is_success()
@@ -5903,7 +5951,7 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
             let body = response.bytes().await.expect("read the stream");
             assert_eq!(
                 body.as_ref(),
-                b"before-the-moves;after-the-move;",
+                fresh,
                 "node {source} answered a stale read of group {}",
                 moved.0
             );
@@ -5925,6 +5973,7 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
         &[5],
         cancelled,
         Intent::To(voter_set(&BTreeSet::from([1, 4, 5]))),
+        NewVoters::MayBeDown,
         false,
     )
     .await;
@@ -6068,8 +6117,15 @@ async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() 
     .await;
     // Node 5's place goes to the node the group was placed off, the one
     // node of 1 to 3 the group has no retirement for.
-    let (end, out) =
-        placement_move(&nodes, &[5], moved, replace(5, first_meta_leader), false).await;
+    let (end, out) = placement_move(
+        &nodes,
+        &[5],
+        moved,
+        replace(5, first_meta_leader),
+        NewVoters::Live,
+        false,
+    )
+    .await;
     assert!(matches!(end, GroupEnd::Accepted { .. }), "{end:?}\n{out}");
     ctl.set_maintenance_drain(&drained.ctl(), false)
         .await
@@ -6215,7 +6271,7 @@ async fn cli_a_durable_single_node_grows_to_three_and_moves_its_groups() {
         .await;
         let read = format!("{}?offset=0&max_bytes=256", url(target, group));
         read_until_matches(&client, &read, b"before-the-growth;").await;
-        post_until_no_content(&client, &url(&nodes[0], group), "after-the-move;").await;
+        post_until_no_content(&client, &url(target, group), "after-the-move;").await;
         read_until_matches(&client, &read, b"before-the-growth;after-the-move;").await;
     }
     let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
@@ -6265,13 +6321,15 @@ async fn cli_a_durable_single_node_grows_to_three_and_moves_its_groups() {
 /// S3(f) on the server: five nodes at replication factor 3 with meta
 /// voters 1 to 3, behind a gateway that writes to a stream of every group.
 ///
-/// 1. Each node in turn restarts behind `ursulactl verify-survivors` with
-///    it excluded and `ursulactl wait` for it. The gateway answers every
+/// 1. Each node in turn stops, `ursulactl verify-survivors` with it
+///    excluded passes once the survivors lead every group, and the node
+///    restarts behind `ursulactl wait`. The gateway answers every
 ///    write `204` or a `503` with `Retry-After`, and each stream holds every
-///    acknowledged write once, in order, and no write refused before it
-///    applied. Then the leaderships settle: no leader changes for three
-///    balancer ticks. A restart that drops writes, a refusal that applied, or
-///    a balancer that never stops moving leaderships fails it.
+///    acknowledged write once, in order, and no write whose `503` code
+///    proves it applied nothing. Then the leaderships settle: no leader
+///    changes for three balancer ticks. A restart that drops writes, a
+///    proven refusal that applied, or a balancer that never stops moving
+///    leaderships fails it.
 /// 2. A group moves to {x, 4, 5}, x a meta voter, so meta keeps a quorum
 ///    when its three voters are killed and lose their run state. The group
 ///    stalls. A cutting plan whose `certified` floor names an entry above
@@ -6331,20 +6389,26 @@ async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certif
     let load = GatewayLoad::start(streams.clone(), "rolling");
     let manifest = ctl_manifest(&nodes, &[]);
     for node in &nodes {
-        let survivors = ursula_ctl::quorum::verify_surviving_quorum(
-            &manifest,
-            node.id,
-            &ctl_client(),
-            &ursula_ctl::quorum::QuorumVerificationOptions {
-                timeout: META_WAIT,
-                poll_interval: Duration::from_millis(200),
-            },
-        )
-        .await;
-        if let Err(err) = survivors {
-            panic!("verify-survivors without node {}: {err:?}", node.id);
-        }
+        // `verify-survivors` observes the others once the node is down. It
+        // refuses while a group's survivors still name the stopped node as
+        // leader, so it is retried, as an operator would, until they
+        // elected another.
         procs.stop(node.id).await;
+        let what = format!("verify-survivors passes without node {}", node.id);
+        eventually(&mut procs, &what, async || {
+            ursula_ctl::quorum::verify_surviving_quorum(
+                &manifest,
+                node.id,
+                &ctl_client(),
+                &ursula_ctl::quorum::QuorumVerificationOptions {
+                    timeout: Duration::from_secs(10),
+                    poll_interval: Duration::from_millis(200),
+                },
+            )
+            .await
+            .map_err(|err| format!("{err:?}"))
+        })
+        .await;
         procs.start(binary, node);
         let outcome = ursula_ctl::wait_node_ready(
             &manifest,
