@@ -237,18 +237,31 @@ reads it from the `meta` field of the node's metrics, apart from
 without it.
 
 Readiness and maintenance eligibility are two answers from one report
-(`check_raft_maintenance` in `crates/ursula-raft/src/maintenance.rs`). The
-report compares local replicas against the placement's inventory, the groups
-whose target voters in the node's latest view list the node, with those
-voters, and lists issues per group, such as `incomplete_voter_set`,
-`unconfigured_member` (a member that is not a placed voter, which the leader
-never removes),
-`joint_membership`, `apply_lag` or `apply_stopped`. `GET /__ursula/ready` uses
-`serving_ready()`, which ignores incomplete voter sets, unconfigured members,
-joint membership and stopped apply, so
-healthy survivors keep serving while a peer catches up. Maintenance tooling uses
-`ready()`, which requires no issue at all, so a second disruption waits for
-full redundancy. The readiness body includes the full report.
+(`check_raft_maintenance` in `crates/ursula-raft/src/maintenance.rs`, schema
+version 2). The inventory comes from the node's placement view: the groups in
+which its bootstrapped view gives the node a role, each with its role, its
+target voters and whether the replica counts as a voter by the one voter
+predicate. The voter checks come from each replica's effective membership. A
+replica that does not count as a voter, such as an incoming learner, is
+checked only for being stopped. That blocks nothing while the report lists
+the replica in `expected_groups` or `unplaced`. Before a bootstrapped view
+and while meta is damaged the report lists no replica, so a stopped replica
+blocks as a voter's would. Node issues come
+from the view, the meta replica's status and the hosting driver's: a node
+that does not know its groups (`placement_unknown`, a wiped voter before meta
+answers), a view that has not bootstrapped, a genesis mismatch, a meta group
+without a leader for 30 s, a damaged meta replica, which replaces every issue
+the view gives, and a configured group count or replication factor the
+cluster does not share. Group issues name a missing placed replica, a replica
+held without a role (`unplaced_replica`), an incomplete voter set, a member
+without a role (`unplaced_member`, which the leader never removes),
+`joint_membership`, `apply_lag` or `apply_stopped`. A node with no group is
+ready. `GET /__ursula/ready` uses `serving_ready()`, which ignores incomplete
+voter sets, members and replicas without a role, joint membership and stopped
+apply, so healthy survivors keep serving while a peer catches up. Maintenance
+tooling uses `ready()`, which ignores only a meta group without a leader and a
+damaged meta replica, so a second disruption waits for full redundancy. The
+readiness body includes the full report.
 
 ## 4. Kubernetes integration
 

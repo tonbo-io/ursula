@@ -549,10 +549,12 @@ mod tests {
             version: ursula_proto::admin::SchemaVersion,
             node_id: state.node_id,
             lag_tolerance: 0,
+            placement: None,
             expected_groups: std::collections::BTreeMap::from([(
                 7,
-                std::collections::BTreeSet::from([1, 2, 3]),
+                crate::metrics::test_expected(&[1, 2, 3]),
             )]),
+            unplaced: std::collections::BTreeMap::new(),
             node_issues: vec![],
             group_issues: std::collections::BTreeMap::new(),
         });

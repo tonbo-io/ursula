@@ -1468,7 +1468,7 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
 
 /// Replacing the voter set removes every learner outside it: a node that
 /// configuration no longer lists, left behind as a learner, leaves with it,
-/// so the group does not report `unconfigured_member` forever.
+/// so the group does not report `unplaced_member` forever.
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn replacing_the_voters_removes_learners_outside_them() {

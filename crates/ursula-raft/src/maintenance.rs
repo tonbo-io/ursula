@@ -1,131 +1,166 @@
-//! Local Raft eligibility for Kubernetes readiness and maintenance tooling.
+//! Local Raft eligibility for Kubernetes readiness and maintenance tooling
+//! (design 10).
 //!
-//! The expected inventory comes from configuration, never from the observed
-//! groups. This is a local eligibility check; cluster-wide disruption control
-//! must also observe every configured peer and serialize maintenance operations.
+//! [`check_raft_maintenance`] is one pure decision over typed inputs: the
+//! node's data replicas, whether each counts as a voter by the one voter
+//! predicate ([`RaftGroupHandleRegistry::counts_as_voter`]), and what the
+//! node knows of its placement ([`NodePlacement`]). The inventory comes
+//! from the node's bootstrapped view, never from the observed groups, and
+//! the voter checks from each replica's effective membership. A replica
+//! that does not count as a voter is checked only for being stopped.
+//! [`raft_maintenance_report`] gathers the inputs on a node.
+//!
+//! This is a local eligibility check. Cluster-wide disruption control must
+//! also observe every peer and serialize maintenance operations.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::time::Duration;
 
+use ursula_control::Cluster;
+use ursula_control::ClusterView;
+use ursula_control::Counts;
+use ursula_control::GroupPlacement;
+use ursula_control::MetaReplicaStatus;
+use ursula_control::PlacementStatus;
+use ursula_control::RegistrationStatus;
+use ursula_proto::admin::NodePlacementReport;
 pub use ursula_proto::admin::RaftMaintenanceIssue;
 pub use ursula_proto::admin::RaftMaintenanceReport;
+use ursula_proto::placement::ExpectedReplica;
+use ursula_proto::placement::GenesisClaim;
+use ursula_proto::placement::NodeId;
+use ursula_proto::placement::Registered;
+use ursula_proto::placement::ReplicaRole;
+use ursula_proto::placement::UnplacedReplica;
+use ursula_shard::RaftGroupId;
 
+use crate::HostingStatus;
+use crate::RaftGroupHandleRegistry;
+use crate::meta::status::MetaStatusReader;
 use crate::types::RaftGroupMetricsSnapshot;
 
-/// Require every expected local replica to be running, recovered, a member of
-/// the complete uniform voter set, and applied through its membership entry.
-/// Bound application lag and require a leader belonging to that voter set.
+/// How far a replica's applied index may trail its committed one.
+pub const LAG_TOLERANCE: u64 = 16;
+
+/// How long a node may know no meta leader before it reports
+/// `meta_unavailable`: the window after which it also registers again.
+pub const META_UNAVAILABLE_AFTER: Duration = crate::meta::registration::REREGISTER_AFTER;
+
+/// What a node's maintenance report reads of its placement.
+#[derive(Debug, Clone, Copy)]
+pub struct NodePlacement<'a> {
+    /// The node's placement status, from its latest view.
+    pub status: &'a PlacementStatus,
+    /// The node's genesis claim: its configured group count and effective
+    /// replication factor.
+    pub claim: &'a GenesisClaim,
+    /// How long the node has known no meta leader, `None` while it knows
+    /// one.
+    pub leaderless_for: Option<Duration>,
+    /// The hosting driver's last status.
+    pub hosting: &'a HostingStatus,
+}
+
+/// The inputs of [`check_raft_maintenance`].
+#[derive(Debug, Clone, Copy)]
+pub struct MaintenanceInputs<'a, C> {
+    pub node_id: u64,
+    pub lag_tolerance: u64,
+    /// The node's data replicas' metrics.
+    pub groups: &'a [RaftGroupMetricsSnapshot],
+    /// Whether the node's replica of a group counts as a voter, by the one
+    /// voter predicate, also when it is closed.
+    pub counts: C,
+    /// `None` on a Raft node without a meta runtime.
+    pub placement: Option<NodePlacement<'a>>,
+}
+
+/// The node's maintenance report (see the module docs).
+///
+/// Node issues: a node without a meta runtime reports `placement_unknown`.
+/// A damaged meta replica reports `meta_damaged` and replaces every issue
+/// the view gives, the inventory included. Otherwise the bootstrapped view
+/// gives the inventory and the mismatches with the node's genesis claim. A
+/// view that has not bootstrapped gives `placement_not_bootstrapped` when
+/// the node holds or runs replicas, and `placement_unknown` when it holds
+/// none, confirmed no view in this run, and was not answered `forming` or
+/// `unreferenced`. `meta_unavailable` comes after
+/// [`META_UNAVAILABLE_AFTER`] without a meta leader, unless the node holds
+/// nothing and is placed nowhere.
+///
+/// Group issues: every running replica is checked against its effective
+/// membership if it counts as a voter, and only for being stopped if not.
+/// Against the bootstrapped view, a replica held or running without a role
+/// is `unplaced_replica`, a counting replica whose membership is not the
+/// placement's target is `incomplete_voter_set`, and one whose membership
+/// names a node without a role is `unplaced_member`. A `voter` or
+/// `incoming` role without a running replica is `missing_group`.
 pub fn check_raft_maintenance(
-    groups: &[RaftGroupMetricsSnapshot],
-    node_id: u64,
-    expected_groups: BTreeMap<u32, BTreeSet<u64>>,
-    lag_tolerance: u64,
+    inputs: MaintenanceInputs<'_, impl Fn(RaftGroupId) -> Counts>,
 ) -> RaftMaintenanceReport {
     use RaftMaintenanceIssue as Issue;
 
+    let MaintenanceInputs {
+        node_id,
+        lag_tolerance,
+        groups,
+        counts,
+        placement,
+    } = inputs;
+    let counts = |group: u32| counts(RaftGroupId(group)) == Counts::Voter;
     let mut report = RaftMaintenanceReport {
         version: ursula_proto::admin::SchemaVersion,
         node_id,
         lag_tolerance,
-        expected_groups,
+        placement: None,
+        expected_groups: Default::default(),
+        unplaced: Default::default(),
         node_issues: Vec::new(),
-        group_issues: BTreeMap::new(),
+        group_issues: Default::default(),
     };
-    if report.expected_groups.is_empty() {
-        report.node_issues.push(Issue::EmptyExpectedInventory);
-    }
+    let running = groups
+        .iter()
+        .map(|group| group.raft_group_id)
+        .collect::<BTreeSet<_>>();
+    let cluster = match placement {
+        Some(placement) => read_placement(&mut report, placement, &running, &counts),
+        None => {
+            report.node_issues.push(Issue::PlacementUnknown);
+            None
+        }
+    };
     let mut seen = BTreeSet::new();
     for group in groups {
+        let id = group.raft_group_id;
         let mut issues = Vec::new();
-        if !seen.insert(group.raft_group_id) {
+        if !seen.insert(id) {
             issues.push(Issue::DuplicateGroup);
         }
-        let Some(expected) = report.expected_groups.get(&group.raft_group_id) else {
-            issues.push(Issue::UnexpectedGroup);
-            report
-                .group_issues
-                .entry(group.raft_group_id)
-                .or_default()
-                .extend(issues);
-            continue;
-        };
         if group.node_id != node_id {
             issues.push(Issue::WrongNodeIdentity);
         }
-        // A stopped group's Raft observations are stale. The stop is its
-        // only issue, so serving and maintenance policy can each decide on it.
-        if group.apply_failure.is_some() {
-            issues.push(Issue::ApplyStopped);
-            report
-                .group_issues
-                .entry(group.raft_group_id)
-                .or_default()
-                .extend(issues);
-            continue;
+        if report.unplaced.contains_key(&id) {
+            issues.push(Issue::UnplacedReplica);
         }
-        if !group.maintenance.running {
-            issues.push(Issue::RaftStopped);
-        }
-        if !group.maintenance.recovery_ready {
-            issues.push(Issue::RecoveryBarrier);
-        }
-        if group.maintenance.stopped_for_operator {
-            issues.push(Issue::StoppedForOperator);
-        }
-        if group.maintenance.membership_joint {
-            issues.push(Issue::JointMembership);
-        }
-        let voters = group.voter_ids.iter().copied().collect::<BTreeSet<_>>();
-        if group.voter_configurations.is_empty()
-            || !group
-                .voter_configurations
-                .iter()
-                .all(|config| config.contains(&node_id))
-        {
-            issues.push(Issue::LocalReplicaNotVoter);
-        }
-        if &voters != expected || !group.learner_ids.is_empty() {
-            issues.push(Issue::IncompleteVoterSet);
-        }
-        // The leader heals a missing placed voter by itself, but never
-        // removes a member the placement does not list.
-        if voters
-            .iter()
-            .chain(&group.learner_ids)
-            .any(|member| !expected.contains(member))
-        {
-            issues.push(Issue::UnconfiguredMember);
-        }
-        let applied = group.last_applied.map(|id| id.index);
-        if group.maintenance.membership_log_index.is_none()
-            || applied < group.maintenance.membership_log_index
-        {
-            issues.push(Issue::MembershipNotApplied);
-        }
-        match group.current_leader {
-            None => issues.push(Issue::LeaderUnknown),
-            Some(leader) if !voters.contains(&leader) => issues.push(Issue::LeaderOutsideVoters),
-            Some(_) => {}
-        }
-        match (group.committed, applied) {
-            (Some(committed), Some(applied))
-                if committed.index.saturating_sub(applied) > lag_tolerance =>
-            {
-                issues.push(Issue::ApplyLag)
-            }
-            (Some(_), Some(_)) => {}
-            _ => issues.push(Issue::NotApplied),
-        }
+        let placed = cluster
+            .filter(|_| report.expected_groups.contains_key(&id))
+            .and_then(|cluster| cluster.group(RaftGroupId(id)));
+        voter_checks(
+            group,
+            node_id,
+            counts(id),
+            placed,
+            lag_tolerance,
+            &mut issues,
+        );
         if !issues.is_empty() {
-            report
-                .group_issues
-                .entry(group.raft_group_id)
-                .or_default()
-                .extend(issues);
+            report.group_issues.entry(id).or_default().extend(issues);
         }
     }
-    for group in report.expected_groups.keys() {
-        if !seen.contains(group) {
+    for (group, expected) in &report.expected_groups {
+        if !seen.contains(group)
+            && matches!(expected.role, ReplicaRole::Voter | ReplicaRole::Incoming)
+        {
             report
                 .group_issues
                 .entry(*group)
@@ -133,244 +168,244 @@ pub fn check_raft_maintenance(
                 .push(Issue::MissingGroup);
         }
     }
+    // A held replica that does not run is unplaced all the same.
+    for group in report.unplaced.keys() {
+        if !seen.contains(group) {
+            report
+                .group_issues
+                .entry(*group)
+                .or_default()
+                .push(Issue::UnplacedReplica);
+        }
+    }
     report
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::RaftGroupMaintenanceState;
-    use crate::RaftLogProgressSnapshot;
+/// Fills the report's placement, inventory and node issues from
+/// `placement`, and returns the bootstrapped view's cluster the group
+/// checks read, `None` before a bootstrapped view and while meta is
+/// damaged.
+fn read_placement<'a>(
+    report: &mut RaftMaintenanceReport,
+    placement: NodePlacement<'a>,
+    running: &BTreeSet<u32>,
+    counts: &impl Fn(u32) -> bool,
+) -> Option<&'a Cluster> {
+    use RaftMaintenanceIssue as Issue;
 
-    #[test]
-    fn serving_keeps_survivors_but_excludes_the_rebuilding_learner() {
-        let mut survivor = healthy(0);
-        survivor.voter_ids = vec![1, 2];
-        survivor.voter_configurations = vec![BTreeSet::from([1, 2])];
-        survivor.learner_ids = vec![3];
-        let expected = BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]);
-        let report = check_raft_maintenance(&[survivor.clone()], 1, expected.clone(), 16);
-        assert!(report.serving_ready());
-        assert!(!report.ready());
-        survivor.node_id = 3;
-        let rebuilding = check_raft_maintenance(&[survivor], 3, expected, 16);
-        assert!(!rebuilding.serving_ready());
+    let me = NodeId::new(report.node_id);
+    let status = placement.status;
+    let (meta_role, meta_leader) = match &status.meta {
+        MetaReplicaStatus::Running { role, leader } => (Some(*role), *leader),
+        MetaReplicaStatus::Damaged { .. } | MetaReplicaStatus::Absent => (None, None),
+    };
+    let registration = match &status.registration {
+        RegistrationStatus::Answered(answer) => Some(*answer),
+        RegistrationStatus::Pending
+        | RegistrationStatus::RootRefused { .. }
+        | RegistrationStatus::Refused(_)
+        | RegistrationStatus::Removed => None,
+    };
+    let cluster = match &status.view {
+        ClusterView::Bootstrapped(cluster) => Some(cluster),
+        ClusterView::MetaGenesis { .. }
+        | ClusterView::MetaCatchingUp
+        | ClusterView::Registering { .. }
+        | ClusterView::FormationCut => None,
+    };
+    report.placement = Some(NodePlacementReport {
+        view: status.view.stage(),
+        applied: status.applied,
+        meta_role,
+        meta_leader,
+        lifecycle: cluster
+            .and_then(|cluster| cluster.node(me))
+            .map(|record| record.lifecycle),
+        registration,
+    });
+    if matches!(status.meta, MetaReplicaStatus::Damaged { .. }) {
+        report.node_issues.push(Issue::MetaDamaged);
+        return None;
     }
-
-    fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
-        let progress = RaftLogProgressSnapshot {
-            term: 1,
-            index: 20,
-            node_id: 1,
-        };
-        RaftGroupMetricsSnapshot {
-            apply_failure: None,
-            raft_group_id: id,
-            node_id: 1,
-            current_term: 1,
-            current_leader: Some(2),
-            last_log: Some(progress),
-            committed: Some(progress),
-            last_applied: Some(progress),
-            snapshot: None,
-            purged: None,
-            voter_ids: vec![1, 2, 3],
-            voter_configurations: vec![BTreeSet::from([1, 2, 3])],
-            committed_voter_configurations: vec![BTreeSet::from([1, 2, 3])],
-            learner_ids: vec![],
-            maintenance: RaftGroupMaintenanceState {
-                running: true,
-                recovery_ready: true,
-                accepting_transfers: true,
-                membership_joint: false,
-                membership_log_index: Some(10),
-                stopped_for_operator: false,
-            },
-            log: Default::default(),
-            history: None,
-            recovery: None,
-            recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
-            leads_live: false,
+    let hosting = placement.hosting;
+    let holds = !hosting.held.is_empty() || !running.is_empty();
+    match cluster {
+        Some(cluster) => {
+            let params = cluster.params();
+            if params.group_count != placement.claim.group_count {
+                report.node_issues.push(Issue::GroupCountMismatch);
+            }
+            if params.replication_factor != placement.claim.replication_factor {
+                report.node_issues.push(Issue::ReplicationFactorMismatch);
+            }
+            for (group, placed) in cluster.groups().iter() {
+                if let Some(role) = placed.role(me) {
+                    report.expected_groups.insert(group.0, ExpectedReplica {
+                        role,
+                        since: placed.since(),
+                        target: placed.target_voters().clone(),
+                        counts_as_voter: counts(group.0),
+                    });
+                }
+            }
+            let unplaced = hosting
+                .unplaced
+                .iter()
+                .map(|group| group.0)
+                .chain(running.iter().copied())
+                .filter(|group| !report.expected_groups.contains_key(group))
+                .collect::<BTreeSet<_>>();
+            for group in unplaced {
+                report.unplaced.insert(group, UnplacedReplica {
+                    counts_as_voter: counts(group),
+                });
+            }
+        }
+        None if holds => report.node_issues.push(Issue::PlacementNotBootstrapped),
+        None => {
+            let answered = matches!(
+                registration,
+                Some(Registered::Forming | Registered::Unreferenced(_))
+            );
+            if hosting.last_confirmed.is_none() && !answered {
+                report.node_issues.push(Issue::PlacementUnknown);
+            }
         }
     }
-
-    #[test]
-    fn outgoing_joint_voter_is_not_serving_even_while_in_union() {
-        let mut group = healthy(0);
-        group.node_id = 3;
-        group.maintenance.membership_joint = true;
-        group.voter_configurations = vec![BTreeSet::from([1, 2, 3]), BTreeSet::from([1, 2])];
-        let report = check_raft_maintenance(
-            &[group],
-            3,
-            BTreeMap::from([(0, BTreeSet::from([1, 2, 3]))]),
-            16,
-        );
-        assert!(report.group_issues[&0].contains(&RaftMaintenanceIssue::LocalReplicaNotVoter));
-        assert!(!report.serving_ready());
+    if let ClusterView::MetaGenesis {
+        genesis_mismatch, ..
+    } = &status.view
+        && !genesis_mismatch.is_empty()
+    {
+        report.node_issues.push(Issue::GenesisMismatch);
     }
-
-    fn report(groups: &[RaftGroupMetricsSnapshot]) -> RaftMaintenanceReport {
-        check_raft_maintenance(
-            groups,
-            1,
-            BTreeMap::from([
-                (0, BTreeSet::from([1, 2, 3])),
-                (1, BTreeSet::from([1, 2, 3])),
-            ]),
-            16,
-        )
+    let placed_nowhere = match cluster {
+        Some(_) => report.expected_groups.is_empty(),
+        None => matches!(registration, Some(Registered::Unreferenced(_))),
+    };
+    if placement
+        .leaderless_for
+        .is_some_and(|leaderless| leaderless >= META_UNAVAILABLE_AFTER)
+        && (holds || !placed_nowhere)
+    {
+        report.node_issues.push(Issue::MetaUnavailable);
     }
+    cluster
+}
 
-    #[test]
-    fn apply_failure_has_a_distinct_maintenance_reason() {
-        let mut group = healthy(0);
-        group.maintenance.running = false;
-        group.apply_failure = Some(ursula_proto::admin::ApplyFailure {
-            term: 2,
-            index: 9,
-            kind: ursula_proto::admin::ApplyFailureKind::InvariantViolation,
-            message: "invariant".to_owned(),
-        });
-        group.current_leader = None;
-        group.maintenance.recovery_ready = false;
-        let report = report(&[group, healthy(1)]);
-        assert_eq!(report.group_issues[&0], vec![
-            RaftMaintenanceIssue::ApplyStopped
-        ]);
-        assert!(!report.group_issues.contains_key(&1));
-        // The stop blocks disruption, while the node keeps serving its other
-        // groups and the stopped group answers with a typed 503.
-        assert!(!report.ready());
-        assert!(report.serving_ready());
+/// The checks of one running replica: only for being stopped when it does
+/// not count as a voter, else against its effective membership, and
+/// against `placed`, its group's placement, when the node expects it.
+fn voter_checks(
+    group: &RaftGroupMetricsSnapshot,
+    node_id: u64,
+    counts: bool,
+    placed: Option<&GroupPlacement>,
+    lag_tolerance: u64,
+    issues: &mut Vec<RaftMaintenanceIssue>,
+) {
+    use RaftMaintenanceIssue as Issue;
+
+    // A stopped group's Raft observations are stale. The stop is its only
+    // issue, so serving and maintenance policy can each decide on it.
+    if group.apply_failure.is_some() {
+        issues.push(Issue::ApplyStopped);
+        return;
     }
-
-    #[test]
-    fn inventory_is_configuration_backed_even_if_every_observation_omits_a_group() {
-        assert!(report(&[healthy(0), healthy(1)]).ready());
-        let missing = report(&[healthy(0)]);
-        assert!(!missing.ready());
-        assert_eq!(missing.group_issues[&1], vec![
-            RaftMaintenanceIssue::MissingGroup
-        ]);
-        assert!(!report(&[]).ready());
-        assert!(!check_raft_maintenance(&[], 1, BTreeMap::new(), 16).ready());
+    if !group.maintenance.running {
+        issues.push(Issue::RaftStopped);
     }
-
-    #[test]
-    fn a_new_ready_process_cannot_replace_a_voter_before_promotion_is_applied() {
-        let mut new = healthy(1);
-        new.voter_ids = vec![2, 3];
-        new.learner_ids = vec![1];
-        assert!(
-            report(&[healthy(0), new.clone()]).group_issues[&1]
-                .contains(&RaftMaintenanceIssue::IncompleteVoterSet)
-        );
-        new.voter_ids = vec![1, 2, 3];
-        new.learner_ids.clear();
-        new.maintenance.membership_log_index = Some(21);
-        assert!(
-            report(&[healthy(0), new.clone()]).group_issues[&1]
-                .contains(&RaftMaintenanceIssue::MembershipNotApplied)
-        );
-        new.last_applied = Some(RaftLogProgressSnapshot {
-            term: 1,
-            index: 21,
-            node_id: 1,
-        });
-        assert!(report(&[healthy(0), new]).ready());
+    if !counts {
+        return;
     }
-
-    /// A member that configuration does not list blocks maintenance but not
-    /// serving: the leader never removes it, and nothing dials it.
-    #[test]
-    fn an_unconfigured_member_blocks_maintenance_but_not_serving() {
-        for (voters, learners) in [(vec![1, 2, 3, 4], vec![]), (vec![1, 2, 3], vec![4])] {
-            let mut group = healthy(1);
-            group.voter_ids = voters.clone();
-            group.voter_configurations = vec![voters.iter().copied().collect()];
-            group.learner_ids = learners;
-            let report = report(&[healthy(0), group]);
-            assert_eq!(report.group_issues[&1], vec![
-                RaftMaintenanceIssue::IncompleteVoterSet,
-                RaftMaintenanceIssue::UnconfiguredMember,
-            ]);
-            assert!(report.serving_ready());
-            assert!(!report.ready());
+    if !group.maintenance.recovery_ready {
+        issues.push(Issue::RecoveryBarrier);
+    }
+    if group.maintenance.stopped_for_operator {
+        issues.push(Issue::StoppedForOperator);
+    }
+    if group.maintenance.membership_joint {
+        issues.push(Issue::JointMembership);
+    }
+    if group.voter_configurations.is_empty()
+        || !group
+            .voter_configurations
+            .iter()
+            .all(|config| config.contains(&node_id))
+    {
+        issues.push(Issue::LocalReplicaNotVoter);
+    }
+    let voters = group.voter_ids.iter().copied().collect::<BTreeSet<_>>();
+    if let Some(placed) = placed {
+        let target = placed
+            .target_voters()
+            .iter()
+            .map(NodeId::get)
+            .collect::<BTreeSet<_>>();
+        if voters != target || !group.learner_ids.is_empty() {
+            issues.push(Issue::IncompleteVoterSet);
         }
-        // A placed voter missing from the membership is healed by the
-        // leader: it is no `UnconfiguredMember`.
-        let mut group = healthy(1);
-        group.voter_ids = vec![1, 2];
-        group.voter_configurations = vec![BTreeSet::from([1, 2])];
-        assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
-            RaftMaintenanceIssue::IncompleteVoterSet
-        ]);
-        // Nor is the learner the leader is healing back: a placed voter.
-        let mut group = healthy(1);
-        group.voter_ids = vec![1, 2];
-        group.voter_configurations = vec![BTreeSet::from([1, 2])];
-        group.learner_ids = vec![3];
-        assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
-            RaftMaintenanceIssue::IncompleteVoterSet
-        ]);
-    }
-
-    #[test]
-    fn stopped_recovering_joint_and_operator_stopped_replicas_are_ineligible() {
-        for maintenance in [
-            RaftGroupMaintenanceState {
-                running: false,
-                ..healthy(1).maintenance
-            },
-            RaftGroupMaintenanceState {
-                recovery_ready: false,
-                ..healthy(1).maintenance
-            },
-            RaftGroupMaintenanceState {
-                membership_joint: true,
-                ..healthy(1).maintenance
-            },
-            RaftGroupMaintenanceState {
-                stopped_for_operator: true,
-                ..healthy(1).maintenance
-            },
-            RaftGroupMaintenanceState::default(),
-        ] {
-            let mut group = healthy(1);
-            group.maintenance = maintenance;
-            assert!(!report(&[healthy(0), group]).ready());
+        // The leader heals a missing target voter by itself, but never
+        // removes a member the placement gives no role.
+        if voters
+            .iter()
+            .chain(&group.learner_ids)
+            .any(|member| placed.role(NodeId::new(*member)).is_none())
+        {
+            issues.push(Issue::UnplacedMember);
         }
     }
-
-    #[test]
-    fn a_missing_leader_or_large_apply_gap_prevents_maintenance() {
-        let mut group = healthy(1);
-        group.current_leader = None;
-        assert!(!report(&[healthy(0), group.clone()]).ready());
-        group.current_leader = Some(4);
-        assert!(!report(&[healthy(0), group.clone()]).ready());
-        group.current_leader = Some(2);
-        group.committed = Some(RaftLogProgressSnapshot {
-            term: 1,
-            index: 37,
-            node_id: 1,
-        });
-        assert!(!report(&[healthy(0), group.clone()]).ready());
-        group.committed = Some(RaftLogProgressSnapshot {
-            term: 1,
-            index: 36,
-            node_id: 1,
-        });
-        assert!(report(&[healthy(0), group]).ready());
+    let applied = group.last_applied.map(|id| id.index);
+    if group.maintenance.membership_log_index.is_none()
+        || applied < group.maintenance.membership_log_index
+    {
+        issues.push(Issue::MembershipNotApplied);
     }
-
-    #[test]
-    fn duplicate_foreign_and_wrong_identity_observations_do_not_count_as_redundancy() {
-        assert!(!report(&[healthy(0), healthy(1), healthy(1)]).ready());
-        assert!(!report(&[healthy(0), healthy(1), healthy(2)]).ready());
-        let mut wrong = healthy(1);
-        wrong.node_id = 2;
-        assert!(!report(&[healthy(0), wrong]).ready());
+    match group.current_leader {
+        None => issues.push(Issue::LeaderUnknown),
+        Some(leader) if !voters.contains(&leader) => issues.push(Issue::LeaderOutsideVoters),
+        Some(_) => {}
+    }
+    match (group.committed, applied) {
+        (Some(committed), Some(applied))
+            if committed.index.saturating_sub(applied) > lag_tolerance =>
+        {
+            issues.push(Issue::ApplyLag)
+        }
+        (Some(_), Some(_)) => {}
+        _ => issues.push(Issue::NotApplied),
     }
 }
+
+/// The maintenance report of node `node_id`: its registry's data replicas,
+/// each judged by the one voter predicate, against its placement as `meta`
+/// reads it and the hosting driver's last status, the default before the
+/// driver's first pass. `meta` is `None` on a node without a meta runtime.
+pub fn raft_maintenance_report(
+    registry: &RaftGroupHandleRegistry,
+    node_id: u64,
+    meta: Option<&MetaStatusReader>,
+    hosting: Option<&HostingStatus>,
+) -> RaftMaintenanceReport {
+    let groups = registry.metrics_snapshot();
+    let before_first_pass = HostingStatus::default();
+    let status = meta.map(MetaStatusReader::placement_status);
+    let placement = meta
+        .zip(status.as_ref())
+        .map(|(reader, status)| NodePlacement {
+            status,
+            claim: reader.claim(),
+            leaderless_for: reader.meta_leaderless_for(),
+            hosting: hosting.unwrap_or(&before_first_pass),
+        });
+    check_raft_maintenance(MaintenanceInputs {
+        node_id,
+        lag_tolerance: LAG_TOLERANCE,
+        groups: &groups,
+        counts: |group| registry.counts_as_voter(group),
+        placement,
+    })
+}
+
+#[cfg(test)]
+mod tests;

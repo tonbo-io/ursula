@@ -82,12 +82,8 @@ async fn an_external_append_whose_leadership_ended_during_its_put_answers_503_an
         .await
         .expect("leader");
     let cold_store = runtime.cold_store().expect("a memory cold store");
-    let state = HttpState::with_raft_cluster(
-        runtime.clone(),
-        registry.clone(),
-        Arc::new(ursula_raft::FixedPlacement::single(1)),
-    )
-    .with_external_payload_min_bytes(1);
+    let state = HttpState::with_raft_cluster(runtime.clone(), registry.clone())
+        .with_external_payload_min_bytes(1);
     let app = router_with_http_state(state);
     let created = app
         .clone()

@@ -311,16 +311,13 @@ fn group_engine_leadership_refusal_is_detected_without_matching_message() {
 // typed.
 #[test]
 fn leader_redirect_never_points_at_this_node() {
-    let router = ClientWriteLeaderRouter::new(
-        bound_registry(
-            2,
-            crate::shared_peers([
-                (1, "http://node-1/".to_owned()),
-                (2, "http://node-2".to_owned()),
-            ]),
-        ),
-        Arc::new(ursula_raft::FixedPlacement::single(2)),
-    );
+    let router = ClientWriteLeaderRouter::new(bound_registry(
+        2,
+        crate::shared_peers([
+            (1, "http://node-1/".to_owned()),
+            (2, "http://node-2".to_owned()),
+        ]),
+    ));
     let forward = |leader: Option<KnownLeader>| RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
@@ -362,16 +359,13 @@ fn leader_redirect_never_points_at_this_node() {
 // and `leader_url` both give up.
 #[test]
 fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
-    let router = ClientWriteLeaderRouter::new(
-        bound_registry(
-            2,
-            crate::shared_peers([
-                (1, "http://node-1:4437".to_owned()),
-                (2, "http://node-2:4437".to_owned()),
-            ]),
-        ),
-        Arc::new(ursula_raft::FixedPlacement::single(2)),
-    );
+    let router = ClientWriteLeaderRouter::new(bound_registry(
+        2,
+        crate::shared_peers([
+            (1, "http://node-1:4437".to_owned()),
+            (2, "http://node-2:4437".to_owned()),
+        ]),
+    ));
     let unlisted = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
@@ -584,8 +578,6 @@ struct StaticGrpcTestNode {
     /// The node's router, for requests sent in process.
     app: Router,
     registry: RaftGroupHandleRegistry,
-    /// What the node's groups and its routes read of placement.
-    placement: Arc<dyn ursula_raft::PlacementInputs>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
     raft_wal: ursula_raft::RaftWal,
@@ -804,7 +796,7 @@ async fn spawn_static_grpc_test_node(
             .expect("runtime");
     // Its answers name the cluster its WAL holds, as a server's do.
     let app = router_with_http_state(
-        HttpState::with_raft_cluster(runtime.clone(), registry.clone(), Arc::clone(&placement))
+        HttpState::with_raft_cluster(runtime.clone(), registry.clone())
             .with_configured_cluster_id(Some(static_test_cluster_id())),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -824,7 +816,6 @@ async fn spawn_static_grpc_test_node(
         runtime,
         app,
         registry,
-        placement,
         shutdown: Some(shutdown_tx),
         server,
         raft_wal: log_stores,
@@ -2068,7 +2059,6 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
-    let inputs = spawned.placement.expect("a Raft node's placement");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
         .get(RaftGroupId(0))
@@ -2077,7 +2067,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .current_leader(1, "static durable gRPC Raft group should elect node 1")
         .await
         .expect("wait for leader");
-    let app = router_with_raft_cluster(runtime.clone(), registry, inputs);
+    let app = router_with_raft_cluster(runtime.clone(), registry);
 
     let response = http_put(
         &app,
@@ -2147,7 +2137,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         spawned.bind_without_meta();
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
-        let inputs = spawned.placement.expect("a Raft node's placement");
         let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
         runtime.warm_all_groups().await.expect("warm group");
         let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
@@ -2159,7 +2148,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "static durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for leader");
-        let app = router_with_raft_cluster(runtime, registry, inputs);
+        let app = router_with_raft_cluster(runtime, registry);
 
         let response = http_put(
             &app,
@@ -2203,7 +2192,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("restarted runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
-        let inputs = spawned.placement.expect("a Raft node's placement");
         let raft_wal = spawned.raft_wal.expect("restarted WAL");
         let opening = raft_wal.opening();
         assert_eq!(
@@ -2232,7 +2220,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .await
             .expect("wait for restarted leader");
         let shutdown_runtime = runtime.clone();
-        let app = router_with_raft_cluster(runtime, registry, inputs);
+        let app = router_with_raft_cluster(runtime, registry);
 
         let response = http_get(
             &app,
@@ -2281,11 +2269,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .warm_group(RaftGroupId(0))
         .await
         .expect("warm raft group");
-    let app = router_with_raft_cluster(
-        runtime.clone(),
-        registry.clone(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let app = router_with_raft_cluster(runtime.clone(), registry.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -2412,83 +2396,10 @@ async fn static_grpc_seed_initializers_distribute_leaders() {
         }
     }
 
-    let manifest = peers
-        .iter()
-        .map(|(id, endpoint)| ursula_ctl::NodeInfo {
-            id: *id,
-            admin_url: endpoint.parse().unwrap(),
-            http_url: Some(endpoint.parse().unwrap()),
-            metrics_url: Some(endpoint.parse().unwrap()),
-            client_url: None,
-            host: endpoint.clone(),
-        })
-        .collect::<Vec<_>>();
-    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
-    ursula_ctl::wait_cluster_ready(
-        "fresh quorum fixture startup",
-        &manifest,
-        &client,
-        Duration::from_secs(5),
-        Duration::from_millis(10),
-        16,
-    )
-    .await
-    .unwrap();
-    let mut options = ursula_ctl::quorum::QuorumVerificationOptions {
-        group_count: 6,
-        timeout: Duration::from_secs(5),
-        poll_interval: Duration::from_millis(10),
-    };
-    let proof = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-        .await
-        .unwrap();
-    assert_eq!(proof.process_incarnations.len(), 3);
-    assert_eq!(proof.prefixes.len(), 6);
-    assert_eq!(proof.applied.len(), 3);
-    for (id, prefix) in proof.prefixes {
-        assert_eq!(prefix.leader_id, u64::from(id % 3) + 1);
-        assert!(
-            proof
-                .applied
-                .values()
-                .all(|groups| groups[&id] >= prefix.required_applied_index)
-        );
-    }
-    options.group_count = 7;
-    let missing = ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-        .await
-        .unwrap_err();
-    assert!(
-        missing.to_string().contains("inventory differs"),
-        "{missing}"
-    );
-
-    options.group_count = 6;
-    nodes.pop().unwrap().shutdown().await;
-    ursula_ctl::quorum::verify_quorum(&manifest, &client, &options)
-        .await
-        .expect_err("quorum verification must fail while a voter is down");
-    let survivor = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            match ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options).await
-            {
-                Ok(proof) => break proof,
-                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
-            }
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(survivor.configured_voter_ids, BTreeSet::from([1, 2, 3]));
-    assert_eq!(survivor.surviving_voter_ids, BTreeSet::from([1, 2]));
-    assert!(!survivor.full_redundancy_restored);
-    assert_eq!(survivor.verification.prefixes.len(), 6);
-    assert_eq!(survivor.verification.applied.len(), 2);
-    nodes.pop().unwrap().shutdown().await;
-    ursula_ctl::quorum::verify_surviving_quorum(&manifest, 3, &client, &options)
-        .await
-        .expect_err("surviving-quorum verification must fail with one voter left");
-
+    // `ursulactl`'s quorum proofs need ready maintenance reports, which
+    // these nodes never give: they run no meta runtime, so they report
+    // `placement_unknown`. The proofs run on real processes in
+    // `static_cluster_cli.rs`.
     for node in nodes {
         node.shutdown().await;
     }
@@ -2897,12 +2808,8 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
             monitor.observe_available(99),
             crate::wal_disk::WalDiskTransition::EnterPressure
         );
-        let state = HttpState::with_raft_cluster(
-            node.runtime.clone(),
-            node.registry.clone(),
-            Arc::clone(&node.placement),
-        )
-        .with_wal_disk_monitor(monitor.clone());
+        let state = HttpState::with_raft_cluster(node.runtime.clone(), node.registry.clone())
+            .with_wal_disk_monitor(monitor.clone());
         client_router_with_admission(
             state,
             IngressAdmission::default().with_wal_disk_monitor(monitor),
@@ -3236,17 +3143,22 @@ async fn start_durable_cluster(
     nodes
 }
 
-/// Polls `url` until it answers 200, and returns the last status.
-async fn poll_status(client: &reqwest::Client, url: &str) -> StatusCode {
-    let deadline = tokio::time::Instant::now()
-        .checked_add(Duration::from_secs(10))
-        .expect("deadline");
-    loop {
-        let status = client.get(url).send().await.expect("request").status();
-        if status == StatusCode::OK || tokio::time::Instant::now() >= deadline {
-            return status;
+/// Waits until every node knows a leader of each of its first `groups`
+/// groups.
+async fn wait_group_leaders(nodes: &[StaticGrpcTestNode], groups: u32) {
+    for node in nodes {
+        for group in 0..groups {
+            node.registry
+                .get(RaftGroupId(group))
+                .expect("registered group")
+                .wait(Some(Duration::from_secs(20)))
+                .metrics(
+                    |metrics| metrics.current_leader.is_some(),
+                    "the group has a leader",
+                )
+                .await
+                .expect("a leader of the group");
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -3280,10 +3192,11 @@ async fn poll_payload(
 }
 
 /// A deterministic poison record stops its group on every voter: a buggy
-/// binary replays the committed record at startup on each replica. Every
-/// node stays serving-ready and serves its other group, while maintenance
-/// readiness refuses disruption. Corrected code replays the record on every
-/// voter without skipping it.
+/// binary replays the committed record at startup on each replica. On every
+/// node the stop is the group's only issue, which serving ignores, and the
+/// node serves its other group, while maintenance readiness refuses
+/// disruption. Corrected code replays the record on every voter without
+/// skipping it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_replay() {
     let root = TestWalRoot::new();
@@ -3324,15 +3237,7 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
     };
     let poisoned = stream_of(0, "poisoned");
     let healthy = stream_of(1, "healthy");
-    ursula_ctl::observe::wait_ready(
-        &ctl,
-        &manifest,
-        2,
-        Duration::from_secs(20),
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("a fresh cluster becomes ready");
+    wait_group_leaders(&nodes, 2).await;
     for (stream, body) in [(&poisoned, "poison"), (&healthy, "healthy")] {
         let created = client
             .put(format!("{}/{stream}", bases[0]))
@@ -3379,11 +3284,38 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
         assert_eq!(stopped.index, poison);
     }
     for (base, node_id) in bases.iter().zip(1..=3u64) {
-        assert_eq!(
-            poll_status(&client, &format!("{base}/__ursula/ready")).await,
-            StatusCode::OK,
-            "node {node_id} keeps serving its other group"
-        );
+        // The stop is the stopped group's only issue, which serving
+        // ignores. These nodes run no meta runtime, so readiness itself
+        // answers `placement_unknown`.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(10))
+            .expect("deadline");
+        loop {
+            let ready: ursula_proto::admin::ServingReadiness = client
+                .get(format!("{base}/__ursula/ready"))
+                .send()
+                .await
+                .expect("readiness")
+                .json()
+                .await
+                .expect("readiness JSON");
+            let report = ready.raft_maintenance.expect("a maintenance report");
+            if report.group_issues
+                == BTreeMap::from([(0, vec![
+                    ursula_proto::admin::RaftMaintenanceIssue::ApplyStopped,
+                ])])
+            {
+                assert_eq!(report.node_issues, vec![
+                    ursula_proto::admin::RaftMaintenanceIssue::PlacementUnknown
+                ]);
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "node {node_id} keeps serving its other group: {report:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         let appended = client
             .post(format!("{base}/{healthy}"))
             .header(CONTENT_TYPE, "text/plain")
@@ -3431,15 +3363,23 @@ async fn a_group_stopped_on_every_voter_keeps_nodes_serving_until_corrected_repl
 
     // Corrected code replays the retained record on every voter.
     let nodes = start_durable_cluster(root.path(), &addresses, None).await;
-    ursula_ctl::observe::wait_ready(
-        &ctl,
-        &manifest,
-        2,
-        Duration::from_secs(20),
-        Duration::from_millis(50),
-    )
-    .await
-    .expect("corrected code recovers the group");
+    wait_group_leaders(&nodes, 2).await;
+    for node in &nodes {
+        node.registry
+            .get(RaftGroupId(0))
+            .expect("group 0")
+            .wait(Some(Duration::from_secs(20)))
+            .applied_index_at_least(Some(poison), "corrected code applies the record")
+            .await
+            .expect("replay the record");
+        assert!(
+            node.registry
+                .metrics_snapshot()
+                .iter()
+                .all(|group| group.apply_failure.is_none()),
+            "corrected code stops no group"
+        );
+    }
     for base in &bases {
         poll_payload(&client, base, &poisoned, "poison").await;
         poll_payload(&client, base, &healthy, "healthy-1-2-3").await;
@@ -5944,7 +5884,6 @@ async fn cluster_router_reports_leadership_shed_policy() {
             .expect("runtime")
             .runtime,
         registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
     );
     let cluster = cluster_router_from_state(state);
     let response = http_get(&cluster, LEADERSHIP_SHED_PATH).await;
@@ -5968,7 +5907,6 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
             .expect("runtime")
             .runtime,
         registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
     );
     let router = cluster_router_from_state(state.clone())
         .merge(admin_ops_router(state.clone()))
@@ -6570,11 +6508,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         .expect("runtime")
         .runtime;
     let app = client_router_with_admission(
-        HttpState::with_raft_cluster(
-            runtime,
-            registry.clone(),
-            std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-        ),
+        HttpState::with_raft_cluster(runtime, registry.clone()),
         IngressAdmission::default(),
     );
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
@@ -6695,11 +6629,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
             .expect("runtime")
             .runtime;
-        let state = HttpState::with_raft_cluster(
-            runtime,
-            registry.clone(),
-            std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-        );
+        let state = HttpState::with_raft_cluster(runtime, registry.clone());
         let client = client_router_with_admission(state.clone(), IngressAdmission::default());
         let admin = admin_router(state.clone());
         // Operator tooling reads the same readiness through its admin tunnel.
@@ -7035,8 +6965,12 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         engine.shutdown().await.expect("stop the group");
     }
 }
+/// Readiness never takes the inventory from what runs: a Raft node without
+/// a meta runtime knows no placement, so it reports `placement_unknown`,
+/// lists no group and is not ready, although no replica runs to fail a
+/// check (the bug: an empty inventory read as nothing to check).
 #[tokio::test]
-async fn raft_readiness_uses_the_placed_inventory_even_when_every_group_is_missing() {
+async fn a_raft_node_without_a_meta_runtime_reports_its_placement_unknown() {
     let runtime = spawn_runtime(&test_config(1, 2), Topology::Development { group_count: 2 })
         .expect("runtime")
         .runtime;
@@ -7049,12 +6983,7 @@ async fn raft_readiness_uses_the_placed_inventory_even_when_every_group_is_missi
             (3, "http://localhost:4439".to_owned()),
         ]),
     );
-    let placement = ursula_raft::FixedPlacement {
-        node: 1,
-        voters: BTreeSet::from([1, 2, 3]),
-        initializer: 1,
-    };
-    let state = HttpState::with_raft_cluster(runtime, registry, Arc::new(placement));
+    let state = HttpState::with_raft_cluster(runtime, registry);
     let app = client_router_with_admission(state, IngressAdmission::default());
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -7065,14 +6994,13 @@ async fn raft_readiness_uses_the_placed_inventory_even_when_every_group_is_missi
         Some(ursula_proto::admin::ServingReadinessReason::RaftReplicaUnready)
     );
     let body = serde_json::to_value(typed).unwrap();
+    assert_eq!(body["raft_maintenance"]["placement"], json!(null));
+    assert_eq!(body["raft_maintenance"]["expected_groups"], json!({}));
     assert_eq!(
-        body["raft_maintenance"]["expected_groups"],
-        json!({"0": [1, 2, 3], "1": [1, 2, 3]})
+        body["raft_maintenance"]["node_issues"],
+        json!(["placement_unknown"])
     );
-    assert_eq!(
-        body["raft_maintenance"]["group_issues"],
-        json!({"0": ["missing_group"], "1": ["missing_group"]})
-    );
+    assert_eq!(body["raft_maintenance"]["group_issues"], json!({}));
     let response = http_get(&app, "/__ursula/metrics").await;
     let body: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
     assert_eq!(body["configured_raft_group_count"], 2);
@@ -8626,11 +8554,7 @@ mod snapshot_driver {
             .expect("warm the groups");
         let coordinator = registry.snapshot_build_coordinator();
         let app = crate::client_router_with_admission(
-            HttpState::with_raft_cluster(
-                runtime.clone(),
-                registry,
-                std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-            ),
+            HttpState::with_raft_cluster(runtime.clone(), registry),
             crate::IngressAdmission::new(&config.server)
                 .with_raft_log_pressure(Some(coordinator.clone())),
         );
@@ -9526,7 +9450,6 @@ mod snapshot_driver {
         let admin = admin_router(HttpState::with_raft_cluster(
             node.runtime.clone(),
             node.registry.clone(),
-            node.placement.clone(),
         ));
         (node, admin)
     }
@@ -13155,17 +13078,9 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
     let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
         .expect("runtime")
         .runtime;
-    let old = HttpState::with_raft_cluster(
-        runtime.clone(),
-        RaftGroupHandleRegistry::default(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let old = HttpState::with_raft_cluster(runtime.clone(), RaftGroupHandleRegistry::default());
     let registry = RaftGroupHandleRegistry::default();
-    let replacement = HttpState::with_raft_cluster(
-        runtime,
-        registry.clone(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let replacement = HttpState::with_raft_cluster(runtime, registry.clone());
     assert_ne!(old.process_incarnation, replacement.process_incarnation);
     assert_eq!(
         replacement.process_incarnation,
@@ -13260,7 +13175,6 @@ async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() 
             .expect("runtime")
             .runtime,
         registry.clone(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
     );
     let response = admin_router(state)
         .oneshot(
@@ -13351,11 +13265,7 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         .current_leader(1, "single voter elected")
         .await
         .unwrap();
-    let state = HttpState::with_raft_cluster(
-        runtime.clone(),
-        registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let state = HttpState::with_raft_cluster(runtime.clone(), registry);
     let identity = state.process_incarnation;
     let admin = admin_router(state);
     let path = "/__ursula/raft/0/quorum";
@@ -13425,11 +13335,7 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         .metrics(|m| m.vote.is_committed(), "the leader's vote is committed")
         .await
         .unwrap();
-    let admin = admin_router(HttpState::with_raft_cluster(
-        runtime.clone(),
-        registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    ));
+    let admin = admin_router(HttpState::with_raft_cluster(runtime.clone(), registry));
     let observed = raft.metrics().borrow_watched().clone();
     let self_election = |current_term: u64| {
         http_post(
@@ -13481,6 +13387,28 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
     spawned.raft_wal.unwrap().shutdown().await.unwrap();
 }
 
+/// Waits until every recovery gate on `registry` is open, so each of its
+/// replicas may vote and campaign.
+async fn wait_recovery_gates_open(registry: &RaftGroupHandleRegistry) {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(10))
+        .expect("deadline");
+    loop {
+        let gates = registry.recovery_gates();
+        if gates
+            .values()
+            .all(|gate| *gate == ursula_proto::admin::RecoveryGateStatus::Open)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "recovery gates stay closed: {gates:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// A follower's self-election is held to the policy of every leadership
 /// transfer it receives: refused with 409 while it may not campaign (here a
 /// maintenance drain), and once it may, taken with 204, after which it leads.
@@ -13528,34 +13456,14 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
     }
     // The followers' recovery gates open once they caught up: until then
     // they may not campaign either.
-    let manifest = peers
-        .iter()
-        .map(|(id, endpoint)| ursula_ctl::NodeInfo {
-            id: *id,
-            admin_url: endpoint.parse().unwrap(),
-            http_url: Some(endpoint.parse().unwrap()),
-            metrics_url: Some(endpoint.parse().unwrap()),
-            client_url: None,
-            host: endpoint.clone(),
-        })
-        .collect::<Vec<_>>();
-    let client = ursula_ctl::MetricsClient::new(Duration::from_secs(1)).unwrap();
-    ursula_ctl::wait_cluster_ready(
-        "self-election fixture startup",
-        &manifest,
-        &client,
-        Duration::from_secs(5),
-        Duration::from_millis(10),
-        1,
-    )
-    .await
-    .unwrap();
+    for node in &nodes {
+        wait_recovery_gates_open(&node.registry).await;
+    }
     let follower = &nodes[1];
     let raft = follower.registry.get(group).expect("registered group");
     let admin = admin_router(HttpState::with_raft_cluster(
         follower.runtime.clone(),
         follower.registry.clone(),
-        follower.placement.clone(),
     ));
     let self_election = |current_term: u64| {
         http_post(

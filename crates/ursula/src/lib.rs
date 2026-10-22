@@ -416,26 +416,20 @@ impl HttpState {
         Arc::make_mut(&mut self.0)
     }
 
-    /// The placement is the expected inventory: the voters this node's
-    /// placement inputs give each group, which are meta's seeds in the
-    /// node's latest view on a server node. Observed metrics cannot
-    /// establish which groups or voters are missing after a restart. Before
-    /// a bootstrapped view the node expects no group.
+    /// This node's maintenance report (report v2, design 10): its data
+    /// replicas against its placement view, its meta replica's status and
+    /// its hosting driver's, and each replica's effective membership. A
+    /// Raft node that knows no node id of its own reports none.
     fn raft_maintenance_report(&self) -> Option<ursula_raft::RaftMaintenanceReport> {
         let registry = self.raft_registry()?;
-        let router = self.client_write_router.as_ref()?;
-        let snapshots = registry.metrics_snapshot();
-        let node_id = router
-            .node_id()
-            .or_else(|| snapshots.first().map(|group| group.node_id))?;
-        let expected = (0..self.runtime.raft_group_count())
-            .filter_map(|id| {
-                let voters = router.placed_voters(RaftGroupId(id));
-                voters.contains(&node_id).then_some((id, voters))
-            })
-            .collect();
-        Some(ursula_raft::check_raft_maintenance(
-            &snapshots, node_id, expected, 16,
+        let node_id = self.node_id()?;
+        let reader = self.meta.status_reader();
+        let hosting = self.meta.hosting_status();
+        Some(ursula_raft::raft_maintenance_report(
+            registry,
+            node_id,
+            reader.as_ref(),
+            hosting.as_deref(),
         ))
     }
 
@@ -598,16 +592,15 @@ impl HttpState {
     /// A Raft node of a cluster. Its redirects read the peers
     /// `raft_registry`'s peer cluster binds, and its `NotHosted` hints the
     /// registry's placement views ([`ClientWriteLeaderRouter`]). Its
-    /// maintenance inventory reads the voters `placement`, the node's
-    /// placement inputs, gives each group.
+    /// maintenance inventory reads the node's meta runtime, which the server
+    /// sets: without one the node reports its placement unknown.
     pub fn with_raft_cluster(
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
-        placement: Arc<dyn ursula_raft::PlacementInputs>,
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
-        let router = ClientWriteLeaderRouter::new(raft_registry.clone(), placement);
+        let router = ClientWriteLeaderRouter::new(raft_registry.clone());
         HttpStateFields {
             process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
@@ -843,22 +836,16 @@ impl Drop for AbortOnDrop {
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     registry: RaftGroupHandleRegistry,
-    placement: Arc<dyn ursula_raft::PlacementInputs>,
     /// The `NotHosted` answers given, which rotate the node each names.
     not_hosted_turns: Arc<AtomicUsize>,
 }
 
 impl ClientWriteLeaderRouter {
     /// Routes over `registry`'s peers, placement views and voter
-    /// predicate. `placement`, the node's placement inputs, gives the
-    /// maintenance inventory.
-    pub fn new(
-        registry: RaftGroupHandleRegistry,
-        placement: Arc<dyn ursula_raft::PlacementInputs>,
-    ) -> Self {
+    /// predicate.
+    pub fn new(registry: RaftGroupHandleRegistry) -> Self {
         Self {
             registry,
-            placement,
             not_hosted_turns: Arc::default(),
         }
     }
@@ -870,11 +857,6 @@ impl ClientWriteLeaderRouter {
     /// This node's id, as its peer cluster binds it.
     fn node_id(&self) -> Option<u64> {
         self.peers().identity().map(|identity| identity.node_id())
-    }
-
-    /// The voters this node's placement gives `group`.
-    fn placed_voters(&self, group: RaftGroupId) -> BTreeSet<u64> {
-        self.placement.nodes(group).voters()
     }
 
     /// The client URL `raft.peers` lists for `leader_id`. `None` for this
@@ -1248,9 +1230,8 @@ pub fn router(runtime: ShardRuntime) -> Router {
 pub fn router_with_raft_cluster(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
-    placement: Arc<dyn ursula_raft::PlacementInputs>,
 ) -> Router {
-    let state = HttpState::with_raft_cluster(runtime, raft_registry, placement);
+    let state = HttpState::with_raft_cluster(runtime, raft_registry);
     cluster_router_from_state(state.clone()).merge(client_router_with_admission(
         state,
         IngressAdmission::default(),

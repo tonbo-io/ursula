@@ -242,18 +242,10 @@ impl Cluster {
             ),
             peers,
         );
-        let state = HttpState::with_raft_cluster(
-            runtime.clone(),
-            front_door,
-            Arc::new(ursula_raft::FixedPlacement {
-                node: 1,
-                voters: (1..=3).collect(),
-                initializer: 1,
-            }),
-        )
-        .with_wall_clock_handle(Arc::new(SimHttpWallClock {
-            now_ms: Arc::clone(&now_ms),
-        }));
+        let state = HttpState::with_raft_cluster(runtime.clone(), front_door)
+            .with_wall_clock_handle(Arc::new(SimHttpWallClock {
+                now_ms: Arc::clone(&now_ms),
+            }));
         let app = router_with_http_state(state);
         trace.push(SimEvent::ClusterBuilt { seed: config.seed });
         let path = format!("/{}/{}", config.stream.bucket_id, config.stream.stream_id);

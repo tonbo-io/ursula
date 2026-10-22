@@ -180,13 +180,11 @@ async fn init_state(
             .await;
     }
 
-    let state = match (spawned.raft_registry, spawned.placement) {
+    let state = match spawned.raft_registry {
         // Leader redirects send clients to a peer's client plane, which is
         // not its Raft `url` when the cluster plane listens apart.
-        (Some(registry), Some(placement)) => {
-            HttpState::with_raft_cluster(runtime, registry, placement)
-        }
-        _ => HttpState::new(runtime),
+        Some(registry) => HttpState::with_raft_cluster(runtime, registry),
+        None => HttpState::new(runtime),
     };
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
@@ -1039,6 +1037,7 @@ mod tests {
             .await
             .expect("the held replica leads");
         let created = client
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("PUT")
@@ -1050,6 +1049,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
+        // Report v2: damaged meta replaces every issue the view gives, so
+        // the node passes its probe once its replica passes the voter
+        // checks. Readiness v1 expected no group here and stayed unready
+        // for the whole run.
+        let deadline = tokio::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(30))
+            .expect("deadline");
+        let ready = loop {
+            let (status, ready) = get_json(&client, crate::READINESS_PATH).await;
+            if status == StatusCode::OK || tokio::time::Instant::now() >= deadline {
+                break ready;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(ready["ready"], serde_json::json!(true), "{ready}");
+        assert_eq!(
+            ready["raft_maintenance"]["node_issues"],
+            serde_json::json!(["meta_damaged"])
+        );
+        assert_eq!(
+            ready["raft_maintenance"]["group_issues"],
+            serde_json::json!({})
+        );
         stop(state).await;
     }
 

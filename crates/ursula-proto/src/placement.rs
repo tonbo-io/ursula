@@ -19,9 +19,11 @@
 //!   MessagePack closure uses `#[serde(other)]`: an unknown variant decoding
 //!   as another would hide a format mismatch.
 //! - **Admin JSON**: the admin protocol, compatible within a minor and never
-//!   in the meta log or between nodes. [`ReplicaRole`], [`TeardownStage`],
-//!   [`WaitReason`], [`StepKind`], [`StepFailureKind`], [`StepFailure`],
-//!   [`ReconcileState`], [`ReconcileStatus`] and [`WriteEffect`].
+//!   in the meta log or between nodes. [`ReplicaRole`], [`MetaRole`],
+//!   [`ClusterStage`], [`ExpectedReplica`], [`UnplacedReplica`],
+//!   [`TeardownStage`], [`WaitReason`], [`StepKind`], [`StepFailureKind`],
+//!   [`StepFailure`], [`ReconcileState`], [`ReconcileStatus`] and
+//!   [`WriteEffect`].
 //! - **Header and admin JSON**: [`ProcessIncarnation`], one fixed grammar
 //!   of 32 hex digits, carried as a header or gRPC metadata value and in
 //!   admin JSON, in no MessagePack type.
@@ -55,9 +57,10 @@
 //! details and an unknown one decodes to `Unknown`, its details ignored. Such
 //! an enum's details hold no map with number keys, since serde buffers an
 //! internally tagged value and a buffered JSON key stays a string: a list
-//! of structs takes its place. [`ReplicaRole`] and [`WriteEffect`] stay
-//! closed: a role is the kernel's, fixed with the format epoch, and a write
-//! effect is a yes or no a client must not guess. An `Option` field of an
+//! of structs takes its place. [`ReplicaRole`], [`MetaRole`],
+//! [`ClusterStage`] and [`WriteEffect`] stay closed: a role and a stage are
+//! the kernel's, fixed with the format epoch, and a write effect is a yes or
+//! no a client must not guess. An `Option` field of an
 //! admin JSON struct is required, also when `null`
 //! ([`crate::admin::required_option`]).
 //!
@@ -656,6 +659,54 @@ pub enum ReplicaRole {
     /// An earlier target of a move that is in neither its source nor its
     /// target.
     Abandoned,
+}
+
+/// A node's role in meta's effective membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetaRole {
+    Voter,
+    Learner,
+    NotMember,
+}
+
+/// The stage of a node's placement view: `ursula_control`'s `ClusterView`
+/// without its details.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterStage {
+    /// Meta has not formed.
+    MetaGenesis,
+    /// Meta formed elsewhere and the node's replica applied nothing yet.
+    MetaCatchingUp,
+    /// Meta formed and nodes register.
+    Registering,
+    /// A meta recovery plan ended the formation.
+    FormationCut,
+    Bootstrapped,
+}
+
+/// A group in which the node's bootstrapped view gives it a role, as the
+/// maintenance report lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExpectedReplica {
+    pub role: ReplicaRole,
+    /// The group's placement key.
+    pub since: PlacementEpoch,
+    /// The voters the group should end on: its seed or stable voters, or
+    /// its move's target.
+    pub target: VoterSet,
+    /// Whether the node's replica counts as a voter, by the one voter
+    /// predicate, also while it is closed.
+    pub counts_as_voter: bool,
+}
+
+/// A replica the node holds or runs while its bootstrapped view gives it
+/// no role in the group, as the maintenance report lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnplacedReplica {
+    /// Whether the replica counts as a voter, by the one voter predicate.
+    pub counts_as_voter: bool,
 }
 
 /// What the meta group answered a node's registration.

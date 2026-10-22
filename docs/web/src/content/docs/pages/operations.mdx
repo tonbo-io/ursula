@@ -186,7 +186,7 @@ kubectl delete pod -l app.kubernetes.io/instance=<release>,app.kubernetes.io/nam
 
 The gateway's `-gateway` name does not match that selector. The upgrade starts the rollout itself. The controller replaces the highest ordinal, which comes up alone on the new port and stays unready, so the rollout cannot finish on its own. `--wait` would hang until its timeout, `--atomic` would roll the change back, and a GitOps sync shows Progressing until the delete. Expect one voter isolated in between. The recreated pods take the new revision, all together under the chart's `Parallel` pod management policy, and each records a clean shutdown on `SIGTERM`. `global.clusterDomain` rolls like any restart while the old domain still resolves.
 
-A node that a group's membership names but `[[raft.peers]]` does not list is never dialed. Each node logs it once, and the group reports `unconfigured_member` in the maintenance report ([`unconfigured_member`](/docs/troubleshooting#unconfigured_member)).
+A node that a group's membership names but `[[raft.peers]]` does not list is never dialed. Each node logs it once, and the group reports `unplaced_member` in the maintenance report when the node has no role in the group's placement ([`unplaced_member`](/docs/troubleshooting#unplaced_member)).
 
 ### WAL routing configuration
 

@@ -48,13 +48,31 @@ it reports the first of:
 | `disk_lease_lost` | No probe of the WAL disk synced within `raft.wal.lease`. The node takes part in no Raft traffic and answers clients `503` until a probe succeeds |
 | `format_epoch_mismatch` | The node exchanged a Raft RPC with a peer of another format epoch. It stays unready until it restarts |
 | `wal_disk_pressure` | The WAL filesystem is below `raft.wal.min_available_size`, or its free-space check failed |
-| `recovery_stalled` | A group's recovery gate on this node is stalled. The groups are listed under `recovery_stalled_groups` |
-| `recovery_gate_closed` | A group's recovery gate on this node is closed until the replica has applied a fresh barrier from the group's leader |
-| `raft_replica_unready` | A local replica is not a healthy voter. `raft_maintenance.group_issues` names the issue |
+| `recovery_stalled` | A group's recovery gate on this node is stalled on a replica that counts as a voter. The groups are listed under `recovery_stalled_groups` |
+| `recovery_gate_closed` | A group's recovery gate on this node is closed on a replica that counts as a voter, until the replica has applied a fresh barrier from the group's leader |
+| `raft_replica_unready` | A local replica is not a healthy voter, or the node does not know its placement. `raft_maintenance.node_issues` and `group_issues` name the issue ([Maintenance report](#maintenance-report)) |
 
 Ursula does **not** expose `/healthz`, `/readyz`, Prometheus `/metrics`, or
 `/cluster/status`. Use the JSON snapshot for detailed diagnosis and
 `ursulactl wait-ready` for cluster-wide Raft readiness.
+
+### Maintenance report
+
+`raft_maintenance` (schema version 2) checks this node's replicas against its placement view and their effective memberships. `placement` names the view's stage, the applied meta entry, the node's meta role and the meta leader it knows, its lifecycle and the last registration answer. `expected_groups` lists the groups in which the bootstrapped view gives the node a role, with the role, the placement key, the target voters and whether the replica counts as a voter. `unplaced` lists the replicas the node holds without a role. A node with no group is ready.
+
+`serving_ready` decides `/__ursula/ready`, and `ready` decides whether a second disruption is safe (`ursulactl wait`, `wait-ready` and the quorum checks). A replica that does not count as a voter, such as an incoming learner or a replica its group answered is no voter, is checked only for `raft_stopped` and `apply_stopped`. Neither blocks anything while `expected_groups` or `unplaced` lists the replica. Before a bootstrapped view and while meta is damaged the report lists no replica, so a stopped replica blocks as a voter's would: `raft_stopped` blocks both, and `apply_stopped` blocks maintenance. Node issues:
+
+| Issue | Serving | Maintenance | Meaning |
+| ----- | ------- | ----------- | ------- |
+| `placement_unknown` | blocks | blocks | The node does not know whether it is a voter: it confirmed no view in this run, holds no replica, its meta replica holds no bootstrapped state and no registration was answered. A wiped voter reports it until meta answers. A Raft node without a meta runtime reports it too |
+| `placement_not_bootstrapped` | | blocks | The node holds replicas and its view has not bootstrapped. The replicas keep their voter checks |
+| `genesis_mismatch` | | blocks | A peer's genesis claim differs from this node's |
+| `meta_unavailable` | | | The node's meta replica has known no leader for 30 s. Restarts need no meta |
+| `meta_damaged` | | | The node runs no meta replica in this run. It replaces every issue the view gives, and the replicas keep their voter checks |
+| `group_count_mismatch` | blocks | blocks | `raft.group_count` differs from the cluster's |
+| `replication_factor_mismatch` | | blocks | `raft.placement.replication_factor`, capped at the `[[raft.peers]]` count, differs from the cluster's |
+
+Group issues against the placement: `missing_group` (a `voter` or `incoming` role and no replica, blocking serving for a `voter`), `unplaced_replica` (a replica held without a role), `incomplete_voter_set` (the membership is not the target voters with no learner) and [`unplaced_member`](#unplaced_member) block maintenance. The voter checks against the effective membership, such as `local_replica_not_voter`, `recovery_barrier`, `leader_unknown` or `apply_lag`, block both.
 
 ### Serving while a replica catches up
 
@@ -164,15 +182,15 @@ Set `storage.cold.s3.bucket`, or set `storage.cold.backend = "none"` if you don'
 
 Every node dials its peers at the `url` its own `[[raft.peers]]` lists. A node that moved, or a node whose peers still list its old address, gets no Raft traffic from the peers that list the wrong one. Its groups catch up on nothing, and `ursulactl wait` does not return. Check that `[[raft.peers]]` is the same on every node and names each node where it listens now, then restart the nodes whose list was wrong. A move of a listener, such as a new cluster port, needs every voter restarted together ([Changing a peer address](/docs/operations#changing-a-peer-address)).
 
-### `unconfigured_member`
+### `unplaced_member`
 
-The maintenance report names `unconfigured_member` for a group whose Raft membership names a node that is not one of its configured voters, as a voter or a learner. No node dials a member that `[[raft.peers]]` does not list, and each node logs that once:
+The maintenance report names `unplaced_member` for a group whose Raft membership names a node that has no role in the group's placement, as a voter or a learner. No node dials a member that `[[raft.peers]]` does not list, and each node logs that once:
 
 ```text
 raft.peers lists no node 4, a member of a Raft group: not dialing it; list the node in raft.peers or remove it from the group's membership
 ```
 
-The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group leader never removes such a member by itself. List the node in `[[raft.peers]]` again, or send the group's configured voters to the group's leader with `POST /__ursula/raft/{group}/membership?voters=` ([Admin endpoints](/docs/operations#admin-endpoints)). The endpoint replaces the voter set and removes every learner outside it in the same change, so a member left behind as a learner goes too.
+The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group leader never removes such a member by itself. List the node in `[[raft.peers]]` again, or send the group's placed voters to the group's leader with `POST /__ursula/raft/{group}/membership?voters=` ([Admin endpoints](/docs/operations#admin-endpoints)). The endpoint replaces the voter set and removes every learner outside it in the same change, so a member left behind as a learner goes too.
 
 ### `raft WAL directory … holds data without a format marker`
 
@@ -221,7 +239,9 @@ write was lost. Each
 gated group waits until it has applied a fresh barrier from the group's leader,
 and its leader catches the replica up meanwhile, which stays a voter. `recovery_gates` in
 `/__ursula/metrics` lists the gated groups. This normally clears in seconds
-once a leader is reachable. See
+once a leader is reachable. A gate of a replica that does not count as a
+voter, such as an incoming learner, never makes the node unready, closed or
+stalled. See
 [Recovering after a host crash](/docs/operations#recovering-after-a-host-crash).
 
 ### `/__ursula/ready` answers `503` with `recovery_stalled`

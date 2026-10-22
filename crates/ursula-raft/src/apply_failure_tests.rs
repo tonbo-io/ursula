@@ -1,6 +1,5 @@
 //! Native disk-WAL drill: isolate poison application and replay the intact record.
 
-use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -204,12 +203,16 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
             .maintenance
             .running
     );
-    let report = crate::check_raft_maintenance(
-        &groups,
-        1,
-        BTreeMap::from([(0, BTreeSet::from([1])), (1, BTreeSet::from([1]))]),
-        0,
-    );
+    let report = crate::check_raft_maintenance(crate::MaintenanceInputs {
+        node_id: 1,
+        lag_tolerance: 0,
+        groups: &groups,
+        counts: |_group| ursula_control::Counts::Voter,
+        placement: None,
+    });
+    assert_eq!(report.group_issues[&0], vec![
+        crate::RaftMaintenanceIssue::ApplyStopped
+    ]);
     assert!(!report.ready());
     let retained = poisoned_log
         .try_get_log_entries(poison_index..=poison_index)
@@ -305,15 +308,17 @@ async fn poison_apply_isolates_one_group_and_corrected_code_replays_the_intact_w
     assert_eq!(failed.last_applied, stopped.last_applied);
     assert!(!failed.maintenance.running);
     assert!(!failed.maintenance.recovery_ready);
-    assert!(
-        !crate::check_raft_maintenance(
-            &state,
-            1,
-            BTreeMap::from([(0, BTreeSet::from([1])), (1, BTreeSet::from([1]))]),
-            0,
-        )
-        .ready()
-    );
+    let report = crate::check_raft_maintenance(crate::MaintenanceInputs {
+        node_id: 1,
+        lag_tolerance: 0,
+        groups: &state,
+        counts: |_group| ursula_control::Counts::Voter,
+        placement: None,
+    });
+    assert_eq!(report.group_issues[&0], vec![
+        crate::RaftMaintenanceIssue::ApplyStopped
+    ]);
+    assert!(!report.ready());
     // The stopped group closes only its own participation: planned handoffs
     // of the node's other groups stay open.
     assert!(restarted_registry.recovery_barriers_ready());

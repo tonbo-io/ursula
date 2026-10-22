@@ -264,10 +264,31 @@ impl RollingRestartValidator {
                         version: ursula_proto::admin::SchemaVersion,
                         node_id,
                         lag_tolerance: 0,
+                        placement: None,
                         expected_groups: std::collections::BTreeMap::from([(
                             placement.raft_group_id.0,
-                            self.node_ids.iter().copied().collect(),
+                            ursula_proto::placement::ExpectedReplica {
+                                role: ursula_proto::placement::ReplicaRole::Voter,
+                                since: ursula_proto::placement::PlacementEpoch::new(
+                                    ursula_proto::placement::MetaLogId::new(
+                                        ursula_proto::placement::RaftLogId {
+                                            term: 1,
+                                            leader: ursula_proto::placement::NodeId::new(node_id),
+                                            index: 1,
+                                        },
+                                    ),
+                                ),
+                                target: ursula_proto::placement::VoterSet::from_first(
+                                    ursula_proto::placement::NodeId::new(node_id),
+                                    self.node_ids
+                                        .iter()
+                                        .copied()
+                                        .map(ursula_proto::placement::NodeId::new),
+                                ),
+                                counts_as_voter: true,
+                            },
                         )]),
+                        unplaced: std::collections::BTreeMap::new(),
                         node_issues: vec![],
                         group_issues: std::collections::BTreeMap::new(),
                     }),

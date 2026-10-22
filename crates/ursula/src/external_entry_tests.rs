@@ -134,11 +134,7 @@ async fn external_json_writes_of_tiny_messages_make_small_entries() {
     let wal_root = crate::tests::TestWalRoot::new();
     let registry = ursula_raft::RaftGroupHandleRegistry::default();
     let (runtime, raft_wal) = durable_runtime_with_cold_store(&wal_root, &registry);
-    let app = router_with_raft_cluster(
-        runtime.clone(),
-        registry,
-        Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let app = router_with_raft_cluster(runtime.clone(), registry);
     let body = tiny_messages_body();
 
     // An append to an existing stream.

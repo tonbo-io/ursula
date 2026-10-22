@@ -153,6 +153,16 @@ impl MetaSlot {
             .map(|meta| meta.wal_metrics.clone())
     }
 
+    /// The hosting driver's last status, once it started.
+    pub(crate) fn hosting_status(&self) -> Option<Arc<ursula_raft::HostingStatus>> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .and_then(|meta| meta.hosting.as_ref())
+            .map(|hosting| hosting.status().current())
+    }
+
     /// What this node's placement status reads, while the meta runtime
     /// runs.
     pub(crate) fn status_reader(&self) -> Option<MetaStatusReader> {
