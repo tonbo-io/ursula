@@ -5553,7 +5553,14 @@ struct LoadWrite {
 
 /// Appends `{prefix}-{n};` to its streams in turn every 20 ms until
 /// stopped, and keeps every write with how it was answered. Each write
-/// waits at most 10 s for its answer.
+/// waits at most 10 s for its answer. Once stopped it goes on until it has
+/// an acknowledged write, at most [`LOAD_ACK_GRACE`] longer: a write the
+/// gateway forwarded to a stopped (blackholed) node waits out the client's
+/// timeout, and a move can converge within it.
+/// How long a stopped [`GatewayLoad`] goes on for its first acknowledged
+/// write: three of the client's 10 s timeouts.
+const LOAD_ACK_GRACE: Duration = Duration::from_secs(30);
+
 struct GatewayLoad {
     stop: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<Vec<LoadWrite>>,
@@ -5566,10 +5573,18 @@ impl GatewayLoad {
             let stop = Arc::clone(&stop);
             tokio::spawn(async move {
                 let client = bounded_client();
-                let mut writes = Vec::new();
+                let mut writes: Vec<LoadWrite> = Vec::new();
+                let mut stopped_at = None;
                 for (write, stream) in streams.iter().cycle().enumerate() {
                     if stop.load(std::sync::atomic::Ordering::Acquire) {
-                        break;
+                        let since = *stopped_at.get_or_insert_with(tokio::time::Instant::now);
+                        if writes
+                            .iter()
+                            .any(|write| write.answer == LoadAnswer::Acknowledged)
+                            || since.elapsed() >= LOAD_ACK_GRACE
+                        {
+                            break;
+                        }
                     }
                     let payload = format!("{prefix}-{write};");
                     let sent = client
@@ -5610,8 +5625,9 @@ impl GatewayLoad {
         Self { stop, task }
     }
 
-    /// Stops the load once its write in flight is answered, and answers
-    /// every write it sent.
+    /// Stops the load once its write in flight is answered and it has an
+    /// acknowledged write (at most [`LOAD_ACK_GRACE`] after the stop), and
+    /// answers every write it sent.
     async fn stop(self) -> Vec<LoadWrite> {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         self.task.await.expect("the write load ends")
