@@ -25,15 +25,18 @@
 //!   group `Live` and stable on one voter set, and the group's leader holds
 //!   a committed uniform membership of exactly those voters, with no
 //!   learner. Its teardown half is a wait too: no running node holds a log
-//!   of a group the latest view gives it no role in.
+//!   of a group the latest view gives it no role in. Both halves leave out
+//!   the nodes the latest view shows removed: a removed node closes its
+//!   replicas and keeps their logs (design 8.1), and once meta drops it as
+//!   a learner its view stays where it was.
 //! - I4 ([`I4`]), P-SELF: every membership entry lists the leader that
 //!   appended it in its last config, but the RF 1 step, whose configs have
 //!   one voter each.
 //! - I5 ([`I5`]) is a wait and a script's check: once a group's replicas
 //!   without a role are torn down, the latest view keeps no retirement
 //!   record of the group, and a log a node retired and reopened replays
-//!   nothing of its retired life. The family keeps its snapshots inline, so
-//!   no snapshot record or owned object exists for I5 to judge.
+//!   nothing of its retired life. Its removal half, the swept objects of a
+//!   removed node, is [`super::placed_removals`]'s.
 //! - I8 ([`I8`]): no voter change appended in a term above every term the
 //!   group's replicas held when the placement took a node's role away
 //!   (abandoned or retired) adds that node. A leader elected later confirms
@@ -53,7 +56,10 @@
 //!   placement that created a replica was confirmed.
 //!
 //! A run that moved a group fails when I4, I5's record half, either half
-//! of I8, I9 or the creation rule judged nothing of that group
+//! of I8, I9 or the creation rule judged nothing of that group, but I5's
+//! record half and I8's teardown half for a group whose dropped voters were
+//! all removed: a removal drops their retirement records and retires no
+//! log, and the removal checks judge in their place
 //! ([`HostingChecks::judged_the_moves`]), so a check that never saw the
 //! move cannot pass it.
 //!
@@ -963,6 +969,23 @@ impl MetaCluster {
         }
     }
 
+    /// The nodes the latest view shows `Removed`.
+    pub(super) fn removed_nodes(&self) -> BTreeSet<u64> {
+        self.latest_view()
+            .cluster()
+            .map(|bootstrapped| {
+                bootstrapped
+                    .nodes()
+                    .iter()
+                    .filter(|(_, record)| {
+                        record.lifecycle == ursula_proto::placement::NodeLifecycle::Removed
+                    })
+                    .map(|(node, _)| node.get())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// The replica of `group` on `node_id`'s running host.
     pub(super) fn hosted_raft(
         &self,
@@ -978,7 +1001,7 @@ impl MetaCluster {
     }
 
     /// The highest term any running replica of `group` holds.
-    fn max_term(&self, group: u32) -> u64 {
+    pub(super) fn max_term(&self, group: u32) -> u64 {
         self.hosting(group)
             .iter()
             .filter_map(|(_, host)| host.raft(group))
@@ -989,7 +1012,10 @@ impl MetaCluster {
 
     /// The latest committed membership of `group` among its running
     /// replicas, by log index: its voter configs and learners.
-    fn latest_committed(&self, group: u32) -> Option<(u64, Vec<BTreeSet<u64>>, BTreeSet<u64>)> {
+    pub(super) fn latest_committed(
+        &self,
+        group: u32,
+    ) -> Option<(u64, Vec<BTreeSet<u64>>, BTreeSet<u64>)> {
         self.hosting(group)
             .iter()
             .filter_map(|(_, host)| host.raft(group))
@@ -1033,11 +1059,16 @@ impl MetaCluster {
 
     /// I3's teardown half: a running node that holds a log of `group`
     /// which the latest view gives it no role in, if one does. A log on a
-    /// core that did not open is never torn down.
+    /// core that did not open is never torn down, and neither is a removed
+    /// node's.
     pub(super) fn unplaced_replica(&self, group: u32) -> Option<String> {
         let latest = self.latest_view();
         let bootstrapped = latest.cluster()?;
+        let removed = self.removed_nodes();
         self.running().into_iter().find_map(|node_id| {
+            if removed.contains(&node_id) {
+                return None;
+            }
             let log = self.local_log(node_id, group)?;
             let role = bootstrapped.role(
                 RaftGroupId(group),
@@ -1347,10 +1378,15 @@ impl MetaCluster {
         }
     }
 
-    /// Why `group` has not settled on its placement, if it has not.
+    /// Why `group` has not settled on its placement, if it has not. A
+    /// removed node's view is left out: meta stops replicating to it.
     pub(super) fn not_settled(&self, group: u32) -> Option<String> {
         let mut placed: Option<BTreeSet<u64>> = None;
+        let removed = self.removed_nodes();
         for node_id in self.running() {
+            if removed.contains(&node_id) {
+                continue;
+            }
             let placement = self
                 .view(node_id)
                 .cluster()
@@ -2010,7 +2046,10 @@ impl HostingChecks {
     /// the group against a committed membership, I9 saw the move converge,
     /// and the creation rule judged a node outside the seed voters creating
     /// the group's log. A check that judged nothing of a moved group fails,
-    /// so a vacuous pass shows.
+    /// so a vacuous pass shows. A group whose dropped seed voters were all
+    /// removed has no record to drop and no log retired: the removal that
+    /// dropped them drops their records and closes their replicas, and
+    /// [`super::placed_removals::RemovalChecks::judged_the_removals`] judges them.
     pub(super) fn judged_the_moves(
         &self,
         cluster: &MetaCluster,
@@ -2020,12 +2059,15 @@ impl HostingChecks {
         let Some(placed) = cluster.placed.as_ref() else {
             return;
         };
+        let removed = cluster.removed_nodes();
         for group in JOURNAL_GROUPS {
             let seeds = cluster.seeds(group);
             let voters = cluster.placed_voters(group);
             if voters == seeds {
                 continue;
             }
+            let dropped: BTreeSet<u64> = seeds.difference(&voters).copied().collect();
+            let decommissioned = !dropped.is_empty() && dropped.is_subset(&removed);
             let moved = format!("group {group} moved from {seeds:?} to {voters:?}");
             let judged = |judged: &BTreeMap<u32, BTreeSet<(u64, u64)>>| {
                 judged.get(&group).map_or(0, BTreeSet::len)
@@ -2038,13 +2080,14 @@ impl HostingChecks {
                     format!("{moved}, but I4 judged no membership entry of it"),
                 );
             }
-            if self
-                .judged
-                .dropped_records
-                .get(&group)
-                .copied()
-                .unwrap_or(0)
-                == 0
+            if !decommissioned
+                && self
+                    .judged
+                    .dropped_records
+                    .get(&group)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
             {
                 fail(
                     trace,
@@ -2061,11 +2104,12 @@ impl HostingChecks {
                     format!("{moved}, but I8 judged no voter change of it"),
                 );
             }
-            if self
-                .judged
-                .retired_logs
-                .get(&group)
-                .is_none_or(BTreeSet::is_empty)
+            if !decommissioned
+                && self
+                    .judged
+                    .retired_logs
+                    .get(&group)
+                    .is_none_or(BTreeSet::is_empty)
             {
                 fail(
                     trace,

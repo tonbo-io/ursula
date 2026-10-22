@@ -15,7 +15,9 @@
 //!   last step: a GET of a node's own object is a restore, the only reader
 //!   of its own objects, and a GET inside a send's window is a read of an
 //!   object the sender holds. It also notes when each key stopped being
-//!   named, for I4.
+//!   named, for I4. [`SnapshotChecks::step_except`] leaves the removed nodes
+//!   out of I1 and I3: the sweep deletes the objects a removed node's
+//!   records still name, which its restore may then read.
 //! - [`SnapshotChecks::bound`]: I4 (`snapshot_superseded_without_marker`),
 //!   no object that no node names holds the marker past the bound.
 //! - [`SnapshotChecks::quiesce`], the only route to I5
@@ -141,7 +143,22 @@ impl SnapshotChecks {
         trace: &mut SimTrace,
         after_event: &str,
     ) {
-        let names = cluster.snapshot_names();
+        self.step_except(cluster, trace, after_event, &BTreeSet::new());
+    }
+
+    /// [`Self::step`], with I1 and I3 leaving out the nodes in `removed`:
+    /// the removed-node sweep deletes a removed node's objects, which its
+    /// records still name, and a removed node's restore may read one it
+    /// took. A sweep of any other node's named object still fails I1.
+    pub(super) fn step_except(
+        &mut self,
+        cluster: &JournalCluster,
+        trace: &mut SimTrace,
+        after_event: &str,
+        removed: &BTreeSet<u64>,
+    ) {
+        let mut names = cluster.snapshot_names();
+        names.retain(|node| !removed.contains(&node.node_id));
         let bucket = cluster.snapshot_bucket();
         let view = bucket.key_view();
         check(
@@ -161,6 +178,7 @@ impl SnapshotChecks {
         let reads: Vec<CommittedRead> = events
             .iter()
             .filter_map(|event| covered_read(&view.prefix, event))
+            .filter(|read| !removed.contains(&read.node_id))
             .collect();
         check(
             trace,
