@@ -133,6 +133,16 @@ fn the_view_plans_only_from_a_committed_membership_of_a_live_leader() {
         membership_view(&quiet, me, window, PendingStep::None, inputs()).leadership,
         Leadership::NotLeading
     );
+    // The only voter is its own quorum: no follower ever acknowledges it,
+    // and it still leads (an RF 1 group's move starts from it).
+    let mut alone = quiet.clone();
+    let at = log_id(3, 1, 10);
+    alone.membership_config = membership(at, &[1], &[]);
+    alone.committed_membership_config = membership(at, &[1], &[]);
+    assert!(matches!(
+        membership_view(&alone, me, window, PendingStep::None, inputs()).leadership,
+        Leadership::Leading(_)
+    ));
     let mut campaigning = leader();
     campaigning.vote = UrsulaVote::new(3, 1);
     assert_eq!(

@@ -144,14 +144,16 @@ pub const RECOVERY_STALL_AFTER: Duration = Duration::from_secs(30);
 pub(crate) const LIVE_LEADER_QUORUM_ACK: Duration = Duration::from_secs(3);
 
 /// Whether the replica whose metrics are `metrics` leads with a quorum that
-/// acknowledged it within [`LIVE_LEADER_QUORUM_ACK`]. A leader that lost its
-/// quorum stays in OpenRaft's leader state.
+/// acknowledged it within [`LIVE_LEADER_QUORUM_ACK`], or leads as its own
+/// quorum, the only voter, which no follower acknowledges. A leader that
+/// lost its quorum stays in OpenRaft's leader state.
 pub fn leads_live(metrics: &RaftMetrics<UrsulaRaftTypeConfig>) -> bool {
     metrics.state == openraft::ServerState::Leader
-        && metrics
-            .last_quorum_acked
-            .as_ref()
-            .is_some_and(|acked| acked.elapsed() < LIVE_LEADER_QUORUM_ACK)
+        && (crate::leadership::own_quorum(metrics)
+            || metrics
+                .last_quorum_acked
+                .as_ref()
+                .is_some_and(|acked| acked.elapsed() < LIVE_LEADER_QUORUM_ACK))
 }
 
 /// The membership a replica keeps when a recovery plan cuts its log back to

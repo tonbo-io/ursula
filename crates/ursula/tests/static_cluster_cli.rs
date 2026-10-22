@@ -7,6 +7,7 @@
 )]
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::net::TcpListener;
@@ -28,11 +29,21 @@ use ursula_control::GroupPlacement;
 use ursula_control::MetaDamageKind;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::MetaRole;
+use ursula_control::NodeEligibility;
 use ursula_control::PlacementStatus;
 use ursula_control::RegistrationStatus;
+use ursula_control::Target;
+use ursula_ctl::placement::moves::GroupEnd;
+use ursula_ctl::placement::moves::Intent;
+use ursula_ctl::placement::moves::MoveOptions;
+use ursula_ctl::placement::moves::Replacement;
+use ursula_ctl::placement::moves::run_moves;
+use ursula_proto::admin::RaftGroupMetrics;
+use ursula_proto::admin::RecoveryGateStatus;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::Registered;
+use ursula_proto::placement::VoterSet;
 use ursula_runtime::ColdStore;
 use ursula_shard::RaftGroupId;
 
@@ -3944,6 +3955,12 @@ impl Processes {
         drop(self.0.remove(&id).expect("the node runs"));
     }
 
+    /// Sends `signal` to node `id`: `-STOP` blackholes it, its sockets open
+    /// and nothing answered, until `-CONT`.
+    fn signal(&self, id: u64, which: &str) {
+        signal(self.0.get(&id).expect("the node runs"), which);
+    }
+
     fn exited(&mut self) -> Option<String> {
         self.0.values_mut().find_map(exited_report)
     }
@@ -5065,8 +5082,11 @@ async fn cli_five_nodes_at_rf_three_cover_every_group_in_node_wide_passes() {
 }
 
 /// One stream name of each data group, as `bucket`'s streams hash to the
-/// groups of a meta test cluster.
+/// groups of a meta test cluster. `bucket` must be a valid bucket ID, or
+/// every create in it answers `400`.
 fn stream_per_group(bucket: &str) -> Vec<String> {
+    ursula_runtime::validate_bucket_id(bucket)
+        .unwrap_or_else(|err| panic!("bucket {bucket:?}: {err}"));
     let map = ursula_shard::StaticShardMap::new(1, META_TEST_GROUPS).expect("shard map");
     let mut streams: BTreeMap<u32, String> = BTreeMap::new();
     for candidate in 0_u32.. {
@@ -5212,6 +5232,1502 @@ async fn runs_exactly(
             Err(format!("runs {running:?}"))
         }
     })
+    .await;
+}
+
+/// How long every data group's leader must stay put before the balancer
+/// counts as settled: three of its 5 s ticks and a margin.
+const BALANCE_SETTLED: Duration = Duration::from_secs(16);
+
+/// A client whose every request ends within 10 s, so that a request to a
+/// stopped node fails instead of hanging.
+fn bounded_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("HTTP client")
+}
+
+fn voter_set(ids: &BTreeSet<u64>) -> VoterSet {
+    VoterSet::new(ids.iter().copied().map(NodeId::new).collect()).expect("a voter set")
+}
+
+/// Node `id` of `nodes`.
+fn node_of(nodes: &[MetaNode], id: u64) -> &MetaNode {
+    nodes
+        .iter()
+        .find(|node| node.id == id)
+        .unwrap_or_else(|| panic!("node {id} is in the cluster"))
+}
+
+/// The `ursulactl` manifest of `nodes` but the stopped or dead ones of
+/// `skip`.
+fn ctl_manifest(nodes: &[MetaNode], skip: &[u64]) -> Vec<ursula_ctl::NodeInfo> {
+    nodes
+        .iter()
+        .filter(|node| !skip.contains(&node.id))
+        .map(MetaNode::ctl)
+        .collect()
+}
+
+/// A fresh `ursulactl` client: each pins the process incarnation of the
+/// nodes it writes to, and the tests restart nodes.
+fn ctl_client() -> ursula_ctl::MetricsClient {
+    ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client")
+}
+
+/// Whether a [`placement_move`] may add a node the meta leader does not
+/// report live (`--allow-not-live`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewVoters {
+    Live,
+    MayBeDown,
+}
+
+/// `ursulactl placement move` of `group` by `intent` (a cancel with
+/// [`Intent::Cancel`]) over the nodes of `nodes` but `skip`, with `--wait`
+/// when `wait`. Answers how the group ended and what the command printed.
+async fn placement_move(
+    nodes: &[MetaNode],
+    skip: &[u64],
+    group: RaftGroupId,
+    intent: Intent,
+    new_voters: NewVoters,
+    wait: bool,
+) -> (GroupEnd, String) {
+    let options = MoveOptions {
+        groups: vec![group],
+        intent,
+        expect: None,
+        retarget: false,
+        allow_not_live: new_voters == NewVoters::MayBeDown,
+        wait,
+        timeout: META_WAIT,
+        poll_interval: Duration::from_millis(500),
+    };
+    let mut out = Vec::new();
+    let ends = run_moves(
+        &ctl_client(),
+        &ctl_manifest(nodes, skip),
+        &options,
+        &mut out,
+    )
+    .await
+    .expect("placement move");
+    let out = String::from_utf8_lossy(&out).into_owned();
+    let end = ends
+        .get(&group)
+        .cloned()
+        .unwrap_or_else(|| panic!("no end for group {}: {out}", group.0));
+    (end, out)
+}
+
+/// [`placement_move`] with `--wait`, which must end with the group stable
+/// at `to`.
+async fn move_converges(
+    nodes: &[MetaNode],
+    skip: &[u64],
+    group: RaftGroupId,
+    intent: Intent,
+    to: &BTreeSet<u64>,
+) {
+    let (end, out) = placement_move(nodes, skip, group, intent, NewVoters::Live, true).await;
+    assert_eq!(end, GroupEnd::Converged { to: voter_set(to) }, "{out}");
+}
+
+/// Waits until the meta leader's report lists each of `ids` `Eligible`, read
+/// as `ursulactl placement move` reads it (`PlacementStatus.leader_report`)
+/// over the nodes of `nodes` but `skip`. A move without `--allow-not-live`
+/// refuses a node the report leaves out, and the leader lists a node only a
+/// pass after it holds both the node's acknowledgement within
+/// `LIVE_WITHIN` and its WAL-disk state, which it asks for every few
+/// seconds. So a node that just resumed, or any node under a meta leader
+/// elected a moment ago, is not listed yet, and a move must wait for the
+/// report instead of racing it.
+async fn wait_eligible(procs: &mut Processes, nodes: &[MetaNode], skip: &[u64], ids: &[u64]) {
+    let ctl = ctl_client();
+    let manifest = ctl_manifest(nodes, skip);
+    let what = format!("the meta leader reports nodes {ids:?} eligible");
+    eventually(procs, &what, async || {
+        let status = ursula_ctl::view::leader_status(&ctl, &manifest)
+            .await
+            .map_err(|err| err.to_string())?
+            .map_err(|refusal| refusal.to_string())?;
+        let report = status
+            .leader_report
+            .ok_or_else(|| format!("node {} publishes no leader report", status.node))?;
+        let missing: Vec<u64> = ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                report.eligibility.get(&NodeId::new(*id)) != Some(&NodeEligibility::Eligible)
+            })
+            .collect();
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("nodes {missing:?} are not eligible: {report:?}"))
+        }
+    })
+    .await;
+}
+
+fn replace(old: u64, new: u64) -> Intent {
+    Intent::Replace(Replacement {
+        old: NodeId::new(old),
+        new: NodeId::new(new),
+    })
+}
+
+/// The bootstrapped cluster a meta read barrier confirmed on the first
+/// node of `nodes` but `skip` that answers one.
+async fn confirmed_cluster(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+    skip: &[u64],
+) -> Cluster {
+    eventually(procs, "a node confirms a bootstrapped view", async || {
+        let mut last = String::from("no node asked");
+        for node in nodes.iter().filter(|node| !skip.contains(&node.id)) {
+            match confirmed_placement_status(client, node).await {
+                Ok(status) => match bootstrapped(&status) {
+                    Some(cluster) => return Ok(cluster.clone()),
+                    None => last = format!("{status:?}"),
+                },
+                Err(err) => last = err,
+            }
+        }
+        Err(last)
+    })
+    .await
+}
+
+/// The meta leader node `via` names, once that node names itself.
+async fn known_meta_leader(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+    via: &MetaNode,
+) -> u64 {
+    let what = format!("node {} names a meta leader that names itself", via.id);
+    eventually(procs, &what, async || {
+        let status = placement_status(client, via).await?;
+        let leader = meta_leader(&status).ok_or_else(|| format!("{status:?}"))?;
+        let own = placement_status(client, node_of(nodes, leader)).await?;
+        if meta_leader(&own) == Some(leader) {
+            Ok(leader)
+        } else {
+            Err(format!("{own:?}"))
+        }
+    })
+    .await
+}
+
+/// Node `node`'s replica of `group`, from its metrics.
+async fn replica_of(
+    client: &reqwest::Client,
+    node: &MetaNode,
+    group: RaftGroupId,
+) -> Result<RaftGroupMetrics, String> {
+    try_node_metrics(client, &node.url())
+        .await?
+        .groups
+        .into_iter()
+        .find(|replica| replica.raft_group_id == u64::from(group.0))
+        .ok_or_else(|| format!("node {} runs no replica of group {}", node.id, group.0))
+}
+
+/// The replica of `group` that leads it with a live quorum, among those
+/// of the nodes of `nodes` in `among`.
+async fn leading_replica(
+    client: &reqwest::Client,
+    nodes: &[MetaNode],
+    among: &BTreeSet<u64>,
+    group: RaftGroupId,
+) -> Result<RaftGroupMetrics, String> {
+    let mut seen = Vec::new();
+    for node in nodes.iter().filter(|node| among.contains(&node.id)) {
+        match replica_of(client, node, group).await {
+            Ok(replica) if replica.current_leader == Some(node.id) && replica.leads_live => {
+                return Ok(replica);
+            }
+            Ok(replica) => seen.push(format!("{replica:?}")),
+            Err(err) => seen.push(err),
+        }
+    }
+    Err(format!(
+        "no live leader of group {} on {among:?}: {seen:?}",
+        group.0
+    ))
+}
+
+/// Waits until node `node` runs a replica of every group `cluster`
+/// places on it as a voter, each knowing a leader with its gate open.
+async fn wait_serves_placed(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+    cluster: &Cluster,
+) {
+    let placed = placed_on(cluster, node.id);
+    let what = format!("node {} serves its groups {placed:?}", node.id);
+    eventually(procs, &what, async || {
+        let metrics = try_node_metrics(client, &node.url()).await?;
+        for group in &placed {
+            let serves = metrics.groups.iter().any(|replica| {
+                replica.raft_group_id == *group
+                    && replica.current_leader.is_some()
+                    && replica.recovery_gate == RecoveryGateStatus::Open
+            });
+            if !serves {
+                return Err(format!("group {group}: {:?}", metrics.groups));
+            }
+        }
+        Ok(())
+    })
+    .await;
+}
+
+/// Creates the stream at `url`.
+async fn create_stream(client: &reqwest::Client, procs: &mut Processes, url: &str) {
+    let what = format!("{url} is created");
+    eventually(procs, &what, async || {
+        let response = client
+            .put(url)
+            .header("content-type", "text/plain")
+            .send()
+            .await
+            .map_err(|err| format!("PUT {url}: {err}"))?;
+        match response.status() {
+            reqwest::StatusCode::CREATED | reqwest::StatusCode::OK => Ok(()),
+            status => {
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|err| format!("<unreadable body: {err}>"));
+                Err(format!("PUT {url}: {status}: {body}"))
+            }
+        }
+    })
+    .await;
+}
+
+/// Starts `ursula gateway` in front of every node of `nodes`, and answers
+/// it with its URL.
+fn spawn_gateway(binary: &str, nodes: &[MetaNode]) -> (ChildGuard, String) {
+    let port = free_port();
+    let mut command = Command::new(binary);
+    command
+        .arg("gateway")
+        .arg("--listen")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--raft-group-count")
+        .arg(META_TEST_GROUPS.to_string());
+    for node in nodes {
+        command.arg("--upstream").arg(node.url());
+    }
+    let gateway = spawn_child(command, format!("gateway-{port}"));
+    (gateway, format!("http://127.0.0.1:{port}"))
+}
+
+/// How the gateway answered one write of a [`GatewayLoad`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoadAnswer {
+    Acknowledged,
+    /// `503` with `Retry-After`, and the code its error body names.
+    Retryable(Option<ursula_headers::ErrorCode>),
+    /// Any other status.
+    Failed(u16),
+    /// No answer within the client's 10 s, or no connection to the gateway.
+    Unanswered,
+}
+
+/// One write of a [`GatewayLoad`].
+#[derive(Debug, Clone)]
+struct LoadWrite {
+    stream: String,
+    payload: String,
+    answer: LoadAnswer,
+}
+
+/// Appends `{prefix}-{n};` to its streams in turn every 20 ms until
+/// stopped, and keeps every write with how it was answered. Each write
+/// waits at most 10 s for its answer. Once stopped it goes on until it has
+/// an acknowledged write, at most [`LOAD_ACK_GRACE`] longer: a write the
+/// gateway forwarded to a stopped (blackholed) node waits out the client's
+/// timeout, and a move can converge within it.
+/// How long a stopped [`GatewayLoad`] goes on for its first acknowledged
+/// write: three of the client's 10 s timeouts.
+const LOAD_ACK_GRACE: Duration = Duration::from_secs(30);
+
+struct GatewayLoad {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    task: tokio::task::JoinHandle<Vec<LoadWrite>>,
+}
+
+impl GatewayLoad {
+    fn start(streams: Vec<String>, prefix: &'static str) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task = {
+            let stop = Arc::clone(&stop);
+            tokio::spawn(async move {
+                let client = bounded_client();
+                let mut writes: Vec<LoadWrite> = Vec::new();
+                let mut stopped_at = None;
+                for (write, stream) in streams.iter().cycle().enumerate() {
+                    if stop.load(std::sync::atomic::Ordering::Acquire) {
+                        let since = *stopped_at.get_or_insert_with(tokio::time::Instant::now);
+                        if writes
+                            .iter()
+                            .any(|write| write.answer == LoadAnswer::Acknowledged)
+                            || since.elapsed() >= LOAD_ACK_GRACE
+                        {
+                            break;
+                        }
+                    }
+                    let payload = format!("{prefix}-{write};");
+                    let sent = client
+                        .post(stream)
+                        .header("content-type", "text/plain")
+                        .body(payload.clone())
+                        .send()
+                        .await;
+                    let answer = match sent {
+                        Err(_unanswered) => LoadAnswer::Unanswered,
+                        Ok(response) => match response.status() {
+                            reqwest::StatusCode::NO_CONTENT => LoadAnswer::Acknowledged,
+                            reqwest::StatusCode::SERVICE_UNAVAILABLE
+                                if response
+                                    .headers()
+                                    .contains_key(reqwest::header::RETRY_AFTER) =>
+                            {
+                                let body = response.bytes().await.unwrap_or_default();
+                                LoadAnswer::Retryable(
+                                    ursula_headers::ErrorBody::parse(&body)
+                                        .ok()
+                                        .map(|body| body.code),
+                                )
+                            }
+                            status => LoadAnswer::Failed(status.as_u16()),
+                        },
+                    };
+                    writes.push(LoadWrite {
+                        stream: stream.clone(),
+                        payload,
+                        answer,
+                    });
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                writes
+            })
+        };
+        Self { stop, task }
+    }
+
+    /// Stops the load once its write in flight is answered and it has an
+    /// acknowledged write (at most [`LOAD_ACK_GRACE`] after the stop), and
+    /// answers every write it sent.
+    async fn stop(self) -> Vec<LoadWrite> {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        self.task.await.expect("the write load ends")
+    }
+}
+
+/// Asserts that the gateway answered each of `writes` with `204` or with a
+/// `503` and `Retry-After`, or left it unanswered when `unanswered` allows
+/// that, and acknowledged some.
+fn assert_only_retryable(writes: &[LoadWrite], unanswered: bool) {
+    let failed: Vec<&LoadWrite> = writes
+        .iter()
+        .filter(|write| match write.answer {
+            LoadAnswer::Acknowledged | LoadAnswer::Retryable(_) => false,
+            LoadAnswer::Unanswered => !unanswered,
+            LoadAnswer::Failed(_) => true,
+        })
+        .collect();
+    assert!(
+        failed.is_empty(),
+        "{} of {} writes failed: {failed:?}",
+        failed.len(),
+        writes.len()
+    );
+    assert!(
+        writes
+            .iter()
+            .any(|write| write.answer == LoadAnswer::Acknowledged),
+        "no write was acknowledged: {writes:?}"
+    );
+}
+
+/// Reads `stream` once its load stopped, until it holds every write the
+/// load acknowledged, and checks it against the load's `writes`: it holds
+/// nothing the load did not send, nothing twice, every acknowledged write in
+/// the order sent, and no write whose `503` proves it applied nothing
+/// ([`ursula_headers::write_outcome::proves_refusal`]). A `503` whose body
+/// names no code proves nothing, so such a write may be held.
+async fn check_load_read(client: &reqwest::Client, stream: &str, writes: &[LoadWrite]) {
+    let writes: Vec<&LoadWrite> = writes
+        .iter()
+        .filter(|write| write.stream == stream)
+        .collect();
+    let acknowledged: Vec<String> = writes
+        .iter()
+        .filter(|write| write.answer == LoadAnswer::Acknowledged)
+        .map(|write| write.payload.clone())
+        .collect();
+    let read = read_until_holding(
+        client,
+        &format!("{stream}?offset=0&max_bytes=8388608"),
+        &acknowledged,
+    )
+    .await;
+    let sent: HashMap<&str, &LoadAnswer> = writes
+        .iter()
+        .map(|write| (write.payload.trim_end_matches(';'), &write.answer))
+        .collect();
+    let text = String::from_utf8_lossy(&read);
+    let mut held = HashSet::new();
+    let mut in_order = Vec::new();
+    for token in text.split(';').filter(|token| !token.is_empty()) {
+        let answer = sent
+            .get(token)
+            .unwrap_or_else(|| panic!("{stream} holds {token:?}, which the load never sent"));
+        assert!(held.insert(token), "{stream} holds {token:?} twice");
+        match answer {
+            LoadAnswer::Acknowledged => in_order.push(format!("{token};")),
+            LoadAnswer::Retryable(code) => assert!(
+                !code
+                    .as_ref()
+                    .is_some_and(|code| ursula_headers::write_outcome::proves_refusal(503, code)),
+                "{stream} holds {token:?}, whose {code:?} proves it applied nothing"
+            ),
+            LoadAnswer::Failed(_) | LoadAnswer::Unanswered => {}
+        }
+    }
+    assert_eq!(
+        in_order, acknowledged,
+        "{stream} holds the acknowledged writes out of order"
+    );
+}
+
+/// Waits until every data group of `nodes` has one leader that each of its
+/// replicas reports and that leads with a live quorum, and the leaders
+/// stay the same for [`BALANCE_SETTLED`]. Answers each group's leader.
+async fn wait_leaders_settle(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+) -> BTreeMap<u64, u64> {
+    let mut stable: Option<(BTreeMap<u64, u64>, std::time::Instant)> = None;
+    eventually(procs, "the balancer settles", async || {
+        let mut reported: BTreeMap<u64, BTreeSet<Option<u64>>> = BTreeMap::new();
+        let mut live = BTreeSet::new();
+        for node in nodes {
+            for replica in try_node_metrics(client, &node.url()).await?.groups {
+                if replica.current_leader == Some(node.id) && replica.leads_live {
+                    live.insert(replica.raft_group_id);
+                }
+                reported
+                    .entry(replica.raft_group_id)
+                    .or_default()
+                    .insert(replica.current_leader);
+            }
+        }
+        let mut leaders = BTreeMap::new();
+        for (group, named) in &reported {
+            match named.iter().collect::<Vec<_>>().as_slice() {
+                [Some(leader)] if live.contains(group) => leaders.insert(*group, *leader),
+                _ => return Err(format!("group {group}: leaders {named:?}")),
+            };
+        }
+        if leaders.len() != META_TEST_GROUPS {
+            return Err(format!("leaders of {leaders:?}"));
+        }
+        match &stable {
+            Some((seen, since)) if *seen == leaders => {
+                if since.elapsed() >= BALANCE_SETTLED {
+                    Ok(leaders)
+                } else {
+                    Err(format!("{leaders:?} for {:?}", since.elapsed()))
+                }
+            }
+            _ => {
+                stable = Some((leaders.clone(), std::time::Instant::now()));
+                Err(format!("leaders moved to {leaders:?}"))
+            }
+        }
+    })
+    .await
+}
+
+/// S3(i), integrations 1 (without its teardown checks), 3, 4, 10 and 13
+/// (#768, design 15.3), in phases on one cluster: nodes 1 to 4 at
+/// replication factor 3 with meta voters 1 to 3, and node 5 added by a
+/// rolling `raft.peers` update. Every move and cancel goes through
+/// `ursula_ctl::placement` calls.
+///
+/// 1. With node 5 stopped, `move --replace --allow-not-live` puts node 5 in
+///    place of a meta voter of the group placed off the meta leader (the
+///    other moves onto a live node leave the liveness check on). The
+///    group's leader adds node 5 as a learner and waits. The meta leader is
+///    killed there, node 5 continues, and the move converges under the next
+///    meta leader: the placement is stable at the target with a new
+///    `converged_at`, and node 5 serves the group as a voter. A move that
+///    needs the meta leader it was requested under fails it.
+/// 2. Once the moved-off source no longer counts its replica as a voter,
+///    a read sent to it is answered with a `2xx` at least once, and every
+///    `2xx` holds the write made after the move. A dropped voter that
+///    answers a read from its own stale state fails it. Refusals pass: a
+///    dropped voter that campaigns knows no leader. The client follows
+///    redirects, so once the source tore its replica down, the `2xx` comes
+///    from a node its `307` names: the phase shows that no read sent to the
+///    source is stale, not which path answered it.
+/// 3. The group placed on {1, 2, 3} moves to {1, 4, 5} with node 5 stopped
+///    (`--allow-not-live`), so its leader promotes node 4 and waits for
+///    node 5. Node 4 is killed once a uniform membership lists it, and a
+///    cancel converges back on {1, 2, 3} with nodes 4 and 5 down. A cancel
+///    that needs its dead target or the learner that never caught up fails
+///    it.
+/// 4. Through a gateway, each of the two groups not moved yet replaces its
+///    leader by node 5 under write load. The lowest-id voter that stays is
+///    killed for the first group and stopped (`SIGSTOP`, a blackhole) for
+///    the second, before the load starts. With it dead, the gateway answers
+///    every write `204` or a `503` with `Retry-After`. With it stopped, a
+///    write the gateway sends it waits longer than the load's 10 s, which
+///    the test allows, so that leg claims only that no write gets another
+///    status. Each stream holds every acknowledged write once, in order, and
+///    no write whose `503` code proves it applied nothing. A leader that
+///    hands off only to the dead or stopped voter, or a proven refusal that
+///    applied, fails it.
+/// 5. Node 4, a meta learner, restarts with its meta snapshot record
+///    corrupted and reports its meta damaged. The moved group's staying meta
+///    voter is drained and node 5 killed, which leaves node 4 the group's
+///    only voter that may campaign, and it leads the group. A move of node
+///    5's place onto the node the group was placed off is accepted while
+///    node 4 leads, and converges once the drain is cleared: node 4 hands the
+///    group off and ends leading nothing. A damaged leader that keeps its
+///    leadership fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_moves_and_a_cancel_converge_through_kills_stops_and_damaged_meta() {
+    use ursula_proto::admin::RaftMaintenanceReport;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the move test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 5);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    let first = peers_of(&nodes[..4]);
+    for node in &nodes[..4] {
+        node.write(&first, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes[..4]).await;
+
+    // Node 5 joins: it registers, and nodes 1 to 4 restart one at a time
+    // with the full `raft.peers`, as an operator adds a node.
+    let all = peers_of(&nodes);
+    nodes[4].write(&all, meta);
+    procs.start(binary, &nodes[4]);
+    wait_placement(
+        &client,
+        &mut procs,
+        &nodes[4],
+        "registers without a role",
+        |status| {
+            matches!(
+                status.registration,
+                RegistrationStatus::Answered(Registered::Unreferenced(_))
+            )
+        },
+    )
+    .await;
+    for node in &nodes[..4] {
+        procs.stop(node.id).await;
+        node.write(&all, meta);
+        procs.start(binary, node);
+        wait_readiness_reason(&client, &mut procs, node, None).await;
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let streams = stream_per_group("moves");
+    let url = |node: &MetaNode, group: RaftGroupId| {
+        format!(
+            "{}/moves/{}",
+            node.url(),
+            streams[usize::try_from(group.0).unwrap()]
+        )
+    };
+    let read = |node: &MetaNode, group: RaftGroupId| {
+        format!("{}?offset=0&max_bytes=256", url(node, group))
+    };
+    for group in (0..u32::try_from(META_TEST_GROUPS).unwrap()).map(RaftGroupId) {
+        put_until_created(&client, &url(&nodes[0], group)).await;
+        post_until_no_content(&client, &url(&nodes[0], group), "before-the-moves;").await;
+    }
+
+    // 1. The group placed off the meta leader moves one of its meta voters
+    // onto node 5, which is stopped, so the move waits with node 5 a learner.
+    let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    let first_meta_leader = known_meta_leader(&client, &mut procs, &nodes, &nodes[3]).await;
+    let (moved, from) = current_voters(&cluster)
+        .into_iter()
+        .find(|(_, voters)| !voters.contains(&first_meta_leader))
+        .unwrap_or_else(|| panic!("a group is placed off node {first_meta_leader}: {cluster:?}"));
+    let source = *from.iter().find(|id| **id != 4).expect("a meta voter");
+    let staying = *from
+        .iter()
+        .find(|id| **id != 4 && **id != source)
+        .expect("a second meta voter");
+    let moved_to = BTreeSet::from([staying, 4, 5]);
+    let converged_before = match cluster.group(moved) {
+        Some(GroupPlacement::Live { converged_at, .. }) => *converged_at,
+        other => panic!("group {moved:?} is not live: {other:?}"),
+    };
+    procs.signal(5, "-STOP");
+    let (end, out) = placement_move(
+        &nodes,
+        &[5],
+        moved,
+        replace(source, 5),
+        NewVoters::MayBeDown,
+        false,
+    )
+    .await;
+    assert!(matches!(end, GroupEnd::Accepted { .. }), "{end:?}\n{out}");
+    let what = format!("group {} adds node 5 as a learner", moved.0);
+    eventually(&mut procs, &what, async || {
+        let leader = leading_replica(&client, &nodes, &from, moved).await?;
+        let voter = leader
+            .voter_configs
+            .iter()
+            .any(|voters| voters.contains(&5));
+        if leader.learner_ids.contains(&5) && !voter {
+            Ok(())
+        } else {
+            Err(format!("{leader:?}"))
+        }
+    })
+    .await;
+    let killed_meta_leader = known_meta_leader(&client, &mut procs, &nodes, &nodes[3]).await;
+    procs.kill(killed_meta_leader);
+    procs.signal(5, "-CONT");
+    move_converges(
+        &nodes,
+        &[killed_meta_leader],
+        moved,
+        replace(source, 5),
+        &moved_to,
+    )
+    .await;
+    let after = confirmed_cluster(&client, &mut procs, &nodes, &[killed_meta_leader]).await;
+    match after.group(moved) {
+        Some(GroupPlacement::Live {
+            converged_at,
+            target: Target::Stable { voters },
+            ..
+        }) => {
+            assert_eq!(node_ids(voters.iter()), moved_to, "{after:?}");
+            assert_ne!(*converged_at, converged_before, "{after:?}");
+        }
+        other => panic!("group {moved:?} is not stable: {other:?}"),
+    }
+    let what = format!("node 5 is a voter of group {}", moved.0);
+    eventually(&mut procs, &what, async || {
+        let replica = replica_of(&client, &nodes[4], moved).await?;
+        if replica.voter_configs == vec![moved_to.clone()] && replica.current_leader.is_some() {
+            Ok(())
+        } else {
+            Err(format!("{replica:?}"))
+        }
+    })
+    .await;
+    read_until_matches(&client, &read(&nodes[4], moved), b"before-the-moves;").await;
+    procs.start(binary, node_of(&nodes, killed_meta_leader));
+    wait_placement(
+        &client,
+        &mut procs,
+        node_of(&nodes, killed_meta_leader),
+        "rejoins as a meta voter",
+        |status| meta_role(status) == Some(MetaRole::Voter) && meta_leader(status).is_some(),
+    )
+    .await;
+
+    // 2. The moved-off source, once its replica does not count as a voter,
+    // never answers a read without the write made after the move.
+    post_until_no_content(&client, &url(&nodes[4], moved), "after-the-move;").await;
+    let source_node = node_of(&nodes, source);
+    let what = format!(
+        "node {source}'s replica of group {} does not count",
+        moved.0
+    );
+    eventually(&mut procs, &what, async || {
+        let (_, ready) = readiness(&client, source_node).await?;
+        let report: RaftMaintenanceReport = ready
+            .raft_maintenance
+            .ok_or_else(|| "no maintenance report".to_owned())?;
+        let placed = report.expected_groups.contains_key(&moved.0);
+        let counts = report
+            .unplaced
+            .get(&moved.0)
+            .is_some_and(|unplaced| unplaced.counts_as_voter);
+        if placed || counts {
+            Err(format!("{report:?}"))
+        } else {
+            Ok(())
+        }
+    })
+    .await;
+    let fresh = b"before-the-moves;after-the-move;";
+    let what = format!("node {source} answers a read of group {}", moved.0);
+    eventually(&mut procs, &what, async || {
+        let response = client
+            .get(read(source_node, moved))
+            .send()
+            .await
+            .map_err(|err| err.to_string())?;
+        if !response.status().is_success() {
+            return Err(format!("{}", response.status()));
+        }
+        let body = response.bytes().await.map_err(|err| err.to_string())?;
+        assert_eq!(
+            body.as_ref(),
+            fresh,
+            "node {source} answered a stale read of group {}",
+            moved.0
+        );
+        Ok(())
+    })
+    .await;
+    for _ in 0..20 {
+        if let Ok(response) = client.get(read(source_node, moved)).send().await
+            && response.status().is_success()
+        {
+            let body = response.bytes().await.expect("read the stream");
+            assert_eq!(
+                body.as_ref(),
+                fresh,
+                "node {source} answered a stale read of group {}",
+                moved.0
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // 3. The group on {1, 2, 3} moves to {1, 4, 5} with node 5 stopped:
+    // node 4 is promoted and the move waits for node 5. Node 4 dies once a
+    // uniform membership lists it, and the cancel converges without it.
+    let seeded = BTreeSet::from([1, 2, 3]);
+    let (cancelled, _) = current_voters(&cluster)
+        .into_iter()
+        .find(|(_, voters)| *voters == seeded)
+        .unwrap_or_else(|| panic!("a group is placed on 1, 2 and 3: {cluster:?}"));
+    procs.signal(5, "-STOP");
+    let (end, out) = placement_move(
+        &nodes,
+        &[5],
+        cancelled,
+        Intent::To(voter_set(&BTreeSet::from([1, 4, 5]))),
+        NewVoters::MayBeDown,
+        false,
+    )
+    .await;
+    assert!(matches!(end, GroupEnd::Accepted { .. }), "{end:?}\n{out}");
+    let what = format!("a uniform membership of group {} lists node 4", cancelled.0);
+    eventually(&mut procs, &what, async || {
+        let leader =
+            leading_replica(&client, &nodes, &BTreeSet::from([1, 2, 3, 4]), cancelled).await?;
+        match leader.voter_configs.as_slice() {
+            [voters] if voters.contains(&4) => Ok(()),
+            _ => Err(format!("{leader:?}")),
+        }
+    })
+    .await;
+    procs.kill(4);
+    move_converges(&nodes, &[4, 5], cancelled, Intent::Cancel, &seeded).await;
+    procs.signal(5, "-CONT");
+    procs.start(binary, &nodes[3]);
+    let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    assert_eq!(
+        cluster.group(cancelled).map(GroupPlacement::moving),
+        Some(None),
+        "{cluster:?}"
+    );
+    for node in &nodes[3..] {
+        wait_serves_placed(&client, &mut procs, node, &cluster).await;
+    }
+    post_until_no_content(&client, &url(&nodes[0], cancelled), "after-the-cancel;").await;
+    read_until_matches(
+        &client,
+        &read(&nodes[1], cancelled),
+        b"before-the-moves;after-the-cancel;",
+    )
+    .await;
+
+    // 4. Through a gateway, each group not moved yet hands its leader's
+    // place to node 5 under write load, with the lowest-id voter that stays
+    // killed for the first and stopped for the second.
+    let (_gateway, gateway) = spawn_gateway(binary, &nodes);
+    let gateway_streams = stream_per_group("gateway");
+    let unmoved: Vec<(RaftGroupId, BTreeSet<u64>)> = current_voters(&cluster)
+        .into_iter()
+        .filter(|(group, _)| *group != moved && *group != cancelled)
+        .collect();
+    assert_eq!(unmoved.len(), 2, "{cluster:?}");
+    for ((group, voters), blackholed) in unmoved.into_iter().zip([false, true]) {
+        let stream = format!(
+            "{gateway}/gateway/{}",
+            gateway_streams[usize::try_from(group.0).unwrap()]
+        );
+        create_stream(&client, &mut procs, &stream).await;
+        let what = format!("group {} has a live leader", group.0);
+        let leader = eventually(&mut procs, &what, async || {
+            leading_replica(&client, &nodes, &voters, group).await
+        })
+        .await
+        .node_id;
+        let stays: BTreeSet<u64> = voters.iter().copied().filter(|id| *id != leader).collect();
+        let lowest = *stays.first().expect("two voters stay");
+        // Before the load starts, so that no write is in flight to it.
+        if blackholed {
+            procs.signal(lowest, "-STOP");
+        } else {
+            procs.kill(lowest);
+        }
+        // Node 5 was stopped in phase 3, and the voter just killed or
+        // stopped may have led meta.
+        wait_eligible(&mut procs, &nodes, &[lowest], &[5]).await;
+        let load = GatewayLoad::start(vec![stream.clone()], "through-the-gateway");
+        let mut to = stays.clone();
+        to.insert(5);
+        move_converges(&nodes, &[lowest], group, replace(leader, 5), &to).await;
+        let writes = load.stop().await;
+        if blackholed {
+            procs.signal(lowest, "-CONT");
+        } else {
+            procs.start(binary, node_of(&nodes, lowest));
+        }
+        assert_only_retryable(&writes, blackholed);
+        check_load_read(&client, &stream, &writes).await;
+        let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+        wait_serves_placed(&client, &mut procs, node_of(&nodes, lowest), &cluster).await;
+    }
+
+    // 5. Node 4 restarts with its meta snapshot record corrupted.
+    let damaged = &nodes[3];
+    let response = admin_test_post(
+        &client,
+        format!("{}/__ursula/raft/meta/snapshot", damaged.admin()),
+    )
+    .await
+    .send()
+    .await
+    .expect("snapshot meta");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let record = damaged.meta_dir().join("group-0.snapshot.json");
+    eventually(&mut procs, "node 4 records its meta snapshot", async || {
+        ursula_raft::current_snapshot_pointer(&record)
+            .map_err(|err| err.to_string())?
+            .ok_or_else(|| "no current snapshot record yet".to_owned())
+    })
+    .await;
+    procs.stop(4).await;
+    std::fs::write(&record, b"not a meta snapshot record").expect("corrupt the meta record");
+    procs.start(binary, damaged);
+    wait_placement(
+        &client,
+        &mut procs,
+        damaged,
+        "reports its meta damaged",
+        |status| {
+            matches!(status.meta, MetaReplicaStatus::Damaged {
+                kind: MetaDamageKind::Restore,
+                ..
+            })
+        },
+    )
+    .await;
+    eventually(
+        &mut procs,
+        "node 4 marks placement-unavailable",
+        async || {
+            let shed = leadership_shed(&client, damaged).await;
+            if sheds_placement_unavailable(&shed) {
+                Ok(())
+            } else {
+                Err(format!("{shed:?}"))
+            }
+        },
+    )
+    .await;
+    // The moved group's third voter is drained and node 5 dies: node 4 is
+    // the only voter that may campaign. The drain mark only stops the
+    // third voter from campaigning and taking transfers, and a leadership
+    // it holds stays, so it hands that one to node 5 first: node 4, without
+    // meta, takes no transfer.
+    let ctl = ctl_client();
+    let drained = node_of(&nodes, staying);
+    ctl.set_maintenance_drain(&drained.ctl(), true)
+        .await
+        .expect("drain the third voter");
+    let what = format!("node {staying} hands group {} off", moved.0);
+    eventually(&mut procs, &what, async || {
+        let Err(led) = leading_replica(&client, &nodes, &BTreeSet::from([4, 5]), moved).await
+        else {
+            return Ok(());
+        };
+        let answer = ctl
+            .transfer_leader(&drained.ctl(), u64::from(moved.0), 5)
+            .await
+            .map_err(|err| format!("{led}; transfer to node 5: {err:#}"))?;
+        Err(format!("{led}; transfer to node 5: {answer:?}"))
+    })
+    .await;
+    procs.kill(5);
+    let what = format!("node 4 leads group {}", moved.0);
+    eventually(&mut procs, &what, async || {
+        leading_replica(&client, &nodes, &BTreeSet::from([4]), moved).await
+    })
+    .await;
+    // Node 5's place goes to the node the group was placed off, the one
+    // node of 1 to 3 the group has no retirement for.
+    wait_eligible(&mut procs, &nodes, &[5], &[first_meta_leader]).await;
+    let (end, out) = placement_move(
+        &nodes,
+        &[5],
+        moved,
+        replace(5, first_meta_leader),
+        NewVoters::Live,
+        false,
+    )
+    .await;
+    assert!(matches!(end, GroupEnd::Accepted { .. }), "{end:?}\n{out}");
+    ctl.set_maintenance_drain(&drained.ctl(), false)
+        .await
+        .expect("clear the drain");
+    move_converges(
+        &nodes,
+        &[5],
+        moved,
+        replace(5, first_meta_leader),
+        &BTreeSet::from([staying, 4, first_meta_leader]),
+    )
+    .await;
+    eventually(&mut procs, "node 4 leads no data group", async || {
+        let led = leads(&try_node_metrics(&client, &damaged.url()).await?, 4);
+        if led == 0 {
+            Ok(())
+        } else {
+            Err(format!("node 4 leads {led} groups"))
+        }
+    })
+    .await;
+    read_until_matches(
+        &client,
+        &read(damaged, moved),
+        b"before-the-moves;after-the-move;",
+    )
+    .await;
+}
+
+/// S3(i), integration 7's growth (#768, design 15.3): a durable single
+/// node with meta voter 1 bootstraps at replication factor 1, and grows to
+/// three nodes: nodes 2 and 3 join with the same cluster id and meta
+/// voters, and node 1 restarts with the grown `raft.peers`. Every node's
+/// view is the single node's cluster, with its params and placement keys,
+/// so the growth bootstraps nothing anew. `ursulactl placement move` moves
+/// group 0 onto node 2 and group 1 onto node 3, each the only voter that
+/// serves the group's earlier writes and takes new ones, and the other
+/// groups stay on node 1 under their keys. Node 3, whose
+/// `raft.placement.replication_factor` is left at its default of 3, reports
+/// `replication_factor_mismatch`, and nodes 1 and 2, configured to 1, do
+/// not. A growth that re-forms the cluster, an RF 1 move that never hands
+/// the only voter's place over, or a node whose configured factor differs
+/// from the cluster's that reports no mismatch (or one that does not
+/// differ that reports one), fails it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_durable_single_node_grows_to_three_and_moves_its_groups() {
+    use ursula_proto::admin::RaftMaintenanceIssue;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the growth test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let at_one = MetaToml {
+        meta_voters: Some(&[1]),
+        replication_factor: Some(1),
+        ..MetaToml::default()
+    };
+    let at_default = MetaToml {
+        meta_voters: Some(&[1]),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    nodes[0].write(&peers_of(&nodes[..1]), at_one);
+    procs.start(binary, &nodes[0]);
+    let formed = wait_settled(&client, &mut procs, &nodes[..1]).await;
+    let single = settled(&formed[0]).expect("settled").clone();
+    assert_eq!(single.params().replication_factor.get(), 1, "{single:?}");
+    for (group, voters) in current_voters(&single) {
+        assert_eq!(voters, BTreeSet::from([1]), "group {group:?}: {single:?}");
+    }
+    let streams = stream_per_group("grown");
+    let url = |node: &MetaNode, group: u32| {
+        format!(
+            "{}/grown/{}",
+            node.url(),
+            streams[usize::try_from(group).unwrap()]
+        )
+    };
+    for group in 0..u32::try_from(META_TEST_GROUPS).unwrap() {
+        put_until_created(&client, &url(&nodes[0], group)).await;
+        post_until_no_content(&client, &url(&nodes[0], group), "before-the-growth;").await;
+    }
+
+    // 1. Nodes 2 and 3 join, and node 1 restarts with the grown peers.
+    let all = peers_of(&nodes);
+    nodes[1].write(&all, at_one);
+    nodes[2].write(&all, at_default);
+    for node in &nodes[1..] {
+        procs.start(binary, node);
+        wait_placement(
+            &client,
+            &mut procs,
+            node,
+            "registers without a role",
+            |status| {
+                matches!(
+                    status.registration,
+                    RegistrationStatus::Answered(Registered::Unreferenced(_))
+                )
+            },
+        )
+        .await;
+    }
+    procs.stop(1).await;
+    nodes[0].write(&all, at_one);
+    procs.start(binary, &nodes[0]);
+    for status in wait_settled(&client, &mut procs, &nodes).await {
+        let grown = settled(&status).unwrap();
+        assert_eq!(grown.params(), single.params(), "{status:?}");
+        assert_eq!(sinces(grown), sinces(&single), "{status:?}");
+        assert_eq!(
+            node_ids(grown.nodes().keys().copied()),
+            BTreeSet::from([1, 2, 3]),
+            "{status:?}"
+        );
+    }
+
+    // 2. Group 0 moves onto node 2 and group 1 onto node 3.
+    for (group, to) in [(0_u32, 2_u64), (1, 3)] {
+        let to_set = BTreeSet::from([to]);
+        // Node 1, meta's only voter, restarted above.
+        wait_eligible(&mut procs, &nodes, &[], &[to]).await;
+        move_converges(
+            &nodes,
+            &[],
+            RaftGroupId(group),
+            Intent::To(voter_set(&to_set)),
+            &to_set,
+        )
+        .await;
+        let target = node_of(&nodes, to);
+        let what = format!("node {to} is group {group}'s only voter and leads it");
+        eventually(&mut procs, &what, async || {
+            let replica = replica_of(&client, target, RaftGroupId(group)).await?;
+            if replica.voter_configs == vec![to_set.clone()] && replica.current_leader == Some(to) {
+                Ok(())
+            } else {
+                Err(format!("{replica:?}"))
+            }
+        })
+        .await;
+        let read = format!("{}?offset=0&max_bytes=256", url(target, group));
+        read_until_matches(&client, &read, b"before-the-growth;").await;
+        post_until_no_content(&client, &url(target, group), "after-the-move;").await;
+        read_until_matches(&client, &read, b"before-the-growth;after-the-move;").await;
+    }
+    let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    let keys = sinces(&single);
+    for (group, voters) in current_voters(&cluster) {
+        let expected = match group.0 {
+            0 => BTreeSet::from([2]),
+            1 => BTreeSet::from([3]),
+            _ => {
+                assert_eq!(
+                    cluster.group(group).map(GroupPlacement::since),
+                    keys.get(&group).copied(),
+                    "{cluster:?}"
+                );
+                BTreeSet::from([1])
+            }
+        };
+        assert_eq!(voters, expected, "group {group:?}: {cluster:?}");
+        assert_eq!(
+            cluster.group(group).map(GroupPlacement::moving),
+            Some(None),
+            "{cluster:?}"
+        );
+    }
+
+    // 3. Only node 3, left at the default factor, reports the mismatch.
+    for node in &nodes {
+        let what = format!("node {} reports its node issues", node.id);
+        let issues = eventually(&mut procs, &what, async || {
+            let (_, ready) = readiness(&client, node).await?;
+            ready
+                .raft_maintenance
+                .map(|report| report.node_issues)
+                .ok_or_else(|| "no maintenance report".to_owned())
+        })
+        .await;
+        assert_eq!(
+            issues.contains(&RaftMaintenanceIssue::ReplicationFactorMismatch),
+            node.id == 3,
+            "node {}: {issues:?}",
+            node.id
+        );
+    }
+}
+
+/// S3(i), integration 9 (#768, design 15.3), and the certified floor of
+/// S3(f) on the server: five nodes at replication factor 3 with meta
+/// voters 1 to 3, behind a gateway that writes to a stream of every group.
+///
+/// 1. Each node in turn stops, `ursulactl verify-survivors` with it
+///    excluded passes once the survivors lead every group, and the node
+///    restarts behind `ursulactl wait`. The gateway answers every
+///    write `204` or a `503` with `Retry-After`, and each stream holds every
+///    acknowledged write once, in order, and no write whose `503` code
+///    proves it applied nothing. Then the leaderships settle: no leader
+///    changes for three balancer ticks. A restart that drops writes, a
+///    proven refusal that applied, or a balancer that never stops moving
+///    leaderships fails it.
+/// 2. A group moves to {x, 4, 5}, x a meta voter, so meta keeps a quorum
+///    when its three voters are killed and lose their run state. The group
+///    stalls. A cutting plan whose `certified` floor names an entry above
+///    the plan leader's log is refused `floor_not_held` and changes
+///    nothing. The cutting plan under the floor `ursulactl recover-group`
+///    reads from the confirmed view, the move's `converged_at`, is
+///    satisfied on every voter: the group keeps the moved membership, serves
+///    its write, and its placement keeps its key and `converged_at`. A
+///    server that takes a plan without the certified entry, or a data plan
+///    that rewrites the placement, fails it. Every commit marker here lies
+///    at or above the certified entry, so a cut below it is not exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_rolling_restart_loses_no_write_and_a_moved_group_keeps_its_certified_membership() {
+    use ursula_proto::admin::PlanFloor;
+    use ursula_proto::admin::PlanStep;
+    use ursula_proto::admin::RecoveryPlanRefusal;
+    use ursula_proto::admin::RecoveryPlanRefused;
+    use ursula_proto::admin::RecoveryPlanReport;
+    use ursula_proto::admin::RecoveryPlanRequest;
+    use ursula_proto::admin::ReplicaLogView;
+    use ursula_proto::placement::MembershipLogId;
+    use ursula_proto::placement::RaftLogId;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the rolling restart test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 5);
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    for node in &nodes {
+        wait_readiness_reason(&client, &mut procs, node, None).await;
+    }
+    let (_gateway, gateway) = spawn_gateway(binary, &nodes);
+    let streams: Vec<String> = stream_per_group("rolling")
+        .iter()
+        .map(|stream| format!("{gateway}/rolling/{stream}"))
+        .collect();
+    for stream in &streams {
+        create_stream(&client, &mut procs, stream).await;
+    }
+
+    // 1. A rolling restart under write load.
+    let load = GatewayLoad::start(streams.clone(), "rolling");
+    let manifest = ctl_manifest(&nodes, &[]);
+    for node in &nodes {
+        // `verify-survivors` observes the others once the node is down. It
+        // refuses while a group's survivors still name the stopped node as
+        // leader, so it is retried, as an operator would, until they
+        // elected another.
+        procs.stop(node.id).await;
+        let what = format!("verify-survivors passes without node {}", node.id);
+        eventually(&mut procs, &what, async || {
+            ursula_ctl::quorum::verify_surviving_quorum(
+                &manifest,
+                node.id,
+                &ctl_client(),
+                &ursula_ctl::quorum::QuorumVerificationOptions {
+                    timeout: Duration::from_secs(10),
+                    poll_interval: Duration::from_millis(200),
+                },
+            )
+            .await
+            .map_err(|err| format!("{err:?}"))
+        })
+        .await;
+        procs.start(binary, node);
+        let outcome = ursula_ctl::wait_node_ready(
+            &manifest,
+            &node.ctl(),
+            &ctl_client(),
+            &ursula_ctl::CatchUpOptions {
+                stall_timeout: Duration::from_secs(60),
+                ready_timeout: META_WAIT,
+                poll_interval: Duration::from_millis(200),
+                lag_tolerance: 16,
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("wait for node {}: {err:?}", node.id));
+        assert!(
+            matches!(outcome, ursula_ctl::CatchUpOutcome::Ready),
+            "node {}: {outcome:?}",
+            node.id
+        );
+    }
+    let writes = load.stop().await;
+    assert_only_retryable(&writes, false);
+    for stream in &streams {
+        check_load_read(&client, stream, &writes).await;
+    }
+    wait_leaders_settle(&client, &mut procs, &nodes).await;
+
+    // 2. A group moves onto {x, 4, 5}, x a meta voter.
+    let cluster = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    let (group, from, to) = current_voters(&cluster)
+        .into_iter()
+        .find_map(|(group, voters)| {
+            let kept = voters
+                .iter()
+                .copied()
+                .find(|id| META_VOTERS.contains(id))
+                .unwrap_or(1);
+            let to = BTreeSet::from([kept, 4, 5]);
+            (to != voters).then_some((group, voters, to))
+        })
+        .unwrap_or_else(|| panic!("a group is placed off some {{x, 4, 5}}: {cluster:?}"));
+    let added: Vec<u64> = to.difference(&from).copied().collect();
+    wait_eligible(&mut procs, &nodes, &[], &added).await;
+    move_converges(&nodes, &[], group, Intent::To(voter_set(&to)), &to).await;
+    // The move changed which nodes may lead the group, so the balancer may
+    // still hand leaderships on. A create or append it races can answer
+    // `OUTCOME_UNKNOWN` and still apply: a retried create then answers `200`,
+    // which `create_stream` takes, and a retried append lands twice, while
+    // the cut below must keep exactly one copy. So the writes wait until the
+    // leaders settled again.
+    wait_leaders_settle(&client, &mut procs, &nodes).await;
+    let kept = *to.first().expect("three voters");
+    let cut_stream = format!(
+        "{}/cutover/{}",
+        node_of(&nodes, kept).url(),
+        stream_per_group("cutover")[usize::try_from(group.0).unwrap()]
+    );
+    create_stream(&client, &mut procs, &cut_stream).await;
+    post_until_no_content(&client, &cut_stream, "before-the-cut;").await;
+    let moved = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    let placement = moved.group(group).cloned().expect("the group is placed");
+    let floor =
+        ursula_ctl::recovery::group_floor(group.0, Some(&ClusterView::Bootstrapped(moved.clone())))
+            .expect("a live group's floor");
+    let GroupPlacement::Live { converged_at, .. } = &placement else {
+        panic!("group {group:?} is not live: {placement:?}");
+    };
+    let converged_at = *converged_at;
+    assert_eq!(floor.plan_floor(), PlanFloor::Certified(converged_at));
+
+    // Its voters die together and lose their run state: every replica of
+    // the group comes back gated and stalls.
+    for id in &to {
+        procs.kill(*id);
+    }
+    for id in &to {
+        remove_test_path(
+            node_of(&nodes, *id)
+                .wal
+                .join("raft-log")
+                .join("run-state.bin"),
+        );
+    }
+    for id in &to {
+        procs.start(binary, node_of(&nodes, *id));
+    }
+    let replicas = eventually(
+        &mut procs,
+        "every replica of the group stalls",
+        async || {
+            let mut replicas = Vec::new();
+            for id in &to {
+                let replica = replica_of(&client, node_of(&nodes, *id), group).await?;
+                if replica.recovery_gate != RecoveryGateStatus::Stalled {
+                    return Err(format!("{replica:?}"));
+                }
+                replicas.push(replica);
+            }
+            Ok(replicas)
+        },
+    )
+    .await;
+    let leader = replicas
+        .iter()
+        .max_by_key(|replica| (replica.committed_index, replica.node_id))
+        .expect("three replicas")
+        .clone();
+    let point = leader
+        .committed_index
+        .expect("the leader knows its committed entry");
+    let highest_term = replicas
+        .iter()
+        .map(|replica| replica.current_term)
+        .max()
+        .unwrap_or(0);
+    let request =
+        |replica: &RaftGroupMetrics, floor: PlanFloor, step: PlanStep| RecoveryPlanRequest {
+            point_entry: None,
+            floor,
+            leader: leader.node_id,
+            point,
+            cut: true,
+            step,
+            expected: ReplicaLogView {
+                last_log_index: replica.last_log_index,
+                last_log_term: replica.last_log_term,
+                current_term: replica.current_term,
+            },
+        };
+    let accept = |id: u64| {
+        format!(
+            "{}/__ursula/raft/{}/recovery/accept-unsynced-loss",
+            node_of(&nodes, id).admin(),
+            group.0
+        )
+    };
+
+    // A certified entry above the leader's log: refused, nothing changed.
+    let above = MembershipLogId::new(RaftLogId {
+        index: leader
+            .last_log_index
+            .unwrap_or(point)
+            .max(point)
+            .checked_add(1)
+            .unwrap(),
+        ..converged_at.get()
+    });
+    let response = admin_test_post(&client, accept(leader.node_id))
+        .await
+        .json(&request(
+            &leader,
+            PlanFloor::Certified(above),
+            PlanStep::Lead { highest_term },
+        ))
+        .send()
+        .await
+        .expect("send the plan above the leader's log");
+    assert_ne!(response.status(), reqwest::StatusCode::OK);
+    let refused: RecoveryPlanRefused = response.json().await.expect("typed refusal");
+    assert_eq!(
+        refused.refusal,
+        RecoveryPlanRefusal::FloorNotHeld,
+        "{refused:?}"
+    );
+    let unchanged = replica_of(&client, node_of(&nodes, leader.node_id), group)
+        .await
+        .expect("the leader's replica");
+    assert_eq!(
+        unchanged.recovery_gate,
+        RecoveryGateStatus::Stalled,
+        "{unchanged:?}"
+    );
+    assert_eq!(unchanged.recovery, None, "{unchanged:?}");
+
+    // The plan under the floor the tool reads: the leader first.
+    let response = admin_test_post(&client, accept(leader.node_id))
+        .await
+        .json(&request(&leader, floor.plan_floor(), PlanStep::Lead {
+            highest_term,
+        }))
+        .send()
+        .await
+        .expect("send the plan to its leader");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let report: RecoveryPlanReport = response.json().await.expect("typed report");
+    for member in replicas
+        .iter()
+        .filter(|replica| replica.node_id != leader.node_id)
+    {
+        let response = admin_test_post(&client, accept(member.node_id))
+            .await
+            .json(&request(member, floor.plan_floor(), PlanStep::Follow {
+                leader_term: report.leader_term,
+            }))
+            .send()
+            .await
+            .expect("send the plan to a member");
+        if response.status() != reqwest::StatusCode::OK {
+            // The members that took it may have elected the leader already.
+            let refused: RecoveryPlanRefused = response.json().await.expect("typed refusal");
+            assert_eq!(
+                refused.refusal,
+                RecoveryPlanRefusal::FollowsLeader {
+                    leader: leader.node_id
+                },
+                "{refused:?}"
+            );
+        }
+    }
+    eventually(
+        &mut procs,
+        "the plan is satisfied on every voter",
+        async || {
+            for id in &to {
+                let replica = replica_of(&client, node_of(&nodes, *id), group).await?;
+                let satisfied = replica.recovery.is_none()
+                    && replica
+                        .history
+                        .is_some_and(|history| history.event_index > point);
+                if !satisfied || replica.voter_configs != vec![to.clone()] {
+                    return Err(format!("{replica:?}"));
+                }
+            }
+            Ok(())
+        },
+    )
+    .await;
+    let after = confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    assert_eq!(after.group(group), Some(&placement), "{after:?}");
+    read_until_matches(
+        &client,
+        &format!("{cut_stream}?offset=0&max_bytes=64"),
+        b"before-the-cut;",
+    )
     .await;
 }
 
