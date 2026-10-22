@@ -505,7 +505,14 @@ redundancy. The readiness body includes the full report.
 The chart's StatefulSet always updates by `RollingUpdate` under the `Parallel`
 pod management policy. The controller replaces one pod at a time, from the
 highest ordinal down, and moves on only once the replaced pod passes its
-readiness probe (`GET /__ursula/ready`), which the chart always renders. A
+readiness probe (`GET /__ursula/ready`), which the chart always renders. The
+chart renders `rollingUpdate.partition: 0`, so a pod the controller recreates
+mid-roll takes the update revision: with no `rollingUpdate`, the controller
+creates a missing pod whose ordinal is below the count of old-revision pods at
+the old revision, and under `Parallel` (Kubernetes 1.37 and later) it deletes
+an unready old-revision pod at once, so the two loop. The same release of the
+controller first replaces every pod already unready on the old revision, all
+at once, and a ready pod only while every other pod is ready. A
 replaced voter runs the graceful shutdown on `SIGTERM`: it hands off its
 leaderships, then records a clean shutdown, so its restart reads its journals
 strictly. Between the two it drains its HTTP listeners
@@ -521,11 +528,19 @@ on one whose last answer started before the drain, which closes without
 only once `ursulactl verify-cluster` passes, and the default
 PodDisruptionBudget limits evictions to one server pod at a time.
 
-`Parallel` matters for a listener move (`server.clusterListen`,
-`server.ports.cluster`). Every server pod is deleted at once after the
-`helm upgrade`, and the controller recreates them together. Under
-`OrderedReady` it would recreate one at a time, each waiting for a readiness
-that needs the others.
+`Parallel` matters for a fresh install and for a listener move
+(`server.clusterListen`, `server.ports.cluster`). A fresh cluster forms only
+once every pod is up, and after a listener move every server pod is deleted at
+once and the controller recreates them together. Under `OrderedReady` it would
+create one at a time, each waiting for a readiness that needs the others.
+
+The gateway Deployment's upstream list names every server pod, so a change of
+`server.replicaCount` rolls the gateway pods too. A terminating gateway pod
+keeps serving for `gateway.preStopDelaySeconds` in a preStop hook, so that
+every node's Service proxy stops sending it new connections before it gets
+`SIGTERM`. It then drains through the same `serve_until_shutdown` as a node,
+within `gateway.gracefulShutdownTimeoutSeconds`, which the chart keeps inside
+the pod's grace period.
 
 A pod's node id is its ordinal plus one, so `server.replicaCount` names the
 node ids. A higher count adds nodes that host nothing until groups move onto

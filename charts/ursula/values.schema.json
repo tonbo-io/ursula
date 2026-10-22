@@ -845,10 +845,20 @@
           "minimum": 1,
           "description": "Bytes of request bodies the gateway buffers at once, across requests (--body-budget-bytes, 0.7.6 and later). Unset, the gateway uses 256 MiB or maxRequestBodyBytes plus 32 MiB, whichever is larger."
         },
+        "preStopDelaySeconds": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds a terminating gateway pod keeps serving before SIGTERM, so that Service proxies and load balancers stop sending it new connections before its listener closes. 0 renders no preStop hook."
+        },
         "gracefulShutdownTimeoutSeconds": {
           "type": "integer",
           "minimum": 1,
-          "description": "Maximum graceful shutdown drain time after SIGTERM, in seconds."
+          "description": "Maximum graceful drain time after SIGTERM, in seconds. Requests in flight finish within it, and live reads end at it."
+        },
+        "terminationGracePeriodSeconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Gateway pod grace period. Must exceed preStopDelaySeconds plus gracefulShutdownTimeoutSeconds."
         },
         "extraArgs": {
           "type": "array",
@@ -1067,7 +1077,9 @@
         "responseHeaderTimeoutSeconds",
         "upstreamTcpUserTimeoutSeconds",
         "maxRequestBodyBytes",
+        "preStopDelaySeconds",
         "gracefulShutdownTimeoutSeconds",
+        "terminationGracePeriodSeconds",
         "extraArgs",
         "extraEnv",
         "extraEnvFrom",

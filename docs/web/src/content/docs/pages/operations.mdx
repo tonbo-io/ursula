@@ -230,7 +230,7 @@ Restart one voter at a time:
 
 Do not stop another voter before `wait` returns. Two overlapping outages of a three-voter group leave it without a quorum even if the restarts were issued separately.
 
-With the chart, `helm upgrade` rolls the voters by `RollingUpdate`. The StatefulSet controller replaces one pod at a time, from the highest ordinal down, and moves on only once the replaced pod passes its readiness probe. Each voter hands off its leaderships on `SIGTERM` ([Graceful voter shutdown](#graceful-voter-shutdown)). The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
+With the chart, `helm upgrade` rolls the voters by `RollingUpdate`. The StatefulSet controller replaces one pod at a time, from the highest ordinal down, and moves on only once the replaced pod passes its readiness probe. A pod the controller recreates during the roll, after a crash or an eviction, takes the new revision. On Kubernetes 1.37 and later, the controller first replaces every pod that is already unready on the old revision, all at once, and replaces a ready pod only while every other pod is ready. Each voter hands off its leaderships on `SIGTERM` ([Graceful voter shutdown](#graceful-voter-shutdown)). The controller does not look at the other pods, so start an upgrade only when `ursulactl verify-cluster` passes.
 
 ### Changing a peer address
 

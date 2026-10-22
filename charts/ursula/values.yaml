@@ -387,8 +387,19 @@ gateway:
   # gateway uses 256 MiB or maxRequestBodyBytes plus 32 MiB, whichever is
   # larger. Set, it must be at least maxRequestBodyBytes plus 32 MiB.
   bodyBudgetBytes: null
-  # Maximum graceful shutdown drain time after SIGTERM, in seconds.
-  gracefulShutdownTimeoutSeconds: 3600
+  # Seconds a terminating gateway pod keeps serving before it gets SIGTERM, so
+  # that every node's Service proxy and any load balancer in front stop sending
+  # it new connections before its listener closes. Raise it to the
+  # deregistration delay of a load balancer that targets pod IPs. 0 renders no
+  # preStop hook.
+  preStopDelaySeconds: 10
+  # Maximum graceful drain time after SIGTERM, in seconds: requests in flight
+  # finish within it, and live reads end at it. Keep it above
+  # responseHeaderTimeoutSeconds so that a forwarded write is answered.
+  gracefulShutdownTimeoutSeconds: 45
+  # Pod grace period. Must exceed preStopDelaySeconds plus
+  # gracefulShutdownTimeoutSeconds, or the kubelet kills a drain in progress.
+  terminationGracePeriodSeconds: 60
   # Extra CLI args appended after the generated gateway args.
   extraArgs: []
   # Extra container environment entries for the gateway.
