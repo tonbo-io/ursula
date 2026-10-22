@@ -422,6 +422,7 @@ mod tests {
             .unplaced
             .insert(7, ursula_proto::placement::UnplacedReplica {
                 counts_as_voter: true,
+                last_answer: None,
             });
         assert!(plan_drain(&snapshot, 1).is_empty());
     }
