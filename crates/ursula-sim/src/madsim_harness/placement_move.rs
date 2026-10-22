@@ -2032,8 +2032,10 @@ mod tests {
     use crate::madsim_harness::tests::sim_test_guard;
 
     const SCENARIO: SimScenario = SimScenario::PlacementMove;
-    /// The seeds whose family runs the replay covers.
-    const REPLAYED: std::ops::RangeInclusive<u64> = 1100..=1101;
+    /// The seeds whose family runs the replay covers, both of the shape
+    /// `Meta { nodes: 5 }` under `family`'s draw (the decommission seeds
+    /// replay in `placement_decommission`).
+    const REPLAYED: [u64; 2] = [1102, 1104];
     /// The seed every scripted run uses.
     const SCRIPTED: u64 = 1100;
 

@@ -222,6 +222,17 @@ impl RemovalChecks {
         }
     }
 
+    /// How many of the sweep's DELETEs of `node`'s objects I8's sweep half
+    /// judged so far.
+    pub(super) fn swept(&self, node: u64) -> u64 {
+        self.judged.get(&node).map_or(0, |judged| {
+            judged
+                .sweeps
+                .values()
+                .fold(0, |swept, count| swept.saturating_add(*count))
+        })
+    }
+
     /// Notes that a wait found `node`'s object directory empty.
     pub(super) fn emptied(&mut self, node: u64) {
         self.judged.entry(node).or_default().emptied = true;

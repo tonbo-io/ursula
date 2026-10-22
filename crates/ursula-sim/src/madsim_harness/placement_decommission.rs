@@ -26,10 +26,12 @@
 //!   at a drawn store call, the LIST of a group's objects or before or
 //!   after a DELETE, and that leader is killed there too. The leader after
 //!   it sweeps node 4's directory empty (I5);
-//! - restarts node 4 with its disk before or after the sweep: it opens what
-//!   it holds and closes each once its group answered, and keeps closed a
-//!   replica whose snapshot object the sweep took, since its restore
-//!   finds the object gone (I13);
+//! - restarts node 4 with its disk before or after the sweep. While its
+//!   objects remain it opens what it holds, its left marks gone with its
+//!   process, and closes each once its group answered (I13, which fails a
+//!   restart that opens nothing). Once they are swept it keeps closed for
+//!   5 s every replica whose snapshot object the sweep took, since its
+//!   restore finds the object gone (I13);
 //! - and every group settles live on its placement and every voter reads
 //!   every acknowledged append (I3, I1).
 //!
@@ -224,7 +226,6 @@ pub(super) async fn decommission_family(
     run.sweep(LEAVING, draw.sweep_hold).await;
     if draw.restart == Restart::AfterSweep {
         run.restart_removed(LEAVING).await;
-        run.kept_closed(LEAVING).await;
     }
     run.settle_and_read().await;
     run.removals.judged_the_removals(&mut run.trace, "finished");
@@ -392,14 +393,45 @@ impl Run {
     }
 
     /// Restarts the removed `node` with its disk, its process killed first
-    /// if it runs, and waits until it holds nothing open (I13).
+    /// if it runs. The step names what the sweep had done when the restart
+    /// began: `removed_node_restarted` with no DELETE of the sweep judged,
+    /// `removed_node_restarted_mid_sweep` with some and objects left, and
+    /// `removed_node_restarted_swept` with its directory empty.
+    ///
+    /// While its objects remain, I13 waits until it opens a replica, since
+    /// its new process holds no left mark, so a closed log counts as a
+    /// voter until its group answers (S10), and then until it holds
+    /// nothing open. Once they are gone, it keeps closed ([`Self::kept_closed`]).
     async fn restart_removed(&mut self, node: u64) {
+        const PHASE: &str = "removed_restart";
+        self.observe(PHASE);
+        let swept = self.removals.swept(node);
+        let holding = !self.cluster.objects_of(node).is_empty();
+        let starts = self.cluster.replica_starts(node);
         if self.cluster.runtimes.contains_key(&node) {
             self.cluster.stop_node(node).await;
         }
         self.cluster.start_node(node).await;
-        self.step("removed_node_restarted");
-        self.closes(node).await;
+        self.step(match (swept, holding) {
+            (0, _) => "removed_node_restarted",
+            (_, true) => "removed_node_restarted_mid_sweep",
+            (_, false) => "removed_node_restarted_swept",
+        });
+        if holding {
+            self.until(PHASE, I13, BOUND, move |cluster| {
+                (cluster.replica_starts(node) == starts).then(|| {
+                    format!(
+                        "removed node {node}, restarted with its disk and its snapshot objects, \
+                         opened none of the replicas it holds"
+                    )
+                })
+            })
+            .await;
+            self.closes(node).await;
+        } else {
+            self.kept_closed(node).await;
+            self.removals.closed(node);
+        }
     }
 
     /// I13 for a removed `node` restarted after the sweep: for a while it
@@ -479,19 +511,65 @@ mod tests {
     use crate::madsim_harness::tests::sim_test_guard;
 
     const SCENARIO: SimScenario = SimScenario::PlacementMove;
-    /// Family seeds whose shape is the decommission: 1120 a live one of both
-    /// groups, the meta leader killed while a group moves and the sweep
-    /// held before a DELETE, the node restarted after the sweep, and 1139 a
-    /// dead one of group 1, the meta leader killed while it moves and the
-    /// sweep held before a LIST, the node restarted before the sweep.
-    const DECOMMISSIONS: [u64; 2] = [1120, 1139];
 
-    /// The family's decommission seeds remove node 4 and hold, the same
-    /// way twice per seed.
+    /// A window of a decommission run, as its trace shows it.
+    #[derive(Debug, Clone, Copy)]
+    enum Window {
+        /// The meta leader killed while a group of node 4 moves.
+        MovingKill,
+        /// The new meta leader's sweep held at this store call, and that
+        /// leader killed there.
+        SweepHold(&'static str),
+        /// Node 4 restarted at this step of the sweep.
+        Restarted(&'static str),
+    }
+
+    impl Window {
+        fn reached(self, phase: &str) -> bool {
+            match self {
+                Self::MovingKill => {
+                    phase.starts_with("decommission: the meta leader ")
+                        && phase.ends_with(" is killed")
+                }
+                Self::SweepHold(hold) => {
+                    phase.starts_with("sweep: node ")
+                        && phase.ends_with(&format!("'s sweep holds at {hold}"))
+                }
+                Self::Restarted(step) => phase == step,
+            }
+        }
+    }
+
+    /// Family seeds whose shape is the decommission, with the windows each
+    /// must reach: 1120 a live one of both groups, the meta leader killed
+    /// while a group moves and the sweep held before a DELETE, the node
+    /// restarted after the sweep. 1138 a dead one of group 1, the sweep
+    /// held before a DELETE, the node restarted before any DELETE of the
+    /// sweep: no meta leadership begins between the removal and the
+    /// sweep's kill, so none sweeps first. 1152 a live one of both groups,
+    /// the sweep held before a LIST, the node restarted before the sweep.
+    const DECOMMISSIONS: [(u64, &[Window]); 3] = [
+        (1120, &[
+            Window::MovingKill,
+            Window::SweepHold("BeforeDelete"),
+            Window::Restarted("removed_node_restarted_swept"),
+        ]),
+        (1138, &[
+            Window::SweepHold("BeforeDelete"),
+            Window::Restarted("removed_node_restarted"),
+        ]),
+        (1152, &[
+            Window::SweepHold("List"),
+            Window::Restarted("removed_node_restarted"),
+        ]),
+    ];
+
+    /// The family's decommission seeds remove node 4, reach their windows
+    /// and hold, the same way twice per seed.
     #[test]
     fn placement_move_decommission_seeds_replays() {
         let _guard = sim_test_guard();
-        for seed in DECOMMISSIONS {
+        for (seed, windows) in DECOMMISSIONS {
             let run = || {
                 ThreeNodeRaftSim::run_placement_move_with_controls_report(
                     ThreeNodeRaftSimConfig::new(
@@ -516,6 +594,12 @@ mod tests {
                 .any(|event| matches!(event, SimEvent::PlacementMoveMetaHeld { .. }));
             assert!(removed, "seed {seed}: node 4 is removed and swept");
             assert!(held, "seed {seed}: the run ends held");
+            for window in windows {
+                let reached = first.outcome.trace.events.iter().any(|event| {
+                    matches!(event, SimEvent::FaultApplied { phase } if window.reached(phase))
+                });
+                assert!(reached, "seed {seed}: the run reaches {window:?}");
+            }
         }
     }
 }

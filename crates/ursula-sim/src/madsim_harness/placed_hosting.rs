@@ -167,6 +167,19 @@ impl StartedGates {
         u64::try_from(started).unwrap_or(u64::MAX)
     }
 
+    /// How many replicas of `node_id` started so far, in any of its
+    /// processes.
+    fn of_node(&self, node_id: u64) -> u64 {
+        let started = self
+            .0
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .filter(|(_, node, _)| *node == node_id)
+            .count();
+        u64::try_from(started).unwrap_or(u64::MAX)
+    }
+
     /// The nodes whose replicas of each group ran `Initialize`.
     fn initializers(&self) -> BTreeMap<u32, Vec<u64>> {
         let mut initializers: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
@@ -850,6 +863,13 @@ impl MetaCluster {
             .get(&node_id)
             .map(|node| node.host.replicas())
             .unwrap_or_default()
+    }
+
+    /// How many replicas `node_id` started in the run, each start counted
+    /// once it opened, so a replica that opened and closed between two
+    /// observations still counts.
+    pub(super) fn replica_starts(&self, node_id: u64) -> u64 {
+        self.placed().started.of_node(node_id)
     }
 
     /// `node_id`'s current replica of `group`, if it runs one.
