@@ -601,6 +601,7 @@ impl<T: RecoveryTransport> MetaDrivers for ReplicaDrivers<T> {
             peers: replica.registry.peer_cluster().clone(),
             election: replica.election.clone(),
             status: self.reconcile.clone(),
+            steps: replica.registry.reconcile_step_counter(),
         };
         replica.tasks.push(crate::rt::spawn(shell.run(
             self.recovery.interval,

@@ -190,7 +190,7 @@ The maintenance report names `unplaced_member` for a group whose Raft membership
 raft.peers lists no node 4, a member of a Raft group: not dialing it; list the node in raft.peers or remove it from the group's membership
 ```
 
-The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group leader never removes such a member by itself. List the node in `[[raft.peers]]` again, or send the group's placed voters to the group's leader with `POST /__ursula/raft/{group}/membership?voters=` ([Admin endpoints](/docs/operations#admin-endpoints)). The endpoint replaces the voter set and removes every learner outside it in the same change, so a member left behind as a learner goes too.
+The node keeps serving, but maintenance readiness fails, so `ursulactl drain` and `wait` stop. The group's leader removes such a learner once the group is seeded or its voters equal its placement, and such a voter only by a move or by leaving a joint configuration ([Admin endpoints](/docs/operations#admin-endpoints)). List the node in `[[raft.peers]]` again if it should stay.
 
 ### `raft WAL directory … holds data without a format marker`
 

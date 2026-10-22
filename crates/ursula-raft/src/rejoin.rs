@@ -3559,5 +3559,6 @@ pub use reconcile::MembershipTargetSource;
 pub use reconcile::NoPeerGates;
 pub use reconcile::PeerGates;
 pub(crate) use reconcile::ReconcileShell;
+pub(crate) use reconcile::ReconcileSteps;
 pub use reconcile::TargetRead;
 pub(crate) use reconcile::initial_status;

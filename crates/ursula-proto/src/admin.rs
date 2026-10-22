@@ -1011,22 +1011,8 @@ pub struct PurgeResponse {
     pub purged_index: Option<u64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipResponse {
-    pub raft_group_id: u32,
-    #[serde(default)]
-    pub voter_ids: BTreeSet<u64>,
-    pub log_index: Option<u64>,
-    pub current_leader: Option<u64>,
-    pub changed: bool,
-    pub reason: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PurgeQuery {
     pub upto: u64,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipQuery {
-    pub voters: String,
 }
 
 /// Shared operational metrics. Diagnostic extensions are intentionally ignored
@@ -1049,7 +1035,7 @@ pub struct NodeMetrics {
     pub raft_maintenance: Option<RaftMaintenanceReport>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaftGroupMetrics {
     pub raft_group_id: u64,
     pub node_id: u64,

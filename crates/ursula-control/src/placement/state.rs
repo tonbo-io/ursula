@@ -131,6 +131,16 @@ impl Cluster {
             .count();
         u32::try_from(moving).unwrap_or(u32::MAX)
     }
+
+    /// When the oldest move in progress started (display only, the
+    /// proposer's clock), `None` while no group moves.
+    pub fn oldest_move_since_ms(&self) -> Option<u64> {
+        self.groups
+            .iter()
+            .filter_map(|(_, placement)| placement.moving())
+            .map(|moving| moving.since_ms)
+            .min()
+    }
 }
 
 /// Every group's placement, keyed by group id, encoded as the plain map.

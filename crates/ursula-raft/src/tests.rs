@@ -1466,54 +1466,6 @@ async fn the_recovery_barrier_asks_configured_voters_and_members_by_id() {
     shutdown_all(&engines).await;
 }
 
-/// Replacing the voter set removes every learner outside it: a node that
-/// configuration no longer lists, left behind as a learner, leaves with it,
-/// so the group does not report `unplaced_member` forever.
-#[cfg(not(madsim))]
-#[tokio::test]
-async fn replacing_the_voters_removes_learners_outside_them() {
-    use openraft::rt::WatchReceiver;
-    let (_registry, engines, leader_id, _wal_roots) =
-        build_three_node_cluster("ursula-replace-voters-test", None).await;
-    let leader = &engines[usize::try_from(leader_id).unwrap() - 1];
-    leader
-        .raft
-        .add_learner(4, EmptyNode {}, false)
-        .await
-        .expect("add a learner configuration does not list");
-    assert_eq!(
-        leader
-            .raft
-            .metrics()
-            .borrow_watched()
-            .membership_config
-            .membership()
-            .learner_ids()
-            .collect::<Vec<_>>(),
-        vec![4]
-    );
-    leader
-        .read_barrier
-        .owner()
-        .replace_voters(BTreeSet::from([1, 2, 3]))
-        .await
-        .expect("replace the voter set");
-    leader
-        .raft
-        .wait(Some(Duration::from_secs(5)))
-        .metrics(
-            |metrics| {
-                let membership = metrics.membership_config.membership();
-                membership.learner_ids().next().is_none()
-                    && membership.voter_ids().collect::<BTreeSet<_>>() == BTreeSet::from([1, 2, 3])
-            },
-            "the learner left with the voter change",
-        )
-        .await
-        .expect("the voter change removes the learner");
-    shutdown_all(&engines).await;
-}
-
 #[cfg(not(madsim))]
 #[tokio::test]
 async fn three_node_openraft_group_replicates_group_writes() {

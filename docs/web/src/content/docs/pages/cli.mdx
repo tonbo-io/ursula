@@ -50,7 +50,7 @@ Each invocation remembers the first server instance it observes on each node. A 
 
 ## The admin plane
 
-Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/membership/leader-transfer, maintenance drain, cold-flush trigger, bucket purge) plus metrics and usage are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics and usage.
+Nodes carry **no cluster-mutation surface on the network**. The mutating operator endpoints (raft snapshot/purge/leader-transfer, placement moves and the move limit, maintenance drain, cold-flush trigger, bucket purge) plus metrics and usage are served on a separate **admin plane** bound to `server.admin_listen`, which defaults to loopback (`127.0.0.1:4438`). The public client plane (`:4437`) serves only stream traffic and read-only metrics and usage.
 
 Metrics and readiness use an explicit `metrics_url` when configured, then `client_url`, then `admin_url`. The client and admin planes serve them. The Raft `http_url` is never used for them, since a cluster listener serves neither. Set `metrics_url` to reach a node's metrics through a separate forward, for example to inspect a replacement before its cluster DNS name resolves. Mutating verbs always use `admin_url`.
 

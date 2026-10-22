@@ -52,7 +52,6 @@ mod staged_parts;
 mod wal_disk;
 
 use std::collections::BTreeMap;
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -1263,6 +1262,10 @@ pub fn admin_router(state: HttpState) -> Router {
                 placement_status::PLACEMENT_PATH,
                 get(placement_status::admin_placement_status),
             )
+            .route(
+                placement_status::GROUP_ROUTE,
+                get(placement_status::admin_group_status),
+            )
             .route(READINESS_PATH, get(readiness))
             .route("/__ursula/usage", get(bucket_usage))
             .with_state(state),
@@ -1301,10 +1304,6 @@ fn admin_ops_router(state: HttpState) -> Router {
         )
         .route("/__ursula/raft/{target}/purge", post(trigger_raft_purge))
         .route(
-            "/__ursula/raft/{target}/membership",
-            post(change_raft_membership),
-        )
-        .route(
             "/__ursula/raft/{target}/leader/transfer/{node_id}",
             post(transfer_raft_leader),
         )
@@ -1324,6 +1323,14 @@ fn admin_ops_router(state: HttpState) -> Router {
         .route(
             placement_status::REPLACE_DISK_ROUTE,
             post(placement_status::replace_disk),
+        )
+        .route(
+            placement_status::MOVE_ROUTE,
+            post(placement_status::request_move),
+        )
+        .route(
+            placement_status::MOVE_LIMIT_ROUTE,
+            post(placement_status::set_move_limit),
         );
     #[cfg(feature = "jemalloc-prof")]
     let router = router.route("/__ursula/debug/heap-profile", get(heap_profile));
@@ -1707,6 +1714,10 @@ pub fn client_router_with_admission(state: HttpState, admission: IngressAdmissio
         .route(
             placement_status::PLACEMENT_PATH,
             get(placement_status::placement_status),
+        )
+        .route(
+            placement_status::GROUP_ROUTE,
+            get(placement_status::group_status),
         )
         .route("/{bucket}", put(create_bucket))
         // The bare path (the removed latest-snapshot redirect and the removed
@@ -2965,110 +2976,6 @@ pub(crate) async fn trigger_raft_purge(
         .into_response()
 }
 
-/// The answer to a membership request OpenRaft refused before appending it
-/// while no leader is known: `503` with `Retry-After`, as while a new leader
-/// waits for its quorum.
-fn membership_no_leader_response(operation: &str) -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(axum::http::header::RETRY_AFTER, "1")],
-        format!("{operation}: no leader with a live quorum; retry"),
-    )
-        .into_response()
-}
-
-pub(crate) async fn change_raft_membership(
-    State(state): State<HttpState>,
-    Path(target): Path<String>,
-    axum::extract::Query(query): axum::extract::Query<ursula_proto::admin::MembershipQuery>,
-) -> Response {
-    let raft_group_id = match data_group_target(&target, "membership") {
-        Ok(group) => group,
-        Err(response) => return *response,
-    };
-    let voters = match parse_voter_ids(&query.voters) {
-        Ok(voters) => voters,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
-    };
-    let (raft_group_id, raft) = match resolve_raft_group(&state, raft_group_id) {
-        Ok(resolved) => resolved,
-        Err(response) => return *response,
-    };
-    let metrics = raft.metrics().borrow_watched().clone();
-    if metrics.current_leader != Some(metrics.id) {
-        return (
-            StatusCode::CONFLICT,
-            axum::Json(ursula_proto::admin::MembershipResponse {
-                raft_group_id: raft_group_id.0,
-                current_leader: metrics.current_leader,
-                changed: false,
-                reason: Some("not leader".to_owned()),
-                voter_ids: BTreeSet::new(),
-                log_index: None,
-            }),
-        )
-            .into_response();
-    }
-
-    match raft.replace_voters(voters.clone()).await {
-        Ok(response) => (
-            StatusCode::OK,
-            axum::Json(ursula_proto::admin::MembershipResponse {
-                raft_group_id: raft_group_id.0,
-                voter_ids: voters,
-                log_index: Some(response.log_id.index()),
-                changed: true,
-                current_leader: None,
-                reason: None,
-            }),
-        )
-            .into_response(),
-        Err(err) => match err.api_error() {
-            // Refused before anything was appended: retry on the leader.
-            Some(openraft::error::ClientWriteError::ForwardToLeader(forward)) => {
-                match forward.leader_id {
-                    Some(leader) => (
-                        StatusCode::CONFLICT,
-                        axum::Json(ursula_proto::admin::MembershipResponse {
-                            raft_group_id: raft_group_id.0,
-                            current_leader: Some(leader),
-                            changed: false,
-                            reason: Some("not leader".to_owned()),
-                            voter_ids: BTreeSet::new(),
-                            log_index: None,
-                        }),
-                    )
-                        .into_response(),
-                    None => membership_no_leader_response("change raft membership"),
-                }
-            }
-            _ => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("change raft membership: {err}"),
-            )
-                .into_response(),
-        },
-    }
-}
-
-pub(crate) fn parse_voter_ids(raw: &str) -> Result<BTreeSet<u64>, String> {
-    let mut voters = BTreeSet::new();
-    for part in raw.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err("voters contains an empty node id".to_owned());
-        }
-        let node_id = part
-            .parse::<u64>()
-            .map_err(|err| format!("invalid voter id '{part}': {err}"))?;
-        voters.insert(node_id);
-    }
-    if voters.is_empty() {
-        return Err("voters must not be empty".to_owned());
-    }
-    Ok(voters)
-}
-
 pub(crate) async fn transfer_raft_leader(
     State(state): State<HttpState>,
     Path((target, node_id)): Path<(String, u64)>,
@@ -3459,19 +3366,6 @@ fn data_group_target(raw: &str, route: &str) -> Result<RaftGroupId, Box<Response
                 .into_response(),
         )),
     }
-}
-
-/// Resolves the raft registry and looks up the live group handle, the
-/// preamble of the data-group raft admin routes: `400` without a registry
-/// and `404` for a group the node does not run.
-fn resolve_raft_group(
-    state: &HttpState,
-    raft_group_id: RaftGroupId,
-) -> Result<(RaftGroupId, OwnerRaftHandle), Box<Response>> {
-    let Some(registry) = state.raft_registry() else {
-        return Err(no_raft_registry());
-    };
-    resolve_registered_raft_group(registry, raft_group_id)
 }
 
 /// The answer of a meta route on a node that runs no meta replica: the

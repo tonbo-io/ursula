@@ -4,10 +4,12 @@
 //! meta replica and placement view at once, and derives the view's
 //! [`ClusterView`] stage ([`cluster_view`]). A confirmed status
 //! ([`MetaStatusReader::confirmed_placement_status`]) derives it from a view
-//! a meta read barrier confirmed current. The reader also carries the
-//! placement routes' writes ([`MetaStatusReader::release_root`]) and the
-//! data group leaders' reports ([`MetaStatusReader::report_converged`]) to
-//! the meta group.
+//! a meta read barrier confirmed current, and a group's status
+//! ([`MetaStatusReader::group_status`]) joins its placement with this node's
+//! replica. The reader also carries the placement routes' writes
+//! ([`MetaStatusReader::release_root`], [`MetaStatusReader::request_move`],
+//! [`MetaStatusReader::set_move_limit`]) and the data group leaders'
+//! reports ([`MetaStatusReader::report_converged`]) to the meta group.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -18,17 +20,24 @@ use ursula_control::ClusterView;
 use ursula_control::ConfirmedView;
 use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
+use ursula_control::ControlError;
 use ursula_control::ControlPlaneState;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::MetaRole;
+use ursula_control::MoveLimit;
+use ursula_control::PlacementApiError;
+use ursula_control::PlacementGroupStatus;
 use ursula_control::PlacementStatus;
 use ursula_control::PlacementView;
 use ursula_control::RegistrationStatus;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::RootId;
+use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
 
+use super::api::refused_read;
 use super::confirm::MetaBarrierError;
 use super::genesis_driver::GenesisStatus;
 use super::handle::MetaHandle;
@@ -163,6 +172,74 @@ impl MetaStatusReader {
         self.meta
             .submit(ControlCommand::ReleaseRoot { node, root })
             .await
+    }
+
+    /// Starts, retargets or cancels a move of `group` to `to` through the
+    /// meta leader, while its placement is at `expected`
+    /// (`ControlCommand::RequestMove`). The command's time is this node's
+    /// clock.
+    pub async fn request_move(
+        &self,
+        group: RaftGroupId,
+        expected: PlacementEpoch,
+        to: VoterSet,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.meta
+            .submit(ControlCommand::RequestMove {
+                group,
+                expected,
+                to,
+                now_ms: ursula_runtime::unix_time_ms(),
+            })
+            .await
+    }
+
+    /// Sets the move limit through the meta leader
+    /// (`ControlCommand::SetMoveLimit`).
+    pub async fn set_move_limit(&self, limit: MoveLimit) -> Result<ControlApplied, MetaWriteError> {
+        self.meta
+            .submit(ControlCommand::SetMoveLimit { limit })
+            .await
+    }
+
+    /// `group`'s placement in this node's view, confirmed by a meta read
+    /// barrier first when `confirmed`, and this node's replica of it. A view
+    /// that shows no bootstrapped cluster or no such group refuses as the
+    /// meta state machine would.
+    pub async fn group_status(
+        &self,
+        group: RaftGroupId,
+        confirmed: bool,
+    ) -> Result<PlacementGroupStatus, PlacementApiError> {
+        let view = if confirmed {
+            Arc::new(self.meta.confirm_view().await?.view().clone())
+        } else {
+            self.registry.placement_watch().current()
+        };
+        let cluster = match &*view.state {
+            ControlPlaneState::Bootstrapped(cluster) => cluster,
+            ControlPlaneState::Forming { .. } => {
+                return Err(refused_read(ControlError::NotBootstrapped));
+            }
+            ControlPlaneState::FormationCut => {
+                return Err(refused_read(ControlError::FormationCut));
+            }
+        };
+        let placement = cluster
+            .group(group)
+            .ok_or_else(|| refused_read(ControlError::UnknownGroup { group }))?
+            .clone();
+        let replica = self
+            .registry
+            .metrics_snapshot()
+            .iter()
+            .find(|metrics| metrics.raft_group_id == group.0)
+            .map(crate::RaftGroupMetricsSnapshot::to_admin);
+        Ok(PlacementGroupStatus {
+            node: self.node,
+            placement,
+            replica,
+        })
     }
 
     /// Reports through the meta leader that `group`'s leader, proven,

@@ -483,17 +483,6 @@ fn runtime_error_response_uses_structured_context_for_stream_closed_header() {
 }
 
 #[test]
-fn parses_membership_voter_ids() {
-    assert_eq!(
-        parse_voter_ids("3,1,2").expect("parse voters"),
-        BTreeSet::from([1, 2, 3])
-    );
-    parse_voter_ids("").expect_err("an empty voter list must be rejected");
-    parse_voter_ids("1,,2").expect_err("an empty node id between commas must be rejected");
-    parse_voter_ids("1,node-2").expect_err("a non-numeric voter id must be rejected");
-}
-
-#[test]
 fn query_parser_decodes_membership_and_learner_values() {
     let query = parse_query(Some(
         "voters=1%2C2%2C3&addr=http%3A%2F%2Fnode-3%3A4437&blocking=false",
@@ -4818,9 +4807,13 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .registry
         .get(RaftGroupId(0))
         .expect("late learner group");
+    // The leader takes node 3's address from `raft.peers`.
     let learner_added = leader_raft
-        // The leader takes node 3's address from `raft.peers`.
-        .add_learner(3, true)
+        .change_membership_if(
+            openraft::ChangeMembers::AddNodes(BTreeMap::from([(3, openraft::EmptyNode {})])),
+            true,
+            Vec::new(),
+        )
         .await
         .expect("add late learner over gRPC");
     late_learner
@@ -4845,27 +4838,15 @@ async fn run_static_grpc_late_learner_snapshot_over_tcp(raft_root: Option<PathBu
         .await
         .expect("wait for late learner catch-up");
 
-    let promote = admin_test_request(
-        &client,
-        reqwest::Method::POST,
-        format!("{leader_base}/__ursula/raft/0/membership?voters=1,2,3"),
-    )
-    .await
-    .send()
-    .await
-    .expect("promote late learner");
-    assert_eq!(promote.status(), StatusCode::OK);
-    let promote_body = promote.text().await.expect("promote body");
-    assert!(
-        promote_body.contains("\"voter_ids\":[1,2,3]"),
-        "promote response should include final voter set: {promote_body}"
-    );
-    let promote_json: serde_json::Value =
-        serde_json::from_str(&promote_body).expect("decode promote response");
-    let promote_index = promote_json
-        .get("log_index")
-        .and_then(serde_json::Value::as_u64)
-        .expect("promote log index");
+    let promoted = leader_raft
+        .change_membership_if(
+            openraft::ChangeMembers::AddVoterIds(BTreeSet::from([3])),
+            false,
+            Vec::new(),
+        )
+        .await
+        .expect("promote late learner");
+    let promote_index = promoted.log_id.index();
     late_learner
         .wait(Some(Duration::from_secs(10)))
         .applied_index_at_least(Some(promote_index), "late learner applied voter promotion")

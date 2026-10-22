@@ -74,8 +74,9 @@ only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 
 The meta Raft group forms over the nodes of `raft.peers` and records the
 cluster's bootstrap and every group's placement. Every node that runs Raft
-runs a replica of it, unless its meta journal or replica is damaged. The
-server never moves a group to another node or changes its voter count.
+runs a replica of it, unless its meta journal or replica is damaged. A
+group moves to other nodes only on an operator's move request, which keeps
+its voter count (section 3).
 `GET /__ursula/placement`, on the client and the admin listener, reports what
 the node's meta replica applied, its role and leader, and its registration
 (`crates/ursula-raft/src/meta/status.rs`). With `?confirmed=true`, on the
@@ -89,8 +90,7 @@ drain, hands its meta leadership away too. A node that sheds only for cold
 health keeps it, so an object store outage that every node sheds for does
 not pass meta from voter to voter. A data group's leader reports the voters
 it formed on to the meta group, which makes the group `Live` (section 2).
-The admin routes (section 3) can change a group's OpenRaft membership
-directly. Nothing changes it back.
+No admin route changes a data group's OpenRaft membership directly.
 
 ## 2. Replica loss and rejoin
 
@@ -229,19 +229,39 @@ binding, so the old process falls silent first.
 The admin plane binds `server.admin_listen`, which is pod loopback by default
 (`admin_router` in `crates/ursula/src/lib.rs`). Its per-group routes name a
 `{target}`, a data group's id or `meta`, the meta group
-(`parse_raft_target`). The membership and purge routes serve data groups only
-and answer `400` for `meta`:
+(`parse_raft_target`). The purge route serves data groups only and answers
+`400` for `meta`. The placement routes
+(`crates/ursula/src/placement_status.rs`) submit to the meta group:
 
 | Route | Purpose |
 | --- | --- |
-| `POST /__ursula/raft/{target}/membership?voters=` | Change the voter set. Only the leader accepts it, others answer `409`. |
 | `POST /__ursula/raft/{target}/leader/transfer/{node}` | Transfer leadership. |
 | `GET /__ursula/raft/{target}/quorum` | Confirm a fresh quorum prefix for this group. |
 | `POST /__ursula/raft/{target}/self-election` | Start an election on this replica while its term is unchanged. |
 | `POST /__ursula/raft/{target}/recovery/accept-unsynced-loss` | Take a recovery plan for a stalled group. Its `floor` names the plane (`meta`, or `seeded` or `certified` for a data group), and a floor of the other plane is refused with `floor_other_plane` before the plan runs. A `certified` floor names the membership entry the group's last convergence certified: the plan's leader refuses unless it holds it (`floor_not_held`), and every replica that holds it keeps it through a cut. |
 | `POST /__ursula/raft/{target}/snapshot`, `.../purge` | Build a snapshot or purge the log. |
 | `POST`/`DELETE /__ursula/leadership-shed/maintenance` | Set or clear the maintenance-drain mark. |
+| `POST /__ursula/placement/groups/{group}/move` | Move a live group to `to`, as many voters as it has, while its placement is at `expected` (`RequestMove`). A move of a moving group retargets it, and a move to its source cancels it. |
+| `POST /__ursula/placement/move-limit` | Set how many groups may move at once (`SetMoveLimit`). |
 | `POST /__ursula/placement/nodes/{node}/replace-disk` | Release the root the node id is bound to, given as `{"expect_root": R}` (section 2). |
+
+`GET /__ursula/placement/groups/{group}`, on the client and the admin
+listener, answers the group's placement in the node's view, confirmed by a
+meta read barrier with `?confirmed=true` on the admin listener only, and the
+node's replica of the group as its metrics show it, with the reconcile
+shell's status. Every refusal of a placement route is one
+`PlacementApiError`, built from the meta write's error or the view's
+refusal (`crates/ursula-raft/src/meta/api.rs`), with its reason, whether the
+write may have applied, and for a stale placement the placement as
+`current`. It answers `404` for an unknown group or node, `409` for another
+refusal of the meta state machine, `503` while the meta group cannot answer,
+and `504` when the write may have applied. A move's leader adds its learners
+and waits for their recovery gates, which it does not ask other nodes for
+yet, so a move waits as `gate_unknown`. The shells count their steps in
+`ursula.placement.reconcile_steps_total{step, outcome}`, and
+`ursula.placement.reconcile_waiting{reason}` and
+`ursula.placement.oldest_move_age_seconds` show why replicas wait and how
+long the oldest move runs.
 
 Every server generates a fresh process incarnation at startup and publishes
 it on all listeners. Every mutating admin request, and the quorum proof, must

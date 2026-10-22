@@ -4,6 +4,8 @@
 //! route renders the same refusal the same way: the reason, whether the
 //! write may have applied, and the rendered source chain as `message`.
 
+use ursula_control::ControlError;
+use ursula_control::GroupPlacement;
 use ursula_control::PlacementApiError;
 use ursula_control::PlacementApiReason;
 use ursula_proto::placement::WriteEffect;
@@ -34,7 +36,19 @@ impl From<MetaBarrierError> for PlacementApiError {
     }
 }
 
-/// A meta write that did not answer with its result.
+/// A placement read the node's view refuses as the meta state machine
+/// would refuse a command: an unknown group, or no bootstrapped cluster.
+pub(crate) fn refused_read(error: ControlError) -> PlacementApiError {
+    PlacementApiError {
+        message: ErrorChain(&error).to_string(),
+        reason: PlacementApiReason::Refused(error),
+        write_effect: WriteEffect::NotApplied,
+        current: None,
+    }
+}
+
+/// A meta write that did not answer with its result. A refusal for a stale
+/// placement carries the group's placement as `current`.
 impl From<MetaWriteError> for PlacementApiError {
     fn from(error: MetaWriteError) -> Self {
         let reason = match &error {
@@ -53,10 +67,16 @@ impl From<MetaWriteError> for PlacementApiError {
                 PlacementApiReason::LeaderRefused { leader: *origin }
             }
         };
+        let current = match &error {
+            MetaWriteError::Refused(ControlError::StalePlacement { current, .. }) => {
+                Some(GroupPlacement::clone(current))
+            }
+            _ => None,
+        };
         Self {
             reason,
             write_effect: error.write_effect(),
-            current: None,
+            current,
             message: ErrorChain(&error).to_string(),
         }
     }

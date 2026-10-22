@@ -1,11 +1,18 @@
 //! `GET /__ursula/placement` (design 11.1): this node's placement status
 //! (`ursula_control::PlacementStatus`), on the client and the admin
-//! listener. `?confirmed=true`, a meta read barrier, is served on the admin
-//! listener only.
+//! listener. `GET /__ursula/placement/groups/{group}` is one group's
+//! placement with this node's replica of it
+//! (`ursula_control::PlacementGroupStatus`), on both listeners too.
+//! `?confirmed=true`, a meta read barrier, is served on the admin listener
+//! only.
 //!
-//! `POST /__ursula/placement/nodes/{node}/replace-disk` (admin listener,
-//! [`replace_disk`]) releases the root a node id is bound to, the
-//! `ursulactl node replace-disk` verb.
+//! The admin listener's writes go to the meta leader:
+//! `POST /__ursula/placement/groups/{group}/move` ([`request_move`]) starts,
+//! retargets or cancels a move, `POST /__ursula/placement/move-limit`
+//! ([`set_move_limit`]) sets the move limit, and
+//! `POST /__ursula/placement/nodes/{node}/replace-disk` ([`replace_disk`])
+//! releases the root a node id is bound to, the `ursulactl node
+//! replace-disk` verb.
 //!
 //! Every refusal of a placement route answers through
 //! [`placement_api_error_response`], one status per reason.
@@ -19,23 +26,41 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use ursula_control::ControlApplied;
 use ursula_control::ControlError;
+use ursula_control::MoveLimitRequest;
+use ursula_control::MoveLimitResponse;
+use ursula_control::MoveRequest;
+use ursula_control::MoveResponse;
 use ursula_control::PlacementApiError;
 use ursula_control::PlacementApiReason;
 use ursula_control::ReplaceDiskRequest;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::WriteEffect;
+use ursula_shard::RaftGroupId;
 
 use crate::HttpState;
 
 pub(crate) const PLACEMENT_PATH: &str = "/__ursula/placement";
+pub(crate) const GROUP_ROUTE: &str = "/__ursula/placement/groups/{group}";
+pub(crate) const MOVE_ROUTE: &str = "/__ursula/placement/groups/{group}/move";
+pub(crate) const MOVE_LIMIT_ROUTE: &str = "/__ursula/placement/move-limit";
 pub(crate) const REPLACE_DISK_ROUTE: &str = "/__ursula/placement/nodes/{node}/replace-disk";
 
-/// The query of `GET /__ursula/placement`.
+/// The query of the placement reads.
 #[derive(Debug, Default, serde::Deserialize)]
 pub(crate) struct PlacementQuery {
     /// Confirm the view by a meta read barrier first (admin listener only).
     #[serde(default)]
     confirmed: bool,
+}
+
+/// The client listener's answer to `?confirmed=true`: a barrier is the
+/// admin listener's.
+fn confirmed_on_client() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "`confirmed=true` is served on the admin listener only",
+    )
+        .into_response()
 }
 
 /// The client listener's placement status: the current view, never a
@@ -45,11 +70,7 @@ pub(crate) async fn placement_status(
     Query(query): Query<PlacementQuery>,
 ) -> Response {
     if query.confirmed {
-        return (
-            StatusCode::BAD_REQUEST,
-            "`confirmed=true` is served on the admin listener only",
-        )
-            .into_response();
+        return confirmed_on_client();
     }
     match state.meta().status_reader() {
         Some(reader) => Json(reader.placement_status()).into_response(),
@@ -75,6 +96,78 @@ pub(crate) async fn admin_placement_status(
     }
 }
 
+/// The client listener's status of one group, from the current view.
+pub(crate) async fn group_status(
+    state: State<HttpState>,
+    group: Path<u32>,
+    Query(query): Query<PlacementQuery>,
+) -> Response {
+    if query.confirmed {
+        return confirmed_on_client();
+    }
+    admin_group_status(state, group, Query(query)).await
+}
+
+/// The admin listener's status of one group, from a view a meta read
+/// barrier confirmed when the query asks. A group the view does not place
+/// answers `404` (`unknown_group`), a view before Bootstrap `503`.
+pub(crate) async fn admin_group_status(
+    State(state): State<HttpState>,
+    Path(group): Path<u32>,
+    Query(query): Query<PlacementQuery>,
+) -> Response {
+    let Some(reader) = state.meta().status_reader() else {
+        return placement_api_error_response(no_meta_runtime());
+    };
+    match reader
+        .group_status(RaftGroupId(group), query.confirmed)
+        .await
+    {
+        Ok(status) => Json(status).into_response(),
+        Err(error) => placement_api_error_response(error),
+    }
+}
+
+/// Starts, retargets or cancels a move of `group` through the meta leader,
+/// and answers the group's new placement key. A placement no longer at
+/// `expected` answers `409` (`stale_placement`) with the placement as
+/// `current`.
+pub(crate) async fn request_move(
+    State(state): State<HttpState>,
+    Path(group): Path<u32>,
+    Json(request): Json<MoveRequest>,
+) -> Response {
+    let Some(reader) = state.meta().status_reader() else {
+        return placement_api_error_response(no_meta_runtime());
+    };
+    match reader
+        .request_move(RaftGroupId(group), request.expected, request.to)
+        .await
+    {
+        Ok(ControlApplied::MoveAccepted { since }) => Json(MoveResponse { since }).into_response(),
+        Ok(other) => other_command_response("move", &other),
+        Err(error) => placement_api_error_response(error.into()),
+    }
+}
+
+/// Sets the move limit through the meta leader, and answers the limit
+/// applied.
+pub(crate) async fn set_move_limit(
+    State(state): State<HttpState>,
+    Json(request): Json<MoveLimitRequest>,
+) -> Response {
+    let Some(reader) = state.meta().status_reader() else {
+        return placement_api_error_response(no_meta_runtime());
+    };
+    match reader.set_move_limit(request.limit).await {
+        Ok(ControlApplied::MoveLimitSet { limit }) => {
+            Json(MoveLimitResponse { limit }).into_response()
+        }
+        Ok(other) => other_command_response("move-limit", &other),
+        Err(error) => placement_api_error_response(error.into()),
+    }
+}
+
 /// Releases `expect_root`, the root node `node` is bound to, through the
 /// meta leader, and answers the node's record with its released root. A
 /// slot on another root answers `409` (`stale_root`), an unknown or
@@ -92,19 +185,24 @@ pub(crate) async fn replace_disk(
         .await
     {
         Ok(ControlApplied::RootReleased(record)) => Json(record).into_response(),
-        Ok(other) => {
-            tracing::error!(
-                ?other,
-                "replace-disk: the meta group answered another command"
-            );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "the meta group answered another command",
-            )
-                .into_response()
-        }
+        Ok(other) => other_command_response("replace-disk", &other),
         Err(error) => placement_api_error_response(error.into()),
     }
+}
+
+/// The answer when the meta group answered a placement write as another
+/// command: a bug, never a refusal.
+fn other_command_response(route: &str, other: &ControlApplied) -> Response {
+    tracing::error!(
+        route,
+        ?other,
+        "the meta group answered a placement write as another command"
+    );
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the meta group answered another command",
+    )
+        .into_response()
 }
 
 /// The refusal of a node that runs no meta runtime: the zero-config

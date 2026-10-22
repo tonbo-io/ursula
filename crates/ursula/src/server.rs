@@ -757,6 +757,211 @@ mod tests {
         ));
     }
 
+    /// The placement routes of a single durable node: a group's status
+    /// joins its placement with the replica, whose leader reports its
+    /// convergence and then shows its reconcile shell converged, on both
+    /// listeners. A move answers each kernel refusal by its status, a stale
+    /// placement with the placement as `current`, the move limit applies,
+    /// writes need the process incarnation, and the membership route is
+    /// gone.
+    #[tokio::test]
+    async fn the_placement_routes_answer_a_group_status_moves_and_the_move_limit() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        use ursula_control::ControlError;
+        use ursula_control::GroupPlacement;
+        use ursula_control::PlacementApiError;
+        use ursula_control::PlacementApiReason;
+        use ursula_control::PlacementGroupStatus;
+        use ursula_proto::placement::NodeId;
+        use ursula_proto::placement::PlacementEpoch;
+        use ursula_proto::placement::ReconcileState;
+        use ursula_proto::placement::VoterSet;
+        let dir = crate::tests::TestWalRoot::new();
+        let mut config = ursula_config::UrsulaConfig::default();
+        config.runtime.core_count = 1;
+        config.raft.group_count = Some(1);
+        config.raft.node_id = 7;
+        config.raft.wal.path = Some(dir.path().to_owned());
+        config.raft.wal.fsync = Some(ursula_config::WalFsync::Never);
+        config.raft.wal.min_available_size = ursula_config::HumanSize::bytes(0);
+        super::complete_temporary_node(&mut config);
+        let wal_dir = crate::ClusterWal::resolve(&config.raft.wal).unwrap();
+        let state = super::init_state(&config, Some(wal_dir)).await.unwrap();
+        let raft_wal = state.raft_wal().cloned().expect("a disk WAL starts");
+        let client =
+            crate::client_router_with_admission(state.clone(), crate::IngressAdmission::default());
+        let admin = crate::admin_router(state.clone());
+        let me = NodeId::new(7);
+        // Group 0's leader reports its seeded voters, so the group turns
+        // live, and its shell then shows the settled target converged.
+        let status = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let (code, body) = get_json(&client, "/__ursula/placement/groups/0").await;
+                if code == StatusCode::OK {
+                    let status: PlacementGroupStatus = serde_json::from_value(body).unwrap();
+                    let converged = status
+                        .replica
+                        .as_ref()
+                        .and_then(|replica| replica.reconcile.as_ref())
+                        .is_some_and(|reconcile| reconcile.state == ReconcileState::Converged);
+                    if matches!(status.placement, GroupPlacement::Live { .. }) && converged {
+                        return status;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("group 0 turns live and its shell converges");
+        assert_eq!(status.node, me);
+        assert_eq!(status.placement.current_voters(), &VoterSet::single(me));
+        let replica = status.replica.as_ref().expect("the node hosts group 0");
+        assert_eq!(
+            (replica.raft_group_id, replica.current_leader),
+            (0, Some(7))
+        );
+        let since = status.placement.since();
+        // Only the admin listener confirms the view by a barrier.
+        let (code, _) = get_json(&client, "/__ursula/placement/groups/0?confirmed=true").await;
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        let (code, body) = get_json(&admin, "/__ursula/placement/groups/0?confirmed=true").await;
+        assert_eq!(code, StatusCode::OK);
+        let confirmed: PlacementGroupStatus = serde_json::from_value(body).unwrap();
+        assert_eq!(confirmed.placement, status.placement);
+        let refusal = |code: StatusCode, body: serde_json::Value, expected: StatusCode| {
+            assert_eq!(code, expected, "{body}");
+            serde_json::from_value::<PlacementApiError>(body).expect("a typed refusal")
+        };
+        let (code, body) = get_json(&client, "/__ursula/placement/groups/3").await;
+        let unknown = refusal(code, body, StatusCode::NOT_FOUND);
+        assert!(matches!(
+            unknown.reason,
+            PlacementApiReason::Refused(ControlError::UnknownGroup { .. })
+        ));
+
+        let incarnation = state.process_incarnation.to_string();
+        let post = |uri: &str, body: serde_json::Value, incarnation: Option<&str>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json");
+            if let Some(incarnation) = incarnation {
+                request =
+                    request.header(ursula_proto::admin::PROCESS_INCARNATION_HEADER, incarnation);
+            }
+            let request = request
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let admin = admin.clone();
+            async move {
+                let response = admin.oneshot(request).await.unwrap();
+                let code = response.status();
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                (
+                    code,
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null),
+                )
+            }
+        };
+        let request = |expected: PlacementEpoch, to: &[u64]| {
+            serde_json::to_value(ursula_control::MoveRequest {
+                expected,
+                to: VoterSet::new(to.iter().copied().map(NodeId::new).collect()).unwrap(),
+            })
+            .unwrap()
+        };
+        let move_0 = "/__ursula/placement/groups/0/move";
+        // A write needs the incarnation of the process it observed.
+        let (code, _) = post(move_0, request(since, &[8]), None).await;
+        assert_eq!(code, StatusCode::PRECONDITION_REQUIRED);
+        let stale_epoch = PlacementEpoch::new(ursula_proto::placement::MetaLogId::new(
+            ursula_proto::placement::RaftLogId {
+                term: 0,
+                leader: me,
+                index: 0,
+            },
+        ));
+        let (code, body) = post(move_0, request(stale_epoch, &[8]), Some(&incarnation)).await;
+        let stale = refusal(code, body, StatusCode::CONFLICT);
+        assert!(matches!(
+            stale.reason,
+            PlacementApiReason::Refused(ControlError::StalePlacement { .. })
+        ));
+        assert_eq!(stale.current.as_ref(), Some(&status.placement));
+        // Every other refusal carries no placement.
+        let (code, body) = post(move_0, request(since, &[8]), Some(&incarnation)).await;
+        let unknown = refusal(code, body, StatusCode::NOT_FOUND);
+        assert!(matches!(
+            unknown.reason,
+            PlacementApiReason::Refused(ControlError::UnknownNode { node }) if node == NodeId::new(8)
+        ));
+        assert_eq!(unknown.current, None);
+        let (code, body) = post(move_0, request(since, &[7]), Some(&incarnation)).await;
+        let no_change = refusal(code, body, StatusCode::CONFLICT);
+        assert!(matches!(
+            no_change.reason,
+            PlacementApiReason::Refused(ControlError::NoChange { .. })
+        ));
+        let (code, body) = post(move_0, request(since, &[7, 8]), Some(&incarnation)).await;
+        let factor = refusal(code, body, StatusCode::CONFLICT);
+        assert!(matches!(
+            factor.reason,
+            PlacementApiReason::Refused(ControlError::ReplicationFactorChange {
+                current: 1,
+                requested: 2,
+                ..
+            })
+        ));
+        let (code, body) = post(
+            "/__ursula/placement/groups/3/move",
+            request(since, &[7]),
+            Some(&incarnation),
+        )
+        .await;
+        let unknown = refusal(code, body, StatusCode::NOT_FOUND);
+        assert!(matches!(
+            unknown.reason,
+            PlacementApiReason::Refused(ControlError::UnknownGroup { .. })
+        ));
+
+        // The move limit applies, and a confirmed view shows it.
+        let limit = ursula_control::MoveLimit::new(2);
+        let (code, body) = post(
+            "/__ursula/placement/move-limit",
+            serde_json::to_value(ursula_control::MoveLimitRequest { limit }).unwrap(),
+            Some(&incarnation),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let answer: ursula_control::MoveLimitResponse = serde_json::from_value(body).unwrap();
+        assert_eq!(answer.limit, limit);
+        let (code, body) = get_json(&admin, "/__ursula/placement?confirmed=true").await;
+        assert_eq!(code, StatusCode::OK);
+        let placement: ursula_control::PlacementStatus = serde_json::from_value(body).unwrap();
+        let ursula_control::ClusterView::Bootstrapped(cluster) = placement.view else {
+            panic!("the confirmed view is bootstrapped");
+        };
+        assert_eq!(cluster.params().max_concurrent_moves, limit);
+
+        // The membership route is removed: it answers as an unknown route.
+        let (code, _) = post(
+            "/__ursula/raft/0/membership?voters=7",
+            serde_json::Value::Null,
+            Some(&incarnation),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND);
+        assert!(matches!(
+            super::shutdown_raft_wal(&state.runtime, state.meta().take(), Some(&raft_wal)).await,
+            super::WalShutdown::Clean(_)
+        ));
+    }
+
     /// The admin recovery route takes `meta` as its target and hands the
     /// plan to the meta replica, and each plane refuses a plan floor of the
     /// other one before the plan runs.

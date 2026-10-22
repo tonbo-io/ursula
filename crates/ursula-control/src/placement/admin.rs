@@ -14,6 +14,7 @@ use std::collections::BTreeSet;
 
 use serde::Deserialize;
 use serde::Serialize;
+use ursula_proto::admin::RaftGroupMetrics;
 use ursula_proto::admin::required_option;
 use ursula_proto::placement::ClusterStage;
 use ursula_proto::placement::GenesisClaim;
@@ -190,6 +191,28 @@ pub struct MoveRequest {
     pub to: VoterSet,
 }
 
+/// The answer to an accepted move: the group's new placement key, which a
+/// later move or cancel of the group names as `expected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveResponse {
+    pub since: PlacementEpoch,
+}
+
+/// `GET /__ursula/placement/groups/{group}`: the group's placement in the
+/// node's view, confirmed by a meta read barrier with `?confirmed=true`
+/// (admin listener only), and the node's replica of the group as its
+/// metrics show it: its membership, its leader and, under `reconcile`, what
+/// its membership reconcile shell does, the step a leader takes toward the
+/// placement or why it waits. `replica` is `null` when the node hosts no
+/// replica of the group.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlacementGroupStatus {
+    pub node: NodeId,
+    pub placement: GroupPlacement,
+    #[serde(deserialize_with = "required_option")]
+    pub replica: Option<RaftGroupMetrics>,
+}
+
 /// `POST /__ursula/placement/nodes/{node}/replace-disk`: release the root
 /// the node id is bound to when it is still `expect_root`, once that root's
 /// disk is revoked. The answer is the node's record with its released root.
@@ -199,9 +222,17 @@ pub struct ReplaceDiskRequest {
     pub expect_root: RootId,
 }
 
-/// `POST /__ursula/placement/move-limit`.
+/// `POST /__ursula/placement/move-limit`: set the most groups that may
+/// move at once ([`MoveLimit`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MoveLimitRequest {
+    pub limit: MoveLimit,
+}
+
+/// The answer to `POST /__ursula/placement/move-limit`: the limit the meta
+/// group applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MoveLimitResponse {
     pub limit: MoveLimit,
 }
 

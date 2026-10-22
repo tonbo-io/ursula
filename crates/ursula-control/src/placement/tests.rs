@@ -32,10 +32,13 @@ use super::MetaReplicaStatus;
 use super::MetaRole;
 use super::MoveLimit;
 use super::MoveLimitRequest;
+use super::MoveLimitResponse;
 use super::MoveRequest;
+use super::MoveResponse;
 use super::NodeEligibility;
 use super::PlacementApiError;
 use super::PlacementApiReason;
+use super::PlacementGroupStatus;
 use super::PlacementStatus;
 use super::RegistrationStatus;
 use super::ReplaceDiskRequest;
@@ -990,6 +993,19 @@ fn every_root_round_trips_through_messagepack_and_json() {
     });
     round_trip(&MoveLimitRequest {
         limit: MoveLimit::new(2),
+    });
+    round_trip(&MoveLimitResponse {
+        limit: MoveLimit::new(3),
+    });
+    round_trip(&MoveResponse {
+        since: PlacementEpoch::new(meta(4, 5)),
+    });
+    // A replica's metrics round-trip in `ursula-proto` and through the
+    // route's end-to-end test.
+    round_trip(&PlacementGroupStatus {
+        node: node(6),
+        placement: cluster.group(RaftGroupId(2)).cloned().unwrap(),
+        replica: None,
     });
     for error in sample_errors() {
         round_trip(&PlacementApiError {
