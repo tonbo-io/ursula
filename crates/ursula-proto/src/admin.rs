@@ -119,9 +119,12 @@ pub struct RecoveryPlanRequest {
     pub floor: PlanFloor,
     /// With a cut whose `point` is above the plan leader's own commit
     /// marker: the id of the entry at `point`, which another replica reported
-    /// committed (#613). The leader keeps its log up to `point` only if it
-    /// holds exactly that entry; every other member cuts to its own commit
-    /// marker as always.
+    /// committed (#613), or under a `certified` floor the certified entry.
+    /// The leader keeps its log up to `point` only if it holds exactly that
+    /// entry. Every other member cuts to its own commit marker, except that
+    /// under a `certified` floor a member whose marker lies below the
+    /// certified entry and that holds it at or below `point` keeps its log
+    /// up to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub point_entry: Option<EntryId>,
     /// This replica's log as the tool read it.

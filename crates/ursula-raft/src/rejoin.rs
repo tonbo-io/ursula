@@ -785,7 +785,7 @@ pub enum RecoveryGateError {
     },
     #[error(
         "{group}'s recovery plan carries the floor {floor:?} of the other plane: a data \
-         group takes `seeded`, the meta group `meta`"
+         group takes `seeded` or `certified`, the meta group `meta`"
     )]
     FloorOtherPlane {
         group: RaftTarget,

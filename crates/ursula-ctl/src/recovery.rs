@@ -137,6 +137,23 @@ impl CertifiedMembership {
         self.entry.get().index
     }
 
+    /// Whether `member`'s log holds the certified entry, by the rule the
+    /// server's plan accept checks exactly (`certified_held` in
+    /// `ursula-raft`): its last log id is at least the entry's in both term
+    /// and index. A log that reaches the entry's index at a lower last term
+    /// holds another entry there, an uncommitted tail of an older leader.
+    /// Under Raft's log matching and leader completeness the two agree: a
+    /// last entry of the entry's term or a later one was written by a
+    /// leader that held the committed entry.
+    fn held_by(&self, member: &PlanMember) -> bool {
+        let id = self.entry.get();
+        member
+            .log
+            .last_log_index
+            .is_some_and(|last| last >= id.index)
+            && member.log.last_log_term.is_some_and(|term| term >= id.term)
+    }
+
     /// The entry's id as a plan's `point_entry` names it.
     fn entry_id(&self) -> EntryId {
         let id = self.entry.get();
@@ -148,11 +165,11 @@ impl CertifiedMembership {
 
     /// `members` as a plan under this certified membership sees them. The
     /// certified entry is committed, so a membership older than it is no
-    /// newest committed membership: a replica whose log does not reach the
-    /// entry reports only older ones, and one whose log reaches it but whose
-    /// commit marker lies below it keeps the entry through a cut, so it
-    /// keeps the certified membership. Replicas whose marker reaches the
-    /// entry are seen as they report themselves.
+    /// newest committed membership: a replica whose log does not hold the
+    /// entry ([`Self::held_by`]) reports only older ones, and one that holds
+    /// it but whose commit marker lies below it keeps the entry through a
+    /// cut, so it keeps the certified membership. Replicas whose marker
+    /// reaches the entry are seen as they report themselves.
     fn view<'a>(&self, members: &'a [PlanMember]) -> Cow<'a, [PlanMember]> {
         let index = self.index();
         let reaches = |at: Option<u64>| at.is_some_and(|at| at >= index);
@@ -164,7 +181,7 @@ impl CertifiedMembership {
                 .iter()
                 .map(|member| {
                     let mut member = member.clone();
-                    if !reaches(member.log.last_log_index) {
+                    if !self.held_by(&member) {
                         member.voter_configs.clear();
                         member.committed_voter_configs.clear();
                     } else if !reaches(member.committed) {
@@ -432,11 +449,12 @@ pub enum PlanError {
     #[error("node {leader} leads the group: it has a live leader and needs no plan")]
     HasLeader { leader: u64 },
     /// The group's last convergence certified a membership entry, and no
-    /// voter of that membership the plan may count has a log that reaches
-    /// it: every plan would drop it (design 7.4).
+    /// voter of that membership the plan may count has a log that holds it
+    /// (its last log id reaches the entry's term and index): every plan
+    /// would drop it (design 7.4).
     #[error(
         "the group's last convergence certified membership entry {certified}, but no voter of \
-         that membership the tool reached with a vote floor has a log that reaches it"
+         that membership the tool reached with a vote floor has a log that holds it"
     )]
     CertifiedNotReached { certified: MembershipLogId },
 }
@@ -476,7 +494,7 @@ pub fn plan_group(members: &[PlanMember]) -> Result<GroupPlan, PlanError> {
 ///   too (design 7.4), and the planner sees the replicas as such a plan
 ///   leaves them ([`CertifiedMembership::view`]). A cut whose leader's
 ///   marker lies below the entry keeps every log up to it, led by a voter
-///   of that membership whose log reaches it, so the point is never below
+///   of that membership whose log holds it, so the point is never below
 ///   it. Without such a voter the plan is refused as
 ///   [`PlanError::CertifiedNotReached`]. Commit markers are not synced on
 ///   their own, so after a full power loss every marker may lie below a
@@ -546,13 +564,9 @@ pub fn plan_group_excluding(
     // Design 7.4: only a replica that holds the certified entry may lead,
     // and the cut keeps it, so the plan's point is never below it.
     if let Some(certified) = certified
-        && !planned.iter().any(|member| {
-            certified.voters.contains(&member.node_id)
-                && member
-                    .log
-                    .last_log_index
-                    .is_some_and(|last| last >= certified.index())
-        })
+        && !planned
+            .iter()
+            .any(|member| certified.voters.contains(&member.node_id) && certified.held_by(member))
     {
         return Err(PlanError::CertifiedNotReached {
             certified: certified.entry,
@@ -640,8 +654,9 @@ pub fn plan_group_excluding(
         });
         // Design 7.4: the certified entry is committed too. The membership
         // at it is the certified one, whose voters the view names, so the
-        // leader is one of them whose log reaches it, whatever its marker
-        // keeps. The leader refuses unless it holds that entry.
+        // leader is one of them whose log holds it, whatever its marker
+        // keeps. A log that reaches its index at a lower last term holds an
+        // older leader's tail there, and as the leader it would refuse.
         let certified_raise = certified.and_then(|certified| {
             let index = certified.index();
             if marker.is_some_and(|committed| committed >= index) {
@@ -649,7 +664,7 @@ pub fn plan_group_excluding(
             }
             let leader = candidates()
                 .filter(|member| certified.voters.contains(&member.node_id))
-                .filter(reaches(index))
+                .filter(|member| certified.held_by(member))
                 .max_by_key(|member| (member.committed, member.node_id))?;
             Some((index, true, leader.node_id, certified.entry_id()))
         });
@@ -2799,6 +2814,72 @@ mod tests {
         }
         assert!(matches!(
             super::plan_group_excluding(&members, &Default::default(), &certified_at_20()),
+            Err(PlanError::CertifiedNotReached { certified }) if certified.get().index == 20
+        ));
+    }
+
+    /// Design 7.4: holding the certified entry takes its term too, as the
+    /// server's `certified_held` checks the exact log id. Certified voters
+    /// {1, 2, 4} with the entry at index 20 written by node 2 at term 4.
+    /// Node 1, an old term-3 leader, has an uncommitted tail to 30 and its
+    /// marker at 18. Node 2 holds the entry with its marker at 15. Node 4
+    /// does not answer. A planner that read "my log reaches index 20" as
+    /// holding the entry would see node 1 keep the certified membership and
+    /// raise the cut from node 1's greater marker, and node 1 would refuse
+    /// with `floor_not_held`. Node 2 leads, and two of the three certified
+    /// voters take it.
+    #[test]
+    fn a_certified_voter_with_a_longer_tail_at_a_lower_term_is_not_chosen() {
+        use ursula_proto::placement::MembershipLogId;
+        use ursula_proto::placement::NodeId;
+        use ursula_proto::placement::RaftLogId;
+        let floor = super::Floor::Certified(super::CertifiedMembership {
+            entry: MembershipLogId::new(RaftLogId {
+                term: 4,
+                leader: NodeId::new(2),
+                index: 20,
+            }),
+            voters: [1, 2, 4].into(),
+        });
+        let members = [(1, (30, 3), 18), (2, (20, 4), 15)]
+            .into_iter()
+            .map(|(node_id, last, marker)| {
+                let mut stalled = member(
+                    node_id,
+                    Some(last),
+                    5,
+                    Some(marker),
+                    RecoveryGateStatus::Stalled,
+                );
+                stalled.voter_configs = vec![[1, 2, 4].into()];
+                stalled
+            })
+            .collect::<Vec<_>>();
+        let plan = super::plan_group_excluding(&members, &Default::default(), &floor)
+            .expect("a certified plan");
+        assert_eq!(
+            (plan.leader, plan.point, plan.cut, plan.point_entry),
+            (
+                2,
+                20,
+                true,
+                Some(ursula_proto::admin::EntryId {
+                    term: 4,
+                    node_id: 2
+                })
+            )
+        );
+        assert_eq!(super::electorate(&plan, &members, &floor), vec![
+            [1, 2, 4].into()
+        ]);
+        // Without the certified voter that holds the entry, node 1's longer
+        // log does not stand in for it, with node 4 answering short of it.
+        let mut without_two = members.clone();
+        let mut short = member(4, Some((19, 4)), 5, Some(15), RecoveryGateStatus::Stalled);
+        short.voter_configs = vec![[1, 2, 4].into()];
+        without_two.push(short);
+        assert!(matches!(
+            super::plan_group_excluding(&without_two, &[2].into(), &floor),
             Err(PlanError::CertifiedNotReached { certified }) if certified.get().index == 20
         ));
     }
