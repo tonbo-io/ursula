@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -308,50 +307,6 @@ impl MetricsClient {
                 "maintenance-drain {} at node {} returned {}: {}",
                 if enabled { "mark" } else { "clear" },
                 node.id,
-                status,
-                body
-            ))
-        }
-    }
-
-    pub async fn change_membership(
-        &self,
-        leader: &NodeInfo,
-        raft_group_id: u64,
-        voters: &BTreeSet<u64>,
-    ) -> Result<()> {
-        let path = format!("/__ursula/raft/{raft_group_id}/membership");
-        let url = leader.admin_url.join(&path).with_context(|| {
-            format!(
-                "compose membership url at leader node {} for group {}",
-                leader.id, raft_group_id
-            )
-        })?;
-        let voter_list = voters
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
-        let query = ursula_proto::admin::MembershipQuery { voters: voter_list };
-        let resp = self
-            .admin_request(leader, Method::POST, url.clone())
-            .await?
-            .query(&query)
-            .send()
-            .await
-            .with_context(|| format!("POST {url}"))?;
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        if status.is_success() {
-            let _: ursula_proto::admin::MembershipResponse =
-                serde_json::from_str(&body).context("decode admin response")?;
-            Ok(())
-        } else {
-            Err(anyhow!(
-                "change membership at leader node {} (group {} voters={:?}) returned {}: {}",
-                leader.id,
-                raft_group_id,
-                voters,
                 status,
                 body
             ))

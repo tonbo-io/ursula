@@ -482,6 +482,36 @@ fn membership_outcome(
     }
 }
 
+/// How many membership steps this node's reconcile shells finished, by step
+/// and outcome, the meta group's included. One per node, in its registry,
+/// so it only grows. Both keys are bounded: a step kind and a
+/// [`StepOutcome`] name.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReconcileSteps(
+    Arc<std::sync::Mutex<std::collections::HashMap<(StepKind, &'static str), u64>>>,
+);
+
+impl ReconcileSteps {
+    fn record(&self, step: StepKind, outcome: &'static str) {
+        let mut counts = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let count = counts.entry((step, outcome)).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// Each step kind and outcome name with its count.
+    pub(crate) fn snapshot(&self) -> Vec<(StepKind, &'static str, u64)> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(|((step, outcome), count)| (*step, *outcome, *count))
+            .collect()
+    }
+}
+
 /// A confirmation the shell holds: the stamp, and the vote it was taken
 /// under on both sides of the barrier.
 #[derive(Debug, Clone, Copy)]
@@ -520,6 +550,8 @@ where SM: RaftStateMachine<C, SnapshotData = SnapshotData> + 'static
     pub(crate) peers: PeerCluster,
     pub(crate) election: ElectionPolicy,
     pub(crate) status: watch::Sender<ReconcileStatus>,
+    /// The node's step counts, which each finished step counts into.
+    pub(crate) steps: ReconcileSteps,
 }
 
 /// A fresh status: waiting as no leader.
@@ -1055,6 +1087,7 @@ where
             StepOutcome::ProofFailed(error) => Some(error.to_string()),
             _ => None,
         };
+        self.steps.record(pending.kind, outcome.name());
         tracing::info!(
             target: "ursula::placement",
             plane = self.replica.plane().as_str_name(),

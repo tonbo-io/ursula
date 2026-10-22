@@ -84,8 +84,17 @@ curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "h
 # Hand leadership of one group to another voter (used by `ursulactl drain`)
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/raft/42/leader/transfer/2
 
-# Replace the voter set of one group (call on the group's current leader)
-curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST "http://127.0.0.1:4438/__ursula/raft/42/membership?voters=1,2,3"
+# Read group 42's placement and this node's replica of it, with what its reconcile shell does
+curl --fail http://127.0.0.1:4438/__ursula/placement/groups/42
+
+# Move group 42 to nodes 2, 3 and 4, while its placement is still at the key the status shows
+curl --fail-with-body -H "x-ursula-process-incarnation: ${process_incarnation}" -H "content-type: application/json" \
+  -d '{"expected": {"term": 3, "leader": 1, "index": 57}, "to": [2, 3, 4]}' \
+  -X POST http://127.0.0.1:4438/__ursula/placement/groups/42/move
+
+# Let at most two groups move at once
+curl --fail-with-body -H "x-ursula-process-incarnation: ${process_incarnation}" -H "content-type: application/json" \
+  -d '{"limit": 2}' -X POST http://127.0.0.1:4438/__ursula/placement/move-limit
 
 # Put this node into maintenance drain / lift it again
 curl --fail -H "x-ursula-process-incarnation: ${process_incarnation}" -X POST http://127.0.0.1:4438/__ursula/leadership-shed/maintenance
@@ -110,15 +119,15 @@ curl --fail-with-body -H "x-ursula-process-incarnation: ${process_incarnation}" 
 
 ```
 
-Each `/__ursula/raft/{target}/...` route takes a data group's id or `meta`, the meta group. The snapshot, leader-transfer, quorum, self-election and recovery routes act on this node's meta replica for `meta`, and answer `404` when the node runs none. The purge and membership routes serve data groups only and answer `400` for `meta`. The meta group answers as `raft_group_id` `0` in their bodies.
+Each `/__ursula/raft/{target}/...` route takes a data group's id or `meta`, the meta group. The snapshot, leader-transfer, quorum, self-election and recovery routes act on this node's meta replica for `meta`, and answer `404` when the node runs none. The purge route serves data groups only and answers `400` for `meta`. The meta group answers as `raft_group_id` `0` in their bodies.
 
 The snapshot endpoint answers once the group has a snapshot of everything it had applied when the request arrived. It waits while a build of the group runs or other snapshot builds hold all of the node's build permits, and answers `503` with `Retry-After: 1` when no build of the group can start within 10 seconds (see [Manually trigger a snapshot](/docs/troubleshooting#manually-trigger-a-snapshot)).
 
 The leader-transfer endpoint refuses with `409 Conflict` if the receiving node isn't the current leader and `400 Bad Request` if the target isn't a voter. This is why `ursulactl` is the safer way to chain these calls: it consults metrics first.
 
-The group leader keeps every group at its configured voters: if the membership endpoint drops a configured voter, the leader adds it back as a learner and promotes it again once it has caught up (see [Recovering after a host crash](#recovering-after-a-host-crash)). Membership changes are for repair, not for shrinking a group.
+Placement decides which nodes vote in each group, and only a move changes it. `GET /__ursula/placement/groups/{group}` answers the group's placement in the node's view, with `?confirmed=true` on the admin plane after a meta read barrier, and the node's replica of the group as its metrics show it, `null` when the node hosts none. On the group's leader, the replica's `reconcile` says which membership step the leader takes toward the placement or why it waits. The client plane serves the same read without `confirmed`.
 
-The membership endpoint has the same leader-only contract: it answers `409 Conflict` (with the current leader's id in the body) when the receiving node does not lead the group, and `400 Bad Request` without a non-empty `voters` query parameter. On success it returns the log index at which the new voter set was committed. It replaces the whole voter set in one call, so include every node that should remain a voter. It also removes every learner outside the new voters in the same change.
+`POST /__ursula/placement/groups/{group}/move` starts a move of a live group to the voters `to`, as many as it has now, when its placement is still at `expected`, the `since` of the placement the status shows. A move of a moving group retargets it, and a move back to its source cancels it. The meta leader takes the request from any node, and the answer is the group's new `since`. `POST /__ursula/placement/move-limit` sets how many groups may move at once. Every refusal names its reason and whether the write may have applied: `404` for an unknown group or node, `409` for a refusal of the meta group, such as `stale_placement` with the placement as `current`, `move_limit` or `no_change`, `503` while the meta group cannot answer, and `504` when the write may have applied, after which a confirmed status shows whether it did. The group's leader adds the new voters as learners. It changes the voters only once each learner caught up and its recovery gate is open, and this build does not yet ask other nodes for their gates, so a move waits there with `gate_unknown`.
 
 ### Maintenance drain
 

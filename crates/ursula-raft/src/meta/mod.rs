@@ -56,7 +56,8 @@
 //!   bound on its size, and the trigger that snapshots the meta group on
 //!   its journal's age rule.
 //! - [`status`]: this node's placement status
-//!   ([`status::MetaStatusReader`]) and its view's stage.
+//!   ([`status::MetaStatusReader`]), its view's stage, and why a group's
+//!   status answered none ([`status::GroupStatusError`]).
 //! - [`state_machine`]: the meta state machine ([`MetaStateMachine`]): its
 //!   dispatch of the meta log, its inline snapshot record and the views it
 //!   publishes.

@@ -231,6 +231,7 @@ impl RecoveryGate {
                 peers: registry.peer_cluster().clone(),
                 election: registry.election_policy(),
                 status,
+                steps: registry.reconcile_step_counter(),
             };
             self.push(crate::rt::spawn(
                 shell.run(config.interval, registry.follower_log_reversion_counter()),

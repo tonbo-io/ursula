@@ -3,7 +3,6 @@
 //! a sender. Jobs are polled concurrently so a waiting write cannot prevent
 //! the AppendEntries or vote that lets it complete.
 
-use std::collections::BTreeSet;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -370,16 +369,6 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         self.call(move |raft| async move { raft.get_snapshot().await })
             .await?
     }
-    pub async fn add_learner(
-        &self,
-        id: u64,
-        blocking: bool,
-    ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
-        // A new leader proposes only once a quorum acknowledged it.
-        crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
-        self.call(move |raft| async move { raft.add_learner(id, EmptyNode {}, blocking).await })
-            .await?
-    }
     /// Proposes the membership change `members` only while every one of
     /// `preconditions` holds (OpenRaft's `change_membership_if`), once this
     /// leader's first quorum acknowledgement arrived, as every other
@@ -401,41 +390,12 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         })
         .await?
     }
-    /// Makes `voters` the group's voter set and removes every learner
-    /// outside it, in one joint change, so a member that configuration no
-    /// longer lists leaves with it. Nothing adds a voter removed here back:
-    /// the reconcile shell changes voters only toward a move's target.
-    pub async fn replace_voters(
-        &self,
-        voters: BTreeSet<u64>,
-    ) -> Result<ClientWriteResponse<C>, RaftError<C, ClientWriteError<C>>> {
-        // A new leader proposes only once a quorum acknowledged it.
-        crate::forward::await_quorum_ack_on(self.metrics(), self.handoff_ack_window).await;
-        let learners = self
-            .metrics()
-            .borrow_watched()
-            .membership_config
-            .membership()
-            .learner_ids()
-            .filter(|learner| !voters.contains(learner))
-            .collect::<BTreeSet<_>>();
-        let change = if learners.is_empty() {
-            ChangeMembers::ReplaceAllVoters(voters)
-        } else {
-            ChangeMembers::Batch(vec![
-                ChangeMembers::ReplaceAllVoters(voters),
-                ChangeMembers::RemoveNodes(learners),
-            ])
-        };
-        self.call(move |raft| async move { raft.change_membership(change, false).await })
-            .await?
-    }
     /// Initializes the group with the voters `members`, for a unit test
     /// that runs no bootstrap driver.
     #[cfg(all(test, not(madsim)))]
     pub(crate) async fn initialize(
         &self,
-        members: BTreeSet<u64>,
+        members: std::collections::BTreeSet<u64>,
     ) -> Result<(), RaftError<C, InitializeError<C>>> {
         self.call(move |raft| async move { raft.initialize(members).await })
             .await?

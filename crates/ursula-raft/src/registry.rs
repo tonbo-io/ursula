@@ -222,6 +222,9 @@ pub struct RaftGroupHandleRegistry {
     /// How often each follower lost entries it had acknowledged to a leader
     /// on this node ([`Self::follower_log_reversions`]).
     follower_log_reversions: crate::rejoin::FollowerLogReversions,
+    /// The membership steps this node's reconcile shells finished
+    /// ([`Self::reconcile_steps`]).
+    reconcile_steps: crate::rejoin::ReconcileSteps,
     /// This node's running meta replica, apart from every structure keyed
     /// by group id, where its group 0 would meet data group 0. A restart
     /// swaps it, and an RPC resolves it per call.
@@ -262,6 +265,7 @@ impl Default for RaftGroupHandleRegistry {
             placement: crate::meta::watch::PlacementPublisher::for_peers(peer_cluster.clone()),
             peer_cluster,
             follower_log_reversions: Default::default(),
+            reconcile_steps: Default::default(),
             meta: Arc::default(),
             group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
             meta_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
@@ -884,10 +888,23 @@ impl RaftGroupHandleRegistry {
         self.follower_log_reversions.snapshot()
     }
 
-    /// The counter behind [`Self::follower_log_reversions`], which the heal
-    /// drivers of this node's groups count into.
+    /// The counter behind [`Self::follower_log_reversions`], which the
+    /// reconcile shells of this node's groups count into.
     pub(crate) fn follower_log_reversion_counter(&self) -> crate::rejoin::FollowerLogReversions {
         self.follower_log_reversions.clone()
+    }
+
+    /// How many membership steps this node's reconcile shells finished
+    /// since start, by step kind and outcome name, the meta group's
+    /// included.
+    pub fn reconcile_steps(&self) -> Vec<(ursula_proto::placement::StepKind, &'static str, u64)> {
+        self.reconcile_steps.snapshot()
+    }
+
+    /// The counter behind [`Self::reconcile_steps`], which the reconcile
+    /// shells of this node's replicas count into.
+    pub(crate) fn reconcile_step_counter(&self) -> crate::rejoin::ReconcileSteps {
+        self.reconcile_steps.clone()
     }
 
     /// The recovery gates of [`Self::recovery_gates`] that are not open,

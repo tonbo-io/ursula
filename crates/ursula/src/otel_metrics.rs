@@ -143,8 +143,11 @@ pub(crate) fn register_recovery_gates(registry: ursula_raft::RaftGroupHandleRegi
 
 /// Register the meta group's instruments: `ursula.meta.leader` (1 while
 /// this node leads meta), `ursula.meta.applied_index` (the last meta entry
-/// this node's view includes), `ursula.placement.moving_groups` and
-/// `ursula.placement.retirements_pending` (from that view), and the meta
+/// this node's view includes), `ursula.placement.moving_groups`,
+/// `ursula.placement.retirements_pending` and
+/// `ursula.placement.oldest_move_age_seconds` (from that view), the
+/// reconcile shells' `ursula.placement.reconcile_waiting` and
+/// `ursula.placement.reconcile_steps_total` (design 11.4), and the meta
 /// journal's own WAL counters, `ursula.meta.wal.batches` and
 /// `ursula.meta.wal.records`, from `wal`.
 pub(crate) fn register_meta(
@@ -186,6 +189,65 @@ pub(crate) fn register_meta(
             }
         })
         .build();
+    let oldest = registry.clone();
+    let _ = meter
+        .u64_observable_gauge("ursula.placement.oldest_move_age_seconds")
+        .with_description(
+            "Seconds since the oldest move in progress started, in this node's placement view, \
+             by the clock of the node that requested it",
+        )
+        .with_callback(move |observer| {
+            if let Some(since_ms) = oldest
+                .placement_watch()
+                .current()
+                .cluster()
+                .and_then(ursula_control::Cluster::oldest_move_since_ms)
+            {
+                let age_ms = ursula_runtime::unix_time_ms().saturating_sub(since_ms);
+                observer.observe(age_ms / 1_000, &[]);
+            }
+        })
+        .build();
+    let waiting = registry.clone();
+    let _ = meter
+        .u64_observable_gauge("ursula.placement.reconcile_waiting")
+        .with_description(
+            "Data group replicas on this node whose membership reconcile shell waits, by reason; \
+             a follower's shell waits as not_leader",
+        )
+        .with_callback(move |observer| {
+            let mut counts = BTreeMap::<String, u64>::new();
+            for group in waiting.metrics_snapshot() {
+                if let Some(ursula_proto::placement::ReconcileStatus {
+                    state: ursula_proto::placement::ReconcileState::Waiting(reason),
+                    ..
+                }) = &group.reconcile
+                {
+                    let count = counts.entry(admin_name(reason, "reason")).or_insert(0);
+                    *count = count.saturating_add(1);
+                }
+            }
+            for (reason, count) in counts {
+                observer.observe(count, &[KeyValue::new("reason", reason)]);
+            }
+        })
+        .build();
+    let steps = registry.clone();
+    let _ = meter
+        .u64_observable_counter("ursula.placement.reconcile_steps_total")
+        .with_description(
+            "Membership steps this node's reconcile shells finished since start, by step and \
+             outcome",
+        )
+        .with_callback(move |observer| {
+            for (step, outcome, count) in steps.reconcile_steps() {
+                observer.observe(count, &[
+                    KeyValue::new("step", admin_name(&step, "step")),
+                    KeyValue::new("outcome", outcome),
+                ]);
+            }
+        })
+        .build();
     let _ = meter
         .u64_observable_gauge("ursula.placement.retirements_pending")
         .with_description(
@@ -224,6 +286,21 @@ pub(crate) fn register_meta(
             .with_description(description)
             .with_callback(move |observer| observer.observe(field(&wal.snapshot()), &[]))
             .build();
+    }
+}
+
+/// The name admin JSON gives `value`, so a label and the JSON share one
+/// source: a unit variant's string, or the `tag` field of an internally
+/// tagged variant.
+fn admin_name(value: &impl serde::Serialize, tag: &str) -> String {
+    match serde_json::to_value(value) {
+        Ok(serde_json::Value::String(name)) => name,
+        Ok(serde_json::Value::Object(fields)) => fields
+            .get(tag)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_owned(),
+        Ok(_) | Err(_) => "unknown".to_owned(),
     }
 }
 
