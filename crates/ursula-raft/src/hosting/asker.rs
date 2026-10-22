@@ -196,31 +196,8 @@ pub(super) async fn ask(
 ) -> Option<GroupAnswer> {
     for leader in candidates {
         let asked = marks.ask(group);
-        let barrier = meta.barrier(leader, RaftTarget::Data(group));
-        let answer = match crate::rt::time::timeout(
-            crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
-            barrier,
-        )
-        .await
-        {
-            Ok(Ok(answer)) => answer,
-            Ok(Err(failure)) => {
-                tracing::debug!(
-                    group = group.0,
-                    leader = leader.get(),
-                    %failure,
-                    "membership asker: no barrier from this candidate"
-                );
-                continue;
-            }
-            Err(_elapsed) => {
-                tracing::debug!(
-                    group = group.0,
-                    leader = leader.get(),
-                    "membership asker: the candidate's barrier timed out"
-                );
-                continue;
-            }
+        let Some(answer) = live_barrier(&meta, group, leader).await else {
+            continue;
         };
         match answer.memberships.answer(me) {
             Ok(classified) => {
@@ -241,4 +218,38 @@ pub(super) async fn ask(
         }
     }
     None
+}
+
+/// `leader`'s answer to a fresh quorum barrier of `group`, asked over the
+/// one barrier seam ([`MetaStatusReader::barrier`]) within
+/// [`crate::rejoin::RECOVERY_BARRIER_TIMEOUT`]: `None` when it answered
+/// nothing as a live leader. This asker, the teardown's asks and the
+/// removed-node sweep (`meta::sweep`) ask through it. The rejoin barrier
+/// loop (`rejoin::barrier`) still asks a group's memberships on its own.
+pub(crate) async fn live_barrier(
+    meta: &MetaStatusReader,
+    group: RaftGroupId,
+    leader: NodeId,
+) -> Option<crate::BarrierAnswer> {
+    let barrier = meta.barrier(leader, RaftTarget::Data(group));
+    match crate::rt::time::timeout(crate::rejoin::RECOVERY_BARRIER_TIMEOUT, barrier).await {
+        Ok(Ok(answer)) => Some(answer),
+        Ok(Err(failure)) => {
+            tracing::debug!(
+                group = group.0,
+                leader = leader.get(),
+                %failure,
+                "membership ask: no barrier from this candidate"
+            );
+            None
+        }
+        Err(_elapsed) => {
+            tracing::debug!(
+                group = group.0,
+                leader = leader.get(),
+                "membership ask: the candidate's barrier timed out"
+            );
+            None
+        }
+    }
 }

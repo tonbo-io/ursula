@@ -12,6 +12,7 @@ use ursula_shard::RaftGroupId;
 use super::CommittedRead;
 use super::CommittedReadPurpose;
 use super::DelayRange;
+use super::DeleteKind;
 use super::DeleteOutcome;
 use super::Gate;
 use super::GateError;
@@ -638,7 +639,11 @@ async fn a_recorded_foreign_delete_fails_the_i2_check() {
             path: path.clone(),
         })
     );
-    let foreign = StoreDelete { node_id: 1, path };
+    let foreign = StoreDelete {
+        node_id: 1,
+        path,
+        kind: DeleteKind::Own,
+    };
     assert_eq!(bucket.foreign_deletes(), [foreign.clone(), foreign]);
 }
 
@@ -664,6 +669,68 @@ async fn own_deletes_pass_the_i2_check() {
     assert_eq!(check_no_foreign_delete(&bucket.view()), Ok(()));
 }
 
+/// The removed-node sweep's delete is the one delete of another node's key
+/// I2 admits: node 1 lists node 2's group and deletes exactly what it
+/// listed, and node 2's other group keeps its object.
+#[tokio::test(start_paused = true)]
+async fn the_sweep_deletes_another_nodes_listed_keys_and_passes_the_i2_check() {
+    let bucket = MemorySnapshotBucket::new(1, prefix(), SnapshotStoreFaults::none());
+    let (one, two) = (bucket.store(1), bucket.store(2));
+    let first = key_of(&build(&two, 1, b"first").await.1.unwrap());
+    let second = key_of(&build(&two, 2, b"second").await.1.unwrap());
+    let other_group = two.stage(RaftGroupId(7), 1, body(b"other")).await.unwrap();
+    let other_group = key_of(&two.write_staged(other_group).await.unwrap().into_location());
+
+    let listing = one.list_node_group(2, GROUP).await.unwrap();
+    let listed: Vec<String> = listing
+        .objects
+        .iter()
+        .map(|object| object.path().to_owned())
+        .collect();
+    assert_eq!(listed, [first, second]);
+    for object in listing.objects {
+        one.delete_node_object(object).await.unwrap();
+    }
+    assert_eq!(bucket.keys(), BTreeSet::from([other_group]));
+    assert_eq!(check_no_foreign_delete(&bucket.view()), Ok(()));
+    assert!(
+        bucket
+            .view()
+            .deletes
+            .iter()
+            .all(|delete| delete.node_id == 1 && delete.kind == DeleteKind::Swept { of: 2 })
+    );
+}
+
+/// A sweep's delete passes I2 only for a key of the node it names, and
+/// never for the deleting node's own key, which only its GC deletes.
+#[test]
+fn the_i2_check_admits_a_sweep_only_of_the_swept_nodes_key() {
+    let key = |node: u64| {
+        format!("snapshots/node-{node}/group-0/00000000000000000001-0000000000000001.snap")
+    };
+    let check = |path: String, of: u64| {
+        check_no_foreign_delete(&super::SnapshotStoreView {
+            prefix: prefix(),
+            objects: BTreeMap::new(),
+            deletes: vec![StoreDelete {
+                node_id: 1,
+                path,
+                kind: DeleteKind::Swept { of },
+            }],
+        })
+    };
+    assert_eq!(check(key(2), 2), Ok(()));
+    assert!(matches!(
+        check(key(2), 3),
+        Err(SnapshotInvariantViolation::ForeignDelete { node_id: 1, .. })
+    ));
+    assert!(matches!(
+        check(key(1), 1),
+        Err(SnapshotInvariantViolation::ForeignDelete { node_id: 1, .. })
+    ));
+}
+
 #[test]
 fn the_i2_check_tells_node_1_from_node_10() {
     let view = super::SnapshotStoreView {
@@ -672,6 +739,7 @@ fn the_i2_check_tells_node_1_from_node_10() {
         deletes: vec![StoreDelete {
             node_id: 1,
             path: "snapshots/node-10/group-0/00000000000000000001-0000000000000001.snap".to_owned(),
+            kind: DeleteKind::Own,
         }],
     };
     assert!(matches!(

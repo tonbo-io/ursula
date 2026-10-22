@@ -6,7 +6,9 @@
 //! - [`SnapshotChecks::step`], after every action of a scenario and every
 //!   [`STEP`] while it waits: I1 (`snapshot_named_keys_exist`) over what
 //!   every node's snapshot records name, a stopped node's included, I2
-//!   (`snapshot_no_foreign_delete`) over every DELETE the bucket served (the
+//!   (`snapshot_no_foreign_delete`) over every DELETE the bucket served,
+//!   which admits exactly the removed-node sweep's DELETEs of the swept
+//!   node's keys besides each node's own (the
 //!   bucket panics on a foreign DELETE in the deleting task first, so this
 //!   check records `invariant_failed` only for a recording bucket), and
 //!   I3 (`snapshot_reads_found`) over the reads the bucket logged since the
@@ -55,7 +57,8 @@ use super::journal_cluster::metrics;
 
 /// I1: every key a node's snapshot records name exists.
 pub(super) const NAMED_KEYS_EXIST: &str = "snapshot_named_keys_exist";
-/// I2: no node deletes outside its own directory.
+/// I2: no node deletes outside its own directory, but the removed-node
+/// sweep, which deletes only the swept node's keys.
 pub(super) const NO_FOREIGN_DELETE: &str = "snapshot_no_foreign_delete";
 /// I3: no restore and no read inside a send's RPC sees `NotFound`.
 pub(super) const READS_FOUND: &str = "snapshot_reads_found";

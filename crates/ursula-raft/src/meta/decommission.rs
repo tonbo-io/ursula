@@ -13,8 +13,9 @@
 //! applies on, and its placement CAS refuses a plan from an old state.
 //!
 //! Each pass publishes the [`MetaLeaderReport`]: the eligibility it planned
-//! with, the groups the plan could not move, the age of the oldest move and
-//! the last refusal of this node's `Bootstrap`. A node that does not lead
+//! with, the groups the plan could not move, the age of the oldest move,
+//! the last refusal of this node's `Bootstrap` and the groups the
+//! removed-node sweep left ([`super::sweep`]). A node that does not lead
 //! publishes none.
 
 use std::collections::BTreeMap;
@@ -32,6 +33,7 @@ use ursula_proto::placement::NodeId;
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
 use super::liveness::Liveness;
+use super::sweep::SweepPending;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
 use crate::rt::sync::watch;
@@ -48,12 +50,15 @@ pub(crate) struct DecommissionDriver<T> {
     /// The last refusal of this node's `Bootstrap`, which the report
     /// carries.
     pub(crate) bootstrap_refusal: watch::Receiver<Option<ControlError>>,
+    /// What the removed-node sweep left ([`super::sweep`]), which the
+    /// report carries.
+    pub(crate) sweep_pending: watch::Receiver<SweepPending>,
     pub(crate) report: watch::Sender<Option<MetaLeaderReport>>,
 }
 
 /// This node's meta leadership, as a pass reads it.
-struct Leading {
-    term: u64,
+pub(super) struct Leading {
+    pub(super) term: u64,
     /// The age of each node's last acknowledgement of this leader.
     acked: BTreeMap<NodeId, Duration>,
 }
@@ -117,7 +122,7 @@ impl<T: RecoveryTransport> DecommissionDriver<T> {
                 leader_since_ms: since_ms,
                 eligibility,
                 decommission_blocked: blocked,
-                sweep_pending: BTreeMap::new(),
+                sweep_pending: self.sweep_pending.borrow().clone(),
                 last_bootstrap_refusal: self.bootstrap_refusal.borrow().clone(),
                 oldest_move_age_ms: oldest_move_since_ms
                     .map(|since_ms| now_ms.saturating_sub(since_ms)),
@@ -168,7 +173,7 @@ impl<T: RecoveryTransport> DecommissionDriver<T> {
 
 /// Node `me`'s meta leadership, when its meta replica leads under a
 /// committed vote with a settled history.
-fn leading(registry: &RaftGroupHandleRegistry, me: NodeId) -> Option<Leading> {
+pub(super) fn leading(registry: &RaftGroupHandleRegistry, me: NodeId) -> Option<Leading> {
     let active = registry.meta()?;
     if active.core.history.pending() {
         return None;

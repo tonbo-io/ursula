@@ -325,6 +325,8 @@ pub use runtime::SweptPartsObserver;
 pub use runtime::unix_time_ms;
 pub use snapshot_store::FencedSnapshotStore;
 pub use snapshot_store::InlineSnapshotStore;
+pub use snapshot_store::NodeListing;
+pub use snapshot_store::NodeObject;
 pub use snapshot_store::NotOwned;
 pub use snapshot_store::OwnListing;
 pub use snapshot_store::OwnedKey;

@@ -100,7 +100,7 @@ use crate::rt::sync::watch;
 use crate::rt::task::JoinHandle;
 use crate::rt::time::Instant;
 
-mod asker;
+pub(crate) mod asker;
 mod teardown;
 
 pub use asker::ASK_INTERVAL;

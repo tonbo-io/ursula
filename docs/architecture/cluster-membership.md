@@ -146,13 +146,31 @@ shed leadership for its WAL disk (`crates/ursula-raft/src/meta/liveness.rs`).
 A node the leader has not heard from in that time, or whose answer did not
 arrive, is not live and gets no group. On the meta leader `GET /__ursula/placement` carries the leader's
 report in `leader_report`: each live node's eligibility, the groups the last
-pass could not move with the reason, and the age of the oldest move. Every
+pass could not move with the reason, the age of the oldest move and the
+groups whose objects the removed-node sweep left. Every
 other node answers `null` there. A node whose view shows it removed, or
 whose registration the meta group refused as removed, stays removed for the
 rest of the run, even when a later view no longer shows it (a damaged meta
 replica, a restored older snapshot). It marks the `placement-unavailable`
 leadership shed, which refuses leadership transfers to it, and its hosting
 driver closes each replica once it stops counting as a voter.
+
+A node deletes only its own snapshot objects, with one exception: the
+removed-node sweep (`crates/ursula-raft/src/meta/sweep.rs`). While the meta
+leader leads and its node fence admits, at the start of its leadership and
+then every 10 minutes, it confirms its view by a meta read barrier it
+answered itself in the term it leads, so a deposed meta leader sweeps
+nothing. For each node that view shows removed it lists the groups the
+node's snapshot directory holds objects of, and per group lists the node's
+objects of it, then asks the group for a fresh quorum barrier, its own
+replica first and then the group's leader candidates, until a live leader
+answers. When that leader's memberships list the node in neither membership,
+the sweep deletes exactly the objects it listed
+(`sweep_removed_group` in `crates/ursula-raft/src/snapshot_holds.rs`). An
+object written after the listing waits for the next pass. A group without
+a live leader, or whose leader still lists the node, keeps its objects, and
+`leader_report.sweep_pending` names it under the removed node. The pass
+keeps no replicated state.
 
 ## 2. Replica loss and rejoin
 

@@ -10,7 +10,8 @@
 //! reopens the replica with all of them. The node tasks are the
 //! registration ([`super::registration`]), the formation
 //! ([`super::formation`]), the decommission driver with the meta leader's
-//! report ([`super::decommission`]) and the damage supervisor.
+//! report ([`super::decommission`]), the removed-node sweep
+//! ([`super::sweep`]) and the damage supervisor.
 //!
 //! No meta failure stops the node. A journal that did not open, or a
 //! replica that did not, leaves the runtime [`MetaRuntimeState::Damaged`]
@@ -73,6 +74,7 @@ use super::replica::MetaReplicaTasks;
 use super::replica::MetaSnapshotTrigger;
 use super::root::RootGuard;
 use super::status::MetaStatusReader;
+use super::sweep::RemovedSweep;
 use super::target::MetaTargetSource;
 use crate::FixedNodes;
 use crate::FixedRole;
@@ -202,6 +204,7 @@ where
             leaderless: leaderless_rx,
             leader_report: leader_report_rx,
         };
+        let fence = wal.fence();
         let guard = RootGuard::new(
             me,
             wal.incarnation().root,
@@ -329,12 +332,24 @@ where
             pauses,
             stopped.clone(),
         )));
+        let (sweep_pending, sweep_pending_rx) = watch::channel(Default::default());
+        let sweep = RemovedSweep {
+            me,
+            reader: runtime.reader.clone(),
+            registry: registry.clone(),
+            fence,
+            pending: sweep_pending,
+        };
+        runtime
+            .tasks
+            .push(crate::rt::spawn(sweep.run(stopped.clone())));
         let decommission = DecommissionDriver {
             me,
             handle,
             registry: registry.clone(),
             liveness: Liveness::new(me, registry.clone(), config.wal_disk_sheds),
             bootstrap_refusal: runtime.status.bootstrap_refusal.clone(),
+            sweep_pending: sweep_pending_rx,
             report: leader_report,
         };
         runtime

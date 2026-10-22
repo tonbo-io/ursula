@@ -41,6 +41,8 @@ use std::sync::PoisonError;
 use ursula_shard::RaftGroupId;
 
 use crate::rt::sync::Notify;
+use crate::snapshot_store::NodeListing;
+use crate::snapshot_store::NodeObject;
 use crate::snapshot_store::OwnListing;
 use crate::snapshot_store::OwnedLocation;
 use crate::snapshot_store::OwnedNamespace;
@@ -66,6 +68,11 @@ pub enum StoreOp {
     DeleteOwn,
     /// [`SnapshotStore::list_node_groups`], the LIST of a node's directory.
     ListNodeGroups,
+    /// [`SnapshotStore::list_node_group`], the sweep's LIST of another
+    /// node's directory for a group.
+    ListNodeGroup,
+    /// [`SnapshotStore::delete_node_object`], the sweep's DELETE.
+    DeleteNodeObject,
     /// [`SnapshotStore::read_stored`], the GET.
     Get,
     /// [`SnapshotStore::verify_uploaded`], the HEAD.
@@ -500,6 +507,27 @@ impl SnapshotStore for GatedSnapshotStore {
             StoreOp::ListNodeGroups,
             format!("node-{node}"),
             self.inner.list_node_groups(node),
+        ))
+    }
+
+    fn list_node_group<'a>(
+        &'a self,
+        node: u64,
+        raft_group_id: RaftGroupId,
+    ) -> SnapshotStoreFuture<'a, NodeListing> {
+        Box::pin(self.gated(
+            StoreOp::ListNodeGroup,
+            format!("node-{node}/group-{}", raft_group_id.0),
+            self.inner.list_node_group(node, raft_group_id),
+        ))
+    }
+
+    fn delete_node_object<'a>(&'a self, object: NodeObject) -> SnapshotStoreFuture<'a, ()> {
+        let subject = object.path().to_owned();
+        Box::pin(self.gated(
+            StoreOp::DeleteNodeObject,
+            subject,
+            self.inner.delete_node_object(object),
         ))
     }
 

@@ -14,7 +14,7 @@
 //! [`state_machine`]'s dispatch of the meta log is frozen with the epoch.
 //! The runtime and its tasks ([`runtime`], [`handle`], [`genesis_driver`],
 //! [`registration`], `root`, [`formation`], [`decommission`], [`liveness`],
-//! [`damage`], [`pause`] and the meta membership target) encode nothing
+//! [`sweep`], [`damage`], [`pause`] and the meta membership target) encode nothing
 //! either: they write only the commands above. The placement status
 //! ([`status`]) with the meta leader's report and the placement routes'
 //! refusals (`api`) are admin JSON.
@@ -65,6 +65,8 @@
 //! - [`status`]: this node's placement status
 //!   ([`status::MetaStatusReader`]), its view's stage, and why a group's
 //!   status answered none ([`status::GroupStatusError`]).
+//! - [`sweep`]: the meta leader's sweep of removed nodes' snapshot
+//!   objects, the one exception to owner-only deletion.
 //! - [`state_machine`]: the meta state machine ([`MetaStateMachine`]): its
 //!   dispatch of the meta log, its inline snapshot record and the views it
 //!   publishes.
@@ -90,6 +92,7 @@ pub mod runtime;
 pub mod snapshot;
 pub mod state_machine;
 pub mod status;
+pub mod sweep;
 mod target;
 pub mod watch;
 
