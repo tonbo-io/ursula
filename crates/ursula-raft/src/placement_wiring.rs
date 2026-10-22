@@ -355,13 +355,17 @@ impl SeedRole for MetaSeedRole {
 
     /// The role in this node's latest view while the last meta read
     /// barrier's stamp still covers it
-    /// ([`crate::RaftGroupHandleRegistry::confirmed_view`]).
+    /// ([`crate::RaftGroupHandleRegistry::confirmed_view`]), read with the
+    /// node's standing: none once it knows itself removed
+    /// ([`ursula_control::Standing::placed_role`]).
     fn placed_role(&self) -> Option<ReplicaRole> {
-        let confirmed = self.placement.registry.confirmed_view()?;
-        confirmed
-            .view()
-            .cluster()?
-            .role(self.group, self.placement.node)
+        let registry = &self.placement.registry;
+        let confirmed = registry.confirmed_view()?;
+        registry.standing().placed_role(
+            confirmed.view().cluster()?,
+            self.group,
+            self.placement.node,
+        )
     }
 }
 

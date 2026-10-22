@@ -48,9 +48,13 @@
 //!
 //! A node that knows itself removed, by a `NodeRemoved` answer or by its
 //! view ([`ursula_control::Standing::knows_removed`]), latches the removal
-//! for the rest of the run, even if its view later regresses. It marks its
-//! `PlacementUnavailable` leadership shed, which refuses transfers to it,
-//! and its plan closes each replica once it stops counting (design 8.1).
+//! for the rest of the run ([`RaftGroupHandleRegistry::standing`]), even if
+//! its view later regresses. It marks its `PlacementUnavailable` leadership
+//! shed, which refuses transfers to it, and its plan closes each replica
+//! once it stops counting (design 8.1). No group places it any more
+//! ([`ursula_control::Standing::placed_role`]), whatever a view from before
+//! the removal shows, so the asker asks about every replica it holds and a
+//! group's `NotMember` answer stops it counting.
 //!
 //! While the node fence refuses, the driver creates, closes, tears down,
 //! reports and deletes nothing: every admission it publishes is `Open`, and
@@ -280,13 +284,9 @@ impl<H: GroupHost> HostingDriver<H> {
             ),
         };
         let mut only_voter = BTreeSet::new();
-        // The node's standing, latched `Removed` for the rest of the run
-        // once a pass knows it removed.
-        let mut standing = Standing::Member;
         loop {
             actions.reap(&mut work);
-            self.pass(&mut actions, &mut confirms, &mut work, &mut standing)
-                .await;
+            self.pass(&mut actions, &mut confirms, &mut work).await;
             self.registry.refresh_only_voter_elections(&mut only_voter);
             let ended = crate::rt::select! {
                 biased;
@@ -314,16 +314,10 @@ impl<H: GroupHost> HostingDriver<H> {
     /// One pass: read the journals, confirm when the plan asks for it and
     /// the interval allows, plan, act on the plan, run the teardowns and
     /// the object passes, then ask about the held replicas that may have
-    /// left their groups. `standing` is the run's latched standing: once the
-    /// node knows itself removed, it stays `Removed` whatever a later view
-    /// or answer says.
-    async fn pass(
-        &self,
-        actions: &mut Actions,
-        confirms: &mut Confirms,
-        work: &mut Work,
-        standing: &mut Standing,
-    ) {
+    /// left their groups. Once the node knows itself removed, it stays
+    /// `Removed` for the run whatever a later view or answer says
+    /// ([`RaftGroupHandleRegistry::learn_standing`]).
+    async fn pass(&self, actions: &mut Actions, confirms: &mut Confirms, work: &mut Work) {
         let local = match self.wal.local_groups() {
             Ok(local) => local,
             Err(error) => {
@@ -343,15 +337,12 @@ impl<H: GroupHost> HostingDriver<H> {
             .collect();
         let view = self.registry.placement_watch().current();
         let answered = self.meta.registration_answers().borrow().standing();
-        if answered.knows_removed(view.cluster(), self.me) {
-            // A removal holds for the rest of the run (design 8.1), even
-            // when the view regresses: a damaged meta replica publishes an
-            // empty view, and a restored snapshot may predate the removal.
-            // Without the latch the plan would fall back to opening every
-            // held replica, the closed ones included.
-            *standing = Standing::Removed;
-        }
-        let standing = *standing;
+        // A removal holds for the rest of the run (design 8.1), even when
+        // the view regresses: without the latch the plan would fall back to
+        // opening every held replica, the closed ones included.
+        let standing = self
+            .registry
+            .learn_standing(answered, view.cluster(), self.me);
         if standing == Standing::Removed {
             // A removed node takes no leadership transfer for the rest of
             // the run: a group it led would never reconcile toward a
@@ -419,7 +410,7 @@ impl<H: GroupHost> HostingDriver<H> {
             &local,
             &published,
         );
-        self.ask(&local, &view, &peers, actions, work);
+        self.ask(&local, &view, standing, &peers, actions, work);
     }
 
     /// Starts and cancels the plan's teardowns, publishes its admissions,
@@ -538,14 +529,17 @@ impl<H: GroupHost> HostingDriver<H> {
     /// Asks, for each held replica that may have left its group and is due
     /// ([`Askers::due`]), the group's leader candidates whether the node is
     /// still a member: a closed replica, and an open one that does not lead
-    /// and whose bootstrapped view gives the node the role `Outgoing`,
-    /// `Abandoned` or none. An open replica adds its effective membership to
-    /// the candidates. A teardown past its first step asks for itself.
-    /// While the node fence refuses, nothing is asked.
+    /// and whose bootstrapped view, read with the node's `standing`
+    /// ([`Standing::placed_role`]), gives the node the role `Outgoing`,
+    /// `Abandoned` or none. So a removed node asks about every replica it
+    /// does not lead. An open replica adds its effective membership to the
+    /// candidates. A teardown past its first step asks for itself. While the
+    /// node fence refuses, nothing is asked.
     fn ask(
         &self,
         local: &BTreeMap<RaftGroupId, LocalReplica>,
         view: &PlacementView,
+        standing: Standing,
         peers: &BTreeSet<NodeId>,
         actions: &mut Actions,
         work: &mut Work,
@@ -566,7 +560,9 @@ impl<H: GroupHost> HostingDriver<H> {
                 // Without a bootstrapped view an open replica counts by its
                 // membership, and a leader knows its own: nothing says it
                 // may have left.
-                let placed = view.cluster().map(|cluster| cluster.role(*group, self.me));
+                let placed = view
+                    .cluster()
+                    .map(|cluster| standing.placed_role(cluster, *group, self.me));
                 let may_have_left = matches!(
                     placed,
                     Some(None | Some(ReplicaRole::Outgoing | ReplicaRole::Abandoned))

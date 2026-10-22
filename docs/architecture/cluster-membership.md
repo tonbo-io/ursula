@@ -153,7 +153,16 @@ whose registration the meta group refused as removed, stays removed for the
 rest of the run, even when a later view no longer shows it (a damaged meta
 replica, a restored older snapshot). It marks the `placement-unavailable`
 leadership shed, which refuses leadership transfers to it, and its hosting
-driver closes each replica once it stops counting as a voter.
+driver closes each replica once it stops counting as a voter. No group
+places a removed node, whatever its view shows
+(`Standing::placed_role` in `crates/ursula-control/src/placement/hosting.rs`):
+restarted with its disk, it keeps the view it had before its removal, since
+it hears no more meta entries, and that view still places it. So the voter
+predicate, the membership asker and the readiness inventory read no role
+for it, the asker asks about every replica it does not lead, and a group's
+`not_member` answer stops the replica counting, which closes it. A replica
+whose group's leader still lists the node stays open until a move takes it
+off.
 
 A node deletes only its own snapshot objects, with one exception: the
 removed-node sweep (`crates/ursula-raft/src/meta/sweep.rs`). While the meta
@@ -422,7 +431,8 @@ answers), a view that has not bootstrapped, a genesis mismatch, a meta group
 without a leader for 30 s, a damaged meta replica, which replaces every issue
 the view gives, a configured group count or replication factor the cluster
 does not share, and a removed node (`node_removed`), which replaces every
-other node issue while its replicas keep their group checks. Group issues name a missing placed replica, a replica
+other node issue. A removed node has no expected group, so each replica it
+still runs is `unplaced_replica` and keeps its voter checks. Group issues name a missing placed replica, a replica
 held without a role (`unplaced_replica`, listed with the last answer the
 node's membership asker got about it and the stage of its teardown), an incomplete voter set, a member
 without a role (`unplaced_member`: the leader removes such a learner once the

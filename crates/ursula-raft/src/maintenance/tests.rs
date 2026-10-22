@@ -192,6 +192,8 @@ impl Node {
                 claim: &self.claim,
                 leaderless_for: self.leaderless_for,
                 hosting: &self.hosting,
+                // A test's run learned no more than its registration says.
+                standing: self.status.registration.standing(),
             }),
         })
     }
@@ -377,24 +379,45 @@ fn damaged_meta_keeps_only_the_voter_checks() {
     assert!(!report.serving_ready());
 }
 
-/// The bug: a removed node whose view gives it no role, or whose meta
+/// The bugs: a removed node whose view gives it no role, or whose meta
 /// group it no longer hears, reports node issues such as
 /// `meta_unavailable` and holds the disruption budget while it closes the
-/// replicas that stopped counting. Removal, by a `NodeRemoved` answer or
-/// by the view, reports `node_removed` alone among the node issues and
-/// blocks neither readiness, and the replicas keep their voter checks.
+/// replicas that stopped counting. And a removed node restarted with its
+/// disk, whose view from before its removal still places it, reports the
+/// replicas it closed as `missing_group` and never serves again. Removal,
+/// by a `NodeRemoved` answer or by the view, reports `node_removed` alone
+/// among the node issues, no group places the node, and it stays
+/// serving-ready. Each replica it still holds is unplaced, which holds
+/// maintenance until the replica closes, and a running one keeps its voter
+/// checks.
 #[test]
-fn a_removed_node_reports_node_removed_alone_and_stays_ready() {
+fn a_removed_node_reports_node_removed_alone_and_stays_serving_ready() {
+    // Node 1's view still places it in groups 0 and 1, and it runs both.
     let mut answered = Node::three();
     answered.status.registration = RegistrationStatus::Removed;
     answered.leaderless_for = Some(META_UNAVAILABLE_AFTER);
     let report = answered.report();
     assert_eq!(report.node_issues, vec![Issue::NodeRemoved]);
-    assert!(report.serving_ready() && report.ready(), "{report:?}");
+    assert!(report.expected_groups.is_empty(), "{report:?}");
+    assert_eq!(report.group_issues[&0], vec![Issue::UnplacedReplica]);
+    assert!(report.serving_ready() && !report.ready(), "{report:?}");
     answered.groups[0].current_leader = None;
     assert_eq!(answered.report().group_issues[&0], vec![
+        Issue::UnplacedReplica,
         Issue::LeaderUnknown
     ]);
+    // Group 1's replica closed: it is no missing group.
+    answered.groups.truncate(1);
+    answered.groups[0].current_leader = Some(2);
+    let report = answered.report();
+    assert!(!report.group_issues.contains_key(&1), "{report:?}");
+    assert!(report.serving_ready(), "{report:?}");
+    // Once every replica closed, it is ready: the closed logs stay on its
+    // disk, unplaced by no plan.
+    answered.groups.clear();
+    let report = answered.report();
+    assert!(report.group_issues.is_empty(), "{report:?}");
+    assert!(report.serving_ready() && report.ready(), "{report:?}");
     // Node 4 has no role in the group seeded on {1, 2, 3}, so its
     // decommission removes it at once, and its view shows it.
     let mut state = ControlPlaneState::Bootstrapped(bootstrapped(&[1, 2, 3, 4], 1, 3));

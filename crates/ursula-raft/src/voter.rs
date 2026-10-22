@@ -31,7 +31,8 @@
 //!   may set it;
 //! - so may every answer the hosting driver's membership asker gets for a
 //!   held replica that is closed, or whose role is `Outgoing`, `Abandoned`
-//!   or none (`crate::hosting`);
+//!   or none, as every role is on a node that knows itself removed
+//!   (`crate::hosting`);
 //! - every inbound append with a committed vote may clear it
 //!   ([`crate::GroupRejoin::observe_inbound_append`]).
 //!

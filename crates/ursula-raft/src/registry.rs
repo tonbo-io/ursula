@@ -240,6 +240,9 @@ pub struct RaftGroupHandleRegistry {
     meta_changes: Arc<crate::rt::sync::watch::Sender<()>>,
     /// Each data group's left mark, for the run (`crate::voter`).
     left_marks: crate::LeftMarks,
+    /// Whether this node learned in this run that it is removed
+    /// ([`Self::learn_standing`]).
+    removed: Arc<std::sync::atomic::AtomicBool>,
     /// This node process's one pause registry ([`crate::meta::pause`]).
     pauses: crate::meta::pause::MetaPauses,
 }
@@ -272,6 +275,7 @@ impl Default for RaftGroupHandleRegistry {
             group_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
             meta_changes: Arc::new(crate::rt::sync::watch::channel(()).0),
             left_marks: crate::LeftMarks::default(),
+            removed: Arc::default(),
             pauses: crate::meta::pause::MetaPauses::default(),
         }
     }
@@ -1390,6 +1394,34 @@ impl RaftGroupHandleRegistry {
     /// ([`crate::meta::pause::MetaPauses`]).
     pub fn pauses(&self) -> &crate::meta::pause::MetaPauses {
         &self.pauses
+    }
+
+    /// This node's standing in this run (design 8.1): `Removed` once it
+    /// learned its removal ([`Self::learn_standing`]), whatever a later view
+    /// shows. A damaged meta replica publishes an empty view, and a restored
+    /// snapshot or the view of a restart may predate the removal.
+    pub fn standing(&self) -> ursula_control::Standing {
+        if self.removed.load(Ordering::Acquire) {
+            ursula_control::Standing::Removed
+        } else {
+            ursula_control::Standing::Member
+        }
+    }
+
+    /// Latches this node `Removed` for the rest of the run when `answered`,
+    /// its registration's standing, or `cluster`, its bootstrapped view,
+    /// shows node `me` removed ([`ursula_control::Standing::knows_removed`]),
+    /// and returns the run's standing ([`Self::standing`]).
+    pub(crate) fn learn_standing(
+        &self,
+        answered: ursula_control::Standing,
+        cluster: Option<&ursula_control::Cluster>,
+        me: ursula_proto::placement::NodeId,
+    ) -> ursula_control::Standing {
+        if answered.knows_removed(cluster, me) {
+            self.removed.store(true, Ordering::Release);
+        }
+        self.standing()
     }
 
     /// This node's latest placement view, while the stamp of its last meta

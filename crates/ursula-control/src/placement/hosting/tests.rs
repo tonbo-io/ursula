@@ -281,6 +281,26 @@ fn a_view_showing_the_node_removed_plans_as_removed() {
     );
 }
 
+/// The bug: a removed node restarted with its disk keeps the view it had
+/// before its removal, since it hears no more meta entries, and that view
+/// places it in its old groups. Read from it, the role kept the node's open
+/// replicas from the membership asker, so no group's `NotMember` answer
+/// reached them and none closed. Once the node knows itself removed, no
+/// view places it.
+#[test]
+fn a_removal_overrides_the_role_a_view_from_before_it_shows() {
+    let stale = Driver::live(&[1, 2, 3, 4], 4, 3);
+    let cluster = stale.cluster();
+    for group in [G1, G2, G3] {
+        assert_eq!(cluster.role(group, node(4)), Some(ReplicaRole::Voter));
+        assert_eq!(
+            Standing::Member.placed_role(cluster, group, node(4)),
+            Some(ReplicaRole::Voter)
+        );
+        assert_eq!(Standing::Removed.placed_role(cluster, group, node(4)), None);
+    }
+}
+
 #[test]
 fn only_a_seeded_groups_recorded_initializer_initializes() {
     let mut driver = Driver::bootstrapped(&[1, 2, 3, 4], params(&[1, 2, 3, 4], 4, 3, 4));
