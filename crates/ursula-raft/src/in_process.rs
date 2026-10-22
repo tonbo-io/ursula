@@ -842,6 +842,13 @@ fn no_meta_replica() -> ursula_runtime::GroupEngineError {
 /// The meta plane's in-process registry: each node's production registry.
 pub type InProcessMetaRegistry = InProcessRegistry<crate::meta::MetaStateMachine>;
 
+impl crate::meta::liveness::WalDiskSheds for InProcessMetaRegistry {
+    fn shedding(&self) -> crate::meta::liveness::Shedding<'_> {
+        let shedding = self.wal_disk_shedding();
+        Box::pin(std::future::ready(shedding))
+    }
+}
+
 /// The meta plane's in-process network factory.
 pub type InProcessMetaNetworkFactory = InProcessNetworkFactory<crate::meta::MetaStateMachine>;
 
@@ -853,6 +860,23 @@ impl InProcessRegistry<crate::meta::MetaStateMachine> {
             .lock()
             .expect("endpoint registry")
             .insert(node_id, registry.clone());
+    }
+
+    /// The registered nodes whose registry sheds leadership for WAL disk
+    /// pressure: the simulation's source of the meta leader's liveness
+    /// ([`crate::meta::liveness::WalDiskSheds`]).
+    fn wal_disk_shedding(&self) -> BTreeSet<ursula_proto::placement::NodeId> {
+        self.endpoints
+            .lock()
+            .expect("endpoint registry")
+            .iter()
+            .filter(|(_, registry)| {
+                registry
+                    .leadership_shed_state()
+                    .contains(crate::LeadershipShedState::WAL_DISK_PRESSURE)
+            })
+            .map(|(node_id, _)| ursula_proto::placement::NodeId::new(*node_id))
+            .collect()
     }
 
     /// The genesis probe RPC of `caller` on `node_id`

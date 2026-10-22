@@ -6,11 +6,14 @@
 //! ([`MetaStatusReader::confirmed_placement_status`]) derives it from a view
 //! a meta read barrier confirmed current, and a group's status
 //! ([`MetaStatusReader::group_status`]) joins its placement with this node's
-//! replica. The reader also carries the placement routes' writes
+//! replica. On the meta leader the status carries the leader's report,
+//! which the decommission driver publishes ([`super::decommission`]). The
+//! reader also carries the placement routes' writes
 //! ([`MetaStatusReader::release_root`], [`MetaStatusReader::request_move`],
-//! [`MetaStatusReader::set_move_limit`]) and the data group leaders'
-//! reports ([`MetaStatusReader::report_converged`]) to the meta group, and
-//! the barriers that ask a group's leader about its memberships
+//! [`MetaStatusReader::set_lifecycle`], [`MetaStatusReader::set_move_limit`])
+//! and the data group leaders' reports
+//! ([`MetaStatusReader::report_converged`]) to the meta group, and the
+//! barriers that ask a group's leader about its memberships
 //! (`MetaStatusReader::barrier`).
 
 use std::future::Future;
@@ -24,6 +27,7 @@ use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
 use ursula_control::ControlError;
 use ursula_control::ControlPlaneState;
+use ursula_control::LifecycleChange;
 use ursula_control::MetaReplicaStatus;
 use ursula_control::MetaRole;
 use ursula_control::MoveLimit;
@@ -223,6 +227,23 @@ impl MetaStatusReader {
             .await
     }
 
+    /// Cordons, uncordons or decommissions `node` through the meta leader
+    /// (`ControlCommand::SetNodeLifecycle`). The command's time is this
+    /// node's clock.
+    pub async fn set_lifecycle(
+        &self,
+        node: NodeId,
+        change: LifecycleChange,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.meta
+            .submit(ControlCommand::SetNodeLifecycle {
+                node,
+                change,
+                now_ms: ursula_runtime::unix_time_ms(),
+            })
+            .await
+    }
+
     /// Sets the move limit through the meta leader
     /// (`ControlCommand::SetMoveLimit`).
     pub async fn set_move_limit(&self, limit: MoveLimit) -> Result<ControlApplied, MetaWriteError> {
@@ -321,6 +342,17 @@ impl MetaStatusReader {
                 (MetaReplicaStatus::Running { role, leader }, formed)
             }
         };
+        // Only while the replica still names this node the leader: a
+        // deposed leader's last report is not the meta leader's.
+        let leader_report = match &meta {
+            MetaReplicaStatus::Running {
+                leader: Some(leader),
+                ..
+            } if *leader == self.node => self.status.leader_report.borrow().clone(),
+            MetaReplicaStatus::Running { .. }
+            | MetaReplicaStatus::Damaged { .. }
+            | MetaReplicaStatus::Absent => None,
+        };
         PlacementStatus {
             node: self.node,
             view: cluster_view(
@@ -334,6 +366,7 @@ impl MetaStatusReader {
             meta,
             registration: self.status.registration.borrow().clone(),
             last_bootstrap_refusal: self.status.bootstrap_refusal.borrow().clone(),
+            leader_report,
         }
     }
 }

@@ -71,6 +71,8 @@ async fn a_single_node_forms_meta_at_once() {
             },
             engine: crate::RaftEngineConfig::default(),
             snapshots: None,
+            // A single node has no peer to shed.
+            wal_disk_sheds: Arc::new(crate::InProcessMetaRegistry::default()),
         },
         journal,
         wal.clone(),

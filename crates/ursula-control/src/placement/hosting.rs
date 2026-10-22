@@ -49,11 +49,24 @@ impl ViewInput<'_> {
 }
 
 /// Whether the node knows itself removed, from a registration answer. A
-/// view that shows the node `Removed` counts too.
+/// view that shows the node `Removed` counts too ([`Standing::knows_removed`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Standing {
     Member,
     Removed,
+}
+
+impl Standing {
+    /// Whether node `me` knows itself removed (design 8.1): its standing
+    /// says so, or `cluster`, its bootstrapped view, shows it `Removed`. The
+    /// one reading of a removal, for the node's hosting plan, its
+    /// leadership shed and its readiness. It holds for the rest of the run.
+    pub fn knows_removed(self, cluster: Option<&Cluster>, me: NodeId) -> bool {
+        self == Self::Removed
+            || cluster
+                .and_then(|cluster| cluster.node(me))
+                .is_some_and(|record| record.lifecycle == NodeLifecycle::Removed)
+    }
 }
 
 /// What the node's journal holds of a group. A group the journal does not
@@ -331,12 +344,10 @@ pub struct HostingPlan {
 ///
 /// A replica whose teardown passed its first step is never admitted.
 pub fn plan_hosting(input: &HostingInput<'_>) -> HostingPlan {
-    let view = input.view.view();
-    let shown_removed = view
-        .cluster()
-        .and_then(|cluster| cluster.node(input.me))
-        .is_some_and(|record| record.lifecycle == NodeLifecycle::Removed);
-    if input.standing == Standing::Removed || shown_removed {
+    if input
+        .standing
+        .knows_removed(input.view.view().cluster(), input.me)
+    {
         return plan_removed(input.local);
     }
     match input.view {

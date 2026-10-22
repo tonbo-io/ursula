@@ -1015,37 +1015,7 @@ fn every_root_round_trips_through_messagepack_and_json() {
             message: "refused".to_owned(),
         });
     }
-    round_trip(&MetaLeaderReport {
-        leader: node(2),
-        leader_since_ms: 71,
-        eligibility: BTreeMap::from([
-            (node(1), NodeEligibility::Eligible),
-            (node(3), NodeEligibility::Unknown),
-            (node(4), NodeEligibility::DiskPressure),
-        ]),
-        decommission_blocked: vec![
-            BlockedMove {
-                group: RaftGroupId(3),
-                reason: BlockReason::NoEligibleTarget,
-            },
-            BlockedMove {
-                group: RaftGroupId(4),
-                reason: BlockReason::TargetsUnderDiskPressure,
-            },
-            BlockedMove {
-                group: RaftGroupId(5),
-                reason: BlockReason::GroupNotLive,
-            },
-        ],
-        sweep_pending: BTreeMap::from([(
-            node(6),
-            BTreeSet::from([RaftGroupId(1), RaftGroupId(7)]),
-        )]),
-        last_bootstrap_refusal: Some(ControlError::InvalidBootstrap {
-            problem: BootstrapProblem::ReplicationFactorAboveNodes,
-        }),
-        oldest_move_age_ms: Some(72),
-    });
+    round_trip(&sample_leader_report());
     round_trip(&MetaLeaderReport {
         leader: node(1),
         leader_since_ms: 0,
@@ -1087,6 +1057,58 @@ fn every_root_round_trips_through_messagepack_and_json() {
             current: None,
             message: String::new(),
         });
+    }
+}
+
+/// A meta leader report with every field set and every planner variant
+/// it carries.
+fn sample_leader_report() -> MetaLeaderReport {
+    // Each list feeds both its exhaustive match and the report, so a new
+    // variant fails to compile until the report samples it.
+    let eligibilities = [
+        NodeEligibility::Eligible,
+        NodeEligibility::DiskPressure,
+        NodeEligibility::Unknown,
+    ];
+    let reasons = [
+        BlockReason::NoEligibleTarget,
+        BlockReason::TargetsUnderDiskPressure,
+        BlockReason::GroupNotLive,
+        BlockReason::Unknown,
+    ];
+    for eligibility in eligibilities {
+        match eligibility {
+            NodeEligibility::Eligible
+            | NodeEligibility::DiskPressure
+            | NodeEligibility::Unknown => {}
+        }
+    }
+    for reason in reasons {
+        match reason {
+            BlockReason::NoEligibleTarget
+            | BlockReason::TargetsUnderDiskPressure
+            | BlockReason::GroupNotLive
+            | BlockReason::Unknown => {}
+        }
+    }
+    MetaLeaderReport {
+        leader: node(2),
+        leader_since_ms: 71,
+        eligibility: [1, 3, 4].into_iter().map(node).zip(eligibilities).collect(),
+        decommission_blocked: [3, 4, 5, 8]
+            .into_iter()
+            .map(RaftGroupId)
+            .zip(reasons)
+            .map(|(group, reason)| BlockedMove { group, reason })
+            .collect(),
+        sweep_pending: BTreeMap::from([(
+            node(6),
+            BTreeSet::from([RaftGroupId(1), RaftGroupId(7)]),
+        )]),
+        last_bootstrap_refusal: Some(ControlError::InvalidBootstrap {
+            problem: BootstrapProblem::ReplicationFactorAboveNodes,
+        }),
+        oldest_move_age_ms: Some(72),
     }
 }
 
@@ -1182,6 +1204,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
             meta: replica,
             registration,
             last_bootstrap_refusal: (!applied).then_some(ControlError::AlreadyBootstrapped),
+            leader_report: applied.then(sample_leader_report),
         });
         applied = !applied;
     }
@@ -1194,6 +1217,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
             meta: replica,
             registration: RegistrationStatus::Pending,
             last_bootstrap_refusal: None,
+            leader_report: None,
         });
     }
     for registration in registrations {
@@ -1204,6 +1228,7 @@ fn sample_placement_statuses() -> Vec<PlacementStatus> {
             meta: MetaReplicaStatus::Absent,
             registration,
             last_bootstrap_refusal: None,
+            leader_report: None,
         });
     }
     statuses
@@ -1221,12 +1246,17 @@ fn a_placement_status_refuses_a_missing_option() {
         },
         registration: RegistrationStatus::Pending,
         last_bootstrap_refusal: None,
+        leader_report: Some(sample_leader_report()),
     };
     let json = serde_json::to_value(&status).unwrap();
     // An `Option` field is required, also when `null`.
-    for path in [&["applied"][..], &["last_bootstrap_refusal"], &[
-        "meta", "running", "leader",
-    ]] {
+    for path in [
+        &["applied"][..],
+        &["last_bootstrap_refusal"],
+        &["leader_report"],
+        &["leader_report", "oldest_move_age_ms"],
+        &["meta", "running", "leader"],
+    ] {
         let mut missing = json.clone();
         let (last, parents) = path.split_last().unwrap();
         let mut object = &mut missing;

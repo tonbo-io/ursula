@@ -133,6 +133,7 @@ impl Node {
                 },
                 registration: RegistrationStatus::Answered(Registered::Referenced(record)),
                 last_bootstrap_refusal: None,
+                leader_report: None,
             },
             claim: GenesisClaim {
                 meta_voters: params.meta_voters.clone(),
@@ -374,6 +375,43 @@ fn damaged_meta_keeps_only_the_voter_checks() {
     let report = node.report();
     assert_eq!(report.group_issues[&0], vec![Issue::LeaderUnknown]);
     assert!(!report.serving_ready());
+}
+
+/// The bug: a removed node whose view gives it no role, or whose meta
+/// group it no longer hears, reports node issues such as
+/// `meta_unavailable` and holds the disruption budget while it closes the
+/// replicas that stopped counting. Removal, by a `NodeRemoved` answer or
+/// by the view, reports `node_removed` alone among the node issues and
+/// blocks neither readiness, and the replicas keep their voter checks.
+#[test]
+fn a_removed_node_reports_node_removed_alone_and_stays_ready() {
+    let mut answered = Node::three();
+    answered.status.registration = RegistrationStatus::Removed;
+    answered.leaderless_for = Some(META_UNAVAILABLE_AFTER);
+    let report = answered.report();
+    assert_eq!(report.node_issues, vec![Issue::NodeRemoved]);
+    assert!(report.serving_ready() && report.ready(), "{report:?}");
+    answered.groups[0].current_leader = None;
+    assert_eq!(answered.report().group_issues[&0], vec![
+        Issue::LeaderUnknown
+    ]);
+    // Node 4 has no role in the group seeded on {1, 2, 3}, so its
+    // decommission removes it at once, and its view shows it.
+    let mut state = ControlPlaneState::Bootstrapped(bootstrapped(&[1, 2, 3, 4], 1, 3));
+    let applied = state.apply(samples::meta(1, 20), ControlCommand::SetNodeLifecycle {
+        node: NodeId::new(4),
+        change: ursula_control::LifecycleChange::Decommission,
+        now_ms: 30,
+    });
+    assert_eq!(
+        applied,
+        Ok(ursula_control::ControlApplied::LifecycleChanged {
+            lifecycle: ursula_proto::placement::NodeLifecycle::Removed,
+        })
+    );
+    let mut shown = Node::placed(state.cluster().unwrap().clone(), 4);
+    shown.leaderless_for = Some(META_UNAVAILABLE_AFTER);
+    assert_eq!(shown.report().node_issues, vec![Issue::NodeRemoved]);
 }
 
 #[test]

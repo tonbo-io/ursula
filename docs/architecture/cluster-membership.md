@@ -94,8 +94,8 @@ only: OpenRaft's `Node` is `EmptyNode` in `crates/ursula-raft/src/types.rs`.
 The meta Raft group forms over the nodes of `raft.peers` and records the
 cluster's bootstrap and every group's placement. Every node that runs Raft
 runs a replica of it, unless its meta journal or replica is damaged. A
-group moves to other nodes only on an operator's move request, which keeps
-its voter count (section 3).
+group moves to other nodes only on a move request, an operator's or the
+decommission driver's, which keeps its voter count (section 3).
 `GET /__ursula/placement`, on the client and the admin listener, reports what
 the node's meta replica applied, its role and leader, and its registration
 (`crates/ursula-raft/src/meta/status.rs`). With `?confirmed=true`, on the
@@ -110,6 +110,25 @@ health keeps it, so an object store outage that every node sheds for does
 not pass meta from voter to voter. A data group's leader reports the voters
 it formed on to the meta group, which makes the group `Live` (section 2).
 No admin route changes a data group's OpenRaft membership directly.
+
+The meta leader runs the decommission driver
+(`crates/ursula-raft/src/meta/decommission.rs`). While it leads under a
+committed vote with a settled history, every second and on each new view, it
+plans with `plan_decommission` and submits the planned moves of the
+decommissioning nodes' groups as `RequestMove`, which the meta state machine
+decides as it decides an operator's. The first refusal ends the pass, and a
+refusal of a plan made from an old view confirms the view and plans again. A
+node is an eligible move target when it acknowledged the meta leader's
+heartbeats within 10 seconds and does not shed leadership for its WAL disk,
+as its leadership-shed answer says (`crates/ursula-raft/src/meta/liveness.rs`).
+A node the leader has not heard from in that time is not live and gets no
+group. On the meta leader `GET /__ursula/placement` carries the leader's
+report in `leader_report`: each live node's eligibility, the groups the last
+pass could not move with the reason, and the age of the oldest move. Every
+other node answers `null` there. A node whose view shows it removed, or
+whose registration the meta group refused as removed, marks the
+`placement-unavailable` leadership shed for the rest of the run, and its
+hosting driver closes each replica once it stops counting as a voter.
 
 ## 2. Replica loss and rejoin
 
@@ -358,8 +377,9 @@ from the view, the meta replica's status and the hosting driver's: a node
 that does not know its groups (`placement_unknown`, a wiped voter before meta
 answers), a view that has not bootstrapped, a genesis mismatch, a meta group
 without a leader for 30 s, a damaged meta replica, which replaces every issue
-the view gives, and a configured group count or replication factor the
-cluster does not share. Group issues name a missing placed replica, a replica
+the view gives, a configured group count or replication factor the cluster
+does not share, and a removed node (`node_removed`), which replaces every
+other node issue while its replicas keep their group checks. Group issues name a missing placed replica, a replica
 held without a role (`unplaced_replica`, listed with the last answer the
 node's membership asker got about it), an incomplete voter set, a member
 without a role (`unplaced_member`: the leader removes such a learner once the
@@ -372,9 +392,9 @@ move. A node with no group is ready. `GET /__ursula/ready` uses
 `serving_ready()`, which ignores incomplete voter sets, members and replicas
 without a role, moves, joint membership, stopped apply and a stalled move, so
 healthy survivors keep serving while a peer catches up. Maintenance tooling
-uses `ready()`, which ignores only a meta group without a leader and a damaged
-meta replica, so a second disruption waits for full redundancy. The readiness
-body includes the full report.
+uses `ready()`, which ignores only a meta group without a leader, a damaged
+meta replica and a removal, so a second disruption waits for full
+redundancy. The readiness body includes the full report.
 
 ## 4. Kubernetes integration
 

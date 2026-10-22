@@ -41,6 +41,11 @@
 //!   exemption of an only voter reads those voters, and the election switch
 //!   holds what it read last.
 //!
+//! A node that knows itself removed, by a `NodeRemoved` answer or by its
+//! view ([`ursula_control::Standing::knows_removed`]), marks its `PlacementUnavailable`
+//! leadership shed for the rest of the run, and its plan closes each
+//! replica once it stops counting (design 8.1).
+//!
 //! While the node fence refuses, the driver creates and closes nothing:
 //! every admission it publishes is `Open`, and no group leaves the set.
 //!
@@ -70,8 +75,6 @@ use ursula_control::HostingPlan;
 use ursula_control::HostingStep;
 use ursula_control::LocalReplica;
 use ursula_control::PlacementView;
-use ursula_control::RegistrationStatus;
-use ursula_control::Standing;
 use ursula_control::ViewInput;
 use ursula_control::leader_candidates;
 use ursula_control::plan_hosting;
@@ -80,6 +83,7 @@ use ursula_proto::placement::ReplicaRole;
 use ursula_shard::CoreId;
 use ursula_shard::RaftGroupId;
 
+use crate::LeadershipShedReason;
 use crate::RaftGroupHandleRegistry;
 use crate::RaftWal;
 use crate::meta::status::MetaStatusReader;
@@ -302,13 +306,7 @@ impl<H: GroupHost> HostingDriver<H> {
                 })
             })
             .collect();
-        let standing = match *self.meta.registration_answers().borrow() {
-            RegistrationStatus::Removed => Standing::Removed,
-            RegistrationStatus::Pending
-            | RegistrationStatus::Answered(_)
-            | RegistrationStatus::RootRefused { .. }
-            | RegistrationStatus::Refused(_) => Standing::Member,
-        };
+        let standing = self.meta.registration_answers().borrow().standing();
         let input = |view| HostingInput {
             me: self.me,
             standing,
@@ -316,6 +314,14 @@ impl<H: GroupHost> HostingDriver<H> {
             local: &local,
         };
         let view = self.registry.placement_watch().current();
+        if standing.knows_removed(view.cluster(), self.me) {
+            // A removed node takes no leadership for the rest of the run
+            // (design 8.1): it closes what stopped counting, and a group it
+            // led would never reconcile toward a placement that has no
+            // role for it.
+            self.registry
+                .mark_leadership_shed(LeadershipShedReason::PlacementUnavailable);
+        }
         let mut plan = plan_hosting(&input(ViewInput::Unconfirmed(&view)));
         if plan.steps.first() == Some(&HostingStep::ConfirmView) {
             if let Some(confirmed) = confirms.carried(&view) {

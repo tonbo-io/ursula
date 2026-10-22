@@ -1,6 +1,7 @@
 //! Which nodes may take over a leadership: the ones whose leadership-shed
 //! policy lets them campaign. This node reads its own policy and asks each
-//! peer for its state (`GET /__ursula/leadership-shed`). The leadership
+//! peer for its state (`GET /__ursula/leadership-shed`). The same answers
+//! tell the meta leader each peer's WAL-disk state ([`ParticipationSheds`]). The leadership
 //! balancer, the shutdown handoff and the snapshot-store and cold-health
 //! gates hand leaderships only to the nodes known to be allowed to campaign.
 //! The cluster-egress gate, whose questions travel the path it judges
@@ -23,6 +24,7 @@ use ursula_control::PeerGate;
 use ursula_proto::admin::LeadershipShedStatus;
 use ursula_proto::admin::RaftTargetKey;
 use ursula_proto::placement::NodeId;
+use ursula_raft::LeadershipShedState;
 use ursula_raft::PeerDirectory;
 use ursula_raft::PeerGates;
 use ursula_raft::RaftGroupHandleRegistry;
@@ -307,6 +309,25 @@ impl PeerParticipation {
         self.campaign_stances(registry).await.may_campaign()
     }
 
+    /// Each answering peer's WAL-disk state, `true` when its answer says it
+    /// sheds leadership for WAL disk pressure. A peer that does not answer
+    /// in time, or answers for another cluster, is left out: its state is
+    /// unknown.
+    pub(crate) async fn wal_disk_shedding(
+        &self,
+        registry: &RaftGroupHandleRegistry,
+    ) -> BTreeMap<NodeId, bool> {
+        self.answers(registry, |_peer| true)
+            .await
+            .into_iter()
+            .filter_map(|(peer_id, answer)| {
+                let sheds = LeadershipShedState::from_bits_truncate(answer?.bits)
+                    .contains(LeadershipShedState::WAL_DISK_PRESSURE);
+                Some((NodeId::new(peer_id), sheds))
+            })
+            .collect()
+    }
+
     /// The recovery gate each of `learners` answers for `replica`'s group,
     /// asked of the learners only. A learner without an answer, or whose
     /// answer lists no gate of the group, is left out, so it counts as
@@ -377,6 +398,21 @@ impl PeerParticipation {
                 None
             }
         }
+    }
+}
+
+/// The meta leader's source of its peers' WAL-disk states
+/// ([`ursula_raft::meta::liveness::WalDiskSheds`]): their participation
+/// answers.
+#[derive(Debug)]
+pub(crate) struct ParticipationSheds {
+    pub(crate) participation: PeerParticipation,
+    pub(crate) registry: RaftGroupHandleRegistry,
+}
+
+impl ursula_raft::meta::liveness::WalDiskSheds for ParticipationSheds {
+    fn shedding(&self) -> ursula_raft::meta::liveness::Shedding<'_> {
+        Box::pin(self.participation.wal_disk_shedding(&self.registry))
     }
 }
 

@@ -9,7 +9,8 @@
 //! (`MetaTargetSource`), so a recovery plan's restart
 //! reopens the replica with all of them. The node tasks are the
 //! registration ([`super::registration`]), the formation
-//! ([`super::formation`]) and the damage supervisor.
+//! ([`super::formation`]), the decommission driver with the meta leader's
+//! report ([`super::decommission`]) and the damage supervisor.
 //!
 //! No meta failure stops the node. A journal that did not open, or a
 //! replica that did not, leaves the runtime [`MetaRuntimeState::Damaged`]
@@ -39,6 +40,7 @@ use std::sync::Arc;
 use openraft::RaftNetworkFactory;
 use ursula_control::ControlError;
 use ursula_control::MetaDamageKind;
+use ursula_control::MetaLeaderReport;
 use ursula_control::PlacementView;
 use ursula_control::RegistrationStatus;
 use ursula_control::SeedRoleOf;
@@ -50,11 +52,14 @@ use ursula_proto::placement::ReconcileStatus;
 use ursula_runtime::GroupEngineMetrics;
 
 use super::damage::CommitScreenDamage;
+use super::decommission::DecommissionDriver;
 use super::formation::FormationParams;
 use super::formation::run_formation;
 use super::genesis_driver::GenesisStatus;
 use super::genesis_driver::genesis_gate_probe;
 use super::handle::MetaHandle;
+use super::liveness::Liveness;
+use super::liveness::WalDiskSheds;
 use super::pause::MetaPauses;
 use super::registration::MetaLeaderless;
 use super::registration::Registrant;
@@ -102,6 +107,9 @@ pub struct MetaRuntimeConfig {
     pub engine: RaftEngineConfig,
     /// The meta snapshot trigger, if the replica runs one.
     pub snapshots: Option<MetaSnapshotTrigger>,
+    /// Where this node, as the meta leader, learns which peers shed
+    /// leadership for WAL disk pressure ([`super::liveness`]).
+    pub wal_disk_sheds: Arc<dyn WalDiskSheds>,
 }
 
 /// The meta journal as the caller opened it
@@ -136,6 +144,9 @@ pub struct MetaRuntimeStatus {
     /// Since when this node has known no meta leader, as the meta leader's
     /// tracker publishes it, counted from the start until the tracker runs.
     pub leaderless: watch::Receiver<MetaLeaderless>,
+    /// The meta leader's report, published by the decommission driver
+    /// while this node leads ([`super::decommission`]).
+    pub leader_report: watch::Receiver<Option<MetaLeaderReport>>,
 }
 
 /// This node's meta runtime (see the module docs).
@@ -181,6 +192,7 @@ where
             watch::channel(crate::rejoin::initial_status(ursula_runtime::unix_time_ms()));
         let (damage, damage_rx) = watch::channel(None);
         let (leaderless, leaderless_rx) = watch::channel(Some(crate::rt::time::Instant::now()));
+        let (leader_report, leader_report_rx) = watch::channel(None);
         let status = MetaRuntimeStatus {
             state: state_rx,
             genesis: genesis_rx,
@@ -188,6 +200,7 @@ where
             bootstrap_refusal: refusal_rx,
             reconcile: reconcile_rx,
             leaderless: leaderless_rx,
+            leader_report: leader_report_rx,
         };
         let guard = RootGuard::new(
             me,
@@ -307,15 +320,26 @@ where
             stopped.clone(),
         )));
         runtime.tasks.push(crate::rt::spawn(run_formation(
-            handle,
+            handle.clone(),
             me,
             config.claim,
             config.formation,
             registry.clone(),
             refusal,
             pauses,
-            stopped,
+            stopped.clone(),
         )));
+        let decommission = DecommissionDriver {
+            me,
+            handle,
+            registry: registry.clone(),
+            liveness: Liveness::new(me, registry.clone(), config.wal_disk_sheds),
+            bootstrap_refusal: runtime.status.bootstrap_refusal.clone(),
+            report: leader_report,
+        };
+        runtime
+            .tasks
+            .push(crate::rt::spawn(decommission.run(stopped)));
         runtime.tasks.push(crate::rt::spawn(supervise_damage(
             damage_rx,
             Arc::clone(&runtime.replica),

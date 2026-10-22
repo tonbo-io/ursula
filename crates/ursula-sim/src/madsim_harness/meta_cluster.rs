@@ -640,6 +640,9 @@ impl MetaCluster {
                 },
                 engine: ursula_raft::RaftEngineConfig::default(),
                 snapshots: Some(SNAPSHOTS),
+                // The peers' registries are the simulation's participation
+                // answers.
+                wal_disk_sheds: std::sync::Arc::new(self.meta.clone()),
             },
             journal,
             raft_wal,
