@@ -8740,6 +8740,10 @@ const SLOW_LINK_IDLE_ONE_WAY: Duration = Duration::from_millis(200);
 const SLOW_LINK_BUSY_ONE_WAY: Duration = Duration::from_millis(400);
 /// A cluster group's leader lease, its `election_timeout_max`.
 const SLOW_LINK_LEADER_LEASE: Duration = Duration::from_secs(3);
+/// The cluster-egress probe timeout of the slow-link test, in milliseconds:
+/// longer than either phase's round trip, plus a window update for the
+/// probe's payload.
+const SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS: u64 = 5000;
 
 /// A TCP link in front of a node's listener that holds every byte it
 /// carries for the same one-way delay in each direction, as a `netem delay`
@@ -8922,6 +8926,11 @@ fn check_slow_append(
 ///   pins that OpenRaft puts no timeout of its own on replication calls.
 ///
 /// Linearizable reads, back at the first delay, return every write.
+///
+/// The nodes' cluster-egress probes wait [`SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS`]
+/// instead of the default 200 ms. The egress gate judges added delay as
+/// impaired egress by design and would shed every node's leaderships, which
+/// is not what this test pins.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -8942,6 +8951,7 @@ async fn cli_slow_links_slow_writes_instead_of_stopping_them() {
         .collect::<Vec<_>>();
     let meta = MetaToml {
         meta_voters: Some(META_VOTERS),
+        egress_probe_timeout_ms: Some(SLOW_LINK_EGRESS_PROBE_TIMEOUT_MS),
         ..MetaToml::default()
     };
     let client = bounded_client();
@@ -9664,8 +9674,8 @@ fn write_node_toml(
     admin_port
 }
 
-/// The meta, placement and cold-flush keys of a node config. `None` leaves
-/// a key out, so the server's default applies.
+/// The meta, placement, cold-flush and egress-probe keys of a node config.
+/// `None` leaves a key out, so the server's default applies.
 #[derive(Debug, Clone, Copy, Default)]
 struct MetaToml<'a> {
     /// `raft.meta_voters`.
@@ -9674,6 +9684,8 @@ struct MetaToml<'a> {
     replication_factor: Option<u8>,
     /// `storage.cold.flush_min_hot_size`, in bytes.
     flush_min_hot_bytes: Option<u64>,
+    /// `governance.cluster_probe.timeout`, in milliseconds.
+    egress_probe_timeout_ms: Option<u64>,
 }
 
 /// One node's config file, of a cluster of any number of nodes.
@@ -9806,6 +9818,14 @@ gc_interval = "1s"
                 let escaped = toml::Value::String(value).to_string();
                 writeln!(config, "server_side_encryption = {escaped}").unwrap();
             }
+        }
+
+        if let Some(timeout_ms) = meta.egress_probe_timeout_ms {
+            writeln!(
+                config,
+                "\n[governance.cluster_probe]\ntimeout = \"{timeout_ms}ms\""
+            )
+            .unwrap();
         }
 
         std::fs::write(path, config).expect("write node toml config");
