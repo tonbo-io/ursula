@@ -72,6 +72,15 @@
 //!   follower applied, so it builds. Then its volume moves while the old
 //!   process runs on, cut off from every node, and the gate holds the LIST
 //!   until the new process wrote and named a snapshot object of the group.
+//! - **zombie cold jobs** (D29): under `always`, every replica writes one
+//!   in-memory cold store, each process's handle behind its node fence. A
+//!   group leader's volume moves while its old process runs on, cut off
+//!   from every node, so it keeps leading in its server state. The other
+//!   two nodes elect a leader, which takes external appends and offloads
+//!   their refs from state into the cold index. Once the old process's
+//!   lease ended, every node runs the production cold-index repair step,
+//!   the old process included, whose stale tail lies below every new
+//!   entry.
 //!
 //! Its checks:
 //!
@@ -104,6 +113,8 @@
 //!   earlier one led.
 //! - Liveness ([`RESUME`]): after the faults heal, every group takes a write
 //!   within a predecessor wait and a bound.
+//! - In **zombie cold jobs** I1 reads the external appends through the
+//!   cold index pages, a cold read.
 //! - In **zombie GC** also the snapshot object checks at every step
 //!   (`snapshot_checks`): every key a node's records name exists
 //!   (`snapshot_named_keys_exist`), no node deletes outside its directory,
@@ -119,10 +130,13 @@
 //! check: after a correlated power loss every node hosts what its journals
 //! hold while no view shows a bootstrap. The negative controls
 //! ([`Controls`]) each run one script with one defence off and fail inside
-//! it, but the zombie's, which turns off both of its defences: the leader
-//! predicate refuses every read of a fenced leader before its round, and
-//! its sender check stops every round it would start, so either alone
-//! keeps its reads current.
+//! it, but the zombie's two, which each turn off both of their defences.
+//! In the zombie leads, the leader predicate refuses every read of a
+//! fenced leader before its round, and its sender check stops every round
+//! it would start, so either alone keeps its reads current. In the zombie
+//! cold jobs, the leader predicate stops the repair step before it reads a
+//! page, and the cold store refuses its page PUT, so either alone keeps
+//! the cold index whole.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -143,11 +157,17 @@ use ursula_raft::JournalTuning;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::meta::pause::MetaPausePoint;
 use ursula_raft::predecessor_wait::PREDECESSOR_WAIT;
+use ursula_runtime::AppendExternalRequest;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdWriteAdmission;
+use ursula_runtime::ExternalPayloadRef;
 use ursula_runtime::FollowerRead;
 use ursula_runtime::GroupEngine;
+use ursula_runtime::OffloadColdRefsRequest;
+use ursula_runtime::ProposedUpload;
 use ursula_runtime::ReadStreamRequest;
+use ursula_runtime::RepairColdIndexRequest;
+use ursula_runtime::new_external_payload_path;
 use ursula_runtime::node_fence::FenceStatus;
 use ursula_runtime::node_fence::fence_now;
 use ursula_runtime::snapshot_harness::Gate;
@@ -161,6 +181,7 @@ use ursula_stream::sim_controls::fired;
 use ursula_stream::sim_controls::reset_fired;
 use ursula_stream::sim_controls::set_off;
 
+use super::ColdRepairOutcome;
 use super::IDENTITY_FENCE_EXTENDED_SEEDS;
 use super::IDENTITY_FENCE_SEEDS;
 use super::SimEvent;
@@ -217,6 +238,20 @@ const DRIVERS: DriverPlan = DriverPlan {
 /// `raft.install_snapshot_timeout` of every node in a zombie GC run.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// The object stores a run's nodes write besides their journals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Stores {
+    /// The journals only: snapshots stay inline, and no replica has a
+    /// cold store.
+    Journals,
+    /// The production snapshot driver on every node over the in-memory
+    /// snapshot store, each process's store behind its node fence.
+    Snapshots,
+    /// One in-memory cold store, each process's handle behind its node
+    /// fence.
+    Cold,
+}
+
 /// Which run a scenario makes, and which defence it turns off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Controls {
@@ -261,12 +296,19 @@ pub(super) enum Controls {
     /// Zombie GC, with the fence checked before each DELETE (`true`) or
     /// read when the pass's LIST began (N25).
     ObjectWriteCheck { defended: bool },
+    /// Zombie cold jobs, with the cold store's check before each PUT and
+    /// DELETE (`cold_write_check`) and the leader predicate's fence
+    /// (`fenced_leadership`) each on (`true`) or off (N24 turns off both).
+    ZombieColdJobs {
+        cold_write_check: bool,
+        fenced_leadership: bool,
+    },
 }
 
 /// The run's defences, reset when the run ends.
 struct Switched;
 
-const SWITCHED: [Defence; 12] = [
+const SWITCHED: [Defence; 13] = [
     Defence::SuccessorWait,
     Defence::DiskLease,
     Defence::OwedWait,
@@ -279,6 +321,7 @@ const SWITCHED: [Defence; 12] = [
     Defence::FencedLeadership,
     Defence::WaitCoversObjects,
     Defence::ObjectWriteCheck,
+    Defence::ColdWriteCheck,
 ];
 
 impl Switched {
@@ -330,12 +373,17 @@ impl Switched {
         );
         set_off(
             Defence::FencedLeadership,
-            [true, false].into_iter().any(|send_lease| {
+            [true, false].into_iter().any(|other| {
                 controls
                     == Controls::ZombieLeads {
-                        send_lease,
+                        send_lease: other,
                         fenced_leadership: false,
                     }
+                    || controls
+                        == Controls::ZombieColdJobs {
+                            cold_write_check: other,
+                            fenced_leadership: false,
+                        }
             }),
         );
         set_off(
@@ -345,6 +393,16 @@ impl Switched {
         set_off(
             Defence::ObjectWriteCheck,
             controls == Controls::ObjectWriteCheck { defended: false },
+        );
+        set_off(
+            Defence::ColdWriteCheck,
+            [true, false].into_iter().any(|fenced_leadership| {
+                controls
+                    == Controls::ZombieColdJobs {
+                        cold_write_check: false,
+                        fenced_leadership,
+                    }
+            }),
         );
         reset_fired();
         Self
@@ -687,12 +745,13 @@ struct Run {
 
 impl Run {
     async fn start(seed: u64, fsync: WalFsync) -> Self {
-        Self::start_with(seed, fsync, false).await
+        Self::start_with(seed, fsync, Stores::Journals).await
     }
 
-    /// [`Self::start`], every node running the production snapshot driver
-    /// over the in-memory snapshot store when `snapshots` is set.
-    async fn start_with(seed: u64, fsync: WalFsync, snapshots: bool) -> Self {
+    /// [`Self::start`], with the object stores `stores` names.
+    async fn start_with(seed: u64, fsync: WalFsync, stores: Stores) -> Self {
+        let snapshots = stores == Stores::Snapshots;
+        super::journal_cluster::set_cold_store(stores == Stores::Cold);
         if snapshots {
             super::journal_cluster::set_snapshot_drivers(Some(DRIVERS));
             super::journal_cluster::set_snapshot_store(Some(SnapshotStorePlan {
@@ -715,6 +774,7 @@ impl Run {
         )
         .await;
         // The cluster read them when it was provisioned.
+        super::journal_cluster::set_cold_store(false);
         super::journal_cluster::set_snapshot_drivers(None);
         super::journal_cluster::set_snapshot_store(None);
         let mut run = Self {
@@ -2151,6 +2211,10 @@ impl Run {
         // the group as soon as its fence lets it write the object. Each
         // request follows an append it applied, so it builds.
         let restored = self.named_by(moved);
+        self.trace.push(SimEvent::SnapshotKeysRestored {
+            node_id: moved,
+            keys: restored.iter().cloned().collect(),
+        });
         let deadline = madsim::time::Instant::now() + PREDECESSOR_WAIT + BOUND;
         while self.named_by(moved).is_subset(&restored) {
             if madsim::time::Instant::now() >= deadline {
@@ -2176,6 +2240,211 @@ impl Run {
             self.resume(group, "zombie_gc_healed").await;
         }
         self.reads_back("zombie_gc_reads").await;
+    }
+
+    /// Appends one payload to `group` through `node_id`'s replica as an
+    /// external append, staged in the cold store first as the front door
+    /// stages a large body, and answers whether it was acknowledged.
+    async fn append_external_on(&mut self, group: u32, node_id: u64) -> bool {
+        let (Some(engine), Some(cold_store)) = (
+            self.cluster.hosted_engine(node_id, group),
+            self.cluster.data.cold_store(node_id),
+        ) else {
+            return false;
+        };
+        let count = self.appended.entry(group).or_default();
+        let payload = format!("g{group}-{count};").into_bytes();
+        *count = count.saturating_add(1);
+        let stream = group_stream(group);
+        let s3_path = new_external_payload_path(&stream);
+        let object_size = match cold_store.write_chunk(&s3_path, &payload).await {
+            Ok(object_size) => object_size,
+            Err(error) => {
+                tracing::info!(%error, group, node_id, "an external payload was not staged");
+                return false;
+            }
+        };
+        let staged = ExternalPayloadRef {
+            s3_path,
+            payload_len: u64::try_from(payload.len()).unwrap_or(u64::MAX),
+            object_size,
+        };
+        let appended = madsim::time::timeout(APPEND_TIMEOUT, async {
+            let mut engine = engine.lock().await;
+            let fence = engine.upload_fence()?;
+            let request = AppendExternalRequest::from_append_request(
+                AppendRequest::from_bytes(stream, Vec::new()),
+                staged,
+                0,
+                ProposedUpload::new(fence),
+            );
+            Some(
+                engine
+                    .append_external(request, group_placement(group))
+                    .await,
+            )
+        })
+        .await;
+        if !matches!(appended, Ok(Some(Ok(_)))) {
+            return false;
+        }
+        self.fence
+            .acknowledged
+            .entry(group)
+            .or_default()
+            .push((madsim::time::Instant::now(), payload));
+        true
+    }
+
+    /// Zombie cold jobs (D29): see the module docs. The old process's
+    /// repair step keeps no external page entry at or past its own tail,
+    /// and the new leader's offload moved its external refs from state
+    /// into those entries, so a page the old process rewrote leaves the
+    /// new leader's acknowledged bytes unreadable (I1 by a cold read).
+    async fn zombie_cold_jobs(&mut self) {
+        const PHASE: &str = "zombie_cold_jobs";
+        let roles = self.roles(PHASE).await;
+        self.trace.push(SimEvent::FaultApplied {
+            phase: format!("{PHASE}: {roles:?}"),
+        });
+        let Roles {
+            group,
+            leader,
+            moved: follower,
+            far,
+        } = roles;
+        self.led_by(group, leader, PHASE).await;
+        let old_engine = self
+            .cluster
+            .hosted_engine(leader, group)
+            .expect("the leader runs the group");
+        let old_fence = self.cluster.data.wals[&leader].raft_wal().fence();
+        self.after_probe(leader, SCRIPTED_OFFSET).await;
+        self.step(PHASE);
+        // No one reaches the old process, and it reaches no one, so it
+        // leads the group in its server state for as long as it runs.
+        let zombie = self.cluster.move_volume(
+            leader,
+            &format!("identity-fence-{}-moved-{leader}", self.seed),
+            &[],
+        );
+        for node_id in 1..=NODES {
+            self.cluster.cut_route(zombie.process, node_id);
+        }
+        self.cluster.start_node(leader).await;
+        self.step(PHASE);
+        // The follower and the far node elect a leader, which takes
+        // external appends and offloads their refs into the cold index.
+        let survivors = [follower, far];
+        let deadline = madsim::time::Instant::now() + BOUND;
+        let mut externals = 0;
+        while externals < EXTERNAL_APPENDS {
+            if madsim::time::Instant::now() >= deadline {
+                let nodes = self.describe(group);
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    PHASE,
+                    format!("group {group} took {externals} external appends: {nodes}"),
+                );
+            }
+            let appended = match self.leader(group, &survivors) {
+                Some(new_leader) => self.append_external_on(group, new_leader).await,
+                None => false,
+            };
+            if appended {
+                externals = externals.saturating_add(1);
+            } else {
+                madsim::time::sleep(STEP).await;
+                self.observe(PHASE);
+            }
+        }
+        self.offload(group, &survivors, PHASE).await;
+        // The fence claims the old process's jobs from the end of its
+        // lease, so they run once it ended.
+        let deadline = madsim::time::Instant::now() + LEASE + BOUND;
+        while old_fence.admits_now() {
+            if madsim::time::Instant::now() >= deadline {
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    PHASE,
+                    format!("node {leader}'s old process kept its lease"),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(PHASE);
+        }
+        // The production repair step on every node, as each node's runtime
+        // runs it on a timer, the old process's included: only the leader
+        // predicate and the cold store's check stand between it and the
+        // pages.
+        for node_id in self.cluster.running() {
+            if let Some(engine) = self.cluster.hosted_engine(node_id, group) {
+                let outcome = repair_step(&engine, group).await;
+                tracing::info!(node_id, ?outcome, "a cold-index repair step");
+            }
+        }
+        let outcome = repair_step(&old_engine, group).await;
+        drop(old_engine);
+        self.trace.push(SimEvent::ZombieColdRepair { outcome });
+        self.step(PHASE);
+        self.heal(vec![zombie]).await;
+        for group in JOURNAL_GROUPS {
+            self.resume(group, "zombie_cold_jobs_healed").await;
+        }
+        self.reads_back("zombie_cold_jobs_reads").await;
+    }
+
+    /// The production offload pass on `group`'s leader among `among`,
+    /// within the bound: every external ref of its streams moves from state
+    /// into the cold index, whatever its age.
+    async fn offload(&mut self, group: u32, among: &[u64], phase: &str) {
+        let deadline = madsim::time::Instant::now() + BOUND;
+        loop {
+            let leader = self.leader(group, among);
+            let engine = leader.and_then(|leader| self.cluster.hosted_engine(leader, group));
+            if let Some(engine) = engine {
+                let request = OffloadColdRefsRequest {
+                    now_ms: 0,
+                    min_age_ms: 0,
+                    max_staged_refs: 0,
+                    max_streams: JOURNAL_GROUPS.len(),
+                };
+                let offloaded = madsim::time::timeout(COLD_JOB_TIMEOUT, async {
+                    engine
+                        .lock()
+                        .await
+                        .offload_cold_refs(request, group_placement(group))
+                        .await
+                })
+                .await;
+                match offloaded {
+                    Ok(Ok(report)) if report.refs_offloaded > 0 => {
+                        self.step(phase);
+                        return;
+                    }
+                    Ok(Ok(report)) => {
+                        tracing::info!(?report, group, "an offload pass moved no ref");
+                    }
+                    Ok(Err(error)) => {
+                        tracing::info!(%error, group, "an offload pass failed");
+                    }
+                    Err(_elapsed) => tracing::info!(group, "an offload pass timed out"),
+                }
+            }
+            if madsim::time::Instant::now() >= deadline {
+                let nodes = self.describe(group);
+                fail(
+                    &mut self.trace,
+                    RESUME,
+                    phase,
+                    format!("group {group}'s leader offloaded no external ref: {nodes}"),
+                );
+            }
+            madsim::time::sleep(STEP).await;
+            self.observe(phase);
+        }
     }
 
     /// Ends the run: I17 over the whole run, and I16 fails when no step
@@ -2210,6 +2479,41 @@ impl Run {
 /// How long after the old process's last probe its volume moves in a
 /// scripted split: as early as can be, so its lease lasts the longest.
 const SCRIPTED_OFFSET: Duration = Duration::from_millis(1);
+
+/// How many external appends the new leader takes in zombie cold jobs.
+const EXTERNAL_APPENDS: u32 = 3;
+/// How long one cold job of a replica may take.
+const COLD_JOB_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// One production cold-index repair step of `engine`'s replica of
+/// `group`, a cursor step's from the start, and what it did.
+async fn repair_step(engine: &Arc<AsyncMutex<RaftGroupEngine>>, group: u32) -> ColdRepairOutcome {
+    let request = RepairColdIndexRequest {
+        after: None,
+        max_streams: JOURNAL_GROUPS.len(),
+        stream: None,
+        retention_gc_now_ms: None,
+    };
+    let repaired = madsim::time::timeout(COLD_JOB_TIMEOUT, async {
+        engine
+            .lock()
+            .await
+            .repair_cold_index(request, group_placement(group))
+            .await
+    })
+    .await;
+    match repaired {
+        Ok(Ok(response)) if response.cycle_completed => ColdRepairOutcome::Repaired {
+            pages_rewritten: response.report.pages_rewritten,
+        },
+        Ok(Ok(_)) => ColdRepairOutcome::NotLeading,
+        Ok(Err(error)) => {
+            tracing::info!(%error, group, "a cold-index repair step failed");
+            ColdRepairOutcome::Failed
+        }
+        Err(_elapsed) => ColdRepairOutcome::TimedOut,
+    }
+}
 
 pub(super) async fn run_identity_fence_inner(
     config: ThreeNodeRaftSimConfig,
@@ -2265,15 +2569,20 @@ pub(super) async fn run_identity_fence_inner(
             run.finish()
         }
         Controls::WaitCoversObjects { .. } | Controls::ObjectWriteCheck { .. } => {
-            let mut run = Run::start_with(seed, WalFsync::Always, true).await;
+            let mut run = Run::start_with(seed, WalFsync::Always, Stores::Snapshots).await;
             run.zombie_gc().await;
+            run.finish()
+        }
+        Controls::ZombieColdJobs { .. } => {
+            let mut run = Run::start_with(seed, WalFsync::Always, Stores::Cold).await;
+            run.zombie_cold_jobs().await;
             run.finish()
         }
     }
 }
 
 /// How many scripts the family runs, one per seed in turn.
-const SCRIPTS: u64 = 13;
+const SCRIPTS: u64 = 14;
 
 /// The script of `seed`: the family's scripts are numbered over
 /// [`IDENTITY_FENCE_SEEDS`] and then [`IDENTITY_FENCE_EXTENDED_SEEDS`],
@@ -2303,7 +2612,12 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
         2 | 3 => WalFsync::Never,
         _ => WalFsync::Always,
     };
-    let mut run = Run::start_with(seed, fsync, script == 12).await;
+    let stores = match script {
+        12 => Stores::Snapshots,
+        13 => Stores::Cold,
+        _ => Stores::Journals,
+    };
+    let mut run = Run::start_with(seed, fsync, stores).await;
     match script {
         0 => run.split(offset, false).await,
         1 => run.split(offset, true).await,
@@ -2317,19 +2631,27 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
         9 => run.two_moved(offset).await,
         10 => run.resumed_leader().await,
         11 => run.zombie_leads(offset).await,
-        _ => run.zombie_gc().await,
+        12 => run.zombie_gc().await,
+        _ => run.zombie_cold_jobs().await,
     }
     run.finish()
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::Controls;
     use super::I1;
     use super::I2;
     use super::I16;
     use super::I17;
     use super::I18;
+    use super::SCRIPTS;
+    use super::script_of;
+    use crate::madsim_harness::ColdRepairOutcome;
+    use crate::madsim_harness::IDENTITY_FENCE_EXTENDED_SEEDS;
+    use crate::madsim_harness::IDENTITY_FENCE_SEEDS;
     use crate::madsim_harness::SimEvent;
     use crate::madsim_harness::SimReport;
     use crate::madsim_harness::SimScenario;
@@ -2369,6 +2691,26 @@ mod tests {
                 } => Some((*held_observations, *linearizable_reads, *defences_fired)),
                 _ => None,
             })
+    }
+
+    /// What the old process's repair step did in a zombie cold jobs run.
+    fn cold_repair(trace: &SimTrace) -> Option<ColdRepairOutcome> {
+        trace.events.iter().find_map(|event| match event {
+            SimEvent::ZombieColdRepair { outcome } => Some(*outcome),
+            _ => None,
+        })
+    }
+
+    /// Each seed of the family's two ranges runs one script, and every
+    /// script has a seed.
+    #[test]
+    fn identity_fence_seeds_cover_every_script() {
+        let seeds: Vec<u64> = IDENTITY_FENCE_SEEDS
+            .chain(IDENTITY_FENCE_EXTENDED_SEEDS)
+            .collect();
+        assert_eq!(u64::try_from(seeds.len()).ok(), Some(SCRIPTS));
+        let scripts: BTreeSet<u64> = seeds.iter().map(|seed| script_of(*seed)).collect();
+        assert_eq!(scripts, (0..SCRIPTS).collect::<BTreeSet<u64>>());
     }
 
     /// The family's seeds hold the same way twice per seed. Each saw a
@@ -2475,7 +2817,11 @@ mod tests {
             I16,
             "remount",
         );
-        assert!(message.contains("while held"), "{message}");
+        assert!(
+            message.contains("opened its gate") || message.contains("wrote a vote floor"),
+            "{message}"
+        );
+        assert!(message.contains("held by its fence: true"), "{message}");
     }
 
     /// A moved volume read as a process crash under `never` votes with
@@ -2541,8 +2887,8 @@ mod tests {
     }
 
     /// The new process of a leader whose device hung resumes the
-    /// leadership of its term when a crashed leader is not demoted, and
-    /// appends under the log id of the entry only a follower holds (N16).
+    /// leadership of its term when a crashed leader is not demoted, so two
+    /// processes of its node lead one term (N16).
     #[test]
     fn negative_control_crashed_leader_demotion() {
         let _guard = sim_test_guard();
@@ -2588,7 +2934,7 @@ mod tests {
             NAMED_KEYS_EXIST,
             "zombie_gc",
         );
-        assert!(!message.is_empty(), "{message}");
+        assert_names_a_new_object(&message);
     }
 
     /// A pass that reads the fence when its LIST began, inside the lease,
@@ -2602,7 +2948,82 @@ mod tests {
             NAMED_KEYS_EXIST,
             "zombie_gc",
         );
-        assert!(!message.is_empty(), "{message}");
+        assert_names_a_new_object(&message);
+    }
+
+    /// The missing key of a zombie GC failure is one the moved node names,
+    /// and none it restored: the new process wrote it.
+    fn assert_names_a_new_object(message: &str) {
+        let (node_id, restored) = SimTrace::last_recorded()
+            .events
+            .iter()
+            .find_map(|event| match event {
+                SimEvent::SnapshotKeysRestored { node_id, keys } => Some((*node_id, keys.clone())),
+                _ => None,
+            })
+            .expect("the new process restored its records");
+        assert!(
+            message.starts_with(&format!("I1: node {node_id} names ")),
+            "{message}"
+        );
+        assert!(
+            restored.iter().all(|key| !message.contains(key.as_str())),
+            "{message} names a restored key"
+        );
+    }
+
+    /// The old process's repair step, which a fenced leader predicate and a
+    /// fenced cold store would both stop, rewrites the new leader's page
+    /// once its lease ended, dropping the entries of its offloaded external
+    /// appends, so no replica reads those acknowledged bytes (N24, D29).
+    #[test]
+    fn negative_control_zombie_cold_jobs() {
+        let _guard = sim_test_guard();
+        let message = assert_caught(
+            Controls::ZombieColdJobs {
+                cold_write_check: true,
+                fenced_leadership: true,
+            },
+            Controls::ZombieColdJobs {
+                cold_write_check: false,
+                fenced_leadership: false,
+            },
+            I1,
+            "zombie_cold_jobs_reads",
+        );
+        assert!(message.contains("acknowledged writes"), "{message}");
+        let outcome = cold_repair(&SimTrace::last_recorded());
+        assert!(
+            matches!(outcome, Some(ColdRepairOutcome::Repaired { pages_rewritten }) if pages_rewritten > 0),
+            "{outcome:?}"
+        );
+    }
+
+    /// Either defence against a zombie's cold jobs alone keeps the cold
+    /// index whole. With both on the old process's repair step answers as
+    /// a follower's. With the leader predicate's fence off it runs as a
+    /// leader's and the cold store refuses its page PUT. With the cold
+    /// store's check off the predicate stops it before any PUT.
+    #[test]
+    fn either_defence_against_zombie_cold_jobs_alone_suffices() {
+        let _guard = sim_test_guard();
+        for (cold_write_check, fenced_leadership, expected) in [
+            (true, true, ColdRepairOutcome::NotLeading),
+            (true, false, ColdRepairOutcome::Failed),
+            (false, true, ColdRepairOutcome::NotLeading),
+        ] {
+            let controls = Controls::ZombieColdJobs {
+                cold_write_check,
+                fenced_leadership,
+            };
+            let report = run(SCRIPTED, controls);
+            assert!(held(&report).is_some(), "{controls:?} passes");
+            assert_eq!(
+                cold_repair(&report.outcome.trace),
+                Some(expected),
+                "{controls:?}"
+            );
+        }
     }
 
     /// Either defence of a zombie leader alone keeps its reads current, and

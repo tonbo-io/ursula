@@ -237,8 +237,8 @@ pub enum Defence {
     /// A replica whose last run did not end cleanly replaces a committed
     /// vote for itself with the same vote uncommitted before its group
     /// starts, so it starts as a follower (N16 of the identity fence, T3).
-    /// Off, OpenRaft restores it as the leader of that term, and it appends
-    /// under the log ids of entries it lost while a follower keeps them.
+    /// Off, OpenRaft restores it as the leader of that term, so two
+    /// processes of one node lead one term.
     CrashedLeaderDemotion,
     /// A process whose fence does not admit sends no Raft request and
     /// counts no answer that reaches it (the sender and arrival lease
@@ -261,6 +261,10 @@ pub enum Defence {
     /// reads the fence as it was when the pass's LIST began, so a pass that
     /// began inside the lease deletes after it ended.
     ObjectWriteCheck,
+    /// A cold store PUT or DELETE checks the node fence right before it is
+    /// sent (N24 of the identity fence, with `FencedLeadership`). Off, a
+    /// fenced process's cold writes are sent.
+    ColdWriteCheck,
 }
 
 #[cfg(madsim)]
@@ -270,8 +274,8 @@ mod switches {
     use super::Defence;
 
     std::thread_local! {
-        static OFF: Cell<[bool; 52]> = const { Cell::new([false; 52]) };
-        static FIRED: Cell<[u64; 52]> = const { Cell::new([0; 52]) };
+        static OFF: Cell<[bool; 53]> = const { Cell::new([false; 53]) };
+        static FIRED: Cell<[u64; 53]> = const { Cell::new([0; 53]) };
     }
 
     fn slot(defence: Defence) -> usize {
@@ -328,6 +332,7 @@ mod switches {
             Defence::FencedLeadership => 49,
             Defence::WaitCoversObjects => 50,
             Defence::ObjectWriteCheck => 51,
+            Defence::ColdWriteCheck => 52,
         }
     }
 
@@ -350,7 +355,7 @@ mod switches {
     }
 
     pub(super) fn reset_fired() {
-        FIRED.with(|fired| fired.set([0; 52]));
+        FIRED.with(|fired| fired.set([0; 53]));
     }
 
     pub(super) fn set_off(defence: Defence, value: bool) {

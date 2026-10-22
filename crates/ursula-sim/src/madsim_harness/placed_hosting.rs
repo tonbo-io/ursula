@@ -483,6 +483,7 @@ impl SimHost {
         options.metrics = Some(self.parts.metrics.group_engine_metrics());
         options.peer_cluster = Some(registry.peer_cluster().clone());
         options.fence = Some(wal.raft_wal().fence());
+        options.cold_store = self.parts.cold_store.clone();
         if self.parts.snapshots {
             // As the engine factory wires a node with a snapshot driver:
             // its registry's coordinators and store, and the store's record.
@@ -763,6 +764,7 @@ impl MetaCluster {
         let mut parts = self.data.replica_parts(node_id);
         parts.process = self.process(node_id);
         parts.snapshot_store = snapshot_store;
+        parts.cold_store = self.data.cold_store(node_id);
         let placed = self.placed_mut();
         let started = placed.started.clone();
         let memberships = placed.memberships.clone();

@@ -1809,9 +1809,23 @@ impl ColdReadCache {
 /// The fence's check right before a PUT or DELETE is sent: a refused one
 /// fails as a store call does, and its job runs again later.
 fn check_fence(fence: &NodeFence, operation: &'static str, path: &str) -> io::Result<()> {
-    fence
-        .check_write(FencedObject::Cold, operation, path)
-        .map_err(io::Error::other)
+    let checked = fence.check_write(FencedObject::Cold, operation, path);
+    if checked.is_err() && !cold_writes_fenced() {
+        return Ok(());
+    }
+    checked.map_err(io::Error::other)
+}
+
+/// Whether a refused cold write stays refused, read only when the fence
+/// refused one. A negative control turns it off (`Defence::ColdWriteCheck`),
+/// and a fenced process's cold writes are then sent.
+fn cold_writes_fenced() -> bool {
+    use ursula_stream::sim_controls::Defence;
+    if ursula_stream::sim_controls::off(Defence::ColdWriteCheck) {
+        ursula_stream::sim_controls::note_fired(Defence::ColdWriteCheck);
+        return false;
+    }
+    true
 }
 
 fn cold_store_io_error(path: &str, err: opendal::Error) -> io::Error {

@@ -373,7 +373,7 @@ pub const SNAPSHOT_OBJECTS_SEEDS: std::ops::RangeInclusive<u64> = 546..=549;
 pub const PLACEMENT_MOVE_SEEDS: std::ops::RangeInclusive<u64> = 1100..=1109;
 pub const PLACEMENT_MOVE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1120..=1159;
 pub const IDENTITY_FENCE_SEEDS: std::ops::RangeInclusive<u64> = 1110..=1119;
-pub const IDENTITY_FENCE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1160..=1162;
+pub const IDENTITY_FENCE_EXTENDED_SEEDS: std::ops::RangeInclusive<u64> = 1160..=1163;
 pub const RUNTIME_RAFT_NETWORK_PARTITION_FAILURE_SEEDS: std::ops::RangeInclusive<u64> = 212..=216;
 pub const RUNTIME_RAFT_NETWORK_RANDOMIZED_COLD_READ_FAILURE_SEEDS: std::ops::RangeInclusive<u64> =
     322..=326;
@@ -563,6 +563,7 @@ impl SimFailureRegressionRecord {
 }
 
 mod trace;
+pub use self::trace::ColdRepairOutcome;
 pub use self::trace::SimEvent;
 pub use self::trace::SimTrace;
 
