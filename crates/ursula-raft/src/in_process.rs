@@ -862,20 +862,20 @@ impl InProcessRegistry<crate::meta::MetaStateMachine> {
             .insert(node_id, registry.clone());
     }
 
-    /// The registered nodes whose registry sheds leadership for WAL disk
-    /// pressure: the simulation's source of the meta leader's liveness
-    /// ([`crate::meta::liveness::WalDiskSheds`]).
-    fn wal_disk_shedding(&self) -> BTreeSet<ursula_proto::placement::NodeId> {
+    /// Every registered node's WAL-disk state, `true` when its registry
+    /// sheds leadership for WAL disk pressure: the simulation's source of
+    /// the meta leader's liveness ([`crate::meta::liveness::WalDiskSheds`]).
+    fn wal_disk_shedding(&self) -> BTreeMap<ursula_proto::placement::NodeId, bool> {
         self.endpoints
             .lock()
             .expect("endpoint registry")
             .iter()
-            .filter(|(_, registry)| {
-                registry
+            .map(|(node_id, registry)| {
+                let sheds = registry
                     .leadership_shed_state()
-                    .contains(crate::LeadershipShedState::WAL_DISK_PRESSURE)
+                    .contains(crate::LeadershipShedState::WAL_DISK_PRESSURE);
+                (ursula_proto::placement::NodeId::new(*node_id), sheds)
             })
-            .map(|(node_id, _)| ursula_proto::placement::NodeId::new(*node_id))
             .collect()
     }
 

@@ -1,9 +1,10 @@
 //! Which nodes may take over a leadership: the ones whose leadership-shed
 //! policy lets them campaign. This node reads its own policy and asks each
-//! peer for its state (`GET /__ursula/leadership-shed`). The same answers
-//! tell the meta leader each peer's WAL-disk state ([`ParticipationSheds`]). The leadership
+//! peer for its state (`GET /__ursula/leadership-shed`). The leadership
 //! balancer, the shutdown handoff and the snapshot-store and cold-health
 //! gates hand leaderships only to the nodes known to be allowed to campaign.
+//! The same answers tell the meta leader each peer's WAL-disk state
+//! ([`ParticipationSheds`]).
 //! The cluster-egress gate, whose questions travel the path it judges
 //! impaired, may also try a peer that did not answer, once per leadership
 //! ([`CampaignStances::shed_targets_over_impaired_path`]). An answer from a

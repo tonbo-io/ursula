@@ -60,7 +60,8 @@ impl Standing {
     /// Whether node `me` knows itself removed (design 8.1): its standing
     /// says so, or `cluster`, its bootstrapped view, shows it `Removed`. The
     /// one reading of a removal, for the node's hosting plan, its
-    /// leadership shed and its readiness. It holds for the rest of the run.
+    /// leadership shed and its readiness. The hosting driver latches it for
+    /// the rest of the run, since a later view may no longer show it.
     pub fn knows_removed(self, cluster: Option<&Cluster>, me: NodeId) -> bool {
         self == Self::Removed
             || cluster

@@ -119,16 +119,18 @@ decommissioning nodes' groups as `RequestMove`, which the meta state machine
 decides as it decides an operator's. The first refusal ends the pass, and a
 refusal of a plan made from an old view confirms the view and plans again. A
 node is an eligible move target when it acknowledged the meta leader's
-heartbeats within 10 seconds and does not shed leadership for its WAL disk,
-as its leadership-shed answer says (`crates/ursula-raft/src/meta/liveness.rs`).
-A node the leader has not heard from in that time is not live and gets no
-group. On the meta leader `GET /__ursula/placement` carries the leader's
+heartbeats within 10 seconds and its leadership-shed answer says it does not
+shed leadership for its WAL disk (`crates/ursula-raft/src/meta/liveness.rs`).
+A node the leader has not heard from in that time, or whose answer did not
+arrive, is not live and gets no group. On the meta leader `GET /__ursula/placement` carries the leader's
 report in `leader_report`: each live node's eligibility, the groups the last
 pass could not move with the reason, and the age of the oldest move. Every
 other node answers `null` there. A node whose view shows it removed, or
-whose registration the meta group refused as removed, marks the
-`placement-unavailable` leadership shed for the rest of the run, and its
-hosting driver closes each replica once it stops counting as a voter.
+whose registration the meta group refused as removed, stays removed for the
+rest of the run, even when a later view no longer shows it (a damaged meta
+replica, a restored older snapshot). It marks the `placement-unavailable`
+leadership shed, which refuses leadership transfers to it, and its hosting
+driver closes each replica once it stops counting as a voter.
 
 ## 2. Replica loss and rejoin
 

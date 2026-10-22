@@ -42,9 +42,10 @@
 //!   holds what it read last.
 //!
 //! A node that knows itself removed, by a `NodeRemoved` answer or by its
-//! view ([`ursula_control::Standing::knows_removed`]), marks its `PlacementUnavailable`
-//! leadership shed for the rest of the run, and its plan closes each
-//! replica once it stops counting (design 8.1).
+//! view ([`ursula_control::Standing::knows_removed`]), latches the removal
+//! for the rest of the run, even if its view later regresses. It marks its
+//! `PlacementUnavailable` leadership shed, which refuses transfers to it,
+//! and its plan closes each replica once it stops counting (design 8.1).
 //!
 //! While the node fence refuses, the driver creates and closes nothing:
 //! every admission it publishes is `Open`, and no group leaves the set.
@@ -75,6 +76,7 @@ use ursula_control::HostingPlan;
 use ursula_control::HostingStep;
 use ursula_control::LocalReplica;
 use ursula_control::PlacementView;
+use ursula_control::Standing;
 use ursula_control::ViewInput;
 use ursula_control::leader_candidates;
 use ursula_control::plan_hosting;
@@ -258,9 +260,13 @@ impl<H: GroupHost> HostingDriver<H> {
         let mut confirms = Confirms::default();
         let mut askers = Askers::default();
         let mut only_voter = BTreeSet::new();
+        // The node's standing, latched `Removed` for the rest of the run
+        // once a pass knows it removed.
+        let mut standing = Standing::Member;
         loop {
             actions.reap(&mut askers);
-            self.pass(&mut actions, &mut confirms, &mut askers).await;
+            self.pass(&mut actions, &mut confirms, &mut askers, &mut standing)
+                .await;
             self.registry.refresh_only_voter_elections(&mut only_voter);
             let ended = crate::rt::select! {
                 biased;
@@ -287,8 +293,16 @@ impl<H: GroupHost> HostingDriver<H> {
 
     /// One pass: read the journals, confirm when the plan asks for it and
     /// the interval allows, plan, act on the plan, then ask about the held
-    /// replicas that may have left their groups.
-    async fn pass(&self, actions: &mut Actions, confirms: &mut Confirms, askers: &mut Askers) {
+    /// replicas that may have left their groups. `standing` is the run's
+    /// latched standing: once the node knows itself removed, it stays
+    /// `Removed` whatever a later view or answer says.
+    async fn pass(
+        &self,
+        actions: &mut Actions,
+        confirms: &mut Confirms,
+        askers: &mut Askers,
+        standing: &mut Standing,
+    ) {
         let local = match self.wal.local_groups() {
             Ok(local) => local,
             Err(error) => {
@@ -306,22 +320,31 @@ impl<H: GroupHost> HostingDriver<H> {
                 })
             })
             .collect();
-        let standing = self.meta.registration_answers().borrow().standing();
+        let view = self.registry.placement_watch().current();
+        let answered = self.meta.registration_answers().borrow().standing();
+        if answered.knows_removed(view.cluster(), self.me) {
+            // A removal holds for the rest of the run (design 8.1), even
+            // when the view regresses: a damaged meta replica publishes an
+            // empty view, and a restored snapshot may predate the removal.
+            // Without the latch the plan would fall back to opening every
+            // held replica, the closed ones included.
+            *standing = Standing::Removed;
+        }
+        let standing = *standing;
+        if standing == Standing::Removed {
+            // A removed node takes no leadership transfer for the rest of
+            // the run: a group it led would never reconcile toward a
+            // placement that has no role for it. The mark does not stop its
+            // elections, so it may still win one while a replica counts.
+            self.registry
+                .mark_leadership_shed(LeadershipShedReason::PlacementUnavailable);
+        }
         let input = |view| HostingInput {
             me: self.me,
             standing,
             view,
             local: &local,
         };
-        let view = self.registry.placement_watch().current();
-        if standing.knows_removed(view.cluster(), self.me) {
-            // A removed node takes no leadership for the rest of the run
-            // (design 8.1): it closes what stopped counting, and a group it
-            // led would never reconcile toward a placement that has no
-            // role for it.
-            self.registry
-                .mark_leadership_shed(LeadershipShedReason::PlacementUnavailable);
-        }
         let mut plan = plan_hosting(&input(ViewInput::Unconfirmed(&view)));
         if plan.steps.first() == Some(&HostingStep::ConfirmView) {
             if let Some(confirmed) = confirms.carried(&view) {
