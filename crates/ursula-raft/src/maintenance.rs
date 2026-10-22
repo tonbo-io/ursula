@@ -87,8 +87,8 @@ pub fn check_raft_maintenance(
         if &voters != expected || !group.learner_ids.is_empty() {
             issues.push(Issue::IncompleteVoterSet);
         }
-        // The leader heals a missing configured voter by itself, but never
-        // removes a member configuration does not list.
+        // The leader heals a missing placed voter by itself, but never
+        // removes a member the placement does not list.
         if voters
             .iter()
             .chain(&group.learner_ids)
@@ -298,15 +298,15 @@ mod tests {
             assert!(report.serving_ready());
             assert!(!report.ready());
         }
-        // A configured voter missing from the membership is healed by the
-        // leader: it is no unconfigured member.
+        // A placed voter missing from the membership is healed by the
+        // leader: it is no `UnconfiguredMember`.
         let mut group = healthy(1);
         group.voter_ids = vec![1, 2];
         group.voter_configurations = vec![BTreeSet::from([1, 2])];
         assert_eq!(report(&[healthy(0), group]).group_issues[&1], vec![
             RaftMaintenanceIssue::IncompleteVoterSet
         ]);
-        // Nor is the learner the leader is healing back: a configured voter.
+        // Nor is the learner the leader is healing back: a placed voter.
         let mut group = healthy(1);
         group.voter_ids = vec![1, 2];
         group.voter_configurations = vec![BTreeSet::from([1, 2])];

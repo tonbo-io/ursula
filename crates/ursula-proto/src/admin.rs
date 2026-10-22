@@ -566,7 +566,7 @@ pub enum RaftMaintenanceIssue {
     JointMembership,
     IncompleteVoterSet,
     /// The group's membership names a node that is not one of its
-    /// configured voters. No node dials a member that `raft.peers` does not
+    /// placed voters. No node dials a member that `raft.peers` does not
     /// list, and the leader never removes it: an operator lists the node
     /// again, or replaces the voter set without it through the membership
     /// endpoint, which also removes every learner outside the new voters.

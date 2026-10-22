@@ -403,7 +403,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     }
     /// Makes `voters` the group's voter set and removes every learner
     /// outside it, in one joint change, so a member that configuration no
-    /// longer lists leaves with it. A configured voter removed here comes
+    /// longer lists leaves with it. A placed voter removed here comes
     /// back: the heal driver adds it as a learner again.
     pub async fn replace_voters(
         &self,

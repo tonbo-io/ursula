@@ -113,7 +113,7 @@ pub fn spawn_runtime(
 }
 
 /// [`spawn_runtime`] with every Raft group placed by `placement`, for a
-/// test that runs no meta: production's placement inputs are interim.
+/// test that runs no meta: production's placement inputs read meta's view.
 #[cfg(test)]
 pub(crate) fn spawn_runtime_with_placement(
     config: &ursula_config::UrsulaConfig,

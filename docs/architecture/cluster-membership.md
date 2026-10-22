@@ -77,10 +77,10 @@ again every 30 seconds (`crates/ursula/src/bootstrap/meta_shed.rs`). A node
 that sheds for a reason that refuses transfers, such as the maintenance
 drain, hands its meta leadership away too. A node that sheds only for cold
 health keeps it, so an object store outage that every node sheds for does
-not pass meta from voter to voter. The configured voter set is the target that the heal driver restores
-(section 2). The admin routes (section 3) can change a group's OpenRaft
-membership directly, and the heal driver adds a configured voter that is
-missing back as a learner and promotes it.
+not pass meta from voter to voter. The target voters of a group's placement
+are the set that the heal driver restores (section 2). The admin routes
+(section 3) can change a group's OpenRaft membership directly, and the heal
+driver adds a placed voter that is missing back as a learner and promotes it.
 
 ## 2. Replica loss and rejoin
 
@@ -108,7 +108,7 @@ membership changes. Its conflict counts as its acknowledgement of the leader,
 so the leader keeps its quorum, and this holds when the followers that lost
 entries are a majority too. The heal driver
 (`crates/ursula-raft/src/rejoin/heal.rs`) observes and counts each reversion.
-It also adds a configured voter that is missing as a learner, promotes it once
+It also adds a placed voter that is missing as a learner, promotes it once
 it caught up, and flattens a joint configuration whose second step never
 committed.
 
@@ -229,9 +229,11 @@ without it.
 
 Readiness and maintenance eligibility are two answers from one report
 (`check_raft_maintenance` in `crates/ursula-raft/src/maintenance.rs`). The
-report compares local replicas against the configured inventory and lists
-issues per group, such as `incomplete_voter_set`, `unconfigured_member` (a
-member that is not a configured voter, which the leader never removes),
+report compares local replicas against the placement's inventory, the groups
+whose target voters in the node's latest view list the node, with those
+voters, and lists issues per group, such as `incomplete_voter_set`,
+`unconfigured_member` (a member that is not a placed voter, which the leader
+never removes),
 `joint_membership`, `apply_lag` or `apply_stopped`. `GET /__ursula/ready` uses
 `serving_ready()`, which ignores incomplete voter sets, unconfigured members,
 joint membership and stopped apply, so

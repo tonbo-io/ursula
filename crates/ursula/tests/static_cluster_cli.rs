@@ -4077,14 +4077,10 @@ async fn placed_replicas(
     .await
 }
 
-/// Asserts that every data replica node `node` reports took part in
-/// nothing: no vote floor (term 0, where a barrier would adopt its
-/// leader's), no entry and a closed recovery gate.
+/// Asserts that every data replica node `node` reports, if it runs any,
+/// took part in nothing: no vote floor (term 0, where a barrier would adopt
+/// its leader's), no entry and a closed recovery gate.
 fn assert_data_held(metrics: &ursula_proto::admin::NodeMetrics, node: u64) {
-    assert!(
-        !metrics.groups.is_empty(),
-        "node {node} runs its data replicas"
-    );
     for group in &metrics.groups {
         assert_eq!(
             group.current_term, 0,
@@ -5210,9 +5206,12 @@ fn bound_root(cluster: &Cluster, node: u64) -> ursula_proto::placement::RootId {
 /// IT-3 (#768): node 3 loses its disk and starts on an empty WAL under its
 /// live id. The meta group refuses the new root for the one it binds the
 /// id to: node 3 reports `root_refused` naming that root, while nodes 1 and
-/// 2 serve. Its data replicas are held out from its open: none took a vote
-/// floor (its term stays 0, the term a barrier would adopt is the leader's),
-/// none holds a log entry, and every data gate stays closed. Its meta
+/// 2 serve. Its data replicas take part in nothing: the empty WAL holds no
+/// group, so the node creates a replica only where a confirmed view places
+/// one, and
+/// any it runs is held out from its open. None took a vote floor (its term
+/// stays 0, the term a barrier would adopt is the leader's), none holds a
+/// log entry, and every data gate stays closed. Its meta
 /// replica is not held before the refusal, and the test claims nothing
 /// about it. A crash and restart of node 3 while it is refused changes
 /// nothing: its identity file still records the root unbound, so it is
@@ -5284,7 +5283,9 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     read_until_matches(&client, &read(&nodes[1]), b"before-the-loss;while-refused;").await;
     // Node 3's data replicas took part in nothing, though their leaders
     // replicated a write since it started.
-    let held = placed_replicas(&client, &mut procs, &nodes[2]).await;
+    let held = try_node_metrics(&client, &nodes[2].url())
+        .await
+        .expect("node 3 reports its replicas");
     assert_data_held(&held, 3);
     // A restart while refused: still refused and held, never superseded.
     procs.kill(3);
@@ -5310,7 +5311,9 @@ async fn cli_an_empty_disk_under_a_live_id_binds_after_replace_disk() {
     )
     .await;
     post_until_no_content(&client, &stream, "while-restarted;").await;
-    let held = placed_replicas(&client, &mut procs, &nodes[2]).await;
+    let held = try_node_metrics(&client, &nodes[2].url())
+        .await
+        .expect("node 3 reports its replicas after the restart");
     assert_data_held(&held, 3);
 
     // 2. The guard refuses a node that still runs on the root it names.

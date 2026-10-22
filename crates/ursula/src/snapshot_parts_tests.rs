@@ -1832,7 +1832,11 @@ async fn a_new_raft_term_lists_the_stream_again() {
         .await
         .expect("leader");
     let cold_store = runtime.cold_store().expect("a memory cold store");
-    let mut state = HttpState::with_raft_registry(runtime.clone(), registry.clone());
+    let mut state = HttpState::with_raft_cluster(
+        runtime.clone(),
+        registry.clone(),
+        Arc::new(ursula_raft::FixedPlacement::single(1)),
+    );
     state.set_staged_parts(crate::staged_parts::StagedParts::for_test(3, 1_000));
     let app = router_with_http_state(state.clone());
     create(&app, "/parts/s").await;

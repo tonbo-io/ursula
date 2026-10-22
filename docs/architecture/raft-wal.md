@@ -502,10 +502,10 @@ The heal driver observes each reversion in the leader's replication metrics. It
 logs a warning that names the group and the follower and counts it per
 follower in `ursula.raft.follower_log_reversions`. A follower that lost entries
 without a host crash or a lost disk, for example on a disk that drops synced
-writes, shows up there. The driver also adds a configured voter that is missing
-back as a learner, promotes it once it caught up, and flattens a joint
-configuration whose second step never committed. Desired voters come from the
-static configuration.
+writes, shows up there. The driver also adds a voter of the group's placement
+that is missing back as a learner, promotes it once it caught up, and flattens
+a joint configuration whose second step never committed. The desired voters
+are the target voters of the group's placement in the node's latest meta view.
 
 **Lease while followers catch up.** Gated followers renew the leader's lease
 before they caught up. If they cannot catch up, for example when one needs a
@@ -533,8 +533,8 @@ its gate is stalled and it still holds that log. An open gate answers `200` with
 outcome `already_open`. The admin incarnation precondition applies.
 
 **Bootstrap.** A replica that ever held its group never runs `Initialize`. The
-initializer, holding nothing, runs it only when every configured voter reports
-an empty group, no leader and a persisted genesis vote floor `(0, 0)`. It opens
+initializer, holding nothing, runs it only when every voter of the group's
+placement reports an empty group, no leader and a persisted genesis vote floor `(0, 0)`. It opens
 its own gate first, so the membership entry records `initialized`. A durable
 `(0, 0)` proves the peer never voted or acknowledged a leader, since either
 persists a higher vote first.

@@ -1017,6 +1017,16 @@ mod tests {
         // No view confirms anything, so the driver admits what the journal
         // holds and creates nothing.
         wait_hosted(&state, 0).await;
+        // The empty view places no group, so the open does not wait for the
+        // replica to lead, as it waits for a group's only placed voter: the
+        // write waits for the leader instead.
+        registry
+            .get(ursula_shard::RaftGroupId(0))
+            .expect("the driver opened group 0")
+            .wait(Some(std::time::Duration::from_secs(30)))
+            .current_leader(7, "the held replica leads its group")
+            .await
+            .expect("the held replica leads");
         let created = client
             .oneshot(
                 Request::builder()

@@ -1418,7 +1418,7 @@ async fn a_handoff_settles_within_the_transfer_deadline_and_one_minimum_election
     raft.shutdown().await.expect("shutdown raft group");
 }
 
-/// The recovery barrier asks the group's configured voters and the members
+/// The recovery barrier asks the group's placed voters and the members
 /// of its effective membership, by node id, never itself.
 #[cfg(not(madsim))]
 #[tokio::test]
