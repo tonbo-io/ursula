@@ -173,5 +173,12 @@
     "snippet_contains": "tokio::select! {",
     "reason": "not-sim-reachable",
     "plan": "no action: shutdown_signal and the axum serve loop run only in the binaries; simulations call the router directly and never serve a listener."
+  },
+  {
+    "category": "tokio_watch",
+    "path": "crates/ursula-observability/src/serve.rs",
+    "snippet_contains": "use tokio::sync::watch;",
+    "reason": "not-sim-reachable",
+    "plan": "no action: the drain's draining and open channels exist only inside serve_until_shutdown, which runs only in the binaries; simulations call the router directly and never serve a listener."
   }
 ]

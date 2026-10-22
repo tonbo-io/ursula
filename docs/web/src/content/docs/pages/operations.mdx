@@ -194,8 +194,17 @@ prevent re-acquiring leadership. It keeps Raft transport available while attempt
 to hand off each leadership to an eligible voter (see the handoff rule under
 [Recovering after a host crash](#recovering-after-a-host-crash)). It waits for
 observed leadership changes for up to five seconds, then closes Raft transport and
-drains HTTP listeners for up to ten seconds. A connection still open after
-that, such as one from a peer that lost power, is abandoned. It then stops its
+drains HTTP listeners for up to ten seconds. Each listener stops accepting
+connections and marks every HTTP/1 answer it starts from then on
+`Connection: close`. A connection that was idle when the drain began stays
+open for up to one second, so a request a client sends on it within that
+second is answered. The gateway reuses an idle connection for at most half a
+second. A gateway request can still fail with `502` in two cases. One is a
+connection the node's kernel completed but the node had not accepted when its
+listener closed, which is reset. The other is a connection whose last answer
+started before the drain, which closes after that answer without
+`Connection: close`. A connection still open after the ten seconds, such as
+one from a peer that lost power, is abandoned. It then stops its
 Raft groups, `fsync`s every journal and records a clean shutdown, so the next
 start reads the journals strictly and the node holds every entry it
 acknowledged. The whole shutdown has a deadline of
