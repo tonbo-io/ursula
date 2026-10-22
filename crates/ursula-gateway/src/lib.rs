@@ -937,6 +937,12 @@ impl Gateway {
     /// - A search hop or a hinted hop that cannot connect sent nothing, so the
     ///   search goes on to the next upstream. A leader hop that cannot connect
     ///   ends the request.
+    /// - A hop that sends no response headers within the response header
+    ///   timeout may have delivered the request to an upstream that accepted
+    ///   it and never answers, such as a stopped process. A request whose
+    ///   repeat is safe ([`Replay`]) goes on, once, to an upstream it has not
+    ///   tried, which answers or redirects to the current leader. Any other
+    ///   request ends with the timeout, whose outcome is unknown.
     /// - At most [`MAX_LEADER_REDIRECTS`] hops follow redirects, and none
     ///   starts later than [`LEADER_REDIRECT_DEADLINE`] after the first
     ///   redirect. When no upstream answers without redirecting within those
@@ -944,9 +950,11 @@ impl Gateway {
     ///   ([`GatewayError::LeaderNotFound`]).
     ///
     /// Each hop sends the request again. A node redirects a write only when
-    /// it refused the write before proposing it, so no hop meets a write an
-    /// earlier hop applied, and a `503 NO_LEADER` after the hops is a
-    /// refusal too.
+    /// it refused the write before proposing it, so no hop after a redirect
+    /// meets a write an earlier hop applied, and a `503 NO_LEADER` after the
+    /// hops is a refusal too. Only a producer write goes on after a hop that
+    /// answered nothing, and its key keeps the earlier hop's apply from
+    /// applying it twice.
     async fn forward(
         &self,
         upstream: &str,
@@ -960,6 +968,7 @@ impl Gateway {
             .map(|pq| pq.as_str())
             .unwrap_or("/");
         let pin_key = upstream_pin_key(&parts.uri, self.shard_map.as_ref());
+        let replay = Replay::of(parts);
         let started = Instant::now();
         let mut chain = Chain::new(upstream);
         loop {
@@ -986,13 +995,38 @@ impl Gateway {
                         chain.follow(next, Lead::Search);
                         continue;
                     }
+                    // A hop that may have delivered the request and answered
+                    // nothing in time: a request whose repeat is safe goes
+                    // on, once, to an upstream it has not tried.
+                    if matches!(error, GatewayError::UpstreamTimeout { .. })
+                        && replay != Replay::Never
+                        && let Some(next) = chain
+                            .may_replay()
+                            .then(|| self.untried_upstream(&chain))
+                            .flatten()
+                    {
+                        debug!(
+                            upstream = target,
+                            next, "no answer in time; sending the request to another upstream"
+                        );
+                        self.followed(&target, &next, Lead::Search);
+                        chain.replay(next, error);
+                        continue;
+                    }
                     self.chain_ended(&chain, started);
-                    return Err(error);
+                    return Err(chain.ending(replay, error));
                 }
             };
             self.upstream_answered(&target);
             if !is_raft_redirect(&response) {
                 self.chain_ended(&chain, started);
+                if replay == Replay::Keyed && !response.status().is_success() {
+                    // Only a receipt settles a write an earlier hop of the
+                    // chain may still apply.
+                    if let Some(unanswered) = chain.unanswered.take() {
+                        return Err(unanswered);
+                    }
+                }
                 return self.answer(response, tail, &chain, pin_key.as_deref());
             }
 
@@ -1023,9 +1057,8 @@ impl Gateway {
                     .leader_not_found
                     .fetch_add(1, Ordering::Relaxed);
                 self.chain_ended(&chain, started);
-                return Err(GatewayError::LeaderNotFound {
-                    followed: chain.redirects,
-                });
+                let followed = chain.redirects;
+                return Err(chain.ending(replay, GatewayError::LeaderNotFound { followed }));
             };
             self.followed(&target, &next, lead);
             chain.follow(next, lead);
@@ -1552,6 +1585,38 @@ impl Lead {
     }
 }
 
+/// Whether the gateway may send a request again, to another upstream, after
+/// a hop that may have delivered it answered nothing in time
+/// ([`Gateway::forward`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Replay {
+    /// A `GET` or a `HEAD`: a repeat changes nothing.
+    Read,
+    /// A producer write, keyed by `Producer-Id`, `Producer-Epoch` and
+    /// `Producer-Seq`: the key applies it at most once however often it is
+    /// sent, and a `2xx` receipt says that it holds. Any other answer to the
+    /// repeat leaves the outcome of the earlier hop unknown.
+    Keyed,
+    /// Any other request: a repeat may apply a write twice.
+    Never,
+}
+
+impl Replay {
+    fn of(parts: &axum::http::request::Parts) -> Self {
+        if matches!(parts.method, Method::GET | Method::HEAD) {
+            return Self::Read;
+        }
+        let keyed = ursula_headers::ProducerRequestHeaders::parse(
+            parts
+                .headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_bytes())),
+        )
+        .is_ok_and(|headers| headers.producer.is_some());
+        if keyed { Self::Keyed } else { Self::Never }
+    }
+}
+
 /// The hops of one forwarded request ([`Gateway::forward`]).
 struct Chain {
     /// The upstream of the hop under way.
@@ -1565,6 +1630,9 @@ struct Chain {
     /// When the first redirect arrived: [`LEADER_REDIRECT_DEADLINE`] counts
     /// from it.
     first_redirect: Option<Instant>,
+    /// The timeout of a hop that may have delivered the request, after which
+    /// the request was sent again ([`Replay`]).
+    unanswered: Option<GatewayError>,
 }
 
 impl Chain {
@@ -1575,6 +1643,7 @@ impl Chain {
             redirects: 0,
             lead: Lead::Picked,
             first_redirect: None,
+            unanswered: None,
         }
     }
 
@@ -1599,6 +1668,32 @@ impl Chain {
             && self
                 .first_redirect
                 .is_none_or(|first| now.saturating_duration_since(first) < LEADER_REDIRECT_DEADLINE)
+    }
+
+    /// Whether the request may be sent again after a hop that answered
+    /// nothing in time: it was not sent again before, and it has hops left.
+    fn may_replay(&self) -> bool {
+        self.unanswered.is_none() && self.redirects < MAX_LEADER_REDIRECTS
+    }
+
+    /// Sends the request again, to `next`, after the hop under way answered
+    /// nothing in time (`unanswered`). The search for the leader from there
+    /// starts its own [`LEADER_REDIRECT_DEADLINE`].
+    fn replay(&mut self, next: String, unanswered: GatewayError) {
+        self.unanswered = Some(unanswered);
+        self.first_redirect = None;
+        self.follow(next, Lead::Search);
+    }
+
+    /// The error a request of `replay` ends with when its last hop ended
+    /// with `error`: a write sent again after a hop that answered nothing
+    /// ends with that hop's timeout, since the earlier hop may still apply
+    /// it. A read ends with `error`.
+    fn ending(&mut self, replay: Replay, error: GatewayError) -> GatewayError {
+        match (replay, self.unanswered.take()) {
+            (Replay::Keyed, Some(unanswered)) => unanswered,
+            (Replay::Read | Replay::Keyed | Replay::Never, _) => error,
+        }
     }
 
     /// Sends the next hop to `next`, which `lead` chose.
@@ -2442,19 +2537,20 @@ pub enum GatewayError {
 }
 
 impl GatewayError {
-    /// Whether the upstream failed at the transport, so selection should
-    /// leave it out for a while (#454). A missing response within the header
-    /// timeout is not such a failure: one slow group on a live node causes it
-    /// too, and a node that vanished fails its connections within the
-    /// upstream TCP user timeout instead. Nor is a request that could not be
-    /// built, which never left the gateway.
+    /// Whether the upstream failed at the transport, or answered nothing
+    /// within the response header timeout, so selection should leave it out
+    /// for a while (#454). A node answers a write it cannot finish within its
+    /// leader lease, so a missing answer marks a node that does not answer at
+    /// all, such as a stopped process. A live node whose request was only
+    /// slow comes back with its next answer, a redirect's included. A request
+    /// that could not be built never left the gateway.
     fn ejects_upstream(&self) -> bool {
         match self {
-            Self::UpstreamUnreachable { .. } | Self::LeaderUnreachable { .. } => true,
+            Self::UpstreamUnreachable { .. }
+            | Self::LeaderUnreachable { .. }
+            | Self::UpstreamTimeout { .. } => true,
             Self::Upstream { source, .. } => !source.is_builder(),
-            Self::UpstreamTimeout { .. } | Self::LeaderNotFound { .. } | Self::ResponseBuild(_) => {
-                false
-            }
+            Self::LeaderNotFound { .. } | Self::ResponseBuild(_) => false,
         }
     }
 

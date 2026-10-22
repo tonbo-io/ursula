@@ -7,12 +7,21 @@
 //! lapsed in its leader state, and the fence blocks every message that
 //! could depose it, so a fenced replica leads nothing here, and every
 //! leader-gated job stops at this one site.
+//!
+//! So does OpenRaft's leader lease: a leader that no quorum acknowledged
+//! within it stays in OpenRaft's leader state until a message with a higher
+//! term reaches it, which a leader cut off from its peers never gets. Such
+//! a leader leads nothing here either ([`LeaderRole::Lapsed`]): a write
+//! routed to it is refused before its body, and a write it proposed earlier
+//! stops waiting for an answer only its quorum could give ([`until_lapsed`]).
 
 use std::time::Duration;
 
 use openraft::RaftMetrics;
 use openraft::ServerState;
 use openraft::rt::Instant as _;
+use openraft::rt::WatchReceiver;
+use openraft::type_config::alias::WatchReceiverOf;
 use ursula_runtime::CommittedLeader;
 use ursula_runtime::NodeFence;
 use ursula_runtime::UploadFence;
@@ -30,6 +39,13 @@ pub enum LeaderRole {
     Follows { leader_id: u64 },
     /// No leader is known, or this replica is between roles.
     Unknown,
+    /// OpenRaft keeps this replica in its leader state, but it cannot
+    /// commit: its node fence does not admit it, or no quorum acknowledged
+    /// it within its leader lease. OpenRaft answers a write it proposed
+    /// only once the write commits or a newer leader's log replaces it, so
+    /// a lapsed leader cut off from its peers would hold the write for as
+    /// long as the cut lasts.
+    Lapsed,
 }
 
 /// A replica's view of its group's leadership. It can lag an election: a
@@ -45,16 +61,28 @@ pub struct GroupLeadership {
 }
 
 impl GroupLeadership {
-    /// The view `metrics` show behind `fence`. Only `ServerState::Leader`
+    /// The view `metrics` show behind `fence`, for a group whose OpenRaft
+    /// leader lease is `lease` ([`leader_lease`]). Only `ServerState::Leader`
     /// leads: a node that names itself leader in any other state is between
-    /// roles. While the fence does not admit, the role is unknown, and after
-    /// it lifted a leader leads again only once OpenRaft confirmed its
-    /// leadership ([`fence_lets_lead`]).
-    pub fn of(metrics: &RaftMetrics<UrsulaRaftTypeConfig>, fence: &NodeFence) -> Self {
+    /// roles. While the fence does not admit, a leader has lapsed and any
+    /// other replica's role is unknown. After the fence lifted, a leader
+    /// leads again only once OpenRaft confirmed its leadership
+    /// ([`fence_lets_lead`]). A leader that no quorum acknowledged within
+    /// `lease` has lapsed ([`lease_holds`]).
+    pub fn of(
+        metrics: &RaftMetrics<UrsulaRaftTypeConfig>,
+        fence: &NodeFence,
+        lease: Duration,
+    ) -> Self {
         let now = fence_now();
+        let leader = metrics.state == ServerState::Leader;
         let role = if !fence.admits(now) && fence_rules_leadership() {
-            LeaderRole::Unknown
-        } else if metrics.state == ServerState::Leader {
+            if leader {
+                LeaderRole::Lapsed
+            } else {
+                LeaderRole::Unknown
+            }
+        } else if leader {
             let own_quorum = own_quorum(metrics);
             let acked_age = metrics
                 .last_quorum_acked
@@ -63,10 +91,12 @@ impl GroupLeadership {
             let since_lift = fence
                 .lifted_at()
                 .map(|lifted| now.saturating_duration_since(lifted));
-            if fence_lets_lead(own_quorum, acked_age, since_lift) || !fence_rules_leadership() {
+            let fence_lets =
+                fence_lets_lead(own_quorum, acked_age, since_lift) || !fence_rules_leadership();
+            if fence_lets && lease_holds(own_quorum, acked_age, lease) {
                 LeaderRole::Leads
             } else {
-                LeaderRole::Unknown
+                LeaderRole::Lapsed
             }
         } else {
             match metrics.current_leader {
@@ -94,7 +124,7 @@ impl GroupLeadership {
                 leader_id,
                 term: self.term,
             },
-            LeaderRole::Unknown => WriteRoute::NoLeader,
+            LeaderRole::Unknown | LeaderRole::Lapsed => WriteRoute::NoLeader,
         }
     }
 
@@ -126,6 +156,58 @@ impl GroupLeadership {
             LeaderRole::Leads if self.node_id == leader => Some(self.term),
             _ => None,
         }
+    }
+}
+
+/// OpenRaft's leader lease of a group that runs `config`: OpenRaft takes it
+/// from `election_timeout_max`, and refuses a write while no quorum
+/// acknowledged its leader within it. Its followers campaign within the same
+/// bound once the leader goes silent.
+pub(crate) fn leader_lease(config: &openraft::Config) -> Duration {
+    Duration::from_millis(config.election_timeout_max)
+}
+
+/// Whether a leader keeps its lease: it is its own quorum, or a quorum
+/// acknowledged it less than `lease` ago (`acked_age`, the age of OpenRaft's
+/// `last_quorum_acked`). A leader no follower answered yet (`acked_age` is
+/// `None`) was just elected and keeps it: OpenRaft refuses its writes until
+/// the first answer, and a write waits for that answer before it proposes
+/// ([`crate::forward::await_first_quorum_ack`]).
+fn lease_holds(own_quorum: bool, acked_age: Option<Duration>, lease: Duration) -> bool {
+    own_quorum || acked_age.is_none_or(|age| age < lease)
+}
+
+/// Resolves once this replica's leadership, as `metrics` show it behind
+/// `fence` for a group whose lease is `lease`, has lapsed
+/// ([`LeaderRole::Lapsed`]). A write OpenRaft took while this replica led
+/// waits on it beside its answer: a lapsed leader cut off from its peers gets
+/// no answer for it, and the write may still commit through its quorum or a
+/// newer leader, so its outcome is unknown. Any other role keeps the wait:
+/// a replica that stepped down hears of the write's fate from the newer
+/// leader.
+///
+/// A lease ends by time, not by a metrics change, so the wait looks again
+/// when the lease of the last quorum acknowledgement would end, which a
+/// later acknowledgement moves on: a write that commits within its lease
+/// never wakes it. A fence that closes while a quorum still acknowledges is
+/// seen by the next look, at most one lease later.
+pub(crate) async fn until_lapsed(
+    metrics: WatchReceiverOf<UrsulaRaftTypeConfig, RaftMetrics<UrsulaRaftTypeConfig>>,
+    fence: &NodeFence,
+    lease: Duration,
+) {
+    loop {
+        let lease_left = {
+            let current = metrics.borrow_watched();
+            if GroupLeadership::of(&current, fence, lease).role == LeaderRole::Lapsed {
+                return;
+            }
+            current
+                .last_quorum_acked
+                .as_ref()
+                .map_or(lease, |acked| lease.saturating_sub(acked.elapsed()))
+        };
+        crate::rt::time::sleep(lease_left).await;
     }
 }
 
@@ -185,7 +267,10 @@ mod tests {
     use super::GroupLeadership;
     use super::LeaderRole;
     use super::fence_lets_lead;
+    use super::lease_holds;
     use crate::types::UrsulaRaftTypeConfig as C;
+
+    const LEASE: Duration = Duration::from_secs(3);
 
     /// The one leader predicate behind the fence: a fenced leader leads
     /// nothing, and a leader whose fence never lifted leads.
@@ -195,12 +280,25 @@ mod tests {
         let mut metrics = RaftMetrics::<C>::new_initial(1);
         metrics.state = ServerState::Leader;
         metrics.current_leader = Some(1);
-        let fenced = GroupLeadership::of(&metrics, &fence);
-        assert_eq!(fenced.role, LeaderRole::Unknown);
+        let fenced = GroupLeadership::of(&metrics, &fence, LEASE);
+        assert_eq!(fenced.role, LeaderRole::Lapsed);
         assert_eq!(fenced.upload_fence(), None);
         let start = fence_now();
         fence.record_probe(start, ProbeOutcome::Synced, start);
-        assert!(GroupLeadership::of(&metrics, &fence).leads());
+        assert!(GroupLeadership::of(&metrics, &fence, LEASE).leads());
+    }
+
+    /// A leader leads while a quorum acknowledged it within its lease, or
+    /// while no follower answered it yet, and lapses once the last
+    /// acknowledgement is older than the lease. Its own quorum never lapses.
+    #[test]
+    fn a_leader_lapses_once_its_last_quorum_acknowledgement_is_older_than_its_lease() {
+        let secs = Duration::from_secs;
+        assert!(lease_holds(false, None, LEASE), "just elected");
+        assert!(lease_holds(false, Some(secs(1)), LEASE), "acknowledged");
+        assert!(!lease_holds(false, Some(LEASE), LEASE), "at the lease");
+        assert!(!lease_holds(false, Some(secs(60)), LEASE), "cut off");
+        assert!(lease_holds(true, Some(secs(60)), LEASE), "its own quorum");
     }
 
     /// After a lift a leader leads again only once a quorum acknowledged an

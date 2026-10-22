@@ -156,7 +156,8 @@ async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
     raft: &Raft<UrsulaRaftTypeConfig, SM>,
     fence: &ursula_runtime::NodeFence,
 ) -> Outcome {
-    if !GroupLeadership::of(&raft.metrics().borrow_watched(), fence).leads() {
+    let lease = crate::leadership::leader_lease(raft.config());
+    if !GroupLeadership::of(&raft.metrics().borrow_watched(), fence, lease).leads() {
         return Ok(None);
     }
     let budget = Duration::from_millis(raft.config().election_timeout_min);
@@ -168,7 +169,7 @@ async fn confirm<SM: RaftStateMachine<UrsulaRaftTypeConfig>>(
             group_engine_linearizable_read_error(
                 err,
                 OPERATION,
-                &GroupLeadership::of(&raft.metrics().borrow_watched(), fence),
+                &GroupLeadership::of(&raft.metrics().borrow_watched(), fence, lease),
             )
         })?;
     let read_log_id = *linearizer.read_log_id().log_id();

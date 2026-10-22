@@ -1051,17 +1051,19 @@ pub(crate) async fn write_commands_on_raft<SM: crate::replica::ReplicaStateMachi
         .client_write_many(commands)
         .await
         .map_err(crate::openraft_error::write_not_submitted)?;
+    let lease = crate::leadership::leader_lease(raft.config());
     let responses =
         stream
             .zip(futures_util::stream::iter(expected_kinds))
             .map(|(result, expected)| {
                 result.map(|result| {
                     crate::openraft_error::batch_write_result::<SM>(result, expected, || {
-                        GroupLeadership::of(&raft.metrics().borrow_watched(), fence)
+                        GroupLeadership::of(&raft.metrics().borrow_watched(), fence, lease)
                     })
                 })
             });
-    Ok(collect_batch_responses(responses, expected_responses).await)
+    let lapsed = crate::leadership::until_lapsed(raft.metrics(), fence, lease);
+    Ok(collect_batch_responses(responses, expected_responses, lapsed).await)
 }
 
 /// Waits, at most `election_timeout_min`, until this leader holds a quorum
@@ -1126,7 +1128,11 @@ pub(crate) fn refuse_unless_leader<
 ) -> Result<(), GroupEngineError> {
     let receiver = raft.metrics();
     let metrics = receiver.borrow_watched();
-    let leadership = GroupLeadership::of(&metrics, fence);
+    let leadership = GroupLeadership::of(
+        &metrics,
+        fence,
+        crate::leadership::leader_lease(raft.config()),
+    );
     if leadership.leads() {
         return Ok(());
     }
@@ -1139,13 +1145,29 @@ pub(crate) fn refuse_unless_leader<
 }
 
 /// Preserve every delivered outcome even when a later responder is lost.
+/// Once `lapsed` resolves, the leader that took the batch has lapsed
+/// ([`crate::leadership::until_lapsed`]) and the commands not answered yet
+/// may never be: each answers that its outcome is unknown
+/// ([`crate::openraft_error::write_outlived_leadership`]).
 async fn collect_batch_responses<T, E: std::fmt::Display>(
     mut stream: impl futures_util::Stream<Item = Result<Result<T, GroupEngineError>, E>> + Unpin,
     expected: usize,
+    lapsed: impl std::future::Future<Output = ()>,
 ) -> Vec<Result<T, GroupEngineError>> {
+    let mut lapsed = std::pin::pin!(lapsed);
     let mut responses = Vec::with_capacity(expected);
     loop {
-        match stream.try_next().await {
+        let next = crate::rt::select! {
+            biased;
+            next = stream.try_next() => next,
+            () = &mut lapsed => {
+                let lost = expected.saturating_sub(responses.len());
+                responses.resize_with(expected, crate::openraft_error::write_outlived_leadership);
+                tracing::debug!(lost, expected, "a lapsed leader stopped waiting for its batch");
+                return responses;
+            }
+        };
+        match next {
             Ok(Some(response)) => responses.push(response),
             Ok(None) => break,
             Err(error) => {
@@ -1326,8 +1348,12 @@ mod batch_response_tests {
             if error {
                 replies.push(Err("raft stopped"));
             }
-            let result =
-                collect_batch_responses(futures_util::stream::iter(replies.clone()), 4).await;
+            let result = collect_batch_responses(
+                futures_util::stream::iter(replies.clone()),
+                4,
+                std::future::pending(),
+            )
+            .await;
             assert_eq!(result[0], Ok(7));
             assert_eq!(result[1], replies[1].clone().unwrap());
             assert!(result[2..].iter().all(|item| matches!(

@@ -72,6 +72,9 @@ pub struct OwnerRaftHandle<
     transfer_deadline: Duration,
     /// The node fence the one leader predicate reads.
     fence: NodeFence,
+    /// The group's OpenRaft leader lease, which the one leader predicate
+    /// reads too ([`crate::leadership::leader_lease`]).
+    lease: Duration,
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHandle<SM> {
@@ -84,6 +87,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for OwnerRaftHa
             handoff_ack_window: self.handoff_ack_window,
             transfer_deadline: self.transfer_deadline,
             fence: self.fence.clone(),
+            lease: self.lease,
         }
     }
 }
@@ -105,6 +109,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
         let data_metrics = raft.data_metrics();
         let server_metrics = raft.server_metrics();
         let handoff_ack_window = Duration::from_millis(raft.config().election_timeout_min);
+        let lease = crate::leadership::leader_lease(raft.config());
         let transfer_deadline = Duration::from_millis(
             raft.config()
                 .election_timeout_max
@@ -133,6 +138,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
             handoff_ack_window,
             transfer_deadline,
             fence,
+            lease,
         }
     }
 
@@ -285,7 +291,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> OwnerRaftHandle<SM> {
     /// This replica's view of the group's leadership, from one borrow of
     /// its Raft metrics, without a trip through the group's core.
     pub fn leadership(&self) -> GroupLeadership {
-        GroupLeadership::of(&self.metrics.borrow_watched(), &self.fence)
+        GroupLeadership::of(&self.metrics.borrow_watched(), &self.fence, self.lease)
     }
 
     /// OpenRaft's data metrics, which carry the full last log id. Its
