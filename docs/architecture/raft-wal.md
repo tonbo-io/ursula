@@ -58,8 +58,11 @@ and one spawn path: its groups open behind their recovery gates under
 `raft.node_id`, and it runs the snapshot store of `storage.snapshot.backend`,
 the log write gate, the store, egress and cold-health gates, the leadership
 balancer and the commit-stall watchdog. A shed never stops the campaign of a
-group whose only voter is the node (`ElectionPolicy::refresh`), since no other
-voter could take its leadership. The Helm chart sets the
+group whose placement inputs make the node its only voter
+(`ElectionPolicy::refresh`), since no other voter could take its leadership.
+The replica's own membership plays no part, so a replica that joins a group
+of more voters gets no exemption, even while it knows no membership yet. The
+Helm chart sets the
 path to `raft.logDir` on each voter's `raft-data` PVC and exposes the other keys
 as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 `raft.minAvailableBytes` and `raft.resumeAvailableBytes`.

@@ -1042,6 +1042,11 @@ pub struct GroupRejoin {
     )>,
     /// How long a plan may apply nothing before it reports stalled.
     stall_after: OnceLock<Duration>,
+    /// The group's node sets, which its gate drivers read, bound when they
+    /// spawn ([`crate::RecoveryGate::spawn_gate_drivers`]). The election
+    /// policy reads from them whether this replica is the group's only
+    /// voter ([`Self::is_only_voter`]).
+    nodes: OnceLock<Arc<dyn crate::GroupNodes>>,
     /// Test-only: the accept job waits for a permit here once it changed
     /// the gate, so a test can drop its caller mid-job.
     #[cfg(any(test, feature = "fault-injection"))]
@@ -1246,6 +1251,7 @@ impl GroupRejoin {
             refused_snapshot: Mutex::new(None),
             cut_refused,
             stall_after: OnceLock::new(),
+            nodes: OnceLock::new(),
             #[cfg(any(test, feature = "fault-injection"))]
             plan_pause: Mutex::new(None),
             plan_in_flight: AtomicBool::new(false),
@@ -1320,6 +1326,29 @@ impl GroupRejoin {
             raft.runtime_config().elect(false);
         }
         Ok(())
+    }
+
+    /// Binds the group's node sets, which the replica's gate drivers read
+    /// at each use. A gate gets its drivers once, so a second bind keeps
+    /// the first sets.
+    pub(crate) fn bind_nodes(&self, nodes: Arc<dyn crate::GroupNodes>) {
+        if self.nodes.set(nodes).is_err() {
+            tracing::warn!(
+                node_id = self.node_id,
+                plane = self.group.plane().as_str_name(),
+                raft_group_id = self.group.wire_group_id(),
+                "recovery gate: its node sets were bound already; the first ones stay"
+            );
+        }
+    }
+
+    /// Whether the group's node sets, read now, make this replica its only
+    /// voter ([`crate::GroupNodes::is_only_voter`]). Never before they are
+    /// bound.
+    pub(crate) fn is_only_voter(&self) -> bool {
+        self.nodes
+            .get()
+            .is_some_and(|nodes| nodes.is_only_voter(self.node_id))
     }
 
     fn metrics(&self) -> Option<RaftMetrics<UrsulaRaftTypeConfig>> {

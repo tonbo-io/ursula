@@ -3,7 +3,7 @@ title: Quick Start
 sidebarTitle: Quick Start
 ---
 
-This page assumes a single node is already running on `127.0.0.1:4437`. Starting one is a single Docker or Cargo command, see [Install](/docs/install). The default node keeps nothing across restarts. For disk-backed persistence, set `raft.wal.path` (see [Configuration](/docs/configuration)). A multi-node cluster also needs `server.cluster_id`, the same on every node.
+This page assumes a single node is already running on `127.0.0.1:4437`. Starting one is a single Docker or Cargo command, see [Install](/docs/install). The default node keeps nothing across restarts. For disk-backed persistence, set `raft.wal.path`, list the node itself in `[[raft.peers]]` and set `server.cluster_id`, as the disk-backed single node in [Complete examples](/docs/configuration#complete-examples) does. A node with `raft.wal.path` that misses either refuses to start. Every node of a multi-node cluster sets the same `server.cluster_id`.
 
 Drive the HTTP API with `curl` from another terminal.
 

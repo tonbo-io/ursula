@@ -6047,6 +6047,101 @@ async fn startup_maintenance_drain_disables_groups_registered_after_the_fence() 
     }
 }
 
+/// A shed exempts only a group whose placement makes this node its only
+/// voter. A drained node that initializes a fresh three-voter group joins
+/// it and still does not campaign, so the group, whose other voters know
+/// no membership yet, elects nobody until the drain ends. The bug this
+/// catches: an exemption read from the replica's own membership, which is
+/// empty when its gate opens just before it initializes the group, and
+/// which nothing read again once the group had three voters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_initializer_of_a_three_voter_group_does_not_campaign() {
+    let mut listeners = Vec::new();
+    let mut peers = Vec::new();
+    for node_id in 1..=3u64 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        peers.push((
+            node_id,
+            format!("http://{}", listener.local_addr().expect("listener addr")),
+        ));
+        listeners.push(listener);
+    }
+    let mut nodes = Vec::new();
+    for (index, listener) in listeners.into_iter().enumerate() {
+        nodes.push(
+            spawn_static_grpc_test_node(
+                u64::try_from(index + 1).expect("node id fits u64"),
+                listener,
+                peers.clone(),
+                peers.clone(),
+                1,
+                StaticGrpcTestNodeStorage {
+                    // Node 1 is group 0's initializer.
+                    start_maintenance_drained: index == 0,
+                    ..Default::default()
+                },
+            )
+            .await,
+        );
+    }
+    for node in &nodes {
+        node.runtime
+            .warm_all_groups()
+            .await
+            .expect("warm raft group");
+    }
+    let initializer = nodes[0]
+        .registry
+        .get(RaftGroupId(0))
+        .expect("the drained initializer's group");
+    initializer
+        .wait(Some(Duration::from_secs(10)))
+        .metrics(
+            |metrics| {
+                metrics
+                    .membership_config
+                    .membership()
+                    .voter_ids()
+                    .collect::<BTreeSet<_>>()
+                    == BTreeSet::from([1, 2, 3])
+            },
+            "the drained initializer initializes the group with its three voters",
+        )
+        .await
+        .expect("the group initializes");
+    // Several maximum election timeouts (3 s) with nobody else able to
+    // campaign: only the initializer knows the membership.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    for node in &nodes {
+        let metrics = node
+            .registry
+            .get(RaftGroupId(0))
+            .expect("registered group")
+            .metrics()
+            .borrow_watched()
+            .clone();
+        assert_eq!(
+            metrics.current_term, 0,
+            "no replica campaigns while the only one that could is drained: {metrics:?}"
+        );
+        assert_ne!(metrics.state, openraft::ServerState::Leader, "{metrics:?}");
+    }
+    // The scenario can elect: once the drain ends, the initializer leads.
+    nodes[0]
+        .registry
+        .clear_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
+    initializer
+        .wait(Some(Duration::from_secs(15)))
+        .current_leader(1, "the undrained initializer elects itself")
+        .await
+        .expect("the group elects once the drain ends");
+    for node in nodes {
+        node.shutdown().await;
+    }
+}
+
 #[tokio::test]
 async fn merged_router_serves_both_planes() {
     // The single-listener router (backwards compat / in-process tests) must
