@@ -636,6 +636,10 @@ pub enum RaftMaintenanceIssue {
     /// A replica runs or is held while the view gives the node no role in
     /// the group.
     UnplacedReplica,
+    /// The view shows a move of a group in which it gives the node a role.
+    /// It blocks maintenance on a replica that does not count as a voter
+    /// too.
+    MoveInProgress,
     DuplicateGroup,
     WrongNodeIdentity,
     RaftStopped,
@@ -694,6 +698,7 @@ impl RaftMaintenanceIssue {
             | Self::MetaDamaged
             | Self::ReplicationFactorMismatch
             | Self::UnplacedReplica
+            | Self::MoveInProgress
             | Self::JointMembership
             | Self::IncompleteVoterSet
             | Self::UnplacedMember
@@ -1393,6 +1398,7 @@ mod serving_readiness_tests {
 
     use crate::placement::ClusterStage;
     use crate::placement::ExpectedReplica;
+    use crate::placement::MembershipAnswer;
     use crate::placement::MetaLogId;
     use crate::placement::MetaRole;
     use crate::placement::NodeId;
@@ -1439,6 +1445,7 @@ mod serving_readiness_tests {
             })]),
             unplaced: BTreeMap::from([(5, UnplacedReplica {
                 counts_as_voter: false,
+                last_answer: Some(MembershipAnswer::NotMember),
             })]),
             node_issues: vec![],
             group_issues: BTreeMap::new(),
@@ -1472,7 +1479,7 @@ mod serving_readiness_tests {
                     "target": [1, 2, 3],
                     "counts_as_voter": true
                 }},
-                "unplaced": {"5": {"counts_as_voter": false}},
+                "unplaced": {"5": {"counts_as_voter": false, "last_answer": "not_member"}},
                 "node_issues": [], "group_issues": {}
             })
         );
@@ -1495,6 +1502,7 @@ mod serving_readiness_tests {
             ("/expected_groups/0", "target"),
             ("/expected_groups/0", "counts_as_voter"),
             ("/unplaced/5", "counts_as_voter"),
+            ("/unplaced/5", "last_answer"),
         ] {
             let mut missing = wire.clone();
             missing
@@ -1556,6 +1564,7 @@ mod serving_readiness_tests {
             (Issue::JointMembership, false),
             (Issue::ApplyStopped, false),
             (Issue::UnplacedReplica, false),
+            (Issue::MoveInProgress, false),
             (Issue::LocalReplicaNotVoter, true),
             (Issue::RecoveryBarrier, true),
             (Issue::RaftStopped, true),
@@ -1593,10 +1602,11 @@ mod serving_readiness_tests {
                 assert!(non_voter.serving_ready());
                 assert!(non_voter.ready());
             }
-            non_voter
-                .group_issues
-                .insert(group, vec![Issue::UnplacedReplica]);
-            assert!(!non_voter.ready());
+            for issue in [Issue::UnplacedReplica, Issue::MoveInProgress] {
+                non_voter.group_issues.insert(group, vec![issue]);
+                assert!(non_voter.serving_ready());
+                assert!(!non_voter.ready());
+            }
             non_voter.group_issues.insert(group, vec![Issue::Unknown]);
             assert!(!non_voter.serving_ready());
         }
@@ -1604,6 +1614,10 @@ mod serving_readiness_tests {
         let mut outside = report();
         outside.group_issues.insert(9, vec![Issue::RaftStopped]);
         assert!(!outside.serving_ready());
+        assert_eq!(
+            serde_json::to_value(Issue::MoveInProgress).unwrap(),
+            serde_json::json!("move_in_progress")
+        );
         // A node with no group is ready.
         let mut empty = report();
         empty.expected_groups.clear();

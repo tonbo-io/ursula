@@ -303,17 +303,20 @@ answers), a view that has not bootstrapped, a genesis mismatch, a meta group
 without a leader for 30 s, a damaged meta replica, which replaces every issue
 the view gives, and a configured group count or replication factor the
 cluster does not share. Group issues name a missing placed replica, a replica
-held without a role (`unplaced_replica`), an incomplete voter set, a member
+held without a role (`unplaced_replica`, listed with the last answer the
+node's membership asker got about it), an incomplete voter set, a member
 without a role (`unplaced_member`: the leader removes such a learner once the
 group is seeded or its voters equal the target, and such a voter only by a
 move or by leaving a joint configuration; nothing restores a missing voter),
-`joint_membership`, `apply_lag` or `apply_stopped`. A node with no group is
-ready. `GET /__ursula/ready` uses `serving_ready()`, which ignores incomplete
-voter sets, members and replicas without a role, joint membership and stopped
-apply, so healthy survivors keep serving while a peer catches up. Maintenance
-tooling uses `ready()`, which ignores only a meta group without a leader and a
-damaged meta replica, so a second disruption waits for full redundancy. The
-readiness body includes the full report.
+a move of the group in the view (`move_in_progress`, for every role, a
+replica that does not count as a voter included), `joint_membership`,
+`apply_lag` or `apply_stopped`. A node with no group is ready.
+`GET /__ursula/ready` uses `serving_ready()`, which ignores incomplete voter
+sets, members and replicas without a role, moves, joint membership and
+stopped apply, so healthy survivors keep serving while a peer catches up.
+Maintenance tooling uses `ready()`, which ignores only a meta group without a
+leader and a damaged meta replica, so a second disruption waits for full
+redundancy. The readiness body includes the full report.
 
 ## 4. Kubernetes integration
 

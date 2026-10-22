@@ -10,26 +10,34 @@
 //! when the log lists the node ([`crate::GroupRejoin::counts`]).
 //!
 //! An open replica that holds nothing and has no confirmed role counts for
-//! nothing, so its closed gate holds back no participation. A server node's
-//! wiped voter (#729) never runs in that state: the hosting driver creates
-//! a replica it does not hold only from a confirmed view, whose role the
-//! predicate then reads, and opens only what its journal holds from an
-//! unconfirmed one. A replica that kept anything counts as an open replica
-//! with a held log does, so its gate keeps the node out of handoffs until
-//! it opens (design 5.8).
+//! nothing, so its closed gate holds back no participation. The hosting
+//! driver creates a replica it does not hold only from a confirmed view,
+//! whose role the predicate then reads. But it reopens what its journal
+//! holds, an empty log too, from an unconfirmed view. So a server node's
+//! wiped voter (#729) that restarts before its gate opened, while no view
+//! is confirmed (meta down, or before the driver's first confirmation),
+//! counts for nothing, and holds back no participation, until a confirmed
+//! view gives it its role again or its leader's replication brings it a
+//! membership that lists it. A replica that kept
+//! anything counts as an open replica with a held log does, so its gate
+//! keeps the node out of handoffs until it opens.
 //!
 //! The left mark of each group ([`LeftMarks`]) belongs to the node, not to
 //! a replica's engine, so a replica closed and opened again keeps it for
-//! the run. Two producers feed it:
+//! the run. Three producers feed it:
 //!
 //! - every barrier answer a replica's gate driver gets, classified for this
 //!   node by the kernel's one classifier ([`crate::LeaderMemberships::answer`]),
 //!   may set it;
+//! - so may every answer the hosting driver's membership asker gets for a
+//!   held replica that is closed, or whose role is `Outgoing`, `Abandoned`
+//!   or none (`crate::hosting`);
 //! - every inbound append with a committed vote may clear it
 //!   ([`crate::GroupRejoin::observe_inbound_append`]).
 //!
 //! Node participation ([`crate::RaftGroupHandleRegistry::recovery_barriers_ready`]),
-//! the egress probe's groups and the hosting driver's plan read the
+//! the egress probe's groups, the hosting driver's plan and client reads
+//! (a replica that does not count reads like a leader-only read) read the
 //! predicate. The meta replica's gate counts for none of them.
 
 use std::collections::BTreeMap;
@@ -37,8 +45,10 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 
+use ursula_control::Asked;
 use ursula_control::LeftMark;
 use ursula_control::counts_as_voter;
+use ursula_proto::placement::MembershipAnswer;
 use ursula_shard::RaftGroupId;
 
 use crate::types::UrsulaVote;
@@ -65,6 +75,32 @@ impl LeftMarks {
         )
     }
 
+    /// Records that a membership question about `group` goes out now, for
+    /// the mark its answer may set ([`LeftMark::ask`]).
+    pub(crate) fn ask(&self, group: RaftGroupId) -> Asked {
+        lock(&self.cell(group)).ask()
+    }
+
+    /// Records a live leader's answer about this node, under its vote
+    /// `vote`, to the question about `group` asked at `asked`
+    /// ([`LeftMark::answered`]).
+    pub(crate) fn answered(
+        &self,
+        group: RaftGroupId,
+        asked: Asked,
+        answer: MembershipAnswer,
+        vote: UrsulaVote,
+    ) {
+        lock(&self.cell(group)).answered(asked, answer, vote);
+    }
+
+    /// Whether an append to `group`'s replica with a vote of at least
+    /// `vote` arrived after the question asked at `asked`
+    /// ([`LeftMark::followed`]).
+    pub(crate) fn followed(&self, group: RaftGroupId, asked: Asked, vote: &UrsulaVote) -> bool {
+        lock(&self.cell(group)).followed(asked, vote)
+    }
+
     /// Whether `group` marked this node left.
     pub fn is_left(&self, group: RaftGroupId) -> bool {
         let cell = self
@@ -77,11 +113,14 @@ impl LeftMarks {
     }
 }
 
+/// The mark in `cell`, locked.
+pub(crate) fn lock(cell: &LeftMarkCell) -> std::sync::MutexGuard<'_, LeftMark<UrsulaVote>> {
+    cell.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// Whether the mark in `cell` is set.
 pub(crate) fn is_left(cell: &LeftMarkCell) -> bool {
-    cell.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .is_left()
+    lock(cell).is_left()
 }
 
 /// Whether a closed replica of `group` counts as a voter: unless the group

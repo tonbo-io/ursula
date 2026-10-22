@@ -9,7 +9,9 @@
 //! replica. The reader also carries the placement routes' writes
 //! ([`MetaStatusReader::release_root`], [`MetaStatusReader::request_move`],
 //! [`MetaStatusReader::set_move_limit`]) and the data group leaders'
-//! reports ([`MetaStatusReader::report_converged`]) to the meta group.
+//! reports ([`MetaStatusReader::report_converged`]) to the meta group, and
+//! the barriers that ask a group's leader about its memberships
+//! (`MetaStatusReader::barrier`).
 
 use std::future::Future;
 use std::pin::Pin;
@@ -35,13 +37,16 @@ use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::RootId;
 use ursula_proto::placement::VoterSet;
 use ursula_shard::RaftGroupId;
+use ursula_shard::RaftTarget;
 
+use super::confirm::BarrierFailure;
 use super::confirm::MetaBarrierError;
 use super::genesis_driver::GenesisStatus;
 use super::handle::MetaHandle;
 use super::handle::MetaWriteError;
 use super::runtime::MetaRuntimeState;
 use super::runtime::MetaRuntimeStatus;
+use crate::BarrierAnswer;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
 use crate::rejoin::Convergence;
@@ -50,6 +55,7 @@ pub(crate) type Confirmation<'a> =
     Pin<Box<dyn Future<Output = Result<ConfirmedView, MetaBarrierError>> + Send + 'a>>;
 type Submission<'a> =
     Pin<Box<dyn Future<Output = Result<ControlApplied, MetaWriteError>> + Send + 'a>>;
+type Barrier<'a> = Pin<Box<dyn Future<Output = Result<BarrierAnswer, BarrierFailure>> + Send + 'a>>;
 
 /// Why [`MetaStatusReader::group_status`] answered with no group status.
 #[derive(Debug, thiserror::Error)]
@@ -63,11 +69,12 @@ pub enum GroupStatusError {
     Refused(#[source] ControlError),
 }
 
-/// A meta read barrier on this node's view, and a write to the meta group,
-/// whatever the transport.
+/// A meta read barrier on this node's view, a write to the meta group and a
+/// barrier of any group, whatever the transport.
 trait MetaAccess: Send + Sync {
     fn confirm_view(&self) -> Confirmation<'_>;
     fn submit(&self, command: ControlCommand) -> Submission<'_>;
+    fn barrier(&self, leader: NodeId, target: RaftTarget) -> Barrier<'_>;
 }
 
 impl<T: RecoveryTransport> MetaAccess for MetaHandle<T> {
@@ -77,6 +84,10 @@ impl<T: RecoveryTransport> MetaAccess for MetaHandle<T> {
 
     fn submit(&self, command: ControlCommand) -> Submission<'_> {
         Box::pin(MetaHandle::submit(self, command))
+    }
+
+    fn barrier(&self, leader: NodeId, target: RaftTarget) -> Barrier<'_> {
+        Box::pin(MetaHandle::barrier(self, leader, target))
     }
 }
 
@@ -141,6 +152,14 @@ impl MetaStatusReader {
     /// ([`MetaHandle::confirm_view`]).
     pub(crate) fn confirm_view(&self) -> Confirmation<'_> {
         self.meta.confirm_view()
+    }
+
+    /// Asks `leader` for a fresh quorum barrier of `target`, answered with
+    /// the memberships of the leader view it confirmed, over this node's one
+    /// recovery transport. Its answer passed the check every seam runs
+    /// ([`BarrierAnswer::accept`]).
+    pub(crate) fn barrier(&self, leader: NodeId, target: RaftTarget) -> Barrier<'_> {
+        self.meta.barrier(leader, target)
     }
 
     /// This node's placement status, from its current view.

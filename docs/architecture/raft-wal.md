@@ -488,6 +488,23 @@ learner and a voter that a membership step dropped therefore never hold the
 node back. The meta replica's gate counts for none of this. The egress probe
 and the hosting driver read the same predicate.
 
+**Membership asker.** A voter that a membership step dropped receives no
+appends, so only its group can tell it. The hosting driver asks
+(`crates/ursula-raft/src/hosting/asker.rs`): for each held replica that is
+closed, or that does not lead and whose bootstrapped view gives its node the
+role `Outgoing`, `Abandoned` or none, it sends a `RejoinBarrier` to the group's
+leader candidates in order (`ursula_control::leader_candidates`, with the open
+replica's effective membership). It asks after each change of the replica's
+vote, and every 30 seconds until an append with a vote of at least its last
+answer's follows that answer. Each ask is one of the driver's actions under
+its per-core budget, begun after the pass's opens and closes, and none goes
+out while the node fence refuses. Its answers reach the mark as the gate
+driver's do, and the driver's status keeps the latest answer of each group.
+Client reads read the predicate too: a follower replica that does not count
+answers every read like a leader-only read, forwarding it to a known leader
+or refusing as a follower that knows none. A follower never answers a `HEAD`
+itself.
+
 **Rewind in place.** A follower that answers `Conflict` at or below the index it
 had matched in this leadership lost entries. Every group with a recovery gate
 runs OpenRaft with `allow_log_reversion`, and the network passes every conflict
