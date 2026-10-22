@@ -471,6 +471,19 @@ impl PeerCluster {
         url
     }
 
+    /// The client URL `raft.peers` lists for `node_id`, the one a redirect
+    /// names the node by: its `client_url`, or its `url` when the node
+    /// serves both planes on one listener. `None` for a node `raft.peers`
+    /// does not list, and before the bind.
+    pub fn client_url(&self, node_id: u64) -> Option<String> {
+        self.0
+            .bound
+            .load()
+            .as_deref()
+            .and_then(|bound| bound.peers.client_url(node_id))
+            .map(str::to_owned)
+    }
+
     /// The fence of the identity last bound, or an unleased one when none
     /// is bound.
     pub fn fence(&self) -> NodeFence {

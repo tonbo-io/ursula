@@ -1563,7 +1563,15 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
                 && group.last_log_index.unwrap_or(0) == 0),
         "{other_metrics:?}"
     );
-    let read = client
+    // Its own answer is a refusal: without a placement view it names
+    // another `raft.peers` node (`307 NotHosted`, design 9), or answers
+    // `503`. The cluster id fences Raft traffic, not that hint, so the read
+    // must not follow the redirect, whose target serves the stream.
+    let no_redirect = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("client without redirects");
+    let read = no_redirect
         .get(format!(
             "{}/benchcmp/cli-cluster-id?offset=0&max_bytes=64",
             peers[2].1
@@ -1572,6 +1580,13 @@ async fn cli_static_grpc_refuses_a_peer_configured_with_another_cluster_id() {
         .await
         .expect("read on node 3");
     let read_status = read.status();
+    assert!(
+        matches!(
+            read_status,
+            reqwest::StatusCode::TEMPORARY_REDIRECT | reqwest::StatusCode::SERVICE_UNAVAILABLE
+        ),
+        "node 3 answered its read with {read_status}"
+    );
     let body = read.bytes().await.expect("read body on node 3");
     assert!(
         !body
@@ -4288,7 +4303,8 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
 /// views reach the bootstrapped cluster. Placement decides what each node
 /// hosts: every group stays on the genesis peers it was seeded on, though
 /// `raft.peers` grew, and nodes 4 and 5, in no group's seeds, host nothing
-/// and route a write to a node that hosts its group.
+/// and route a write to a node that hosts its group, naming each of its
+/// voters in turn.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_learn() {
     let _guard = static_cluster_cli_test_guard().await;
@@ -4445,13 +4461,33 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
         ),
         "{routing:?}"
     );
-    let location = redirect.headers()["location"].to_str().expect("a location");
-    assert!(
-        nodes[..3]
-            .iter()
-            .any(|node| location == format!("{}/meta-cli/late-node", node.url())),
-        "the redirect names a seeded node: {location}"
-    );
+    // Each answer names the next seed voter, never the other late node: the
+    // hint takes the first tier of the leader candidates in node 4's view,
+    // round robin, so three answers name the three seed voters.
+    let mut answers = vec![redirect];
+    for _ in 1..3 {
+        answers.push(
+            no_redirect
+                .put(&stream)
+                .header("content-type", "text/plain")
+                .send()
+                .await
+                .expect("PUT to node 4"),
+        );
+    }
+    let named: BTreeSet<u64> = answers
+        .iter()
+        .map(|answer| {
+            assert_eq!(answer.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+            let location = answer.headers()["location"].to_str().expect("a location");
+            nodes[..3]
+                .iter()
+                .find(|node| location == format!("{}/meta-cli/late-node", node.url()))
+                .unwrap_or_else(|| panic!("the redirect names a seeded node: {location}"))
+                .id
+        })
+        .collect();
+    assert_eq!(named, BTreeSet::from([1, 2, 3]));
     put_until_created(&client, &stream).await;
     let metrics = node_metrics(&client, &nodes[3].url()).await;
     assert!(metrics.groups.is_empty(), "node 4: {metrics:?}");

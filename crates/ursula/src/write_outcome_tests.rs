@@ -673,7 +673,7 @@ impl Node {
         // to node 2 is a redirect the gateway can follow, and it answers
         // each hop with a redirect again.
         state.fields_mut().client_write_router = Some(ClientWriteLeaderRouter::new(
-            crate::tests::bound_peer_cluster(1, crate::shared_peers([(2, url.clone())])),
+            crate::tests::bound_registry(1, crate::shared_peers([(2, url.clone())])),
             Arc::new(ursula_raft::FixedPlacement::single(1)),
         ));
         // A stream holds two staged, unused parts at most, so the third is

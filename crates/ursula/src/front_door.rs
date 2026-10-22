@@ -9,8 +9,10 @@
 //! 2. malformed headers (`400`), checked by each handler;
 //! 3. routing: a node that does not lead the stream's group answers `307`
 //!    to the leader with `x-ursula-raft-leader-id`, `x-ursula-raft-group` and
-//!    `x-ursula-raft-term`, or `503` with `Retry-After` and
-//!    `x-ursula-raft-group` when it knows no leader ([`route_before_body`]);
+//!    `x-ursula-raft-term`. When it knows no leader, a node whose replica
+//!    counts as a voter answers `503` with `Retry-After` and
+//!    `x-ursula-raft-group`, and any other node `307` (`NotHosted`) to a
+//!    node its placement view gives the group ([`route_before_body`]);
 //! 4. early answers: the leader's answer to a repeat of an applied producer
 //!    write or a key conflict (section 2.5), and the `429` of a snapshot
 //!    part whose stream holds as many staged parts as it may
@@ -155,12 +157,14 @@ pub(crate) async fn route_before_body(
                 ),
                 // A leader that `raft.peers` does not list: as good as none
                 // known.
-                None => routing_response(RoutingAnswer::NoLeader { group }, None),
+                None => no_leader_answer(state, routed.raft_group_id, request_target),
             })
         }
-        WriteRoute::NoLeader => {
-            HeadDecision::Answer(routing_response(RoutingAnswer::NoLeader { group }, None))
-        }
+        WriteRoute::NoLeader => HeadDecision::Answer(no_leader_answer(
+            state,
+            routed.raft_group_id,
+            request_target,
+        )),
         // An early answer exists only for a query, which names its token.
         WriteRoute::Leader {
             early_answer: Some(answer),
@@ -250,6 +254,29 @@ pub(crate) async fn not_leading(
             routing_response(RoutingAnswer::NoLeader { group }, None)
         }
     }
+}
+
+/// The answer of a replica of `raft_group_id` that knows no leader to route
+/// to: `NotHosted` toward a node its placement view gives the group when the
+/// replica does not count as a voter, else `503` with `Retry-After`, as the
+/// router decides for every such refusal
+/// ([`crate::ClientWriteLeaderRouter`]).
+fn no_leader_answer(
+    state: &HttpState,
+    raft_group_id: RaftGroupId,
+    request_target: &str,
+) -> Response {
+    state
+        .client_write_router()
+        .and_then(|router| router.no_leader_redirect(raft_group_id, request_target))
+        .unwrap_or_else(|| {
+            routing_response(
+                RoutingAnswer::NoLeader {
+                    group: RaftGroup::from_u32(raft_group_id.0),
+                },
+                None,
+            )
+        })
 }
 
 /// Runs the deferred pressure checks, if admission runs, for a write this

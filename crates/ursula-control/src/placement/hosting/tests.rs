@@ -6,6 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ursula_proto::placement::MembershipAnswer;
+use ursula_proto::placement::NodeId;
 use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReplicaRole;
 use ursula_proto::placement::TeardownStage;
@@ -307,7 +308,6 @@ fn leader_candidates_walk_the_placement_then_the_membership_then_the_peers() {
         ids(&[1]),
         ids(&[6])
     ]);
-    assert_eq!(outsider.first_tier(), Some(&ids(&[2, 3])));
     assert_eq!(
         outsider.iter().map(|id| id.get()).collect::<Vec<_>>(),
         vec![2, 3, 4, 1, 6]
@@ -331,7 +331,7 @@ fn leader_candidates_walk_the_placement_then_the_membership_then_the_peers() {
         ids(&[5, 6])
     ]);
     let stable = leader_candidates(node(5), CandidatesOf::Group(G0), &view, None, &peers);
-    assert_eq!(stable.first_tier(), Some(&ids(&[1, 2, 3])));
+    assert_eq!(stable.tiers().first(), Some(&ids(&[1, 2, 3])));
     let blind = leader_candidates(
         node(5),
         CandidatesOf::Group(G0),
@@ -340,6 +340,44 @@ fn leader_candidates_walk_the_placement_then_the_membership_then_the_peers() {
         &peers,
     );
     assert_eq!(blind.tiers(), [ids(&[1, 2, 3, 4, 6])]);
+}
+
+/// A `NotHosted` hint names a node of the first tier, rotating over it per
+/// answer, and passes over a tier none of whose nodes is reachable. A hint
+/// drawn from all candidates would name the source's other voter 4, the
+/// target's new voter 1 or the peer 6 while voters of both sides run, one
+/// that never rotated would send every client to node 2, and one that
+/// ignored reachability would name a node with no address. Without a view
+/// the only tier is every other peer.
+#[test]
+fn a_not_hosted_hint_rotates_over_the_first_tier_with_a_reachable_node() {
+    let mut driver = Driver::live(&[1, 2, 3, 4], 4, 3);
+    driver.request_move(G1, &[1, 2, 3]).unwrap();
+    let view = view_of(&driver);
+    let peers = ids(&[1, 2, 3, 4, 5, 6]);
+    let outsider = leader_candidates(node(5), CandidatesOf::Group(G1), &view, None, &peers);
+    let any = |_node: NodeId| true;
+    let hints: Vec<_> = (0..4)
+        .map(|turn| outsider.not_hosted_hint(turn, any).map(NodeId::get))
+        .collect();
+    assert_eq!(hints, [Some(2), Some(3), Some(2), Some(3)]);
+    let without_both_sides = |node: NodeId| ![2, 3].contains(&node.get());
+    assert_eq!(
+        outsider.not_hosted_hint(7, without_both_sides),
+        Some(node(4))
+    );
+    assert_eq!(outsider.not_hosted_hint(0, |_node| false), None);
+    let blind = leader_candidates(
+        node(5),
+        CandidatesOf::Group(G1),
+        &PlacementView::empty(),
+        None,
+        &peers,
+    );
+    let hints: BTreeSet<_> = (0..5)
+        .filter_map(|turn| blind.not_hosted_hint(turn, any))
+        .collect();
+    assert_eq!(hints, ids(&[1, 2, 3, 4, 6]));
 }
 
 /// The meta form asks meta's voters first, from the best source this node

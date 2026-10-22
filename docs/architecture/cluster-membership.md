@@ -33,9 +33,18 @@ stays closed under its open back-off, and the driver opens it again. A node
 that `raft.peers` gained after genesis is in no group's seeds, so it hosts
 nothing.
 
-The voters each group's placement gives are also what the node routes a group
-it does not host to (`NotHosted`) and what its maintenance inventory expects.
-Before a bootstrapped view the node routes no such group and expects none. The
+The voters each group's placement gives are also what the node's maintenance
+inventory expects, none before a bootstrapped view. A node that hosts no
+replica of a group, or whose replica knows no leader and does not count as a
+voter, answers `307` (`NotHosted`) toward a node of the first tier of the
+group's leader candidates in its latest view (`ursula_control::leader_candidates`):
+the voters of both sides of a move, or the current voters, rotating per
+answer so that successive answers name different nodes. Without a view the
+only tier is every other `raft.peers` node. A replica that counts as a voter
+and knows no leader answers `503` with `Retry-After`, since its group has
+none. The admin plane never answers `NotHosted`, whose `Location` would name
+a client-plane URL: it answers that `503`, and `ursulactl`, which follows no
+redirect, asks its next node. The
 egress probe judges each voter config of the effective membership of every
 replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.
