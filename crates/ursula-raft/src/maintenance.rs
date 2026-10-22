@@ -345,8 +345,10 @@ fn voter_checks(
         if voters != target || !group.learner_ids.is_empty() {
             issues.push(Issue::IncompleteVoterSet);
         }
-        // The leader heals a missing target voter by itself, but never
-        // removes a member the placement gives no role.
+        // Nothing restores a missing target voter. The leader removes a
+        // learner without a role once the group is seeded or its voters
+        // equal the target, and a voter only by a move or by leaving a joint
+        // configuration.
         if voters
             .iter()
             .chain(&group.learner_ids)

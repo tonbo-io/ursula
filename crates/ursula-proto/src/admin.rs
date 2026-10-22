@@ -601,7 +601,9 @@ pub enum RaftMaintenanceIssue {
     IncompleteVoterSet,
     /// The group's membership names a node that has no role in the group's
     /// placement, as a voter or a learner. No node dials a member that
-    /// `raft.peers` does not list.
+    /// `raft.peers` does not list. The leader removes such a learner once
+    /// the group is seeded or its voters equal the target, and such a voter
+    /// only by a move or by leaving a joint configuration.
     UnplacedMember,
     LocalReplicaNotVoter,
     MembershipNotApplied,
@@ -1064,6 +1066,12 @@ pub struct RaftGroupMetrics {
     /// last 3 seconds. A leader that lost its quorum stays a leader in its
     /// own metrics; this says it is not live (m2, #581 review).
     pub leads_live: bool,
+    /// What the replica's membership reconcile shell does: on a leader, the
+    /// step it takes toward the group's placement, or why it waits. `null`
+    /// for a replica that runs no shell, such as one stopped by an apply
+    /// failure.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reconcile: Option<crate::placement::ReconcileStatus>,
 }
 
 /// The history event a replica applied last.
@@ -1152,6 +1160,7 @@ mod metrics_contract_tests {
                 recovery: None,
                 recovery_gate: RecoveryGateStatus::Open,
                 leads_live: false,
+                reconcile: None,
             }],
         }
     }

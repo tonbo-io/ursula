@@ -173,6 +173,30 @@ impl LeaderView {
         matches!(self.matched.get(&node), Some(Some(index)) if *index >= self.committed_index)
     }
 
+    /// The learners whose gates a promotion toward `target` reads: under a
+    /// moving target, the listed targets outside the voters that caught up.
+    /// The shell asks for these gates and no others, so the planner's own
+    /// caught-up rule picks them.
+    pub fn gates_needed(&self, target: &MembershipTarget) -> BTreeSet<NodeId> {
+        let EffectiveMembership::Committed {
+            config: MembershipConfig::Uniform { voters, .. },
+            ..
+        } = &self.membership
+        else {
+            return BTreeSet::new();
+        };
+        if !matches!(target.stage, TargetStage::Moving { .. }) {
+            return BTreeSet::new();
+        }
+        target
+            .voters
+            .iter()
+            .filter(|node| {
+                !voters.contains(*node) && !self.unlisted.contains(node) && self.caught_up(*node)
+            })
+            .collect()
+    }
+
     /// The smallest of `nodes` other than `me` that a handoff accepts now.
     fn handoff_target(&self, me: NodeId, nodes: impl Iterator<Item = NodeId>) -> Option<NodeId> {
         nodes

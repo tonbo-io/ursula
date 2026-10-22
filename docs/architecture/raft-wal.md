@@ -503,14 +503,13 @@ proves a vote floor, so two such replicas of three never heal on their own.
 This is safe because the leader holds every committed entry and a replica that
 may have lost entries votes for no one until its gate opens.
 
-The heal driver observes each reversion in the leader's replication metrics. It
-logs a warning that names the group and the follower and counts it per
-follower in `ursula.raft.follower_log_reversions`. A follower that lost entries
-without a host crash or a lost disk, for example on a disk that drops synced
-writes, shows up there. The driver also adds a voter of the group's placement
-that is missing back as a learner, promotes it once it caught up, and flattens
-a joint configuration whose second step never committed. The desired voters
-are the target voters of the group's placement in the node's latest meta view.
+The leader's membership reconcile shell observes each reversion in its
+replication metrics. It logs a warning that names the group and the follower
+and counts it per follower in `ursula.raft.follower_log_reversions`. A
+follower that lost entries without a host crash or a lost disk, for example
+on a disk that drops synced writes, shows up there. The rewound follower
+stays in the membership, so the shell proposes nothing for it
+([Cluster membership](cluster-membership.md#2-replica-loss-and-rejoin)).
 
 **Lease while followers catch up.** Gated followers renew the leader's lease
 before they caught up. If they cannot catch up, for example when one needs a

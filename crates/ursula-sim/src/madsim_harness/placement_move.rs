@@ -36,6 +36,8 @@
 //!   loop, planner and sender (the meta plan check), after which every node
 //!   learns the view again (I11), and then every data group those two
 //!   stalled by a data plan through the same tool;
+//! - waits until every group's leader reported its seed voters, so every
+//!   running node's view shows every group `Live` (I3's live half);
 //! - reads every acknowledged append back from every seed voter (I1).
 //!
 //! A killed or discarded node ends its WAL run, so its next start is a new
@@ -637,6 +639,8 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
             MetaFault::Plan => run.plan().await,
         }
     }
+    run.cluster.groups_live(&mut run.trace, "groups_live").await;
+    run.step("groups_live");
     for group in JOURNAL_GROUPS {
         run.cluster
             .placed_reads(&mut run.trace, "final_reads", group)

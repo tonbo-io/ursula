@@ -89,6 +89,7 @@ fn healthy(id: u32) -> RaftGroupMetricsSnapshot {
         recovery: None,
         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
         leads_live: false,
+        reconcile: None,
     }
 }
 
@@ -469,9 +470,9 @@ fn a_replica_without_a_role_is_unplaced() {
     ]);
 }
 
-/// A member without a role blocks maintenance but not serving: the leader
-/// never removes it, and nothing dials it. A target voter missing from the
-/// membership is healed by the leader: it is no `unplaced_member`.
+/// A member without a role blocks maintenance but not serving, and nothing
+/// dials it. A target voter missing from the membership is an incomplete
+/// voter set, not an `unplaced_member`.
 #[test]
 fn a_member_without_a_role_blocks_maintenance_but_not_serving() {
     for (voters, learners) in [(vec![1, 2, 3, 4], vec![]), (vec![1, 2, 3], vec![4])] {

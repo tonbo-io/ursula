@@ -150,6 +150,10 @@ pub(crate) struct ReplicaCore<
     /// whose history is pending proposes, serves and confirms nothing.
     pub(crate) history: Arc<GroupHistory>,
     pub(crate) apply_health: ApplyHealth,
+    /// What the replica's membership reconcile shell publishes, served in
+    /// its metrics. `None` for a replica that runs no shell.
+    pub(crate) reconcile:
+        Option<crate::rt::sync::watch::Receiver<ursula_proto::placement::ReconcileStatus>>,
 }
 
 impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for ReplicaCore<SM> {
@@ -159,6 +163,7 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> Clone for ReplicaCore
             recovery: self.recovery.clone(),
             history: self.history.clone(),
             apply_health: self.apply_health.clone(),
+            reconcile: self.reconcile.clone(),
         }
     }
 }
@@ -442,6 +447,10 @@ impl<SM: RaftStateMachine<C, SnapshotData = SnapshotData>> ReplicaCore<SM> {
                 ursula_proto::admin::RecoveryGateStatus::Open,
                 GroupRejoin::status,
             ),
+            reconcile: self
+                .reconcile
+                .as_ref()
+                .map(|status| status.borrow().clone()),
         }
     }
 

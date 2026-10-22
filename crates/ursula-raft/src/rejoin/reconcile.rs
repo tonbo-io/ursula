@@ -20,9 +20,15 @@
 //!   the target source confirmed within the current leadership. The shell
 //!   keeps a confirmation only while its vote is unchanged and every view it
 //!   reads carries its stamp.
-//!
-//! The shell reports nothing: a `Converged` step under a seeded or moving
-//! target publishes `Reporting` and goes no further.
+//! - **Reports** (design 5.7): a `Converged` step under a seeded or moving
+//!   target at `since` proves the leadership with a fresh quorum barrier,
+//!   re-reads the vote and the committed uniform membership, and reports
+//!   them through the target source ([`MembershipTargetSource::report`]).
+//!   An accepted report waits until the view moves past `since`. A report
+//!   the meta group refuses as stale publishes `StaleView`, and one that
+//!   may have applied, or that a refusal says to plan again from a
+//!   confirmed view, makes the shell confirm its view before it plans
+//!   again. Each later report takes a new proof.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -46,6 +52,8 @@ use openraft::storage::RaftStateMachine;
 use openraft::type_config::TypeConfigExt;
 use openraft::vote::RaftLeaderId;
 use ursula_control::ConfirmedStamp;
+use ursula_control::ControlApplied;
+use ursula_control::ControlError;
 use ursula_control::EffectiveMembership;
 use ursula_control::LeaderView;
 use ursula_control::Leadership;
@@ -53,11 +61,13 @@ use ursula_control::MembershipStep;
 use ursula_control::MembershipTarget;
 use ursula_control::MembershipView;
 use ursula_control::PeerGate;
+use ursula_control::Requeue;
 use ursula_control::TargetStage;
 use ursula_control::ViewFreshness;
 use ursula_control::plan_membership_step;
 use ursula_proto::placement::MembershipLogId;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::RaftLogId;
 use ursula_proto::placement::ReconcileState;
 use ursula_proto::placement::ReconcileStatus;
@@ -65,6 +75,7 @@ use ursula_proto::placement::StepFailure;
 use ursula_proto::placement::StepFailureKind;
 use ursula_proto::placement::StepKind;
 use ursula_proto::placement::ViewStage;
+use ursula_proto::placement::VoterSet;
 use ursula_proto::placement::WaitReason;
 use ursula_shard::RaftGroupId;
 use ursula_shard::RaftTarget;
@@ -80,7 +91,9 @@ use crate::election::LeadershipTransferError;
 use crate::memberships::MembershipKind;
 use crate::memberships::membership_config;
 use crate::meta::confirm::MetaBarrierError;
+use crate::meta::handle::MetaWriteError;
 use crate::peer_cluster::PeerCluster;
+use crate::registry::QuorumProofError;
 use crate::replica::ReplicaCore;
 use crate::rt::sync::watch;
 use crate::target::WireTarget;
@@ -100,6 +113,23 @@ pub trait MembershipTargetSource: Send + Sync + 'static {
     fn target(&self) -> Option<TargetRead>;
     /// A meta read barrier: the stamp a view must carry to be confirmed.
     fn confirm(&self) -> BoxFuture<'_, Result<ConfirmedStamp, MetaBarrierError>>;
+    /// Reports to the meta group that the group's committed uniform
+    /// membership reached the target of the placement at
+    /// [`Convergence::since`] (`ControlCommand::ReportConverged`). The
+    /// shell reports only after it proved its leadership.
+    fn report(
+        &self,
+        convergence: Convergence,
+    ) -> BoxFuture<'_, Result<ControlApplied, MetaWriteError>>;
+}
+
+/// What a proven leader reports of its group: the placement it pursued, and
+/// the voters of its committed uniform membership at `membership`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Convergence {
+    pub since: PlacementEpoch,
+    pub voters: VoterSet,
+    pub membership: MembershipLogId,
 }
 
 /// A target and the stage of the placement view it was read from, read
@@ -123,7 +153,8 @@ pub trait PeerGates: Send + Sync + 'static {
     ) -> BoxFuture<'_, BTreeMap<NodeId, PeerGate>>;
 }
 
-/// No gates: the meta group never promotes a learner.
+/// No gates: every learner's gate is unknown, so no learner is promoted.
+/// The meta group never promotes one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoPeerGates;
 
@@ -156,12 +187,13 @@ pub(crate) enum PendingStep {
     },
 }
 
-/// The planner inputs the shell gathers beside the metrics.
+/// The planner inputs the shell gathers beside the metrics. The gates
+/// come once the view names the learners it needs them of
+/// ([`ursula_control::LeaderView::gates_needed`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShellInputs {
     pub(crate) freshness: ViewFreshness,
     pub(crate) handoff_ready: BTreeSet<NodeId>,
-    pub(crate) gates: BTreeMap<NodeId, PeerGate>,
     pub(crate) unlisted: BTreeSet<NodeId>,
 }
 
@@ -234,7 +266,7 @@ fn leadership(
         matched,
         live,
         handoff_ready: inputs.handoff_ready,
-        gates: inputs.gates,
+        gates: BTreeMap::new(),
         unlisted: inputs.unlisted,
         view: inputs.freshness,
     }))
@@ -277,6 +309,30 @@ enum StepOutcome {
     TransferRefused(LeadershipTransferError),
     /// The meta read barrier failed.
     ConfirmFailed(MetaBarrierError),
+    /// OpenRaft refused the change as one no planned step makes: an empty
+    /// membership or a transition it does not support. A planner bug.
+    Unplannable(Box<ClientWriteError<C>>),
+    /// The meta group applied the report of the placement at `since`.
+    Reported {
+        since: PlacementEpoch,
+        applied: ControlApplied,
+    },
+    /// The meta group refused the report: the placement moved from
+    /// `reported` to `current`.
+    StalePlacement {
+        reported: PlacementEpoch,
+        current: PlacementEpoch,
+    },
+    /// The meta group refused the report for another reason.
+    ReportRefused(ControlError),
+    /// The report may have applied.
+    ReportUnknown(Box<MetaWriteError>),
+    /// The report did not apply.
+    ReportFailed(Box<MetaWriteError>),
+    /// The leadership proof before a report failed.
+    ProofFailed(Box<QuorumProofError>),
+    /// The committed membership moved during the proof.
+    MembershipMoved,
     /// The Raft stopped.
     Stopped,
 }
@@ -291,6 +347,14 @@ impl StepOutcome {
             Self::NotLeader => "not_leader",
             Self::TransferRefused(_) => "transfer_refused",
             Self::ConfirmFailed(_) => "confirm_failed",
+            Self::Unplannable(_) => "unplannable",
+            Self::Reported { .. } => "reported",
+            Self::StalePlacement { .. } => "stale_placement",
+            Self::ReportRefused(_) => "report_refused",
+            Self::ReportUnknown(_) => "report_unknown",
+            Self::ReportFailed(_) => "report_failed",
+            Self::ProofFailed(_) => "proof_failed",
+            Self::MembershipMoved => "membership_moved",
             Self::Stopped => "stopped",
         }
     }
@@ -298,15 +362,74 @@ impl StepOutcome {
     /// The failure a status records, `None` for a step that did its part.
     fn failure(&self) -> Option<StepFailureKind> {
         match self {
-            Self::Done | Self::Confirmed(_) | Self::JointCommitted | Self::Stopped => None,
+            Self::Done
+            | Self::Confirmed(_)
+            | Self::JointCommitted
+            | Self::Reported { .. }
+            | Self::Stopped => None,
             Self::Replan { kind, .. } => Some(*kind),
             Self::NotLeader => Some(StepFailureKind::NotLeader),
             Self::TransferRefused(LeadershipTransferError::NotLeader { .. }) => {
                 Some(StepFailureKind::NotLeader)
             }
             Self::TransferRefused(_) => Some(StepFailureKind::TransferAbandoned),
-            Self::ConfirmFailed(_) => Some(StepFailureKind::MetaUnavailable),
+            Self::ConfirmFailed(_) | Self::ReportUnknown(_) | Self::ReportFailed(_) => {
+                Some(StepFailureKind::MetaUnavailable)
+            }
+            Self::Unplannable(_)
+            | Self::StalePlacement { .. }
+            | Self::ReportRefused(_)
+            | Self::MembershipMoved => Some(StepFailureKind::PreconditionFailed),
+            Self::ProofFailed(_) => Some(StepFailureKind::LeadershipProofFailed),
         }
+    }
+
+    /// Whether the shell confirms its view before it plans again: the
+    /// report may have applied, or the meta group says the view it was
+    /// planned from is behind.
+    fn rereads(&self) -> bool {
+        match self {
+            Self::StalePlacement { .. } | Self::ReportUnknown(_) => true,
+            Self::ReportRefused(error) => error.requeue() == Requeue::ConfirmView,
+            Self::Done
+            | Self::Confirmed(_)
+            | Self::JointCommitted
+            | Self::Replan { .. }
+            | Self::NotLeader
+            | Self::TransferRefused(_)
+            | Self::ConfirmFailed(_)
+            | Self::Unplannable(_)
+            | Self::Reported { .. }
+            | Self::ReportFailed(_)
+            | Self::ProofFailed(_)
+            | Self::MembershipMoved
+            | Self::Stopped => false,
+        }
+    }
+}
+
+/// How the meta group answered the report of the placement at `since`.
+fn report_outcome(
+    result: Result<ControlApplied, MetaWriteError>,
+    since: PlacementEpoch,
+) -> StepOutcome {
+    match result {
+        Ok(applied) => StepOutcome::Reported { since, applied },
+        Err(MetaWriteError::Refused(ControlError::StalePlacement { current, .. })) => {
+            StepOutcome::StalePlacement {
+                reported: since,
+                current: current.since(),
+            }
+        }
+        Err(MetaWriteError::Refused(error)) => StepOutcome::ReportRefused(error),
+        Err(error) => match error.write_effect() {
+            ursula_proto::placement::WriteEffect::MayHaveApplied => {
+                StepOutcome::ReportUnknown(Box::new(error))
+            }
+            ursula_proto::placement::WriteEffect::NotApplied => {
+                StepOutcome::ReportFailed(Box::new(error))
+            }
+        },
     }
 }
 
@@ -320,6 +443,15 @@ fn membership_outcome(
         Err(RaftError::Fatal(_stopped)) => return StepOutcome::Stopped,
         Err(RaftError::APIError(error)) => error,
     };
+    if matches!(
+        error,
+        ClientWriteError::ChangeMembershipError(
+            ChangeMembershipError::EmptyMembership(_)
+                | ChangeMembershipError::UnsupportedMembershipTransition(_)
+        )
+    ) {
+        return StepOutcome::Unplannable(Box::new(error));
+    }
     let kind = match &error {
         ClientWriteError::ForwardToLeader(_) | ClientWriteError::LogEntryDiscarded(_) => {
             return StepOutcome::NotLeader;
@@ -338,6 +470,7 @@ fn membership_outcome(
         ClientWriteError::ChangeMembershipError(
             ChangeMembershipError::InProgress(_) | ChangeMembershipError::UncommittedLeaderLog(_),
         ) => StepFailureKind::InProgress,
+
         // A learner that left, or a change the membership moved under:
         // both re-plan from the membership as it is.
         ClientWriteError::ChangeMembershipError(_) => StepFailureKind::PreconditionFailed,
@@ -375,7 +508,7 @@ struct Pending {
 }
 
 /// The membership reconcile shell of one replica.
-pub(crate) struct ReconcileShell<SM, S, G>
+pub(crate) struct ReconcileShell<SM, S: ?Sized, G>
 where SM: RaftStateMachine<C, SnapshotData = SnapshotData> + 'static
 {
     pub(crate) core: ReplicaCore<SM>,
@@ -411,12 +544,25 @@ struct ShellState {
     retry: StepRetry<MembershipStep>,
     /// Plan on the next wake-up even when it is not due.
     force: bool,
+    /// The placement whose report the meta group applied: nothing is
+    /// reported again until the view moves past it.
+    reported: Option<PlacementEpoch>,
+    /// Confirm the view before the next plan.
+    reread: bool,
+}
+
+/// What a report names beside the `Converged` step's voters: the placement
+/// it reports, and the membership it was planned from.
+#[derive(Debug, Clone, Copy)]
+struct ReportKey {
+    since: PlacementEpoch,
+    membership: MembershipLogId,
 }
 
 impl<SM, S, G> ReconcileShell<SM, S, G>
 where
     SM: RaftStateMachine<C, SnapshotData = SnapshotData> + 'static,
-    S: MembershipTargetSource,
+    S: MembershipTargetSource + ?Sized,
     G: PeerGates,
 {
     /// Runs the shell until its Raft stops. A step still pending then keeps
@@ -452,7 +598,18 @@ where
                     let Some(pending) = state.pending.take() else {
                         continue;
                     };
-                    let outcome = joined.unwrap_or(StepOutcome::Stopped);
+                    let outcome = joined.unwrap_or_else(|error| {
+                        tracing::error!(
+                            target: "ursula::placement",
+                            plane = self.replica.plane().as_str_name(),
+                            group = self.replica.wire_group_id(),
+                            node = self.me.get(),
+                            step = ?pending.kind,
+                            %error,
+                            "a membership step's task ended without an answer"
+                        );
+                        StepOutcome::Stopped
+                    });
                     self.finish(&mut state, pending, outcome);
                     state.force = true;
                     continue;
@@ -518,27 +675,42 @@ where
         state.confirmed = state.confirmed.filter(|confirmed| {
             confirmed.vote == metrics.vote && confirmed.stamp.covers(read.view)
         });
+        // A view the meta group said is behind, or a report that may have
+        // applied, is confirmed before anything is planned from it. The
+        // state stays as published meanwhile.
+        if state.reread && leads_live(metrics) {
+            let step = MembershipStep::ConfirmView;
+            if state.retry.admit(&step, interval) {
+                state.pending = self.start(step, StepKind::ConfirmView, metrics, None);
+            }
+            return;
+        }
         let pending = match state.transfer {
             Some(transfer) => PendingStep::Transfer { to: transfer.to },
             None => PendingStep::None,
         };
         let inputs = if leads_live(metrics) {
-            self.inputs(state, metrics, &read.target).await
+            self.inputs(state, metrics, &read.target)
         } else {
             ShellInputs {
                 freshness: ViewFreshness::Unconfirmed,
                 handoff_ready: BTreeSet::new(),
-                gates: BTreeMap::new(),
                 unlisted: BTreeSet::new(),
             }
         };
-        let view = membership_view(
+        let mut view = membership_view(
             metrics,
             self.me,
             self.core.owner().handoff_ack_window(),
             pending,
             inputs,
         );
+        if let Leadership::Leading(leader) = &mut view.leadership {
+            let needed = leader.gates_needed(&read.target);
+            if !needed.is_empty() {
+                leader.gates = self.gates.gates(self.replica, &needed).await;
+            }
+        }
         let step = plan_membership_step(&view, &read.target);
         let target_since = match read.target.stage {
             TargetStage::Seeded { since } | TargetStage::Moving { since } => Some(since),
@@ -548,43 +720,60 @@ where
             ViewStage::Empty => None,
             ViewStage::Applied { applied, .. } => Some(applied),
         };
-        let kind = match (&step, step.kind()) {
-            (MembershipStep::Wait(reason), _) => {
-                let waiting = ReconcileState::Waiting(reason.clone());
-                self.publish(waiting, target_since, view_applied, false);
+        let (step, report, reconcile) = match step {
+            MembershipStep::Wait(reason) => {
+                self.publish(
+                    ReconcileState::Waiting(reason),
+                    target_since,
+                    view_applied,
+                    false,
+                );
                 return;
             }
-            (MembershipStep::Converged { .. }, _) => {
-                // The proof and the report land with the meta plane's
-                // consumers: under a seeded or moving target the shell
-                // stops at reporting.
-                let reached = if read.target.stage == TargetStage::Settled {
-                    ReconcileState::Converged
-                } else {
-                    ReconcileState::Reporting
+            MembershipStep::Converged { voters } => {
+                let (Some(since), Leadership::Leading(leader)) = (target_since, &view.leadership)
+                else {
+                    state.reported = None;
+                    self.publish(ReconcileState::Converged, target_since, view_applied, false);
+                    return;
                 };
-                self.publish(reached, target_since, view_applied, false);
-                return;
+                let EffectiveMembership::Committed {
+                    log_id: membership, ..
+                } = leader.membership
+                else {
+                    return;
+                };
+                if state.reported == Some(since) {
+                    // Applied: the view has not caught up with the report.
+                    self.publish(ReconcileState::Reporting, target_since, view_applied, false);
+                    return;
+                }
+                let report = ReportKey { since, membership };
+                (
+                    MembershipStep::Converged { voters },
+                    Some(report),
+                    ReconcileState::Reporting,
+                )
             }
-            (_, Some(kind)) => kind,
-            // Only a wait has no kind.
-            (_, None) => return,
+            step => match step.kind() {
+                Some(kind) => (step, None, ReconcileState::Stepping { step: kind }),
+                // Only a wait has no kind.
+                None => return,
+            },
+        };
+        let Some(kind) = step.kind() else {
+            return;
         };
         if !state.retry.admit(&step, interval) {
             return;
         }
-        self.publish(
-            ReconcileState::Stepping { step: kind },
-            target_since,
-            view_applied,
-            true,
-        );
-        state.pending = self.start(step, kind, metrics);
+        self.publish(reconcile, target_since, view_applied, true);
+        state.pending = self.start(step, kind, metrics, report);
     }
 
-    /// The handoff targets, the gates of caught-up learners the target
-    /// promotes, and the target voters this node's address book lacks.
-    async fn inputs(
+    /// The handoff targets, and the target voters this node's address book
+    /// lacks.
+    fn inputs(
         &self,
         state: &mut ShellState,
         metrics: &RaftMetrics<C>,
@@ -605,20 +794,6 @@ where
             })
             .map(NodeId::new)
             .collect();
-        let committed = log_index(metrics.local_committed.as_ref());
-        let matched = matched_indexes(metrics);
-        let promotable: BTreeSet<NodeId> = membership
-            .learner_ids()
-            .filter(|learner| target.voters.contains(NodeId::new(*learner)))
-            .filter(|learner| matched.get(learner).copied().flatten() >= committed)
-            .map(NodeId::new)
-            .collect();
-        let gates = if promotable.is_empty() || !matches!(target.stage, TargetStage::Moving { .. })
-        {
-            BTreeMap::new()
-        } else {
-            self.gates.gates(self.replica, &promotable).await
-        };
         let unlisted = target
             .voters
             .iter()
@@ -633,21 +808,25 @@ where
         ShellInputs {
             freshness,
             handoff_ready,
-            gates,
             unlisted,
         }
     }
 
-    /// Spawns `step`'s future. Its handle is kept until it answers.
+    /// Spawns `step`'s future, a report of the `Converged` step when
+    /// `report` names one. Its handle is kept until it answers.
     fn start(
         &self,
         step: MembershipStep,
         kind: StepKind,
         metrics: &RaftMetrics<C>,
+        report: Option<ReportKey>,
     ) -> Option<Pending> {
         let vote = metrics.vote;
-        let handle = match &step {
-            MembershipStep::AddLearners { expected, nodes } => self.change(
+        let handle = match (&step, report) {
+            (MembershipStep::Converged { voters }, Some(report)) => {
+                self.report(voters.clone(), report, vote)
+            }
+            (MembershipStep::AddLearners { expected, nodes }, _) => self.change(
                 *expected,
                 vote,
                 ChangeMembers::AddNodes(
@@ -658,19 +837,19 @@ where
                 ),
                 true,
             ),
-            MembershipStep::ChangeVoters { expected, voters } => self.change(
+            (MembershipStep::ChangeVoters { expected, voters }, _) => self.change(
                 *expected,
                 vote,
                 ChangeMembers::ReplaceAllVoters(voters.iter().map(NodeId::get).collect()),
                 false,
             ),
-            MembershipStep::RemoveLearners { expected, nodes } => self.change(
+            (MembershipStep::RemoveLearners { expected, nodes }, _) => self.change(
                 *expected,
                 vote,
                 ChangeMembers::RemoveNodes(nodes.iter().map(|node| node.get()).collect()),
                 false,
             ),
-            MembershipStep::TransferLeadership { to } => {
+            (MembershipStep::TransferLeadership { to }, _) => {
                 let core = self.core.clone();
                 let election = self.election.clone();
                 let group = RaftGroupId(self.replica.wire_group_id());
@@ -682,7 +861,7 @@ where
                     }
                 })
             }
-            MembershipStep::ConfirmView => {
+            (MembershipStep::ConfirmView, _) => {
                 let source = self.source.clone();
                 crate::rt::spawn(async move {
                     match source.confirm().await {
@@ -691,7 +870,7 @@ where
                     }
                 })
             }
-            MembershipStep::Converged { .. } | MembershipStep::Wait(_) => return None,
+            (MembershipStep::Converged { .. }, None) | (MembershipStep::Wait(_), _) => return None,
         };
         tracing::info!(
             target: "ursula::placement",
@@ -741,6 +920,52 @@ where
         })
     }
 
+    /// Spawns the report of `voters`, the committed uniform membership at
+    /// `report.membership`, for the placement at `report.since`, planned
+    /// under `vote` (design 5.7). A fresh quorum barrier proves the
+    /// leadership first, which a deposed leader fails. The vote and the
+    /// committed uniform membership are read again after it, and the report
+    /// goes only when both are still the ones it was planned from.
+    fn report(
+        &self,
+        voters: VoterSet,
+        report: ReportKey,
+        vote: UrsulaVote,
+    ) -> crate::rt::task::JoinHandle<StepOutcome> {
+        let ReportKey { since, membership } = report;
+        let core = self.core.clone();
+        let source = self.source.clone();
+        let group = RaftGroupId(self.replica.wire_group_id());
+        let expected = openraft_log_id(membership);
+        crate::rt::spawn(async move {
+            let proof = match core.confirm_barrier(group).await {
+                Ok(proof) => proof,
+                Err(error) => return StepOutcome::ProofFailed(Box::new(error)),
+            };
+            let (now, committed, effective) = {
+                let metrics = core.owner().metrics();
+                let metrics = metrics.borrow_watched();
+                (
+                    metrics.vote,
+                    *metrics.committed_membership_config.log_id(),
+                    *metrics.membership_config.log_id(),
+                )
+            };
+            if proof.vote != vote || now != vote {
+                return StepOutcome::NotLeader;
+            }
+            if committed != Some(expected) || effective != Some(expected) {
+                return StepOutcome::MembershipMoved;
+            }
+            let convergence = Convergence {
+                since,
+                voters,
+                membership,
+            };
+            report_outcome(source.report(convergence).await, since)
+        })
+    }
+
     /// Records how `pending` ended.
     fn finish(&self, state: &mut ShellState, pending: Pending, outcome: StepOutcome) {
         let (vote, leading) = {
@@ -748,6 +973,9 @@ where
             let metrics = metrics.borrow_watched();
             (metrics.vote, metrics.current_leader == Some(metrics.id))
         };
+        if outcome.rereads() {
+            state.reread = true;
+        }
         match &outcome {
             StepOutcome::Done => {
                 if let MembershipStep::TransferLeadership { to } = pending.step {
@@ -758,30 +986,72 @@ where
                     });
                 }
             }
-            // A confirmation counts only when it ran wholly in one
-            // leadership: the vote after the barrier is the vote before it.
-            StepOutcome::Confirmed(stamp) if vote == pending.vote && leading => {
-                state.confirmed = Some(Confirmation {
-                    vote: pending.vote,
-                    stamp: *stamp,
-                });
+            StepOutcome::Confirmed(stamp) => {
+                // The view was read again, whichever leadership the barrier
+                // ran in.
+                state.reread = false;
+                // A confirmation counts only when it ran wholly in one
+                // leadership: the vote after the barrier is the vote before
+                // it.
+                if vote == pending.vote && leading {
+                    state.confirmed = Some(Confirmation {
+                        vote: pending.vote,
+                        stamp: *stamp,
+                    });
+                }
             }
             StepOutcome::TransferRefused(_) => {
                 if let MembershipStep::TransferLeadership { to } = pending.step {
                     state.skip = Some(to);
                 }
             }
-            StepOutcome::Confirmed(_)
-            | StepOutcome::JointCommitted
+            StepOutcome::Reported { since, .. } => state.reported = Some(*since),
+            StepOutcome::StalePlacement { reported, current } => {
+                // A report crossed a placement change: the confirmation the
+                // shell holds is of an older view.
+                state.confirmed = None;
+                let view_applied = self.status.borrow().view_applied;
+                self.publish(
+                    ReconcileState::StaleView {
+                        reported: *reported,
+                        current: *current,
+                    },
+                    Some(*reported),
+                    view_applied,
+                    false,
+                );
+            }
+            StepOutcome::Unplannable(error) => tracing::error!(
+                target: "ursula::placement",
+                plane = self.replica.plane().as_str_name(),
+                group = self.replica.wire_group_id(),
+                node = self.me.get(),
+                step = ?pending.kind,
+                planned = ?pending.step,
+                %error,
+                "OpenRaft refused a planned membership step that no plan should make"
+            ),
+            StepOutcome::JointCommitted
             | StepOutcome::Replan { .. }
             | StepOutcome::NotLeader
             | StepOutcome::ConfirmFailed(_)
+            | StepOutcome::ReportRefused(_)
+            | StepOutcome::ReportUnknown(_)
+            | StepOutcome::ReportFailed(_)
+            | StepOutcome::ProofFailed(_)
+            | StepOutcome::MembershipMoved
             | StepOutcome::Stopped => {}
         }
         let detail = match &outcome {
             StepOutcome::Replan { error, .. } => Some(error.to_string()),
             StepOutcome::TransferRefused(error) => Some(error.to_string()),
             StepOutcome::ConfirmFailed(error) => Some(error.to_string()),
+            StepOutcome::Reported { applied, .. } => Some(format!("{applied:?}")),
+            StepOutcome::ReportRefused(error) => Some(error.to_string()),
+            StepOutcome::ReportUnknown(error) | StepOutcome::ReportFailed(error) => {
+                Some(error.to_string())
+            }
+            StepOutcome::ProofFailed(error) => Some(error.to_string()),
             _ => None,
         };
         tracing::info!(
@@ -814,7 +1084,7 @@ where
     fn publish(
         &self,
         reconcile: ReconcileState,
-        target_since: Option<ursula_proto::placement::PlacementEpoch>,
+        target_since: Option<PlacementEpoch>,
         view_applied: Option<ursula_proto::placement::MetaLogId>,
         attempt: bool,
     ) {
@@ -836,14 +1106,17 @@ where
 }
 
 enum Event {
-    Joined(Option<StepOutcome>),
+    Joined(Result<StepOutcome, crate::rt::task::JoinError>),
     Tick(Option<Option<Box<RaftMetrics<C>>>>),
 }
 
-/// The answer of the pending step, never ready without one.
-async fn wait_pending(pending: &mut Option<Pending>) -> Option<StepOutcome> {
+/// The answer of the pending step, never ready without one: an error when
+/// its task panicked or was cancelled.
+async fn wait_pending(
+    pending: &mut Option<Pending>,
+) -> Result<StepOutcome, crate::rt::task::JoinError> {
     match pending {
-        Some(pending) => (&mut pending.handle).await.ok(),
+        Some(pending) => (&mut pending.handle).await,
         None => std::future::pending().await,
     }
 }

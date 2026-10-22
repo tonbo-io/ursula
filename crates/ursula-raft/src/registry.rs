@@ -721,16 +721,7 @@ impl RaftGroupHandleRegistry {
     /// Publish all group resources together, before any transport can find its Raft handle.
     pub(crate) fn register_engine(&self, engine: &crate::RaftGroupEngine) {
         let entry = Arc::new(GroupEntry::Active(Arc::new(ActiveGroup {
-            core: ReplicaCore {
-                barrier: engine.read_barrier.clone(),
-                recovery: engine
-                    .rejoin
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone(),
-                history: engine.history.clone(),
-                apply_health: engine.apply_health.clone(),
-            },
+            core: engine.replica_core(),
             snapshot_installs: engine.snapshot_installs.clone(),
             cache: engine.cold_index_cache.clone(),
             log_gauge: engine.log_gauge.clone(),
@@ -1400,6 +1391,7 @@ impl RaftGroupHandleRegistry {
                         recovery: None,
                         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
                         leads_live: false,
+                        reconcile: None,
                     });
                     continue;
                 }

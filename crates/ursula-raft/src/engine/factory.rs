@@ -26,8 +26,8 @@ use crate::grpc::GrpcRaftNetworkFactory;
 use crate::log_store::RaftWal;
 use crate::registry::RaftGroupHandleRegistry;
 use crate::rejoin::GroupRejoin;
+use crate::rejoin::RECOVERY_INTERVAL;
 use crate::rejoin::RECOVERY_STALL_AFTER;
-use crate::rejoin::REJOIN_HEAL_INTERVAL;
 
 /// Minimum election timeout of every data-group Raft, in milliseconds.
 const GROUP_ELECTION_TIMEOUT_MIN_MS: u64 = 1500;
@@ -441,7 +441,7 @@ impl PlacedRaftGroupEngineFactory {
                 timeout: self.engine_config.bootstrap_peer_connect,
             },
             crate::rejoin::RecoveryConfig {
-                interval: REJOIN_HEAL_INTERVAL,
+                interval: RECOVERY_INTERVAL,
                 barrier_timeout: crate::rejoin::RECOVERY_BARRIER_TIMEOUT,
                 stall_after: RECOVERY_STALL_AFTER,
                 bootstrap_interval: self.engine_config.bootstrap_peer_probe_interval,

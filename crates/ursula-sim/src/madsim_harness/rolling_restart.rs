@@ -251,6 +251,7 @@ impl RollingRestartValidator {
                             history: None,
                             recovery: None,
                             leads_live: false,
+                            reconcile: None,
                             recovery_gate: self
                                 .registry
                                 .rejoin(node_id)

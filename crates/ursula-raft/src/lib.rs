@@ -76,9 +76,10 @@
 //!   the group's history is pending and its obligation to propose the
 //!   history event (genesis, recovery plans).
 //! - [`rejoin`]: the recovery gate of a replica that may be missing entries
-//!   it acknowledged, the leader-side heal driver, the membership reconcile
-//!   shell around the pure membership planner ([`MembershipTargetSource`],
-//!   [`PeerGates`]), and the bootstrap probe.
+//!   it acknowledged, the membership reconcile shell around the pure
+//!   membership planner ([`MembershipTargetSource`], [`PeerGates`]), which
+//!   every replica runs and a leader reports its group's convergence
+//!   through, and the bootstrap probe.
 //! - [`replica`]: one replica of either plane: the gate screens of every
 //!   inbound RPC, the recovery barrier with its history fence, and the
 //!   recovery plan's orchestration, generic over the state machine.
@@ -272,6 +273,8 @@ pub use placement_wiring::FixedPlacement;
 pub use placement_wiring::FixedRole;
 pub use placement_wiring::GroupNodes;
 pub use placement_wiring::MetaPlacement;
+#[cfg(any(test, madsim, feature = "test-support"))]
+pub use placement_wiring::NoTarget;
 pub use placement_wiring::PlacementInputs;
 pub use placement_wiring::SeedRole;
 pub use registry::IncomingTransferError;
@@ -289,6 +292,7 @@ pub use registry::SingleNodeRaftNetworkFactory;
 pub use registry::SnapshotBuildError;
 pub use registry::SnapshotGcPass;
 pub use registry::SnapshotInstallError;
+pub use rejoin::Convergence;
 pub use rejoin::GateOpenError;
 pub use rejoin::GroupBootstrap;
 pub use rejoin::GroupRejoin;

@@ -8,6 +8,7 @@ use openraft::ServerState;
 use openraft::alias::LogIdOf;
 use openraft::error::ChangeMembershipError;
 use openraft::error::ClientWriteError;
+use openraft::error::EmptyMembership;
 use openraft::error::Fatal;
 use openraft::error::ForwardToLeader;
 use openraft::error::InProgress;
@@ -18,17 +19,25 @@ use openraft::metrics::SerdeInstant;
 use openraft::type_config::TypeConfigExt;
 use openraft::type_config::alias::StoredMembershipOf;
 use openraft::vote::RaftLeaderId;
+use ursula_control::ControlApplied;
+use ursula_control::ControlError;
 use ursula_control::EffectiveMembership;
+use ursula_control::GroupPlacement;
 use ursula_control::Leadership;
 use ursula_control::ViewFreshness;
+use ursula_control::samples;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::PlacementEpoch;
 use ursula_proto::placement::StepFailureKind;
+use ursula_shard::RaftGroupId;
 
 use super::PendingStep;
 use super::ShellInputs;
 use super::StepOutcome;
 use super::membership_outcome;
 use super::membership_view;
+use super::report_outcome;
+use crate::meta::handle::MetaWriteError;
 use crate::types::UrsulaRaftTypeConfig as C;
 use crate::types::UrsulaVote;
 
@@ -55,7 +64,6 @@ fn inputs() -> ShellInputs {
     ShellInputs {
         freshness: ViewFreshness::Unconfirmed,
         handoff_ready: BTreeSet::new(),
-        gates: BTreeMap::new(),
         unlisted: BTreeSet::new(),
     }
 }
@@ -230,4 +238,96 @@ fn a_refused_membership_step_classifies_by_the_guard_that_refused_it() {
         membership_outcome(Err(RaftError::Fatal(Fatal::Stopped)), expected),
         StepOutcome::Stopped
     ));
+    // A change no plan makes is a planner bug, never planned again as if
+    // the membership had moved.
+    assert!(matches!(
+        membership_outcome(
+            refused(ClientWriteError::ChangeMembershipError(
+                ChangeMembershipError::EmptyMembership(EmptyMembership {})
+            )),
+            expected
+        ),
+        StepOutcome::Unplannable(_)
+    ));
+}
+
+/// How the meta group's answers to a report classify (design 5.7). An
+/// applied report waits for the view, a stale one names the placement it
+/// lost to, and a refusal whose class is to plan again from a confirmed
+/// view makes the shell confirm its view, as does an answer that may have
+/// applied. A write that did not apply is retried as it is. Catches a stale
+/// report read as applied, which would wait for a view that never moves,
+/// and a lost answer read as not applied, which would report again without
+/// learning whether the first one applied.
+#[test]
+fn a_report_answer_classifies_by_what_the_meta_group_did() {
+    let since = PlacementEpoch::new(samples::meta(2, 7));
+    let applied = report_outcome(
+        Ok(ControlApplied::Converged {
+            since: PlacementEpoch::new(samples::meta(2, 8)),
+            retired: Default::default(),
+            removed: Default::default(),
+        }),
+        since,
+    );
+    assert!(matches!(applied, StepOutcome::Reported { since: reported, .. } if reported == since));
+    assert!(!applied.rereads());
+    assert_eq!(applied.failure(), None);
+
+    let current = GroupPlacement::Seeded {
+        since: PlacementEpoch::new(samples::meta(3, 9)),
+        voters: samples::voters(&[1, 2, 3]),
+        initializer: samples::node(1),
+    };
+    let stale = report_outcome(
+        Err(MetaWriteError::Refused(ControlError::StalePlacement {
+            group: RaftGroupId(1),
+            current: Box::new(current.clone()),
+        })),
+        since,
+    );
+    assert!(matches!(
+        stale,
+        StepOutcome::StalePlacement { reported, current: now }
+            if reported == since && now == current.since()
+    ));
+    assert!(stale.rereads());
+
+    let not_moving = report_outcome(
+        Err(MetaWriteError::Refused(ControlError::NotMoving {
+            group: RaftGroupId(1),
+        })),
+        since,
+    );
+    assert!(matches!(not_moving, StepOutcome::ReportRefused(_)));
+    assert!(not_moving.rereads());
+    let not_target = report_outcome(
+        Err(MetaWriteError::Refused(ControlError::NotTarget {
+            group: RaftGroupId(1),
+            reported: samples::voters(&[1, 2]),
+        })),
+        since,
+    );
+    assert!(matches!(not_target, StepOutcome::ReportRefused(_)));
+    assert!(!not_target.rereads());
+    assert_eq!(
+        not_target.failure(),
+        Some(StepFailureKind::PreconditionFailed)
+    );
+
+    let lost = report_outcome(
+        Err(MetaWriteError::Leader {
+            leader: NodeId::new(2),
+            source: ursula_runtime::GroupEngineError::Infra(
+                ursula_runtime::GroupInfraError::OutcomeUnknown,
+            ),
+        }),
+        since,
+    );
+    assert!(matches!(lost, StepOutcome::ReportUnknown(_)));
+    assert!(lost.rereads());
+    let no_leader = report_outcome(Err(MetaWriteError::NoLeader), since);
+    assert!(matches!(no_leader, StepOutcome::ReportFailed(_)));
+    assert!(!no_leader.rereads());
+    assert_eq!(no_leader.failure(), Some(StepFailureKind::MetaUnavailable));
 }

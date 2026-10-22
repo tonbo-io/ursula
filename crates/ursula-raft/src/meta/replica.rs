@@ -118,6 +118,9 @@ pub struct MetaReplicaTasks {
     pub(crate) drivers: Option<Arc<dyn MetaDrivers>>,
     /// Where the replica reports a for-good refusal of its commit screen.
     pub(crate) damage: Option<watch::Sender<Option<CommitScreenDamage>>>,
+    /// What the reconcile shell of `drivers` publishes, which the replica
+    /// serves in its metrics.
+    pub(crate) reconcile: Option<watch::Receiver<ursula_proto::placement::ReconcileStatus>>,
     /// The meta runtime's pause points, which a restart passes.
     pub(crate) pauses: super::pause::MetaPauses,
 }
@@ -581,6 +584,7 @@ impl MetaReplica {
             recovery: Some(Arc::clone(&gate)),
             history: Arc::clone(&history),
             apply_health,
+            reconcile: tasks.reconcile.clone(),
         };
         let replica = Self {
             active: Arc::new(ActiveMeta {

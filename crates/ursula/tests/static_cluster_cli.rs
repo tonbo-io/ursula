@@ -4014,6 +4014,34 @@ fn bootstrapped(status: &PlacementStatus) -> Option<&Cluster> {
     }
 }
 
+/// The bootstrapped cluster once every group's leader reported its
+/// voters: every group `Live` and not moving. Nothing changes a placement
+/// after that until a move, so views read then compare.
+fn settled(status: &PlacementStatus) -> Option<&Cluster> {
+    bootstrapped(status).filter(|cluster| {
+        cluster.groups().iter().all(|(_, placement)| {
+            matches!(placement, GroupPlacement::Live { .. }) && placement.moving().is_none()
+        })
+    })
+}
+
+/// [`wait_bootstrapped`], until every node's view is [`settled`].
+async fn wait_settled(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+) -> Vec<PlacementStatus> {
+    let mut statuses = Vec::new();
+    for node in nodes {
+        let status = wait_placement(client, procs, node, "shows every group live", |status| {
+            settled(status).is_some() && meta_leader(status).is_some()
+        })
+        .await;
+        statuses.push(status);
+    }
+    statuses
+}
+
 /// The meta leader a node's running meta replica knows.
 fn meta_leader(status: &PlacementStatus) -> Option<u64> {
     match &status.meta {
@@ -4136,9 +4164,10 @@ fn sheds_placement_unavailable(shed: &ursula_proto::admin::LeadershipShedStatus)
 
 /// S1 (#768): three nodes form the meta group over gRPC and bootstrap the
 /// cluster while the data groups form and serve. Each node is a meta voter
-/// of one bootstrapped cluster that seeds every group, and a follower's
-/// view confirmed by a meta read barrier, which the meta leader answers
-/// over gRPC, is that cluster. `ursulactl drain` of the meta leader hands
+/// of one bootstrapped cluster that seeds every group. Each group's leader
+/// reports the voters it formed on, so every group turns live on its seed
+/// voters (S3, design 5.7), and a follower's view confirmed by a meta read
+/// barrier, which the meta leader answers over gRPC, is that cluster. `ursulactl drain` of the meta leader hands
 /// its meta leadership away with its data leaderships. A full restart keeps
 /// every placement's `since`, and each node's registration is then
 /// answered by the meta leader, through a forward on the followers.
@@ -4164,8 +4193,20 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
     }
 
     // 1. One bootstrapped cluster on every node, every node a meta voter.
+    // Right after the bootstrap each group is seeded, or its leader already
+    // reported its voters. Once every leader reported, every group is live
+    // on the voters it was seeded on, and every node's view is the same.
     let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
-    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    let seeded = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    assert!(
+        seeded
+            .groups()
+            .iter()
+            .all(|(_, placement)| placement.moving().is_none()),
+        "{seeded:?}"
+    );
+    let formed = wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = settled(&formed[0]).expect("settled").clone();
     assert_eq!(
         node_ids(cluster.params().meta_voters.iter()),
         BTreeSet::from([1, 2, 3])
@@ -4175,13 +4216,15 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
         BTreeSet::from([1, 2, 3])
     );
     assert_eq!(cluster.groups().len(), META_TEST_GROUPS);
-    assert!(
-        cluster
-            .groups()
-            .iter()
-            .all(|(_, placement)| matches!(placement, GroupPlacement::Seeded { .. })),
-        "{cluster:?}"
-    );
+    for (group, placement) in seeded.groups().iter() {
+        if let GroupPlacement::Seeded { voters, .. } = placement {
+            assert_eq!(
+                cluster.group(group).map(GroupPlacement::current_voters),
+                Some(voters),
+                "{cluster:?}"
+            );
+        }
+    }
     for status in &formed {
         assert_eq!(bootstrapped(status), Some(&cluster), "{status:?}");
         assert_eq!(meta_role(status), Some(MetaRole::Voter), "{status:?}");
@@ -4255,7 +4298,7 @@ async fn cli_three_nodes_form_meta_and_keep_serving() {
     for node in &nodes {
         procs.start(binary, node);
     }
-    for status in wait_bootstrapped(&client, &mut procs, &nodes).await {
+    for status in wait_settled(&client, &mut procs, &nodes).await {
         let restarted = bootstrapped(&status).unwrap();
         assert_eq!(sinces(restarted), sinces(&cluster), "{status:?}");
         assert_eq!(restarted.params(), cluster.params());
@@ -4326,8 +4369,8 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
         node.write(&old_peers, meta);
         procs.start(binary, node);
     }
-    let formed = wait_bootstrapped(&client, &mut procs, &nodes[..3]).await;
-    let cluster = bootstrapped(&formed[0]).expect("bootstrapped").clone();
+    let formed = wait_settled(&client, &mut procs, &nodes[..3]).await;
+    let cluster = settled(&formed[0]).expect("settled").clone();
     assert_eq!(
         node_ids(cluster.nodes().keys().copied()),
         BTreeSet::from([1, 2, 3])
@@ -4392,10 +4435,10 @@ async fn cli_five_nodes_with_meta_voters_one_to_three_bootstrap_and_late_nodes_l
             &mut procs,
             node,
             "learns as a meta learner",
-            |status| bootstrapped(status).is_some() && meta_role(status) == Some(MetaRole::Learner),
+            |status| settled(status).is_some() && meta_role(status) == Some(MetaRole::Learner),
         )
         .await;
-        let learned = bootstrapped(&status).unwrap();
+        let learned = settled(&status).unwrap();
         assert_eq!(learned.params(), cluster.params());
         assert_eq!(sinces(learned), sinces(&cluster));
     }
@@ -4874,8 +4917,8 @@ async fn cli_a_genesis_claim_mismatch_holds_meta_until_fixed() {
     procs.stop(1).await;
     nodes[0].write(&peers, meta);
     procs.start(binary, &nodes[0]);
-    let formed = wait_bootstrapped(&client, &mut procs, &nodes).await;
-    let cluster = bootstrapped(&formed[0]).unwrap();
+    let formed = wait_settled(&client, &mut procs, &nodes).await;
+    let cluster = settled(&formed[0]).unwrap();
     assert_eq!(cluster.params().replication_factor.get(), 3);
     assert_eq!(
         node_ids(cluster.nodes().keys().copied()),

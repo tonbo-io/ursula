@@ -11,6 +11,8 @@
 use futures_util::future::BoxFuture;
 use openraft::rt::WatchReceiver;
 use ursula_control::ConfirmedStamp;
+use ursula_control::ControlApplied;
+use ursula_control::ControlError;
 use ursula_control::ControlPlaneState;
 use ursula_control::MembershipConfig;
 use ursula_control::MembershipTarget;
@@ -21,12 +23,14 @@ use ursula_proto::placement::NodeLifecycle;
 
 use super::confirm::MetaBarrierError;
 use super::handle::MetaHandle;
+use super::handle::MetaWriteError;
 use super::state_machine::MetaStateMachine;
 use super::watch::PlacementWatch;
 use crate::RecoveryTransport;
 use crate::memberships::MembershipKind;
 use crate::memberships::membership_config;
 use crate::owner::OwnerRaftHandle;
+use crate::rejoin::Convergence;
 use crate::rejoin::MembershipTargetSource;
 use crate::rejoin::TargetRead;
 
@@ -60,6 +64,19 @@ impl<T: RecoveryTransport> MembershipTargetSource for MetaTargetSource<T> {
                 .await
                 .map(|confirmed| confirmed.stamp())
         })
+    }
+
+    /// Meta's target is always settled, so the shell never reports one: a
+    /// report is refused as the kernel refuses a stable group's.
+    fn report(
+        &self,
+        _convergence: Convergence,
+    ) -> BoxFuture<'_, Result<ControlApplied, MetaWriteError>> {
+        Box::pin(std::future::ready(Err(MetaWriteError::Refused(
+            ControlError::NotMoving {
+                group: super::state_machine::META_GROUP,
+            },
+        ))))
     }
 }
 

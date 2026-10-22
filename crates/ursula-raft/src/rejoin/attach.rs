@@ -11,9 +11,10 @@ use ursula_control::ControlResponse;
 use ursula_control::SeedRoleOf;
 
 use super::GroupRejoin;
+use super::NoPeerGates;
 use super::PeerGroupLog;
+use super::ReconcileShell;
 use super::run_group_bootstrap;
-use super::run_rejoin_heal;
 use super::run_rejoin_vote_barrier;
 use crate::BarrierAnswer;
 use crate::GroupNodes;
@@ -200,9 +201,12 @@ pub(crate) type GateProbe = Arc<
 impl RecoveryGate {
     /// Binds a data replica's voter predicate to the seed role `inputs`
     /// gives its group and to the node's left marks, publishes its recovery
-    /// gate, then spawns its heal driver and its gate drivers
-    /// (`spawn_gate_drivers`) with the transport's bootstrap probe vote,
-    /// over that seed role and the node sets `inputs` gives the group.
+    /// gate, then spawns its membership reconcile shell over the target
+    /// source `inputs` gives the group ([`PlacementInputs::target_source`])
+    /// and its gate drivers (`spawn_gate_drivers`) with the transport's
+    /// bootstrap probe vote, over that seed role and the node sets `inputs`
+    /// gives the group. The shell asks no learner's gate yet, so it
+    /// promotes none ([`NoPeerGates`]).
     pub fn attach<T: RecoveryTransport>(
         &self,
         engine: &crate::RaftGroupEngine,
@@ -217,13 +221,21 @@ impl RecoveryGate {
         let seed = inputs.seed_role(group);
         rejoin.bind_placement(seed.clone(), registry.left_marks());
         engine.publish_recovery(rejoin.clone(), registry)?;
-        self.push(crate::rt::spawn(run_rejoin_heal(
-            engine.raft_handle(),
-            rejoin.clone(),
-            nodes.clone(),
-            config.interval,
-            registry.follower_log_reversion_counter(),
-        )));
+        if let Some(status) = engine.reconcile.clone() {
+            let shell = ReconcileShell {
+                core: engine.replica_core(),
+                replica: RaftTarget::Data(group),
+                me: ursula_proto::placement::NodeId::new(rejoin.node_id),
+                source: inputs.target_source(group),
+                gates: Arc::new(NoPeerGates),
+                peers: registry.peer_cluster().clone(),
+                election: registry.election_policy(),
+                status,
+            };
+            self.push(crate::rt::spawn(
+                shell.run(config.interval, registry.follower_log_reversion_counter()),
+            ));
+        }
         let probe_transport = transport.clone();
         let probe: GateProbe = Arc::new(move |peer| {
             let transport = probe_transport.clone();

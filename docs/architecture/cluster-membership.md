@@ -17,10 +17,11 @@ With `N` at most the replication factor, every node votes in every group.
 Placement decides what each node hosts. The engine factory takes every input
 placement decides through one seam, `PlacementInputs`
 (`crates/ursula-raft/src/placement_wiring.rs`): which groups the node hosts
-and how each may open, the replica's seed role, and the voters its recovery
-drivers ask, initialize and heal toward, read at each use. On a server node
-it is `MetaPlacement`. The node's view gives the seed role and the voters,
-and the hosting set gives the admission. Only the hosting driver writes that
+and how each may open, the replica's seed role, the voters its recovery
+drivers ask and initialize, and the membership target its reconcile shell
+pursues (section 2), read at each use. On a server node it is
+`MetaPlacement`. The node's view gives the seed role, the voters and the
+target, and the hosting set gives the admission. Only the hosting driver writes that
 set (`crates/ursula-raft/src/hosting.rs`, started by
 `crates/ursula/src/bootstrap/hosting.rs`). The runtime starts with an empty
 set, so no replica opens before the driver admits it. The driver starts once
@@ -86,10 +87,10 @@ again every 30 seconds (`crates/ursula/src/bootstrap/meta_shed.rs`). A node
 that sheds for a reason that refuses transfers, such as the maintenance
 drain, hands its meta leadership away too. A node that sheds only for cold
 health keeps it, so an object store outage that every node sheds for does
-not pass meta from voter to voter. The target voters of a group's placement
-are the set that the heal driver restores (section 2). The admin routes
-(section 3) can change a group's OpenRaft membership directly, and the heal
-driver adds a placed voter that is missing back as a learner and promotes it.
+not pass meta from voter to voter. A data group's leader reports the voters
+it formed on to the meta group, which makes the group `Live` (section 2).
+The admin routes (section 3) can change a group's OpenRaft membership
+directly. Nothing changes it back.
 
 ## 2. Replica loss and rejoin
 
@@ -115,11 +116,34 @@ such conflict and replicates its log to it again
 ([Raft WAL](raft-wal.md#recovery-gate)). The follower stays a voter and no
 membership changes. Its conflict counts as its acknowledgement of the leader,
 so the leader keeps its quorum, and this holds when the followers that lost
-entries are a majority too. The heal driver
-(`crates/ursula-raft/src/rejoin/heal.rs`) observes and counts each reversion.
-It also adds a placed voter that is missing as a learner, promotes it once
-it caught up, and flattens a joint configuration whose second step never
-committed.
+entries are a majority too. The replica's membership reconcile shell
+(`crates/ursula-raft/src/rejoin/reconcile.rs`) observes and counts each
+reversion.
+
+Every replica runs that shell. On the leader it reads the group's target
+from its placement in the node's latest view: the placement's target voters,
+`Seeded` or `Moving` at the placement's key, or `Settled` for a live group
+that does not move. It asks the pure planner
+(`crates/ursula-control/src/placement/reconcile.rs`) for one step and runs it
+under a compare-and-set on the leadership and the membership it was planned
+from. A seeded group only reports, and a settled group changes no voter, so
+until a move the shell flattens a joint configuration and reports. When the
+committed uniform membership has the target's voters under a seeded or
+moving target, the leader proves it still leads with a fresh quorum barrier,
+reads its vote and committed membership again, and submits
+`ReportConverged` with the placement's key, the voters and the membership's
+log id. The meta group accepts it only while the placement is still at that
+key, so a report from a deposed leader or of an older placement changes
+nothing. An accepted report makes the group `Live` and stable on those
+voters, certified at that membership. A refused stale report publishes
+`stale_view`, and a report that may have applied makes the shell confirm
+its view before it plans again. Each group's metrics on `GET
+/__ursula/metrics` carry the shell's status under `reconcile`: its state
+(`stepping`, `waiting` with its reason, `reporting`, `stale_view` or
+`converged`), its last failed step, and the placement and meta entry it
+read. The shell asks no learner's recovery gate yet, so it promotes no
+learner. A group placed by hand in tests and the simulation
+(`FixedPlacement`) has no target, and its shell only observes.
 
 A replica that lost its vote history, such as one on a wiped disk, answers
 errors until a quorum without it proves a vote. Two such replicas of three
@@ -254,7 +278,9 @@ without a leader for 30 s, a damaged meta replica, which replaces every issue
 the view gives, and a configured group count or replication factor the
 cluster does not share. Group issues name a missing placed replica, a replica
 held without a role (`unplaced_replica`), an incomplete voter set, a member
-without a role (`unplaced_member`, which the leader never removes),
+without a role (`unplaced_member`: the leader removes such a learner once the
+group is seeded or its voters equal the target, and such a voter only by a
+move or by leaving a joint configuration; nothing restores a missing voter),
 `joint_membership`, `apply_lag` or `apply_stopped`. A node with no group is
 ready. `GET /__ursula/ready` uses `serving_ready()`, which ignores incomplete
 voter sets, members and replicas without a role, joint membership and stopped

@@ -674,6 +674,12 @@ impl ursula_raft::PlacementInputs for SeededPlacement {
             None => Arc::new(ursula_raft::FixedNodes::from_voters(BTreeSet::new())),
         }
     }
+
+    /// The seeds are fixed: no target, as [`ursula_raft::FixedPlacement`]
+    /// has none.
+    fn target_source(&self, _group: RaftGroupId) -> Arc<dyn ursula_raft::MembershipTargetSource> {
+        Arc::new(ursula_raft::NoTarget)
+    }
 }
 
 #[derive(Default)]
@@ -7194,6 +7200,7 @@ fn raft_metrics_snapshot(
         recovery: None,
         recovery_gate: ursula_proto::admin::RecoveryGateStatus::Open,
         leads_live: false,
+        reconcile: None,
     }
 }
 

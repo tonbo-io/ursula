@@ -340,7 +340,7 @@ pub(super) struct JournalCluster {
     /// The snapshot driver task of each running node.
     driver_tasks: BTreeMap<u64, madsim::task::JoinHandle<()>>,
     /// Each node's registry its recovery drivers attach to, kept across its
-    /// restarts as a node's runtime keeps its own: its heal drivers count
+    /// restarts as a node's runtime keeps its own: its reconcile shells count
     /// follower log reversions there.
     pub(super) recovery_registries: BTreeMap<u64, ursula_raft::RaftGroupHandleRegistry>,
     /// The snapshot store every node writes its objects to, if any

@@ -5,8 +5,9 @@
 //! [`ClusterView`] stage ([`cluster_view`]). A confirmed status
 //! ([`MetaStatusReader::confirmed_placement_status`]) derives it from a view
 //! a meta read barrier confirmed current. The reader also carries the
-//! placement routes' writes ([`MetaStatusReader::release_root`]) to the
-//! meta group.
+//! placement routes' writes ([`MetaStatusReader::release_root`]) and the
+//! data group leaders' reports ([`MetaStatusReader::report_converged`]) to
+//! the meta group.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -26,6 +27,7 @@ use ursula_control::RegistrationStatus;
 use ursula_proto::placement::GenesisClaim;
 use ursula_proto::placement::NodeId;
 use ursula_proto::placement::RootId;
+use ursula_shard::RaftGroupId;
 
 use super::confirm::MetaBarrierError;
 use super::genesis_driver::GenesisStatus;
@@ -35,6 +37,7 @@ use super::runtime::MetaRuntimeState;
 use super::runtime::MetaRuntimeStatus;
 use crate::RaftGroupHandleRegistry;
 use crate::RecoveryTransport;
+use crate::rejoin::Convergence;
 
 pub(crate) type Confirmation<'a> =
     Pin<Box<dyn Future<Output = Result<ConfirmedView, MetaBarrierError>> + Send + 'a>>;
@@ -159,6 +162,30 @@ impl MetaStatusReader {
     ) -> Result<ControlApplied, MetaWriteError> {
         self.meta
             .submit(ControlCommand::ReleaseRoot { node, root })
+            .await
+    }
+
+    /// Reports through the meta leader that `group`'s leader, proven,
+    /// reached `convergence` (`ControlCommand::ReportConverged`). The
+    /// command's time is this node's clock.
+    pub async fn report_converged(
+        &self,
+        group: RaftGroupId,
+        convergence: Convergence,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        let Convergence {
+            since,
+            voters,
+            membership,
+        } = convergence;
+        self.meta
+            .submit(ControlCommand::ReportConverged {
+                group,
+                since,
+                voters,
+                membership,
+                now_ms: ursula_runtime::unix_time_ms(),
+            })
             .await
     }
 
