@@ -13,6 +13,7 @@ use serde::de::DeserializeOwned;
 use tonic::transport::Channel;
 use ursula_control::ControlCommand;
 use ursula_control::ControlResponse;
+use ursula_proto::placement::NodeId;
 use ursula_runtime::AnswerProblem;
 use ursula_runtime::CommittedLeader;
 use ursula_runtime::ErrorChain;
@@ -253,6 +254,81 @@ pub(crate) async fn forward_purge_bucket_to_leader(
         "bucket purge answer",
     )?;
     PurgeBucketResponse::try_from(response)
+}
+
+impl crate::RaftGroupHandleRegistry {
+    /// Purges `bucket_id` from `placement`'s group, which this node hosts
+    /// no replica of, through the group's leader. The purge goes to the
+    /// group's leader candidates in turn (`ursula_control::leader_candidates`
+    /// over this node's latest placement view and `raft.peers`), following
+    /// the leader a candidate's refusal names, until a node answers as the
+    /// group's leader. A candidate that hosts no replica of the group, or
+    /// refuses as no leader before anything is proposed, passes the purge
+    /// on. Any other answer is the group's. With no candidate left, the
+    /// answer is a leadership refusal that names no leader.
+    pub async fn purge_bucket_through_leader(
+        &self,
+        placement: ShardPlacement,
+        bucket_id: &str,
+    ) -> Result<PurgeBucketResponse, GroupEngineError> {
+        let no_leader =
+            || unknown_leader(LeadershipReason::LeaderUnreachable, Proposal::NotProposed);
+        let candidates = {
+            let peers = self.peer_cluster().directory();
+            let me = NodeId::new(peers.node_id().ok_or_else(no_leader)?);
+            let ids = peers.node_ids().map(NodeId::new).collect();
+            ursula_control::leader_candidates(
+                me,
+                ursula_control::CandidatesOf::Group(placement.raft_group_id),
+                &self.placement_watch().current(),
+                None,
+                &ids,
+            )
+        };
+        let mut asked = std::collections::BTreeSet::new();
+        for candidate in candidates.iter() {
+            let mut next = Some(candidate.get());
+            while let Some(node) = next.take() {
+                if !asked.insert(node) {
+                    break;
+                }
+                let Some(address) = self.peer_cluster().cluster_url(node) else {
+                    break;
+                };
+                let route = LeaderRoute {
+                    peer_cluster: self.peer_cluster().clone(),
+                    leader_id: node,
+                    address,
+                };
+                match forward_purge_bucket_to_leader(&route, placement, bucket_id.to_owned()).await
+                {
+                    Err(error) if passes_on(&error) => {
+                        next = error
+                            .not_leader()
+                            .and_then(|refusal| refusal.leader.as_ref())
+                            .map(|leader| leader.node_id);
+                    }
+                    answer => return answer,
+                }
+            }
+        }
+        Err(no_leader())
+    }
+}
+
+/// Whether the node a forwarded write went to gave no answer as the
+/// group's leader and applied nothing: it runs no replica of the group
+/// (`NOT_FOUND`, before the handler looks at the write), or it refused as
+/// no leader before anything was proposed.
+fn passes_on(error: &GroupEngineError) -> bool {
+    match error {
+        GroupEngineError::NotLeader(refusal) => refusal.proposal == Proposal::NotProposed,
+        GroupEngineError::Infra(GroupInfraError::ForwardFailed {
+            failure: ForwardFailure::Refused { grpc_code },
+            ..
+        }) => *grpc_code == i32::from(tonic::Code::NotFound),
+        GroupEngineError::Infra(_) | GroupEngineError::Stream(_) => false,
+    }
 }
 
 /// Forwards one control command to the meta leader `route` names: a

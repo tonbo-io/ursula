@@ -11731,6 +11731,15 @@ async fn tenant_buckets_isolate_identical_stream_names() {
     );
 }
 
+/// A usage report's per-bucket usage across its groups, as a collector
+/// sums it, in JSON.
+fn usage_buckets(report: &serde_json::Value) -> serde_json::Value {
+    let report: ursula_proto::admin::UsageReport =
+        serde_json::from_value(report.clone()).expect("typed usage");
+    let (buckets, _complete) = ursula_proto::admin::UsageReport::bucket_usage(&[report]);
+    serde_json::to_value(buckets).expect("usage buckets JSON")
+}
+
 // #135 data-plane half: committed usage counters aggregated across groups.
 #[tokio::test]
 async fn usage_endpoint_reports_per_bucket_committed_counters() {
@@ -11748,7 +11757,7 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     }
 
     let usage_for = |report: &serde_json::Value, bucket: &str| -> serde_json::Value {
-        report["buckets"][bucket].clone()
+        usage_buckets(report)[bucket].clone()
     };
     let fetch_usage = || async {
         let response = http_get(&app, "/__ursula/usage").await;
@@ -11760,7 +11769,7 @@ async fn usage_endpoint_reports_per_bucket_committed_counters() {
     let created = fetch_usage().await;
     let tenant_a_created = usage_for(&created, "tenant-a");
     assert_eq!(tenant_a_created["stream_count"], 1);
-    assert_eq!(created["version"], 1);
+    assert_eq!(created["version"], 2);
     assert_eq!(created["write_unit_bytes"], 10 * 1024);
     assert_eq!(tenant_a_created["committed_write_units"], 1);
     assert!(
@@ -12513,14 +12522,15 @@ async fn purge_endpoint_erases_one_tenant_and_leaves_the_other_intact() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = body_bytes(response).await;
     let usage: serde_json::Value = serde_json::from_slice(&body).expect("usage JSON");
-    assert_eq!(usage["buckets"]["tenant-a"]["stream_count"], 0);
-    assert_eq!(usage["buckets"]["tenant-a"]["retained_bytes"], 0);
+    let buckets = usage_buckets(&usage);
+    assert_eq!(buckets["tenant-a"]["stream_count"], 0);
+    assert_eq!(buckets["tenant-a"]["retained_bytes"], 0);
     assert!(
-        usage["buckets"]["tenant-a"]["committed_write_units"]
+        buckets["tenant-a"]["committed_write_units"]
             .as_u64()
             .is_some_and(|units| units > 0)
     );
-    assert!(usage["buckets"].get("tenant-b").is_some());
+    assert!(buckets.get("tenant-b").is_some());
 
     // Idempotent re-run: same report shape, zero removals.
     let response = send(

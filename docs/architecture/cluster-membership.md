@@ -45,7 +45,22 @@ only tier is every other `raft.peers` node. A replica that counts as a voter
 and knows no leader answers `503` with `Retry-After`, since its group has
 none. The admin plane never answers `NotHosted`, whose `Location` would name
 a client-plane URL: it answers that `503`, and `ursulactl`, which follows no
-redirect, asks its next node. The
+redirect, asks its next node.
+
+The node-wide passes cover the groups the node hosts. The cold flush, cold
+GC, cold-index repair, orphan sweep, shared-ref compaction, external-locator
+offload and tidy passes, and `/__ursula/usage`, skip a group the node hosts
+no replica of, which its core refuses at once (`RuntimeError::GroupNotHosted`),
+so one such group stops no pass. Each group's own replicas run its passes.
+`/__ursula/usage` reports each hosted group apart, with the index its replica
+applied, and a collector keeps the newest replica's report per group
+(`UsageReport::bucket_usage`). A bucket purge covers every group from any
+node: it purges the groups the node hosts in place and sends each other
+group's purge to the group's leader candidates in turn, following the leader
+a refusal names, until a node answers as the group's leader
+(`RaftGroupHandleRegistry::purge_bucket_through_leader`).
+
+The
 egress probe judges each voter config of the effective membership of every
 replica that counts as a voter, when one of the configs lists the node
 ([Raft WAL](raft-wal.md#recovery-gate)), and probes each peer once per tick.

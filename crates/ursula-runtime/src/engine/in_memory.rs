@@ -1796,7 +1796,12 @@ impl GroupEngine for InMemoryGroupEngine {
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
-        Box::pin(async move { Ok(self.state_machine.bucket_usage_report()) })
+        Box::pin(async move {
+            Ok(super::GroupBucketUsage {
+                applied_index: self.commit_index,
+                buckets: self.state_machine.bucket_usage_report(),
+            })
+        })
     }
 
     fn close_stream<'a>(

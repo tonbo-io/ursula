@@ -4295,7 +4295,7 @@ impl GroupEngine for RecordingEngine {
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async { Ok(crate::GroupBucketUsage::default()) })
     }
 
     fn accepts_local_writes(&self) -> bool {
@@ -4682,7 +4682,7 @@ impl GroupEngine for FailingEngine {
     }
 
     fn bucket_usage<'a>(&'a mut self, _placement: ShardPlacement) -> GroupBucketUsageFuture<'a> {
-        Box::pin(async { Ok(Vec::new()) })
+        Box::pin(async { Ok(crate::GroupBucketUsage::default()) })
     }
 
     fn create_stream<'a>(

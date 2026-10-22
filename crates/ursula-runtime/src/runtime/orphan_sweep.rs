@@ -328,8 +328,8 @@ impl ShardRuntime {
         Ok(plan.leader.then_some(plan.part_dirs))
     }
 
-    /// One orphan-sweep step in every group. A failing group is logged and
-    /// skipped, so it cannot stall the others.
+    /// One orphan-sweep step in every group this node hosts. A failing
+    /// group is logged and skipped, so it cannot stall the others.
     pub async fn sweep_cold_orphans_all_groups_once(
         &self,
         max_streams_per_group: usize,
@@ -340,15 +340,16 @@ impl ShardRuntime {
             return report;
         }
         for group_id in 0..self.shard_map.raft_group_count() {
-            match self
-                .sweep_cold_orphans_group_once(
+            match super::hosted(
+                self.sweep_cold_orphans_group_once(
                     RaftGroupId(group_id),
                     max_streams_per_group,
                     grace_ms,
                 )
-                .await
-            {
-                Ok(step) => report.add(&step),
+                .await,
+            ) {
+                Ok(Some(step)) => report.add(&step),
+                Ok(None) => {}
                 Err(err) => tracing::warn!(
                     raft_group_id = group_id,
                     error = %err,

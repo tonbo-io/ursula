@@ -1613,19 +1613,21 @@ mod serving_readiness_tests {
     }
 }
 
-/// Answer of `GET /__ursula/usage`: per-bucket usage on the answering node,
-/// and the staged snapshot parts of the groups it leads.
+/// Answer of `GET /__ursula/usage`: the per-bucket usage of each group the
+/// answering node hosts, and the staged snapshot parts of the groups it
+/// leads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageReport {
-    pub version: SchemaVersion<1>,
+    pub version: SchemaVersion<2>,
     /// The answering node's id, when it has one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_id: Option<u64>,
     /// The unit of `committed_write_units`, in bytes.
     pub write_unit_bytes: u64,
-    /// From replicated state, summed across the node's Raft groups: every
-    /// replica reports the same values.
-    pub buckets: BTreeMap<String, BucketUsageReport>,
+    /// From replicated state, one entry per group the node hosts a replica
+    /// of, in group order. A collector keeps, per group, the report with
+    /// the highest `applied_index` ([`Self::bucket_usage`]).
+    pub groups: Vec<GroupUsage>,
     /// How many Raft groups the cluster has, numbered from 0.
     pub raft_group_count: u32,
     /// The staged, unused snapshot parts of each group the node leads, in
@@ -1636,6 +1638,41 @@ pub struct UsageReport {
     pub staged_snapshot_parts: Vec<GroupStagedParts>,
 }
 
+/// Answer of `DELETE /__ursula/purge/{bucket}`: what the purge removed from
+/// every Raft group, and whether the bucket's cold objects are gone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketPurgeReport {
+    pub bucket: String,
+    /// Streams the purge removed, across every group.
+    pub removed_streams: u64,
+    /// The groups in which it removed a stream, ascending.
+    pub groups_with_streams: Vec<u32>,
+    /// Cold-GC entries the answering node's GC pass after the purge
+    /// reclaimed, in the groups it hosts. Diagnostic only.
+    pub cold_gc_entries_reclaimed: u64,
+    /// Cold-GC entries every group still holds for the bucket, as a second
+    /// purge after that pass read them.
+    pub cold_gc_pending_entries: u64,
+    /// No group holds a cold-GC entry of the bucket, the pass failed
+    /// nowhere and `bucket_prefix_absent` holds.
+    pub cold_gc_complete: bool,
+    /// Why the GC pass or the erasure of the bucket's prefix failed.
+    pub cold_gc_error: Option<String>,
+    /// The cold store lists no object below `{bucket}/`.
+    pub bucket_prefix_absent: bool,
+}
+
+/// One group's usage in a [`UsageReport`], as the answering node's replica
+/// applied it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupUsage {
+    pub raft_group_id: u32,
+    /// The index of the last entry the replica applied: of two reports of
+    /// the group, the one with the higher index is the newer.
+    pub applied_index: u64,
+    pub buckets: BTreeMap<String, BucketUsageReport>,
+}
+
 /// One bucket's usage in a [`UsageReport`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BucketUsageReport {
@@ -1644,6 +1681,23 @@ pub struct BucketUsageReport {
     pub committed_write_units: u64,
     pub retained_bytes: u64,
     pub stream_count: u64,
+}
+
+impl BucketUsageReport {
+    /// Adds `other`'s counters and gauges to these.
+    pub fn add(&mut self, other: &Self) {
+        self.committed_append_bytes = self
+            .committed_append_bytes
+            .saturating_add(other.committed_append_bytes);
+        self.committed_records = self
+            .committed_records
+            .saturating_add(other.committed_records);
+        self.committed_write_units = self
+            .committed_write_units
+            .saturating_add(other.committed_write_units);
+        self.retained_bytes = self.retained_bytes.saturating_add(other.retained_bytes);
+        self.stream_count = self.stream_count.saturating_add(other.stream_count);
+    }
 }
 
 /// The staged snapshot parts of one group, as its leader counts them.
@@ -1660,6 +1714,33 @@ pub struct GroupStagedParts {
 }
 
 impl UsageReport {
+    /// The usage per bucket across `reports`, one per node, as a collector
+    /// sums it: for each group the report with the highest `applied_index`
+    /// counts, and `false` beside the sum when no report names one of the
+    /// cluster's groups.
+    pub fn bucket_usage(reports: &[Self]) -> (BTreeMap<String, BucketUsageReport>, bool) {
+        let mut newest = BTreeMap::<u32, &GroupUsage>::new();
+        for group in reports.iter().flat_map(|report| &report.groups) {
+            match newest.get(&group.raft_group_id) {
+                Some(seen) if seen.applied_index >= group.applied_index => {}
+                _ => {
+                    newest.insert(group.raft_group_id, group);
+                }
+            }
+        }
+        let group_count = reports
+            .iter()
+            .map(|report| report.raft_group_count)
+            .max()
+            .unwrap_or(0);
+        let complete = (0..group_count).all(|group| newest.contains_key(&group));
+        let mut buckets = BTreeMap::<String, BucketUsageReport>::new();
+        for (bucket_id, usage) in newest.values().flat_map(|group| &group.buckets) {
+            buckets.entry(bucket_id.clone()).or_default().add(usage);
+        }
+        (buckets, complete)
+    }
+
     /// The staged-part bytes per bucket across `reports`, one per node, as
     /// a collector sums them: for each group the report of the highest term
     /// counts, and `false` beside the sum when one of those has not finished
@@ -1699,7 +1780,9 @@ impl UsageReport {
 mod usage_tests {
     use std::collections::BTreeMap;
 
+    use super::BucketUsageReport;
     use super::GroupStagedParts;
+    use super::GroupUsage;
     use super::SchemaVersion;
     use super::UsageReport;
 
@@ -1708,10 +1791,55 @@ mod usage_tests {
             version: SchemaVersion,
             node_id: Some(node_id),
             write_unit_bytes: 10_240,
-            buckets: BTreeMap::new(),
+            groups: Vec::new(),
             raft_group_count: 2,
             staged_snapshot_parts: groups,
         }
+    }
+
+    fn usage(raft_group_id: u32, applied_index: u64, streams: u64) -> GroupUsage {
+        GroupUsage {
+            raft_group_id,
+            applied_index,
+            buckets: BTreeMap::from([("tenant".to_owned(), BucketUsageReport {
+                committed_append_bytes: streams.saturating_mul(10),
+                committed_records: streams.saturating_mul(2),
+                committed_write_units: streams.saturating_mul(3),
+                retained_bytes: streams.saturating_mul(7),
+                stream_count: streams,
+            })]),
+        }
+    }
+
+    fn usage_report(node_id: u64, groups: Vec<GroupUsage>) -> UsageReport {
+        UsageReport {
+            groups,
+            ..report(node_id, Vec::new())
+        }
+    }
+
+    /// Each group counts once, by the replica that applied the most: a
+    /// lagging replica's older report of a group is not added to the newer
+    /// one, and a group no node reports makes the sum partial.
+    #[test]
+    fn a_collector_keeps_the_newest_replica_per_group() {
+        let reports = [
+            usage_report(1, vec![usage(0, 9, 4), usage(1, 3, 1)]),
+            usage_report(2, vec![usage(0, 12, 5)]),
+            usage_report(3, vec![usage(1, 3, 1)]),
+        ];
+        let (buckets, complete) = UsageReport::bucket_usage(&reports);
+        assert!(complete);
+        assert_eq!(buckets["tenant"], BucketUsageReport {
+            committed_append_bytes: 60,
+            committed_records: 12,
+            committed_write_units: 18,
+            retained_bytes: 42,
+            stream_count: 6,
+        });
+        let (buckets, complete) = UsageReport::bucket_usage(&reports[1..2]);
+        assert!(!complete);
+        assert_eq!(buckets["tenant"].stream_count, 5);
     }
 
     fn group(raft_group_id: u32, term: u64, finished: bool, bytes: u64) -> GroupStagedParts {
