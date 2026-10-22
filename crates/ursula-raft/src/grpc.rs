@@ -244,6 +244,13 @@ pub(crate) enum AppendCallError {
     /// replication backs off.
     #[error("raft append stream backlog full: {queued} of {budget} bytes queued")]
     BacklogFull { queued: usize, budget: usize },
+    /// The call was sent and got no answer within its timeout: a slow peer
+    /// or link, not a broken channel. A broken one fails the call as
+    /// `Unavailable` (the session closes), so a rebuild would not speed the
+    /// answer. To OpenRaft the call failed, and replication resends from
+    /// the peer's progress.
+    #[error("raft append call unanswered after {waited:?}")]
+    Unanswered { waited: Duration },
     #[error(transparent)]
     Status(#[from] tonic::Status),
 }
@@ -252,6 +259,9 @@ impl From<AppendCallError> for tonic::Status {
     fn from(error: AppendCallError) -> Self {
         match error {
             AppendCallError::BacklogFull { .. } => tonic::Status::unavailable(error.to_string()),
+            AppendCallError::Unanswered { .. } => {
+                tonic::Status::deadline_exceeded(error.to_string())
+            }
             AppendCallError::Status(status) => status,
         }
     }
@@ -806,6 +816,19 @@ const RAFT_GRPC_APPEND_STREAM_WIRE_FRAMES: usize = 4;
 /// A session with calls outstanding and no response for this long is closed (its calls fail as
 /// `Unavailable`); the next call opens a fresh stream.
 const RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long one Append call (a replication batch or a heartbeat) waits for its answer: the
+/// minimum election timeout of a cluster group ([`crate::engine::cluster_raft_config`]).
+///
+/// OpenRaft gives each Append its heartbeat interval as the RPC's TTL. Held to that, every append
+/// fails once a round trip is longer than the heartbeat interval, and nothing commits. The
+/// transport needs no such short deadline to notice a peer that is gone: HTTP/2 keepalive closes
+/// a connection whose peer went silent within 3 s ([`crate::peer_channel`]), and a session with
+/// calls outstanding and no answer for [`RAFT_GRPC_APPEND_STREAM_STALL_TIMEOUT`] closes. A call's
+/// own deadline is then only the wait a peer that is slow but answers gets, and the election
+/// timeout is the slowest link a group keeps a leader over. OpenRaft still bounds each heartbeat
+/// by the heartbeat interval itself.
+const RAFT_GRPC_APPEND_TIMEOUT: Duration =
+    Duration::from_millis(crate::engine::GROUP_ELECTION_TIMEOUT_MIN_MS);
 const RAFT_GRPC_ZSTD_MIN_MESSAGE_BYTES: usize = 1024;
 
 #[derive(Debug)]
@@ -2266,10 +2289,12 @@ impl GrpcRaftNetwork {
         }
     }
 
+    /// Sends one Append call on the shared session and waits at most
+    /// `timeout` for its admission and answer.
     async fn try_append_stream(
         &self,
         envelope: raft_internal_proto::RaftRpcEnvelopeV1,
-        option: RPCOption,
+        timeout: Duration,
     ) -> Result<raft_internal_proto::RaftRpcAckV1, AppendCallError> {
         let channel = self
             .channel
@@ -2288,11 +2313,11 @@ impl GrpcRaftNetwork {
         // Fair admission: a call that does not fit waits in the semaphore's FIFO queue, which
         // hands freed budget to the oldest waiter first (and lets no later call overtake it), so
         // a multi-MiB catch-up append is not starved by a stream of small ones. The wait shares
-        // the call's OpenRaft deadline; still not admitted by then is the true overflow case.
+        // the call's deadline; still not admitted by then is the true overflow case.
         let deadline = tokio::time::Instant::now()
-            .checked_add(option.hard_ttl())
+            .checked_add(timeout)
             .ok_or_else(|| {
-                tonic::Status::invalid_argument("raft rpc hard TTL overflows the monotonic clock")
+                tonic::Status::invalid_argument("raft append timeout overflows the monotonic clock")
             })?;
         let admitted = match session.budget.clone().try_acquire_many_owned(charge) {
             Ok(permit) => Some(permit),
@@ -2335,32 +2360,30 @@ impl GrpcRaftNetwork {
                 "raft append stream closed without a response",
             )
             .into()),
-            Err(_) => Err(tonic::Status::deadline_exceeded(
-                "raft append stream exceeded the OpenRaft hard TTL",
-            )
-            .into()),
+            Err(_elapsed) => Err(AppendCallError::Unanswered { waited: timeout }),
         }
     }
 
     async fn append_rpc(
         &mut self,
         envelope: raft_internal_proto::RaftRpcEnvelopeV1,
-        option: RPCOption,
+        timeout: Duration,
     ) -> Result<raft_internal_proto::RaftRpcAckV1, RPCError<UrsulaRaftTypeConfig>> {
         // A client without a channel answers unreachable before it queues
         // anything, and it has no channel to rebuild.
         if let Err(error) = &self.channel {
             return Err(RPCError::Unreachable(Unreachable::new(error)));
         }
-        match self.try_append_stream(envelope, option).await {
+        match self.try_append_stream(envelope, timeout).await {
             Ok(ack) => {
                 self.note_success();
                 Ok(ack)
             }
             Err(error) => {
-                // A full queue is congestion on a live stream, not a broken channel: rebuilding
-                // the channel would not drain it.
-                let backpressure = matches!(error, AppendCallError::BacklogFull { .. });
+                // A full queue is congestion on a live stream, and an unanswered call a slow
+                // peer: neither is a broken channel, and rebuilding the channel would neither
+                // drain the queue nor speed the answer.
+                let broken = matches!(error, AppendCallError::Status(_));
                 let (mapped, refusal) = self.map_tonic_status("AppendStream", error.into());
                 // An item refused as meant for another node: the session
                 // streams to the wrong node, so the channel is dialed again.
@@ -2385,7 +2408,7 @@ impl GrpcRaftNetwork {
                     .transport
                     .peer_cluster
                     .refuses(self.target, crate::rt::time::Instant::now());
-                if !backpressure && !other_cluster {
+                if broken && !other_cluster {
                     self.note_failure("AppendStream");
                 }
                 Err(mapped)
@@ -2926,16 +2949,18 @@ pub(crate) fn raft_rpc_network_error(message: impl ToString) -> RPCError<UrsulaR
 impl RaftNetworkV2<UrsulaRaftTypeConfig> for GrpcRaftNetwork {
     type SnapshotData = SnapshotData;
 
+    /// `_option` is OpenRaft's heartbeat interval, which the call does not
+    /// wait by: it waits [`RAFT_GRPC_APPEND_TIMEOUT`].
     async fn append_entries(
         &mut self,
         rpc: UrsulaAppendEntriesRequest,
-        option: RPCOption,
+        _option: RPCOption,
     ) -> Result<UrsulaAppendEntriesResponse, RPCError<UrsulaRaftTypeConfig>> {
         // An append on a session already open passes no interceptor.
         self.check_fence()?;
         let envelope = self.append_envelope(&rpc);
         record_append_logical_sample(append_logical_sample(&rpc, envelope.encoded_len()));
-        let ack = self.append_rpc(envelope, option).await?;
+        let ack = self.append_rpc(envelope, RAFT_GRPC_APPEND_TIMEOUT).await?;
         GRPC_APPEND_RESPONSE_BYTES.fetch_add(ack.encoded_len() as u64, Ordering::Relaxed);
         self.check_fence()?;
         self.decode_rpc_ack("Append", &ack.payload)
@@ -3525,7 +3550,7 @@ mod reconnect_tests {
     }
 
     /// The EKS OOM: a peer that does not keep up must not let the leader queue an unbounded
-    /// backlog of Append calls (each OpenRaft retry after a 250 ms timeout queued another copy of
+    /// backlog of Append calls (each OpenRaft retry after a call's timeout queued another copy of
     /// the same entries). Here the session never drains: the queue stops at the byte budget, later
     /// calls fail fast as backpressure, and backpressure does not count toward a channel rebuild.
     #[tokio::test]
@@ -3551,14 +3576,10 @@ mod reconnect_tests {
         let mut rejected = 0;
         for _ in 0..(3 * RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES / entry_bytes) {
             let result = network
-                .try_append_stream(envelope(), RPCOption::new(Duration::from_millis(1)))
+                .try_append_stream(envelope(), Duration::from_millis(1))
                 .await;
             match result.expect_err("a stalled peer never answers") {
-                AppendCallError::Status(status)
-                    if status.code() == tonic::Code::DeadlineExceeded =>
-                {
-                    timed_out += 1;
-                }
+                AppendCallError::Unanswered { .. } => timed_out += 1,
                 AppendCallError::BacklogFull { .. } => rejected += 1,
                 other => panic!("unexpected error {other:?}"),
             }
@@ -3571,11 +3592,63 @@ mod reconnect_tests {
         // Backpressure is congestion on a live stream, not a broken channel.
         let failures_before = network.consecutive_failures;
         let error = network
-            .append_rpc(envelope(), RPCOption::new(Duration::from_millis(1)))
+            .append_rpc(envelope(), Duration::from_millis(1))
             .await
             .expect_err("still backlogged");
         assert!(matches!(error, RPCError::Unreachable(_)));
         assert_eq!(network.consecutive_failures, failures_before);
+        transport
+            .sessions
+            .lock()
+            .expect("append session pool lock")
+            .remove(&endpoint);
+    }
+
+    /// A slow peer is not a broken channel: an Append call that got no
+    /// answer in time fails as unanswered, and however many do, the client
+    /// keeps its channel, which a single transport failure would rebuild
+    /// here.
+    #[tokio::test]
+    async fn unanswered_appends_do_not_rebuild_the_channel() {
+        let transport = Arc::new(CoreRaftTransport::default());
+        let endpoint = "http://127.0.0.1:11".to_owned();
+        let (sender, _slow_receiver) = mpsc::unbounded_channel();
+        transport
+            .sessions
+            .lock()
+            .expect("append session pool lock")
+            .insert(endpoint.clone(), SharedAppendSession {
+                _task: Arc::new(AppendSessionTask::Paused),
+                generation: 1,
+                sender,
+                budget: Arc::new(Semaphore::new(RAFT_GRPC_APPEND_STREAM_MAX_QUEUED_BYTES)),
+            });
+        let mut network =
+            test_network_with_threshold(transport.clone(), RaftGroupId(1), &endpoint, 1);
+        let generation = network.generation();
+        for _ in 0..3 {
+            let unanswered = network
+                .try_append_stream(
+                    test_envelope(1, Vec::new().into()),
+                    Duration::from_millis(1),
+                )
+                .await
+                .expect_err("the peer never answers");
+            assert!(
+                matches!(unanswered, AppendCallError::Unanswered { .. }),
+                "{unanswered:?}"
+            );
+            let error = network
+                .append_rpc(
+                    test_envelope(1, Vec::new().into()),
+                    Duration::from_millis(1),
+                )
+                .await
+                .expect_err("the peer never answers");
+            assert!(matches!(error, RPCError::Network(_)), "{error:?}");
+        }
+        assert_eq!(network.consecutive_failures, 0);
+        assert_eq!(network.generation(), generation);
         transport
             .sessions
             .lock()
@@ -3613,14 +3686,14 @@ mod reconnect_tests {
         let large = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
         let large = tokio::spawn(async move {
             large
-                .try_append_stream(envelope(1, 2 * mib), RPCOption::new(Duration::from_secs(2)))
+                .try_append_stream(envelope(1, 2 * mib), Duration::from_secs(2))
                 .await
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         // Budget is free for a small call, but the large one is ahead of it.
         let small = test_network(transport.clone(), RaftGroupId(2), 2, endpoint.clone())
-            .try_append_stream(envelope(2, 16), RPCOption::new(Duration::from_millis(50)))
+            .try_append_stream(envelope(2, 16), Duration::from_millis(50))
             .await
             .expect_err("the small call waits behind the large one");
         assert!(matches!(small, AppendCallError::BacklogFull { .. }));
@@ -3881,7 +3954,7 @@ mod reconnect_tests {
         remove_shared_channel(&transport, &endpoint);
         let status = tonic::Status::from(
             test_network(transport, RaftGroupId(1), 2, endpoint.clone())
-                .try_append_stream(misdelivered, RPCOption::new(Duration::from_secs(2)))
+                .try_append_stream(misdelivered, Duration::from_secs(2))
                 .await
                 .expect_err("node 1 is not node 2"),
         );
@@ -3907,10 +3980,7 @@ mod reconnect_tests {
             );
             async move {
                 network
-                    .try_append_stream(
-                        envelope(raft_group_id),
-                        RPCOption::new(Duration::from_secs(2)),
-                    )
+                    .try_append_stream(envelope(raft_group_id), Duration::from_secs(2))
                     .await
             }
         });
@@ -3954,7 +4024,7 @@ mod reconnect_tests {
         for envelope in [large.clone(), large, envelope_of(1024)] {
             let status = tonic::Status::from(
                 network
-                    .try_append_stream(envelope, RPCOption::new(Duration::from_secs(10)))
+                    .try_append_stream(envelope, Duration::from_secs(10))
                     .await
                     .expect_err("the peer hosts no group"),
             );
@@ -3978,10 +4048,10 @@ mod reconnect_tests {
         let mut first = test_network(transport.clone(), RaftGroupId(1), 2, endpoint.clone());
         let second = test_network(transport.clone(), RaftGroupId(2), 2, endpoint.clone());
         let envelope = |raft_group_id| test_envelope(raft_group_id, Vec::new().into());
-        let option = RPCOption::new(Duration::from_secs(2));
+        let timeout = Duration::from_secs(2);
         let (first_result, second_result) = tokio::join!(
-            first.try_append_stream(envelope(1), option.clone()),
-            second.try_append_stream(envelope(2), option),
+            first.try_append_stream(envelope(1), timeout),
+            second.try_append_stream(envelope(2), timeout),
         );
 
         assert_eq!(
@@ -4015,7 +4085,7 @@ mod reconnect_tests {
         }
         assert_ne!(first.generation(), original_generation);
         let result = first
-            .try_append_stream(envelope(1), RPCOption::new(Duration::from_secs(2)))
+            .try_append_stream(envelope(1), Duration::from_secs(2))
             .await;
         assert_eq!(
             tonic::Status::from(result.expect_err("missing group should still fail")).code(),
@@ -4333,18 +4403,17 @@ mod reconnect_tests {
             peer_cluster.clone(),
         ));
         let mut network = test_network(transport, RaftGroupId(1), 1, endpoint);
-        let option = RPCOption::new(Duration::from_secs(2));
         let vote = network
             .vote(
                 UrsulaVoteRequest::new(UrsulaVote::new(1, 3), None),
-                option.clone(),
+                RPCOption::new(Duration::from_secs(2)),
             )
             .await
             .expect_err("a peer of another cluster refuses the vote");
         assert!(matches!(vote, RPCError::Unreachable(_)), "{vote:?}");
         assert_eq!(peer_cluster.refusals(), 1);
         let append = network
-            .append_rpc(test_envelope(1, Vec::new().into()), option)
+            .append_rpc(test_envelope(1, Vec::new().into()), Duration::from_secs(2))
             .await;
         assert!(append.is_err(), "the append stream does not open");
         assert_eq!(peer_cluster.refusals(), 2);

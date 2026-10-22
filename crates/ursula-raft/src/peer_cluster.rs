@@ -81,7 +81,7 @@ pub const CLUSTER_ID_METADATA: &str = "ursula-cluster-id";
 pub const NODE_ID_METADATA: &str = "ursula-node-id";
 
 /// How long a refused peer stays in the report after its last refusal. A
-/// misconfigured peer retries far more often (heartbeats every 250 ms,
+/// misconfigured peer retries far more often (heartbeats every 600 ms,
 /// elections within 3 s), so it stays listed while it keeps trying, and drops
 /// out once an operator fixed it.
 pub const PEER_CLUSTER_MISMATCH_TTL: Duration = Duration::from_secs(60);

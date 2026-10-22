@@ -17,7 +17,7 @@ use tonic::transport::Endpoint;
 const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A connection that has read no frame for this long sends an HTTP/2 PING.
-/// A busy connection (Raft heartbeats every 250 ms) sends none.
+/// A busy connection (Raft heartbeats every 600 ms) sends none.
 const PEER_HTTP2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 /// How long a PING may go unanswered before the connection closes and every

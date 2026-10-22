@@ -8728,6 +8728,230 @@ async fn cli_a_wiped_voter_is_not_ready_before_its_groups() {
     }
 }
 
+/// One-way delay of every link in
+/// [`cli_writes_commit_over_round_trips_longer_than_the_heartbeat_interval`].
+const SLOW_LINK_ONE_WAY: Duration = Duration::from_millis(200);
+/// The round trip [`SLOW_LINK_ONE_WAY`] makes.
+const SLOW_LINK_ROUND_TRIP: Duration = Duration::from_millis(400);
+
+/// A TCP link in front of a node's listener that holds every byte it
+/// carries for the same one-way delay in each direction, as a `netem delay`
+/// on a host's interface does. The delay starts at zero and applies to the
+/// bytes read after it changes. Bytes keep their order.
+struct DelayedLink {
+    url: String,
+    delay: tokio::sync::watch::Sender<Duration>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl DelayedLink {
+    async fn start(target: &str) -> Self {
+        let target = target.trim_start_matches("http://").to_owned();
+        // A reserved port, as for `RaftProxy`.
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", free_port()))
+            .await
+            .unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (delay, delays) = tokio::sync::watch::channel(Duration::ZERO);
+        let task = tokio::spawn(async move {
+            // Dropped with the task, which aborts every connection.
+            let mut connections = tokio::task::JoinSet::new();
+            loop {
+                let Ok((inbound, _peer)) = listener.accept().await else {
+                    continue;
+                };
+                let target = target.clone();
+                let delays = delays.clone();
+                connections.spawn(async move {
+                    let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
+                        return;
+                    };
+                    inbound.set_nodelay(true).unwrap();
+                    outbound.set_nodelay(true).unwrap();
+                    let (inbound_read, inbound_write) = inbound.into_split();
+                    let (outbound_read, outbound_write) = outbound.into_split();
+                    tokio::join!(
+                        delayed_copy(inbound_read, outbound_write, delays.clone()),
+                        delayed_copy(outbound_read, inbound_write, delays),
+                    );
+                });
+            }
+        });
+        Self { url, delay, task }
+    }
+
+    fn set_delay(&self, delay: Duration) {
+        self.delay.send_replace(delay);
+    }
+}
+
+impl Drop for DelayedLink {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Copies `from` to `to`, writing each chunk once the delay `delays` held
+/// when it was read has passed.
+async fn delayed_copy(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    delays: tokio::sync::watch::Receiver<Duration>,
+) {
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
+
+    let (chunks, mut due) =
+        tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let read = async move {
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = match from.read(&mut buffer).await {
+                Ok(0) | Err(_) => break,
+                Ok(read) => read,
+            };
+            let at = tokio::time::Instant::now()
+                .checked_add(*delays.borrow())
+                .unwrap();
+            if chunks.send((at, buffer[..read].to_vec())).is_err() {
+                break;
+            }
+        }
+    };
+    let write = async move {
+        while let Some((at, chunk)) = due.recv().await {
+            tokio::time::sleep_until(at).await;
+            if to.write_all(&chunk).await.is_err() {
+                return;
+            }
+        }
+        // The peer reads the end of the stream where this side's ended.
+        to.shutdown().await.unwrap_or_default();
+    };
+    tokio::join!(read, write);
+}
+
+/// Each group's `(leader, term)` as every node of `nodes` reports it.
+async fn group_leaders_and_terms(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+) -> BTreeMap<u64, BTreeSet<(Option<u64>, u64)>> {
+    let mut views: BTreeMap<u64, BTreeSet<(Option<u64>, u64)>> = BTreeMap::new();
+    for node in nodes {
+        let what = format!("node {} answers its metrics", node.id);
+        let metrics = eventually(procs, &what, async || {
+            try_node_metrics(client, &node.url()).await
+        })
+        .await;
+        for group in metrics.groups {
+            views
+                .entry(group.raft_group_id)
+                .or_default()
+                .insert((group.current_leader, group.current_term));
+        }
+    }
+    views
+}
+
+/// Replication slows with a slow link instead of stopping. Once every
+/// group's leadership settled, every node's Raft traffic passes a link that
+/// holds each byte [`SLOW_LINK_ONE_WAY`] each way, a round trip longer than
+/// the heartbeat interval OpenRaft gives each Append call as its timeout.
+/// Every write to every group is still acknowledged at its first attempt,
+/// each after at least one round trip, no group changes its leader or term,
+/// and linearizable reads return every write. A transport that waits only
+/// the heartbeat interval for an Append's answer fails every append over
+/// such links and commits nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_writes_commit_over_round_trips_longer_than_the_heartbeat_interval() {
+    let _guard = static_cluster_cli_test_guard().await;
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the slow-link test");
+        return;
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let nodes = MetaNode::cluster(root.path(), 3);
+    let mut links = Vec::new();
+    for node in &nodes {
+        links.push(DelayedLink::start(&node.url()).await);
+    }
+    let peers = nodes
+        .iter()
+        .zip(&links)
+        .map(|(node, link)| (node.id, link.url.clone()))
+        .collect::<Vec<_>>();
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        ..MetaToml::default()
+    };
+    let client = bounded_client();
+    let mut procs = Processes::default();
+    for node in &nodes {
+        node.write(&peers, meta);
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let streams = stream_per_group("slowlink");
+    let url = |stream: &str| format!("{}/slowlink/{stream}", nodes[0].url());
+    for stream in &streams {
+        put_until_created(&client, &url(stream)).await;
+        post_until_no_content(&client, &url(stream), "fast;").await;
+    }
+    wait_leaders_settle(&client, &mut procs, &nodes).await;
+    let settled_leaders = group_leaders_and_terms(&client, &mut procs, &nodes).await;
+    assert!(
+        settled_leaders.values().all(|views| views.len() == 1),
+        "{settled_leaders:?}"
+    );
+
+    for link in &links {
+        link.set_delay(SLOW_LINK_ONE_WAY);
+    }
+    for payload in ["slow-1;", "slow-2;", "slow-3;"] {
+        for stream in &streams {
+            let started = std::time::Instant::now();
+            let response = client
+                .post(url(stream))
+                .header("content-type", "text/plain")
+                .body(payload)
+                .send()
+                .await
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "append {payload} to {stream} failed: {err}\n{}",
+                        procs.reports()
+                    )
+                });
+            let status = response.status();
+            assert_eq!(
+                status,
+                reqwest::StatusCode::NO_CONTENT,
+                "append {payload} to {stream}: {:?}",
+                response.text().await
+            );
+            let took = started.elapsed();
+            assert!(
+                took >= SLOW_LINK_ROUND_TRIP,
+                "append {payload} to {stream} took {took:?}, less than a round trip"
+            );
+        }
+    }
+    assert_eq!(
+        group_leaders_and_terms(&client, &mut procs, &nodes).await,
+        settled_leaders,
+        "a group changed its leader or term over the slow links"
+    );
+    for stream in &streams {
+        read_until_matches(
+            &client,
+            &format!("{}?offset=0&max_bytes=64", url(stream)),
+            b"fast;slow-1;slow-2;slow-3;",
+        )
+        .await;
+    }
+}
+
 /// IT-4 (#768): a WAL root opens only under the node id that created it.
 /// Node 2 started on node 1's WAL refuses to start, naming both ids, and
 /// leaves the root as it was.
