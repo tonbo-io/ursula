@@ -311,16 +311,13 @@ fn group_engine_leadership_refusal_is_detected_without_matching_message() {
 // typed.
 #[test]
 fn leader_redirect_never_points_at_this_node() {
-    let router = ClientWriteLeaderRouter::new(
-        bound_registry(
-            2,
-            crate::shared_peers([
-                (1, "http://node-1/".to_owned()),
-                (2, "http://node-2".to_owned()),
-            ]),
-        ),
-        Arc::new(ursula_raft::FixedPlacement::single(2)),
-    );
+    let router = ClientWriteLeaderRouter::new(bound_registry(
+        2,
+        crate::shared_peers([
+            (1, "http://node-1/".to_owned()),
+            (2, "http://node-2".to_owned()),
+        ]),
+    ));
     let forward = |leader: Option<KnownLeader>| RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
@@ -362,16 +359,13 @@ fn leader_redirect_never_points_at_this_node() {
 // and `leader_url` both give up.
 #[test]
 fn a_leader_raft_peers_does_not_list_gets_no_redirect() {
-    let router = ClientWriteLeaderRouter::new(
-        bound_registry(
-            2,
-            crate::shared_peers([
-                (1, "http://node-1:4437".to_owned()),
-                (2, "http://node-2:4437".to_owned()),
-            ]),
-        ),
-        Arc::new(ursula_raft::FixedPlacement::single(2)),
-    );
+    let router = ClientWriteLeaderRouter::new(bound_registry(
+        2,
+        crate::shared_peers([
+            (1, "http://node-1:4437".to_owned()),
+            (2, "http://node-2:4437".to_owned()),
+        ]),
+    ));
     let unlisted = RuntimeError::GroupEngine {
         core_id: ursula_shard::CoreId(0),
         raft_group_id: RaftGroupId(4),
@@ -584,8 +578,6 @@ struct StaticGrpcTestNode {
     /// The node's router, for requests sent in process.
     app: Router,
     registry: RaftGroupHandleRegistry,
-    /// What the node's groups and its routes read of placement.
-    placement: Arc<dyn ursula_raft::PlacementInputs>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     server: tokio::task::JoinHandle<()>,
     raft_wal: ursula_raft::RaftWal,
@@ -804,7 +796,7 @@ async fn spawn_static_grpc_test_node(
             .expect("runtime");
     // Its answers name the cluster its WAL holds, as a server's do.
     let app = router_with_http_state(
-        HttpState::with_raft_cluster(runtime.clone(), registry.clone(), Arc::clone(&placement))
+        HttpState::with_raft_cluster(runtime.clone(), registry.clone())
             .with_configured_cluster_id(Some(static_test_cluster_id())),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -824,7 +816,6 @@ async fn spawn_static_grpc_test_node(
         runtime,
         app,
         registry,
-        placement,
         shutdown: Some(shutdown_tx),
         server,
         raft_wal: log_stores,
@@ -2068,7 +2059,6 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
     let runtime = spawned.runtime;
     let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let registry = spawned.raft_registry.expect("registry");
-    let inputs = spawned.placement.expect("a Raft node's placement");
     runtime.warm_all_groups().await.expect("warm group");
     let raft = registry
         .get(RaftGroupId(0))
@@ -2077,7 +2067,7 @@ async fn static_grpc_raft_runtime_can_use_core_journal() {
         .current_leader(1, "static durable gRPC Raft group should elect node 1")
         .await
         .expect("wait for leader");
-    let app = router_with_raft_cluster(runtime.clone(), registry, inputs);
+    let app = router_with_raft_cluster(runtime.clone(), registry);
 
     let response = http_put(
         &app,
@@ -2147,7 +2137,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         spawned.bind_without_meta();
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
-        let inputs = spawned.placement.expect("a Raft node's placement");
         let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
         runtime.warm_all_groups().await.expect("warm group");
         let placement = runtime.locate(&BucketStreamId::new("benchcmp", "static-raft-log-restart"));
@@ -2159,7 +2148,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .current_leader(1, "static durable gRPC Raft group should elect node 1")
             .await
             .expect("wait for leader");
-        let app = router_with_raft_cluster(runtime, registry, inputs);
+        let app = router_with_raft_cluster(runtime, registry);
 
         let response = http_put(
             &app,
@@ -2203,7 +2192,6 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
         .expect("restarted runtime");
         let runtime = spawned.runtime;
         let registry = spawned.raft_registry.expect("registry");
-        let inputs = spawned.placement.expect("a Raft node's placement");
         let raft_wal = spawned.raft_wal.expect("restarted WAL");
         let opening = raft_wal.opening();
         assert_eq!(
@@ -2232,7 +2220,7 @@ async fn static_grpc_raft_runtime_recovers_from_core_journal_after_restart() {
             .await
             .expect("wait for restarted leader");
         let shutdown_runtime = runtime.clone();
-        let app = router_with_raft_cluster(runtime, registry, inputs);
+        let app = router_with_raft_cluster(runtime, registry);
 
         let response = http_get(
             &app,
@@ -2281,11 +2269,7 @@ async fn raft_grpc_network_dispatches_to_registered_runtime_owned_group() {
         .warm_group(RaftGroupId(0))
         .await
         .expect("warm raft group");
-    let app = router_with_raft_cluster(
-        runtime.clone(),
-        registry.clone(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let app = router_with_raft_cluster(runtime.clone(), registry.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind listener");
@@ -2824,12 +2808,8 @@ async fn static_grpc_follower_routes_writes_before_their_body() {
             monitor.observe_available(99),
             crate::wal_disk::WalDiskTransition::EnterPressure
         );
-        let state = HttpState::with_raft_cluster(
-            node.runtime.clone(),
-            node.registry.clone(),
-            Arc::clone(&node.placement),
-        )
-        .with_wal_disk_monitor(monitor.clone());
+        let state = HttpState::with_raft_cluster(node.runtime.clone(), node.registry.clone())
+            .with_wal_disk_monitor(monitor.clone());
         client_router_with_admission(
             state,
             IngressAdmission::default().with_wal_disk_monitor(monitor),
@@ -5904,7 +5884,6 @@ async fn cluster_router_reports_leadership_shed_policy() {
             .expect("runtime")
             .runtime,
         registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
     );
     let cluster = cluster_router_from_state(state);
     let response = http_get(&cluster, LEADERSHIP_SHED_PATH).await;
@@ -5928,7 +5907,6 @@ async fn maintenance_drain_endpoint_marks_and_clears_leadership_shed() {
             .expect("runtime")
             .runtime,
         registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
     );
     let router = cluster_router_from_state(state.clone())
         .merge(admin_ops_router(state.clone()))
@@ -6530,11 +6508,7 @@ async fn an_unproven_recovery_cannot_count_as_ready_after_undrain() {
         .expect("runtime")
         .runtime;
     let app = client_router_with_admission(
-        HttpState::with_raft_cluster(
-            runtime,
-            registry.clone(),
-            std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-        ),
+        HttpState::with_raft_cluster(runtime, registry.clone()),
         IngressAdmission::default(),
     );
     registry.mark_leadership_shed(ursula_raft::LeadershipShedReason::MaintenanceDrain);
@@ -6655,11 +6629,7 @@ async fn a_recovery_plan_opens_the_gate_for_the_observed_log_only() {
         let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
             .expect("runtime")
             .runtime;
-        let state = HttpState::with_raft_cluster(
-            runtime,
-            registry.clone(),
-            std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-        );
+        let state = HttpState::with_raft_cluster(runtime, registry.clone());
         let client = client_router_with_admission(state.clone(), IngressAdmission::default());
         let admin = admin_router(state.clone());
         // Operator tooling reads the same readiness through its admin tunnel.
@@ -7013,12 +6983,7 @@ async fn a_raft_node_without_a_meta_runtime_reports_its_placement_unknown() {
             (3, "http://localhost:4439".to_owned()),
         ]),
     );
-    let placement = ursula_raft::FixedPlacement {
-        node: 1,
-        voters: BTreeSet::from([1, 2, 3]),
-        initializer: 1,
-    };
-    let state = HttpState::with_raft_cluster(runtime, registry, Arc::new(placement));
+    let state = HttpState::with_raft_cluster(runtime, registry);
     let app = client_router_with_admission(state, IngressAdmission::default());
     let ready = http_get(&app, READINESS_PATH).await;
     assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -8589,11 +8554,7 @@ mod snapshot_driver {
             .expect("warm the groups");
         let coordinator = registry.snapshot_build_coordinator();
         let app = crate::client_router_with_admission(
-            HttpState::with_raft_cluster(
-                runtime.clone(),
-                registry,
-                std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-            ),
+            HttpState::with_raft_cluster(runtime.clone(), registry),
             crate::IngressAdmission::new(&config.server)
                 .with_raft_log_pressure(Some(coordinator.clone())),
         );
@@ -9489,7 +9450,6 @@ mod snapshot_driver {
         let admin = admin_router(HttpState::with_raft_cluster(
             node.runtime.clone(),
             node.registry.clone(),
-            node.placement.clone(),
         ));
         (node, admin)
     }
@@ -13118,17 +13078,9 @@ async fn stale_process_admin_requests_cannot_change_a_replacement_or_clear_its_d
     let runtime = spawn_runtime(&test_config(1, 1), Topology::Development { group_count: 1 })
         .expect("runtime")
         .runtime;
-    let old = HttpState::with_raft_cluster(
-        runtime.clone(),
-        RaftGroupHandleRegistry::default(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let old = HttpState::with_raft_cluster(runtime.clone(), RaftGroupHandleRegistry::default());
     let registry = RaftGroupHandleRegistry::default();
-    let replacement = HttpState::with_raft_cluster(
-        runtime,
-        registry.clone(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let replacement = HttpState::with_raft_cluster(runtime, registry.clone());
     assert_ne!(old.process_incarnation, replacement.process_incarnation);
     assert_eq!(
         replacement.process_incarnation,
@@ -13223,7 +13175,6 @@ async fn admin_mutation_without_observed_incarnation_is_rejected_before_drain() 
             .expect("runtime")
             .runtime,
         registry.clone(),
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
     );
     let response = admin_router(state)
         .oneshot(
@@ -13314,11 +13265,7 @@ async fn admin_quorum_proof_is_incarnation_bound_and_uses_registered_read_barrie
         .current_leader(1, "single voter elected")
         .await
         .unwrap();
-    let state = HttpState::with_raft_cluster(
-        runtime.clone(),
-        registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    );
+    let state = HttpState::with_raft_cluster(runtime.clone(), registry);
     let identity = state.process_incarnation;
     let admin = admin_router(state);
     let path = "/__ursula/raft/0/quorum";
@@ -13388,11 +13335,7 @@ async fn self_election_on_the_leader_is_refused_and_keeps_its_term() {
         .metrics(|m| m.vote.is_committed(), "the leader's vote is committed")
         .await
         .unwrap();
-    let admin = admin_router(HttpState::with_raft_cluster(
-        runtime.clone(),
-        registry,
-        std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
-    ));
+    let admin = admin_router(HttpState::with_raft_cluster(runtime.clone(), registry));
     let observed = raft.metrics().borrow_watched().clone();
     let self_election = |current_term: u64| {
         http_post(
@@ -13521,7 +13464,6 @@ async fn self_election_elects_a_follower_unless_it_may_not_campaign() {
     let admin = admin_router(HttpState::with_raft_cluster(
         follower.runtime.clone(),
         follower.registry.clone(),
-        follower.placement.clone(),
     ));
     let self_election = |current_term: u64| {
         http_post(

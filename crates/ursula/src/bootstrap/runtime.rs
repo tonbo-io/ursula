@@ -52,9 +52,6 @@ pub struct SpawnedRuntime {
     /// records unbound then stay held out
     /// ([`ursula_runtime::NodeFence::awaits_binding`]) for the whole run.
     pub meta: Option<SpawnedMeta>,
-    /// The placement inputs of a Raft node's groups, which its HTTP routes
-    /// read too.
-    pub placement: Option<Arc<dyn PlacementInputs>>,
     /// The hosting set and placement the hosting driver takes, when the
     /// node's groups are placed by meta. The server starts the driver
     /// ([`SpawnedHosting::start`]). Until then the node hosts nothing.
@@ -162,7 +159,6 @@ fn spawn_with_inputs(
                 raft_registry: None,
                 raft_wal: None,
                 meta: None,
-                placement: None,
                 hosting: None,
             }
         }
@@ -350,7 +346,6 @@ fn spawn_raft_node(
         raft_registry: Some(registry),
         raft_wal: Some(raft_wal),
         meta: Some(meta),
-        placement: Some(placement),
         hosting,
     })
 }

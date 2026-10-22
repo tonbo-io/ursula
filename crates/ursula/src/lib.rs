@@ -597,11 +597,10 @@ impl HttpState {
     pub fn with_raft_cluster(
         runtime: ShardRuntime,
         raft_registry: RaftGroupHandleRegistry,
-        placement: Arc<dyn ursula_raft::PlacementInputs>,
     ) -> Self {
         let staged_parts =
             staged_parts::StagedParts::observing(&runtime, Some(raft_registry.clone()));
-        let router = ClientWriteLeaderRouter::new(raft_registry.clone(), placement);
+        let router = ClientWriteLeaderRouter::new(raft_registry.clone());
         HttpStateFields {
             process_incarnation: unpersisted_incarnation(),
             configured_node_id: None,
@@ -837,22 +836,16 @@ impl Drop for AbortOnDrop {
 #[derive(Clone, Debug)]
 pub struct ClientWriteLeaderRouter {
     registry: RaftGroupHandleRegistry,
-    placement: Arc<dyn ursula_raft::PlacementInputs>,
     /// The `NotHosted` answers given, which rotate the node each names.
     not_hosted_turns: Arc<AtomicUsize>,
 }
 
 impl ClientWriteLeaderRouter {
     /// Routes over `registry`'s peers, placement views and voter
-    /// predicate. `placement`, the node's placement inputs, gives the
-    /// maintenance inventory.
-    pub fn new(
-        registry: RaftGroupHandleRegistry,
-        placement: Arc<dyn ursula_raft::PlacementInputs>,
-    ) -> Self {
+    /// predicate.
+    pub fn new(registry: RaftGroupHandleRegistry) -> Self {
         Self {
             registry,
-            placement,
             not_hosted_turns: Arc::default(),
         }
     }
@@ -864,11 +857,6 @@ impl ClientWriteLeaderRouter {
     /// This node's id, as its peer cluster binds it.
     fn node_id(&self) -> Option<u64> {
         self.peers().identity().map(|identity| identity.node_id())
-    }
-
-    /// The voters this node's placement gives `group`.
-    fn placed_voters(&self, group: RaftGroupId) -> BTreeSet<u64> {
-        self.placement.nodes(group).voters()
     }
 
     /// The client URL `raft.peers` lists for `leader_id`. `None` for this
@@ -1242,9 +1230,8 @@ pub fn router(runtime: ShardRuntime) -> Router {
 pub fn router_with_raft_cluster(
     runtime: ShardRuntime,
     raft_registry: RaftGroupHandleRegistry,
-    placement: Arc<dyn ursula_raft::PlacementInputs>,
 ) -> Router {
-    let state = HttpState::with_raft_cluster(runtime, raft_registry, placement);
+    let state = HttpState::with_raft_cluster(runtime, raft_registry);
     cluster_router_from_state(state.clone()).merge(client_router_with_admission(
         state,
         IngressAdmission::default(),

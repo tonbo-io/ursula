@@ -358,7 +358,6 @@ mod tests {
         let state = crate::HttpState::with_raft_cluster(
             ShardRuntime::spawn(RuntimeConfig::new(1, 1)).expect("runtime"),
             registry.clone(),
-            std::sync::Arc::new(ursula_raft::FixedPlacement::single(1)),
         );
         let incarnation = state.process_incarnation.to_string();
         let admin = crate::admin_router(state);

@@ -180,13 +180,11 @@ async fn init_state(
             .await;
     }
 
-    let state = match (spawned.raft_registry, spawned.placement) {
+    let state = match spawned.raft_registry {
         // Leader redirects send clients to a peer's client plane, which is
         // not its Raft `url` when the cluster plane listens apart.
-        (Some(registry), Some(placement)) => {
-            HttpState::with_raft_cluster(runtime, registry, placement)
-        }
-        _ => HttpState::new(runtime),
+        Some(registry) => HttpState::with_raft_cluster(runtime, registry),
+        None => HttpState::new(runtime),
     };
     let mut state = state
         .with_configured_node_id(config.raft.node_id)
