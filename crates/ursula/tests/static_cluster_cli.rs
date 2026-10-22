@@ -1773,8 +1773,9 @@ async fn wait_readiness(
     }
 }
 
-/// The bytes every record of the stream the deleted-data test removes
-/// carries.
+/// The bytes every record of a stream carries whose data a test checks is
+/// gone from a node: the deleted-data tests' stream, and the stream of the
+/// group the teardown test moves off its source.
 const DELETED_MARKER: &str = "deleted-data-marker-669;";
 
 /// The `raft_groups[0]` progress of `base_url`'s metrics: last applied,
@@ -2699,7 +2700,13 @@ async fn wait_serves_group_zero(
 
 /// Asks node `admin`'s group 0 for a snapshot and returns its index.
 async fn snapshot_group_zero(client: &reqwest::Client, admin: &str) -> u64 {
-    let response = admin_test_post(client, format!("{admin}/__ursula/raft/0/snapshot"))
+    snapshot_group(client, admin, 0).await
+}
+
+/// Asks node `admin`'s replica of group `group` for a snapshot and returns
+/// its index.
+async fn snapshot_group(client: &reqwest::Client, admin: &str, group: u32) -> u64 {
+    let response = admin_test_post(client, format!("{admin}/__ursula/raft/{group}/snapshot"))
         .await
         .send()
         .await
@@ -3955,9 +3962,19 @@ impl Processes {
 async fn eventually<T>(
     procs: &mut Processes,
     what: &str,
+    probe: impl AsyncFnMut() -> Result<T, String>,
+) -> T {
+    eventually_for(procs, what, META_WAIT, probe).await
+}
+
+/// [`eventually`], failing after `wait`.
+async fn eventually_for<T>(
+    procs: &mut Processes,
+    what: &str,
+    wait: Duration,
     mut probe: impl AsyncFnMut() -> Result<T, String>,
 ) -> T {
-    let deadline = std::time::Instant::now().checked_add(META_WAIT).unwrap();
+    let deadline = std::time::Instant::now().checked_add(wait).unwrap();
     loop {
         if let Some(report) = procs.exited() {
             panic!("a node exited while waiting until {what}:\n{report}");
@@ -5814,6 +5831,926 @@ async fn cli_an_s3_backed_node_refuses_a_non_inline_meta_record() {
         .unwrap_or_else(|err| panic!("{}", s3_failure("clear the test root", "", &err)));
 }
 
+/// How long one step of the teardown and decommission test may take on a
+/// loaded runner. A teardown asks its group whether the node is a member
+/// at its first step and again before it retires the log, up to
+/// [`ursula_raft::hosting::ASK_INTERVAL`] apart, and a decommission moves
+/// the node's groups one after another under the move limit.
+const LIFECYCLE_WAIT: Duration = Duration::from_secs(300);
+
+/// How long the teardown test waits for a retired log's frames to leave
+/// its source's journal: its `raft.deleted_data_max_age` of 160 s, a quarter
+/// of which is the age at which a segment holding dead frames is given back,
+/// and a margin.
+const JOURNAL_RECLAIM_WAIT: Duration = Duration::from_secs(220);
+
+/// Rewrites `node`'s config for the teardown test, as the S3 deleted-data
+/// test does: a journal segment that holds dead frames is given back once
+/// they are 40 s old (`raft.deleted_data_max_age` of 160 s), segments are
+/// 64 KiB so that a few writes seal them, and a follower's install copy
+/// fits inside a 20 s `raft.install_snapshot_timeout`.
+///
+/// The test applies it to the torn-down source only, the one node whose
+/// journal it inspects.
+fn bound_dead_journal_data(node: &MetaNode) {
+    let text = std::fs::read_to_string(&node.config).expect("read node config");
+    assert!(
+        text.contains("[raft]\n") && text.contains("[raft.wal]\n"),
+        "{text}"
+    );
+    let text = text
+        .replace(
+            "[raft]\n",
+            "[raft]\ndeleted_data_max_age = \"160s\"\ninstall_snapshot_timeout = \"20s\"\n",
+        )
+        .replace("[raft.wal]\n", "[raft.wal]\nsegment_size = \"64KiB\"\n")
+        + "\n[storage.snapshot]\ns3_timeout = \"1500ms\"\ns3_max_retries = 1\n";
+    std::fs::write(&node.config, text).expect("write node config");
+}
+
+/// How long phase 4 of the teardown and decommission test gives one meta
+/// leadership's first sweep pass before it starts another leadership. A
+/// pass asks each listed group at most a few seconds per peer.
+const SWEEP_PASS_WAIT: Duration = Duration::from_secs(60);
+
+/// Asks meta leader `from` to hand the meta leadership alone to the next
+/// meta voter, so a new meta leadership begins while data leaderships stay
+/// where they are.
+async fn try_hand_meta_on(
+    client: &reqwest::Client,
+    nodes: &[MetaNode],
+    from: u64,
+) -> Result<(), String> {
+    use ursula_proto::admin::TransferLeaderResponse;
+
+    if !META_VOTERS.contains(&from) {
+        return Err(format!("meta leader {from} is no meta voter"));
+    }
+    let to = META_VOTERS
+        .iter()
+        .cycle()
+        .skip_while(|voter| **voter != from)
+        .nth(1)
+        .copied()
+        .expect("another meta voter");
+    let leader = nodes
+        .iter()
+        .find(|node| node.id == from)
+        .ok_or_else(|| format!("no node {from}"))?;
+    let url = format!("{}/__ursula/raft/meta/leader/transfer/{to}", leader.admin());
+    let response = try_admin_test_post(client, url.clone())
+        .await?
+        .send()
+        .await
+        .map_err(|err| format!("POST {url}: {err}"))?;
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|err| format!("POST {url}: {err}"))?;
+    match serde_json::from_str::<TransferLeaderResponse>(&body) {
+        Ok(answer) if status.is_success() && answer.transferred => Ok(()),
+        _ => Err(format!("POST {url}: {status} {body}")),
+    }
+}
+
+/// The snapshot objects node `node` owns of group `group`, under
+/// `{prefix}/node-{node}/group-{group}/`.
+async fn owned_objects(
+    cold_store: &ColdStore,
+    prefix: &ursula_runtime::SnapshotPrefix,
+    node: u64,
+    group: u32,
+) -> Result<Vec<String>, String> {
+    let dir = format!(
+        "{}group-{group}/",
+        ursula_runtime::snapshot_harness::node_directory(prefix, node)
+    );
+    let names = cold_store
+        .list_file_names(&dir)
+        .await
+        .map_err(|err| s3_failure("list", &dir, &err))?;
+    Ok(names
+        .into_iter()
+        .map(|name| format!("{dir}{name}"))
+        .collect())
+}
+
+/// Every group of which node `node` owns a snapshot object.
+async fn groups_with_objects(
+    cold_store: &ColdStore,
+    prefix: &ursula_runtime::SnapshotPrefix,
+    node: u64,
+) -> Result<BTreeSet<u32>, String> {
+    let mut groups = BTreeSet::new();
+    for group in 0..u32::try_from(META_TEST_GROUPS).unwrap() {
+        if !owned_objects(cold_store, prefix, node, group)
+            .await?
+            .is_empty()
+        {
+            groups.insert(group);
+        }
+    }
+    Ok(groups)
+}
+
+/// The snapshot records of data group `group` under `wal`, in its core
+/// journals' directories (`raft-log/core-*`). The meta journal's record is
+/// left out.
+fn data_snapshot_records(wal: &Path, group: u32) -> Vec<PathBuf> {
+    let name = format!("group-{group}.snapshot.json");
+    std::fs::read_dir(wal.join("raft-log"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir()
+                && path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("core-"))
+        })
+        .flat_map(|core| files_named(&core, &name))
+        .collect()
+}
+
+/// The bootstrapped cluster a meta read barrier confirmed on the first of
+/// `nodes` but `skip` that answers one.
+async fn try_confirmed_cluster(
+    client: &reqwest::Client,
+    nodes: &[MetaNode],
+    skip: &[u64],
+) -> Result<Cluster, String> {
+    let mut last = String::from("no node asked");
+    for node in nodes.iter().filter(|node| !skip.contains(&node.id)) {
+        match confirmed_placement_status(client, node).await {
+            Ok(status) => match bootstrapped(&status) {
+                Some(cluster) => return Ok(cluster.clone()),
+                None => last = format!("{status:?}"),
+            },
+            Err(err) => last = err,
+        }
+    }
+    Err(last)
+}
+
+/// [`try_confirmed_cluster`], until a node answers.
+async fn wait_confirmed_cluster(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    nodes: &[MetaNode],
+    skip: &[u64],
+) -> Cluster {
+    eventually(procs, "a node confirms a bootstrapped view", async || {
+        try_confirmed_cluster(client, nodes, skip).await
+    })
+    .await
+}
+
+fn lifecycle_of(cluster: &Cluster, node: u64) -> Option<ursula_proto::placement::NodeLifecycle> {
+    cluster
+        .node(NodeId::new(node))
+        .map(|record| record.lifecycle)
+}
+
+/// Appends `body` to the stream at `url`, again until an append answers
+/// `204`.
+async fn append_until_done(client: &reqwest::Client, procs: &mut Processes, url: &str, body: &str) {
+    let what = format!("{url} takes an append");
+    eventually(procs, &what, async || {
+        let response = client
+            .post(url)
+            .header("content-type", "text/plain")
+            .body(body.to_owned())
+            .send()
+            .await
+            .map_err(|err| format!("POST {url}: {err}"))?;
+        if response.status() == reqwest::StatusCode::NO_CONTENT {
+            Ok(())
+        } else {
+            Err(format!("POST {url}: {}", response.status()))
+        }
+    })
+    .await;
+}
+
+/// Waits until a read of `url` answers a body that holds `needle`.
+async fn wait_read_holds(client: &reqwest::Client, procs: &mut Processes, url: &str, needle: &str) {
+    let what = format!("{url} holds {needle:?}");
+    eventually(procs, &what, async || {
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| format!("GET {url}: {err}"))?;
+        if !response.status().is_success() {
+            return Err(format!("GET {url}: {}", response.status()));
+        }
+        let body = response
+            .bytes()
+            .await
+            .map_err(|err| format!("GET {url}: {err}"))?;
+        if body
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+        {
+            Ok(())
+        } else {
+            Err(format!("GET {url}: {}", String::from_utf8_lossy(&body)))
+        }
+    })
+    .await;
+}
+
+/// Whether removed node `node` runs no data replica, keeps none open as
+/// unplaced, reports `node_removed` while it answers ready, and sheds
+/// `placement-unavailable`. Its metrics listing a replica of a group of
+/// `never` fails the test.
+async fn removed_and_closed(
+    client: &reqwest::Client,
+    node: &MetaNode,
+    never: &BTreeSet<u32>,
+) -> Result<(), String> {
+    use ursula_proto::admin::RaftMaintenanceIssue;
+
+    let metrics = try_node_metrics(client, &node.url()).await?;
+    let running: BTreeSet<u64> = metrics
+        .groups
+        .iter()
+        .map(|group| group.raft_group_id)
+        .collect();
+    if let Some(group) = running
+        .iter()
+        .find(|group| never.iter().any(|swept| u64::from(*swept) == **group))
+    {
+        panic!(
+            "removed node {} runs a replica of group {group}, whose snapshot objects the sweep \
+             took: {:?}",
+            node.id, metrics.groups
+        );
+    }
+    if !running.is_empty() {
+        return Err(format!("runs replicas of {running:?}"));
+    }
+    let (status, ready) = readiness(client, node).await?;
+    let report = ready
+        .raft_maintenance
+        .as_ref()
+        .ok_or_else(|| "no maintenance report".to_owned())?;
+    if status != reqwest::StatusCode::OK
+        || !report
+            .node_issues
+            .contains(&RaftMaintenanceIssue::NodeRemoved)
+        || !report.unplaced.is_empty()
+    {
+        return Err(format!("{status} {ready:?}"));
+    }
+    let shed = leadership_shed(client, node).await;
+    if !sheds_placement_unavailable(&shed) {
+        return Err(format!("{shed:?}"));
+    }
+    Ok(())
+}
+
+/// Waits until [`removed_and_closed`] holds for node `node` on every poll
+/// for `hold`.
+async fn wait_removed_and_closed(
+    client: &reqwest::Client,
+    procs: &mut Processes,
+    node: &MetaNode,
+    never: &BTreeSet<u32>,
+    hold: Duration,
+) {
+    let what = format!("removed node {} closes every replica", node.id);
+    let mut since: Option<std::time::Instant> = None;
+    eventually_for(
+        procs,
+        &what,
+        LIFECYCLE_WAIT,
+        async || match removed_and_closed(client, node, never).await {
+            Ok(()) => {
+                let closed = since.get_or_insert_with(std::time::Instant::now).elapsed();
+                if closed >= hold {
+                    Ok(())
+                } else {
+                    Err(format!("closed for {closed:?} of {hold:?}"))
+                }
+            }
+            Err(err) => {
+                since = None;
+                Err(err)
+            }
+        },
+    )
+    .await;
+}
+
+/// Asserts that a move of the first group of `cluster` that puts node
+/// `removed` in place of the group's lowest voter is refused through `via`
+/// with `409 node_removed`, applying nothing.
+async fn assert_move_refused_as_removed(
+    via: &ursula_ctl::NodeInfo,
+    cluster: &Cluster,
+    removed: u64,
+) {
+    use ursula_control::ControlError;
+    use ursula_control::PlacementApiReason;
+    use ursula_ctl::placement::WriteAnswer;
+
+    let (group, placement) = cluster.groups().iter().next().expect("a group");
+    let voters = placement.current_voters();
+    let mut to = voters.to_set();
+    to.remove(&voters.min());
+    to.insert(NodeId::new(removed));
+    let request = ursula_control::MoveRequest {
+        expected: placement.since(),
+        to: ursula_proto::placement::VoterSet::new(to).expect("a voter set"),
+    };
+    let ctl = ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let path = format!("/__ursula/placement/groups/{}/move", group.0);
+    match ursula_ctl::placement::post_write::<_, ursula_control::MoveResponse>(
+        &ctl, via, &path, &request,
+    )
+    .await
+    {
+        WriteAnswer::Refused { status, refusal } => {
+            assert_eq!(status, reqwest::StatusCode::CONFLICT, "{refusal:?}");
+            assert!(
+                matches!(
+                    &refusal.reason,
+                    PlacementApiReason::Refused(ControlError::NodeRemoved { node })
+                        if *node == NodeId::new(removed)
+                ),
+                "{refusal:?}"
+            );
+            assert_eq!(
+                refusal.write_effect,
+                ursula_proto::placement::WriteEffect::NotApplied,
+                "{refusal:?}"
+            );
+        }
+        other => panic!("a move naming removed node {removed} answered {other:?}"),
+    }
+}
+
+/// S4(b) and S5 (#768), integration 1's teardown half and 5 (design 15.3),
+/// in phases on one cluster of five nodes at replication factor 3 with meta
+/// voters 1 to 3, on S3. Every move and lifecycle change goes through
+/// `ursula_ctl` library calls over the admin plane. Runs on real S3 in CI.
+///
+/// 1. Group 1, seeded on nodes 2 to 4, takes a write that node 4's journal
+///    holds, and node 4 snapshots it, which writes its snapshot record and
+///    its own object of the group. `move --replace 4=5` converges, and node
+///    4 tears its replica down: the retirement leaves the view and node 4
+///    runs no replica of the group. Then node 4 keeps no snapshot record and
+///    no object of the group, and once later writes to its other groups
+///    sealed the segments that held the write, no file of its WAL directory
+///    holds it, while the group still serves it. A teardown that keeps the
+///    record or the object, or a retirement that leaves the log's frames
+///    live, fails it.
+/// 2. `verify-removed` refuses node 4 while it is active. `node cordon` and
+///    `node uncordon` round-trip, and node 4 snapshots group 2. `node
+///    decommission --wait` ends with node 4 removed and without a role.
+///    Node 4 then runs no data replica, keeps none open, reports
+///    `node_removed` while it answers ready and sheds
+///    `placement-unavailable`. A move naming it answers `409 node_removed`
+///    and applies nothing, and `verify-removed` passes. A removed node that
+///    keeps a replica open fails it.
+/// 3. Node 5 snapshots group 1, so it records and owns an object of the
+///    group. It is killed, and the groups it holds a snapshot record and an
+///    object of are those the sweep takes. Node 5 is decommissioned: it is
+///    removed once its last group converged without it, and every group
+///    ends on nodes 1 to 3 and takes writes.
+/// 4. The meta leader hands the meta leadership alone to another meta
+///    voter, so data leaderships stay put, and the new leader's sweep runs
+///    at once (a pass runs when a leadership begins). A pass that leaves a
+///    group or confirms no view passes again only after the sweep
+///    interval, so while objects remain the test hands meta on again after
+///    a pass left a group, or after a minute. Both removed nodes' snapshot
+///    directories end empty and the leader reports no group left by its
+///    sweep. Node 5 is dead, so only the sweep deletes its object of group
+///    1, and a sweep that keeps it fails the test. Node 4's directory ends
+///    empty too, but node 4 was decommissioning, not removed, while its
+///    groups moved away, so its own teardowns may have deleted its objects
+///    before the sweep ran: node 4's half proves nothing of the sweep.
+/// 5. Node 5 restarts with its old disk. It ends running no data replica,
+///    keeping none open, reporting `node_removed`, ready, and shedding
+///    `placement-unavailable`, and stays so for longer than its asker's
+///    interval. Its metrics never list a replica of a group whose object
+///    the sweep took, group 1 among them, while the test polls them. It
+///    leads nothing, so no leadership it may have won stays with it. A move
+///    naming it answers `409 node_removed`, `verify-removed` passes for
+///    nodes 4 and 5, and `verify-not-removed` refuses node 5. Every group
+///    still serves. This holds whichever of its groups node 5 owns objects
+///    of, and on S3 it owns one of every group it holds: every replica
+///    snapshots a group it applied log of and holds no snapshot of, and an
+///    install stores the receiver's own copy. So the phase does not show
+///    that a removed node closes a group it opens from its log after one
+///    asker round. S5(d)'s DST covers that.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_a_torn_down_source_and_decommissioned_nodes_keep_nothing_of_their_groups() {
+    use ursula_ctl::placement::lifecycle::LifecycleEnd;
+    use ursula_ctl::placement::lifecycle::LifecycleOptions;
+    use ursula_ctl::placement::lifecycle::Removal;
+    use ursula_ctl::placement::lifecycle::RemovalRefusal;
+    use ursula_ctl::placement::moves::GroupEnd;
+    use ursula_ctl::placement::moves::Intent;
+    use ursula_ctl::placement::moves::MoveOptions;
+    use ursula_ctl::placement::moves::Replacement;
+    use ursula_proto::placement::NodeLifecycle;
+
+    let _guard = static_cluster_cli_test_guard().await;
+    if std::env::var("URSULA_COLD_S3_INTEGRATION").ok().as_deref() != Some("1") {
+        tracing::warn!(
+            "skipping the S3 teardown and decommission test; set URSULA_COLD_S3_INTEGRATION=1 and URSULA_COLD_S3_BUCKET"
+        );
+        return;
+    }
+    let Some(binary) = option_env!("CARGO_BIN_EXE_ursula") else {
+        tracing::warn!("CARGO_BIN_EXE_ursula is not set; skipping the teardown test");
+        return;
+    };
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time after unix epoch")
+        .as_nanos();
+    // CI scopes each job's credentials to URSULA_S3_PREFIX.
+    let cold_root = match std::env::var("URSULA_S3_PREFIX") {
+        Ok(prefix) => format!("{prefix}/ursula-cli-s3-lifecycle/{suffix}"),
+        Err(_) => format!("ursula-cli-s3-lifecycle/{suffix}"),
+    };
+    let root = tempfile::tempdir().expect("temp root");
+    let mut nodes = MetaNode::cluster(root.path(), 5);
+    for node in &mut nodes {
+        node.cold_root = Some(cold_root.clone());
+    }
+    let nodes = nodes;
+    let peers = peers_of(&nodes);
+    let meta = MetaToml {
+        meta_voters: Some(META_VOTERS),
+        replication_factor: Some(3),
+        ..MetaToml::default()
+    };
+    for node in &nodes {
+        node.write(&peers, meta);
+    }
+    bound_dead_journal_data(&nodes[3]);
+    let config = ursula_config::load_config(Some(&nodes[0].config), None, None)
+        .unwrap_or_else(|err| panic!("load config for the cold store: {err}"));
+    config
+        .validate()
+        .unwrap_or_else(|err| panic!("the node config is valid: {err}"));
+    let prefix = config.storage.snapshot.snapshot_prefix();
+    let cold_store = ColdStore::try_new(&config.storage.cold)
+        .unwrap_or_else(|err| panic!("{}", s3_failure("open the cold store", "", &err)));
+    // Every request ends within 10 s, so a request to a killed node fails
+    // instead of hanging.
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("HTTP client");
+    // A fresh client per command: each pins the process incarnation of the
+    // nodes it writes to, and node 5 restarts.
+    let ctl = || ursula_ctl::MetricsClient::new(Duration::from_secs(5)).expect("ctl client");
+    let manifest = |skip: &[u64]| -> Vec<ursula_ctl::NodeInfo> {
+        nodes
+            .iter()
+            .filter(|node| !skip.contains(&node.id))
+            .map(MetaNode::ctl)
+            .collect()
+    };
+    let lifecycle_options = |ids: &[u64], wait: bool| LifecycleOptions {
+        nodes: ids.iter().copied().map(NodeId::new).collect(),
+        wait,
+        timeout: LIFECYCLE_WAIT,
+        poll_interval: Duration::from_millis(500),
+    };
+    let mut procs = Processes::default();
+    for node in &nodes {
+        procs.start(binary, node);
+    }
+    wait_settled(&client, &mut procs, &nodes).await;
+    let groups = u32::try_from(META_TEST_GROUPS).unwrap();
+    let streams = stream_per_group("lifecycle");
+    let url = |node: &MetaNode, group: u32| {
+        format!(
+            "{}/lifecycle/{}",
+            node.url(),
+            streams[usize::try_from(group).unwrap()]
+        )
+    };
+    let read =
+        |node: &MetaNode, group: u32| format!("{}?offset=0&max_bytes=1048576", url(node, group));
+    for group in 0..groups {
+        put_until_created(&client, &url(&nodes[0], group)).await;
+    }
+
+    // 1. Group 1 moves off node 4, which tears its replica down.
+    let moved = RaftGroupId(1);
+    let source = &nodes[3];
+    let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    assert_eq!(
+        current_voters(&cluster).get(&moved),
+        Some(&BTreeSet::from([2, 3, 4])),
+        "{cluster:?}"
+    );
+    post_until_no_content(&client, &url(&nodes[0], 1), DELETED_MARKER).await;
+    eventually(
+        &mut procs,
+        "node 4's journal holds group 1's write",
+        async || {
+            if wal_files_with_marker(&source.wal).is_empty() {
+                Err("no file holds it".to_owned())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    snapshot_group(&client, &source.admin(), 1).await;
+    eventually(
+        &mut procs,
+        "node 4 records and stores its snapshot of group 1",
+        async || {
+            let objects = owned_objects(&cold_store, &prefix, 4, 1).await?;
+            let records = data_snapshot_records(&source.wal, 1);
+            if objects.is_empty() || records.is_empty() {
+                Err(format!("objects {objects:?}, records {records:?}"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    let mut out = Vec::new();
+    let ends = ursula_ctl::placement::moves::run_moves(
+        &ctl(),
+        &manifest(&[]),
+        &MoveOptions {
+            groups: vec![moved],
+            intent: Intent::Replace(Replacement {
+                old: NodeId::new(4),
+                new: NodeId::new(5),
+            }),
+            expect: None,
+            retarget: false,
+            allow_not_live: false,
+            wait: true,
+            timeout: LIFECYCLE_WAIT,
+            poll_interval: Duration::from_millis(500),
+        },
+        &mut out,
+    )
+    .await
+    .expect("move group 1 off node 4");
+    let out = String::from_utf8_lossy(&out);
+    assert!(
+        matches!(ends.get(&moved), Some(GroupEnd::Converged { .. })),
+        "{ends:?}\n{out}"
+    );
+    let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    assert_eq!(
+        current_voters(&cluster).get(&moved),
+        Some(&BTreeSet::from([2, 3, 5])),
+        "{cluster:?}"
+    );
+    eventually_for(
+        &mut procs,
+        "node 4 tears down its replica of group 1",
+        LIFECYCLE_WAIT,
+        async || {
+            let cluster = try_confirmed_cluster(&client, &nodes, &[]).await?;
+            if cluster.retirement(moved, NodeId::new(4)).is_some() {
+                return Err(format!("retirements {:?}", cluster.retirements()));
+            }
+            let metrics = try_node_metrics(&client, &source.url()).await?;
+            if metrics.groups.iter().any(|group| group.raft_group_id == 1) {
+                return Err(format!("{:?}", metrics.groups));
+            }
+            Ok(())
+        },
+    )
+    .await;
+    eventually_for(
+        &mut procs,
+        "node 4 keeps no snapshot record or object of group 1",
+        LIFECYCLE_WAIT,
+        async || {
+            let objects = owned_objects(&cold_store, &prefix, 4, 1).await?;
+            let records = data_snapshot_records(&source.wal, 1);
+            if objects.is_empty() && records.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("objects {objects:?}, records {records:?}"))
+            }
+        },
+    )
+    .await;
+    // Writes to node 4's other groups, 2 and 3, seal the segments that hold
+    // group 1's frames.
+    let filler = "f".repeat(8192);
+    for group in [2, 3] {
+        for _ in 0..16 {
+            append_until_done(&client, &mut procs, &url(&nodes[0], group), &filler).await;
+        }
+    }
+    eventually_for(
+        &mut procs,
+        "no file of node 4's WAL directory holds group 1's write",
+        JOURNAL_RECLAIM_WAIT,
+        async || {
+            let found = wal_files_with_marker(&source.wal);
+            if found.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{found:?}"))
+            }
+        },
+    )
+    .await;
+    wait_read_holds(&client, &mut procs, &read(&nodes[4], 1), DELETED_MARKER).await;
+
+    // 2. Node 4, live, is decommissioned and closes every replica.
+    let refusal = ursula_ctl::placement::lifecycle::verify_removal(
+        &ctl(),
+        &manifest(&[]),
+        &BTreeSet::from([NodeId::new(4)]),
+        Removal::Removed,
+        META_WAIT,
+        Duration::from_millis(500),
+    )
+    .await
+    .expect_err("verify-removed refuses an active node");
+    assert!(
+        matches!(
+            refusal.downcast_ref::<RemovalRefusal>(),
+            Some(RemovalRefusal::NotRemoved {
+                node,
+                lifecycle: NodeLifecycle::Active,
+            }) if *node == NodeId::new(4)
+        ),
+        "{refusal:?}"
+    );
+    for (change, lifecycle) in [
+        (
+            ursula_control::LifecycleChange::Cordon,
+            NodeLifecycle::Cordoned,
+        ),
+        (
+            ursula_control::LifecycleChange::Uncordon,
+            NodeLifecycle::Active,
+        ),
+    ] {
+        let mut out = Vec::new();
+        let end = ursula_ctl::placement::lifecycle::set_lifecycles(
+            &ctl(),
+            &manifest(&[]),
+            change,
+            &lifecycle_options(&[4], false),
+            &mut out,
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{change:?} node 4: {err:?}"));
+        assert_eq!(end, LifecycleEnd::Done, "{}", String::from_utf8_lossy(&out));
+        let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+        assert_eq!(lifecycle_of(&cluster, 4), Some(lifecycle), "{cluster:?}");
+    }
+    snapshot_group(&client, &source.admin(), 2).await;
+    eventually(
+        &mut procs,
+        "node 4 stores its snapshot of group 2",
+        async || {
+            if owned_objects(&cold_store, &prefix, 4, 2).await?.is_empty() {
+                Err("no object".to_owned())
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    let mut out = Vec::new();
+    let end = ursula_ctl::placement::lifecycle::decommission(
+        &ctl(),
+        &manifest(&[]),
+        &lifecycle_options(&[4], true),
+        &mut out,
+    )
+    .await
+    .expect("decommission node 4");
+    let out = String::from_utf8_lossy(&out);
+    assert_eq!(end, LifecycleEnd::Done, "{out}");
+    assert!(
+        out.contains(ursula_ctl::placement::lifecycle::IRREVERSIBLE),
+        "{out}"
+    );
+    let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    assert_eq!(
+        lifecycle_of(&cluster, 4),
+        Some(NodeLifecycle::Removed),
+        "{cluster:?}"
+    );
+    assert!(!cluster.has_any_role(NodeId::new(4)), "{cluster:?}");
+    wait_removed_and_closed(
+        &client,
+        &mut procs,
+        source,
+        &BTreeSet::new(),
+        Duration::ZERO,
+    )
+    .await;
+    assert_move_refused_as_removed(&nodes[0].ctl(), &cluster, 4).await;
+    ursula_ctl::placement::lifecycle::verify_removal(
+        &ctl(),
+        &manifest(&[]),
+        &BTreeSet::from([NodeId::new(4)]),
+        Removal::Removed,
+        META_WAIT,
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("verify-removed passes for node 4");
+
+    // 3. Node 5 records and owns a snapshot of group 1, is killed and is
+    // decommissioned.
+    let dead = &nodes[4];
+    let held = placed_on(&cluster, 5);
+    assert!(held.contains(&1), "{cluster:?}");
+    snapshot_group(&client, &dead.admin(), 1).await;
+    eventually(
+        &mut procs,
+        "node 5 records and stores its snapshot of group 1",
+        async || {
+            let objects = owned_objects(&cold_store, &prefix, 5, 1).await?;
+            let records = data_snapshot_records(&dead.wal, 1);
+            if objects.is_empty() || records.is_empty() {
+                Err(format!("objects {objects:?}, records {records:?}"))
+            } else {
+                Ok(())
+            }
+        },
+    )
+    .await;
+    procs.kill(5);
+    // The groups whose snapshot record on node 5's disk names an object the
+    // sweep takes. An object without a record (a build cut short by the
+    // kill) is left out: its group opens from the log.
+    let objects = eventually(&mut procs, "list node 5's snapshot objects", async || {
+        groups_with_objects(&cold_store, &prefix, 5).await
+    })
+    .await;
+    let swept: BTreeSet<u32> = objects
+        .into_iter()
+        .filter(|group| !data_snapshot_records(&dead.wal, *group).is_empty())
+        .collect();
+    assert!(swept.contains(&1), "{swept:?}");
+    let mut out = Vec::new();
+    let end = ursula_ctl::placement::lifecycle::decommission(
+        &ctl(),
+        &manifest(&[5]),
+        &lifecycle_options(&[5], true),
+        &mut out,
+    )
+    .await
+    .expect("decommission node 5");
+    assert_eq!(end, LifecycleEnd::Done, "{}", String::from_utf8_lossy(&out));
+    let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[5]).await;
+    assert_eq!(
+        lifecycle_of(&cluster, 5),
+        Some(NodeLifecycle::Removed),
+        "{cluster:?}"
+    );
+    for (group, voters) in current_voters(&cluster) {
+        assert_eq!(
+            voters,
+            BTreeSet::from([1, 2, 3]),
+            "group {}: {cluster:?}",
+            group.0
+        );
+    }
+    for group in 0..groups {
+        append_until_done(&client, &mut procs, &url(&nodes[0], group), "after-node-5;").await;
+        wait_read_holds(
+            &client,
+            &mut procs,
+            &read(&nodes[1], group),
+            "after-node-5;",
+        )
+        .await;
+    }
+
+    // 4. Another meta voter leads meta, and its sweep takes both removed
+    // nodes' objects.
+    let members = manifest(&[4, 5]);
+    // The leader the test last handed meta away from, and when.
+    let mut handed: Option<(NodeId, std::time::Instant)> = None;
+    eventually_for(
+        &mut procs,
+        "the sweep takes the removed nodes' snapshot objects",
+        LIFECYCLE_WAIT,
+        async || {
+            let status = ursula_ctl::view::leader_status(&ctl(), &members)
+                .await
+                .map_err(|err| format!("{err:?}"))?
+                .map_err(|refusal| format!("{refusal:?}"))?;
+            let report = status
+                .leader_report
+                .ok_or_else(|| "no leader report".to_owned())?;
+            let mut left = BTreeMap::new();
+            for node in [4, 5] {
+                let groups = groups_with_objects(&cold_store, &prefix, node).await?;
+                if !groups.is_empty() {
+                    left.insert(node, groups);
+                }
+            }
+            if left.is_empty() && report.sweep_pending.is_empty() {
+                return Ok(());
+            }
+            // A new leadership passes at once. Its pass left a group, or
+            // it has had a minute, so the next pass would wait out the
+            // sweep interval: start another leadership.
+            let pass_again = handed.is_none_or(|(from, at)| {
+                at.elapsed() >= SWEEP_PASS_WAIT
+                    || (report.leader != from && !report.sweep_pending.is_empty())
+            });
+            if pass_again {
+                try_hand_meta_on(&client, &nodes, report.leader.get()).await?;
+                handed = Some((report.leader, std::time::Instant::now()));
+            }
+            Err(format!(
+                "objects of groups {left:?}, sweep pending {:?} on meta leader {}",
+                report.sweep_pending,
+                report.leader.get()
+            ))
+        },
+    )
+    .await;
+
+    // 5. Node 5 restarts with its old disk and closes everything it holds.
+    procs.start(binary, dead);
+    wait_removed_and_closed(
+        &client,
+        &mut procs,
+        dead,
+        &swept,
+        ursula_raft::hosting::ASK_INTERVAL
+            .checked_add(Duration::from_secs(5))
+            .unwrap(),
+    )
+    .await;
+    let cluster = wait_confirmed_cluster(&client, &mut procs, &nodes, &[]).await;
+    assert_move_refused_as_removed(&nodes[0].ctl(), &cluster, 5).await;
+    ursula_ctl::placement::lifecycle::verify_removal(
+        &ctl(),
+        &manifest(&[]),
+        &BTreeSet::from([NodeId::new(4), NodeId::new(5)]),
+        Removal::Removed,
+        META_WAIT,
+        Duration::from_millis(500),
+    )
+    .await
+    .expect("verify-removed passes for nodes 4 and 5");
+    let refusal = ursula_ctl::placement::lifecycle::verify_removal(
+        &ctl(),
+        &manifest(&[]),
+        &BTreeSet::from([NodeId::new(5)]),
+        Removal::NotRemoved,
+        META_WAIT,
+        Duration::from_millis(500),
+    )
+    .await
+    .expect_err("verify-not-removed refuses a removed node");
+    assert!(
+        matches!(
+            refusal.downcast_ref::<RemovalRefusal>(),
+            Some(RemovalRefusal::Removed { node }) if *node == NodeId::new(5)
+        ),
+        "{refusal:?}"
+    );
+    for group in 0..groups {
+        append_until_done(
+            &client,
+            &mut procs,
+            &url(&nodes[0], group),
+            "after-restart;",
+        )
+        .await;
+        wait_read_holds(
+            &client,
+            &mut procs,
+            &read(&nodes[2], group),
+            "after-restart;",
+        )
+        .await;
+    }
+
+    drop(procs);
+    cold_store
+        .remove_all("")
+        .await
+        .unwrap_or_else(|err| panic!("{}", s3_failure("clear the test root", "", &err)));
+}
+
 /// Node `node`'s readiness from its client listener: the status and the
 /// report.
 async fn readiness(
@@ -7544,21 +8481,36 @@ async fn flush_stream_until_cold_hot_bytes_zero(
 }
 
 async fn admin_test_post(client: &reqwest::Client, url: String) -> reqwest::RequestBuilder {
-    let mut metrics_url = reqwest::Url::parse(&url).expect("admin URL");
+    try_admin_test_post(client, url)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+/// [`admin_test_post`], with a node that does not answer its metrics as an
+/// `Err`, for a polled probe.
+async fn try_admin_test_post(
+    client: &reqwest::Client,
+    url: String,
+) -> Result<reqwest::RequestBuilder, String> {
+    let mut metrics_url =
+        reqwest::Url::parse(&url).map_err(|err| format!("admin URL {url}: {err}"))?;
     metrics_url.set_path("/__ursula/metrics");
     metrics_url.set_query(None);
     let metrics: serde_json::Value = client
-        .get(metrics_url)
+        .get(metrics_url.clone())
         .send()
         .await
-        .expect("metrics")
+        .map_err(|err| format!("GET {metrics_url}: {err}"))?
         .json()
         .await
-        .expect("JSON");
-    client.post(url).header(
-        ursula_proto::admin::PROCESS_INCARNATION_HEADER,
-        metrics["process_incarnation"].as_str().expect("identity"),
-    )
+        .map_err(|err| format!("GET {metrics_url}: {err}"))?;
+    let incarnation = metrics["process_incarnation"]
+        .as_str()
+        .ok_or_else(|| format!("GET {metrics_url}: no process incarnation"))?
+        .to_owned();
+    Ok(client
+        .post(url)
+        .header(ursula_proto::admin::PROCESS_INCARNATION_HEADER, incarnation))
 }
 
 /// Asks for an admin purge, again while the group's snapshot work is not
