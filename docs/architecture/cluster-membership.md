@@ -30,7 +30,10 @@ cores its journals hold, in parallel. The driver's first plan then reopens
 every group a journal holds, unconfirmed and without a meta leader. It
 creates a group only from a view a meta read barrier confirmed, on a node
 that view places in the group. No open failure stops the start: such a group
-stays closed under its open back-off, and the driver opens it again. A node
+stays closed under its open back-off, and the driver opens it again. The
+back-off holds back only the group's opens and closes, not the membership
+asker, so a replica whose open keeps failing still asks and learns that it
+left its group. A node
 that `raft.peers` gained after genesis is in no group's seeds, so it hosts
 nothing.
 
@@ -161,8 +164,9 @@ it hears no more meta entries, and that view still places it. So the voter
 predicate, the membership asker and the readiness inventory read no role
 for it, the asker asks about every replica it does not lead, and a group's
 `not_member` answer stops the replica counting, which closes it. A replica
-whose group's leader still lists the node stays open until a move takes it
-off.
+whose objects the sweep took fails every open, asks in the open's back-off,
+and its `not_member` answer keeps it closed. A replica whose group's leader
+still lists the node stays open until a move takes it off.
 
 A node deletes only its own snapshot objects, with one exception: the
 removed-node sweep (`crates/ursula-raft/src/meta/sweep.rs`). While the meta

@@ -27,7 +27,10 @@
 //!   alike, with at most [`ACTIONS_PER_CORE`] opens and closes running per
 //!   core. No failed open stops anything: the group stays closed under its
 //!   open back-off and a pass one [`PLAN_INTERVAL`] later opens it again.
-//!   A failed close is retried likewise.
+//!   A failed close is retried likewise. The back-off holds back the
+//!   group's opens, closes, teardown steps, reports and object passes, not
+//!   its asks, so a replica whose open keeps failing still learns that it
+//!   left its group.
 //! - closes every running replica the plan does not admit and no teardown
 //!   holds (7.3's steps 1 to 3), then forgets its gauges and its open
 //!   back-off.
@@ -37,7 +40,8 @@
 //! - asks, for each held replica that may have left its group, the
 //!   group's leader whether the node is still a member (`hosting::asker`),
 //!   with the room the opens, closes and teardowns leave in each core's
-//!   budget.
+//!   budget. A closed replica whose open failed asks in its open's back-off,
+//!   the window in which no open of the group runs.
 //! - publishes a [`HostingStatus`] for readiness, with the latest answer
 //!   and the teardown stage of each group.
 //! - refreshes the elections of every running replica whose placed voters
@@ -54,7 +58,10 @@
 //! once it stops counting (design 8.1). No group places it any more
 //! ([`ursula_control::Standing::placed_role`]), whatever a view from before
 //! the removal shows, so the asker asks about every replica it holds and a
-//! group's `NotMember` answer stops it counting.
+//! group's `NotMember` answer stops it counting. That keeps closed a replica
+//! whose open fails because the removed-node sweep took its objects: it asks
+//! in the open's back-off, and once it no longer counts the plan stops
+//! admitting it.
 //!
 //! While the node fence refuses, the driver creates, closes, tears down,
 //! reports and deletes nothing: every admission it publishes is `Open`, and
@@ -599,7 +606,11 @@ impl<H: GroupHost> HostingDriver<H> {
                 *group,
                 candidates,
             );
-            if self.begin(
+            // A question, not a retry: the failed back-off does not hold
+            // it. Otherwise a replica whose open keeps failing would never
+            // ask, since every pass after the back-off begins the open
+            // again before it asks.
+            if self.begin_ask(
                 actions,
                 *group,
                 async move { ActionEnd::Asked(asked.await) },
@@ -618,6 +629,20 @@ impl<H: GroupHost> HostingDriver<H> {
         group: RaftGroupId,
         work: impl Future<Output = ActionEnd> + Send + 'static,
     ) -> bool {
+        !actions.failed.contains_key(&group) && self.begin_ask(actions, group, work)
+    }
+
+    /// Starts `work`, a question about `group`, unless an action of the
+    /// group runs or its core runs [`ACTIONS_PER_CORE`] already. Unlike
+    /// [`Self::begin`] it starts while the group's last action failed less
+    /// than [`PLAN_INTERVAL`] ago: the back-off gates retrying an open, a
+    /// close or a step, not asking. Whether it started.
+    fn begin_ask(
+        &self,
+        actions: &mut Actions,
+        group: RaftGroupId,
+        work: impl Future<Output = ActionEnd> + Send + 'static,
+    ) -> bool {
         let Some(core) = self.wal.placement(group).map(|placement| placement.core_id) else {
             tracing::debug!(
                 group = group.0,
@@ -625,10 +650,7 @@ impl<H: GroupHost> HostingDriver<H> {
             );
             return false;
         };
-        if actions.running.contains_key(&group)
-            || actions.failed.contains_key(&group)
-            || !actions.room(core)
-        {
+        if actions.running.contains_key(&group) || !actions.room(core) {
             return false;
         }
         let done = actions.done_tx.clone();
@@ -678,7 +700,8 @@ impl Confirms {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActionEnd {
     Done,
-    /// The group is not acted on again for one [`PLAN_INTERVAL`].
+    /// The group is not acted on again for one [`PLAN_INTERVAL`], except
+    /// by an ask ([`HostingDriver::begin_ask`]).
     Failed,
     /// An ask ended, with a live leader's answer or none.
     Asked(Option<GroupAnswer>),
@@ -711,7 +734,8 @@ struct Action {
 struct Actions {
     running: BTreeMap<RaftGroupId, Action>,
     /// The groups whose last action failed less than [`PLAN_INTERVAL`]
-    /// ago, each with when the driver learned it failed.
+    /// ago, each with when the driver learned it failed. Only an ask may
+    /// start on such a group.
     failed: BTreeMap<RaftGroupId, Instant>,
     done_tx: mpsc::UnboundedSender<(RaftGroupId, ActionEnd)>,
     done: mpsc::UnboundedReceiver<(RaftGroupId, ActionEnd)>,

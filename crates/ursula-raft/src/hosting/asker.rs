@@ -16,7 +16,9 @@
 //! asks again within one interval: a voter dropped after a `Voter` answer,
 //! whose vote no membership change moves, learns it too. Each ask is one
 //! driver action under the per-core budget, begun after the pass's opens
-//! and closes.
+//! and closes. The back-off after a failed open does not hold an ask back,
+//! since the pass after it begins the open again before it asks: a closed
+//! replica whose open keeps failing asks in that back-off.
 //!
 //! Only a leader that just proved its quorum answers, so a group without
 //! one answers nothing and its replicas keep counting. Every answer is
