@@ -2253,7 +2253,13 @@ async fn a_write_handed_to_openraft_is_not_refused_before_proposal_after_a_step_
         }
         // The deposed node now follows, so its own check refuses before
         // proposal. Running it after the hand-off would misclassify the
-        // write.
+        // write. A write its lapse answered can end before the node hears
+        // of the new leader.
+        rafts[index(leader_id)]
+            .wait(Some(Duration::from_secs(10)))
+            .current_leader(new_leader, "the deposed node follows the new leader")
+            .await
+            .expect("the deposed node follows the new leader");
         let checked = engines[index(leader_id)]
             .forward_write_to_leader_if_follower(append_stream_command(stream_id.clone(), b"abc"))
             .await

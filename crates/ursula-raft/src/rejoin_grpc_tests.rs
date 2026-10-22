@@ -1581,9 +1581,12 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
     for service in [&cluster.services[0], &cluster.services[2]] {
         service.pause_replication.store(false, Ordering::SeqCst);
     }
-    // With a quorum again, the same reads answer.
+    // With a quorum again, the same reads answer. The followers may have
+    // elected a leader of their own meanwhile, which takes an election to
+    // settle once the leader's heartbeats reach them again.
     let mut gone = None;
-    for _ in 0..50 {
+    let mut last = None;
+    for _ in 0..500 {
         match cluster.engines[1]
             .read_stream(read_req(stream_id.clone(), 4), placement())
             .await
@@ -1592,11 +1595,17 @@ async fn a_leader_linearizes_what_may_hold_only_for_a_lagging_state() {
                 gone = Some(error);
                 break;
             }
-            Err(_transient) => tokio::time::sleep(Duration::from_millis(20)).await,
+            Err(transient) => {
+                last = Some(transient);
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
             Ok(read) => panic!("a read below the retained offset answered {read:?}"),
         }
     }
-    assert!(gone.is_some(), "the leader's 410 once it reaches a quorum");
+    assert!(
+        gone.is_some(),
+        "the leader's 410 once it reaches a quorum, last {last:?}"
+    );
     cluster.shutdown().await;
 }
 
