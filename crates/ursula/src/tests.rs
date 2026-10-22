@@ -488,31 +488,22 @@ fn query_parser_decodes_membership_and_learner_values() {
     assert_eq!(query.get("blocking").map(String::as_str), Some("false"));
 }
 
-/// Single-node groups on a fresh WAL under `wal_root`, registered in
-/// `registry`, and that WAL. Shut it down with [`shutdown_test_wal`] before
-/// `wal_root` goes.
+/// A single node's groups on a fresh WAL under `wal_root`, registered in
+/// `registry`, and that WAL. The factory binds the registry's node first,
+/// as the server binds its node before the runtime starts. Shut the WAL
+/// down with [`shutdown_test_wal`] before `wal_root` goes.
 fn registered_durable_factory(
     wal_root: &TestWalRoot,
     registry: &RaftGroupHandleRegistry,
-) -> (
-    ursula_raft::DurableRaftGroupEngineFactory,
-    ursula_raft::RaftWal,
-) {
+) -> (PlacedRaftGroupEngineFactory, ursula_raft::RaftWal) {
     let raft_wal = ursula_raft::RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
     .expect("start the Raft WAL");
-    // As the server binds its node before the runtime starts: node 1, the
-    // id of every single-node group, of the WAL's cluster.
-    registry.peer_cluster().bind(
-        ursula_raft::PeerIdentity::new(1, raft_wal.cluster_id().clone()),
-        ursula_raft::PeerDirectory::default(),
-    );
     (
-        ursula_raft::DurableRaftGroupEngineFactory::new(raft_wal.clone())
-            .with_registry(registry.clone()),
+        PlacedRaftGroupEngineFactory::single_node(raft_wal.clone(), registry.clone(), 1),
         raft_wal,
     )
 }
@@ -1829,6 +1820,8 @@ async fn raft_runtime_serves_http_subset_and_writes_core_journal() {
         },
     )
     .expect("runtime");
+    // No meta runs here, so the test settles the fresh root's binding.
+    spawned.bind_without_meta();
     let raft_wal = spawned.raft_wal.expect("a durable runtime starts its WAL");
     let app = router(spawned.runtime.clone());
     let response = http_put(
@@ -8341,6 +8334,8 @@ mod snapshot_driver {
             },
         )
         .expect("spawn a single node");
+        // No meta runs here, so the test settles the fresh root's binding.
+        spawned.bind_without_meta();
         (spawned, root, config.raft.effective_deleted_data_max_age())
     }
 
@@ -8554,6 +8549,8 @@ mod snapshot_driver {
             },
         )
         .expect("spawn a single node");
+        // No meta runs here, so the test settles the fresh root's binding.
+        spawned.bind_without_meta();
         let runtime = spawned.runtime.clone();
         let registry = spawned.raft_registry.clone().expect("a Raft registry");
         tokio::time::timeout(Duration::from_secs(30), runtime.warm_all_groups())

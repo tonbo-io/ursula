@@ -30,12 +30,20 @@ pointer and a host restart the old one. Recovery accepts either.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `raft.wal.path` | none | WAL directory. Journals live in its `raft-log` subdirectory. Required when `raft.peers` is set. |
-| `raft.wal.fsync` | `never` | When appends reach stable storage: `always` or `never`. |
+| `raft.wal.fsync` | see below | When appends reach stable storage: `always` or `never`. |
 | `raft.wal.segment_size` | 64 MiB | Size at which a core journal starts a new segment, at least 4 KiB. |
 | `raft.wal.cache_size` | 256 MiB | Recent entries kept in memory per node, split evenly between its groups. |
 | `raft.wal.min_available_size` | 512 MiB | Free space below which the node refuses writes. Zero disables the guard. |
 | `raft.wal.resume_available_size` | 1 GiB | Free space at which the guard clears. Must exceed the minimum. |
 | `raft.wal.lease` | 5 s | The disk lease: with no synced probe of the root for this long, the node stops all Raft traffic. From 2 s to 10 s. |
+
+Unset, `raft.wal.fsync` resolves from the voters each group has, the
+configured replication factor at most the node count of the address book
+(`raft.peers`, or the node alone when it is empty): `always` for one or two
+voters and `never` for more (`RaftConfig::wal_fsync`). A group of one or two
+voters has no quorum without a replica that a host crash under `never` sends
+through the recovery gate, so only `always` lets it restart unattended. The run
+state records the resolved policy.
 
 There is no interval `fsync` mode: after a host crash under `never` a replica
 keeps only its verified prefix and rejoins through the recovery gate, so a
@@ -43,7 +51,9 @@ periodic `fsync` would not change recovery.
 
 The zero-config development mode (the `default` preset on one node) runs
 without Raft. Any other single node without `raft.wal.path` uses a temporary
-directory, removed only after a clean WAL shutdown. The Helm chart sets the
+directory, removed only after a clean WAL shutdown. A single node's groups run
+as a cluster node's do, each behind its recovery gate under `raft.node_id`,
+with the node as their only voter. The Helm chart sets the
 path to `raft.logDir` on each voter's `raft-data` PVC and exposes the other keys
 as `raft.walFsync`, `raft.walSegmentBytes`, `raft.walCacheBytes`,
 `raft.minAvailableBytes` and `raft.resumeAvailableBytes`.
@@ -349,8 +359,7 @@ While the lease does not hold, the node fence refuses:
   trailers) and in the in-process transport. A sender reads either as an
   unreachable peer, never as a misdelivery or another format epoch.
 - leadership: the one leader predicate (`GroupLeadership::of`), which every
-  group's engine, a single node's included, and the meta replica read with the
-  WAL's fence, answers no leader, so cold flush, compaction, GC, the index
+  group's engine and the meta replica read with the WAL's fence, answers no leader, so cold flush, compaction, GC, the index
   repair, the orphan sweep and every other leader-gated job skip. After the lease holds again, a replica
   leads only once a quorum acknowledged an RPC it sent after the lift, or at
   once as its own quorum.

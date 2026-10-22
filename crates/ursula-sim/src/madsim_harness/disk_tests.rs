@@ -15,6 +15,7 @@ use openraft::storage::RaftLogStorageExt;
 use ursula_config::WalFsync;
 use ursula_raft::GroupRejoin;
 use ursula_raft::JournalTuning;
+use ursula_raft::RaftEngineConfig;
 use ursula_raft::RaftGroupEngine;
 use ursula_raft::RaftGroupFileLogStore;
 use ursula_raft::RaftWal;
@@ -497,6 +498,8 @@ fn journal_fsync_error_poisons_the_node_until_restart() {
 
 /// A single-node group with enough history to span several journal
 /// segments (the simulator rotates every 4 KiB), so a purge deletes some.
+/// Its Raft keeps every entry a snapshot covers, so only the purges a test
+/// asks for free segments.
 struct ReclaimGroup {
     wal: SimNodeWal,
     metrics: RuntimeMetrics,
@@ -508,13 +511,17 @@ impl ReclaimGroup {
         let wal = SimNodeWal::provision(name);
         let placement = group_placement(0);
         let metrics = RuntimeMetrics::new(1, 1);
-        let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-            placement,
-            wal.open(placement, metrics.group_engine_metrics()).await,
-            None,
-        )
-        .await
-        .expect("start a single-node group");
+        let mut engine = wal
+            .single_voter_with(
+                placement,
+                metrics.group_engine_metrics(),
+                RaftEngineConfig {
+                    max_in_snapshot_log_to_keep: u64::MAX,
+                    ..RaftEngineConfig::default()
+                },
+            )
+            .await
+            .expect("start a single-node group");
         engine
             .create_stream(
                 CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
@@ -547,16 +554,29 @@ impl ReclaimGroup {
 
     /// Snapshots the group and purges all but its last few entries.
     async fn purge(&self) {
+        let snapshot = self.snapshot().await;
+        self.purge_covered(snapshot).await;
+    }
+
+    /// Builds the group's snapshot and returns the index it covers. Once
+    /// it returns, the snapshot is the group's current one and its record
+    /// is published in the core's journal directory.
+    async fn snapshot(&self) -> u64 {
         let raft = self.engine.raft_handle();
         raft.trigger().snapshot().await.expect("trigger a snapshot");
-        let snapshot = raft
-            .wait(Some(Duration::from_secs(5)))
+        raft.wait(Some(Duration::from_secs(5)))
             .metrics(|metrics| metrics.snapshot.is_some(), "snapshot built")
             .await
             .expect("wait for the snapshot")
             .snapshot
-            .expect("snapshot log id");
-        let purge_upto = snapshot.index.saturating_sub(8);
+            .expect("snapshot log id")
+            .index
+    }
+
+    /// Purges all but the last few entries of the snapshot up to `snapshot`.
+    async fn purge_covered(&self, snapshot: u64) {
+        let raft = self.engine.raft_handle();
+        let purge_upto = snapshot.saturating_sub(8);
         raft.trigger()
             .purge_log(purge_upto)
             .await
@@ -676,6 +696,11 @@ fn a_segment_that_cannot_be_removed_keeps_the_journal_and_the_group_running() {
 /// rotation created one, poisons the writer: a later segment's durability
 /// relies on that directory. The purge was durable and stays acknowledged,
 /// and a power loss then recovers every retained entry.
+///
+/// The group's snapshot record lives in the same directory and is
+/// published behind its own directory `fsync`, whose failure fails the
+/// snapshot build. So the fault is armed once the snapshot is current, and
+/// the purge's reclaim is the first to sync the directory after it.
 #[test]
 fn a_journal_directory_fsync_failure_poisons_the_writer() {
     let _guard = sim_test_guard();
@@ -683,8 +708,9 @@ fn a_journal_directory_fsync_failure_poisons_the_writer() {
         run_with_madsim(seed, async move {
             let group = ReclaimGroup::start("unpublished-reclaim").await;
             let core_dir = group.wal.root().join("core-0");
+            let snapshot = group.snapshot().await;
             SimDisk::inject_fault(&core_dir, SimDiskFault::Sync).expect("fail the directory fsync");
-            group.purge().await;
+            group.purge_covered(snapshot).await;
             assert!(
                 group.metrics.snapshot().wal_reclaim_failures >= 1,
                 "seed {seed}: the rewrite failed"
@@ -748,13 +774,10 @@ async fn reopen_after_a_reordered_unsynced_tail(
     });
     let placement = group_placement(0);
     let metrics = standalone_wal_metrics(placement);
-    let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-        placement,
-        wal.open(placement, metrics.clone()).await,
-        None,
-    )
-    .await
-    .expect("start a single-node group");
+    let mut engine = wal
+        .single_voter(placement, metrics.clone())
+        .await
+        .expect("start a single-node group");
     engine
         .create_stream(
             CreateStreamRequest::new(group_stream(0), "application/octet-stream"),
@@ -1271,13 +1294,10 @@ fn votes_survive_power_loss_under_never_and_the_metadata_is_old_or_new() {
             let wal = SimNodeWal::provision_with_fsync("never-votes", WalFsync::Never);
             let placement = group_placement(0);
             let metrics = standalone_wal_metrics(placement);
-            let mut engine = RaftGroupEngine::new_single_node_on_log_store(
-                placement,
-                wal.open(placement, metrics.clone()).await,
-                None,
-            )
-            .await
-            .expect("start a single-node group");
+            let mut engine = wal
+                .single_voter(placement, metrics.clone())
+                .await
+                .expect("start a single-node group");
             engine
                 .create_stream(
                     CreateStreamRequest::new(group_stream(0), "application/octet-stream"),

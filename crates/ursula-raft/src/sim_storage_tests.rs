@@ -69,15 +69,23 @@ fn simulated_journal_passes_openraft_storage_conformance() {
 fn simulated_append_batch_reserves_hot_capacity_across_unapplied_entries() {
     super::check_madsim_determinism(11, madsim::Config::default(), || async {
         crate::sim_runtime::MadsimOpenRaftRuntime::scope(11, async {
-            let mut engine = crate::RaftGroupEngine::new_single_node(
-                placement(),
+            // A single node's group, its only voter, once it leads.
+            let factory = crate::PlacedRaftGroupEngineFactory::single_node(
+                super::sim_wal("batch-capacity"),
+                crate::RaftGroupHandleRegistry::default(),
                 1,
-                super::raft_config("sim-batch-capacity", 50, 100),
-                super::sim_journal_store("batch-capacity"),
-                Default::default(),
-            )
-            .await
-            .expect("create simulated engine");
+            );
+            let mut engine = factory
+                .open(
+                    placement(),
+                    RuntimeMetrics::new(1, 1).group_engine_metrics(),
+                )
+                .await
+                .expect("create simulated engine");
+            engine
+                .wait_for_current_leader(1, std::time::Duration::from_secs(5))
+                .await
+                .expect("the group's only voter leads it");
             super::assert_append_batch_reserves_hot_capacity(&mut engine, placement()).await;
             ursula_runtime::GroupEngine::shutdown(&mut engine)
                 .await

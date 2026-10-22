@@ -112,13 +112,6 @@ impl GroupStorage {
             )?),
         })
     }
-
-    fn raft_wal(&self) -> Option<RaftWal> {
-        match self {
-            Self::Raft(log_stores) => Some(log_stores.clone()),
-            Self::InMemory => None,
-        }
-    }
 }
 
 /// Spawn a runtime from a typed `ursula_config::UrsulaConfig`.
@@ -212,7 +205,8 @@ pub fn spawn_runtime(
     let storage = GroupStorage::start(
         persistence,
         JournalTuning {
-            fsync: wal.fsync,
+            // The resolved policy, which the WAL records in its run state.
+            fsync: config.raft.wal_fsync(),
             segment_bytes: wal.segment_size.as_bytes(),
             group_cache_bytes: wal.group_cache_bytes(topology.raft_group_count()),
         },
@@ -254,7 +248,9 @@ pub fn spawn_runtime(
         &topology,
         snapshot_store.clone(),
         engine_config,
-        Some(registry),
+        registry,
+        config.raft.node_id,
+        config.raft.placement.replication_factor,
     )?;
 
     ursula_runtime::tidy_worker::spawn_tidy_worker(
@@ -352,90 +348,81 @@ fn spawn_runtime_core(
     topology: &Topology,
     snapshot_store: Option<SharedSnapshotStore>,
     raft_engine_config: RaftEngineConfig,
-    registry: Option<RaftGroupHandleRegistry>,
+    registry: RaftGroupHandleRegistry,
+    node_id: u64,
+    replication_factor: ursula_proto::placement::ReplicationFactor,
 ) -> Result<SpawnedRuntime, RuntimeError> {
-    match topology {
-        Topology::SingleNode { .. } => spawn_singleton(
-            runtime_config,
-            cold_store,
-            storage,
-            raft_engine_config,
-            registry.unwrap_or_default(),
-        ),
+    match (topology, storage) {
+        (Topology::SingleNode { .. }, GroupStorage::InMemory) => {
+            let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
+            Ok(SpawnedRuntime {
+                runtime: ShardRuntime::spawn_with_engine_factory_and_cold_store(
+                    runtime_config,
+                    factory,
+                    cold_store,
+                )?,
+                raft_registry: None,
+                raft_wal: None,
+                meta: None,
+            })
+        }
+        // A single node's groups run the gated open path of a cluster node's
+        // under `raft.node_id`, seeded over the address book `open_meta`
+        // bound: this node alone (D5, removed in S2(g)), so the node is
+        // every group's only voter and initializer. Its snapshots stay
+        // inline (`Topology::uses_snapshot_store`).
+        (Topology::SingleNode { raft_group_count }, GroupStorage::Raft(log_stores)) => {
+            let seeds = ConfigSeeds::new(
+                &registry.peer_cluster().directory(),
+                *raft_group_count,
+                replication_factor,
+            );
+            spawn_placed(
+                runtime_config,
+                cold_store,
+                log_stores,
+                node_id,
+                seeds,
+                None,
+                raft_engine_config,
+                registry,
+            )
+        }
         // The node's peers reach the factory bound with its identity
         // (`open_meta`), before the runtime starts.
-        Topology::StaticCluster { node_id, seeds, .. } => spawn_static_cluster(
-            runtime_config,
-            cold_store,
-            storage,
-            *node_id,
-            seeds.clone(),
-            snapshot_store,
-            raft_engine_config,
-            registry.unwrap_or_default(),
-        ),
+        (Topology::StaticCluster { node_id, seeds, .. }, GroupStorage::Raft(log_stores)) => {
+            spawn_placed(
+                runtime_config,
+                cold_store,
+                log_stores,
+                *node_id,
+                seeds.clone(),
+                snapshot_store,
+                raft_engine_config,
+                registry,
+            )
+        }
+        (Topology::StaticCluster { .. }, GroupStorage::InMemory) => {
+            Err(RuntimeError::StaticMembershipConfig {
+                message: "static cluster topology requires Raft persistence".to_owned(),
+            })
+        }
     }
 }
 
-/// A single node: the in-memory engine, or single-node Raft groups that
-/// publish themselves in `registry` and run with `raft_engine_config`'s
-/// snapshot settings (#669).
-fn spawn_singleton(
+/// Raft groups over the per-core journals of `log_stores`, each opened
+/// behind its recovery gate by the placed engine factory over `seeds` for
+/// `node_id`, publishing themselves in `registry`.
+fn spawn_placed(
     runtime_config: RuntimeConfig,
     cold_store: Option<ColdStoreHandle>,
-    storage: GroupStorage,
-    raft_engine_config: RaftEngineConfig,
-    registry: RaftGroupHandleRegistry,
-) -> Result<SpawnedRuntime, RuntimeError> {
-    let raft_wal = storage.raft_wal();
-    let mut raft_registry = None;
-    let runtime = match storage {
-        GroupStorage::InMemory => {
-            let factory = InMemoryGroupEngineFactory::with_cold_store(cold_store.clone());
-            ShardRuntime::spawn_with_engine_factory_and_cold_store(
-                runtime_config,
-                factory,
-                cold_store,
-            )?
-        }
-        GroupStorage::Raft(log_stores) => {
-            raft_registry = Some(registry.clone());
-            let factory = ursula_raft::DurableRaftGroupEngineFactory::with_cold_store(
-                log_stores,
-                cold_store.clone(),
-            )
-            .with_registry(registry)
-            .with_engine_config(raft_engine_config);
-            ShardRuntime::spawn_with_engine_factory_and_cold_store(
-                runtime_config,
-                factory,
-                cold_store,
-            )?
-        }
-    };
-    Ok(SpawnedRuntime {
-        runtime,
-        raft_registry,
-        raft_wal,
-        meta: None,
-    })
-}
-
-fn spawn_static_cluster(
-    runtime_config: RuntimeConfig,
-    cold_store: Option<ColdStoreHandle>,
-    storage: GroupStorage,
+    log_stores: RaftWal,
     node_id: u64,
     seeds: ConfigSeeds,
     snapshot_store: Option<SharedSnapshotStore>,
     raft_engine_config: RaftEngineConfig,
     registry: RaftGroupHandleRegistry,
 ) -> Result<SpawnedRuntime, RuntimeError> {
-    let GroupStorage::Raft(log_stores) = storage else {
-        return Err(RuntimeError::StaticMembershipConfig {
-            message: "static cluster topology requires Raft persistence".to_owned(),
-        });
-    };
     let raft_wal = Some(log_stores.clone());
     let factory = ursula_raft::PlacedRaftGroupEngineFactory::new(
         log_stores,

@@ -22,7 +22,9 @@ use tokio::task::JoinSet;
 #[cfg(not(madsim))]
 use ursula_config::WalFsync;
 #[cfg(not(madsim))]
-use ursula_raft::DurableRaftGroupEngineFactory;
+use ursula_raft::PlacedRaftGroupEngineFactory;
+#[cfg(not(madsim))]
+use ursula_raft::RaftGroupHandleRegistry;
 #[cfg(not(madsim))]
 use ursula_raft::RaftWal;
 #[cfg(not(madsim))]
@@ -61,9 +63,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         args.wal_fsync,
         &ursula_shard::StaticShardMap::new(args.core_count, args.raft_group_count)?,
     )?;
+    // Node 1 alone, the only voter of every group.
     let runtime = ShardRuntime::spawn_with_engine_factory(
         config,
-        DurableRaftGroupEngineFactory::new(wal.clone()),
+        PlacedRaftGroupEngineFactory::single_node(
+            wal.clone(),
+            RaftGroupHandleRegistry::default(),
+            1,
+        ),
     )?;
 
     let streams = (0..args.stream_count)

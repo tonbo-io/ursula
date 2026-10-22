@@ -27,7 +27,7 @@ pub enum ColdBackend {
 ///
 /// Votes, the per-group log states and the node's run state are always
 /// written with `fsync`, whatever this policy says.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WalFsync {
     /// Acknowledge a batch of appends only after it is `fsync`ed.
@@ -37,7 +37,6 @@ pub enum WalFsync {
     /// replica then stays out of elections until it has caught up from the
     /// group's leader, and a group whose majority lost it stops until an
     /// operator accepts the loss.
-    #[default]
     Never,
 }
 
@@ -292,6 +291,26 @@ impl RaftConfig {
         }]
     }
 
+    /// The journal policy the node runs: `raft.wal.fsync`, or, unset,
+    /// `always` when the node's groups have one or two voters and `never`
+    /// otherwise. A group of one or two voters has no quorum without a
+    /// replica that a host crash under `never` gates, so only `always`
+    /// lets it restart unattended after one. The voter count is
+    /// `min(raft.placement.replication_factor, N)` over the N nodes of the
+    /// address book: `raft.peers`, or this node alone when it is empty.
+    pub fn wal_fsync(&self) -> WalFsync {
+        if let Some(fsync) = self.wal.fsync {
+            return fsync;
+        }
+        let nodes = self.peers.len().max(1);
+        let voters = nodes.min(usize::from(self.placement.replication_factor.get()));
+        if voters <= 2 {
+            WalFsync::Always
+        } else {
+            WalFsync::Never
+        }
+    }
+
     /// The shortest `deleted_data_max_age` this config allows.
     pub fn min_deleted_data_max_age(&self) -> std::time::Duration {
         self.install_snapshot_timeout
@@ -356,8 +375,10 @@ pub struct WalConfig {
     /// without a path runs its WAL in a fresh temporary directory that is
     /// removed on clean shutdown.
     pub path: Option<PathBuf>,
-    /// When journal appends reach stable storage.
-    pub fsync: WalFsync,
+    /// When journal appends reach stable storage. Unset, it resolves from
+    /// the replication factor ([`RaftConfig::wal_fsync`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fsync: Option<WalFsync>,
     /// The size at which each core's journal starts a new segment. Purge
     /// deletes whole segments, so it is also the granularity at which disk
     /// space comes back.
@@ -405,7 +426,7 @@ impl Default for WalConfig {
     fn default() -> Self {
         Self {
             path: None,
-            fsync: WalFsync::Never,
+            fsync: None,
             segment_size: HumanSize::mib(64),
             cache_size: HumanSize::mib(256),
             min_available_size: HumanSize::mib(512),

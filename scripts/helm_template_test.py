@@ -638,8 +638,9 @@ class HelmTemplateConfigTest(unittest.TestCase):
         self.assertIn("walSegmentBytes", result.stderr)
 
     def test_wal_fsync_policy_is_rendered_and_validated(self) -> None:
+        # Unset by default: the server resolves it from the replication factor.
         wal = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt"))["raft"]["wal"]
-        self.assertEqual(wal["fsync"], "never")
+        self.assertNotIn("fsync", wal)
 
         wal = tomllib.loads(render_config(*NAMED, "--set", "s3.bucket=bkt", "--set", "raft.walFsync=always"))[
             "raft"

@@ -33,7 +33,7 @@ fn owner_burst(c: &mut Criterion) {
         let registry = ursula_raft::RaftGroupHandleRegistry::default();
         let runtime = ShardRuntime::spawn_with_engine_factory(
             RuntimeConfig::new(cores, cores),
-            ursula_raft::DurableRaftGroupEngineFactory::new(wal).with_registry(registry.clone()),
+            ursula_raft::PlacedRaftGroupEngineFactory::single_node(wal, registry.clone(), 1),
         )
         .expect("owner workers");
         let streams = (0..cores)

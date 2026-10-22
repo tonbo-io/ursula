@@ -233,9 +233,9 @@ accepted. The entrypoint should only guard runtime-derived pod ordinal state.
 {{- if $logDir | eq "" -}}
 {{- fail "raft.logDir must be non-empty" -}}
 {{- end -}}
-{{- $walFsync := .Values.raft.walFsync | toString -}}
-{{- if or ($walFsync | eq "always") ($walFsync | eq "never") | not -}}
-{{- fail (printf "raft.walFsync must be always or never; got %q" .Values.raft.walFsync) -}}
+{{- $walFsync := .Values.raft.walFsync | default "" | toString -}}
+{{- if or ($walFsync | eq "") ($walFsync | eq "always") ($walFsync | eq "never") | not -}}
+{{- fail (printf "raft.walFsync must be empty, always or never; got %q" .Values.raft.walFsync) -}}
 {{- end -}}
 {{- if and (gt (.Values.raft.minAvailableBytes | int64) 0) (le (.Values.raft.resumeAvailableBytes | int64) (.Values.raft.minAvailableBytes | int64)) -}}
 {{- fail "raft.resumeAvailableBytes must exceed raft.minAvailableBytes when disk-pressure admission is enabled" -}}

@@ -802,18 +802,15 @@ url = "http://127.0.0.1:4438"
     }
 
     #[test]
-    fn wal_fsync_defaults_to_never_and_parses_both_policies() {
+    fn wal_fsync_is_unset_by_default_and_parses_both_policies() {
         use crate::config::WalFsync;
 
-        assert_eq!(
-            crate::UrsulaConfig::default().raft.wal.fsync,
-            WalFsync::Never
-        );
+        assert_eq!(crate::UrsulaConfig::default().raft.wal.fsync, None);
         let disk = |fsync: &str| format!("[raft.wal]\npath = \"/tmp/ursula-wal\"\n{fsync}\n");
         for (line, expected) in [
-            ("", WalFsync::Never),
-            ("fsync = \"always\"", WalFsync::Always),
-            ("fsync = \"never\"", WalFsync::Never),
+            ("", None),
+            ("fsync = \"always\"", Some(WalFsync::Always)),
+            ("fsync = \"never\"", Some(WalFsync::Never)),
         ] {
             let tmp = temp_config(".toml", &disk(line));
             let config = load_config(Some(tmp.path()), None, Some(1)).expect("valid fsync policy");

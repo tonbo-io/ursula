@@ -160,12 +160,13 @@ raft:
   groupCount: 64
   # Raft log directory, mounted from each pod's raft-data PVC. Must be non-empty.
   logDir: /var/lib/ursula/raft
-  # When Raft WAL appends reach stable storage. never acknowledges once
-  # the write is in the page cache: a host crash can cost this replica its unsynced tail, and it
-  # then stays out of elections until it has caught up from the leader. A group whose majority
-  # lost its tail stops until an operator accepts the loss (see README, Bootstrap Behavior).
-  # always acknowledges a batch after fsync.
-  walFsync: never
+  # When Raft WAL appends reach stable storage. Empty leaves raft.wal.fsync unset, so the server
+  # resolves it: always when the groups have one or two voters, never otherwise. never
+  # acknowledges once the write is in the page cache: a host crash can cost this replica its
+  # unsynced tail, and it then stays out of elections until it has caught up from the leader. A
+  # group whose majority lost its tail stops until an operator accepts the loss (see README,
+  # Bootstrap Behavior). always acknowledges a batch after fsync.
+  walFsync: ""
   # Size at which each core's journal starts a new segment. Purge deletes whole segments, so this is
   # also how much disk space comes back at a time.
   walSegmentBytes: 67108864

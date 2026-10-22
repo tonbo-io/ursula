@@ -126,20 +126,21 @@ async fn cli_sigterm_drains_listeners_and_exits_cleanly() {
 
     // A killed process records nothing, so the next start reads it as a crash:
     // a process crash where the kernel reports a boot id, a host crash where
-    // it does not. Under the default `fsync = "never"` a host crash may have
-    // cost the node its unsynced tail, so it recovers.
+    // it does not. A single voter defaults to `fsync = "always"`, under which
+    // a host crash costs nothing acknowledged, so it opens normally either way.
     child.child.kill().expect("kill the node");
     child.child.wait().expect("reap the node");
     let mut child = spawn_node_with_cluster_config(binary, &config_path);
     wait_until_ready(&client, &base_url, std::slice::from_mut(&mut child)).await;
     let recovery = wal_recovery(&client, &base_url).await;
-    let (expected_run, expected_state) = if cfg!(target_os = "linux") {
-        ("process_crash", "normal")
+    let expected_run = if cfg!(target_os = "linux") {
+        "process_crash"
     } else {
-        ("host_crash", "recovering")
+        "host_crash"
     };
     assert_eq!(recovery["previous_run"]["kind"], expected_run, "{recovery}");
-    assert_eq!(recovery["recovery"]["state"], expected_state, "{recovery}");
+    assert_eq!(recovery["recovery"]["state"], "normal", "{recovery}");
+    assert_eq!(recovery["fsync"], "always", "{recovery}");
     drop(child);
 
     std::fs::remove_dir_all(&root).expect("remove temp root");

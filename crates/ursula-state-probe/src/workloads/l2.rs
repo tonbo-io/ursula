@@ -1,8 +1,8 @@
 //! L2 cross-checks through the real `ShardRuntime` (core workers, group
 //! actors, real cold-flush orchestration with packing, memory cold store) on
-//! the in-memory engine and the single-node OpenRaft engine
-//! (`DurableRaftGroupEngineFactory`, on a per-core journal in a temporary
-//! directory), then the group snapshot encoded with the real codec.
+//! the in-memory engine and a single node's OpenRaft groups
+//! (`PlacedRaftGroupEngineFactory::single_node`, on a per-core journal in a
+//! temporary directory), then the group snapshot encoded with the real codec.
 //!
 //! - `w1`: one stream, inline appends, a flush worker pass every tick.
 //! - `w2`: N trickle streams in one group, a flush worker pass every tick.
@@ -19,7 +19,8 @@ use clap::ValueEnum;
 use serde_json::Value;
 use serde_json::json;
 use ursula_config::WalFsync;
-use ursula_raft::DurableRaftGroupEngineFactory;
+use ursula_raft::PlacedRaftGroupEngineFactory;
+use ursula_raft::RaftGroupHandleRegistry;
 use ursula_raft::RaftWal;
 use ursula_runtime::AppendRequest;
 use ursula_runtime::ColdChunkRef;
@@ -182,10 +183,12 @@ fn spawn(
             (
                 ShardRuntime::spawn_with_engine_factory_and_cold_store(
                     config,
-                    DurableRaftGroupEngineFactory::with_cold_store(
+                    PlacedRaftGroupEngineFactory::single_node(
                         log_stores.clone(),
-                        Some(cold.clone()),
-                    ),
+                        RaftGroupHandleRegistry::default(),
+                        1,
+                    )
+                    .with_cold_store(Some(cold.clone())),
                     Some(cold),
                 ),
                 Some(TempWal { log_stores, root }),

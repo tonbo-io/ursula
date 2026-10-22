@@ -38,8 +38,8 @@
 //!   routing and forward hints share.
 //! - [`maintenance`]: configuration-backed local Raft maintenance eligibility.
 //! - [`state_machine`]: per-group [`RaftGroupStateMachine`] and snapshot builder.
-//! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the engine
-//!   factories under `engine::factory`.
+//! - [`engine`]: [`RaftGroupEngine`] + `GroupEngine` impl, with the placed
+//!   engine factory under `engine::factory`.
 //! - [`openraft_error`]: the one conversion from OpenRaft's errors to the
 //!   group engine's error.
 //! - [`openraft_work`]: the work OpenRaft runs for a group engine on tasks of
@@ -145,7 +145,6 @@ mod types;
 pub mod wal;
 
 pub use election::ElectionPolicy;
-pub use engine::DurableRaftGroupEngineFactory;
 pub use engine::PlacedRaftGroupEngineFactory;
 pub use engine::RaftEngineConfig;
 pub use engine::RaftGroupEngine;

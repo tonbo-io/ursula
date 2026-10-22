@@ -10,8 +10,6 @@
 use std::sync::Arc;
 
 use futures_util::stream;
-#[cfg(not(madsim))]
-use openraft::Config;
 use openraft::Entry;
 use openraft::EntryPayload;
 use openraft::LogId;
@@ -92,39 +90,15 @@ fn read_req(stream_id: BucketStreamId, offset: u64, max_len: usize) -> ReadStrea
 #[cfg(not(madsim))]
 async fn cold_engine(cold_store: Arc<ColdStore>) -> (RaftGroupEngine, tempfile::TempDir) {
     let wal_root = tempfile::tempdir().expect("WAL root");
-    let config = Arc::new(
-        Config {
-            cluster_name: "ursula-cold-index".to_owned(),
-            heartbeat_interval: 10,
-            election_timeout_min: 30,
-            election_timeout_max: 60,
-            ..Default::default()
-        }
-        .validate()
-        .expect("valid config"),
-    );
-    let log_store = RaftWal::start(
+    let wal = RaftWal::start(
         wal_root.path(),
         ursula_config::WalFsync::Never,
         &ursula_shard::StaticShardMap::new(1, 1).expect("valid topology"),
     )
-    .expect("start the WAL")
-    .open(
-        placement(),
-        ursula_control::Admission::Create,
-        ursula_runtime::RuntimeMetrics::new(1, 1).group_engine_metrics(),
-    )
-    .expect("open the log store");
-    let engine = RaftGroupEngine::new_single_node_with_log_store_and_metrics(
-        placement(),
-        1,
-        config,
-        log_store,
-        None,
-        Some(cold_store),
-    )
-    .await
-    .expect("create raft group engine");
+    .expect("start the WAL");
+    let factory =
+        crate::engine::test_support::single_node_factory(&wal).with_cold_store(Some(cold_store));
+    let engine = crate::engine::test_support::open_single_voter(&factory, placement()).await;
     (engine, wal_root)
 }
 
