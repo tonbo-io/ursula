@@ -1,6 +1,7 @@
 //! What the `placement-move` family does to a placed [`MetaCluster`] to
-//! move its groups (design 15.2): control commands through a node's meta
-//! handle, as `ursulactl` sends them to the admin plane, held reconcile
+//! move its groups and decommission its nodes (design 15.2): control
+//! commands through a node's meta handle, as `ursulactl` sends them to the
+//! admin plane, held reconcile
 //! and teardown steps through the node's one pause registry
 //! ([`MetaPausePoint::ShellStep`], [`MetaPausePoint::Teardown`]),
 //! leadership transfers through OpenRaft,
@@ -11,9 +12,11 @@ use std::collections::BTreeSet;
 
 use ursula_control::ControlApplied;
 use ursula_control::ControlCommand;
+use ursula_control::LifecycleChange;
 use ursula_control::MoveLimit;
 use ursula_control::TeardownStep;
 use ursula_proto::placement::NodeId;
+use ursula_proto::placement::NodeLifecycle;
 use ursula_proto::placement::ReconcileState;
 use ursula_proto::placement::StepKind;
 use ursula_proto::placement::VoterSet;
@@ -82,6 +85,30 @@ impl MetaCluster {
                 limit: MoveLimit::new(limit),
             })
             .await
+    }
+
+    /// Submits the lifecycle change `change` of `node` through `via`.
+    pub(super) async fn submit_lifecycle(
+        &self,
+        via: u64,
+        node: u64,
+        change: LifecycleChange,
+    ) -> Result<ControlApplied, MetaWriteError> {
+        self.handle(via)
+            .submit(ControlCommand::SetNodeLifecycle {
+                node: NodeId::new(node),
+                change,
+                now_ms: ursula_runtime::unix_time_ms(),
+            })
+            .await
+    }
+
+    /// `node`'s lifecycle in the latest view, once it is bootstrapped.
+    pub(super) fn lifecycle(&self, node: u64) -> Option<NodeLifecycle> {
+        self.latest_view()
+            .cluster()?
+            .node(NodeId::new(node))
+            .map(|record| record.lifecycle)
     }
 
     /// The move `group`'s placement is in, by the latest view.

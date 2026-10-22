@@ -11,8 +11,9 @@
 //! followed on five nodes by moves, or moves alone on three nodes at RF 2,
 //! on four nodes at RF 2 (a full replacement) or on two nodes at RF 1 with
 //! node 1 drained, whose shed exemption as its group's only voter goes and
-//! comes back as the move and its cancel change the group's placed voters.
-//! A meta run draws whether one node first claims other genesis values,
+//! comes back as the move and its cancel change the group's placed voters,
+//! or on four nodes at RF 3 a live or dead decommission of node 4 and the
+//! removed-node sweep ([`super::placement_decommission`]). A meta run draws whether one node first claims other genesis values,
 //! how a group's initializer restarts before its group formed, and the
 //! order of the meta faults. Each meta run:
 //!
@@ -110,10 +111,13 @@ use super::meta_cluster::claim_with_factor;
 use super::placed_hosting;
 use super::placed_hosting::I3;
 use super::placed_hosting::I5;
+use super::placed_removals::RemovalChecks;
+use super::placement_decommission::decommission_family;
+use super::snapshot_checks::SnapshotChecks;
 
 /// The most nodes a run starts, and the meta voters.
 const NODES: u64 = 5;
-const META_VOTERS: [u64; 3] = [1, 2, 3];
+pub(super) const META_VOTERS: [u64; 3] = [1, 2, 3];
 /// How long a script watches for a second genesis.
 const WATCH: Duration = Duration::from_secs(8);
 /// How often the meta recovery observes the replicas again.
@@ -123,7 +127,7 @@ const SALT: u64 = 0x6d65_7461_6d6f_7665;
 /// How long a move may take to settle: the new replica's creation from a
 /// confirmed view, its catch-up and gate, and the steps, through a
 /// partition's heal.
-const MOVE_BOUND: Duration = Duration::from_secs(40);
+pub(super) const MOVE_BOUND: Duration = Duration::from_secs(40);
 /// How long a family run waits for a leader to hold a drawn step. A leader
 /// that confirmed its view earlier in its leadership never plans
 /// `ConfirmView`, and the move then ends without a hold.
@@ -134,7 +138,7 @@ const CUT: Duration = Duration::from_secs(2);
 const SETTLED: Duration = Duration::from_secs(3);
 /// How long the teardowns of a settled group may take: each of its two
 /// asks may wait one ask interval for the next answer.
-const TEARDOWN_BOUND: Duration = Duration::from_secs(100);
+pub(super) const TEARDOWN_BOUND: Duration = Duration::from_secs(100);
 /// How long N4's script watches for the teardown it released to retire
 /// the log of a voter.
 const RETIRE_WATCH: Duration = Duration::from_secs(20);
@@ -275,6 +279,9 @@ enum Shape {
     /// the other node, the first with a cancel while the step that replaces
     /// the voter is held.
     Rf1,
+    /// Four nodes at RF 3: node 4 is decommissioned, removed and swept
+    /// ([`super::placement_decommission`]).
+    Decommission,
 }
 
 /// When a move is cancelled or retargeted.
@@ -353,7 +360,7 @@ impl TeardownFault {
 
 /// One move of a group's voters to fresh nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MoveDraw {
+pub(super) struct MoveDraw {
     /// Every voter moves, not one.
     full: bool,
     /// The leader is the voter that moves out.
@@ -367,7 +374,7 @@ struct MoveDraw {
 
 impl MoveDraw {
     /// A plain move of one voter, not the leader.
-    const ONE: Self = Self {
+    pub(super) const ONE: Self = Self {
         full: false,
         outgoing_leader: false,
         partition: false,
@@ -420,16 +427,20 @@ impl MoveDraw {
     }
 }
 
-struct Run {
-    cluster: MetaCluster,
-    trace: SimTrace,
+pub(super) struct Run {
+    pub(super) cluster: MetaCluster,
+    pub(super) trace: SimTrace,
     checks: MetaChecks,
+    /// The removed nodes' checks, at every observation.
+    pub(super) removals: RemovalChecks,
+    /// The snapshot object checks, when the nodes run the snapshot store.
+    pub(super) snapshots: Option<SnapshotChecks>,
     rng: SplitMix64,
     seed: u64,
 }
 
 impl Run {
-    async fn start(
+    pub(super) async fn start(
         seed: u64,
         nodes: u64,
         fsync: WalFsync,
@@ -450,6 +461,8 @@ impl Run {
             cluster,
             trace,
             checks: MetaChecks::default(),
+            removals: RemovalChecks::default(),
+            snapshots: None,
             rng: SplitMix64::new(seed ^ SALT),
             seed,
         };
@@ -457,20 +470,32 @@ impl Run {
         run
     }
 
-    /// Records `phase` and checks I12.
-    fn step(&mut self, phase: &str) {
+    /// Records `phase` and checks.
+    pub(super) fn step(&mut self, phase: &str) {
         self.trace.push(SimEvent::FaultApplied {
             phase: phase.to_owned(),
         });
-        self.checks.observe(&self.cluster, &mut self.trace, phase);
+        self.observe(phase);
     }
 
-    /// Waits `wait`, checking I12 every step.
-    async fn watch(&mut self, phase: &str, wait: Duration) {
+    /// The checks of every observation: the meta and hosting checks, the
+    /// removed nodes' and, with a snapshot store, the snapshot objects',
+    /// which leave out the removed nodes.
+    pub(super) fn observe(&mut self, phase: &str) {
+        self.checks.observe(&self.cluster, &mut self.trace, phase);
+        self.removals.observe(&self.cluster, &mut self.trace, phase);
+        if let Some(snapshots) = self.snapshots.as_mut() {
+            let removed = self.cluster.removed_nodes();
+            snapshots.step_except(&self.cluster.data, &mut self.trace, phase, &removed);
+        }
+    }
+
+    /// Waits `wait`, checking every step.
+    pub(super) async fn watch(&mut self, phase: &str, wait: Duration) {
         let deadline = madsim::time::Instant::now() + wait;
         while madsim::time::Instant::now() < deadline {
             madsim::time::sleep(STEP).await;
-            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            self.observe(phase);
         }
     }
 
@@ -479,7 +504,7 @@ impl Run {
     }
 
     /// Every node registered and learns the view (I11).
-    async fn learned(&mut self, phase: &str) {
+    pub(super) async fn learned(&mut self, phase: &str) {
         let nodes = self.nodes();
         self.checks
             .registered_nodes_learn(&self.cluster, &mut self.trace, phase, &nodes)
@@ -489,7 +514,7 @@ impl Run {
 
     /// Every node holds the bootstrapped view, before the first control
     /// write.
-    async fn bootstrapped(&mut self, phase: &str) {
+    pub(super) async fn bootstrapped(&mut self, phase: &str) {
         let nodes = self.nodes();
         self.checks
             .bootstrapped(&self.cluster, &mut self.trace, phase, &nodes)
@@ -502,13 +527,13 @@ impl Run {
     }
 
     /// Every placed group forms on its seed voters within the bound (I15).
-    async fn formed(&mut self, phase: &str) {
+    pub(super) async fn formed(&mut self, phase: &str) {
         self.cluster.groups_form(&mut self.trace, phase).await;
         self.step(phase);
     }
 
     /// Two appends to every data group, each taken within the bound.
-    async fn append_data(&mut self, phase: &str) {
+    pub(super) async fn append_data(&mut self, phase: &str) {
         for group in JOURNAL_GROUPS {
             if !self.cluster.try_append(group, 2).await {
                 meta_checks::fail(
@@ -539,7 +564,7 @@ impl Run {
                 );
             }
             madsim::time::sleep(STEP).await;
-            self.checks.observe(&self.cluster, &mut self.trace, PHASE);
+            self.observe(PHASE);
         }
         match how {
             InitializerRestart::Crash => self.cluster.stop_node(initializer).await,
@@ -765,8 +790,7 @@ impl Run {
                 Ok(Some(_satisfied)) => return,
                 Ok(None) if madsim::time::Instant::now() < deadline => {
                     madsim::time::sleep(PLAN_POLL).await;
-                    self.checks
-                        .observe(&self.cluster, &mut self.trace, "meta_plan");
+                    self.observe("meta_plan");
                 }
                 Ok(None) => {
                     let members = self.describe_meta(nodes);
@@ -828,7 +852,7 @@ impl Run {
 
     /// Waits until `ready` answers `None`, checking at every step, and
     /// fails `invariant` with its last answer after `bound`.
-    async fn until(
+    pub(super) async fn until(
         &mut self,
         phase: &str,
         invariant: &str,
@@ -837,7 +861,7 @@ impl Run {
     ) {
         let deadline = madsim::time::Instant::now() + bound;
         loop {
-            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            self.observe(phase);
             let Some(why) = ready(&self.cluster) else {
                 return;
             };
@@ -849,7 +873,7 @@ impl Run {
     }
 
     /// Whether `ready` holds within `bound`, checking at every step.
-    async fn within(
+    pub(super) async fn within(
         &mut self,
         phase: &str,
         bound: Duration,
@@ -857,7 +881,7 @@ impl Run {
     ) -> bool {
         let deadline = madsim::time::Instant::now() + bound;
         loop {
-            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            self.observe(phase);
             if ready(&self.cluster) {
                 return true;
             }
@@ -888,7 +912,7 @@ impl Run {
             .collect();
         let mut turn = 0usize;
         loop {
-            self.checks.observe(&self.cluster, &mut self.trace, phase);
+            self.observe(phase);
             if self.cluster.target_voters(group).as_ref() == Some(to) {
                 return Ok(());
             }
@@ -948,7 +972,7 @@ impl Run {
 
     /// I3 for one group: it settles live on `voters` within the move bound,
     /// and its replicas without a role are torn down.
-    async fn settled(&mut self, phase: &str, group: u32, voters: &BTreeSet<u64>) {
+    pub(super) async fn settled(&mut self, phase: &str, group: u32, voters: &BTreeSet<u64>) {
         let voters = voters.clone();
         self.until(phase, I3, MOVE_BOUND, move |cluster| {
             cluster.not_settled(group).or_else(|| {
@@ -964,7 +988,7 @@ impl Run {
     /// I3's teardown half and I5's record half for one group: no running
     /// node holds a log of it without a role, and every retirement of it
     /// is reported.
-    async fn torn_down(&mut self, phase: &str, group: u32) {
+    pub(super) async fn torn_down(&mut self, phase: &str, group: u32) {
         self.until(phase, I3, TEARDOWN_BOUND, move |cluster| {
             cluster.unplaced_replica(group)
         })
@@ -1038,7 +1062,7 @@ impl Run {
     }
 
     /// The running leader of `group`, once it has one.
-    async fn leader(&mut self, phase: &str, group: u32) -> u64 {
+    pub(super) async fn leader(&mut self, phase: &str, group: u32) -> u64 {
         self.until(phase, I3, meta_checks::BOUND, move |cluster| {
             cluster
                 .leader_of(group)
@@ -1089,7 +1113,7 @@ impl Run {
 
     /// One move of `group` as `draw` has it, to fresh nodes, with keyed
     /// appends before and after, that settles live on its last target.
-    async fn move_group(&mut self, group: u32, draw: MoveDraw) {
+    pub(super) async fn move_group(&mut self, group: u32, draw: MoveDraw) {
         const PHASE: &str = "move";
         let from = self.cluster.placed_voters(group);
         let fresh = self.fresh(group);
@@ -1298,6 +1322,8 @@ impl Run {
                 };
                 self.move_group(1, moved).await;
             }
+            // Its groups move through the decommission driver.
+            Shape::Decommission => {}
         }
     }
 
@@ -1348,7 +1374,7 @@ impl Run {
     /// The end of every placed run: every group settles live on its
     /// placement and its replicas without a role are torn down (I3, I5),
     /// and every voter reads every acknowledged append (I1).
-    async fn settle_and_read(&mut self) {
+    pub(super) async fn settle_and_read(&mut self) {
         self.cluster
             .groups_live(&mut self.trace, "groups_live")
             .await;
@@ -1366,7 +1392,7 @@ impl Run {
 
     /// Ends the run: a moved group fails a check that judged nothing of it
     /// ([`MetaChecks::judged_the_moves`]).
-    fn finish(mut self) -> ThreeNodeRaftSimOutcome {
+    pub(super) fn finish(mut self) -> ThreeNodeRaftSimOutcome {
         self.checks
             .judged_the_moves(&self.cluster, &mut self.trace, "finished");
         self.trace.push(SimEvent::PlacementMoveMetaHeld {
@@ -1403,7 +1429,7 @@ pub(super) async fn run_placement_move_inner(
     }
 }
 
-fn claims(nodes: u64) -> BTreeMap<u64, ursula_proto::placement::GenesisClaim> {
+pub(super) fn claims(nodes: u64) -> BTreeMap<u64, ursula_proto::placement::GenesisClaim> {
     claims_with_factor(nodes, 3)
 }
 
@@ -1429,14 +1455,16 @@ async fn family(seed: u64) -> ThreeNodeRaftSimOutcome {
     } else {
         WalFsync::Never
     };
-    let shape = match draws.next_bounded(6) {
+    let shape = match draws.next_bounded(8) {
         0 => Shape::Meta { nodes: 3 },
         1 | 2 => Shape::Meta { nodes: NODES },
         3 => Shape::Rf2,
         4 => Shape::FullReplacement,
-        _ => Shape::Rf1,
+        5 => Shape::Rf1,
+        _ => Shape::Decommission,
     };
     match shape {
+        Shape::Decommission => decommission_family(seed, &mut draws, fsync).await,
         Shape::Meta { nodes } => meta_family(seed, &mut draws, fsync, nodes).await,
         Shape::Rf2 => moves_family(seed, &mut draws, fsync, shape, 3, 2).await,
         Shape::FullReplacement => moves_family(seed, &mut draws, fsync, shape, 4, 2).await,
@@ -2004,8 +2032,10 @@ mod tests {
     use crate::madsim_harness::tests::sim_test_guard;
 
     const SCENARIO: SimScenario = SimScenario::PlacementMove;
-    /// The seeds whose family runs the replay covers.
-    const REPLAYED: std::ops::RangeInclusive<u64> = 1100..=1101;
+    /// The seeds whose family runs the replay covers, both of the shape
+    /// `Meta { nodes: 5 }` under `family`'s draw (the decommission seeds
+    /// replay in `placement_decommission`).
+    const REPLAYED: [u64; 2] = [1102, 1104];
     /// The seed every scripted run uses.
     const SCRIPTED: u64 = 1100;
 

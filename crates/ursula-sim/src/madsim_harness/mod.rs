@@ -593,6 +593,8 @@ mod meta_checks;
 mod meta_cluster;
 mod placed_hosting;
 mod placed_moves;
+mod placed_removals;
+mod placement_decommission;
 mod placement_move;
 mod recovery_wiring;
 mod routing;
