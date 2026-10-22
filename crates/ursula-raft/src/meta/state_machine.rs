@@ -4,10 +4,12 @@
 //! Its dispatch is frozen with format epoch 6, like the kernel it applies:
 //!
 //! - a stream entry stops the apply, as a meta entry stops a data group's;
-//! - a history event whose `previous` is not the current history applies
+//! - a history event whose `previous` is not the current history, or whose
+//!   `leader` is not the leader of the entry that carries it, applies
 //!   nothing and answers [`MetaResponse::HistoryMismatch`], and one that
-//!   names it becomes the history and begins it in the kernel
-//!   (`ControlPlaneState::begin_history`);
+//!   names both becomes the history and begins it in the kernel
+//!   (`ControlPlaneState::begin_history`) at its entry's log id
+//!   ([`history_applies`]);
 //! - a control command is applied by the kernel
 //!   (`ControlPlaneState::apply`), at the entry's log id.
 //!
@@ -47,6 +49,7 @@ use ursula_runtime::SnapshotPointer;
 use ursula_shard::RaftGroupId;
 use ursula_shard::RaftTarget;
 use ursula_stream::HistoryEvent;
+use ursula_stream::HistoryLeader;
 
 use super::MetaCommand;
 use super::MetaResponse;
@@ -87,8 +90,26 @@ pub fn meta_log_id(log_id: LogIdOf<C>) -> MetaLogId {
     })
 }
 
+/// Whether a history event naming `previous` and `leader`, carried by the
+/// entry at `log_id`, applies over the current history `current` (0 before
+/// the genesis): only when it names the current history and its entry's
+/// leader. A proposer re-elected between building the event and appending it
+/// names an earlier term than its entry's, and such an event applies
+/// nothing, so the view's history ([`history_log_id`]) and the kernel's
+/// `since` of every placement (the entry's log id) never split. The one
+/// rule of the apply and of every reader that replays meta's log.
+pub(crate) fn history_applies(
+    current: u64,
+    log_id: LogIdOf<C>,
+    previous: u64,
+    leader: HistoryLeader,
+) -> bool {
+    let entry = log_id.committed_leader_id();
+    previous == current && leader.term == entry.term && leader.node_id == entry.node_id
+}
+
 /// The meta log id of the entry that applied `event`: its proposer is the
-/// entry's leader, and its index the entry's.
+/// entry's leader ([`history_applies`]), and its index the entry's.
 fn history_log_id(event: &HistoryEvent) -> MetaLogId {
     MetaLogId::new(RaftLogId {
         term: event.leader.term,
@@ -229,7 +250,7 @@ impl MetaStateMachine {
                 cause,
             } => {
                 let current = self.history.map_or(0, |event| event.id.get());
-                if previous != current {
+                if !history_applies(current, log_id, previous, leader) {
                     return MetaResponse::HistoryMismatch { current };
                 }
                 self.history = Some(HistoryEvent {

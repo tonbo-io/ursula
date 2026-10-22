@@ -118,7 +118,8 @@ pub enum MetaCommand {
     /// Its fields are those of the data groups' `StreamCommand::NewHistory`,
     /// in its order, without its stream clock, and with what began the
     /// history. An event whose `previous` is not the meta group's current
-    /// history applies nothing.
+    /// history, or whose `leader` is not its entry's leader, applies nothing
+    /// (`state_machine::history_applies`).
     NewHistory {
         /// The new history's id, drawn by the proposer.
         history: NonZeroU64,
@@ -221,8 +222,9 @@ pub struct MetaState {
 pub enum MetaResponse {
     /// A history event applied.
     History,
-    /// A history event named another `previous` than the `current` history
-    /// and applied nothing.
+    /// A history event named another `previous` than the `current` history,
+    /// or another leader than its entry's, and applied nothing. The history
+    /// driver proposes again, under its current term.
     HistoryMismatch { current: u64 },
     /// The placement kernel's answer to a control command.
     Control(ControlResponse),

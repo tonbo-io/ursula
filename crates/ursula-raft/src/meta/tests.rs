@@ -93,15 +93,25 @@ fn history_id(id: u64) -> NonZeroU64 {
     NonZeroU64::new(id).unwrap()
 }
 
+/// A history event proposed by the leader of [`log_id`]'s entries.
 fn new_history(id: u64, previous: u64, cause: HistoryCause) -> MetaCommand {
+    new_history_by(id, previous, cause, HistoryLeader {
+        term: 4,
+        node_id: 2,
+    })
+}
+
+fn new_history_by(
+    id: u64,
+    previous: u64,
+    cause: HistoryCause,
+    leader: HistoryLeader,
+) -> MetaCommand {
     MetaCommand::NewHistory {
         history: history_id(id),
         previous,
         kept: 1,
-        leader: HistoryLeader {
-            term: 4,
-            node_id: 2,
-        },
+        leader,
         cause,
     }
 }
@@ -238,6 +248,66 @@ fn a_history_event_whose_previous_is_not_current_applies_nothing() {
         (history_id(0xc3), 3, 0xa1, 1)
     );
     assert_eq!(control(&machine), ControlPlaneState::FormationCut);
+}
+
+/// The leader rule: an event whose `leader` is not its entry's leader
+/// applies nothing, even when it names the current history, and answers the
+/// refusal the driver proposes again on. It catches an apply that takes an
+/// event whose proposer was re-elected between building and appending it:
+/// the view's history would then name the event's term, while the kernel
+/// began the history, and keyed every placement's `since`, at the entry's.
+/// The driver's next event, under its current term, applies, and the view's
+/// history is the log id `begin_history` ran at.
+#[tokio::test]
+async fn a_history_event_under_another_leader_than_its_entry_applies_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal = start_wal(dir.path());
+    let (_store, mut machine, placement) = state_machine(&wal);
+    machine.apply_command(log_id(1), new_history(0xa1, 0, HistoryCause::Genesis));
+    let mut forming = ControlPlaneState::default();
+    forming.begin_history(meta_log_id(log_id(1)), HistoryCause::Genesis);
+
+    // The entries' leader is node 2 in term 4: the proposer in an earlier
+    // term, and another node in the same term.
+    for leader in [
+        HistoryLeader {
+            term: 3,
+            node_id: 2,
+        },
+        HistoryLeader {
+            term: 4,
+            node_id: 1,
+        },
+    ] {
+        let refused = machine.apply_command(
+            log_id(2),
+            new_history_by(0xb2, 0xa1, HistoryCause::Plan, leader),
+        );
+        assert_eq!(refused, MetaResponse::HistoryMismatch { current: 0xa1 });
+        assert!(MetaStateMachine::history_refused(&RaftGroupResponse::Meta(
+            refused
+        )));
+        assert_eq!(*machine.control(), forming, "{leader:?} began nothing");
+        assert_eq!(
+            machine.history().map(|event| event.id),
+            Some(history_id(0xa1))
+        );
+    }
+
+    apply(&mut machine, vec![(
+        3,
+        meta(new_history(0xc3, 0xa1, HistoryCause::Plan)),
+    )])
+    .await
+    .unwrap();
+    let mut cut = forming.clone();
+    cut.begin_history(meta_log_id(log_id(3)), HistoryCause::Plan);
+    let view = placement.subscribe().current();
+    assert_eq!(*view.state, cut);
+    assert_eq!(view.stage, ViewStage::Applied {
+        applied: meta_log_id(log_id(3)),
+        history: meta_log_id(log_id(3)),
+    });
 }
 
 /// A stream entry stops the meta apply: the replica records the stop at the

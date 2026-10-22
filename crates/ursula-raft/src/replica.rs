@@ -90,8 +90,9 @@ pub(crate) trait ReplicaStateMachine:
     /// The command that proposes `proposal` on this plane.
     fn history_command(proposal: HistoryProposal) -> RaftCommand;
     /// Whether the applied answer to a history command refused it: the
-    /// event named another predecessor than the group's history and applied
-    /// nothing, so the driver proposes again.
+    /// event named another predecessor than the group's history, or on the
+    /// meta plane another leader than its entry's, and applied nothing, so
+    /// the driver proposes again.
     fn history_refused(response: &RaftGroupResponse) -> bool;
     /// The answer of a written command in `response`, of the kind
     /// `expected`, or the refusal of a response of another kind.
